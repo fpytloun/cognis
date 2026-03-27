@@ -1,6 +1,6 @@
 # Stage 0: Prerequisites
 
-**Status**: NOT STARTED
+**Status**: IN PROGRESS
 **Repos**: `intaris`, `mnemory`, `cognis` (contract tests only)
 **Depends on**: nothing
 **Estimated effort**: 1-2 weeks
@@ -58,7 +58,7 @@ Add ES256 JWT validation alongside existing API key auth:
 
 ### I6: Event Recording Idempotency
 
-Add optional `idempotency_key` parameter to the event append endpoint.
+Add optional `idempotency_key` query parameter to the event append endpoint.
 Format: `{session_id}:{turn_number}:{batch_index}`. If a duplicate key is
 received, return success without re-appending. Prevents duplicate events
 when the controller retries after a timeout.

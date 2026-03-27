@@ -1,0 +1,91 @@
+"""Domain models for configuration, LLM providers, and model routing."""
+
+from __future__ import annotations
+
+from enum import StrEnum
+from typing import Any
+
+from pydantic import BaseModel, Field
+
+
+class UserRole(StrEnum):
+    """User roles for authorization."""
+
+    ADMIN = "admin"
+    USER = "user"
+    VIEWER = "viewer"
+    SERVICE = "service"
+
+
+class LLMProviderConfig(BaseModel):
+    """A configured LLM provider."""
+
+    provider_id: str
+    display_name: str
+    location: str  # "controller" | "executor"
+    backend: str = "litellm"  # "litellm" | "direct" | "passthrough" | "executor"
+    litellm_provider: str | None = None
+    sdk: str | None = None
+    api_base: str | None = None
+    api_key_secret: str | None = None
+    executor_labels: dict[str, str] | None = None
+    models: list[ModelInfo] = Field(default_factory=list)
+    default_model: str | None = None
+    status: str = "active"
+
+
+class ModelInfo(BaseModel):
+    """A model exposed by a provider."""
+
+    model_id: str
+    display_name: str | None = None
+    context_window: int = 128000
+    max_output_tokens: int = 16384
+    supports_tools: bool = True
+    supports_streaming: bool = True
+    supports_vision: bool = False
+    supports_reasoning: bool = False
+    reasoning_efforts: list[str] = Field(default_factory=list)
+    supports_prompt_caching: bool = False
+    supports_extended_thinking: bool = False
+    input_cost_per_mtok: float | None = None
+    output_cost_per_mtok: float | None = None
+    tier: str = "standard"
+
+
+class ModelRoutingPolicy(BaseModel):
+    """Which models for which task types."""
+
+    default: str | None = None
+    classifier: str | None = None
+    compaction: str | None = None
+    simple_inline: str | None = None
+
+
+class ProviderHealth(BaseModel):
+    """Health status for a single provider."""
+
+    name: str
+    status: str  # "healthy", "degraded", "unhealthy", "unknown"
+    latency_ms: float | None = None
+    circuit_state: str | None = None  # "closed", "open", "half_open"
+    error: str | None = None
+    details: dict[str, Any] | None = None
+
+
+class TokenUsage(BaseModel):
+    """Token usage from an LLM call."""
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+
+
+class Cost(BaseModel):
+    """Cost of an LLM call."""
+
+    input_cost: float = 0.0
+    output_cost: float = 0.0
+    total_cost: float = 0.0
+    model: str = ""
+    provider: str = ""

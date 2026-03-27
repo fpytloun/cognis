@@ -488,12 +488,15 @@ Returns list of pending escalation records.
 
 Request: `[{"type": "user_message", "data": {"content": "..."}}]`
 Headers: `X-Intaris-Source: cognis`
+Query params: `idempotency_key` (optional, format `{session_id}:{turn_number}:{batch_index}`)
 Response: `{"ok": true, "count": 1, "first_seq": 1, "last_seq": 1}`
 
 #### GET /api/v1/session/{id}/events (Read Events)
 
 Query params: `after_seq`, `limit`, `type` (comma-separated), `source`,
 `exclude_source`, `after_ts`, `before_ts`, `last_n` (Intaris prerequisite).
+
+`last_n` is mutually exclusive with `after_seq` and `limit`.
 
 Response:
 ```json

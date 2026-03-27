@@ -1,0 +1,171 @@
+"""Bootstrap services for filesystem, keys, database, and default settings."""
+
+from __future__ import annotations
+
+import base64
+import os
+import secrets
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Final
+
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
+
+from cognis.config import CognisConfig
+from cognis.logging import get_logger
+from cognis.store.database import create_engine, create_session_factory
+from cognis.store.queries import count_users, create_user, upsert_setting
+
+logger = get_logger(__name__)
+
+DEFAULT_SETTINGS: Final[dict[str, tuple[str, object]]] = {
+    "session.max_context_tokens": ("session", 128000),
+    "session.compaction_threshold": ("session", 0.85),
+    "session.compaction_preserve_turns": ("session", 10),
+    "session.max_tool_calls_per_turn": ("session", 50),
+    "session.idle_timeout_seconds": ("session", 1800),
+    "session.max_session_age_seconds": ("session", 86400),
+    "session.max_delegation_depth": ("session", 5),
+    "session.max_queued_messages": ("session", 5),
+    "session.escalation_timeout_seconds": ("session", 300),
+    "decision_engine.inline_max_length": ("decision_engine", 200),
+    "decision_engine.classifier_timeout_ms": ("decision_engine", 500),
+    "decision_engine.classifier_fallback": ("decision_engine", "inline"),
+    "security.non_bypassable_tools": (
+        "security",
+        ["shell", "bash", "write_file", "delete_file"],
+    ),
+    "security.token_ttl_seconds": ("security", 3600),
+    "security.max_connections": ("security", 100),
+    "security.ws_auth_timeout_seconds": ("security", 10),
+}
+
+
+class SetupTokenManager:
+    """In-memory one-time setup token store."""
+
+    def __init__(self) -> None:
+        self._token: str | None = None
+        self._expires_at: datetime | None = None
+
+    def issue(self) -> str:
+        self._token = secrets.token_urlsafe(32)
+        self._expires_at = datetime.now(UTC) + timedelta(minutes=15)
+        return self._token
+
+    def validate(self, token: str) -> bool:
+        if self._token is None or self._expires_at is None:
+            return False
+        if datetime.now(UTC) > self._expires_at:
+            return False
+        return secrets.compare_digest(self._token, token)
+
+    def invalidate(self) -> None:
+        self._token = None
+        self._expires_at = None
+
+
+def _write_bytes_atomic(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_bytes(data)
+    try:
+        os.chmod(tmp_path, 0o600)
+    except OSError:
+        logger.warning("Could not set file permissions", extra={"extra_data": {"path": str(path)}})
+    tmp_path.replace(path)
+
+
+def ensure_data_dir(config: CognisConfig) -> None:
+    """Create required filesystem paths."""
+    config.data_dir.mkdir(parents=True, exist_ok=True)
+    config.jwt_private_key_path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def ensure_jwt_keypair(config: CognisConfig) -> None:
+    """Generate ES256 keypair if missing or incomplete."""
+    private_exists = config.jwt_private_key_path.exists()
+    public_exists = config.jwt_public_key_path.exists()
+    if private_exists and public_exists:
+        return
+
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    private_bytes = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    public_bytes = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    _write_bytes_atomic(config.jwt_private_key_path, private_bytes)
+    _write_bytes_atomic(config.jwt_public_key_path, public_bytes)
+
+
+def ensure_secrets_key(config: CognisConfig) -> None:
+    """Generate AES-256-GCM key if missing."""
+    if config.secrets_key_path.exists():
+        return
+    _write_bytes_atomic(config.secrets_key_path, base64.urlsafe_b64encode(os.urandom(32)))
+
+
+async def run_schema_bootstrap(engine: AsyncEngine) -> None:
+    """Create schema directly for MVP before/alongside Alembic use."""
+    from cognis.store.models import Base
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+
+async def seed_default_settings(session: AsyncSession) -> None:
+    """Seed application settings into the settings table."""
+    for key, (category, value) in DEFAULT_SETTINGS.items():
+        await upsert_setting(session, key=key, value=value, category=category)
+
+
+async def maybe_seed_initial_admin(
+    session: AsyncSession,
+    config: CognisConfig,
+    password_hasher: object,
+) -> CognisConfig:
+    """Seed initial admin from env vars if configured and no users exist."""
+    if await count_users(session) != 0:
+        return config
+    if config.initial_admin_email is None or config.initial_admin_password is None:
+        return config
+
+    password_hash = password_hasher.hash(config.initial_admin_password)  # type: ignore[attr-defined]
+    await create_user(
+        session,
+        email=config.initial_admin_email,
+        name="Admin",
+        password_hash=password_hash,
+        role="admin",
+    )
+    os.environ.pop("COGNIS_INITIAL_ADMIN_PASSWORD", None)
+    return replace(config, initial_admin_password=None)
+
+
+async def bootstrap_runtime(
+    config: CognisConfig,
+    password_hasher: object,
+) -> tuple[CognisConfig, AsyncEngine, async_sessionmaker[AsyncSession], SetupTokenManager]:
+    """Run bootstrap and return engine/session factory/token manager."""
+    ensure_data_dir(config)
+    ensure_jwt_keypair(config)
+    ensure_secrets_key(config)
+
+    engine = create_engine(config.database_url)
+    session_factory = create_session_factory(engine)
+    await run_schema_bootstrap(engine)
+
+    async with session_factory() as session:
+        await seed_default_settings(session)
+        config = await maybe_seed_initial_admin(session, config, password_hasher)
+        await session.commit()
+
+    return config, engine, session_factory, SetupTokenManager()

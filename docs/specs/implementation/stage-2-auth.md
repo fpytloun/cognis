@@ -1,6 +1,6 @@
 # Stage 2: Auth + Bootstrap + CLI
 
-**Status**: NOT STARTED
+**Status**: IMPLEMENTED*
 **Repo**: `cognis`
 **Depends on**: Stage 1
 **Estimated effort**: 2-3 days
@@ -12,6 +12,19 @@ Typer CLI admin commands. After this stage, a user can create the first
 admin account (via setup URL or CLI), log in, get a JWT, and make
 authenticated API calls. The JWKS endpoint works so Mnemory and Intaris
 can validate Cognis-issued tokens.
+
+## Progress Notes
+
+- Stage 2 auth/bootstrap/CLI implementation is complete.
+- Implemented: ES256 JWT auth provider, refresh/service/exchange tokens,
+  JWKS endpoint, setup flow, login/refresh/logout/me endpoints, HTTP auth
+  middleware, API-key authentication, minimal WebSocket auth flow, FastAPI app
+  factory, and Typer CLI commands.
+- MVP note: token revocation and exchange-token single-use state are in-memory
+  only and reset on process restart.
+- Local validation passed through unit tests, `pytest`, `ruff`, and `mypy`.
+- Full long-running server/runtime and WebSocket timeout verification remains
+  environment-dependent.
 
 ## Deliverables
 

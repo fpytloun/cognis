@@ -1,6 +1,6 @@
 # Stage 3: Provider Layer
 
-**Status**: NOT STARTED
+**Status**: IMPLEMENTED*
 **Repo**: `cognis`
 **Depends on**: Stage 2 (auth for JWT service tokens), Stage 0 (contract tests passing)
 **Estimated effort**: 4-5 days
@@ -11,6 +11,19 @@ Implement all 6 provider protocols and their initial implementations.
 After this stage, Cognis can connect to live Mnemory and Intaris instances
 with JWT auth, make LLM calls through LiteLLM, encrypt/decrypt secrets,
 and report provider health. Contract tests pass against real services.
+
+## Progress Notes
+
+- Stage 3 provider-layer implementation is complete.
+- Implemented: provider Protocols, provider registry, configurable circuit
+  breaker instances, Mnemory and Intaris HTTP providers, LiteLLM wrapper,
+  encrypted DB secrets provider, in-process executor placeholder, and bounded
+  remember retry queue with metrics.
+- Per-target JWT audiences (`mnemory` vs `intaris`) are implemented as a
+  deliberate least-privilege tightening over the broader spec example.
+- Local validation passed through unit tests, `pytest`, `ruff`, and `mypy`.
+- Live Mnemory/Intaris contract tests were skipped locally because the required
+  services and JWT test key were not available in this environment.
 
 ## Deliverables
 

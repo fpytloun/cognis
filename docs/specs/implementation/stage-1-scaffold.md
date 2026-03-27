@@ -1,6 +1,6 @@
 # Stage 1: Project Scaffold + Config + Database
 
-**Status**: NOT STARTED
+**Status**: IMPLEMENTED*
 **Repo**: `cognis`
 **Depends on**: Stage 0 (contract tests written, not necessarily all merged)
 **Estimated effort**: 2-3 days
@@ -12,6 +12,18 @@ variable configuration, auto-generated data directory, and full database
 schema. After this stage, `uvx cognis` should start, create `~/.cognis/`,
 initialize the database, seed default settings, and exit cleanly (no API
 server yet — that comes in Stage 2).
+
+## Progress Notes
+
+- Stage 1 scaffold implementation is complete.
+- Implemented: `pyproject.toml`, package tree, structured logging with
+  redaction, pure config loading, bootstrap helpers, DB models/query helpers,
+  Alembic scaffolding, default settings seeding, and unit-test scaffolding.
+- Local validation passed through `pytest`, `ruff`, `mypy`, package build, and
+  CLI help checks.
+- Direct `alembic upgrade/downgrade` command execution remains a manual
+  follow-up because the state-changing shell command was blocked by the guarded
+  execution environment.
 
 ## Deliverables
 
