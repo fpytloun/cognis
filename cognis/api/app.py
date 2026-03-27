@@ -15,13 +15,16 @@ from cognis.api.routes.system import router as system_router
 from cognis.api.websocket import handle_websocket
 from cognis.bootstrap import bootstrap_runtime
 from cognis.config import load_config
+from cognis.core.compaction import CompactionStrategy
+from cognis.core.context import ContextAssembler
+from cognis.core.decision import DecisionEngine
 from cognis.core.remember_queue import RememberRetryQueue
-from cognis.logging import get_logger, setup_logging
+from cognis.core.session import SessionManager
+from cognis.core.session_cache import SessionCache
+from cognis.logging import setup_logging
 from cognis.providers.auth.jwt import JWTAuthProvider
 from cognis.providers.registry import build_provider_registry
 from cognis.security import LoginRateLimiter, create_password_hasher
-
-logger = get_logger(__name__)
 
 
 def _as_int(value: object, default: int) -> int:
@@ -45,16 +48,6 @@ def create_app() -> FastAPI:
         remember_queue = RememberRetryQueue(providers.memory)
         await remember_queue.start()
 
-        app.state.config = config_runtime
-        app.state.engine = engine
-        app.state.session_factory = session_factory
-        app.state.setup_token_manager = setup_token_manager
-        app.state.password_hasher = password_hasher
-        app.state.auth_provider = auth_provider
-        app.state.providers = providers
-        app.state.login_rate_limiter = LoginRateLimiter()
-        app.state.remember_queue = remember_queue
-
         async with session_factory() as session:
             from cognis.store.queries import count_users, get_setting_value
 
@@ -64,6 +57,9 @@ def create_app() -> FastAPI:
             app.state.ws_auth_timeout_seconds = _as_int(
                 await get_setting_value(session, "security.ws_auth_timeout_seconds", 10), 10
             )
+            cache_max_entries = _as_int(
+                await get_setting_value(session, "session.cache_max_entries", 200), 200
+            )
 
             if await count_users(session) == 0:
                 token = setup_token_manager.issue()
@@ -71,6 +67,43 @@ def create_app() -> FastAPI:
                     f"\nNo users found. Complete setup at:\n  http://{config_runtime.host}:{config_runtime.port}/setup?token={token}\nThis link expires in 15 minutes.\n\n"
                 )
                 sys.stdout.flush()
+
+        session_cache = SessionCache(providers.guardrails, max_entries=cache_max_entries)
+        session_manager = SessionManager(session_factory, providers, session_cache)
+        context_assembler = await ContextAssembler.from_session_factory(
+            session_factory=session_factory,
+            memory=providers.memory,
+            guardrails=providers.guardrails,
+            llm=providers.llm,
+            session_cache=session_cache,
+            session_manager=session_manager,
+        )
+        compaction_strategy = await CompactionStrategy.from_session_factory(
+            session_factory=session_factory,
+            guardrails=providers.guardrails,
+            llm=providers.llm,
+            session_cache=session_cache,
+        )
+        decision_engine = await DecisionEngine.from_session_factory(
+            session_factory=session_factory,
+            llm=providers.llm,
+        )
+        await session_manager.recover_stale_sessions()
+
+        app.state.config = config_runtime
+        app.state.engine = engine
+        app.state.session_factory = session_factory
+        app.state.setup_token_manager = setup_token_manager
+        app.state.password_hasher = password_hasher
+        app.state.auth_provider = auth_provider
+        app.state.providers = providers
+        app.state.login_rate_limiter = LoginRateLimiter()
+        app.state.remember_queue = remember_queue
+        app.state.session_cache = session_cache
+        app.state.session_manager = session_manager
+        app.state.context_assembler = context_assembler
+        app.state.compaction_strategy = compaction_strategy
+        app.state.decision_engine = decision_engine
 
         yield
 

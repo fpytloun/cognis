@@ -1,6 +1,6 @@
 # Stage 5: Orchestration Core
 
-**Status**: NOT STARTED
+**Status**: IMPLEMENTED*
 **Repo**: `cognis`
 **Depends on**: Stage 3 (providers)
 **Can run in parallel with**: Stage 4
@@ -14,6 +14,26 @@ controller can create sessions, assemble LLM context from cached Intaris
 events + Mnemory recall, classify turns as foreground or delegated, and
 compact long conversation histories.
 
+## Progress Notes
+
+- Stage 5 orchestration-core implementation is complete and locally validated.
+- Implemented: session lifecycle management, in-memory session cache,
+  parallel context assembly, LLM/mechanical compaction, and the decision
+  engine.
+- Added a small session lifecycle migration for `sessions.updated_at` and
+  `sessions.idle_since` so stale-session recovery is correct for long-lived
+  sessions.
+- LiteLLM routing now exposes Stage 5 helpers for task-type model resolution,
+  model metadata lookup, and structured message token counting with a short
+  in-memory cache.
+- Session cache metrics follow the NFR names and the cache is bounded with
+  least-recently-used eviction.
+- Local validation passed with `uv run pytest tests/unit/ -v`,
+  `uv run ruff check cognis/ tests/`, and `uv run mypy cognis/`.
+- Limitation: conversation purge currently removes Cognis metadata and evicts
+  cache state, but Intaris event-store purge remains deferred until a
+  verified delete-session provider contract exists.
+
 ## Deliverables
 
 ### 1. Session Manager
@@ -26,7 +46,8 @@ compact long conversation histories.
   - Store correlation IDs: `intaris_session_id`, `mnemory_session_id`
   - Session lifecycle: active → idle → completed / failed
   - Session recovery on startup (scan stale active sessions)
-  - Conversation archive / delete / purge with Intaris cascade
+  - Conversation archive / delete / purge (local metadata purge implemented;
+    Intaris cascade deferred until provider contract support exists)
 
 ### 2. Session Cache
 
@@ -61,7 +82,8 @@ compact long conversation histories.
   - Dynamic token budget:
     - Static budget: system prompt + tool schemas (cached per session)
     - Dynamic budget: remaining space for history + memory + message
-    - Token counting via LLMProvider.count_tokens()
+    - Token counting via LLMProvider `count_tokens()` +
+      `count_messages_tokens()`
 
 ### 4. Compaction
 
@@ -94,21 +116,21 @@ compact long conversation histories.
 
 ## Acceptance Criteria
 
-- [ ] Session manager creates conversations + sessions with Intaris/Mnemory correlation
-- [ ] Session cache cold path loads from Intaris correctly
-- [ ] Session cache warm path fetches incrementally (no full re-read)
-- [ ] Cache updates correctly on event recording and compaction
-- [ ] Context assembler runs 3 external fetches in parallel
-- [ ] Context assembly degrades gracefully on partial failure
-- [ ] Token budget computed correctly (static + dynamic split)
-- [ ] LLM-based compaction produces summary and updates Intaris + cache
-- [ ] Mechanical compaction fallback works when LLM fails
-- [ ] Decision Engine classifies obvious cases via rules
-- [ ] Decision Engine uses LLM classifier for ambiguous cases
-- [ ] Classifier fallback to foreground on timeout
-- [ ] Session recovery scans stale sessions on startup
-- [ ] Unit tests for cache, context assembly, compaction, decision engine
-- [ ] `ruff check` and `mypy` clean
+- [x] Session manager creates conversations + sessions with Intaris/Mnemory correlation
+- [x] Session cache cold path loads from Intaris correctly
+- [x] Session cache warm path fetches incrementally (no full re-read)
+- [x] Cache updates correctly on event recording and compaction
+- [x] Context assembler runs 3 external fetches in parallel
+- [x] Context assembly degrades gracefully on partial failure
+- [x] Token budget computed correctly (static + dynamic split)
+- [x] LLM-based compaction produces summary and updates Intaris + cache
+- [x] Mechanical compaction fallback works when LLM fails
+- [x] Decision Engine classifies obvious cases via rules
+- [x] Decision Engine uses LLM classifier for ambiguous cases
+- [x] Classifier fallback to foreground on timeout
+- [x] Session recovery scans stale sessions on startup
+- [x] Unit tests for cache, context assembly, compaction, decision engine
+- [x] `ruff check` and `mypy` clean
 
 ## Key References
 

@@ -8,10 +8,11 @@ import secrets
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Final
+from typing import Any, Final, cast
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
+from sqlalchemy import inspect, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from cognis.config import CognisConfig
@@ -31,6 +32,7 @@ DEFAULT_SETTINGS: Final[dict[str, tuple[str, object]]] = {
     "session.max_delegation_depth": ("session", 5),
     "session.max_queued_messages": ("session", 5),
     "session.escalation_timeout_seconds": ("session", 300),
+    "session.cache_max_entries": ("session", 200),
     "decision_engine.inline_max_length": ("decision_engine", 200),
     "decision_engine.classifier_timeout_ms": ("decision_engine", 500),
     "decision_engine.classifier_fallback": ("decision_engine", "inline"),
@@ -119,6 +121,23 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_ensure_session_lifecycle_columns)
+
+
+def _ensure_session_lifecycle_columns(sync_conn: object) -> None:
+    inspector = cast(Any, inspect(sync_conn))
+    session_columns = {column["name"] for column in inspector.get_columns("sessions")}
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+
+    if "idle_since" not in session_columns:
+        execute(text("ALTER TABLE sessions ADD COLUMN idle_since TIMESTAMP WITH TIME ZONE"))
+    if "updated_at" not in session_columns:
+        execute(
+            text(
+                "ALTER TABLE sessions ADD COLUMN updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP"
+            )
+        )
+        execute(text("UPDATE sessions SET updated_at = COALESCE(updated_at, started_at)"))
 
 
 async def seed_default_settings(session: AsyncSession) -> None:

@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator
 from typing import Any, Protocol
 
 from cognis.models.agent import AgentDefinition
-from cognis.models.config import Cost, ProviderHealth, TokenUsage
+from cognis.models.config import Cost, ModelInfo, ProviderHealth, TokenUsage
 from cognis.models.session import EventAppendResult, EventReadResult, IntarisSession, SessionEvent
 from cognis.models.tool import (
     EscalationRecord,
@@ -163,15 +163,25 @@ class SecretsProvider(Protocol):
 
 class LLMProvider(Protocol):
     async def generate(
-        self, messages: list[dict[str, Any]], model: str | None = None, **kwargs: Any
+        self,
+        messages: list[dict[str, Any]],
+        model: str | None = None,
+        task_type: str = "default",
+        **kwargs: Any,
     ) -> dict[str, Any]: ...
     async def stream_generate(
         self,
         messages: list[dict[str, Any]],
         model: str | None = None,
+        task_type: str = "default",
         **kwargs: Any,
     ) -> AsyncIterator[dict[str, Any]]: ...
+    async def resolve_model(
+        self, explicit_model: str | None = None, task_type: str = "default"
+    ) -> str: ...
+    async def get_model_info(self, model_id: str) -> ModelInfo: ...
     def count_tokens(self, text: str, model: str) -> int: ...
+    def count_messages_tokens(self, messages: list[dict[str, Any]], model: str) -> int: ...
     async def list_models(self) -> list[dict[str, Any]]: ...
     async def get_cost(self, usage: TokenUsage, model: str) -> Cost: ...
     async def health(self) -> ProviderHealth: ...

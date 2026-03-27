@@ -46,8 +46,10 @@ class SessionModel(BaseModel):
     intaris_session_id: str | None = None
     mnemory_session_id: str | None = None
     started_at: datetime | None = None
+    idle_since: datetime | None = None
     completed_at: datetime | None = None
     result_summary: str | None = None
+    updated_at: datetime | None = None
 
 
 class SessionEvent(BaseModel):

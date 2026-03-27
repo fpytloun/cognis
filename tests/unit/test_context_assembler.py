@@ -1,0 +1,269 @@
+from __future__ import annotations
+
+import asyncio
+from time import monotonic
+
+import pytest
+
+from cognis.core.context import ContextAssembler
+from cognis.models.agent import AgentDefinition, AgentLLMConfig
+from cognis.models.config import ModelInfo
+from cognis.models.session import ConversationContext, ConversationModel, SessionModel
+from cognis.models.tool import ToolDefinition, ToolSource
+
+
+class _CacheEntry:
+    def __init__(self) -> None:
+        self.last_compaction_summary = "summary"
+        self.intention = "cached intention"
+        self.events = []
+        self.initialized = True
+
+
+class _SessionCache:
+    def __init__(self, fail_refresh: bool = False, cold: bool = False) -> None:
+        self.fail_refresh = fail_refresh
+        self.cold = cold
+        self.entry = None if cold else _CacheEntry()
+        self.refresh_calls = 0
+
+    async def refresh(self, session: SessionModel) -> object:
+        del session
+        self.refresh_calls += 1
+        await asyncio.sleep(0.1)
+        if self.fail_refresh:
+            raise RuntimeError("event read failed")
+        self.entry = self.entry or _CacheEntry()
+        return self.entry
+
+    def get_entry(self, session_id: str) -> object | None:
+        del session_id
+        return self.entry
+
+    def get_intention(self, session_id: str) -> str | None:
+        del session_id
+        return "cached intention"
+
+    async def update_intention(self, session_id: str, intention: str | None) -> None:
+        del session_id
+        if self.entry is not None:
+            self.entry.intention = intention
+
+    def get_events_since_compaction(self, session_id: str, types: list[str] | None = None) -> list:
+        del session_id, types
+        return []
+
+
+class _Memory:
+    def __init__(self, fail: bool = False) -> None:
+        self.fail = fail
+        self.search_modes: list[str] = []
+
+    async def recall(self, **kwargs: object) -> dict[str, object]:
+        self.search_modes.append(str(kwargs["search_mode"]))
+        await asyncio.sleep(0.1)
+        if self.fail:
+            raise RuntimeError("mnemory unavailable")
+        return {
+            "session_id": "mem-1",
+            "core_memories": "prefers Python",
+            "search_results": [{"memory": "Uses pytest", "score": 0.9}],
+        }
+
+
+class _Guardrails:
+    async def get_session(self, session_id: str) -> object:
+        del session_id
+        await asyncio.sleep(0.1)
+        return type("IntarisSession", (), {"intention": "fresh intention"})()
+
+
+class _LLM:
+    async def resolve_model(
+        self, explicit_model: str | None = None, task_type: str = "default"
+    ) -> str:
+        del explicit_model, task_type
+        return "test-model"
+
+    async def get_model_info(self, model_id: str) -> ModelInfo:
+        del model_id
+        return ModelInfo(model_id="test-model", context_window=2000, max_output_tokens=256)
+
+    def count_tokens(self, text: str, model: str) -> int:
+        del model
+        return max(1, len(text) // 4)
+
+    def count_messages_tokens(self, messages: list[dict[str, object]], model: str) -> int:
+        del model
+        return sum(max(1, len(str(message.get("content", ""))) // 4) for message in messages)
+
+
+class _SessionManager:
+    def __init__(self) -> None:
+        self.attached: list[tuple[str, str]] = []
+
+    async def attach_mnemory_session(self, session_id: str, mnemory_session_id: str) -> bool:
+        self.attached.append((session_id, mnemory_session_id))
+        return True
+
+
+def _agent() -> AgentDefinition:
+    return AgentDefinition(
+        agent_id="agent-1",
+        owner_email="user@example.com",
+        name="Agent",
+        system_prompt="You are helpful.",
+        llm_config=AgentLLMConfig(model="test-model", max_tokens=128),
+    )
+
+
+def _conversation() -> ConversationModel:
+    return ConversationModel(
+        conversation_id="conv-1",
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context=ConversationContext(type="web", memory_labels={"project": "cognis"}),
+    )
+
+
+def _session(mnemory_session_id: str | None = None) -> SessionModel:
+    return SessionModel(
+        session_id="session-1",
+        conversation_id="conv-1",
+        user_email="user@example.com",
+        agent_id="agent-1",
+        intaris_session_id="session-1",
+        mnemory_session_id=mnemory_session_id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_context_assembler_runs_fetches_in_parallel_and_attaches_memory_session() -> None:
+    memory = _Memory()
+    session_manager = _SessionManager()
+    assembler = ContextAssembler(
+        memory=memory,
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=_SessionCache(),
+        session_manager=session_manager,
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+
+    started_at = monotonic()
+    result = await assembler.assemble(
+        session=_session(),
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="please help",
+        tool_definitions=[],
+    )
+    elapsed = monotonic() - started_at
+
+    assert elapsed < 0.25
+    assert memory.search_modes == ["find"]
+    assert session_manager.attached == [("session-1", "mem-1")]
+    assert any('trust="untrusted"' in str(message["content"]) for message in result.messages)
+
+
+@pytest.mark.asyncio
+async def test_context_assembler_uses_search_mode_for_follow_up_turns() -> None:
+    memory = _Memory()
+    assembler = ContextAssembler(
+        memory=memory,
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=_SessionCache(),
+        session_manager=_SessionManager(),
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+
+    await assembler.assemble(
+        session=_session(mnemory_session_id="mem-1"),
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="follow up",
+        tool_definitions=[],
+    )
+
+    assert memory.search_modes == ["search"]
+
+
+@pytest.mark.asyncio
+async def test_context_assembler_uses_warm_cache_when_event_refresh_fails() -> None:
+    assembler = ContextAssembler(
+        memory=_Memory(fail=True),
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=_SessionCache(fail_refresh=True),
+        session_manager=_SessionManager(),
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+
+    result = await assembler.assemble(
+        session=_session(),
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="still works",
+        tool_definitions=[],
+    )
+
+    assert result.degraded is True
+    assert set(result.degraded_sources) == {"events", "memory"}
+
+
+@pytest.mark.asyncio
+async def test_context_assembler_raises_on_cold_cache_event_failure() -> None:
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=_SessionCache(fail_refresh=True, cold=True),
+        session_manager=_SessionManager(),
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+
+    with pytest.raises(RuntimeError, match="event read failed"):
+        await assembler.assemble(
+            session=_session(),
+            conversation=_conversation(),
+            agent=_agent(),
+            user_message="cold failure",
+            tool_definitions=[],
+        )
+
+
+@pytest.mark.asyncio
+async def test_context_assembler_accounts_for_tool_schema_budget() -> None:
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=_SessionCache(),
+        session_manager=_SessionManager(),
+        max_context_tokens=400,
+        compaction_threshold=0.85,
+    )
+    large_tool = ToolDefinition(
+        name="filesystem/read_file",
+        description="Read file",
+        parameters={
+            "type": "object",
+            "properties": {"path": {"type": "string", "description": "x" * 800}},
+        },
+        source=ToolSource(type="builtin"),
+    )
+
+    result = await assembler.assemble(
+        session=_session(),
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="please help",
+        tool_definitions=[large_tool],
+    )
+
+    assert not any('trust="untrusted"' in str(message["content"]) for message in result.messages)

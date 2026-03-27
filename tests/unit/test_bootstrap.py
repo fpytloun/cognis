@@ -3,10 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from sqlalchemy import inspect, text
 
-from cognis.bootstrap import DEFAULT_SETTINGS, bootstrap_runtime
+from cognis.bootstrap import DEFAULT_SETTINGS, bootstrap_runtime, run_schema_bootstrap
 from cognis.config import load_config
 from cognis.security import create_password_hasher
+from cognis.store.database import create_engine
 from cognis.store.queries import list_settings
 
 
@@ -26,5 +28,44 @@ async def test_bootstrap_creates_keys_db_and_settings(monkeypatch: object, tmp_p
     async with session_factory() as session:
         settings = await list_settings(session)
     assert len(settings) == len(DEFAULT_SETTINGS)
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_run_schema_bootstrap_upgrades_legacy_sessions_table(tmp_path: Path) -> None:
+    engine = create_engine(f"sqlite+aiosqlite:///{tmp_path / 'legacy.db'}")
+
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "CREATE TABLE sessions ("
+                "session_id TEXT PRIMARY KEY, "
+                "conversation_id TEXT NOT NULL, "
+                "parent_session_id TEXT, "
+                "user_email TEXT NOT NULL, "
+                "agent_id TEXT NOT NULL, "
+                "delegation_mode TEXT, "
+                "delegation_task TEXT, "
+                "status TEXT NOT NULL DEFAULT 'active', "
+                "intaris_session_id TEXT, "
+                "mnemory_session_id TEXT, "
+                "started_at TIMESTAMP NOT NULL, "
+                "completed_at TIMESTAMP, "
+                "result_summary TEXT"
+                ")"
+            )
+        )
+
+    await run_schema_bootstrap(engine)
+
+    async with engine.begin() as conn:
+        session_columns = await conn.run_sync(
+            lambda sync_conn: {
+                column["name"] for column in inspect(sync_conn).get_columns("sessions")
+            }
+        )
+
+    assert {"idle_since", "updated_at"}.issubset(session_columns)
 
     await engine.dispose()

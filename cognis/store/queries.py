@@ -5,10 +5,19 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from cognis.store.models import Agent, ApiKey, LLMProvider, Secret, Setting, User
+from cognis.store.models import (
+    Agent,
+    ApiKey,
+    Conversation,
+    LLMProvider,
+    Secret,
+    Session,
+    Setting,
+    User,
+)
 
 # --- Users ---
 
@@ -165,12 +174,265 @@ async def list_active_agents_summary(
     ]
 
 
+async def get_agent(session: AsyncSession, agent_id: str) -> Agent | None:
+    """Get an agent by ID."""
+
+    result = await session.execute(select(Agent).where(Agent.agent_id == agent_id))
+    return result.scalar_one_or_none()
+
+
 async def get_llm_provider(session: AsyncSession, provider_id: str) -> LLMProvider | None:
     """Get an LLM provider by ID."""
     result = await session.execute(
         select(LLMProvider).where(LLMProvider.provider_id == provider_id)
     )
     return result.scalar_one_or_none()
+
+
+# --- Conversations ---
+
+
+async def create_conversation(
+    session: AsyncSession,
+    user_email: str,
+    agent_id: str,
+    context_type: str,
+    *,
+    title: str | None = None,
+    context_ref: str | None = None,
+    context_data: dict[str, object] | None = None,
+    memory_labels: dict[str, object] | None = None,
+    conversation_id: str | None = None,
+) -> Conversation:
+    """Create a new conversation row."""
+
+    conversation = Conversation(
+        conversation_id=conversation_id or f"conv_{uuid.uuid4().hex}",
+        user_email=user_email,
+        agent_id=agent_id,
+        title=title,
+        context_type=context_type,
+        context_ref=context_ref,
+        context_data=context_data,
+        memory_labels=memory_labels,
+    )
+    session.add(conversation)
+    await session.flush()
+    return conversation
+
+
+async def get_conversation(session: AsyncSession, conversation_id: str) -> Conversation | None:
+    """Get a conversation by ID."""
+
+    result = await session.execute(
+        select(Conversation).where(Conversation.conversation_id == conversation_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def update_conversation_root_session(
+    session: AsyncSession, conversation_id: str, root_session_id: str
+) -> bool:
+    """Set the root session ID for a conversation."""
+
+    conversation = await get_conversation(session, conversation_id)
+    if conversation is None:
+        return False
+    conversation.root_session_id = root_session_id
+    conversation.updated_at = datetime.now(UTC)
+    await session.flush()
+    return True
+
+
+async def touch_conversation(
+    session: AsyncSession, conversation_id: str, when: datetime | None = None
+) -> bool:
+    """Update conversation timestamps after activity."""
+
+    conversation = await get_conversation(session, conversation_id)
+    if conversation is None:
+        return False
+    timestamp = when or datetime.now(UTC)
+    conversation.last_message_at = timestamp
+    conversation.updated_at = timestamp
+    await session.flush()
+    return True
+
+
+async def set_conversation_status(session: AsyncSession, conversation_id: str, status: str) -> bool:
+    """Set conversation lifecycle status."""
+
+    conversation = await get_conversation(session, conversation_id)
+    if conversation is None:
+        return False
+    conversation.status = status
+    conversation.updated_at = datetime.now(UTC)
+    await session.flush()
+    return True
+
+
+async def list_conversation_sessions(session: AsyncSession, conversation_id: str) -> list[Session]:
+    """List all sessions for a conversation."""
+
+    result = await session.execute(
+        select(Session)
+        .where(Session.conversation_id == conversation_id)
+        .order_by(Session.started_at, Session.session_id)
+    )
+    return list(result.scalars().all())
+
+
+async def delete_conversation(session: AsyncSession, conversation_id: str) -> int:
+    """Hard-delete a conversation row."""
+
+    result = await session.execute(
+        delete(Conversation).where(Conversation.conversation_id == conversation_id)
+    )
+    await session.flush()
+    return int(getattr(result, "rowcount", 0) or 0)
+
+
+# --- Sessions ---
+
+
+async def create_session(
+    session: AsyncSession,
+    conversation_id: str,
+    user_email: str,
+    agent_id: str,
+    *,
+    parent_session_id: str | None = None,
+    delegation_mode: str | None = None,
+    delegation_task: str | None = None,
+    status: str = "active",
+    intaris_session_id: str | None = None,
+    mnemory_session_id: str | None = None,
+    session_id: str | None = None,
+) -> Session:
+    """Create a new session row."""
+
+    session_row = Session(
+        session_id=session_id or f"sess_{uuid.uuid4().hex}",
+        conversation_id=conversation_id,
+        parent_session_id=parent_session_id,
+        user_email=user_email,
+        agent_id=agent_id,
+        delegation_mode=delegation_mode,
+        delegation_task=delegation_task,
+        status=status,
+        intaris_session_id=intaris_session_id,
+        mnemory_session_id=mnemory_session_id,
+    )
+    session.add(session_row)
+    await session.flush()
+    return session_row
+
+
+async def get_session_row(session: AsyncSession, session_id: str) -> Session | None:
+    """Get a session row by ID."""
+
+    result = await session.execute(select(Session).where(Session.session_id == session_id))
+    return result.scalar_one_or_none()
+
+
+async def set_session_intaris_session_id(
+    session: AsyncSession, session_id: str, intaris_session_id: str
+) -> bool:
+    """Persist Intaris correlation ID for a session."""
+
+    session_row = await get_session_row(session, session_id)
+    if session_row is None:
+        return False
+    session_row.intaris_session_id = intaris_session_id
+    session_row.updated_at = datetime.now(UTC)
+    await session.flush()
+    return True
+
+
+async def set_session_mnemory_session_id(
+    session: AsyncSession, session_id: str, mnemory_session_id: str
+) -> bool:
+    """Persist Mnemory correlation ID for a session."""
+
+    session_row = await get_session_row(session, session_id)
+    if session_row is None:
+        return False
+    session_row.mnemory_session_id = mnemory_session_id
+    session_row.updated_at = datetime.now(UTC)
+    await session.flush()
+    return True
+
+
+async def set_session_status(
+    session: AsyncSession,
+    session_id: str,
+    status: str,
+    *,
+    idle_since: datetime | None = None,
+    completed_at: datetime | None = None,
+    result_summary: str | None = None,
+) -> bool:
+    """Update session lifecycle state and timestamps."""
+
+    session_row = await get_session_row(session, session_id)
+    if session_row is None:
+        return False
+    session_row.status = status
+    session_row.idle_since = idle_since
+    session_row.completed_at = completed_at
+    if result_summary is not None:
+        session_row.result_summary = result_summary
+    session_row.updated_at = datetime.now(UTC)
+    await session.flush()
+    return True
+
+
+async def set_session_idle(
+    session: AsyncSession, session_id: str, idle_since: datetime | None = None
+) -> bool:
+    """Mark a session idle."""
+
+    return await set_session_status(
+        session,
+        session_id,
+        "idle",
+        idle_since=idle_since or datetime.now(UTC),
+    )
+
+
+async def list_child_sessions(session: AsyncSession, parent_session_id: str) -> list[Session]:
+    """List all direct child sessions for a parent session."""
+
+    result = await session.execute(
+        select(Session)
+        .where(Session.parent_session_id == parent_session_id)
+        .order_by(Session.started_at, Session.session_id)
+    )
+    return list(result.scalars().all())
+
+
+async def list_stale_active_sessions(
+    session: AsyncSession, updated_before: datetime
+) -> list[Session]:
+    """List active sessions that have not been updated recently."""
+
+    result = await session.execute(
+        select(Session)
+        .where(Session.status == "active")
+        .where(Session.updated_at < updated_before)
+        .order_by(Session.updated_at, Session.session_id)
+    )
+    return list(result.scalars().all())
+
+
+async def delete_sessions_for_conversation(session: AsyncSession, conversation_id: str) -> int:
+    """Hard-delete all sessions for a conversation."""
+
+    result = await session.execute(
+        delete(Session).where(Session.conversation_id == conversation_id)
+    )
+    await session.flush()
+    return int(getattr(result, "rowcount", 0) or 0)
 
 
 # --- Secrets ---

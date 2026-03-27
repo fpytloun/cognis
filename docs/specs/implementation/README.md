@@ -9,7 +9,7 @@
 | 2 | [Auth + Bootstrap + CLI](stage-2-auth.md) | IMPLEMENTED* | Locally validated; full live runtime/WS verification remains environment-dependent |
 | 3 | [Provider Layer](stage-3-providers.md) | IMPLEMENTED* | Locally validated; live Mnemory/Intaris contract checks skipped without services |
 | 4 | [Executor + Tools](stage-4-executor.md) | IMPLEMENTED* | In-process executor, MCP, tool router; remote executor WS deferred to Stage 7 |
-| 5 | [Orchestration Core](stage-5-orchestration.md) | NOT STARTED | Session manager, cache, context, compaction |
+| 5 | [Orchestration Core](stage-5-orchestration.md) | IMPLEMENTED* | Session manager, session cache, context assembly, compaction, decision engine; Intaris purge cascade remains deferred pending a verified delete-session contract |
 | 6 | [Agent Loop + Delegation](stage-6-agent-loop.md) | NOT STARTED | Chat turns, streaming, delegation |
 | 7 | [API + WebSocket](stage-7-api.md) | NOT STARTED | Full REST + WS surface |
 | 8 | [UI](stage-8-ui.md) | NOT STARTED | SvelteKit: chat, agents, settings |

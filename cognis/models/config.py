@@ -53,6 +53,14 @@ class ModelInfo(BaseModel):
     tier: str = "standard"
 
 
+DEFAULT_MODEL_INFO = ModelInfo(
+    model_id="unknown",
+    display_name="Unknown model",
+    context_window=8192,
+    max_output_tokens=4096,
+)
+
+
 class ModelRoutingPolicy(BaseModel):
     """Which models for which task types."""
 
