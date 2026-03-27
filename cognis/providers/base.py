@@ -8,7 +8,14 @@ from typing import Any, Protocol
 from cognis.models.agent import AgentDefinition
 from cognis.models.config import Cost, ProviderHealth, TokenUsage
 from cognis.models.session import EventAppendResult, EventReadResult, IntarisSession, SessionEvent
-from cognis.models.tool import EscalationRecord, EvaluationResult, ExecutorHandle, ToolResult
+from cognis.models.tool import (
+    EscalationRecord,
+    EvaluationResult,
+    ExecutorConfig,
+    ExecutorHandle,
+    ToolCall,
+    ToolResult,
+)
 
 
 class MemoryProvider(Protocol):
@@ -116,9 +123,21 @@ class GuardrailsProvider(Protocol):
 
 
 class ExecutorProvider(Protocol):
-    async def spawn(self, labels: dict[str, str] | None = None) -> ExecutorHandle: ...
-    async def cleanup(self, executor_id: str) -> None: ...
+    async def spawn(self, config: ExecutorConfig) -> ExecutorHandle: ...
+    async def get_executor(self, handle: ExecutorHandle) -> ExecutorConnection: ...
+    async def cancel(self, handle: ExecutorHandle) -> None: ...
+    async def list_active(self) -> list[ExecutorHandle]: ...
+    async def cleanup(self) -> None: ...
     async def health(self) -> ProviderHealth: ...
+
+
+class ExecutorConnection(Protocol):
+    async def rpc_call(self, method: str, params: dict[str, Any]) -> dict[str, Any]: ...
+    async def list_tools(self) -> list[dict[str, Any]]: ...
+    async def tool_execute(
+        self, tool_call: ToolCall, timeout_seconds: int | None = None
+    ) -> ToolResult: ...
+    async def cancel_call(self, call_id: str) -> None: ...
 
 
 class SecretsProvider(Protocol):

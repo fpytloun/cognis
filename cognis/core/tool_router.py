@@ -1,0 +1,231 @@
+"""Tool routing logic for orchestration, Intaris MCP, and local executors."""
+
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass
+from enum import StrEnum
+from fnmatch import fnmatchcase
+from typing import Any
+
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from cognis.models.agent import AgentDefinition
+from cognis.models.session import SessionModel
+from cognis.models.tool import Permission, ToolCall, ToolResult
+from cognis.store.queries import get_setting_value
+from cognis.tools.builtin.orchestration import handle_orchestration_tool_call, is_orchestration_tool
+from cognis.tools.registry import ToolRegistry
+
+
+class ToolRoute(StrEnum):
+    """Tool routing categories."""
+
+    ORCHESTRATION = "orchestration"
+    INTARIS_MCP = "intaris_mcp"
+    LOCAL = "local"
+    UNKNOWN = "unknown"
+
+
+@dataclass(slots=True)
+class PermissionDecision:
+    """Resolved permission for a tool call."""
+
+    decision: str
+    reasoning: str | None = None
+    source: str | None = None
+
+
+class ToolRouter:
+    """Classify, evaluate, execute, and sanitize tool calls."""
+
+    def __init__(self, guardrails: Any, non_bypassable_patterns: list[str] | None = None) -> None:
+        self.guardrails = guardrails
+        self.non_bypassable_patterns = non_bypassable_patterns or []
+
+    @classmethod
+    async def from_session_factory(
+        cls,
+        guardrails: Any,
+        session_factory: async_sessionmaker[AsyncSession],
+    ) -> ToolRouter:
+        """Create a router with cached non-bypassable patterns from settings."""
+
+        async with session_factory() as session:
+            patterns = await get_setting_value(session, "security.non_bypassable_tools", [])
+        return cls(guardrails=guardrails, non_bypassable_patterns=_coerce_patterns(patterns))
+
+    def classify(self, tool_name: str, registry: ToolRegistry) -> ToolRoute:
+        """Classify a tool call by route category."""
+
+        if is_orchestration_tool(tool_name):
+            return ToolRoute.ORCHESTRATION
+        registered_tool = registry.get(tool_name)
+        if registered_tool is None:
+            return ToolRoute.UNKNOWN
+        if registered_tool.definition.source.type == "intaris_mcp":
+            return ToolRoute.INTARIS_MCP
+        return ToolRoute.LOCAL
+
+    async def evaluate_tool_call(
+        self,
+        tool_call: ToolCall,
+        agent: AgentDefinition,
+        session: SessionModel,
+        registry: ToolRegistry,
+    ) -> PermissionDecision:
+        """Resolve whether a local tool call may execute."""
+
+        registered_tool = registry.get(tool_call.name)
+        if registered_tool is None:
+            return PermissionDecision(decision="deny", reasoning="Unknown tool", source="registry")
+        if self._is_non_bypassable(
+            registered_tool.definition.name, registered_tool.definition.non_bypassable
+        ):
+            evaluation = await self.guardrails.evaluate(
+                session_id=_guardrails_session_id(session),
+                tool_name=tool_call.name,
+                arguments=tool_call.arguments,
+                context={},
+            )
+            return PermissionDecision(
+                decision=evaluation.decision,
+                reasoning=evaluation.reasoning,
+                source="guardrails",
+            )
+
+        permission = Permission.EVALUATE
+        if agent.permissions is not None:
+            permission = agent.permissions.resolve_permission(tool_call.name)
+        if permission is Permission.DENY:
+            return PermissionDecision(
+                decision="deny", reasoning="Tool denied by agent policy", source="agent"
+            )
+        if permission is Permission.ALLOW:
+            return PermissionDecision(decision="approve", source="agent")
+
+        evaluation = await self.guardrails.evaluate(
+            session_id=_guardrails_session_id(session),
+            tool_name=tool_call.name,
+            arguments=tool_call.arguments,
+            context={},
+        )
+        return PermissionDecision(
+            decision=evaluation.decision,
+            reasoning=evaluation.reasoning,
+            source="guardrails",
+        )
+
+    async def execute(
+        self,
+        tool_call: ToolCall,
+        session: SessionModel,
+        agent: AgentDefinition,
+        registry: ToolRegistry,
+        executor: Any,
+    ) -> ToolResult:
+        """Execute a tool call using the appropriate route."""
+
+        route = self.classify(tool_call.name, registry)
+        if route is ToolRoute.UNKNOWN:
+            return self._sanitize_result(
+                tool_call.name, ToolResult(output="Unknown tool.", is_error=True), 50_000
+            )
+        if route is ToolRoute.ORCHESTRATION:
+            result = await handle_orchestration_tool_call(tool_call)
+            return self._sanitize_result(tool_call.name, result, 50_000)
+        if route is ToolRoute.INTARIS_MCP:
+            result = await self._call_intaris_mcp(tool_call, session, registry)
+            return self._sanitize_result(
+                tool_call.name, result, _tool_max_size(registry, tool_call.name)
+            )
+
+        decision = await self.evaluate_tool_call(tool_call, agent, session, registry)
+        if decision.decision == "deny":
+            return self._sanitize_result(
+                tool_call.name,
+                ToolResult(output=decision.reasoning or "Tool execution denied.", is_error=True),
+                _tool_max_size(registry, tool_call.name),
+            )
+        if decision.decision == "escalate":
+            return self._sanitize_result(
+                tool_call.name,
+                ToolResult(
+                    output=decision.reasoning or "Tool requires user approval.", is_error=True
+                ),
+                _tool_max_size(registry, tool_call.name),
+            )
+
+        registered_tool = registry.get(tool_call.name)
+        if registered_tool is None:
+            return self._sanitize_result(
+                tool_call.name, ToolResult(output="Unknown tool.", is_error=True), 50_000
+            )
+        try:
+            result = await asyncio.wait_for(
+                executor.tool_execute(
+                    tool_call, timeout_seconds=registered_tool.definition.timeout_seconds
+                ),
+                timeout=registered_tool.definition.timeout_seconds,
+            )
+        except TimeoutError:
+            await executor.cancel_call(tool_call.call_id)
+            result = ToolResult(output="Tool execution timed out.", is_error=True)
+        # TODO: emit metrics for tool route decisions and execution outcomes.
+        return self._sanitize_result(
+            tool_call.name,
+            result,
+            registered_tool.definition.max_result_size,
+        )
+
+    def _is_non_bypassable(self, tool_name: str, explicit_flag: bool) -> bool:
+        if explicit_flag:
+            return True
+        return any(fnmatchcase(tool_name, pattern) for pattern in self.non_bypassable_patterns)
+
+    async def _call_intaris_mcp(
+        self,
+        tool_call: ToolCall,
+        session: SessionModel,
+        registry: ToolRegistry,
+    ) -> ToolResult:
+        registered_tool = registry.get(tool_call.name)
+        if registered_tool is None or registered_tool.definition.source.server_name is None:
+            return ToolResult(output="Unknown Intaris MCP tool.", is_error=True)
+        _, raw_tool_name = tool_call.name.split("/", 1)
+        result = await self.guardrails.call_mcp_tool(
+            session_id=_guardrails_session_id(session),
+            server_name=registered_tool.definition.source.server_name,
+            tool_name=raw_tool_name,
+            arguments=tool_call.arguments,
+        )
+        if isinstance(result, ToolResult):
+            return result
+        return ToolResult.model_validate(result)
+
+    def _sanitize_result(self, tool_name: str, result: ToolResult, max_size: int) -> ToolResult:
+        output = result.output
+        if len(output) > max_size:
+            output = f"{output[:max_size]}\n[truncated: {len(result.output)} chars -> {max_size}]"
+        wrapped = f'<tool_result name="{tool_name}" trust="untrusted">\n{output}\n</tool_result>'
+        metadata = dict(result.metadata or {})
+        metadata["wrapped"] = True
+        metadata["truncated"] = len(result.output) > max_size
+        return result.model_copy(update={"output": wrapped, "metadata": metadata})
+
+
+def _guardrails_session_id(session: SessionModel) -> str:
+    return session.intaris_session_id or session.session_id
+
+
+def _coerce_patterns(value: object) -> list[str]:
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return list(value)
+    return []
+
+
+def _tool_max_size(registry: ToolRegistry, tool_name: str) -> int:
+    registered_tool = registry.get(tool_name)
+    if registered_tool is None:
+        return 50_000
+    return registered_tool.definition.max_result_size

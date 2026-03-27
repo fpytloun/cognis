@@ -46,7 +46,7 @@ def build_provider_registry(
     return ProviderRegistry(
         memory=MnemoryProvider(config.mnemory_url, auth_provider),
         guardrails=IntarisProvider(config.intaris_url, auth_provider),
-        executor=InProcessExecutorProvider(),
+        executor=InProcessExecutorProvider(session_factory=session_factory),
         secrets=secrets_provider,
         llm=LiteLLMProvider(session_factory),
         auth=auth_provider,

@@ -75,6 +75,7 @@ def create_app() -> FastAPI:
         yield
 
         await remember_queue.stop()
+        await providers.executor.cleanup()
         await providers.memory.client.aclose()
         await providers.guardrails.client.aclose()
         await engine.dispose()

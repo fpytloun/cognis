@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from cognis.store.models import ApiKey, LLMProvider, Secret, Setting, User
+from cognis.store.models import Agent, ApiKey, LLMProvider, Secret, Setting, User
 
 # --- Users ---
 
@@ -137,6 +137,32 @@ async def list_llm_providers(session: AsyncSession) -> list[LLMProvider]:
     """List all LLM provider configurations."""
     result = await session.execute(select(LLMProvider).where(LLMProvider.status == "active"))
     return list(result.scalars().all())
+
+
+# --- Agents ---
+
+
+async def list_active_agents_summary(
+    session: AsyncSession, owner_email: str
+) -> list[dict[str, str | None]]:
+    """List safe agent metadata for tool responses."""
+
+    query = (
+        select(Agent.agent_id, Agent.name, Agent.description, Agent.status)
+        .where(Agent.status == "active")
+        .where(Agent.owner_email == owner_email)
+        .order_by(Agent.agent_id)
+    )
+    result = await session.execute(query)
+    return [
+        {
+            "agent_id": agent_id,
+            "name": name,
+            "description": description,
+            "status": status,
+        }
+        for agent_id, name, description, status in result.all()
+    ]
 
 
 async def get_llm_provider(session: AsyncSession, provider_id: str) -> LLMProvider | None:

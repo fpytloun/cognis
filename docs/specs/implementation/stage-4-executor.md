@@ -1,6 +1,6 @@
 # Stage 4: Executor + Tools
 
-**Status**: NOT STARTED
+**Status**: IMPLEMENTED*
 **Repo**: `cognis`
 **Depends on**: Stage 3 (providers, especially Intaris for tool evaluation)
 **Can run in parallel with**: Stage 5
@@ -12,6 +12,21 @@ Implement the executor protocol, in-process executor with JSON-RPC bridge,
 tool registry, tool router, and built-in tools. After this stage, the
 controller can dispatch tool calls to the executor and receive results,
 with proper Intaris evaluation on every call.
+
+## Progress Notes
+
+- Stage 4 executor-and-tools implementation is complete.
+- Implemented: richer tool and executor models, agent permission resolution,
+  built-in orchestration/system tools, tool registry, stdio MCP client,
+  in-process executor bridge, tool router, and focused unit tests.
+- The implementation keeps the remote executor WebSocket endpoint deferred to
+  Stage 7 while validating the JSON-RPC semantics through the in-process
+  executor now.
+- Tool routing caches non-bypassable patterns, preserves the existing
+  `ToolResult.output: str` contract, and normalizes structured executor/MCP
+  payloads before truncation and untrusted wrapping.
+- Local validation passed with `uv run pytest tests/unit/ -v`,
+  `uv run ruff check cognis/ tests/`, and `uv run mypy cognis/`.
 
 ## Deliverables
 
@@ -84,16 +99,16 @@ with proper Intaris evaluation on every call.
 
 ## Acceptance Criteria
 
-- [ ] In-process executor receives and executes tool calls via JSON-RPC
-- [ ] Tool registry merges built-in + MCP tools correctly
-- [ ] Tool router classifies and dispatches tool calls
-- [ ] Non-bypassable tools are always sent to Intaris evaluate
-- [ ] Tool results are wrapped with untrusted content tags
-- [ ] Large tool outputs are truncated with notice
-- [ ] Built-in orchestration tools return proper tool call responses
-- [ ] MCP client connects and discovers tools from an MCP server
-- [ ] Unit tests for router classification, result wrapping, size limits
-- [ ] `ruff check` and `mypy` clean
+- [x] In-process executor receives and executes tool calls via JSON-RPC
+- [x] Tool registry merges built-in + MCP tools correctly
+- [x] Tool router classifies and dispatches tool calls
+- [x] Non-bypassable tools are always sent to Intaris evaluate
+- [x] Tool results are wrapped with untrusted content tags
+- [x] Large tool outputs are truncated with notice
+- [x] Built-in orchestration tools return proper tool call responses
+- [x] MCP client connects and discovers tools from an MCP server
+- [x] Unit tests for router classification, result wrapping, size limits
+- [x] `ruff check` and `mypy` clean
 
 ## Key References
 
