@@ -17,9 +17,14 @@
 - 16 integration tests pass without a live server (API surface, agent CRUD,
   health, degradation, settings, workflows, secrets, JWKS, tools, LLM
   providers, escalation endpoint, recovery, task dependencies, performance).
-- 10 tests requiring WebSocket + LLM streaming are marked `live_server` and
-  deferred to Phase 2 (Starlette TestClient cannot handle async agent loop
-  + LLM streaming; needs Cognis as a subprocess too).
+- Added a second fixture (`live_stack`) that starts Cognis as a subprocess
+  alongside Mnemory + Intaris for full WebSocket/LLM testing. Task lifecycle
+  and batch-submit tests pass via REST polling against the live server.
+- 11 WebSocket chat tests discovered a real orchestration issue: the WS
+  handler attempts to read Intaris session events before the session is
+  created, producing a 404 that crashes the connection. This needs to be
+  fixed in the WS handler / session creation ordering before the chat
+  flow tests can pass.
 - Accessibility polish deferred note carried from Stage 8.
 **Repo**: `cognis`
 **Depends on**: Stage 8 (all functionality must be wired)
