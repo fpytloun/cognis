@@ -52,21 +52,48 @@ resolve escalations, and configure settings.
   - `GET /api/v1/model-routing` — current routing policy
   - `PUT /api/v1/model-routing` — update routing (admin only)
 
-### 4. Other Routes
+### 4. Task Routes
+
+- `cognis/api/routes/tasks.py`
+  - `GET /api/v1/tasks` — list (filterable by status, agent, priority, queue)
+  - `POST /api/v1/tasks` — create (draft by default, queued for chat delegation)
+  - `GET /api/v1/tasks/:id` — detail + workflow progress + step runs + deps
+  - `PATCH /api/v1/tasks/:id` — update (title, description, priority, agent, workflow)
+  - `POST /api/v1/tasks/:id/submit` — draft → queued
+  - `POST /api/v1/tasks/:id/pause` — pause running task
+  - `POST /api/v1/tasks/:id/resume` — resume paused task
+  - `POST /api/v1/tasks/:id/cancel` — cancel (any state)
+  - `POST /api/v1/tasks/:id/gate-response` — respond to gate step
+  - `POST /api/v1/tasks/batch-submit` — submit multiple drafts
+  - `GET /api/v1/tasks/:id/steps` — list step runs
+  - `POST /api/v1/tasks/:id/dependencies` — add dependency
+  - `DELETE /api/v1/tasks/:id/dependencies/:dep_id` — remove dependency
+
+### 5. Workflow Routes
+
+- `cognis/api/routes/workflows.py`
+  - `GET /api/v1/workflows` — list (system + user)
+  - `POST /api/v1/workflows` — create user workflow
+  - `GET /api/v1/workflows/:id` — detail + steps
+  - `PUT /api/v1/workflows/:id` — update
+  - `DELETE /api/v1/workflows/:id` — delete (user only)
+  - `POST /api/v1/workflows/:id/duplicate` — duplicate
+
+### 6. Other Routes
 
 - `cognis/api/routes/secrets.py` — CRUD (values never in response)
 - `cognis/api/routes/tools.py` — list tools, agent tools, MCP servers
 - `cognis/api/routes/escalations.py` — list pending, resolve (proxied to Intaris)
 - `cognis/api/routes/system.py` — health, metrics, JWKS (extend Stage 2)
 
-### 5. API Models
+### 7. API Models
 
 - `cognis/api/models.py` — Pydantic request/response models for all endpoints
   - Consistent pagination: `{items, total, offset, limit}`
   - Error responses: `{error, message, detail}`
   - All models typed and documented
 
-### 6. WebSocket Handler
+### 8. WebSocket Handler
 
 - `cognis/api/websocket.py`
   - Connection lifecycle: auth → active → disconnect
@@ -91,7 +118,7 @@ resolve escalations, and configure settings.
   - Reconnection: client sends last_seq, server replays from cache/Intaris
   - Message queuing: max 5 queued messages per session, merged on turn complete
 
-### 7. Event Bus
+### 9. Event Bus
 
 - `cognis/core/events.py`
   - Internal pub/sub for system events
@@ -106,11 +133,20 @@ resolve escalations, and configure settings.
 - [ ] All REST endpoints return correct responses with proper auth
 - [ ] Conversation CRUD works end-to-end
 - [ ] Agent create bootstraps personality to Mnemory
+- [ ] Task CRUD works: create draft, edit, submit, pause, resume, cancel
+- [ ] Task dependencies: add, remove, DAG validation
+- [ ] Batch submit works
+- [ ] Task delivery config works (same conversation, specific target, latest active, preferred channel, silent)
+- [ ] Task detail shows workflow progress + step runs
+- [ ] Workflow CRUD works: list, create, duplicate, edit, delete
 - [ ] Settings CRUD reads/writes DB settings table
 - [ ] LLM provider management + test endpoint works
 - [ ] WebSocket chat sends messages and receives streaming responses
+- [ ] Workflow progress events push to client (step started/completed/rejected/gate)
+- [ ] Step question events push to client and resume same step via response endpoint
 - [ ] Delegation events push to client in real-time
 - [ ] Escalation events push to client, resolution flows back
+- [ ] Gate response via WebSocket and REST both work
 - [ ] Reconnection replays missed events correctly
 - [ ] Message queuing works (max 5, merged on turn complete)
 - [ ] Purge cascades to Intaris (delete session events)
@@ -122,5 +158,6 @@ resolve escalations, and configure settings.
 ## Key References
 
 - `docs/specs/10-api-spec.md` — full endpoint specification
-- `docs/specs/09-ui-ux.md` — WebSocket protocol, reconnection
+- `docs/specs/14-workflow-engine.md` — workflow engine, task lifecycle
+- `docs/specs/09-ui-ux.md` — WebSocket protocol, reconnection, kanban
 - `docs/specs/03-session-model.md` — message queuing, retention/deletion

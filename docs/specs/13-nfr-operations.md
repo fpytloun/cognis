@@ -230,7 +230,7 @@ All log entries include correlation fields:
   "conversation_id": "...",
   "session_id": "...",
   "agent_id": "...",
-  "user_id": "...",
+  "user_email": "...",
   "duration_ms": 1234
 }
 ```

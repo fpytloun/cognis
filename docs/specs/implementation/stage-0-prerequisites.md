@@ -49,7 +49,7 @@ Expose the last event sequence number via the API. Either:
 Add ES256 JWT validation alongside existing API key auth:
 
 - Accept `Authorization: Bearer <jwt>` with ES256 signature verification
-- Extract `user_id` from JWT `sub` claim
+- Extract authenticated user email from JWT `sub` claim
 - Extract `agent_id` from JWT `agent_id` claim (optional)
 - Verify `aud` includes `"intaris"`
 - Key source: file path (`INTARIS_JWT_PUBLIC_KEY`) or JWKS URL
@@ -70,7 +70,7 @@ when the controller retries after a timeout.
 Same pattern as Intaris I5:
 
 - Accept `Authorization: Bearer <jwt>` with ES256 signature verification
-- Extract `user_id` from JWT `sub` claim (maps to `X-User-Id`)
+- Extract authenticated user email from JWT `sub` claim (maps to `X-User-Id`)
 - Extract `agent_id` from JWT `agent_id` claim or `X-Agent-Id` header
 - Verify `aud` includes `"mnemory"`
 - Key source: file path (`MNEMORY_JWT_PUBLIC_KEY`) or JWKS URL

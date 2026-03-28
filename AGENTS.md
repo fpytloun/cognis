@@ -30,7 +30,10 @@ cognis/
 │   │   │   ├── agents.py
 │   │   │   ├── secrets.py
 │   │   │   ├── settings.py         # System settings, LLM providers, model routing
+│   │   │   ├── tasks.py            # Task queue, dependencies, gate/step responses
 │   │   │   ├── tools.py
+│   │   │   ├── workflows.py        # Workflow CRUD, duplication, import/export
+│   │   │   ├── schedules.py        # Schedule CRUD (task factory)
 │   │   │   ├── escalations.py
 │   │   │   └── system.py           # Health, metrics, JWKS
 │   │   ├── websocket.py            # WebSocket chat handler + reconnection
@@ -38,8 +41,11 @@ cognis/
 │   │   └── models.py              # API request/response Pydantic models
 │   │
 │   ├── core/                       # Orchestration Core
-│   │   ├── agent_loop.py          # Agent loop engine (main + delegated)
-│   │   ├── decision.py            # Decision Engine (rules + LLM classifier)
+│   │   ├── agent_loop.py          # Agent loop engine (step runner)
+│   │   ├── task_queue.py          # Queue picking, capacity, dependency resolution
+│   │   ├── workflow_engine.py     # Workflow orchestration (step sequencing, gates, loops)
+│   │   ├── step_evaluator.py      # Semantic step completion evaluation
+│   │   ├── decision.py            # Decision Engine (rules + workflow selection)
 │   │   ├── session.py             # Session Manager
 │   │   ├── session_cache.py       # L1 in-memory cache for Intaris-derived state
 │   │   ├── tool_router.py         # Tool routing logic
@@ -141,7 +147,13 @@ cognis/
 
 7. **Mnemory owns runtime personality**: Cognis bootstraps agent personality into Mnemory on creation. After that, Mnemory is the runtime authority — personality evolves through interactions. No ongoing sync from Cognis to Mnemory.
 
-8. **Follows mnemory/intaris conventions**: Same build tooling (hatchling/uv), config pattern (env vars, no config files), error handling, and code style. Compatible ecosystem.
+8. **Workflow-driven execution**: All execution goes through the workflow engine. Main chat is a single-step `direct` workflow. Background tasks use multi-step workflows with planning, evaluation, review loops, and gates. Workflows are portable templates above agents — they define process, not agent identity. See `docs/specs/14-workflow-engine.md`.
+
+9. **Explicit step completion**: A workflow step is not done because the LLM stopped calling tools. The agent must call `step_complete` to signal completion. The controller then runs semantic evaluation before advancing the workflow. This is controller-driven, not model-driven.
+
+10. **Tasks route back into conversations**: Task results, task questions, and task failures are injected as synthetic events into a target conversation. Tasks do NOT speak directly to channels. Channel adapters deliver conversation events to Signal/Slack/web/etc. This keeps all human-facing communication inside the normal conversation/session model.
+
+11. **Follows mnemory/intaris conventions**: Same build tooling (hatchling/uv), config pattern (env vars, no config files), error handling, and code style. Compatible ecosystem.
 
 ## Build / Run / Test
 
@@ -334,6 +346,11 @@ uv run alembic -c cognis/store/migrations/alembic.ini downgrade -1
 | `agents` | `agent_id` | Agent definitions |
 | `conversations` | `conversation_id` | Conversation metadata |
 | `sessions` | `session_id` | Session metadata (NO event seq/compaction fields) |
+| `tasks` | `task_id` | Durable work items (kanban cards, queue items) |
+| `task_dependencies` | `(task_id, depends_on)` | DAG edges between tasks |
+| `step_runs` | `step_run_id` | Workflow step execution attempts |
+| `workflows` | `workflow_id` | Portable workflow templates |
+| `schedules` | `schedule_id` | Cron-like task factory |
 | `settings` | `key` | System settings (replaces config file) |
 | `llm_providers` | `provider_id` | LLM provider configurations |
 | `model_routing` | `task_type` | Model routing policy |
@@ -454,6 +471,7 @@ Full architecture and design specifications are in `docs/specs/`:
 | `11-deployment.md` | Local/Docker/K8s deployment, env var reference |
 | `12-mvp-roadmap.md` | 8-week implementation plan |
 | `13-nfr-operations.md` | NFRs, SLOs, metrics, degraded modes, retention |
+| `14-workflow-engine.md` | Workflow templates, step types, completion protocol, evaluation, gates |
 
 **Read the relevant spec before making changes in that area.**
 

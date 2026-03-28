@@ -129,7 +129,7 @@ class CognisJWTValidator:
             claims = jwt.decode(token, self.public_key,
                                 algorithms=["ES256"], issuer="cognis",
                                 audience=self.expected_audience)
-            return AuthContext(user_id=claims["sub"],
+            return AuthContext(user_email=claims["sub"],
                                agent_id=claims.get("agent_id"))
         except jwt.InvalidTokenError:
             return self._validate_api_key(request)  # Fallback
@@ -211,9 +211,27 @@ class UserRole(str, Enum):
 
 ### Resource Authorization
 
-All data is scoped by `user_id`:
+In MVP, all data is effectively scoped by the authenticated user's email.
+
 ```sql
-SELECT * FROM conversations WHERE user_id = ? AND conversation_id = ?;
+SELECT * FROM conversations WHERE user_email = ? AND conversation_id = ?;
+```
+
+Future shared-agent model:
+- agent ownership stays with one `owner_email`
+- agent sharing grants other users `use` or `edit` permissions
+- assistant memory remains agent-scoped/shared
+- user memory remains scoped to the conversation/task initiator only
+
+All Mnemory/Intaris calls still need explicit actor context. The controller
+must always know:
+- **actor** — who triggered the current action
+- **initiator** — whose private user memory is allowed for this conversation/task
+
+Legacy conceptual example:
+```sql
+-- personal MVP conversation
+SELECT * FROM conversations WHERE user_email = ? AND conversation_id = ?;
 ```
 
 The controller enforces user scoping on all Mnemory/Intaris calls by setting
@@ -232,8 +250,8 @@ Since the controller is the sole client for Mnemory/Intaris:
 ### Scope Hierarchy
 
 Resolution order (most specific wins):
-1. Agent-scoped: `WHERE user_id=? AND agent_id=? AND name=?`
-2. User-scoped: `WHERE user_id=? AND agent_id IS NULL AND name=?`
+1. Agent-scoped: `WHERE user_email=? AND agent_id=? AND name=?`
+2. User-scoped: `WHERE user_email=? AND agent_id IS NULL AND name=?`
 3. Global: `WHERE scope='global' AND name=?`
 
 ### Encrypted Storage
@@ -257,11 +275,11 @@ class EncryptedDBSecrets(SecretsProvider):
 Secrets are resolved by the controller at executor spawn time:
 
 ```python
-async def resolve_for_execution(self, agent, user_id) -> dict[str, str]:
+async def resolve_for_execution(self, agent, user_email) -> dict[str, str]:
     """Resolve secrets for agent's allowed_secrets list."""
     resolved = {}
     for name in agent.permissions.allowed_secrets:
-        resolved[name] = await self.get_secret(name, user_id, agent.agent_id)
+        resolved[name] = await self.get_secret(name, user_email, agent.agent_id)
     return resolved
 ```
 

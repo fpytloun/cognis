@@ -104,6 +104,67 @@ fork_tool = ToolDefinition(
 These tools submit **requests** to the Decision Engine, which approves,
 modifies, or rejects them. The LLM cannot force delegation.
 
+## Built-in Task Inspection Tools
+
+These are controller-handled read/write tools for the durable task queue.
+They let the main chat agent inspect and manage background work when the
+user asks things like "what finished recently?" or "show me blocked tasks".
+
+```python
+# list_tasks — Query tasks visible to the current user/agent
+list_tasks_tool = ToolDefinition(
+    name="list_tasks",
+    description="List tasks by status, agent, workflow, or recent completion.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "status": {"type": "string"},
+            "agent_id": {"type": "string"},
+            "workflow_id": {"type": "string"},
+            "recently_finished": {"type": "boolean"},
+            "limit": {"type": "integer", "default": 20},
+        },
+    },
+    source=ToolSource(type="builtin"),
+    read_only=True,
+)
+
+# get_task_status — Detailed status/progress for one task
+get_task_status_tool = ToolDefinition(
+    name="get_task_status",
+    description="Get current status, workflow step, gates, and result summary for a task.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string"},
+        },
+        "required": ["task_id"],
+    },
+    source=ToolSource(type="builtin"),
+    read_only=True,
+)
+
+# update_task — Pause/resume/cancel or reprioritize a task
+update_task_tool = ToolDefinition(
+    name="update_task",
+    description="Pause, resume, cancel, or reprioritize a task.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string"},
+            "action": {"type": "string", "enum": ["pause", "resume", "cancel"]},
+            "priority": {"type": "integer"},
+        },
+        "required": ["task_id"],
+    },
+    source=ToolSource(type="builtin"),
+)
+```
+
+These tools are useful in the main chat because completed/paused/failed task
+events may arrive while the conversation is active or idle. The chat agent can
+query the queue and answer naturally, instead of relying only on pushed events.
+
 ## MCP Integration
 
 ### Local MCP (Executor-Managed)
@@ -220,6 +281,7 @@ permissions:
 ```python
 class ToolRouter:
     ORCHESTRATION_TOOLS = {"delegate", "spawn_worker", "fork"}
+    CONTROLLER_TASK_TOOLS = {"list_tasks", "get_task_status", "update_task"}
 
     async def route(self, tool_call, session, agent, executor):
         # Orchestration → controller handles directly
@@ -227,6 +289,10 @@ class ToolRouter:
             return await self.decision_engine.handle_orchestration(
                 session, tool_call
             )
+
+        # Task queue inspection/control → controller handles directly
+        if tool_call.name in self.CONTROLLER_TASK_TOOLS:
+            return await self.task_service.handle_tool_call(session, tool_call)
 
         # Intaris-managed MCP → Intaris proxy
         tool = self.registry.get(tool_call.name)

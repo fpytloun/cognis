@@ -212,7 +212,7 @@ class GuardrailsProvider(Protocol):
         session_id: str,
         intention: str,
         agent_id: str,
-        user_id: str | None = None,
+        user_email: str | None = None,
         parent_session_id: str | None = None,
         policy: SessionPolicy | None = None,
         details: dict | None = None,
@@ -374,7 +374,7 @@ class EventReadResult(BaseModel):
 
 class IntarisSession(BaseModel):
     session_id: str
-    user_id: str
+    user_email: str            # Intaris user_id mapped from JWT sub/email
     agent_id: str
     intention: str | None            # The authoritative intention
     details: dict | None
@@ -922,11 +922,11 @@ model_routing:
 
 ```python
 class SecretsProvider(Protocol):
-    async def get_secret(self, name: str, user_id: str, agent_id: str | None = None) -> str:
+    async def get_secret(self, name: str, user_email: str, agent_id: str | None = None) -> str:
         ...
-    async def set_secret(self, name: str, value: str, user_id: str, scope: str = "user", ...) -> None:
+    async def set_secret(self, name: str, value: str, user_email: str, scope: str = "user", ...) -> None:
         ...
-    async def resolve_for_execution(self, agent: AgentDefinition, user_id: str) -> dict[str, str]:
+    async def resolve_for_execution(self, agent: AgentDefinition, user_email: str) -> dict[str, str]:
         """Resolve all secrets an agent's executor needs (for MCP servers)."""
         ...
 ```
@@ -944,11 +944,11 @@ Before Cognis development starts, Intaris needs:
 | I2 | UI formatting for new types | Review Intaris console/UI rendering for new event types | 1 day |
 | I3 | Reverse read / last_n | Add `last_n` parameter to GET /session/{id}/events (S3-aware) | 2-3 days |
 | I4 | last_seq endpoint | Expose last_seq via API (or include in empty read response) | 0.5 days |
-| I5 | JWT validation | Add ES256 JWT middleware alongside existing API key auth. Accept public key file path or JWKS URL. Extract user_id from `sub` claim, agent_id from `agent_id` claim. | 1-2 days |
+| I5 | JWT validation | Add ES256 JWT middleware alongside existing API key auth. Accept public key file path or JWKS URL. Extract authenticated user email from `sub` claim, agent_id from `agent_id` claim. | 1-2 days |
 | I6 | Event recording idempotency | Support optional `idempotency_key` on event append. If a duplicate key is received, return success without re-appending. Prevents duplicate events on controller retry after timeout. | 1 day |
 
 ## Mnemory Prerequisites (Phase 0)
 
 | # | Change | Description | Est. |
 |---|--------|-------------|------|
-| M1 | JWT validation | Add ES256 JWT middleware alongside existing API key auth. Accept public key file path or JWKS URL. Extract user_id from `sub` claim, agent_id from `agent_id` claim or `X-Agent-Id` header. | 1-2 days |
+| M1 | JWT validation | Add ES256 JWT middleware alongside existing API key auth. Accept public key file path or JWKS URL. Extract authenticated user email from `sub` claim, agent_id from `agent_id` claim or `X-Agent-Id` header. | 1-2 days |

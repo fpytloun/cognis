@@ -44,8 +44,29 @@ surfaces mismatches in Week 0, not Week 5.
 - Non-blocking main chat (continue chatting during delegations)
 - **Controller runs all agent loops** (brain)
 - **In-process executor handles all tool calls** (hands)
+- **Workflow engine** with portable workflow templates (see 14-workflow-engine.md):
+  - System workflows: Direct, Research, Code with Review, Creative
+  - User workflow creation, duplication, import/export
+  - Explicit step completion via `step_complete` controller tool
+  - Semantic step evaluation (independent LLM check)
+  - Gate/pause steps with structured options
+  - In-step questions via `step_request_input` for workflows that allow caller interaction
+  - Review loops with bounded iteration
+  - Step-local todo/task tools as cognitive aids
+  - Workflow selection: automatic (classifier), user explicit, agent default
+- **Task queue** with priority, concurrency, dependencies:
+  - Tasks as durable kanban items (draft, queued, ready, running, paused, completed, failed, cancelled)
+  - Task dependencies (DAG) with automatic readiness resolution
+  - Queue backed by Postgres `SELECT ... FOR UPDATE SKIP LOCKED`
+  - Concurrency limits per agent, per executor, global
+  - Chat delegation, API, and future scheduler/webhook all create Tasks
+  - Draft tasks for planning (kanban), queued tasks for immediate execution
+  - Batch submit for executing plans
+  - Delivery config for task results/questions (same conversation, specific target, latest active, preferred channel, silent)
+  - Result delivery back into conversations as synthetic task events
 - Three delegation modes: Agent, Worker, Fork
-- Decision Engine (rules + LLM classifier)
+- Decision Engine (rules + LLM classifier + workflow selection)
+- Schedule entity in DB schema (implementation Phase 2, model in MVP)
 - LLM delegation tools (delegate, spawn_worker, fork) as requests to system
 - Mnemory integration (recall/remember, controller-mediated, JWT auth)
 - Intaris integration (evaluate/reasoning/events, controller-mediated, JWT auth)
@@ -151,7 +172,7 @@ surfaces mismatches in Week 0, not Week 5.
 - JWT service auth (issue JWT with aud=mnemory, sub=user email)
 - recall() and remember() matching verified contract
 - Session ID management (first recall creates, subsequent recalls use)
-- X-Agent-Id header management (user_id from JWT sub)
+- X-Agent-Id header management (user email from JWT sub, agent from agent_id/header)
 - Graceful degradation on failure
 - Remember retry queue (bounded, rate-limited — see 05-integrations.md)
 

@@ -17,7 +17,7 @@ Key UX principles:
 
 ```
 SvelteKit Application
-  ├── Pages: /chat, /agents, /agents/new, /settings, /tasks (Phase 2)
+  ├── Pages: /chat, /agents, /agents/new, /settings, /tasks, /workflows
   ├── Components: ChatMessage, DelegStatus, ToolCall, AgentWizard, etc.
   ├── Stores (Svelte): authStore, chatStore, agentStore, wsStore
   └── API Client: REST (fetch) + WebSocket
@@ -37,7 +37,9 @@ SvelteKit Application
 | `/agents/new` | Agent creation wizard | MVP |
 | `/agents/:id` | Agent detail / edit | MVP |
 | `/settings` | Secrets, connections, config | MVP |
-| `/tasks` | Kanban board | Phase 2 |
+| `/tasks` | Task kanban / work queue | MVP |
+| `/tasks/:id` | Task detail + workflow progress | MVP |
+| `/workflows` | Workflow registry + editor | MVP |
 
 ## Chat Interface
 
@@ -166,10 +168,10 @@ Client responsibilities:
 | Marked/remark | Markdown rendering |
 | Shiki | Syntax highlighting |
 
-## Task Kanban (Phase 2)
+## Task Board
 
-Three columns: Queued, In Progress, Completed. Each card shows agent, cost,
-duration, progress bar. Cards are draggable for reprioritization.
+Task planning and execution are MVP features. The detailed kanban/task board
+design appears later in this document under Workflow Progress UI.
 
 ## Platform Integrations (Phase 2)
 
@@ -243,8 +245,131 @@ cognis login                        # Authenticate and save JWT
 cognis logout                       # Remove saved JWT
 ```
 
+## Workflow Progress UI
+
+### Task cards with workflow steps
+
+When a background task runs a multi-step workflow, the task card shows
+step-by-step progress:
+
+```
+Task: "Implement user authentication"
+Workflow: Code with Review
+Agent: Aria
+Dependencies: ← "Design API schema" (completed)
+
+[✓] Plan              2 min    — 5 implementation steps
+[✓] Architect Review   1 min    — approved with notes
+[●] Implement         ...      — 12 tool calls, step 3/5
+[ ] Run Tests
+[ ] Code Review
+[ ] Commit
+[ ] Update Memory
+```
+
+### Task kanban board (`/tasks`)
+
+The kanban board shows tasks across all lifecycle states:
+
+```
+┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐
+│  Draft   │  │  Queued  │  │ Running  │  │  Paused  │  │   Done   │
+│          │  │          │  │          │  │          │  │          │
+│ ┌──────┐ │  │ ┌──────┐ │  │ ┌──────┐ │  │ ┌──────┐ │  │ ┌──────┐ │
+│ │Plan  │ │  │ │Impl  │ │  │ │Auth  │ │  │ │API   │ │  │ │Setup │ │
+│ │API   │ │  │ │endpts│ │  │ │flow  │ │  │ │docs ⏸│ │  │ │DB  ✓│ │
+│ │docs  │ │  │ │ ⏳dep │ │  │ │ ●... │ │  │ │      │ │  │ │      │ │
+│ └──────┘ │  │ └──────┘ │  │ └──────┘ │  │ └──────┘ │  │ └──────┘ │
+│          │  │          │  │          │  │          │  │          │
+└──────────┘  └──────────┘  └──────────┘  └──────────┘  └──────────┘
+```
+
+Task cards show:
+- Title and agent avatar
+- Current status indicator
+- Priority badge
+- Workflow name
+- Dependency indicator (waiting, met, or none)
+- Delivery indicator (same conversation, specific target, preferred channel, silent)
+- Quick actions (submit, pause, cancel, open detail)
+
+Users can:
+- Create draft tasks directly on the board
+- Drag tasks to reorder priority (within a column)
+- Submit drafts individually or batch-submit
+- Set dependencies between tasks (link cards)
+- Click a task to see workflow step progress
+- Configure delivery target for task results/questions
+- Filter by agent, priority, workflow, or search
+
+If a step is re-attempted after evaluation rejection:
+
+```
+[✓] Implement         8 min
+[✗] Run Tests         1 min    — 2 failures found
+[●] Implement (r2)    ...      — addressing test failures
+```
+
+### Gate prompts
+
+When a workflow reaches a gate step, the UI shows a structured prompt:
+
+```
+┌─────────────────────────────────────┐
+│ ⏸️ Plan ready for review            │
+│                                     │
+│ [View Plan]                         │
+│                                     │
+│ [Approve] [Request Changes] [Cancel]│
+└─────────────────────────────────────┘
+```
+
+Gate prompts appear:
+- in the task detail view
+- as a notification in the main chat
+- as a push notification (if configured)
+
+### In-step questions
+
+When a run step has `allow_questions=true`, the step may pause and ask for
+clarification without advancing the workflow. The UI should show this as a
+question on the current step, distinct from a workflow gate:
+
+```
+┌────────────────────────────────────────────┐
+│ ❓ Planning needs clarification             │
+│                                            │
+│ Which auth strategy should be used?        │
+│                                            │
+│ [JWT Refresh Tokens] [Session Only]        │
+│ [Provide custom answer...]                 │
+└────────────────────────────────────────────┘
+```
+
+Difference from gates:
+- step question resumes the SAME step session
+- gate advances or rewinds workflow-level execution
+
+### Workflow editor
+
+Power users can create and edit workflows via a form-based editor:
+- step list with drag-to-reorder
+- per step: name, type (run/gate), prompt, inputs, completion config
+- visual pipeline preview
+- duplicate from existing workflow button
+- export/import as YAML
+
+### Agent workflow settings
+
+In agent configuration, under Execution Settings:
+- Available workflows: checkboxes from workflow registry
+- Default workflow: dropdown
+- Workflow selection: automatic / always ask / use default
+- Step agent overrides: per-workflow, per-step agent dropdown
+
 ## Delivery Priority
 
 For MVP, ship in order: CLI admin commands → chat page → agent CRUD →
-settings. If timeline slips, a working chat page with CLI admin bootstrap
-is the minimum viable deliverable.
+settings → workflow editor. If timeline slips, a working chat page with
+CLI admin bootstrap and the built-in workflows is the minimum viable
+deliverable.

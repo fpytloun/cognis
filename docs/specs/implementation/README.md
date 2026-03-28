@@ -4,15 +4,15 @@
 
 | Stage | Name | Status | Notes |
 |-------|------|--------|-------|
-| 0 | [Prerequisites](stage-0-prerequisites.md) | IN PROGRESS | Local implementation underway across Intaris, Mnemory, and Cognis contract tests |
-| 1 | [Project Scaffold](stage-1-scaffold.md) | IMPLEMENTED* | Locally validated; direct Alembic CLI execution still needs manual verification |
-| 2 | [Auth + Bootstrap + CLI](stage-2-auth.md) | IMPLEMENTED* | Locally validated; full live runtime/WS verification remains environment-dependent |
-| 3 | [Provider Layer](stage-3-providers.md) | IMPLEMENTED* | Locally validated; live Mnemory/Intaris contract checks skipped without services |
-| 4 | [Executor + Tools](stage-4-executor.md) | IMPLEMENTED* | In-process executor, MCP, tool router; remote executor WS deferred to Stage 7 |
-| 5 | [Orchestration Core](stage-5-orchestration.md) | IMPLEMENTED* | Session manager, session cache, context assembly, compaction, decision engine; Intaris purge cascade remains deferred pending a verified delete-session contract |
-| 6 | [Agent Loop + Delegation](stage-6-agent-loop.md) | NOT STARTED | Chat turns, streaming, delegation |
-| 7 | [API + WebSocket](stage-7-api.md) | NOT STARTED | Full REST + WS surface |
-| 8 | [UI](stage-8-ui.md) | NOT STARTED | SvelteKit: chat, agents, settings |
+| 0 | [Prerequisites](stage-0-prerequisites.md) | DONE | Intaris I1-I6, Mnemory M1, contract tests |
+| 1 | [Project Scaffold](stage-1-scaffold.md) | DONE | Package, config, DB schema, Alembic, ~/.cognis |
+| 2 | [Auth + Bootstrap + CLI](stage-2-auth.md) | DONE | JWT, JWKS, setup URL, Typer CLI |
+| 3 | [Provider Layer](stage-3-providers.md) | DONE | All 6 protocols + implementations |
+| 4 | [Executor + Tools](stage-4-executor.md) | DONE | In-process executor, MCP, tool router |
+| 5 | [Orchestration Core](stage-5-orchestration.md) | DONE | Session manager, cache, context, compaction, decision engine |
+| 6 | [Agent Loop + Workflow Engine](stage-6-agent-loop.md) | NOT STARTED | Step runner, workflow engine, evaluator, task queue, gates (largest stage) |
+| 7 | [API + WebSocket](stage-7-api.md) | NOT STARTED | Full REST + WS surface including tasks/kanban |
+| 8 | [UI](stage-8-ui.md) | NOT STARTED | SvelteKit: chat, agents, tasks/kanban, settings, workflows |
 | 9 | [Integration Testing](stage-9-testing.md) | NOT STARTED | Full flow tests, polish |
 
 ## Dependency Graph
@@ -35,7 +35,7 @@ Stage 4 (executor + tools)    Stage 5 (orchestration core)
   └──────────┬─────────────────────┘
              │
              ▼
-         Stage 6 (agent loop + delegation)
+         Stage 6 (agent loop + workflow engine — core)
              │
              ▼
          Stage 7 (API + WebSocket)

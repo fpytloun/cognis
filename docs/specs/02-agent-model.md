@@ -20,7 +20,7 @@ class AgentDefinition(BaseModel):
     avatar_url: str | None = None
 
     # Ownership
-    owner_id: str                          # User who created this agent
+    owner_email: str                       # User who owns this agent
     visibility: AgentVisibility = "private"  # private | shared | public
 
     # Personality (bootstrapped to Mnemory on creation; Mnemory owns runtime)
@@ -113,11 +113,69 @@ class AgentExecutionConfig(BaseModel):
     resource_limits: ResourceLimits | None = None
 
 
+class AgentWorkflowConfig(BaseModel):
+    """Workflow execution preferences. See 14-workflow-engine.md."""
+    available_workflow_ids: list[str] = []   # Which workflows this agent can use
+    default_workflow_id: str = "direct"      # Default workflow for delegated tasks
+    workflow_selection_mode: str = "automatic"  # "automatic" | "always_ask" | "use_default"
+    step_agent_overrides: dict[str, dict[str, str]] = {}
+    # Per-workflow step→agent overrides.
+    # e.g. {"code-with-review": {"code_review": "reviewer-agent-id"}}
+    # Steps without overrides use this agent.
+
+
 class Permission(str, Enum):
     ALLOW = "allow"
     EVALUATE = "evaluate"
     DENY = "deny"
+
+
+class AgentShare(BaseModel):
+    """Future collaboration model (Phase 2+)."""
+    shared_with_email: str
+    permission: str              # "use" | "edit"
 ```
+
+## Ownership and Sharing
+
+An agent is always owned by a single user (`owner_email`). Ownership stays
+simple even when the agent is shared with others.
+
+Future sharing model:
+
+- `use` — another user can chat with the agent, create tasks with it, and
+  inspect task progress
+- `edit` — another user can also modify the agent definition, workflow
+  settings, and sharing
+
+This is resource sharing, not user-memory sharing.
+
+### Memory visibility model for shared agents
+
+When an agent is shared:
+
+- **Assistant memories** are shared with every user who has `use` access to
+  the agent. These memories define the agent's identity, learned knowledge,
+  and behavior.
+- **User memories** remain private to the user who initiated the current
+  conversation or task. They are never shared across collaborators just
+  because the agent is shared.
+
+This means a shared agent has a shared assistant brain, but each user keeps
+their own private user context.
+
+### External / world-facing agent mode
+
+Agents with `visibility: public` are the beginning of agent-to-world
+collaboration. In this mode, the agent may be offered for external tasks or
+public channels.
+
+For public/external interactions:
+
+- only **assistant memories** are available
+- **user memories are not injected at all**
+- the agent's durable public identity comes entirely from its assistant
+  memories and definition
 
 ## Agent Types
 

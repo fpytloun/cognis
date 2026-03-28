@@ -88,6 +88,9 @@ with proper Intaris evaluation on every call.
 - `cognis/tools/builtin/system.py`
   - `list_agents` — list available agents
   - `get_status` — current session and delegation status
+  - `list_tasks` — query tasks by status/agent/recent completion
+  - `get_task_status` — inspect one task's workflow/step progress
+  - `update_task` — pause, resume, cancel, or reprioritize
 
 ### 7. MCP Client
 
@@ -106,6 +109,7 @@ with proper Intaris evaluation on every call.
 - [x] Tool results are wrapped with untrusted content tags
 - [x] Large tool outputs are truncated with notice
 - [x] Built-in orchestration tools return proper tool call responses
+- [x] Built-in task inspection/control tools return proper controller-handled responses
 - [x] MCP client connects and discovers tools from an MCP server
 - [x] Unit tests for router classification, result wrapping, size limits
 - [x] `ruff check` and `mypy` clean

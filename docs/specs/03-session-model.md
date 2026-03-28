@@ -37,7 +37,7 @@ Cognis DB                  Session Cache (L1 memory)   Intaris Event Store
 ```python
 class Conversation(BaseModel):
     conversation_id: str
-    user_id: str
+    user_email: str
     agent_id: str
 
     title: str | None = None
@@ -53,11 +53,28 @@ class Conversation(BaseModel):
 
 
 class ConversationContext(BaseModel):
-    type: str                         # "web", "slack", "discord", "api", "scheduled"
-    ref: str | None = None
+    type: str                         # "web", "signal", "slack", "discord", "api", "scheduled"
+    ref: str | None = None            # normalized routing identity, e.g. signal:+4177666888
     platform_data: dict[str, Any] = {}
     memory_labels: dict[str, str] = {}  # For Mnemory recall scoping
+    reply_capabilities: dict[str, Any] = {}  # buttons, threads, edits, etc.
+    delivery_preferences: dict[str, Any] = {}  # preferred channel/session behavior
 ```
+
+### Context identity and routing
+
+`context.ref` is the canonical delivery identity for a conversation.
+Examples:
+
+- `signal:+4177666888`
+- `slack:C1234567890`
+- `slack:C1234567890:thread:1712345678.000100`
+- `discord:channel:1234567890`
+- `web:user:filip@pytloun.cz:default`
+- `schedule:daily-review`
+
+This lets Cognis route outbound messages and task results back to the
+correct channel/thread through the appropriate connector.
 
 ### Multi-Context Agent Presence
 
@@ -75,6 +92,27 @@ Each is independent: own session, own Intaris scope, own context window. They
 share long-term memory in Mnemory (same agent_id). Mnemory recall uses
 `memory_labels` to bias search toward the conversation's topic area.
 
+Tasks route back into conversations, not directly to channels. A task result,
+question, or failure is injected as a synthetic conversation event into the
+target conversation. The conversation's channel connector then delivers the
+result to the actual transport (Signal, Slack, web UI, etc.).
+
+This means the main chat agent remains the human-facing narrator:
+- the workflow/task system does the work
+- the conversation agent receives task events and phrases the response
+- this works for idle and active conversations alike
+
+Synthetic task events include:
+- `task_result`
+- `task_question`
+- `task_failed`
+- `task_status`
+
+Delivery behavior:
+- **Idle conversation**: synthetic task event triggers a new agent turn immediately
+- **Active conversation**: synthetic task event is queued like any inbound
+  message and processed on the next turn after the current one completes
+
 ## Session Model
 
 ```python
@@ -85,7 +123,7 @@ class Session(BaseModel):
     conversation_id: str
     parent_session_id: str | None     # NULL for root session
 
-    user_id: str
+    user_email: str
     agent_id: str                     # May differ for agent delegation
 
     delegation: DelegationInfo | None  # Set for child sessions
@@ -356,6 +394,39 @@ Cognis Session ────── Mnemory Session ────── Intaris Ses
 4. **Delegation** → controller creates child session in Cognis DB →
    pre-creates both Mnemory session (first recall) and Intaris session
    (POST /intention with parent_session_id)
+
+## Workflow Session Mapping
+
+Workflow execution creates sessions at the step level, not the workflow level.
+See [14-workflow-engine.md](14-workflow-engine.md) for the full workflow spec.
+
+### Mapping to Intaris sessions
+
+Intaris supports parent + child sessions, not deeper nesting. The mapping is:
+
+```
+Task / workflow state (Cognis metadata only — no Intaris session)
+  ├── StepRun: plan        → Intaris parent session
+  │     ├── sub-agent      → Intaris child session
+  │     └── sub-agent      → Intaris child session
+  ├── StepRun: implement   → Intaris parent session
+  │     ├── sub-agent      → Intaris child session
+  │     └── sub-agent      → Intaris child session
+  └── StepRun: review      → Intaris parent session
+```
+
+- Each executable workflow step gets one Intaris parent session per attempt.
+- Sub-agents spawned within the step are Intaris child sessions.
+- Step re-attempts (after evaluation rejection) create new Intaris sessions
+  (context reset with feedback from the evaluator).
+- The workflow-level structure is tracked in Cognis metadata only
+  (`tasks.workflow_state` and `step_runs` tables).
+
+### Main chat as workflow
+
+Main chat runs the `direct` workflow (single step, no evaluation). This
+means all execution goes through the workflow engine — foreground chat is
+just the simplest workflow. Background tasks use multi-step workflows.
 
 ## Delegation Result Delivery
 

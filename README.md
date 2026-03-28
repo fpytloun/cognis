@@ -17,6 +17,7 @@ Part of the [Openclaw](https://github.com/openclaw) ecosystem: Cognis controller
 - **Interactive chat with streaming** -- WebSocket-based chat with real-time token streaming, tool call indicators, and delegation status cards.
 - **Agent identity** -- Create agents with name, personality, behavioral rules, and skills. Personality bootstrapped to Mnemory and evolves through interactions.
 - **Sub-session delegation** -- Three modes: Agent (delegate to different agent), Worker (same agent, focused task), Fork (parallel exploration). Main chat stays responsive.
+- **Task queue + workflows** -- Durable kanban-style tasks with priorities, dependencies, portable workflow templates, step evaluation, and human-in-the-loop gates.
 - **Controller-executor separation** -- The controller decides; executors do. In-process executor for local use, Docker and Kubernetes executors for production. Same JSON-RPC protocol everywhere.
 - **Memory integration** -- Persistent recall and remember through [Mnemory](https://github.com/openclaw/mnemory). Agent identity, user facts, episodic memory, and artifacts.
 - **Guardrails integration** -- Every tool call evaluated by [Intaris](https://github.com/openclaw/intaris). Escalation prompts with approve/deny. Session recording and behavioral analysis.
@@ -162,8 +163,8 @@ cognis config init                      # Print env var template
 
 ## Roadmap
 
-- **Phase 1 (MVP)** -- Interactive chat, sub-session delegation, Mnemory/Intaris integration, SvelteKit UI, in-process executor
-- **Phase 2** -- Multi-agent, task queue + kanban, Docker/K8s executors, chat platform integrations, scheduler
+- **Phase 1 (MVP)** -- Interactive chat, background task queue + workflows, Mnemory/Intaris integration, SvelteKit UI, in-process executor
+- **Phase 2** -- Multi-agent, Docker/K8s executors, chat platform integrations, scheduler
 - **Phase 3** -- A2A federation, cryptographic agent identity, multi-tenant production deployment
 
 See [docs/specs/](docs/specs/) for the full specification set and [docs/specs/implementation/](docs/specs/implementation/) for the implementation stage tracker.

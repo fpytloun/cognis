@@ -54,6 +54,46 @@ did:web:cognis.example.com:agents:aria
 ```
 Decentralized identity, verifiable credentials, signed messages.
 
+## Collaboration Scopes (Future)
+
+Federation and cross-user collaboration depend on keeping ownership,
+assistant identity, and private user context separate.
+
+### Agent ownership
+
+An agent is always owned by a single user (`owner_email`), even when it is
+shared or public.
+
+Future sharing permissions:
+- `use` — another user may use the agent and create tasks with it
+- `edit` — another user may also modify the agent definition and settings
+
+### Memory scopes
+
+There are two durable memory categories:
+
+- **Assistant memories** — define the agent's identity, learned knowledge,
+  habits, and behavior. These are shared with every user who has access to
+  the agent.
+- **User memories** — private facts/preferences for a specific human user.
+  These remain scoped to the conversation/task initiator only.
+
+This means shared-agent collaboration works like this:
+- shared assistant memory
+- private initiator user memory
+
+### External / world-facing tasks
+
+Public agents are the beginning of agent-to-world collaboration.
+
+For external tasks or public channels:
+- assistant memories are available
+- user memories are not injected
+- the agent's public continuity comes entirely from its assistant memories
+
+This prevents leaking private user context while still preserving the
+agent's durable identity.
+
 ## Gateway Pattern (Phase 3)
 
 For production federation:

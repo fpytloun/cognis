@@ -443,6 +443,124 @@ CREATE TABLE model_routing (
     updated_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Tasks (durable work items — the kanban card, the queue item)
+-- Every background delegation, scheduler run, and webhook creates a Task.
+-- Main chat does NOT create tasks — it runs the direct workflow inline.
+-- Status lifecycle: draft → queued → ready → running → completed/failed/cancelled
+CREATE TABLE tasks (
+    task_id       TEXT PRIMARY KEY,
+    title         TEXT NOT NULL,
+    description   TEXT,
+    status        TEXT NOT NULL DEFAULT 'draft',
+        -- draft:     defined but not submitted for execution (kanban planning)
+        -- queued:    submitted, waiting for dependencies and/or capacity
+        -- ready:     all dependencies met, eligible for picking
+        -- running:   picked from queue, workflow executing
+        -- paused:    gate step or user-paused
+        -- completed: workflow finished successfully
+        -- failed:    workflow failed after exhausting retries
+        -- cancelled: user or system cancelled
+    priority      INTEGER NOT NULL DEFAULT 0,   -- higher = picked first
+
+    -- Who
+    created_by    TEXT NOT NULL REFERENCES users(email),
+    agent_id      TEXT NOT NULL REFERENCES agents(agent_id),
+
+    -- Source (how to deliver result back)
+    source_type   TEXT NOT NULL,     -- "chat", "api", "scheduler", "webhook"
+    source_ref    TEXT,              -- conversation_id, schedule_id, etc.
+
+    -- Delivery (where results/questions are routed back)
+    delivery_mode TEXT NOT NULL DEFAULT 'same_conversation',
+        -- same_conversation: source conversation (default for chat)
+        -- specific_conversation: use delivery_target
+        -- latest_active_for_agent: resolve latest active conversation for user+agent
+        -- preferred_channel: user/agent configured default context
+        -- silent: no automatic conversation injection
+    delivery_target TEXT,            -- conversation_id or context_ref depending on mode
+
+    -- Workflow
+    workflow_id   TEXT REFERENCES workflows(workflow_id),
+    workflow_state JSONB,            -- current_step_index, step_outputs, iteration counts
+
+    -- Queue
+    queue_name    TEXT DEFAULT 'default',
+    max_attempts  INTEGER DEFAULT 1,
+    scheduled_for TIMESTAMP,         -- NULL = immediate
+
+    -- Lifecycle
+    created_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    started_at    TIMESTAMP,
+    completed_at  TIMESTAMP,
+
+    -- Result
+    result_summary TEXT,
+    result_data   JSONB
+);
+
+-- Task dependencies (DAG edges between tasks)
+-- A task with unmet required dependencies stays queued but is not eligible
+-- for picking. When a dependency completes, controller re-evaluates dependents.
+CREATE TABLE task_dependencies (
+    task_id       TEXT NOT NULL REFERENCES tasks(task_id),
+    depends_on    TEXT NOT NULL REFERENCES tasks(task_id),
+    required      BOOLEAN NOT NULL DEFAULT TRUE,
+        -- TRUE:  dependent task cannot start until this completes
+        -- FALSE: advisory; dependency result available as input if completed
+    PRIMARY KEY (task_id, depends_on),
+    CHECK (task_id != depends_on)    -- no self-dependencies
+);
+
+-- Schedules (cron-like task factory — creates tasks on a schedule)
+CREATE TABLE schedules (
+    schedule_id   TEXT PRIMARY KEY,
+    name          TEXT NOT NULL,
+    cron_expr     TEXT NOT NULL,      -- standard cron expression
+    agent_id      TEXT NOT NULL REFERENCES agents(agent_id),
+    workflow_id   TEXT REFERENCES workflows(workflow_id),
+    task_template JSONB NOT NULL,     -- title, description, priority, etc.
+    enabled       BOOLEAN NOT NULL DEFAULT TRUE,
+    last_fired_at TIMESTAMP,
+    next_fire_at  TIMESTAMP,
+    created_by    TEXT NOT NULL REFERENCES users(email),
+    created_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Workflow templates (portable, agent-agnostic process definitions)
+CREATE TABLE workflows (
+    workflow_id   TEXT PRIMARY KEY,
+    name          TEXT NOT NULL,
+    description   TEXT,
+    version       INTEGER NOT NULL DEFAULT 1,
+    criteria      TEXT,
+    tags          JSONB,
+    steps         JSONB NOT NULL,
+    interaction   JSONB,
+    defaults      JSONB,
+    is_system     BOOLEAN NOT NULL DEFAULT FALSE,
+    owner_email   TEXT REFERENCES users(email),
+    created_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Step run instances (one per step attempt, children of task)
+CREATE TABLE step_runs (
+    step_run_id   TEXT PRIMARY KEY,
+    task_id       TEXT NOT NULL REFERENCES tasks(task_id),
+    step_name     TEXT NOT NULL,
+    step_type     TEXT NOT NULL,     -- "run" | "gate"
+    attempt       INTEGER NOT NULL DEFAULT 1,
+    status        TEXT NOT NULL DEFAULT 'pending',
+    agent_id      TEXT,
+    session_id    TEXT REFERENCES sessions(session_id),
+    intaris_session_id TEXT,
+    output        JSONB,
+    evaluation    JSONB,
+    started_at    TIMESTAMP,
+    completed_at  TIMESTAMP
+);
+
 -- Encrypted secrets
 CREATE TABLE secrets (
     secret_id   TEXT PRIMARY KEY,
@@ -594,20 +712,30 @@ cognis/
 │   │   │   ├── agents.py
 │   │   │   ├── auth.py
 │   │   │   ├── secrets.py
+│   │   │   ├── settings.py         # System settings, LLM providers, model routing
+│   │   │   ├── tasks.py            # Task queue, dependencies, gate/step responses
 │   │   │   ├── tools.py
-│   │   │   └── system.py
+│   │   │   ├── workflows.py        # Workflow CRUD, gate response
+│   │   │   ├── schedules.py        # Schedule CRUD (task factory)
+│   │   │   ├── escalations.py
+│   │   │   └── system.py           # Health, metrics, JWKS
 │   │   ├── websocket.py            # WebSocket chat handler
 │   │   ├── middleware.py           # Auth, rate limiting
 │   │   └── models.py              # API request/response models
 │   │
 │   ├── core/                       # Orchestration Core
-│   │   ├── agent_loop.py          # Agent loop engine
-│   │   ├── decision.py            # Decision Engine
+│   │   ├── agent_loop.py          # Agent loop engine (step runner)
+│   │   ├── task_queue.py          # Queue picking, capacity, dependency resolution
+│   │   ├── workflow_engine.py     # Workflow orchestration (step sequencing, gates, loops)
+│   │   ├── step_evaluator.py      # Semantic step completion evaluation
+│   │   ├── decision.py            # Decision Engine (classify + workflow selection)
 │   │   ├── session.py             # Session Manager
+│   │   ├── session_cache.py       # L1 in-memory cache for Intaris-derived state
 │   │   ├── tool_router.py         # Tool routing logic
 │   │   ├── compaction.py          # Context compaction
+│   │   ├── context.py             # Context assembly (parallel external fetches)
 │   │   ├── events.py              # Event Bus + hooks
-│   │   └── context.py             # Context assembly
+│   │   └── remember_queue.py      # Bounded retry queue for Mnemory remember
 │   │
 │   ├── models/                     # Domain models (Pydantic)
 │   │   ├── agent.py

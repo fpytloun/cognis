@@ -54,7 +54,38 @@ delegation progress, resolve escalations, and configure LLM providers.
 - `/agents/:id` — agent detail and edit
 - Agent activation/suspension controls
 
-### 4. Settings Page (`/settings`)
+### 4. Task Kanban Board (`/tasks`)
+
+- Kanban columns: Draft, Queued, Running, Paused, Done
+- Task cards showing: title, agent, status, priority, workflow, dependency indicator
+- Create draft tasks directly on the board
+- Drag to reorder priority within a column
+- Submit drafts individually or batch-submit
+- Set dependencies between tasks (link UI or modal)
+- Click task → detail view with workflow step progress
+- Filter by agent, priority, workflow, status, or search
+- `/tasks/:id` — task detail:
+  - Workflow step progress (step list with status indicators)
+  - Step output and evaluation results
+  - Gate prompts with approve/reject/cancel buttons
+  - Dependency graph (which tasks this depends on / depends on this)
+  - Result summary when completed
+
+### 5. Workflow Editor (`/workflows`)
+
+- Workflow list (system + user)
+- System workflows: read-only, can duplicate
+- User workflows: full CRUD
+- Form-based step editor:
+  - Step list with drag-to-reorder
+  - Per step: name, type (run/gate), prompt, inputs, completion config
+  - Gate options editor
+  - Review loop configuration (on_reject, max iterations)
+- Visual pipeline preview
+- Export/import as YAML
+- Duplicate from existing workflow
+
+### 6. Settings Page (`/settings`)
 
 - Tabbed layout:
   - **LLM Providers**: add/edit/remove providers, test connectivity,
@@ -65,7 +96,7 @@ delegation progress, resolve escalations, and configure LLM providers.
     session settings, security settings
   - **Account**: user profile, API keys, password change
 
-### 5. Shared Components
+### 7. Shared Components
 
 - `ChatMessage` — renders assistant/user/system messages with markdown
 - `ToolCallCard` — tool name, args summary, status, duration
@@ -75,7 +106,7 @@ delegation progress, resolve escalations, and configure LLM providers.
 - `ProviderStatusBadge` — health indicator for each provider
 - `LoadingState` — skeleton/spinner states for async operations
 
-### 6. Cross-Service Links
+### 8. Cross-Service Links
 
 - "View in Intaris" links on escalation cards and audit references
 - "View in Mnemory" links on memory references
@@ -103,6 +134,16 @@ delegation progress, resolve escalations, and configure LLM providers.
 - [ ] Reconnection works (disconnect → reconnect → replay missed events)
 - [ ] Agent list shows all agents with status
 - [ ] Agent creation form creates agent and bootstraps to Mnemory
+- [ ] Agent workflow settings (available workflows, default, step agent overrides)
+- [ ] Task kanban board shows tasks across all states (draft through done)
+- [ ] Create draft task, edit, set priority, set dependencies
+- [ ] Configure delivery target for task results/questions
+- [ ] Submit drafts (individual and batch)
+- [ ] Task detail shows workflow step progress with status per step
+- [ ] Gate prompts appear in task detail with action buttons
+- [ ] In-step question prompts appear and resume the same step
+- [ ] Workflow list shows system + user workflows
+- [ ] Workflow editor: create, edit, duplicate, export/import
 - [ ] Settings page manages LLM providers (add, test, remove)
 - [ ] Settings page manages secrets (add, edit, remove)
 - [ ] Model routing configuration works
@@ -112,6 +153,7 @@ delegation progress, resolve escalations, and configure LLM providers.
 
 ## Key References
 
-- `docs/specs/09-ui-ux.md` — UX design, WebSocket protocol, tech stack
+- `docs/specs/09-ui-ux.md` — UX design, WebSocket protocol, kanban, workflow editor
+- `docs/specs/14-workflow-engine.md` — workflow engine, task lifecycle, gates
 - `docs/specs/10-api-spec.md` — REST + WS message formats
 - `docs/specs/07-security-identity.md` — cross-service token exchange

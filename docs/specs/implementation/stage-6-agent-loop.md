@@ -1,124 +1,250 @@
-# Stage 6: Agent Loop + Delegation
+# Stage 6: Agent Loop + Workflow Engine
 
 **Status**: NOT STARTED
 **Repo**: `cognis`
 **Depends on**: Stage 4 (executor + tools) AND Stage 5 (orchestration core)
-**Estimated effort**: 4-5 days
+**Estimated effort**: 7-10 days (largest stage — core of the system)
 
 ## Objective
 
-Implement the agent loop engine that runs complete chat turns: context
-assembly, LLM call, response processing, tool execution, and turn
-finalization. Add delegation support so the main session can spawn
-background sub-sessions for heavy work while staying responsive.
+Implement the agent loop (step runner), workflow engine (step orchestration),
+and step evaluator (completion verification). After this stage, the system
+can run complete chat turns, execute multi-step workflows with evaluation
+and review loops, handle gate/pause steps, and manage background tasks
+with step-by-step progress.
+
+This is the core of Cognis. See `docs/specs/14-workflow-engine.md` for the
+full design.
 
 ## Deliverables
 
-### 1. Agent Loop Engine
+### 1. Agent Loop Engine (Step Runner)
 
 - `cognis/core/agent_loop.py`
-  - Main loop for a single session (main or delegated):
-    1. Receive user message
-    2. Decision Engine classifies (foreground or delegate)
-    3. If delegate: create child session, acknowledge, start child loop
-    4. Context assembly (parallel fetches via ContextAssembler)
-    5. LLM call (streaming via LLMProvider)
-    6. Process response:
+  - Runs a single step session as a full agentic loop:
+    1. Receive step objective (prompt + inputs from previous steps)
+    2. Context assembly (parallel fetches via ContextAssembler)
+    3. LLM call (streaming via LLMProvider)
+    4. Process response:
        - Text → stream to client
        - Tool call → Tool Router dispatch → feed result back → loop
-       - Orchestration tool → handle as controller operation
-    7. Finalize turn:
+       - `step_complete` → signal completion to workflow engine
+       - `step_request_input` → pause and return to caller (if allowed)
+       - Orchestration tool (delegate, spawn_worker, fork) → controller operation
+    5. Continue until `step_complete` is called or limits hit
+    6. Finalize step:
        - Record events to Intaris (with idempotency_key)
        - Append events to session cache
        - Remember to Mnemory (via retry queue)
        - Check compaction threshold
-  - Maximum tool calls per turn (from settings)
-  - Turn timeout handling
+  - If LLM stops without `step_complete`: re-prompt once, then treat as
+    failed attempt
+  - Maximum tool calls per step (from agent settings)
+  - Step duration timeout
+  - Runaway detection (repeated tool calls, no progress)
 
-### 2. LLM Streaming
+### 2. Controller-Injected Step Tools
+
+- `step_complete(summary, outputs, claims)` — always injected into run steps
+- `step_request_input(question, options, context)` — injected only when
+  workflow interaction mode is `step_requests` AND the current step has
+  `allow_questions=true`; resumes the same step session
+- `step_todo_write(todos)` — step-scoped cognitive aid, survives compaction
+- `step_todo_list()` — read current step todos
+
+These are controller tools, not executor tools. The controller intercepts
+them before they reach the executor.
+
+### 3. Task Queue
+
+- `cognis/core/task_queue.py`
+  - Postgres-backed priority queue with `SELECT ... FOR UPDATE SKIP LOCKED`
+  - `LISTEN/NOTIFY` for low-latency wakeups, polling fallback
+  - Task lifecycle: draft → queued → ready → running → paused → completed/failed/cancelled
+  - Dependency resolution: when a task completes, re-evaluate all dependents;
+    if all required deps met → transition to `ready`
+  - DAG validation on dependency creation (reject cycles)
+  - Concurrency enforcement (single unified capacity model for MVP):
+    - Max active steps globally (from settings)
+    - Max active steps per agent (from agent config)
+    - Paused tasks release capacity
+  - Priority: higher value picked first, FIFO within same priority
+  - Scheduled tasks: `scheduled_for` field, not picked until time arrives
+  - Result delivery: route task result back to source (chat conversation,
+    API, scheduler record)
+
+### 4. Workflow Engine
+
+- `cognis/core/workflow_engine.py`
+  - Orchestrates step execution for a task:
+    1. Resolve workflow from task
+    2. For each step:
+       a. Resolve agent (from step_agent_overrides or task's owning agent)
+       b. If run step: spawn step session, run agent loop
+       c. If gate step: pause, send gate event to caller, wait for response
+       d. Collect step output
+       e. Run step evaluator (if configured)
+       f. Handle evaluation result (advance, revise, fail)
+       g. Handle review loops (on_reject → target step with feedback)
+       h. Enforce iteration limits (max_attempts, max_loop_iterations)
+       i. Push progress events
+    3. Collect final result from last step
+    4. Return to task / notify caller
+
+### 5. Step Evaluator
+
+- `cognis/core/step_evaluator.py`
+  - Semantic completion check via independent LLM call
+  - Input: step objective, step inputs, step output + claims, task context
+  - Output: {decision: approved|revise|failed, reasoning, feedback}
+  - Uses cheap model via routing policy (e.g., `task_type: "evaluator"`)
+  - Skeptical by default — tuned to catch premature completion
+  - Custom evaluator prompts per step (from workflow definition)
+  - Timeout protection (single LLM call, not a loop)
+
+### 6. Workflow Registry
+
+- `cognis/core/workflow_registry.py`
+  - Load system workflows on startup (bundled YAML files)
+  - CRUD for user workflows (DB-backed)
+  - Workflow resolution: by ID, or by classifier match
+  - Validation: step references, loop detection, required fields
+
+### 7. LLM Streaming
 
 - Stream tokens from LLMProvider to the caller
 - Accumulate full response for event recording
 - Handle tool call responses (function calling format)
-- Track token usage per turn
+- Track token usage per step and per workflow run
 
-### 3. Session Locking
+### 8. Session Locking
 
 - `SessionLock` — one active turn per session at a time
 - Async lock keyed by session_id
 - Prevents concurrent turns in the same session
-- Different sessions run fully concurrently
+- Different sessions and steps run fully concurrently
 
-### 4. Concurrent Loop Management
+### 9. Concurrent Run Management
 
-- Manager tracks all active agent loops
-- Start/stop loops by session_id
+- Manager tracks all active workflow runs and step sessions
+- Start/stop by run_id or step_run_id
 - Enforce concurrency limits:
-  - Max concurrent sessions (global)
-  - Max concurrent delegations per session
-  - Max delegation depth
-- Clean shutdown: signal all loops, wait for finalization
+  - Max concurrent workflow runs (global)
+  - Max concurrent step sessions per run (currently 1, parallel steps later)
+  - Max sub-agents per step session
+- Clean shutdown: signal all runs, wait for step finalization
 
-### 5. Delegation
+### 10. Delegation (Within Steps)
 
 - Three modes:
   - **Agent**: delegate to a different agent (different persona, tools)
   - **Worker**: delegate to same agent (same tools, focused objective)
   - **Fork**: parallel exploration (same context, branched)
-- Delegation flow:
-  1. LLM requests delegation via orchestration tool
-  2. Decision Engine validates (within depth limit, allowed by policy)
-  3. Controller creates child session
-  4. Controller starts child agent loop concurrently
-  5. Main session receives acknowledgment + progress events
-  6. Child loop completes → structured result
-  7. Controller synthesizes result into main session context
-- Result delivery: structured format (summary, detailed_output, artifacts,
-  memory_refs, confidence, follow_up_suggestions)
+- Within a step, the agent can use delegation tools to spawn sub-agents
+- Sub-agents are Intaris child sessions under the step's parent session
+- Result delivery back to the step session
 
-### 6. Escalation Handling
+### 11. Escalation Handling
 
 - When Intaris returns `decision=escalate` for a tool call:
-  1. Task enters waiting state
+  1. Step session enters waiting state
   2. Push `escalation` event to client
   3. Start countdown timer (from `escalation_timeout_seconds`)
-  4. Wait for user decision (approve/deny via WebSocket or REST)
+  4. Wait for resolution (approve/deny via WebSocket or REST)
   5. On approve: continue tool execution
   6. On deny: inform LLM of denial
   7. On timeout: deny (configurable default)
 
-### 7. Event Recording
+### 12. Gate Handling
 
-- Batch events at turn finalization:
-  - `user_message`
+- When workflow reaches a gate step:
+  1. Workflow run enters `paused` state
+  2. Push `workflow_gate` event to caller with message, options, context
+  3. Wait for gate response (via WebSocket, REST, or main chat agent)
+  4. Process response: continue / revise(target) / cancel
+  5. Resume workflow
+
+### 13. Event Recording
+
+- Batch events at step finalization:
+  - `user_message` (from step prompt injection)
   - `assistant_message` (accumulated from stream)
   - `tool_call` + `tool_result` for each tool execution
-  - `delegation` events for child sessions
+  - `step_complete` event
+  - `delegation` events for sub-agents
 - Include `idempotency_key` for retry safety
 - Append same events to session cache after Intaris confirms
 
+### 14. Decision Engine Integration
+
+- Update Decision Engine to also select workflows:
+  - Match task description against available workflows' criteria fields
+  - Small LLM call: "Which workflow fits this task?"
+  - Respect agent's `workflow_selection_mode`
+  - Return: workflow_id + confidence
+
 ## Acceptance Criteria
 
-- [ ] Agent loop runs a complete chat turn: context → LLM → response → finalize
+### Agent Loop
+- [ ] Agent loop runs a complete step: context → LLM → tools → step_complete → finalize
 - [ ] LLM streaming delivers tokens incrementally to caller
 - [ ] Tool calls route through Intaris evaluate → executor → result → LLM
-- [ ] Multiple tool calls in a single turn work correctly
+- [ ] Multiple tool calls in a single step work correctly
+- [ ] `step_complete` tool is intercepted by controller (not sent to executor)
+- [ ] LLM stop without `step_complete` triggers re-prompt
+- [ ] `step_request_input` pauses and resumes the SAME step session
+- [ ] Step-local todo tools work and survive compaction
 - [ ] Session lock prevents concurrent turns in same session
-- [ ] Delegation creates child session and runs concurrent loop
-- [ ] Child loop result returns to parent session
-- [ ] Delegation depth limit enforced
-- [ ] Escalation pauses execution and waits for resolution
-- [ ] Events recorded to Intaris with idempotency key
-- [ ] Session cache updated after event recording
-- [ ] Remember dispatched to retry queue after turn
-- [ ] Compaction triggered when threshold exceeded
-- [ ] Turn respects max_tool_calls_per_turn limit
-- [ ] Unit tests for loop flow, delegation, escalation
+
+### Task Queue
+- [ ] Tasks can be created in draft and queued states
+- [ ] Draft → queued (submit) transition works
+- [ ] Batch submit works (multiple drafts at once)
+- [ ] Dependencies can be added/removed with DAG validation (cycles rejected)
+- [ ] Dependency resolution: completing a task transitions dependents to ready
+- [ ] Failed required dependency flags dependent task for user decision
+- [ ] Queue picks ready tasks by priority (FIFO within same priority)
+- [ ] Unified capacity limits enforced (global, per-agent)
+- [ ] Scheduled tasks wait until scheduled_for time
+- [ ] Result delivery back to source conversation works
+
+### Workflow Engine
+- [ ] Direct workflow (single step, no evaluation) works for main chat
+- [ ] Multi-step workflow executes steps in sequence
+- [ ] Step outputs accumulate and feed into subsequent steps
+- [ ] Step evaluator runs after `step_complete` and returns approve/revise/failed
+- [ ] Evaluation rejection triggers step re-attempt with feedback
+- [ ] `max_attempts` enforced per step
+- [ ] Review loops between steps work (on_reject → target step)
+- [ ] `max_loop_iterations` enforced
+- [ ] `on_exhausted` actions work: continue, fail, gate
+- [ ] Gate steps pause workflow and send structured options to caller
+- [ ] Gate response resumes workflow correctly (continue/revise/cancel)
+- [ ] Workflow selection works (explicit, agent default, automatic classifier)
+
+### Integration
+- [ ] Background workflow runs don't block main chat
+- [ ] Step progress events push to client in real-time
+- [ ] Delegation within steps creates Intaris child sessions correctly
+- [ ] Escalation pauses step execution and waits for resolution
+- [ ] Events recorded to Intaris with idempotency key per step
+- [ ] Session cache updated after step event recording
+- [ ] Remember dispatched to retry queue after step
+- [ ] Compaction works within long-running steps
+- [ ] System workflows (Direct, Research, Code with Review, Creative) functional
+
+### Testing
+- [ ] Unit tests for workflow engine state machine
+- [ ] Unit tests for step evaluator
+- [ ] Unit tests for step completion protocol
+- [ ] Unit tests for gate handling
+- [ ] Unit tests for review loop iteration
 - [ ] `ruff check` and `mypy` clean
 
 ## Key References
 
+- `docs/specs/14-workflow-engine.md` — full workflow engine design
 - `docs/specs/01-architecture.md` — agent loop, concurrency model
-- `docs/specs/03-session-model.md` — turn lifecycle (steps 1-6), delegation
+- `docs/specs/03-session-model.md` — turn lifecycle, workflow session mapping
 - `docs/specs/04-controller-executor.md` — controller/executor interaction
 - `docs/specs/06-tool-system.md` — tool routing, trust model

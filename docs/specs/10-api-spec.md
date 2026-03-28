@@ -123,6 +123,44 @@ POST   /api/secrets                            → Create/update
 DELETE /api/secrets/:name                      → Delete
 ```
 
+### Tasks (Kanban / Work Queue)
+
+```
+GET    /api/v1/tasks                              → List tasks (filterable by status, agent, priority, queue)
+POST   /api/v1/tasks                              → Create task (draft by default, or queued via source_type=chat)
+GET    /api/v1/tasks/:id                          → Task detail + workflow progress + step runs + dependencies + delivery config
+PATCH  /api/v1/tasks/:id                          → Update (title, description, priority, agent, workflow, delivery)
+DELETE /api/v1/tasks/:id                          → Cancel and remove
+POST   /api/v1/tasks/:id/submit                   → Move draft → queued (start execution)
+POST   /api/v1/tasks/:id/pause                    → Pause running task
+POST   /api/v1/tasks/:id/resume                   → Resume paused task
+POST   /api/v1/tasks/:id/cancel                   → Cancel task (any state)
+POST   /api/v1/tasks/:id/gate-response            → Respond to a gate step
+POST   /api/v1/tasks/:id/step-response            → Respond to `step_request_input` for the current step
+POST   /api/v1/tasks/batch-submit                 → Submit multiple draft tasks at once
+GET    /api/v1/tasks/:id/steps                    → List step runs with status and output
+GET    /api/v1/step-runs/:id                      → Step run detail (output, evaluation, attempts)
+POST   /api/v1/tasks/:id/dependencies             → Add dependency (depends_on task_id, required bool)
+DELETE /api/v1/tasks/:id/dependencies/:dep_id     → Remove dependency
+```
+
+Task create/update payloads also support:
+- `delivery_mode`
+- `delivery_target`
+
+These control where task results/questions are routed back (same conversation,
+specific conversation, latest active for agent, preferred channel, or silent).
+
+### Schedules (Phase 2, model in MVP)
+
+```
+GET    /api/v1/schedules                          → List schedules
+POST   /api/v1/schedules                          → Create schedule
+PUT    /api/v1/schedules/:id                      → Update schedule
+DELETE /api/v1/schedules/:id                      → Delete schedule
+POST   /api/v1/schedules/:id/trigger              → Fire schedule immediately (create task)
+```
+
 ### Escalations
 
 Cognis proxies escalation management through Intaris:
@@ -169,6 +207,26 @@ GET    /api/v1/model-routing                  → Current routing policy
 PUT    /api/v1/model-routing                  → Update routing policy (admin only)
 ```
 
+### Workflows
+
+```
+GET    /api/v1/workflows                      → List workflows (system + user)
+POST   /api/v1/workflows                      → Create user workflow
+GET    /api/v1/workflows/:id                  → Workflow details + steps
+PUT    /api/v1/workflows/:id                  → Update workflow
+DELETE /api/v1/workflows/:id                  → Delete workflow (user only)
+POST   /api/v1/workflows/:id/duplicate        → Duplicate workflow
+```
+
+### Workflow Runs
+
+```
+GET    /api/v1/tasks/:id/workflow-run         → Current workflow run status + step progress
+POST   /api/v1/tasks/:id/gate-response        → Respond to a gate step (approve/revise/cancel)
+GET    /api/v1/workflow-runs/:id/steps        → List step runs with status and output
+GET    /api/v1/step-runs/:id                  → Step run detail (output, evaluation, attempts)
+```
+
 ### System
 
 ```
@@ -194,6 +252,8 @@ Connections that do not send a valid auth message within the timeout are closed.
 {type: "message", conversation_id, content}       // User message
 {type: "cancel", conversation_id, session_id?}     // Cancel
 {type: "resolve_escalation", call_id, decision, note?}
+{type: "gate_response", task_id, step_name, action, feedback?}  // Respond to workflow gate
+{type: "step_response", task_id, step_name, action, feedback?}  // Respond to step_request_input
 {type: "reconnect", conversation_id, last_seq}     // Reconnect and replay missed events
 {type: "ping"}
 ```
@@ -219,6 +279,16 @@ Connections that do not send a valid auth message within the timeout are closed.
 {type: "escalation", conversation_id, session_id, call_id, tool_name,
  arguments, risk, reasoning, timeout_seconds}
 {type: "escalation_expired", call_id}
+
+// Workflow progress
+{type: "workflow_step_started", task_id, step_name, step_type, attempt}
+{type: "workflow_step_completed", task_id, step_name, attempt, output_summary}
+{type: "workflow_step_rejected", task_id, step_name, attempt, feedback}
+{type: "workflow_step_failed", task_id, step_name, attempt, reason}
+{type: "workflow_gate", task_id, step_name, message, options, context}
+{type: "workflow_step_question", task_id, step_name, question, options, context}
+{type: "workflow_completed", task_id, result}
+{type: "workflow_failed", task_id, reason}
 
 // Reconnection
 {type: "reconnected", conversation_id, missed_events_count}
