@@ -6,7 +6,7 @@ import asyncio
 import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import WebSocket, WebSocketDisconnect
@@ -19,10 +19,12 @@ from cognis.api.models import (
     WebSocketError,
     WebSocketPong,
 )
+from cognis.api.serializers import agent_to_response
 from cognis.core.agent_loop import PauseResolution
 from cognis.core.events import Event, EventType
 from cognis.core.session import _to_conversation_model, _to_session_model
 from cognis.logging import get_logger
+from cognis.models.agent import AgentDefinition
 from cognis.models.session import ConversationModel, SessionModel
 from cognis.models.task import TaskDelivery
 from cognis.runtime_context import current_agent_id, current_user_email
@@ -30,6 +32,15 @@ from cognis.store.models import Task
 from cognis.store.queries import get_agent, get_conversation, get_session_row, get_task
 
 logger = get_logger(__name__)
+
+_NEW_SESSION_STREAM_GRACE = timedelta(seconds=30)
+
+
+def _normalize_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value
+
 
 WS_CONNECTIONS_ACTIVE = Gauge("cognis_ws_connections_active", "Active WebSocket connections")
 WS_CONNECTIONS_TOTAL = Counter("cognis_ws_connections_total", "Total WebSocket connections")
@@ -482,10 +493,16 @@ class WebSocketConnectionManager:
             )
             return
         self.subscribe(connection, conversation_id)
+        allow_missing_stream = False
+        if session.started_at is not None:
+            allow_missing_stream = (
+                datetime.now(UTC) - _normalize_utc(session.started_at) <= _NEW_SESSION_STREAM_GRACE
+            )
         result = await self.app.state.providers.guardrails.read_events(
             session_id=session.intaris_session_id or session.session_id,
             after_seq=last_seq,
             limit=DEFAULT_REPLAY_LIMIT,
+            allow_missing_stream=allow_missing_stream,
         )
         replayed = 0
         for item in result.events:
@@ -903,6 +920,7 @@ async def _load_conversation_runtime(
         agent_row = await get_agent(session, conversation_row.agent_id)
         if agent_row is None:
             return None
+        agent_model = AgentDefinition.model_validate(agent_to_response(agent_row).model_dump())
         conversation_model = _to_conversation_model(conversation_row)
         if conversation_row.root_session_id is None:
             intention = (
@@ -917,11 +935,11 @@ async def _load_conversation_runtime(
                 intention=intention,
             )
             conversation_model.root_session_id = root_session.session_id
-            return conversation_model, root_session, agent_row
+            return conversation_model, root_session, agent_model
         session_row = await get_session_row(session, conversation_row.root_session_id)
     if session_row is None:
         return None
-    return conversation_model, _to_session_model(session_row), agent_row
+    return conversation_model, _to_session_model(session_row), agent_model
 
 
 async def _load_pending_task_prompts(app: Any, conversation_id: str) -> list[dict[str, Any]]:

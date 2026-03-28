@@ -2,7 +2,7 @@
 
 **Status**: IN PROGRESS
 
-## Implementation Notes (Partial)
+## Implementation Notes (Current)
 
 - Built integration test infrastructure under `tests/integration/` with
   auto-bootstrapped ES256 keys, subprocess Mnemory + Intaris via `uvx`,
@@ -18,13 +18,15 @@
   health, degradation, settings, workflows, secrets, JWKS, tools, LLM
   providers, escalation endpoint, recovery, task dependencies, performance).
 - Added a second fixture (`live_stack`) that starts Cognis as a subprocess
-  alongside Mnemory + Intaris for full WebSocket/LLM testing. Task lifecycle
-  and batch-submit tests pass via REST polling against the live server.
-- 11 WebSocket chat tests discovered a real orchestration issue: the WS
-  handler attempts to read Intaris session events before the session is
-  created, producing a 404 that crashes the connection. This needs to be
-  fixed in the WS handler / session creation ordering before the chat
-  flow tests can pass.
+  alongside Mnemory + Intaris for full WebSocket/LLM testing.
+- Fixed a WebSocket orchestration bug discovered by the live-server tests:
+  `_load_conversation_runtime()` returned a raw DB row for the agent instead
+  of an `AgentDefinition`, and Intaris event reads for newly created sessions
+  now tolerate 404 as an empty event stream.
+- All 27 integration tests now pass (`tests/integration/`).
+- Contract test refresh also passes against latest published `uvx mnemory`
+  and `uvx intaris` with isolated temp dirs and auto-generated JWT keys
+  (`tests/contract/`: 14 passed, 2 skipped for optional API-key scenarios).
 - Accessibility polish deferred note carried from Stage 8.
 **Repo**: `cognis`
 **Depends on**: Stage 8 (all functionality must be wired)

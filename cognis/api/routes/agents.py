@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from fastapi import APIRouter, Query, Request
 
 from cognis.api.common import (
@@ -83,11 +85,15 @@ async def create_agent_route(request: Request, payload: AgentCreateRequest) -> A
 
     definition = AgentDefinition.model_validate(agent_to_response(row).model_dump())
     try:
-        await request.app.state.providers.memory.bootstrap_agent(definition)
+        await asyncio.wait_for(
+            request.app.state.providers.memory.bootstrap_agent(definition),
+            timeout=5.0,
+        )
     except Exception:
         logger.warning(
             "Mnemory personality bootstrap failed for agent (retry via sync-personality)",
             extra={"extra_data": {"agent_id": payload.agent_id}},
+            exc_info=True,
         )
     return agent_to_response(row)
 
@@ -152,11 +158,15 @@ async def activate_agent(request: Request, agent_id: str) -> AgentResponse:
         await session.refresh(row)
     definition = AgentDefinition.model_validate(agent_to_response(row).model_dump())
     try:
-        await request.app.state.providers.memory.bootstrap_agent(definition)
+        await asyncio.wait_for(
+            request.app.state.providers.memory.bootstrap_agent(definition),
+            timeout=5.0,
+        )
     except Exception:
         logger.warning(
             "Mnemory personality bootstrap failed on activation (retry via sync-personality)",
             extra={"extra_data": {"agent_id": agent_id}},
+            exc_info=True,
         )
     return agent_to_response(row)
 

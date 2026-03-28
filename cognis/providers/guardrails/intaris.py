@@ -151,6 +151,7 @@ class IntarisProvider:
         limit: int = 0,
         types: list[str] | None = None,
         last_n: int | None = None,
+        allow_missing_stream: bool = False,
     ) -> EventReadResult:
         params: dict[str, Any] = {"after_seq": after_seq}
         if limit:
@@ -164,6 +165,8 @@ class IntarisProvider:
             params=params,
             headers=self._headers(user_email=current_user_email.get()),
         )
+        if response.status_code == 404 and allow_missing_stream:
+            return EventReadResult(events=[], last_seq=0, has_more=False)
         response.raise_for_status()
         return EventReadResult.model_validate(response.json())
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from time import monotonic
 from typing import Any
 
@@ -15,6 +16,14 @@ CACHE_HITS = Counter("cognis_session_cache_hits_total", "Session cache hits")
 CACHE_MISSES = Counter("cognis_session_cache_misses_total", "Session cache misses")
 CACHE_EVICTIONS = Counter("cognis_session_cache_evictions_total", "Session cache evictions")
 CACHE_SIZE = Gauge("cognis_session_cache_size", "Session cache entry count")
+
+_NEW_SESSION_STREAM_GRACE = timedelta(seconds=30)
+
+
+def _normalize_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value
 
 
 @dataclass(slots=True)
@@ -59,7 +68,7 @@ class SessionCache:
         entry = await self._ensure_entry(session)
         async with entry.lock:
             if not entry.initialized:
-                await self._cold_load(entry)
+                await self._cold_load(entry, session)
             else:
                 event_read = await self.guardrails.read_events(
                     session_id=entry.intaris_session_id,
@@ -183,9 +192,17 @@ class SessionCache:
             entry.touched_at = monotonic()
             return entry
 
-    async def _cold_load(self, entry: CachedSessionState) -> None:
+    async def _cold_load(self, entry: CachedSessionState, session: SessionModel) -> None:
+        allow_missing_stream = False
+        if session.started_at is not None:
+            allow_missing_stream = (
+                datetime.now(UTC) - _normalize_utc(session.started_at) <= _NEW_SESSION_STREAM_GRACE
+            )
+
         event_read = await self.guardrails.read_events(
-            session_id=entry.intaris_session_id, after_seq=0
+            session_id=entry.intaris_session_id,
+            after_seq=0,
+            allow_missing_stream=allow_missing_stream,
         )
         self._apply_intaris_events(entry, event_read.events)
         entry.last_event_seq = event_read.last_seq

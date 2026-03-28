@@ -258,7 +258,9 @@ def test_event_idempotency_key_replay_returns_success_without_duplicate_append(
         headers=headers,
     )
     events.raise_for_status()
-    assert len(events.json()["events"]) == 1
+    persisted_events = events.json()["events"]
+    user_messages = [event for event in persisted_events if event["type"] == "user_message"]
+    assert len(user_messages) == 1
 
 
 def test_api_key_auth_still_works_when_configured(

@@ -10,8 +10,14 @@ class _Guardrails:
     def __init__(self) -> None:
         self.calls: list[int] = []
 
-    async def read_events(self, session_id: str, after_seq: int = 0) -> object:
+    async def read_events(
+        self,
+        session_id: str,
+        after_seq: int = 0,
+        allow_missing_stream: bool = False,
+    ) -> object:
         del session_id
+        del allow_missing_stream
         self.calls.append(after_seq)
         if after_seq == 0:
             return type(
@@ -29,6 +35,7 @@ class _Guardrails:
                         {"seq": 4, "type": "user_message", "data": {"content": "recent"}},
                     ],
                     "last_seq": 4,
+                    "has_more": False,
                 },
             )()
         return type(
@@ -37,6 +44,7 @@ class _Guardrails:
             {
                 "events": [{"seq": 5, "type": "assistant_message", "data": {"content": "latest"}}],
                 "last_seq": 5,
+                "has_more": False,
             },
         )()
 

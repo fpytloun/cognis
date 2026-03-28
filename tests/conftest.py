@@ -16,7 +16,9 @@ import pytest
 def _healthcheck(url: str) -> None:
     try:
         response = httpx.get(f"{url.rstrip('/')}/health", timeout=5.0)
-        response.raise_for_status()
+        # JWT-protected services may return 401 on /health while still being up.
+        if response.status_code not in {200, 401, 403}:
+            response.raise_for_status()
     except Exception as exc:  # pragma: no cover - integration guard
         pytest.skip(f"Live service unavailable at {url}: {exc}")
 
