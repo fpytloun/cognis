@@ -1,4 +1,4 @@
-"""Workflow engine — orchestrates step execution for tasks.
+"""Workflow engine — orchestrates direct turns and workflow steps.
 
 Manages the between-step layer: step sequencing, gates, review loops,
 evaluation, and pause/resume. Uses the AgentLoop for within-step
@@ -7,9 +7,10 @@ execution.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 from prometheus_client import Counter, Histogram
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -17,8 +18,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from cognis.core.agent_loop import (
     AgentLoop,
     PauseWaiter,
+    PendingPause,
     StepContext,
+    StepInterrupted,
     TokenCallback,
+    ToolCallCallback,
 )
 from cognis.core.events import Event, EventBus, EventType
 from cognis.core.step_evaluator import StepEvaluator
@@ -71,6 +75,10 @@ REVIEW_LOOPS = Counter(
 ProgressCallback = TokenCallback
 
 
+async def _noop_cleanup() -> None:
+    """No-op cleanup callback for shared runtimes."""
+
+
 class WorkflowEngine:
     """Orchestrates step execution for a task."""
 
@@ -95,12 +103,57 @@ class WorkflowEngine:
         self._event_bus = event_bus
         self._pause_waiter = pause_waiter
 
+    async def run_direct_turn(
+        self,
+        *,
+        conversation: Any,
+        session: Any,
+        agent: AgentDefinition,
+        user_message: str,
+        on_progress: ProgressCallback | None = None,
+        on_tool_call: ToolCallCallback | None = None,
+        cancel_event: asyncio.Event | None = None,
+    ) -> StepOutput | None:
+        """Run the hot-path direct workflow through a workflow-engine entrypoint.
+
+        Direct turns stay single-step and do not create Task or StepRun rows,
+        but the engine remains the owner of the orchestration entrypoint so
+        metrics, runtime resolution, and future hooks stay centralized.
+        """
+        tool_registry, executor_connection, cleanup = await self._resolve_step_runtime(
+            agent=agent,
+            user_email=session.user_email,
+        )
+        direct_step = StepDefinition(name="direct", type="run", prompt=user_message)
+        ctx = StepContext(
+            step_definition=direct_step,
+            session=session,
+            conversation=conversation,
+            agent=agent,
+            is_direct=True,
+            user_message=user_message,
+            interaction_mode="explicit_gates",
+            tool_registry=tool_registry,
+            executor_connection=executor_connection,
+            cancel_event=cancel_event,
+        )
+
+        try:
+            return await self._agent_loop.run_step(
+                ctx,
+                on_token=on_progress,
+                on_tool_call=on_tool_call,
+            )
+        finally:
+            await cleanup()
+
     async def execute_workflow(
         self,
         task: TaskModel,
         workflow: Workflow,
         *,
         on_progress: ProgressCallback | None = None,
+        cancel_event: asyncio.Event | None = None,
     ) -> TaskModel:
         """Execute a full workflow for a task.
 
@@ -127,6 +180,7 @@ class WorkflowEngine:
         try:
             while state.current_step_index < len(workflow.steps):
                 step_def = workflow.steps[state.current_step_index]
+                state.current_step_status = "running"
 
                 if step_def.type == "gate":
                     gate_result = await self._handle_gate_step(task, step_def, state, workflow)
@@ -146,7 +200,12 @@ class WorkflowEngine:
 
                 # Run step
                 step_result = await self._execute_run_step(
-                    task, step_def, state, workflow, on_progress=on_progress
+                    task,
+                    step_def,
+                    state,
+                    workflow,
+                    on_progress=on_progress,
+                    cancel_event=cancel_event,
                 )
 
                 if step_result is None:
@@ -200,6 +259,9 @@ class WorkflowEngine:
                         continue
 
                 # Step approved or no evaluation — advance
+                state.current_step_status = None
+                state.pending_pause_type = None
+                state.pending_pause_payload = None
                 state.current_step_index += 1
                 await self._persist_workflow_state(task)
 
@@ -217,10 +279,14 @@ class WorkflowEngine:
             # Workflow completed
             if state.status != "failed":
                 state.status = "completed"
+                state.current_step_status = None
+                state.pending_pause_type = None
+                state.pending_pause_payload = None
                 task.status = TaskStatus.COMPLETED
                 task.result_summary = self._build_result_summary(state, workflow)
                 task.completed_at = datetime.now(UTC)
             else:
+                state.current_step_status = None
                 task.status = TaskStatus.FAILED
                 task.completed_at = datetime.now(UTC)
 
@@ -231,6 +297,22 @@ class WorkflowEngine:
                 status=task.status,
             ).inc()
 
+        except StepInterrupted:
+            current_status = await self._read_task_status(task.task_id)
+            if current_status == TaskStatus.CANCELLED:
+                state.status = "cancelled"
+                state.current_step_status = None
+                state.pending_pause_type = None
+                state.pending_pause_payload = None
+                task.status = TaskStatus.CANCELLED
+                task.completed_at = datetime.now(UTC)
+                await self._persist_task_final(task)
+                WORKFLOWS_TOTAL.labels(workflow_name=workflow.name, status=task.status).inc()
+            else:
+                state.status = "paused"
+                task.status = TaskStatus.PAUSED
+                await self._persist_workflow_state(task)
+                WORKFLOWS_TOTAL.labels(workflow_name=workflow.name, status=task.status).inc()
         except Exception:
             logger.exception(
                 "Workflow execution failed",
@@ -246,7 +328,8 @@ class WorkflowEngine:
         WORKFLOW_DURATION.labels(workflow_name=workflow.name).observe(duration)
 
         # Deliver result
-        await self._deliver_task_result(task)
+        if task.status in {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}:
+            await self._deliver_task_result(task)
 
         return task
 
@@ -258,6 +341,7 @@ class WorkflowEngine:
         workflow: Workflow,
         *,
         on_progress: ProgressCallback | None = None,
+        cancel_event: asyncio.Event | None = None,
     ) -> StepOutput | None:
         """Execute a single run step via the agent loop."""
 
@@ -282,6 +366,7 @@ class WorkflowEngine:
 
         # Create StepRun record
         step_run_id = f"sr_{uuid.uuid4().hex}"
+        attempt = state.loop_iterations.get(f"attempts:{step_def.name}", 1)
         async with self._session_factory() as db_session:
             await create_step_run(
                 db_session,
@@ -289,6 +374,7 @@ class WorkflowEngine:
                 step_name=step_def.name,
                 step_type=step_def.type,
                 agent_id=agent.agent_id,
+                attempt=attempt,
                 step_run_id=step_run_id,
             )
             await update_step_run(
@@ -323,8 +409,10 @@ class WorkflowEngine:
             state.last_evaluation_feedback = None  # Clear after injection
 
         # Resolve tool registry and executor for this step
-        tool_registry = getattr(self._providers, "_tool_registry", None)
-        executor_connection = getattr(self._providers, "_executor_connection", None)
+        tool_registry, executor_connection, cleanup = await self._resolve_step_runtime(
+            agent=agent,
+            user_email=task.created_by,
+        )
 
         # Build step context
         ctx = StepContext(
@@ -340,10 +428,26 @@ class WorkflowEngine:
             interaction_mode=workflow.interaction.mode,
             tool_registry=tool_registry,
             executor_connection=executor_connection,
+            workflow_state=state,
+            cancel_event=cancel_event,
         )
 
         # Run agent loop
-        output = await self._agent_loop.run_step(ctx, on_token=on_progress)
+        try:
+            output = await self._agent_loop.run_step(ctx, on_token=on_progress)
+        except StepInterrupted:
+            current_status = await self._read_task_status(task.task_id)
+            async with self._session_factory() as db_session:
+                await update_step_run(
+                    db_session,
+                    step_run_id,
+                    status="cancelled" if current_status == TaskStatus.CANCELLED else "paused",
+                    completed_at=datetime.now(UTC),
+                )
+                await db_session.commit()
+            raise
+        finally:
+            await cleanup()
 
         # Update StepRun record
         async with self._session_factory() as db_session:
@@ -405,13 +509,34 @@ class WorkflowEngine:
 
         # Pause workflow
         state.status = "paused"
+        state.current_step_status = "paused"
+        pause_id = f"gate_{uuid.uuid4().hex[:12]}"
+        state.pending_pause_type = "gate"
+        state.pending_pause_payload = {
+            "pause_id": pause_id,
+            "task_id": task.task_id,
+            "step_name": step_def.name,
+            "message": gate.message,
+            "context": gate_context,
+            "options": [opt.model_dump(mode="json") for opt in gate.options],
+        }
         await self._persist_workflow_state(task)
 
         async with self._session_factory() as db_session:
             await update_task_status(db_session, task.task_id, "paused")
             await db_session.commit()
 
-        pause_id = f"gate_{uuid.uuid4().hex[:12]}"
+        self._pause_waiter.register(
+            PendingPause(
+                pause_id=pause_id,
+                pause_type="gate",
+                task_id=task.task_id,
+                step_name=step_def.name,
+                question=gate.message,
+                options=[opt.model_dump(mode="json") for opt in gate.options],
+                context=gate_context,
+            )
+        )
         await self._event_bus.publish(
             Event(
                 type=EventType.WORKFLOW_GATE,
@@ -437,6 +562,10 @@ class WorkflowEngine:
 
         # Resume
         state.status = "running"
+        state.current_step_status = "running"
+        state.pending_pause_type = None
+        state.pending_pause_payload = None
+        await self._persist_workflow_state(task)
         async with self._session_factory() as db_session:
             await update_task_status(db_session, task.task_id, "running")
             await db_session.commit()
@@ -618,11 +747,14 @@ class WorkflowEngine:
             )
 
         # Publish event for WebSocket delivery
+        event_type = EventType.TASK_FAILED
+        if task.status == TaskStatus.COMPLETED:
+            event_type = EventType.TASK_COMPLETED
+        elif task.status == TaskStatus.CANCELLED:
+            event_type = EventType.TASK_CANCELLED
         await self._event_bus.publish(
             Event(
-                type=EventType.TASK_COMPLETED
-                if task.status == TaskStatus.COMPLETED
-                else EventType.TASK_FAILED,
+                type=event_type,
                 data={
                     "task_id": task.task_id,
                     "conversation_id": target_conversation_id,
@@ -663,6 +795,36 @@ class WorkflowEngine:
                     task.workflow_state.model_dump(mode="json"),
                 )
             await db_session.commit()
+
+    async def _read_task_status(self, task_id: str) -> TaskStatus:
+        """Read the latest persisted task status."""
+        from cognis.store.queries import get_task
+
+        async with self._session_factory() as db_session:
+            row = await get_task(db_session, task_id)
+        if row is None:
+            return TaskStatus.FAILED
+        return TaskStatus(str(row.status))
+
+    async def _resolve_step_runtime(
+        self,
+        *,
+        agent: AgentDefinition,
+        user_email: str,
+    ) -> tuple[Any, Any, Any]:
+        """Resolve the tool registry and executor connection for one step/turn."""
+        runtime_factory = getattr(self._providers, "_step_runtime_factory", None)
+        if callable(runtime_factory):
+            return cast(
+                tuple[Any, Any, Any],
+                await runtime_factory(agent=agent, user_email=user_email),
+            )
+
+        return (
+            getattr(self._providers, "_tool_registry", None),
+            getattr(self._providers, "_executor_connection", None),
+            _noop_cleanup,
+        )
 
     async def _resolve_step_agent(
         self,

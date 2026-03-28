@@ -47,19 +47,20 @@ POST   /api/v1/auth/exchange-token → Issue short-lived token for Intaris/Mnemo
 ### Conversations
 
 ```
-GET    /api/conversations                     → List conversations
-POST   /api/conversations                     → Create conversation
-GET    /api/conversations/:id                 → Get details
-PATCH  /api/conversations/:id                 → Update (title, archive)
-DELETE /api/conversations/:id                 → Delete
-GET    /api/conversations/:id/messages        → Get history (from Intaris events)
-GET    /api/conversations/:id/sessions        → List sessions
-GET    /api/conversations/:id/delegations     → Active delegations
+GET    /api/v1/conversations                  → List conversations
+POST   /api/v1/conversations                  → Create conversation
+GET    /api/v1/conversations/:id              → Get details
+PATCH  /api/v1/conversations/:id              → Update (title, archive)
+DELETE /api/v1/conversations/:id              → Delete
+DELETE /api/v1/conversations/:id/purge        → Purge metadata (+ Intaris cascade when provider contract supports it)
+GET    /api/v1/conversations/:id/messages     → Get history (from Intaris events)
+GET    /api/v1/conversations/:id/sessions     → List sessions
+GET    /api/v1/conversations/:id/delegations  → Active delegations
 ```
 
 #### Get Messages (proxied from Intaris events)
 ```http
-GET /api/conversations/conv_abc/messages?limit=50&after_seq=100
+GET /api/v1/conversations/conv_abc/messages?limit=50&after_seq=100
 
 → 200 OK
 {
@@ -88,39 +89,39 @@ The controller reads from Intaris event store and formats for the client.
 ### Agents
 
 ```
-GET    /api/agents                            → List agents
-POST   /api/agents                            → Create agent
-GET    /api/agents/:id                        → Get details
-PUT    /api/agents/:id                        → Update
-DELETE /api/agents/:id                        → Archive
-POST   /api/agents/:id/activate              → Activate draft
-POST   /api/agents/:id/suspend               → Suspend
-POST   /api/agents/:id/sync-personality      → Sync to Mnemory
-GET    /api/agents/:id/card                   → A2A Agent Card
+GET    /api/v1/agents                         → List agents
+POST   /api/v1/agents                         → Create agent
+GET    /api/v1/agents/:id                     → Get details
+PUT    /api/v1/agents/:id                     → Update
+DELETE /api/v1/agents/:id                     → Archive
+POST   /api/v1/agents/:id/activate           → Activate draft
+POST   /api/v1/agents/:id/suspend            → Suspend
+POST   /api/v1/agents/:id/sync-personality   → Sync to Mnemory
+GET    /api/v1/agents/:id/card                → A2A Agent Card (deferred unless public discovery metadata is available)
 ```
 
 ### Sessions
 
 ```
-GET    /api/sessions/:id                      → Session details
-GET    /api/sessions/:id/events               → Events (proxied from Intaris)
-POST   /api/sessions/:id/cancel               → Cancel
+GET    /api/v1/sessions/:id                   → Session details
+GET    /api/v1/sessions/:id/events            → Events (proxied from Intaris)
+POST   /api/v1/sessions/:id/cancel            → Cancel
 ```
 
 ### Tools
 
 ```
-GET    /api/tools                             → List all available tools
-GET    /api/agents/:id/tools                  → Tools for agent
-GET    /api/mcp/servers                       → List MCP servers
+GET    /api/v1/tools                          → List all available tools
+GET    /api/v1/agents/:id/tools               → Tools for agent
+GET    /api/v1/mcp/servers                    → List MCP servers
 ```
 
 ### Secrets
 
 ```
-GET    /api/secrets                            → List (metadata only)
-POST   /api/secrets                            → Create/update
-DELETE /api/secrets/:name                      → Delete
+GET    /api/v1/secrets                         → List (metadata only)
+POST   /api/v1/secrets                         → Create/update
+DELETE /api/v1/secrets/:name                   → Delete
 ```
 
 ### Tasks (Kanban / Work Queue)
@@ -166,13 +167,13 @@ POST   /api/v1/schedules/:id/trigger              → Fire schedule immediately 
 Cognis proxies escalation management through Intaris:
 
 ```
-GET    /api/escalations                       → List pending (via Intaris /audit)
-POST   /api/escalations/:call_id/resolve      → Resolve (via Intaris /decision)
+GET    /api/v1/escalations                    → List pending (via Intaris /audit)
+POST   /api/v1/escalations/:call_id/resolve   → Resolve (via Intaris /decision)
 ```
 
 #### Resolve Escalation
 ```http
-POST /api/escalations/call_abc/resolve
+POST /api/v1/escalations/call_abc/resolve
 {"decision": "approve", "note": "Looks safe"}
 
 → 200 {"call_id": "call_abc", "decision": "approve"}
@@ -223,7 +224,7 @@ POST   /api/v1/workflows/:id/duplicate        → Duplicate workflow
 ```
 GET    /api/v1/tasks/:id/workflow-run         → Current workflow run status + step progress
 POST   /api/v1/tasks/:id/gate-response        → Respond to a gate step (approve/revise/cancel)
-GET    /api/v1/workflow-runs/:id/steps        → List step runs with status and output
+GET    /api/v1/workflow-runs/:id/steps        → Deferred in MVP; task-backed workflow state uses /api/v1/tasks/:id/steps instead
 GET    /api/v1/step-runs/:id                  → Step run detail (output, evaluation, attempts)
 ```
 
@@ -234,7 +235,7 @@ GET    /api/health                            → Health check
 GET    /api/health/providers                  → Provider status
 GET    /api/metrics                           → Prometheus metrics
 GET    /.well-known/jwks.json                 → Public keys for JWT validation
-GET    /.well-known/agent.json                → Default agent card (A2A)
+GET    /.well-known/agent.json                → Default agent card (A2A; deferred unless public discovery metadata is configured)
 ```
 
 ## WebSocket API
@@ -346,7 +347,7 @@ JSON-RPC protocol specification.
 
 Cursor-based:
 ```http
-GET /api/conversations?limit=20&cursor=conv_abc
+GET /api/v1/conversations?limit=20&cursor=conv_abc
 
 → {items: [...], cursor: "conv_next", has_more: true}
 ```

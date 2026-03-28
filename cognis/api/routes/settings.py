@@ -1,0 +1,212 @@
+"""Settings, LLM providers, and model routing routes."""
+
+from __future__ import annotations
+
+from collections import defaultdict
+
+from fastapi import APIRouter, Request
+
+from cognis.api.common import api_exception, require_admin, require_current_user
+from cognis.api.models import (
+    CursorPage,
+    LLMProviderRequest,
+    LLMProviderResponse,
+    LLMProviderUpdateRequest,
+    ModelRoutingResponse,
+    ModelRoutingUpdateRequest,
+    SettingResponse,
+    SettingsCategoryResponse,
+    SettingUpdateRequest,
+)
+from cognis.api.serializers import llm_provider_to_response, setting_to_response
+from cognis.store.queries import (
+    create_llm_provider,
+    delete_llm_provider,
+    delete_model_routing,
+    get_llm_provider,
+    get_setting,
+    list_llm_providers,
+    list_model_routing,
+    list_settings,
+    update_llm_provider,
+    upsert_model_routing,
+    upsert_setting,
+)
+
+router = APIRouter(tags=["settings"])
+
+
+@router.get("/api/v1/settings", response_model=list[SettingsCategoryResponse])
+async def settings_list(request: Request) -> list[SettingsCategoryResponse]:
+    require_current_user(request)
+    async with request.app.state.session_factory() as session:
+        rows = await list_settings(session)
+    grouped: dict[str, list[SettingResponse]] = defaultdict(list)
+    for row in rows:
+        grouped[row.category].append(setting_to_response(row))
+    return [
+        SettingsCategoryResponse(category=category, items=items)
+        for category, items in sorted(grouped.items())
+    ]
+
+
+@router.get("/api/v1/settings/{key}", response_model=SettingResponse)
+async def setting_detail(request: Request, key: str) -> SettingResponse:
+    require_current_user(request)
+    async with request.app.state.session_factory() as session:
+        row = await get_setting(session, key)
+    if row is None:
+        raise api_exception(404, "not_found", "Setting not found")
+    return setting_to_response(row)
+
+
+@router.put("/api/v1/settings/{key}", response_model=SettingResponse)
+async def setting_update(
+    request: Request, key: str, payload: SettingUpdateRequest
+) -> SettingResponse:
+    user = require_admin(request)
+    category = key.split(".", 1)[0] if "." in key else "general"
+    async with request.app.state.session_factory() as session:
+        row = await upsert_setting(
+            session,
+            key=key,
+            value=payload.value,
+            category=category,
+            updated_by=user.email,
+        )
+        await session.commit()
+        await session.refresh(row)
+    return setting_to_response(row)
+
+
+@router.get("/api/v1/llm-providers", response_model=CursorPage[LLMProviderResponse])
+async def llm_provider_list(request: Request) -> CursorPage[LLMProviderResponse]:
+    require_admin(request)
+    async with request.app.state.session_factory() as session:
+        rows = await list_llm_providers(session)
+    items = [llm_provider_to_response(row) for row in rows]
+    return CursorPage(items=items, cursor=None, has_more=False)
+
+
+@router.post("/api/v1/llm-providers", response_model=LLMProviderResponse)
+async def llm_provider_create(request: Request, payload: LLMProviderRequest) -> LLMProviderResponse:
+    require_admin(request)
+    async with request.app.state.session_factory() as session:
+        existing = await get_llm_provider(session, payload.provider_id)
+        if existing is not None:
+            raise api_exception(409, "conflict", "LLM provider already exists")
+        row = await create_llm_provider(
+            session,
+            provider_id=payload.provider_id,
+            display_name=payload.display_name,
+            location=payload.location,
+            backend=payload.backend,
+            config=payload.config,
+            status=payload.status,
+        )
+        await session.commit()
+        await session.refresh(row)
+    return llm_provider_to_response(row)
+
+
+@router.get("/api/v1/llm-providers/{provider_id}", response_model=LLMProviderResponse)
+async def llm_provider_detail(request: Request, provider_id: str) -> LLMProviderResponse:
+    require_admin(request)
+    async with request.app.state.session_factory() as session:
+        row = await get_llm_provider(session, provider_id)
+    if row is None:
+        raise api_exception(404, "not_found", "LLM provider not found")
+    return llm_provider_to_response(row)
+
+
+@router.put("/api/v1/llm-providers/{provider_id}", response_model=LLMProviderResponse)
+async def llm_provider_update(
+    request: Request,
+    provider_id: str,
+    payload: LLMProviderUpdateRequest,
+) -> LLMProviderResponse:
+    require_admin(request)
+    async with request.app.state.session_factory() as session:
+        ok = await update_llm_provider(
+            session,
+            provider_id,
+            display_name=payload.display_name,
+            location=payload.location,
+            backend=payload.backend,
+            config=payload.config,
+            status=payload.status,
+        )
+        if not ok:
+            raise api_exception(404, "not_found", "LLM provider not found")
+        row = await get_llm_provider(session, provider_id)
+        await session.commit()
+    if row is None:
+        raise api_exception(404, "not_found", "LLM provider not found")
+    return llm_provider_to_response(row)
+
+
+@router.delete("/api/v1/llm-providers/{provider_id}", response_model=dict)
+async def llm_provider_delete(request: Request, provider_id: str) -> dict[str, bool]:
+    require_admin(request)
+    async with request.app.state.session_factory() as session:
+        ok = await delete_llm_provider(session, provider_id)
+        await session.commit()
+    return {"ok": ok}
+
+
+@router.post("/api/v1/llm-providers/{provider_id}/test", response_model=dict)
+async def llm_provider_test(request: Request, provider_id: str) -> dict[str, object]:
+    require_admin(request)
+    async with request.app.state.session_factory() as session:
+        row = await get_llm_provider(session, provider_id)
+    if row is None:
+        raise api_exception(404, "not_found", "LLM provider not found")
+    health = await request.app.state.providers.llm.health()
+    return {
+        "ok": health.status == "healthy",
+        "provider_id": provider_id,
+        "health": health.model_dump(),
+    }
+
+
+@router.get("/api/v1/model-routing", response_model=ModelRoutingResponse)
+async def model_routing_get(request: Request) -> ModelRoutingResponse:
+    require_current_user(request)
+    async with request.app.state.session_factory() as session:
+        rows = await list_model_routing(session)
+    items = {row.task_type: row.model for row in rows}
+    return ModelRoutingResponse(
+        default=items.get("default"),
+        classifier=items.get("classifier"),
+        compaction=items.get("compaction"),
+        simple_inline=items.get("simple_inline"),
+        items=items,
+    )
+
+
+@router.put("/api/v1/model-routing", response_model=ModelRoutingResponse)
+async def model_routing_put(
+    request: Request,
+    payload: ModelRoutingUpdateRequest,
+) -> ModelRoutingResponse:
+    require_admin(request)
+    updates = {
+        "default": payload.default,
+        "classifier": payload.classifier,
+        "compaction": payload.compaction,
+        "simple_inline": payload.simple_inline,
+        **payload.items,
+    }
+    async with request.app.state.session_factory() as session:
+        for task_type, model in updates.items():
+            if model is None:
+                await delete_model_routing(session, task_type)
+                continue
+            await upsert_model_routing(
+                session,
+                task_type=task_type,
+                provider_id=None,
+                model=model,
+            )
+        await session.commit()
+    return await model_routing_get(request)

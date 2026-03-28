@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class InteractionMode(BaseModel):
@@ -106,7 +106,10 @@ class WorkflowState(BaseModel):
     """Runtime workflow state persisted on the Task entity."""
 
     current_step_index: int = 0
-    step_outputs: dict[str, dict[str, Any]] = {}
-    loop_iterations: dict[str, int] = {}  # "step_a->step_b" -> count
-    status: str = "running"  # "running" | "paused" | "completed" | "failed"
+    step_outputs: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    loop_iterations: dict[str, int] = Field(default_factory=dict)  # "step_a->step_b" -> count
+    status: str = "running"  # "running" | "paused" | "completed" | "failed" | "cancelled"
     last_evaluation_feedback: str | None = None  # Feedback from evaluator for retries
+    pending_pause_type: str | None = None
+    pending_pause_payload: dict[str, Any] | None = None
+    current_step_status: str | None = None

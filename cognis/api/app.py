@@ -6,22 +6,43 @@ import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, Request, WebSocket
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from cognis.api.common import error_response
 from cognis.api.middleware import AuthenticationMiddleware
+from cognis.api.routes.agents import router as agents_router
 from cognis.api.routes.auth import router as auth_router
+from cognis.api.routes.conversations import router as conversations_router
+from cognis.api.routes.escalations import router as escalations_router
+from cognis.api.routes.secrets import router as secrets_router
+from cognis.api.routes.sessions import router as sessions_router
+from cognis.api.routes.settings import router as settings_router
 from cognis.api.routes.system import router as system_router
+from cognis.api.routes.tasks import router as tasks_router
+from cognis.api.routes.tools import router as tools_router
+from cognis.api.routes.workflows import router as workflows_router
+from cognis.api.runtime_support import build_shared_runtime, build_step_runtime_factory
 from cognis.api.websocket import handle_websocket
 from cognis.bootstrap import bootstrap_runtime
 from cognis.config import load_config
+from cognis.core.agent_loop import AgentLoop, PauseWaiter, SessionLock
 from cognis.core.compaction import CompactionStrategy
 from cognis.core.context import ContextAssembler
 from cognis.core.decision import DecisionEngine
+from cognis.core.events import EventBus
 from cognis.core.remember_queue import RememberRetryQueue
 from cognis.core.session import SessionManager
 from cognis.core.session_cache import SessionCache
-from cognis.logging import setup_logging
+from cognis.core.step_evaluator import StepEvaluator
+from cognis.core.task_queue import TaskQueue
+from cognis.core.tool_router import ToolRouter
+from cognis.core.workflow_engine import WorkflowEngine
+from cognis.core.workflow_registry import WorkflowRegistry
+from cognis.logging import get_logger, setup_logging
 from cognis.providers.auth.jwt import JWTAuthProvider
 from cognis.providers.registry import build_provider_registry
 from cognis.security import LoginRateLimiter, create_password_hasher
@@ -29,6 +50,9 @@ from cognis.security import LoginRateLimiter, create_password_hasher
 
 def _as_int(value: object, default: int) -> int:
     return value if isinstance(value, int) else default
+
+
+logger = get_logger(__name__)
 
 
 def create_app() -> FastAPI:
@@ -88,7 +112,59 @@ def create_app() -> FastAPI:
             session_factory=session_factory,
             llm=providers.llm,
         )
-        await session_manager.recover_stale_sessions()
+        event_bus = EventBus()
+        pause_waiter = PauseWaiter()
+        session_lock = SessionLock()
+        tool_router = await ToolRouter.from_session_factory(providers.guardrails, session_factory)
+        workflow_registry = WorkflowRegistry(session_factory)
+        step_evaluator = await StepEvaluator.from_session_factory(
+            session_factory=session_factory,
+            llm=providers.llm,
+        )
+        (
+            shared_tool_registry,
+            shared_executor_connection,
+            shared_runtime_cleanup,
+        ) = await build_shared_runtime(providers)
+        providers._tool_registry = shared_tool_registry  # type: ignore[attr-defined]
+        providers._executor_connection = shared_executor_connection  # type: ignore[attr-defined]
+        providers._step_runtime_factory = build_step_runtime_factory(  # type: ignore[attr-defined]
+            providers=providers,
+            shared_registry=shared_tool_registry,
+            shared_connection=shared_executor_connection,
+        )
+        agent_loop = AgentLoop(
+            providers=providers,
+            session_manager=session_manager,
+            session_cache=session_cache,
+            context_assembler=context_assembler,
+            compaction_strategy=compaction_strategy,
+            tool_router=tool_router,
+            remember_queue=remember_queue,
+            event_bus=event_bus,
+            session_lock=session_lock,
+            pause_waiter=pause_waiter,
+        )
+        workflow_engine = WorkflowEngine(
+            session_factory=session_factory,
+            providers=providers,
+            agent_loop=agent_loop,
+            step_evaluator=step_evaluator,
+            workflow_registry=workflow_registry,
+            session_manager=session_manager,
+            event_bus=event_bus,
+            pause_waiter=pause_waiter,
+        )
+        task_queue = await TaskQueue.from_session_factory(
+            session_factory=session_factory,
+            workflow_engine=workflow_engine,
+            workflow_registry=workflow_registry,
+            event_bus=event_bus,
+        )
+        recovered_sessions = await session_manager.recover_stale_sessions()
+        recovered_tasks = await task_queue.recover_stale_tasks()
+        recovered_paused_tasks = await task_queue.recover_paused_tasks()
+        await task_queue.start()
 
         app.state.config = config_runtime
         app.state.engine = engine
@@ -104,9 +180,25 @@ def create_app() -> FastAPI:
         app.state.context_assembler = context_assembler
         app.state.compaction_strategy = compaction_strategy
         app.state.decision_engine = decision_engine
+        app.state.event_bus = event_bus
+        app.state.pause_waiter = pause_waiter
+        app.state.session_lock = session_lock
+        app.state.tool_router = tool_router
+        app.state.workflow_registry = workflow_registry
+        app.state.step_evaluator = step_evaluator
+        app.state.agent_loop = agent_loop
+        app.state.workflow_engine = workflow_engine
+        app.state.task_queue = task_queue
+        app.state.tool_registry = shared_tool_registry
+        app.state.executor_connection = shared_executor_connection
+        app.state.recovered_session_ids = recovered_sessions
+        app.state.recovered_task_ids = recovered_tasks
+        app.state.recovered_paused_task_ids = recovered_paused_tasks
 
         yield
 
+        await task_queue.stop()
+        await shared_runtime_cleanup()
         await remember_queue.stop()
         await providers.executor.cleanup()
         await providers.memory.client.aclose()
@@ -124,6 +216,46 @@ def create_app() -> FastAPI:
     app.add_middleware(AuthenticationMiddleware)
     app.include_router(auth_router)
     app.include_router(system_router)
+    app.include_router(conversations_router)
+    app.include_router(agents_router)
+    app.include_router(sessions_router)
+    app.include_router(settings_router)
+    app.include_router(tasks_router)
+    app.include_router(workflows_router)
+    app.include_router(secrets_router)
+    app.include_router(tools_router)
+    app.include_router(escalations_router)
+
+    @app.exception_handler(StarletteHTTPException)
+    async def http_exception_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+        if isinstance(exc.detail, dict) and exc.detail.get("code"):
+            return error_response(
+                exc.status_code,
+                str(exc.detail.get("code")),
+                str(exc.detail.get("message", "Request failed")),
+                details=exc.detail.get("details"),
+            )
+        return error_response(exc.status_code, "request_error", str(exc.detail))
+
+    @app.exception_handler(RequestValidationError)
+    async def request_validation_exception_handler(
+        request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        return error_response(
+            422,
+            "validation_error",
+            "Request validation failed",
+            details={"errors": exc.errors()},
+        )
+
+    @app.exception_handler(ValueError)
+    async def value_error_handler(request: Request, exc: ValueError) -> JSONResponse:
+        return error_response(400, "validation_error", str(exc))
+
+    @app.exception_handler(Exception)
+    async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+        logger.exception("Unhandled API exception")
+        return error_response(500, "internal_error", "Internal server error")
 
     @app.websocket("/api/ws")
     async def websocket_endpoint(websocket: WebSocket) -> None:

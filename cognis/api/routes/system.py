@@ -6,6 +6,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
+from cognis.api.common import api_exception
 from cognis.api.models import HealthResponse
 
 router = APIRouter()
@@ -38,3 +39,12 @@ async def metrics() -> Response:
 @router.get("/.well-known/jwks.json")
 async def jwks(request: Request) -> JSONResponse:
     return JSONResponse(content=request.app.state.auth_provider.jwks())
+
+
+@router.get("/.well-known/agent.json")
+async def default_agent_card() -> JSONResponse:
+    raise api_exception(
+        501,
+        "not_implemented",
+        "Default public agent card requires additional discovery metadata and is deferred in MVP.",
+    )

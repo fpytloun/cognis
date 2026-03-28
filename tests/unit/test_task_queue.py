@@ -10,10 +10,14 @@ from cognis.store.database import create_engine, create_session_factory
 from cognis.store.models import Agent, Base, User
 from cognis.store.queries import (
     add_task_dependency,
+    create_step_run,
     create_task,
+    fail_running_step_runs_for_task,
+    get_step_run,
     get_task,
     list_tasks_by_status,
     pick_ready_task,
+    update_step_run,
     update_task_status,
     update_task_workflow_state,
 )
@@ -259,5 +263,57 @@ async def test_list_tasks_by_status(tmp_path: object) -> None:
             assert len(queued) == 2
             # Higher priority first
             assert queued[0].priority == 10
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_finalize_active_step_runs_marks_paused_and_running_rows(tmp_path: object) -> None:
+    engine, factory = await _bootstrap_db(tmp_path)
+    try:
+        async with factory() as session:
+            row = await create_task(
+                session,
+                created_by="user@test.com",
+                agent_id="agent-1",
+                title="Cancelable task",
+                status="running",
+                task_id="task_cancel",
+            )
+            await create_step_run(
+                session,
+                task_id=row.task_id,
+                step_name="implement",
+                step_type="run",
+                agent_id="agent-1",
+                step_run_id="sr_running",
+            )
+            await create_step_run(
+                session,
+                task_id=row.task_id,
+                step_name="review",
+                step_type="run",
+                agent_id="agent-1",
+                step_run_id="sr_paused",
+            )
+            await update_step_run(session, "sr_running", status="running")
+            await update_step_run(session, "sr_paused", status="paused")
+            await session.commit()
+
+        async with factory() as session:
+            updated = await fail_running_step_runs_for_task(
+                session,
+                "task_cancel",
+                datetime.now(UTC),
+                final_status="cancelled",
+            )
+            await session.commit()
+            assert updated == 2
+
+        async with factory() as session:
+            running = await get_step_run(session, "sr_running")
+            paused = await get_step_run(session, "sr_paused")
+            assert running is not None and running.status == "cancelled"
+            assert paused is not None and paused.status == "cancelled"
     finally:
         await engine.dispose()

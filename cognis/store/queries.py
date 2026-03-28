@@ -15,6 +15,7 @@ from cognis.store.models import (
     ApiKey,
     Conversation,
     LLMProvider,
+    ModelRouting,
     Schedule,
     Secret,
     Session,
@@ -160,6 +161,68 @@ async def list_llm_providers(session: AsyncSession) -> list[LLMProvider]:
     return list(result.scalars().all())
 
 
+async def create_llm_provider(
+    session: AsyncSession,
+    *,
+    provider_id: str,
+    display_name: str,
+    location: str,
+    backend: str,
+    config: dict[str, Any],
+    status: str = "active",
+) -> LLMProvider:
+    """Create a new LLM provider row."""
+    row = LLMProvider(
+        provider_id=provider_id,
+        display_name=display_name,
+        location=location,
+        backend=backend,
+        config=config,
+        status=status,
+    )
+    session.add(row)
+    await session.flush()
+    return row
+
+
+async def update_llm_provider(
+    session: AsyncSession,
+    provider_id: str,
+    *,
+    display_name: str | None = None,
+    location: str | None = None,
+    backend: str | None = None,
+    config: dict[str, Any] | None = None,
+    status: str | None = None,
+) -> bool:
+    """Update an LLM provider row."""
+    row = await get_llm_provider(session, provider_id)
+    if row is None:
+        return False
+    if display_name is not None:
+        row.display_name = display_name
+    if location is not None:
+        row.location = location
+    if backend is not None:
+        row.backend = backend
+    if config is not None:
+        row.config = config
+    if status is not None:
+        row.status = status
+    row.updated_at = datetime.now(UTC)
+    await session.flush()
+    return True
+
+
+async def delete_llm_provider(session: AsyncSession, provider_id: str) -> bool:
+    """Delete an LLM provider row."""
+    result = await session.execute(
+        delete(LLMProvider).where(LLMProvider.provider_id == provider_id)
+    )
+    await session.flush()
+    return int(getattr(result, "rowcount", 0) or 0) > 0
+
+
 # --- Agents ---
 
 
@@ -191,6 +254,84 @@ async def get_agent(session: AsyncSession, agent_id: str) -> Agent | None:
 
     result = await session.execute(select(Agent).where(Agent.agent_id == agent_id))
     return result.scalar_one_or_none()
+
+
+async def list_agents(session: AsyncSession, owner_email: str | None = None) -> list[Agent]:
+    """List agents, optionally filtered by owner."""
+    query = select(Agent).order_by(Agent.updated_at.desc(), Agent.agent_id.asc())
+    if owner_email is not None:
+        query = query.where(Agent.owner_email == owner_email)
+    result = await session.execute(query)
+    return list(result.scalars().all())
+
+
+async def create_agent(
+    session: AsyncSession,
+    *,
+    agent_id: str,
+    owner_email: str,
+    name: str,
+    display_name: str | None = None,
+    description: str | None = None,
+    system_prompt: str | None = None,
+    personality: dict[str, Any] | None = None,
+    skills: dict[str, Any] | None = None,
+    tools: dict[str, Any] | None = None,
+    permissions: dict[str, Any] | None = None,
+    llm_config: dict[str, Any] | None = None,
+    execution: dict[str, Any] | None = None,
+    avatar_url: str | None = None,
+    status: str = "draft",
+) -> Agent:
+    """Create an agent row."""
+    row = Agent(
+        agent_id=agent_id,
+        owner_email=owner_email,
+        name=name,
+        display_name=display_name,
+        description=description,
+        system_prompt=system_prompt,
+        personality=personality,
+        skills=skills,
+        tools=tools,
+        permissions=permissions,
+        llm_config=llm_config,
+        execution=execution,
+        avatar_url=avatar_url,
+        status=status,
+    )
+    session.add(row)
+    await session.flush()
+    return row
+
+
+async def update_agent(
+    session: AsyncSession,
+    agent_id: str,
+    *,
+    updates: dict[str, Any],
+) -> bool:
+    """Update mutable agent fields."""
+    row = await get_agent(session, agent_id)
+    if row is None:
+        return False
+    for field_name, value in updates.items():
+        if hasattr(row, field_name) and value is not None:
+            setattr(row, field_name, value)
+    row.updated_at = datetime.now(UTC)
+    await session.flush()
+    return True
+
+
+async def set_agent_status(session: AsyncSession, agent_id: str, status: str) -> bool:
+    """Update an agent's lifecycle status."""
+    row = await get_agent(session, agent_id)
+    if row is None:
+        return False
+    row.status = status
+    row.updated_at = datetime.now(UTC)
+    await session.flush()
+    return True
 
 
 async def get_llm_provider(session: AsyncSession, provider_id: str) -> LLMProvider | None:
@@ -240,6 +381,33 @@ async def get_conversation(session: AsyncSession, conversation_id: str) -> Conve
         select(Conversation).where(Conversation.conversation_id == conversation_id)
     )
     return result.scalar_one_or_none()
+
+
+async def list_conversations(session: AsyncSession, user_email: str) -> list[Conversation]:
+    """List conversations for a user."""
+    result = await session.execute(
+        select(Conversation)
+        .where(Conversation.user_email == user_email)
+        .order_by(Conversation.updated_at.desc(), Conversation.conversation_id.asc())
+    )
+    return list(result.scalars().all())
+
+
+async def update_conversation(
+    session: AsyncSession,
+    conversation_id: str,
+    *,
+    title: str | None = None,
+) -> bool:
+    """Update mutable conversation fields."""
+    row = await get_conversation(session, conversation_id)
+    if row is None:
+        return False
+    if title is not None:
+        row.title = title
+    row.updated_at = datetime.now(UTC)
+    await session.flush()
+    return True
 
 
 async def update_conversation_root_session(
@@ -548,8 +716,8 @@ async def update_task_status(
         "draft": {"queued", "cancelled"},
         "queued": {"ready", "cancelled"},
         "ready": {"running", "cancelled"},
-        "running": {"paused", "completed", "failed", "cancelled"},
-        "paused": {"running", "cancelled"},
+        "running": {"queued", "paused", "completed", "failed", "cancelled"},
+        "paused": {"queued", "running", "cancelled"},
     }
     allowed_from = [k for k, v in valid_transitions.items() if status in v]
     if not allowed_from:
@@ -858,16 +1026,28 @@ async def list_step_runs_for_task(
     return list(result.scalars().all())
 
 
+async def get_step_run(session: AsyncSession, step_run_id: str) -> StepRun | None:
+    """Get a step run by ID."""
+    result = await session.execute(select(StepRun).where(StepRun.step_run_id == step_run_id))
+    return result.scalar_one_or_none()
+
+
 async def fail_running_step_runs_for_task(
     session: AsyncSession,
     task_id: str,
     completed_at: datetime,
+    *,
+    final_status: str = "failed",
 ) -> int:
-    """Fail all running step runs for a task (used during recovery)."""
+    """Finalize all active step runs for a task.
+
+    Used by recovery/cancellation paths where a task should stop owning any
+    in-flight or paused step-run rows.
+    """
     stmt = (
         update(StepRun)
-        .where(StepRun.task_id == task_id, StepRun.status == "running")
-        .values(status="failed", completed_at=completed_at)
+        .where(StepRun.task_id == task_id, StepRun.status.in_(["running", "paused"]))
+        .values(status=final_status, completed_at=completed_at)
     )
     result = await session.execute(stmt)
     return int(getattr(result, "rowcount", 0) or 0)
@@ -929,6 +1109,75 @@ async def list_workflows(
         query = query.where(sa.or_(*conditions))
     result = await session.execute(query)
     return list(result.scalars().all())
+
+
+async def update_workflow(
+    session: AsyncSession,
+    workflow_id: str,
+    *,
+    updates: dict[str, Any],
+) -> bool:
+    """Update a workflow row."""
+    row = await get_workflow(session, workflow_id)
+    if row is None:
+        return False
+    for field_name, value in updates.items():
+        if hasattr(row, field_name) and value is not None:
+            setattr(row, field_name, value)
+    row.updated_at = datetime.now(UTC)
+    await session.flush()
+    return True
+
+
+async def delete_workflow(session: AsyncSession, workflow_id: str) -> bool:
+    """Delete a workflow row."""
+    result = await session.execute(
+        delete(WorkflowRow).where(WorkflowRow.workflow_id == workflow_id)
+    )
+    await session.flush()
+    return int(getattr(result, "rowcount", 0) or 0) > 0
+
+
+async def list_model_routing(session: AsyncSession) -> list[ModelRouting]:
+    """List all model routing rows."""
+    result = await session.execute(select(ModelRouting).order_by(ModelRouting.task_type.asc()))
+    return list(result.scalars().all())
+
+
+async def get_model_routing(session: AsyncSession, task_type: str) -> ModelRouting | None:
+    """Get a model routing row by task type."""
+    result = await session.execute(select(ModelRouting).where(ModelRouting.task_type == task_type))
+    return result.scalar_one_or_none()
+
+
+async def upsert_model_routing(
+    session: AsyncSession,
+    *,
+    task_type: str,
+    provider_id: str | None,
+    model: str,
+    config: dict[str, Any] | None = None,
+) -> ModelRouting:
+    """Create or update a model routing row."""
+    existing = await get_model_routing(session, task_type)
+    if existing is not None:
+        existing.provider_id = provider_id
+        existing.model = model
+        existing.config = config
+        existing.updated_at = datetime.now(UTC)
+        await session.flush()
+        return existing
+    row = ModelRouting(task_type=task_type, provider_id=provider_id, model=model, config=config)
+    session.add(row)
+    await session.flush()
+    return row
+
+
+async def delete_model_routing(session: AsyncSession, task_type: str) -> bool:
+    """Delete a model routing row."""
+    result = await session.execute(delete(ModelRouting).where(ModelRouting.task_type == task_type))
+    await session.flush()
+    return int(getattr(result, "rowcount", 0) or 0) > 0
 
 
 # ---------------------------------------------------------------------------

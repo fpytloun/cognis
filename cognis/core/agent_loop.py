@@ -25,7 +25,7 @@ from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.session import ConversationModel, SessionEvent, SessionModel
 from cognis.models.tool import ToolCall
-from cognis.models.workflow import StepDefinition, StepOutput
+from cognis.models.workflow import StepDefinition, StepOutput, WorkflowState
 from cognis.tools.builtin.orchestration import (
     handle_orchestration_tool_call,
     is_orchestration_tool,
@@ -206,6 +206,22 @@ class PauseResolution:
     data: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class PendingPause:
+    """Metadata describing a currently pending pause."""
+
+    pause_id: str
+    pause_type: str
+    task_id: str | None = None
+    step_name: str | None = None
+    step_run_id: str | None = None
+    session_id: str | None = None
+    question: str | None = None
+    options: list[dict[str, Any]] | None = None
+    context: dict[str, Any] | None = None
+    resolved: bool = False
+
+
 class PauseWaiter:
     """Synchronization mechanism for step pauses.
 
@@ -217,29 +233,109 @@ class PauseWaiter:
     def __init__(self) -> None:
         self._events: dict[str, asyncio.Event] = {}
         self._resolutions: dict[str, PauseResolution] = {}
+        self._pending: dict[str, PendingPause] = {}
+
+    def register(self, pause: PendingPause) -> None:
+        """Register metadata for a pause before waiting on it."""
+        self._pending[pause.pause_id] = pause
 
     async def wait(self, pause_id: str, *, timeout: float = 300.0) -> PauseResolution:
         """Wait for a pause to be resolved. Raises TimeoutError on timeout."""
+        self._pending.setdefault(
+            pause_id,
+            PendingPause(pause_id=pause_id, pause_type="unknown"),
+        )
         event = asyncio.Event()
         self._events[pause_id] = event
+        if pause_id in self._resolutions:
+            event.set()
         try:
             await asyncio.wait_for(event.wait(), timeout=timeout)
             return self._resolutions.pop(pause_id, PauseResolution(decision="deny"))
         finally:
             self._events.pop(pause_id, None)
+            self._pending.pop(pause_id, None)
 
     def resolve(self, pause_id: str, resolution: PauseResolution) -> bool:
-        """Resolve a waiting pause. Returns True if the pause was waiting."""
+        """Resolve a waiting pause exactly once.
+
+        Returns True when the pause was resolved by this call, False when the
+        pause does not exist or has already been resolved.
+        """
+        pending = self._pending.get(pause_id)
+        if pending is None or pending.resolved:
+            return False
+        pending.resolved = True
         self._resolutions[pause_id] = resolution
         event = self._events.get(pause_id)
         if event:
             event.set()
             return True
-        return False
+        return True
+
+    def get(self, pause_id: str) -> PendingPause | None:
+        """Return pending pause metadata."""
+        return self._pending.get(pause_id)
+
+    def find_pending(
+        self,
+        *,
+        task_id: str | None = None,
+        session_id: str | None = None,
+        step_name: str | None = None,
+        pause_type: str | None = None,
+        include_resolved: bool = False,
+    ) -> PendingPause | None:
+        """Find the first unresolved pause matching the provided filters."""
+        for pause in self._pending.values():
+            if pause.resolved and not include_resolved:
+                continue
+            if task_id is not None and pause.task_id != task_id:
+                continue
+            if session_id is not None and pause.session_id != session_id:
+                continue
+            if step_name is not None and pause.step_name != step_name:
+                continue
+            if pause_type is not None and pause.pause_type != pause_type:
+                continue
+            return pause
+        return None
+
+    def list_pending(
+        self,
+        *,
+        task_id: str | None = None,
+        session_id: str | None = None,
+    ) -> list[PendingPause]:
+        """List unresolved pauses, optionally filtered by task or session."""
+        result: list[PendingPause] = []
+        for pause in self._pending.values():
+            if pause.resolved:
+                continue
+            if task_id is not None and pause.task_id != task_id:
+                continue
+            if session_id is not None and pause.session_id != session_id:
+                continue
+            result.append(pause)
+        return result
+
+    def clear(self, pause_id: str) -> None:
+        """Remove all local state for a pause.
+
+        Used by recovered pause flows where a response is stored for later
+        replay rather than being consumed by an already waiting coroutine.
+        """
+        self._events.pop(pause_id, None)
+        self._resolutions.pop(pause_id, None)
+        self._pending.pop(pause_id, None)
 
     def pending_count(self) -> int:
         """Return number of active waits."""
-        return len(self._events)
+        return len([pause for pause in self._pending.values() if not pause.resolved])
+
+
+class StepInterrupted(Exception):
+    """Raised when a step exits early because of pause/cancel control flow."""
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +360,8 @@ class StepContext:
     interaction_mode: str = "explicit_gates"
     tool_registry: Any = None  # ToolRegistry instance for this step
     executor_connection: Any = None  # ExecutorConnection for this step
+    workflow_state: WorkflowState | None = None
+    cancel_event: asyncio.Event | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +415,8 @@ class AgentLoop:
         await self.session_lock.acquire(ctx.session.session_id)
         try:
             return await self._execute_step(ctx, on_token=on_token, on_tool_call=on_tool_call)
+        except StepInterrupted:
+            raise
         except Exception:
             logger.exception(
                 "Agent loop step failed",
@@ -377,6 +477,8 @@ class AgentLoop:
         # Main agentic loop
         reprompted = False
         while True:
+            self._raise_if_cancelled(ctx)
+
             # Stream LLM response
             accumulator = StreamAccumulator()
             async for chunk in self.providers.llm.stream_generate(
@@ -462,6 +564,7 @@ class AgentLoop:
                 )
 
             for tc in tool_calls:
+                self._raise_if_cancelled(ctx)
                 tool_call_count += 1
                 STEP_TOOL_CALLS.labels(tool_name=tc.name).inc()
 
@@ -524,22 +627,79 @@ class AgentLoop:
                         )
                         continue
 
+                    recovered_response = self._get_recovered_step_response(ctx)
+                    if recovered_response is not None:
+                        await self._clear_interactive_pause_state(ctx)
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc.call_id,
+                                "content": json.dumps({"response": recovered_response}),
+                            }
+                        )
+                        continue
+
                     # Pause and wait for input
                     pause_id = f"input_{uuid.uuid4().hex[:12]}"
+                    question = tc.arguments.get("question", "")
+                    options = tc.arguments.get("options")
+                    pause_context = tc.arguments.get("context")
+                    pause_options = (
+                        [str(option) for option in options] if isinstance(options, list) else None
+                    )
+                    self.pause_waiter.register(
+                        PendingPause(
+                            pause_id=pause_id,
+                            pause_type="step_input",
+                            task_id=ctx.task_id,
+                            step_name=ctx.step_definition.name,
+                            step_run_id=ctx.step_run_id,
+                            session_id=ctx.session.session_id,
+                            question=question,
+                            options=(
+                                [{"label": option, "action": option} for option in pause_options]
+                                if pause_options is not None
+                                else None
+                            ),
+                            context={"context": pause_context}
+                            if isinstance(pause_context, str)
+                            else None,
+                        )
+                    )
+                    await self._set_interactive_pause_state(
+                        ctx,
+                        pause_type="step_input",
+                        pause_payload={
+                            "pause_id": pause_id,
+                            "step_name": ctx.step_definition.name,
+                            "step_run_id": ctx.step_run_id,
+                            "session_id": ctx.session.session_id,
+                            "question": question,
+                            "options": pause_options,
+                            "context": pause_context,
+                        },
+                    )
                     await self.event_bus.publish(
                         Event(
                             type=EventType.STEP_PAUSED,
                             data={
                                 "pause_id": pause_id,
                                 "pause_type": "step_input",
-                                "question": tc.arguments.get("question", ""),
-                                "options": tc.arguments.get("options"),
+                                "question": question,
+                                "options": pause_options,
+                                "context": pause_context,
                                 "session_id": ctx.session.session_id,
+                                "task_id": ctx.task_id,
+                                "step_name": ctx.step_definition.name,
+                                "step_run_id": ctx.step_run_id,
                             },
                         )
                     )
                     try:
                         resolution = await self.pause_waiter.wait(pause_id, timeout=300.0)
+                        await self._clear_interactive_pause_state(ctx)
+                        if resolution.decision == "cancel":
+                            raise StepInterrupted("Step input request cancelled")
                         messages.append(
                             {
                                 "role": "tool",
@@ -550,6 +710,7 @@ class AgentLoop:
                             }
                         )
                     except TimeoutError:
+                        await self._clear_interactive_pause_state(ctx)
                         messages.append(
                             {
                                 "role": "tool",
@@ -584,6 +745,20 @@ class AgentLoop:
 
                 else:
                     # Regular tool call — route through tool router
+                    await self.event_bus.publish(
+                        Event(
+                            type=EventType.WORKFLOW_PROGRESS,
+                            data={
+                                "event": "tool_call_started",
+                                "task_id": ctx.task_id,
+                                "session_id": ctx.session.session_id,
+                                "step_name": ctx.step_definition.name,
+                                "step_run_id": ctx.step_run_id,
+                                "call_id": tc.call_id,
+                                "tool_name": tc.name,
+                            },
+                        )
+                    )
                     events_to_record.append(
                         SessionEvent(
                             type="tool_call", data={"name": tc.name, "call_id": tc.call_id}
@@ -614,6 +789,21 @@ class AgentLoop:
                             "tool_call_id": tc.call_id,
                             "content": result.output,
                         }
+                    )
+                    await self.event_bus.publish(
+                        Event(
+                            type=EventType.WORKFLOW_PROGRESS,
+                            data={
+                                "event": "tool_call_completed",
+                                "task_id": ctx.task_id,
+                                "session_id": ctx.session.session_id,
+                                "step_name": ctx.step_definition.name,
+                                "step_run_id": ctx.step_run_id,
+                                "call_id": tc.call_id,
+                                "tool_name": tc.name,
+                                "is_error": result.is_error,
+                            },
+                        )
                     )
 
             # Check if step_complete was called in this batch
@@ -670,7 +860,7 @@ class AgentLoop:
                 idempotency_key=idempotency_key,
             )
             # Update session cache with recorded events
-            self.session_cache.append_recorded_events(ctx.session, events, append_result)
+            await self.session_cache.append_recorded_events(ctx.session, events, append_result)
         except Exception:
             logger.exception(
                 "Failed to record step events to Intaris",
@@ -702,6 +892,82 @@ class AgentLoop:
                         "Compaction failed during step finalization",
                         extra={"extra_data": {"session_id": ctx.session.session_id}},
                     )
+
+    def _raise_if_cancelled(self, ctx: StepContext) -> None:
+        """Abort the current step when external control requested interruption."""
+        if ctx.cancel_event is not None and ctx.cancel_event.is_set():
+            raise StepInterrupted("Step interrupted by external control")
+
+    async def _set_interactive_pause_state(
+        self,
+        ctx: StepContext,
+        *,
+        pause_type: str,
+        pause_payload: dict[str, Any],
+    ) -> None:
+        """Persist pause metadata for task-backed interactive waits."""
+        if ctx.task_id is None or ctx.step_run_id is None or ctx.workflow_state is None:
+            return
+
+        ctx.workflow_state.status = "paused"
+        ctx.workflow_state.current_step_status = "paused"
+        ctx.workflow_state.pending_pause_type = pause_type
+        ctx.workflow_state.pending_pause_payload = pause_payload
+
+        from cognis.store.queries import (
+            update_step_run,
+            update_task_status,
+            update_task_workflow_state,
+        )
+
+        async with self.session_manager.session_factory() as db_session:
+            await update_step_run(db_session, ctx.step_run_id, status="paused")
+            await update_task_status(db_session, ctx.task_id, "paused")
+            await update_task_workflow_state(
+                db_session,
+                ctx.task_id,
+                ctx.workflow_state.model_dump(mode="json"),
+            )
+            await db_session.commit()
+
+    async def _clear_interactive_pause_state(self, ctx: StepContext) -> None:
+        """Clear pause metadata after a task-backed interactive wait resumes."""
+        if ctx.task_id is None or ctx.step_run_id is None or ctx.workflow_state is None:
+            return
+
+        ctx.workflow_state.status = "running"
+        ctx.workflow_state.current_step_status = "running"
+        ctx.workflow_state.pending_pause_type = None
+        ctx.workflow_state.pending_pause_payload = None
+
+        from cognis.store.queries import (
+            update_step_run,
+            update_task_status,
+            update_task_workflow_state,
+        )
+
+        async with self.session_manager.session_factory() as db_session:
+            await update_step_run(db_session, ctx.step_run_id, status="running")
+            await update_task_status(db_session, ctx.task_id, "running")
+            await update_task_workflow_state(
+                db_session,
+                ctx.task_id,
+                ctx.workflow_state.model_dump(mode="json"),
+            )
+            await db_session.commit()
+
+    def _get_recovered_step_response(self, ctx: StepContext) -> str | None:
+        """Return a persisted step-input response recovered after restart."""
+        if ctx.workflow_state is None or ctx.workflow_state.pending_pause_type != "step_input":
+            return None
+        payload = ctx.workflow_state.pending_pause_payload or {}
+        step_name = payload.get("step_name")
+        if step_name is not None and step_name != ctx.step_definition.name:
+            return None
+        response = payload.get("response")
+        if response is None:
+            return None
+        return str(response)
 
     def _build_step_prompt(self, ctx: StepContext) -> str:
         """Build the step objective prompt with inputs from previous steps.

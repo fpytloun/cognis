@@ -34,6 +34,7 @@ class StepRunStatus(StrEnum):
     REJECTED = "rejected"
     PAUSED = "paused"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 class TaskDelivery(BaseModel):

@@ -24,6 +24,7 @@ PUBLIC_ROUTES = {
     ("POST", "/api/auth/login"),
     ("POST", "/api/auth/refresh"),
     ("GET", "/setup"),
+    ("GET", "/.well-known/agent.json"),
 }
 
 

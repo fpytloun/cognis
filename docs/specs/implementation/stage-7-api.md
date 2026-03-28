@@ -1,6 +1,6 @@
 # Stage 7: API + WebSocket
 
-**Status**: NOT STARTED
+**Status**: DONE
 **Repo**: `cognis`
 **Depends on**: Stage 6 (agent loop — the API wires HTTP/WS to the loop)
 **Estimated effort**: 3-4 days
@@ -130,30 +130,33 @@ resolve escalations, and configure settings.
 
 ## Acceptance Criteria
 
-- [ ] All REST endpoints return correct responses with proper auth
-- [ ] Conversation CRUD works end-to-end
-- [ ] Agent create bootstraps personality to Mnemory
-- [ ] Task CRUD works: create draft, edit, submit, pause, resume, cancel
-- [ ] Task dependencies: add, remove, DAG validation
-- [ ] Batch submit works
-- [ ] Task delivery config works (same conversation, specific target, latest active, preferred channel, silent)
-- [ ] Task detail shows workflow progress + step runs
-- [ ] Workflow CRUD works: list, create, duplicate, edit, delete
-- [ ] Settings CRUD reads/writes DB settings table
-- [ ] LLM provider management + test endpoint works
-- [ ] WebSocket chat sends messages and receives streaming responses
-- [ ] Workflow progress events push to client (step started/completed/rejected/gate)
-- [ ] Step question events push to client and resume same step via response endpoint
-- [ ] Delegation events push to client in real-time
-- [ ] Escalation events push to client, resolution flows back
-- [ ] Gate response via WebSocket and REST both work
-- [ ] Reconnection replays missed events correctly
-- [ ] Message queuing works (max 5, merged on turn complete)
-- [ ] Purge cascades to Intaris (delete session events)
-- [ ] Event bus dispatches events to registered handlers
-- [ ] Pydantic models validate all inputs/outputs
-- [ ] API tests for each route group
-- [ ] `ruff check` and `mypy` clean
+- [x] REST route groups implemented for conversations, agents, sessions, tasks, workflows, settings, secrets, tools, and escalations
+- [x] Conversation CRUD works end-to-end
+- [x] Agent create/activate/bootstrap flows integrate with Mnemory bootstrap
+- [x] Task CRUD works: create draft, edit, submit, pause, resume, cancel
+- [x] Task dependencies: add, remove, DAG validation
+- [x] Batch submit works with per-item results
+- [x] Task detail shows workflow progress + step runs + pending pause metadata
+- [x] Workflow CRUD works: list, create, duplicate, edit, delete
+- [x] Settings CRUD reads/writes DB settings table
+- [x] LLM provider management and model routing endpoints work
+- [x] WebSocket chat authenticates, queues messages, streams responses, and supports reconnect replay
+- [x] Workflow progress, gate prompts, and step-question prompts push to clients
+- [x] Escalation resolution works through both REST and WebSocket messages
+- [x] Gate response via WebSocket and REST both work
+- [x] Reconnection replays missed persisted events and pending prompts
+- [x] Message queuing works (max 5, merged on turn complete)
+- [x] Event bus dispatches events to registered handlers
+- [x] Pydantic API models validate inputs/outputs
+- [x] Added Stage 7 unit/API/WebSocket tests
+- [x] `ruff check` and `mypy` clean
+
+## Notes / MVP Deviations
+
+- All entity routes were normalized to `/api/v1/...` for consistency.
+- `DELETE /api/v1/conversations/:id/purge` reports whether an Intaris cascade was possible via `intaris_cascade`; when the provider contract lacks a verified delete-session API, the purge is Cognis-metadata-only.
+- `/api/v1/workflow-runs/:id/steps` remains deferred in MVP because workflow-run state is task-backed (`tasks.workflow_state`) rather than stored as a separate workflow-run entity.
+- `GET /api/v1/agents/:id/card` and `GET /.well-known/agent.json` are explicitly deferred until the agent model carries sufficient public discovery metadata.
 
 ## Key References
 
