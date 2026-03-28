@@ -6,7 +6,7 @@
   import { api, asApiError } from '$lib/api/client';
   import AgentForm from '$lib/components/agents/AgentForm.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
-  import type { Agent, LLMProvider, ToolDefinitionSummary, Workflow } from '$lib/types/api';
+  import type { Agent, LLMProvider, MCPServerTestResponse, ToolDefinitionSummary, Workflow } from '$lib/types/api';
 
   let loading = true;
   let saving = false;
@@ -15,6 +15,8 @@
   let tools: ToolDefinitionSummary[] = [];
   let workflows: Workflow[] = [];
   let providers: LLMProvider[] = [];
+  let mcpTesting = false;
+  let mcpTestResult: MCPServerTestResponse | null = null;
   let form = agentToFormState({
     agent_id: '',
     owner_email: '',
@@ -72,6 +74,36 @@
     }
   }
 
+  async function testMcp(): Promise<void> {
+    mcpTesting = true;
+    error = '';
+    try {
+      mcpTestResult = await api.tools.testAgentMcp(agentIdFromRoute());
+      if (mcpTestResult.ok) {
+        const discoveredTools = mcpTestResult.items.flatMap((item) =>
+          item.tools.map((toolName) => ({
+            name: toolName,
+            description: 'Discovered MCP tool',
+            category: 'mcp',
+            read_only: false,
+            source: { type: 'local_mcp', server_name: item.name },
+            timeout_seconds: 30,
+            non_bypassable: false
+          }))
+        );
+        const merged = new Map(tools.map((tool) => [tool.name, tool]));
+        for (const tool of discoveredTools) {
+          merged.set(tool.name, tool);
+        }
+        tools = Array.from(merged.values());
+      }
+    } catch (caughtError) {
+      error = asApiError(caughtError).message;
+    } finally {
+      mcpTesting = false;
+    }
+  }
+
   onMount(() => {
     void loadAgent();
   });
@@ -89,6 +121,6 @@
       <p class="text-sm uppercase tracking-[0.25em] text-slate-400">Agent editor</p>
       <h1 class="mt-1 text-2xl font-semibold text-white">{agent?.display_name ?? agent?.name ?? 'Agent'}</h1>
     </div>
-    <AgentForm mode="edit" {form} {tools} {workflows} {providers} {saving} {error} onSave={saveAgent} />
+    <AgentForm mode="edit" {form} {tools} {workflows} {providers} {saving} {error} onSave={saveAgent} onTestMcp={testMcp} {mcpTesting} {mcpTestResult} />
   </section>
 {/if}

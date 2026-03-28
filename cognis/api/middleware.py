@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
@@ -13,9 +14,10 @@ from starlette.responses import Response
 from cognis.api.models import ErrorBody, ErrorResponse
 from cognis.runtime_context import current_user_email
 from cognis.security import parse_api_key, verify_api_key
-from cognis.store.queries import get_api_key, get_user
+from cognis.store.queries import get_api_key, get_user, touch_api_key_last_used
 
 PUBLIC_ROUTES = {
+    ("GET", "/api/bootstrap-status"),
     ("POST", "/api/setup"),
     ("GET", "/.well-known/jwks.json"),
     ("GET", "/api/health"),
@@ -23,7 +25,6 @@ PUBLIC_ROUTES = {
     ("GET", "/api/metrics"),
     ("POST", "/api/auth/login"),
     ("POST", "/api/auth/refresh"),
-    ("GET", "/setup"),
     ("GET", "/.well-known/agent.json"),
 }
 
@@ -102,6 +103,16 @@ class AuthenticationMiddleware(BaseHTTPMiddleware):
                             error=ErrorBody(code="unauthorized", message="Invalid API key")
                         ).model_dump(),
                     )
+                expires_at = record.expires_at
+                if expires_at is not None and expires_at.tzinfo is None:
+                    expires_at = expires_at.replace(tzinfo=UTC)
+                if expires_at is not None and expires_at < datetime.now(UTC):
+                    return JSONResponse(
+                        status_code=401,
+                        content=ErrorResponse(
+                            error=ErrorBody(code="unauthorized", message="Expired API key")
+                        ).model_dump(),
+                    )
                 user = await get_user(session, record.user_email)
                 if user is None:
                     return JSONResponse(
@@ -110,6 +121,8 @@ class AuthenticationMiddleware(BaseHTTPMiddleware):
                             error=ErrorBody(code="unauthorized", message="Unknown API key owner")
                         ).model_dump(),
                     )
+                await touch_api_key_last_used(session, record.key_id)
+                await session.commit()
                 request.state.user = AuthenticatedUser(
                     email=user.email, role=user.role, name=user.name, auth_type="api_key"
                 )

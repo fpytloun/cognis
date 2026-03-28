@@ -41,6 +41,9 @@ class CognisConfig:
     log_level: str
     log_format: str
 
+    # UI serving
+    serve_ui: bool
+
     # CORS
     cors_origins: list[str]
 
@@ -62,6 +65,9 @@ def load_config() -> CognisConfig:
 
     cors_raw = os.environ.get("COGNIS_CORS_ORIGINS", "http://localhost:5173")
     cors_origins = [origin.strip() for origin in cors_raw.split(",") if origin.strip()]
+
+    serve_ui_raw = os.environ.get("COGNIS_SERVE_UI", "true").strip().lower()
+    serve_ui = serve_ui_raw not in {"0", "false", "no", "off"}
 
     return CognisConfig(
         data_dir=data_dir,
@@ -90,6 +96,7 @@ def load_config() -> CognisConfig:
         ),
         log_level=os.environ.get("COGNIS_LOG_LEVEL", "info"),
         log_format=os.environ.get("COGNIS_LOG_FORMAT", "json"),
+        serve_ui=serve_ui,
         cors_origins=cors_origins,
         initial_admin_email=os.environ.get("COGNIS_INITIAL_ADMIN_EMAIL"),
         initial_admin_password=os.environ.get("COGNIS_INITIAL_ADMIN_PASSWORD"),
@@ -122,6 +129,9 @@ ENV_TEMPLATE = """\
 # Logging
 # COGNIS_LOG_LEVEL=info
 # COGNIS_LOG_FORMAT=json
+
+# UI serving
+# COGNIS_SERVE_UI=true
 
 # CORS
 # COGNIS_CORS_ORIGINS=http://localhost:5173

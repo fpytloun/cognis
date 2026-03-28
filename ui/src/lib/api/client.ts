@@ -2,22 +2,28 @@ import { apiUrl } from '$lib/config';
 import { reportError } from '$lib/errors';
 import { auth } from '$lib/stores/auth';
 import type {
+  ApiKeyCreateResponse,
   Agent,
   ApiErrorResponse,
+  ApiKeyMetadata,
+  BootstrapStatusResponse,
   Conversation,
   CursorPage,
   Escalation,
   ExchangeTokenResponse,
   HealthResponse,
   LLMProvider,
+  MCPServerTestResponse,
   MCPServer,
   MessageHistoryResponse,
   ModelRouting,
+  ProviderTestResult,
   SecretMetadata,
   Session,
   SessionEventsResponse,
   Setting,
   SettingsCategory,
+  SystemDiagnostics,
   StepRun,
   Task,
   TaskDetail,
@@ -160,8 +166,34 @@ function encodeQuery(params: Record<string, string | number | boolean | null | u
 
 export const api = {
   auth: {
+    bootstrapStatus(): Promise<BootstrapStatusResponse> {
+      return request<BootstrapStatusResponse>('/api/bootstrap-status', { auth: false });
+    },
+
     me(): Promise<UserSummary> {
       return request<UserSummary>('/api/auth/me');
+    },
+
+    changePassword(payload: { current_password: string; new_password: string }): Promise<{ ok: boolean }> {
+      return request<{ ok: boolean }>('/api/auth/change-password', {
+        method: 'POST',
+        body: JSON.stringify(payload)
+      });
+    },
+
+    listApiKeys(): Promise<ApiKeyMetadata[]> {
+      return request<ApiKeyMetadata[]>('/api/v1/auth/api-keys');
+    },
+
+    createApiKey(payload: { name: string; expires_in_days?: number | null }): Promise<ApiKeyCreateResponse> {
+      return request<ApiKeyCreateResponse>('/api/v1/auth/api-keys', {
+        method: 'POST',
+        body: JSON.stringify(payload)
+      });
+    },
+
+    revokeApiKey(keyId: string): Promise<{ ok: boolean }> {
+      return request<{ ok: boolean }>(`/api/v1/auth/api-keys/${keyId}`, { method: 'DELETE' });
     },
 
     exchangeToken(target: 'intaris' | 'mnemory'): Promise<ExchangeTokenResponse> {
@@ -172,12 +204,20 @@ export const api = {
   },
 
   system: {
+    bootstrapStatus(): Promise<BootstrapStatusResponse> {
+      return request<BootstrapStatusResponse>('/api/bootstrap-status', { auth: false });
+    },
+
     health(): Promise<HealthResponse> {
       return request<HealthResponse>('/api/health', { auth: false });
     },
 
     providers(): Promise<Record<string, unknown>> {
       return request<Record<string, unknown>>('/api/health/providers', { auth: false });
+    },
+
+    diagnostics(): Promise<SystemDiagnostics> {
+      return request<SystemDiagnostics>('/api/v1/system/diagnostics');
     }
   },
 
@@ -289,6 +329,12 @@ export const api = {
 
     mcpServers(): Promise<MCPServer[]> {
       return request<MCPServer[]>('/api/v1/mcp/servers');
+    },
+
+    testAgentMcp(agentId: string): Promise<MCPServerTestResponse> {
+      return request<MCPServerTestResponse>(`/api/v1/agents/${agentId}/mcp/test`, {
+        method: 'POST'
+      });
     }
   },
 
@@ -460,8 +506,8 @@ export const api = {
       return request<{ ok: boolean }>(`/api/v1/llm-providers/${providerId}`, { method: 'DELETE' });
     },
 
-    test(providerId: string): Promise<{ ok: boolean; provider_id: string; health: Record<string, unknown> }> {
-      return request<{ ok: boolean; provider_id: string; health: Record<string, unknown> }>(`/api/v1/llm-providers/${providerId}/test`, {
+    test(providerId: string): Promise<ProviderTestResult & { provider_id: string }> {
+      return request<ProviderTestResult & { provider_id: string }>(`/api/v1/llm-providers/${providerId}/test`, {
         method: 'POST'
       });
     }

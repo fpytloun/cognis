@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from time import monotonic
 
 from fastapi import APIRouter, Request
 
@@ -11,6 +12,7 @@ from cognis.api.models import (
     CursorPage,
     LLMProviderRequest,
     LLMProviderResponse,
+    LLMProviderTestResponse,
     LLMProviderUpdateRequest,
     ModelRoutingResponse,
     ModelRoutingUpdateRequest,
@@ -34,6 +36,16 @@ from cognis.store.queries import (
 )
 
 router = APIRouter(tags=["settings"])
+PROVIDER_TEST_COOLDOWN_SECONDS = 10.0
+
+
+def _apply_last_test_metadata(
+    request: Request, response: LLMProviderResponse
+) -> LLMProviderResponse:
+    last_test = getattr(request.app.state, "provider_test_results", {}).get(response.provider_id)
+    if last_test is None:
+        return response
+    return response.model_copy(update={"last_test": last_test})
 
 
 @router.get("/api/v1/settings", response_model=list[SettingsCategoryResponse])
@@ -84,7 +96,7 @@ async def llm_provider_list(request: Request) -> CursorPage[LLMProviderResponse]
     require_admin(request)
     async with request.app.state.session_factory() as session:
         rows = await list_llm_providers(session)
-    items = [llm_provider_to_response(row) for row in rows]
+    items = [_apply_last_test_metadata(request, llm_provider_to_response(row)) for row in rows]
     return CursorPage(items=items, cursor=None, has_more=False)
 
 
@@ -106,7 +118,7 @@ async def llm_provider_create(request: Request, payload: LLMProviderRequest) -> 
         )
         await session.commit()
         await session.refresh(row)
-    return llm_provider_to_response(row)
+    return _apply_last_test_metadata(request, llm_provider_to_response(row))
 
 
 @router.get("/api/v1/llm-providers/{provider_id}", response_model=LLMProviderResponse)
@@ -116,7 +128,7 @@ async def llm_provider_detail(request: Request, provider_id: str) -> LLMProvider
         row = await get_llm_provider(session, provider_id)
     if row is None:
         raise api_exception(404, "not_found", "LLM provider not found")
-    return llm_provider_to_response(row)
+    return _apply_last_test_metadata(request, llm_provider_to_response(row))
 
 
 @router.put("/api/v1/llm-providers/{provider_id}", response_model=LLMProviderResponse)
@@ -142,7 +154,7 @@ async def llm_provider_update(
         await session.commit()
     if row is None:
         raise api_exception(404, "not_found", "LLM provider not found")
-    return llm_provider_to_response(row)
+    return _apply_last_test_metadata(request, llm_provider_to_response(row))
 
 
 @router.delete("/api/v1/llm-providers/{provider_id}", response_model=dict)
@@ -154,19 +166,31 @@ async def llm_provider_delete(request: Request, provider_id: str) -> dict[str, b
     return {"ok": ok}
 
 
-@router.post("/api/v1/llm-providers/{provider_id}/test", response_model=dict)
-async def llm_provider_test(request: Request, provider_id: str) -> dict[str, object]:
+@router.post("/api/v1/llm-providers/{provider_id}/test", response_model=LLMProviderTestResponse)
+async def llm_provider_test(request: Request, provider_id: str) -> LLMProviderTestResponse:
     require_admin(request)
+    cooldowns: dict[str, float] = request.app.state.provider_test_cooldowns
+    last_started_at = cooldowns.get(provider_id)
+    if (
+        last_started_at is not None
+        and monotonic() - last_started_at < PROVIDER_TEST_COOLDOWN_SECONDS
+    ):
+        raise api_exception(429, "rate_limited", "Provider test cooldown is still active")
     async with request.app.state.session_factory() as session:
         row = await get_llm_provider(session, provider_id)
     if row is None:
         raise api_exception(404, "not_found", "LLM provider not found")
-    health = await request.app.state.providers.llm.health()
-    return {
-        "ok": health.status == "healthy",
-        "provider_id": provider_id,
-        "health": health.model_dump(),
-    }
+    cooldowns[provider_id] = monotonic()
+    try:
+        result = await request.app.state.providers.llm.test_provider(
+            provider_id, timeout_seconds=15
+        )
+    finally:
+        cooldowns[provider_id] = monotonic()
+
+    response = LLMProviderTestResponse(provider_id=provider_id, **result)
+    request.app.state.provider_test_results[provider_id] = response.model_dump(mode="json")
+    return response
 
 
 @router.get("/api/v1/model-routing", response_model=ModelRoutingResponse)

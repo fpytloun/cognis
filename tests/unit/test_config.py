@@ -18,3 +18,4 @@ def test_load_config_defaults(monkeypatch: object, tmp_path: Path) -> None:
     assert config.jwt_private_key_path == tmp_path / "keys" / "private.pem"
     assert config.jwt_public_key_path == tmp_path / "keys" / "public.pem"
     assert config.secrets_key_path == tmp_path / "secrets.key"
+    assert config.serve_ui is True

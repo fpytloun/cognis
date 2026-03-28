@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.exceptions import RequestValidationError
@@ -46,10 +49,59 @@ from cognis.logging import get_logger, setup_logging
 from cognis.providers.auth.jwt import JWTAuthProvider
 from cognis.providers.registry import build_provider_registry
 from cognis.security import LoginRateLimiter, create_password_hasher
+from cognis.ui_assets import SPAStaticFiles, resolve_ui_build_dir
 
 
 def _as_int(value: object, default: int) -> int:
     return value if isinstance(value, int) else default
+
+
+def _as_user_facing_host(host: str) -> str:
+    return "localhost" if host in {"0.0.0.0", "::"} else host
+
+
+def _build_user_facing_url(config: object) -> str:
+    return f"http://{_as_user_facing_host(config.host)}:{config.port}"  # type: ignore[attr-defined]
+
+
+def _key_fingerprint(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+
+
+async def _print_startup_status(
+    config: object, providers: object, ui_build_dir: Path | None
+) -> None:
+    base_url = _build_user_facing_url(config)
+    memory_health, guardrails_health = await asyncio.gather(
+        providers.memory.health(),  # type: ignore[attr-defined]
+        providers.guardrails.health(),  # type: ignore[attr-defined]
+    )
+
+    if getattr(config, "serve_ui", False) and ui_build_dir is not None:
+        sys.stdout.write(f"\nWeb UI: {base_url}\n")
+    elif getattr(config, "serve_ui", False):
+        sys.stdout.write(
+            "\nWeb UI assets not found — build the UI in ui/ or set COGNIS_SERVE_UI=false.\n"
+        )
+    else:
+        sys.stdout.write("\nWeb UI: disabled (COGNIS_SERVE_UI=false)\n")
+
+    if memory_health.status == "healthy":
+        sys.stdout.write(f"Mnemory: reachable at {config.mnemory_url}\n")  # type: ignore[attr-defined]
+    else:
+        sys.stdout.write(
+            f"Mnemory: NOT reachable at {config.mnemory_url} — memory features will be unavailable\n"  # type: ignore[attr-defined]
+        )
+
+    if guardrails_health.status == "healthy":
+        sys.stdout.write(f"Intaris: reachable at {config.intaris_url}\n")  # type: ignore[attr-defined]
+    else:
+        sys.stdout.write(
+            f"Intaris: NOT reachable at {config.intaris_url} — guardrail features will be unavailable\n"  # type: ignore[attr-defined]
+        )
+    sys.stdout.flush()
 
 
 logger = get_logger(__name__)
@@ -58,6 +110,7 @@ logger = get_logger(__name__)
 def create_app() -> FastAPI:
     config = load_config()
     setup_logging(config.log_level, config.log_format)
+    ui_build_dir = resolve_ui_build_dir() if config.serve_ui else None
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -71,6 +124,7 @@ def create_app() -> FastAPI:
         providers = build_provider_registry(config_runtime, session_factory, auth_provider)
         remember_queue = RememberRetryQueue(providers.memory)
         await remember_queue.start()
+        await _print_startup_status(config_runtime, providers, ui_build_dir)
 
         async with session_factory() as session:
             from cognis.store.queries import count_users, get_setting_value
@@ -87,9 +141,15 @@ def create_app() -> FastAPI:
 
             if await count_users(session) == 0:
                 token = setup_token_manager.issue()
-                sys.stdout.write(
-                    f"\nNo users found. Complete setup at:\n  http://{config_runtime.host}:{config_runtime.port}/setup?token={token}\nThis link expires in 15 minutes.\n\n"
-                )
+                if config_runtime.serve_ui and ui_build_dir is not None:
+                    sys.stdout.write(
+                        f"\nNo users found. Complete setup at:\n  {_build_user_facing_url(config_runtime)}/setup?token={token}\nThis link expires in 15 minutes.\n\n"
+                    )
+                else:
+                    sys.stdout.write(
+                        "\nNo users found. Web UI setup is unavailable, so create the first admin with:\n"
+                        '  cognis admin create-user admin@example.com --name "Admin"\n\n'
+                    )
                 sys.stdout.flush()
 
         session_cache = SessionCache(providers.guardrails, max_entries=cache_max_entries)
@@ -174,7 +234,13 @@ def create_app() -> FastAPI:
         app.state.auth_provider = auth_provider
         app.state.providers = providers
         app.state.login_rate_limiter = LoginRateLimiter()
+        app.state.provider_test_results = {}
+        app.state.provider_test_cooldowns = {}
         app.state.remember_queue = remember_queue
+        app.state.serve_ui = config_runtime.serve_ui
+        app.state.ui_build_dir = str(ui_build_dir) if ui_build_dir is not None else None
+        app.state.user_facing_url = _build_user_facing_url(config_runtime)
+        app.state.jwt_public_key_fingerprint = _key_fingerprint(config_runtime.jwt_public_key_path)
         app.state.session_cache = session_cache
         app.state.session_manager = session_manager
         app.state.context_assembler = context_assembler
@@ -260,5 +326,8 @@ def create_app() -> FastAPI:
     @app.websocket("/api/ws")
     async def websocket_endpoint(websocket: WebSocket) -> None:
         await handle_websocket(websocket)
+
+    if config.serve_ui and ui_build_dir is not None:
+        app.mount("/", SPAStaticFiles(directory=ui_build_dir, html=True), name="ui")
 
     return app

@@ -5,9 +5,10 @@
   import {
     buildBootstrapPreview,
     formStateToPayload,
-    type AgentFormState
+    type AgentFormState,
+    type MCPServerFormState
   } from '$lib/agents';
-  import type { LLMProvider, ToolDefinitionSummary, Workflow } from '$lib/types/api';
+  import type { LLMProvider, MCPServerTestResponse, ToolDefinitionSummary, Workflow } from '$lib/types/api';
 
   let {
     mode,
@@ -17,7 +18,10 @@
     providers,
     saving = false,
     error = '',
-    onSave
+    onSave,
+    onTestMcp,
+    mcpTesting = false,
+    mcpTestResult = null
   } = $props<{
     mode: 'create' | 'edit';
     form: AgentFormState;
@@ -27,6 +31,9 @@
     saving?: boolean;
     error?: string;
     onSave: (payload: Record<string, unknown>) => void | Promise<void>;
+    onTestMcp?: (() => void | Promise<void>) | null;
+    mcpTesting?: boolean;
+    mcpTestResult?: MCPServerTestResponse | null;
   }>();
 
   const permissionOptions = ['', 'allow', 'evaluate', 'deny'];
@@ -46,6 +53,21 @@
   async function handleSubmit(event: SubmitEvent): Promise<void> {
     event.preventDefault();
     await onSave(formStateToPayload(form));
+  }
+
+  function addMcpServer(): void {
+    const next: MCPServerFormState = {
+      name: '',
+      command: '',
+      argsText: '',
+      envText: '',
+      timeoutSeconds: 30
+    };
+    form.mcpServers = [...form.mcpServers, next];
+  }
+
+  function removeMcpServer(index: number): void {
+    form.mcpServers = form.mcpServers.filter((_: MCPServerFormState, itemIndex: number) => itemIndex !== index);
   }
 </script>
 
@@ -153,6 +175,81 @@
             </tbody>
           </table>
         </div>
+      </Card>
+
+      <Card class="p-5">
+        <div class="flex items-center justify-between gap-3">
+          <div>
+            <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">MCP servers</p>
+            <h2 class="mt-1 text-lg font-semibold text-white">Local MCP integrations</h2>
+            <p class="mt-2 text-sm leading-6 text-slate-400">
+              Configure local MCP server commands that will be launched by the executor when this agent needs them.
+            </p>
+          </div>
+          <Button type="button" variant="secondary" onclick={addMcpServer}>Add server</Button>
+        </div>
+
+        <div class="mt-4 space-y-4">
+          {#if form.mcpServers.length === 0}
+            <p class="rounded-2xl border border-dashed border-slate-800 bg-slate-950/40 px-4 py-4 text-sm text-slate-400">
+              No MCP servers configured yet.
+            </p>
+          {/if}
+
+          {#each form.mcpServers as server, index}
+            <div class="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
+              <div class="grid gap-4 md:grid-cols-2">
+                <label class="space-y-2 text-sm font-medium text-slate-200">
+                  <span>Name</span>
+                  <Input bind:value={server.name} placeholder="filesystem" />
+                </label>
+                <label class="space-y-2 text-sm font-medium text-slate-200">
+                  <span>Command</span>
+                  <Input bind:value={server.command} placeholder="npx" />
+                </label>
+                <label class="space-y-2 text-sm font-medium text-slate-200 md:col-span-2">
+                  <span>Args (one per line)</span>
+                  <textarea bind:value={server.argsText} class="min-h-[90px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 font-mono text-sm text-slate-100" placeholder="@modelcontextprotocol/server-filesystem&#10;/path/to/project"></textarea>
+                </label>
+                <label class="space-y-2 text-sm font-medium text-slate-200 md:col-span-2">
+                  <span>Environment variables (KEY=value per line)</span>
+                  <textarea bind:value={server.envText} class="min-h-[90px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 font-mono text-sm text-slate-100" placeholder="GITHUB_TOKEN=secret_name"></textarea>
+                </label>
+                <label class="space-y-2 text-sm font-medium text-slate-200">
+                  <span>Timeout seconds</span>
+                  <Input bind:value={server.timeoutSeconds} type="number" min="1" />
+                </label>
+              </div>
+
+              <div class="mt-4 flex justify-end">
+                <Button type="button" variant="danger" size="sm" onclick={() => removeMcpServer(index)}>Remove</Button>
+              </div>
+            </div>
+          {/each}
+        </div>
+
+        {#if mode === 'edit' && onTestMcp}
+          <div class="mt-5 flex items-center gap-3">
+            <Button type="button" variant="secondary" onclick={() => onTestMcp?.()} disabled={mcpTesting || form.mcpServers.length === 0}>
+              {mcpTesting ? 'Testing MCP…' : 'Test MCP servers'}
+            </Button>
+          </div>
+        {/if}
+
+        {#if mcpTestResult}
+          <div class="mt-4 space-y-3">
+            {#each mcpTestResult.items as item}
+              <div class={`rounded-2xl border px-4 py-3 text-sm ${item.ok ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-100' : 'border-rose-500/30 bg-rose-500/10 text-rose-100'}`}>
+                <p class="font-medium">{item.name}</p>
+                {#if item.ok}
+                  <p class="mt-1">Discovered {item.tools.length} tool{item.tools.length === 1 ? '' : 's'}.</p>
+                {:else}
+                  <p class="mt-1">{item.error_detail ?? 'Unable to discover MCP tools.'}</p>
+                {/if}
+              </div>
+            {/each}
+          </div>
+        {/if}
       </Card>
 
       <Card class="p-5">

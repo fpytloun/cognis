@@ -1,5 +1,13 @@
 import type { Agent, LLMProvider, ToolDefinitionSummary, Workflow } from '$lib/types/api';
 
+export interface MCPServerFormState {
+  name: string;
+  command: string;
+  argsText: string;
+  envText: string;
+  timeoutSeconds: number;
+}
+
 export interface AgentFormState {
   agentId: string;
   name: string;
@@ -23,6 +31,8 @@ export interface AgentFormState {
   defaultWorkflowId: string;
   workflowSelectionMode: string;
   stepAgentOverridesJson: string;
+  mcpServers: MCPServerFormState[];
+  originalTools: Record<string, unknown>;
 }
 
 export function createEmptyAgentForm(): AgentFormState {
@@ -48,7 +58,9 @@ export function createEmptyAgentForm(): AgentFormState {
     availableWorkflowIds: [],
     defaultWorkflowId: '',
     workflowSelectionMode: 'automatic',
-    stepAgentOverridesJson: '{}'
+    stepAgentOverridesJson: '{}',
+    mcpServers: [],
+    originalTools: {}
   };
 }
 
@@ -58,6 +70,7 @@ export function agentToFormState(agent: Agent): AgentFormState {
   const permissions = agent.permissions ?? {};
   const llmConfig = agent.llm_config ?? {};
   const execution = agent.execution ?? {};
+  const tools = agent.tools ?? {};
 
   return {
     ...form,
@@ -95,7 +108,27 @@ export function agentToFormState(agent: Agent): AgentFormState {
       typeof execution.workflow_selection_mode === 'string'
         ? execution.workflow_selection_mode
         : 'automatic',
-    stepAgentOverridesJson: JSON.stringify(execution.step_agent_overrides ?? {}, null, 2)
+    stepAgentOverridesJson: JSON.stringify(execution.step_agent_overrides ?? {}, null, 2),
+    mcpServers: Array.isArray(tools.mcp_servers)
+      ? tools.mcp_servers
+          .filter((value): value is Record<string, unknown> => Boolean(value && typeof value === 'object'))
+          .map((server) => ({
+            name: typeof server.name === 'string' ? server.name : '',
+            command: typeof server.command === 'string' ? server.command : '',
+            argsText: Array.isArray(server.args)
+              ? server.args.filter((value): value is string => typeof value === 'string').join('\n')
+              : '',
+            envText:
+              server.env && typeof server.env === 'object'
+                ? Object.entries(server.env as Record<string, unknown>)
+                    .map(([key, value]) => `${key}=${String(value)}`)
+                    .join('\n')
+                : '',
+            timeoutSeconds:
+              typeof server.timeout_seconds === 'number' ? server.timeout_seconds : 30
+          }))
+      : [],
+    originalTools: tools
   };
 }
 
@@ -132,6 +165,26 @@ export function formStateToPayload(form: AgentFormState): Record<string, unknown
         .filter(Boolean),
       can_delegate: form.canDelegate,
       max_delegation_depth: form.maxDelegationDepth
+    },
+    tools: {
+      ...(form.originalTools ?? {}),
+      delegation_tools: form.canDelegate,
+      mcp_servers: form.mcpServers
+        .filter((server) => server.name.trim() && server.command.trim())
+        .map((server) => ({
+          name: server.name.trim(),
+          command: server.command.trim(),
+          args: nonEmptyLines(server.argsText),
+          env: Object.fromEntries(
+            nonEmptyLines(server.envText)
+              .map((line) => {
+                const [key, ...rest] = line.split('=');
+                return [key?.trim() ?? '', rest.join('=').trim()];
+              })
+              .filter(([key]) => key)
+          ),
+          timeout_seconds: server.timeoutSeconds || 30
+        }))
     },
     llm_config: {
       provider_id: form.providerId || undefined,

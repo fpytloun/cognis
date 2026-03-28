@@ -14,6 +14,7 @@ from cognis.api.models import (
     MCPServerResponse,
     MessageEventResponse,
     PendingPauseResponse,
+    ProviderTestResultResponse,
     SecretResponse,
     SessionResponse,
     SettingResponse,
@@ -105,6 +106,7 @@ def setting_to_response(row: Any) -> SettingResponse:
 
 def llm_provider_to_response(row: Any) -> LLMProviderResponse:
     config = dict(row.config or {})
+    last_test = getattr(row, "last_test", None)
     return LLMProviderResponse(
         provider_id=row.provider_id,
         display_name=row.display_name,
@@ -115,6 +117,7 @@ def llm_provider_to_response(row: Any) -> LLMProviderResponse:
         created_at=row.created_at,
         updated_at=row.updated_at,
         models=list(config.get("models", [])) if isinstance(config.get("models", []), list) else [],
+        last_test=ProviderTestResultResponse.model_validate(last_test) if last_test else None,
     )
 
 

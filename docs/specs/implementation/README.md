@@ -21,9 +21,9 @@
 
 | Stage | Name | Status | Notes |
 |-------|------|--------|-------|
-| 10 | [Launchable First Run](stage-10-first-run.md) | PENDING | Bundled UI serving, setup page, readiness checks, Dockerfile |
-| 11 | [Guided Integrations](stage-11-guided-integrations.md) | PENDING | LLM presets, meaningful provider test, MCP config UI, account management |
-| 12 | [Honest Bootstrap + Docs](stage-12-bootstrap-docs.md) | PENDING | Rewritten Quick Start, in-app setup guide, diagnostics, user docs |
+| 10 | [Launchable First Run](stage-10-first-run.md) | DONE | Bundled UI serving, setup page, readiness banner, startup diagnostics, Dockerfile |
+| 11 | [Guided Integrations](stage-11-guided-integrations.md) | DONE | Provider presets/tests, model routing guidance, MCP management, account management |
+| 12 | [Honest Bootstrap + Docs](stage-12-bootstrap-docs.md) | DONE | Rewritten Quick Start, in-app getting-started guide, diagnostics, user docs |
 | 13 | [Core UX Polish](stage-13-ux-polish.md) | PENDING | Toasts, validation, confirmations, chat shortcuts, icons, accessibility, mobile |
 | 14 | [Degraded Mode + Recovery UX](stage-14-degraded-ux.md) | PENDING | Outage banners, contextual errors, setup-incomplete states, retry affordances |
 | 15 | [MVP Closure Sweep](stage-15-closure.md) | PENDING | Backend TODOs, skills loader, rate limiting, test coverage, tracker alignment |

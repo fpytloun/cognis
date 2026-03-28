@@ -21,6 +21,33 @@ export interface ExchangeTokenResponse {
   expires_in: number;
 }
 
+export interface BootstrapStatusResponse {
+  setup_available: boolean;
+  setup_complete: boolean;
+}
+
+export interface ApiKeyMetadata {
+  key_id: string;
+  name: string;
+  prefix: string;
+  created_at: string | null;
+  last_used_at: string | null;
+  expires_at: string | null;
+}
+
+export interface ApiKeyCreateResponse extends ApiKeyMetadata {
+  api_key: string;
+}
+
+export interface ProviderTestResult {
+  ok: boolean;
+  model_resolved: string | null;
+  latency_ms: number | null;
+  error_type: string | null;
+  error_detail: string | null;
+  tested_at: string | null;
+}
+
 export interface ApiErrorPayload {
   code?: string;
   message?: string;
@@ -129,6 +156,20 @@ export interface MCPServer {
   name: string;
   type: string;
   details: Record<string, unknown>;
+}
+
+export interface MCPServerTestItem {
+  name: string;
+  ok: boolean;
+  tools: string[];
+  error_type: string | null;
+  error_detail: string | null;
+  duration_ms: number | null;
+}
+
+export interface MCPServerTestResponse {
+  ok: boolean;
+  items: MCPServerTestItem[];
 }
 
 export interface TaskDelivery {
@@ -269,6 +310,7 @@ export interface LLMProvider {
   created_at: string | null;
   updated_at: string | null;
   models: Array<Record<string, unknown>>;
+  last_test: ProviderTestResult | null;
 }
 
 export interface ModelRouting {
@@ -301,6 +343,16 @@ export interface HealthResponse {
   remember_queue?: {
     depth: number;
   } | null;
+}
+
+export interface SystemDiagnostics {
+  readiness: Record<string, boolean>;
+  ui: Record<string, unknown>;
+  database: Record<string, unknown>;
+  config: Record<string, unknown>;
+  providers: Array<Record<string, unknown>>;
+  agents: Record<string, unknown>;
+  key_fingerprint: string | null;
 }
 
 export interface Escalation {

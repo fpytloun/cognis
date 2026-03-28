@@ -3,10 +3,13 @@
   import { page } from '$app/stores';
   import { onMount } from 'svelte';
 
+  import { api } from '$lib/api/client';
+  import { deriveGettingStartedSteps, isGettingStartedDismissed } from '$lib/getting-started';
   import Badge from '$lib/components/ui/Badge.svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import { auth } from '$lib/stores/auth';
+  import type { SystemDiagnostics } from '$lib/types/api';
   import { wsClient, wsState } from '$lib/ws/client';
 
   const navigationItems = [
@@ -18,6 +21,26 @@
   ];
 
   let bootstrapped = false;
+  let diagnostics: SystemDiagnostics | null = null;
+
+  async function loadDiagnosticsIfNeeded(): Promise<void> {
+    if (auth.getSnapshot().user?.role !== 'admin') {
+      diagnostics = null;
+      return;
+    }
+    try {
+      diagnostics = await api.system.diagnostics();
+    } catch {
+      diagnostics = null;
+    }
+  }
+
+  function shouldShowGettingStarted(): boolean {
+    if (!diagnostics || isGettingStartedDismissed()) {
+      return false;
+    }
+    return deriveGettingStartedSteps(diagnostics).some((step) => !step.done);
+  }
 
   function currentTitle(pathname: string): string {
     return navigationItems.find((item) => pathname.startsWith(item.href))?.label ?? 'Workspace';
@@ -30,6 +53,7 @@
         await goto('/login', { replaceState: true });
         return;
       }
+      await loadDiagnosticsIfNeeded();
       wsClient.connect();
     });
 
@@ -97,6 +121,7 @@
           </div>
 
           <div class="flex flex-wrap items-center gap-2">
+            <Button size="sm" variant="secondary" onclick={() => goto('/getting-started')}>Getting started</Button>
             <Badge class={$wsState.status === 'connected' ? 'border-emerald-400/40 bg-emerald-500/10 text-emerald-200' : 'border-amber-400/40 bg-amber-500/10 text-amber-200'}>
               WebSocket: {$wsState.status}
             </Badge>
@@ -105,6 +130,18 @@
             {/if}
           </div>
         </header>
+
+        {#if shouldShowGettingStarted()}
+          <div class="rounded-2xl border border-sky-500/30 bg-sky-500/10 px-4 py-4 text-sm text-sky-100">
+            <div class="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <p class="font-medium">Finish first-run setup</p>
+                <p class="mt-1 text-sky-100/80">Cognis still needs providers, agents, or companion services before the workspace is fully ready.</p>
+              </div>
+              <Button size="sm" onclick={() => goto('/getting-started')}>Open guide</Button>
+            </div>
+          </div>
+        {/if}
 
         <div class="min-h-0 flex-1">
           <slot />

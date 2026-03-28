@@ -27,6 +27,7 @@ Do NOT put tokens in query params.
 ### Bootstrap (Unauthenticated)
 
 ```
+GET    /api/bootstrap-status      → Report whether first-run setup is still available
 POST   /api/setup                → Create first admin user (one-time, token-gated)
 GET    /.well-known/jwks.json    → JWKS public keys for JWT validation
 ```
@@ -40,7 +41,11 @@ one-time token printed to stdout on first start (15 min TTL).
 POST   /api/auth/login           → Authenticate, get JWT (email + password)
 POST   /api/auth/refresh         → Refresh JWT
 POST   /api/auth/logout          → Invalidate token
+POST   /api/auth/change-password → Change current user's password
 GET    /api/auth/me              → Current user info
+GET    /api/v1/auth/api-keys     → List current user's API keys
+POST   /api/v1/auth/api-keys     → Create current user's API key
+DELETE /api/v1/auth/api-keys/:id → Revoke current user's API key
 POST   /api/v1/auth/exchange-token → Issue short-lived token for Intaris/Mnemory UI access
 ```
 
@@ -113,6 +118,7 @@ POST   /api/v1/sessions/:id/cancel            → Cancel
 ```
 GET    /api/v1/tools                          → List all available tools
 GET    /api/v1/agents/:id/tools               → Tools for agent
+POST   /api/v1/agents/:id/mcp/test           → Test local MCP server discovery for agent
 GET    /api/v1/mcp/servers                    → List MCP servers
 ```
 
@@ -198,7 +204,7 @@ POST   /api/v1/llm-providers                  → Add provider (admin only)
 GET    /api/v1/llm-providers/:id              → Provider details + model catalog
 PUT    /api/v1/llm-providers/:id              → Update provider
 DELETE /api/v1/llm-providers/:id              → Remove provider
-POST   /api/v1/llm-providers/:id/test        → Test provider connectivity
+POST   /api/v1/llm-providers/:id/test        → Test provider connectivity (resolved model, latency, sanitized errors)
 ```
 
 ### Model Routing
@@ -233,6 +239,7 @@ GET    /api/v1/step-runs/:id                  → Step run detail (output, evalu
 ```
 GET    /api/health                            → Health check
 GET    /api/health/providers                  → Provider status
+GET    /api/v1/system/diagnostics             → Admin diagnostics and readiness summary
 GET    /api/metrics                           → Prometheus metrics
 GET    /.well-known/jwks.json                 → Public keys for JWT validation
 GET    /.well-known/agent.json                → Default agent card (A2A; deferred unless public discovery metadata is configured)

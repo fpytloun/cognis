@@ -61,10 +61,61 @@ class ExchangeTokenResponse(BaseModel):
     expires_in: int
 
 
+class BootstrapStatusResponse(BaseModel):
+    setup_available: bool
+    setup_complete: bool
+
+
+class PasswordChangeRequest(BaseModel):
+    current_password: str
+    new_password: str = Field(min_length=8)
+
+
+class ApiKeyCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    expires_in_days: int | None = Field(default=None, ge=1, le=3650)
+
+
+class ApiKeyResponse(BaseModel):
+    key_id: str
+    name: str
+    prefix: str
+    created_at: datetime | None = None
+    last_used_at: datetime | None = None
+    expires_at: datetime | None = None
+
+
+class ApiKeyCreateResponse(ApiKeyResponse):
+    api_key: str
+
+
+class ProviderTestResultResponse(BaseModel):
+    ok: bool
+    model_resolved: str | None = None
+    latency_ms: int | None = None
+    error_type: str | None = None
+    error_detail: str | None = None
+    tested_at: datetime | None = None
+
+
+class LLMProviderTestResponse(ProviderTestResultResponse):
+    provider_id: str
+
+
 class HealthResponse(BaseModel):
     status: str
     providers: dict[str, dict[str, Any]]
     remember_queue: dict[str, Any] | None = None
+
+
+class SystemDiagnosticsResponse(BaseModel):
+    readiness: dict[str, bool] = Field(default_factory=dict)
+    ui: dict[str, Any] = Field(default_factory=dict)
+    database: dict[str, Any] = Field(default_factory=dict)
+    config: dict[str, Any] = Field(default_factory=dict)
+    providers: list[dict[str, Any]] = Field(default_factory=list)
+    agents: dict[str, Any] = Field(default_factory=dict)
+    key_fingerprint: str | None = None
 
 
 class ConversationContextModel(BaseModel):
@@ -249,6 +300,7 @@ class LLMProviderResponse(BaseModel):
     created_at: datetime | None = None
     updated_at: datetime | None = None
     models: list[dict[str, Any]] = Field(default_factory=list)
+    last_test: ProviderTestResultResponse | None = None
 
 
 class ModelRoutingResponse(BaseModel):
@@ -467,6 +519,20 @@ class MCPServerResponse(BaseModel):
     name: str
     type: str
     details: dict[str, Any] = Field(default_factory=dict)
+
+
+class MCPServerTestItemResponse(BaseModel):
+    name: str
+    ok: bool
+    tools: list[str] = Field(default_factory=list)
+    error_type: str | None = None
+    error_detail: str | None = None
+    duration_ms: int | None = None
+
+
+class MCPServerTestResponse(BaseModel):
+    ok: bool
+    items: list[MCPServerTestItemResponse] = Field(default_factory=list)
 
 
 class EscalationResolveRequest(BaseModel):

@@ -19,11 +19,12 @@ uvx cognis                               # starts on :8080
 
 On first start, Cognis:
 1. Creates `~/.cognis/` directory with auto-generated keys and SQLite DB.
-2. Prints a one-time setup URL (15 min TTL) to create the first admin user.
-3. Connects to Mnemory and Intaris at default localhost ports.
+2. Serves the bundled web UI on `:8080` when UI assets are present and `COGNIS_SERVE_UI=true`.
+3. Prints a one-time setup URL (15 min TTL) to create the first admin user.
+4. Probes Mnemory and Intaris and reports reachability in startup output.
 
 After creating the admin user via the setup URL, open `http://localhost:8080`
-and log in. Configure LLM providers through Settings > LLM Providers in the
+and log in. Configure LLM providers through **Settings → Providers** in the
 web UI (or via the API).
 
 **Alternative: CLI bootstrap (headless)**
@@ -91,6 +92,7 @@ Creates the admin user on startup if the users table is empty.
 ```bash
 COGNIS_LOG_LEVEL=info                  # Logging level
 COGNIS_LOG_FORMAT=json                 # json or text
+COGNIS_SERVE_UI=true                   # Serve bundled UI assets
 COGNIS_CORS_ORIGINS=http://localhost:5173  # CORS allowlist
 ```
 
@@ -136,16 +138,6 @@ services:
       mnemory: {condition: service_started}
       intaris: {condition: service_started}
 
-  cognis-ui:
-    build: {context: ./ui}
-    ports:
-      - "3000:3000"
-    environment:
-      PUBLIC_COGNIS_API_URL: "https://cognis.example.com"
-      PUBLIC_INTARIS_UI_URL: "https://cognis.example.com/intaris"
-      PUBLIC_MNEMORY_UI_URL: "https://cognis.example.com/mnemory"
-    depends_on: [cognis]
-
   postgres:
     image: postgres:16
     environment:
@@ -179,26 +171,14 @@ secrets:
   postgres_password: {file: ./keys/postgres.pw}
 ```
 
-Note: Mnemory and Intaris are NOT exposed to the host. Only the Cognis
-controller and UI have host port bindings. The UI uses browser-facing
-`PUBLIC_*` origins, so these values should point to externally reachable
-URLs (typically the reverse-proxied Cognis/Intaris/Mnemory routes), not
-container-internal service names.
+Note: Mnemory and Intaris are NOT exposed to the host. The bundled Cognis
+image serves both the API and the UI on `:8080` by default. Set
+`COGNIS_SERVE_UI=false` when running API-only pods behind a separate static
+frontend deployment.
 
 ### Dockerfile
 
 ```dockerfile
-FROM python:3.12-slim AS backend
-WORKDIR /app
-COPY pyproject.toml .
-RUN pip install --no-cache-dir .
-COPY cognis/ cognis/
-EXPOSE 8080
-CMD ["python", "-m", "cognis", "serve", "--host", "0.0.0.0"]
-```
-
-```dockerfile
-# UI
 FROM node:20-slim AS ui-build
 WORKDIR /app
 COPY ui/package*.json ./
@@ -206,12 +186,17 @@ RUN npm ci
 COPY ui/ .
 RUN npm run build
 
-FROM node:20-slim AS ui
+FROM python:3.12-slim AS runtime
 WORKDIR /app
-COPY --from=ui-build /app/build ./build
-COPY --from=ui-build /app/package.json .
-EXPOSE 3000
-CMD ["node", "build"]
+ENV COGNIS_SKIP_UI_BUILD=1
+COPY pyproject.toml README.md build.py ./
+COPY cognis/ ./cognis/
+COPY docs/ ./docs/
+COPY ui/ ./ui/
+COPY --from=ui-build /app/build ./ui/build
+RUN pip install --no-cache-dir .
+EXPOSE 8080
+CMD ["cognis", "serve"]
 ```
 
 ## Kubernetes (Phase 2)

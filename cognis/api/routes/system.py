@@ -2,14 +2,39 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+from sqlalchemy import text
+from sqlalchemy.engine import make_url
 
-from cognis.api.common import api_exception
-from cognis.api.models import HealthResponse
+from cognis.api.common import api_exception, require_admin
+from cognis.api.models import HealthResponse, SystemDiagnosticsResponse
+from cognis.store.queries import list_agents, list_llm_providers
 
 router = APIRouter()
+
+
+def _database_summary(database_url: str) -> dict[str, str | None]:
+    parsed = make_url(database_url)
+    return {
+        "drivername": parsed.drivername,
+        "database": parsed.database,
+        "host": parsed.host,
+        "port": str(parsed.port) if parsed.port is not None else None,
+    }
+
+
+async def _migration_version(request: Request) -> str | None:
+    async with request.app.state.engine.connect() as conn:
+        try:
+            result = await conn.execute(text("SELECT version_num FROM alembic_version LIMIT 1"))
+        except Exception:
+            return None
+    row = result.first()
+    return str(row[0]) if row else None
 
 
 @router.get("/api/health", response_model=HealthResponse)
@@ -29,6 +54,69 @@ async def health(request: Request) -> HealthResponse:
 async def health_providers(request: Request) -> dict[str, object]:
     providers = await request.app.state.providers.health()
     return {name: provider.model_dump() for name, provider in providers.items()}
+
+
+@router.get("/api/v1/system/diagnostics", response_model=SystemDiagnosticsResponse)
+async def diagnostics(request: Request) -> SystemDiagnosticsResponse:
+    require_admin(request)
+    config = request.app.state.config
+    provider_health = await request.app.state.providers.health()
+    async with request.app.state.session_factory() as session:
+        agents = await list_agents(session)
+        providers = await list_llm_providers(session)
+
+    provider_test_results: dict[str, Any] = getattr(request.app.state, "provider_test_results", {})
+    provider_rows = []
+    for provider in providers:
+        provider_rows.append(
+            {
+                "provider_id": provider.provider_id,
+                "display_name": provider.display_name,
+                "location": provider.location,
+                "backend": provider.backend,
+                "status": provider.status,
+                "models": list(provider.config.get("models", []))
+                if isinstance(provider.config.get("models", []), list)
+                else [],
+                "last_test": provider_test_results.get(provider.provider_id),
+            }
+        )
+
+    return SystemDiagnosticsResponse(
+        readiness={
+            "mnemory_reachable": provider_health["memory"].status == "healthy",
+            "intaris_reachable": provider_health["guardrails"].status == "healthy",
+            "llm_provider_configured": len(providers) > 0,
+            "agent_created": len(agents) > 0,
+            "chat_ready": len(providers) > 0 and len(agents) > 0,
+        },
+        ui={
+            "enabled": bool(config.serve_ui),
+            "assets_present": request.app.state.ui_build_dir is not None,
+            "user_facing_url": request.app.state.user_facing_url,
+        },
+        database={
+            **_database_summary(config.database_url),
+            "migration_version": await _migration_version(request),
+        },
+        config={
+            "data_dir": str(config.data_dir),
+            "host": config.host,
+            "port": config.port,
+            "serve_ui": config.serve_ui,
+            "mnemory_url": config.mnemory_url,
+            "intaris_url": config.intaris_url,
+            "log_level": config.log_level,
+            "log_format": config.log_format,
+            "cors_origins": config.cors_origins,
+        },
+        providers=provider_rows,
+        agents={
+            "count": len(agents),
+            "names": [agent.name for agent in agents[:20]],
+        },
+        key_fingerprint=request.app.state.jwt_public_key_fingerprint,
+    )
 
 
 @router.get("/api/metrics")

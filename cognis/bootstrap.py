@@ -122,6 +122,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await conn.run_sync(_ensure_session_lifecycle_columns)
+        await conn.run_sync(_ensure_api_key_columns)
 
 
 def _ensure_session_lifecycle_columns(sync_conn: object) -> None:
@@ -138,6 +139,15 @@ def _ensure_session_lifecycle_columns(sync_conn: object) -> None:
             )
         )
         execute(text("UPDATE sessions SET updated_at = COALESCE(updated_at, started_at)"))
+
+
+def _ensure_api_key_columns(sync_conn: object) -> None:
+    inspector = cast(Any, inspect(sync_conn))
+    api_key_columns = {column["name"] for column in inspector.get_columns("api_keys")}
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+
+    if "last_used_at" not in api_key_columns:
+        execute(text("ALTER TABLE api_keys ADD COLUMN last_used_at TIMESTAMP WITH TIME ZONE"))
 
 
 async def seed_default_settings(session: AsyncSession) -> None:

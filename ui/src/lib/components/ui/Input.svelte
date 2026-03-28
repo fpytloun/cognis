@@ -1,4 +1,6 @@
 <script lang="ts">
+  import type { HTMLInputAttributes } from 'svelte/elements';
+
   import { cn } from '$lib/utils';
 
   let {
@@ -7,7 +9,8 @@
     placeholder = '',
     class: className = '',
     disabled = false,
-    name
+    name,
+    ...rest
   } = $props<{
     type?: string;
     value?: string | number;
@@ -15,7 +18,7 @@
     class?: string;
     disabled?: boolean;
     name?: string;
-  }>();
+  } & HTMLInputAttributes>();
 </script>
 
 <input
@@ -28,4 +31,5 @@
   {placeholder}
   {disabled}
   {name}
+  {...rest}
 />

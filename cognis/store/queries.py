@@ -104,8 +104,35 @@ async def create_api_key(
 
 async def list_api_keys(session: AsyncSession, user_email: str) -> list[ApiKey]:
     """List API keys for a user (metadata only)."""
-    result = await session.execute(select(ApiKey).where(ApiKey.user_email == user_email))
+    result = await session.execute(
+        select(ApiKey)
+        .where(ApiKey.user_email == user_email)
+        .order_by(ApiKey.created_at.desc(), ApiKey.key_id.asc())
+    )
     return list(result.scalars().all())
+
+
+async def delete_api_key(session: AsyncSession, key_id: str, user_email: str) -> bool:
+    """Delete one API key belonging to a user."""
+
+    result = await session.execute(
+        delete(ApiKey).where(ApiKey.key_id == key_id, ApiKey.user_email == user_email)
+    )
+    await session.flush()
+    return int(getattr(result, "rowcount", 0) or 0) > 0
+
+
+async def touch_api_key_last_used(
+    session: AsyncSession, key_id: str, when: datetime | None = None
+) -> bool:
+    """Update the last-used timestamp for an API key."""
+
+    record = await get_api_key(session, key_id)
+    if record is None:
+        return False
+    record.last_used_at = when or _utcnow()
+    await session.flush()
+    return True
 
 
 # --- Settings ---
