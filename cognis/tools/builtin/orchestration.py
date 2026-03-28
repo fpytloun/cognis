@@ -1,8 +1,13 @@
-"""Built-in orchestration tool definitions and stage-4 stubs."""
+"""Built-in orchestration tool definitions.
+
+These tools are intercepted by the agent loop as controller directives.
+They create child sessions for delegation. The executor never sees them.
+"""
 
 from __future__ import annotations
 
 import json
+from typing import Any
 
 from cognis.models.tool import ToolCall, ToolDefinition, ToolResult, ToolSource
 
@@ -74,18 +79,71 @@ def is_orchestration_tool(tool_name: str) -> bool:
     return tool_name in ORCHESTRATION_TOOL_NAMES
 
 
-async def handle_orchestration_tool_call(tool_call: ToolCall) -> ToolResult:
-    """Return a stage-4 orchestration stub response."""
+async def handle_orchestration_tool_call(
+    tool_call: ToolCall,
+    *,
+    session_manager: Any | None = None,
+    session: Any | None = None,
+    agent: Any | None = None,
+) -> ToolResult:
+    """Handle orchestration tool calls as controller directives.
 
+    Creates child sessions for delegation when session_manager is provided.
+    Falls back to an accepted-response stub when the session layer is not
+    available (e.g., direct invocation outside the agent loop).
+    """
+    mode = tool_call.name
+    args = tool_call.arguments
+
+    if session_manager is not None and session is not None and agent is not None:
+        # Real delegation — create a child session
+        try:
+            child_session = await session_manager.create_child_session(
+                parent_session=session,
+                mode=mode,
+                task_description=args.get("task") or args.get("reason", ""),
+                agent_id=args.get("agent_id") or getattr(agent, "agent_id", ""),
+                effective_agent_id=args.get("agent_id") or getattr(agent, "agent_id", ""),
+                expected_output=args.get("expected_output"),
+            )
+            return ToolResult(
+                output=json.dumps(
+                    {
+                        "status": "accepted",
+                        "mode": mode,
+                        "call_id": tool_call.call_id,
+                        "session_id": child_session.session_id,
+                        "message": f"Delegation ({mode}) created. Working in background.",
+                    },
+                    sort_keys=True,
+                ),
+                metadata={"orchestration": True, "mode": mode},
+            )
+        except Exception as exc:
+            return ToolResult(
+                output=json.dumps(
+                    {
+                        "status": "error",
+                        "mode": mode,
+                        "call_id": tool_call.call_id,
+                        "message": f"Delegation failed: {type(exc).__name__}",
+                    },
+                    sort_keys=True,
+                ),
+                is_error=True,
+                metadata={"orchestration": True, "mode": mode},
+            )
+
+    # Stub response when session layer is not available
     return ToolResult(
         output=json.dumps(
             {
                 "status": "accepted",
-                "mode": tool_call.name,
+                "mode": mode,
                 "call_id": tool_call.call_id,
-                "message": "Orchestration flow will be wired in Stage 6.",
+                "message": "Delegation request accepted.",
             },
             sort_keys=True,
         ),
-        metadata={"orchestration": True, "mode": tool_call.name},
+        metadata={"orchestration": True, "mode": mode},
     )

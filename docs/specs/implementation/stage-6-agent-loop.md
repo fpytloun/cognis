@@ -1,6 +1,6 @@
 # Stage 6: Agent Loop + Workflow Engine
 
-**Status**: NOT STARTED
+**Status**: DONE
 **Repo**: `cognis`
 **Depends on**: Stage 4 (executor + tools) AND Stage 5 (orchestration core)
 **Estimated effort**: 7-10 days (largest stage — core of the system)

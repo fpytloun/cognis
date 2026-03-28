@@ -286,3 +286,105 @@ def _parse_classifier_payload(content: str) -> dict[str, Any]:
         if cleaned.startswith("json"):
             cleaned = cleaned[4:].strip()
     return cast(dict[str, Any], json.loads(cleaned))
+
+
+# ---------------------------------------------------------------------------
+# Workflow selection
+# ---------------------------------------------------------------------------
+
+
+class WorkflowSelectionResult(BaseModel):
+    """Result of workflow selection."""
+
+    workflow_id: str
+    confidence: float
+    reason: str
+    source: str  # "explicit" | "default" | "classifier"
+
+
+async def select_workflow(
+    *,
+    llm: Any,
+    task_description: str,
+    available_workflows: list[dict[str, str]],
+    default_workflow_id: str | None = None,
+    selection_mode: str = "automatic",
+    classifier_timeout_seconds: float = 2.0,
+) -> WorkflowSelectionResult:
+    """Select a workflow for a task based on agent config and classifier.
+
+    Args:
+        llm: LLM provider for classifier calls.
+        task_description: Description of the task.
+        available_workflows: List of {workflow_id, name, criteria} dicts.
+        default_workflow_id: Agent's default workflow.
+        selection_mode: "automatic" | "always_ask" | "use_default".
+        classifier_timeout_seconds: Timeout for the LLM classifier.
+    """
+    if selection_mode == "use_default" and default_workflow_id:
+        return WorkflowSelectionResult(
+            workflow_id=default_workflow_id,
+            confidence=1.0,
+            reason="Agent default workflow",
+            source="default",
+        )
+
+    if not available_workflows:
+        return WorkflowSelectionResult(
+            workflow_id=default_workflow_id or "system:direct",
+            confidence=0.5,
+            reason="No workflows available, using default",
+            source="default",
+        )
+
+    # Build classifier prompt
+    workflow_options = "\n".join(
+        f"- {w['workflow_id']}: {w.get('name', '')} — {w.get('criteria', '')}"
+        for w in available_workflows
+    )
+    prompt = [
+        {
+            "role": "system",
+            "content": (
+                "Select the best workflow for the given task. Return JSON only: "
+                '{"workflow_id": "...", "confidence": 0.0-1.0, "reason": "..."}'
+            ),
+        },
+        {
+            "role": "user",
+            "content": f"Task: {task_description}\n\nAvailable workflows:\n{workflow_options}",
+        },
+    ]
+
+    try:
+        response = await asyncio.wait_for(
+            llm.generate(prompt, task_type="classifier", temperature=0),
+            timeout=classifier_timeout_seconds,
+        )
+        content = _extract_text_from_response(response)
+        payload = _parse_classifier_payload(content)
+        workflow_id = str(payload.get("workflow_id", ""))
+
+        # Validate the selected workflow exists
+        valid_ids = {w["workflow_id"] for w in available_workflows}
+        if workflow_id not in valid_ids:
+            workflow_id = default_workflow_id or "system:direct"
+
+        return WorkflowSelectionResult(
+            workflow_id=workflow_id,
+            confidence=float(payload.get("confidence", 0.5)),
+            reason=str(payload.get("reason", "Classifier selection")),
+            source="classifier",
+        )
+
+    except (TimeoutError, Exception):
+        logger.warning(
+            "Workflow selector failed, using default",
+            extra={"extra_data": {"default": default_workflow_id}},
+        )
+        return WorkflowSelectionResult(
+            workflow_id=default_workflow_id or "system:direct",
+            confidence=0.3,
+            reason="Classifier fallback",
+            source="default",
+        )

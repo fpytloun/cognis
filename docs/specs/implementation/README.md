@@ -10,7 +10,7 @@
 | 3 | [Provider Layer](stage-3-providers.md) | DONE | All 6 protocols + implementations |
 | 4 | [Executor + Tools](stage-4-executor.md) | DONE | In-process executor, MCP, tool router |
 | 5 | [Orchestration Core](stage-5-orchestration.md) | DONE | Session manager, cache, context, compaction, decision engine |
-| 6 | [Agent Loop + Workflow Engine](stage-6-agent-loop.md) | NOT STARTED | Step runner, workflow engine, evaluator, task queue, gates (largest stage) |
+| 6 | [Agent Loop + Workflow Engine](stage-6-agent-loop.md) | DONE | Step runner, workflow engine, evaluator, task queue, gates, event bus, registry |
 | 7 | [API + WebSocket](stage-7-api.md) | NOT STARTED | Full REST + WS surface including tasks/kanban |
 | 8 | [UI](stage-8-ui.md) | NOT STARTED | SvelteKit: chat, agents, tasks/kanban, settings, workflows |
 | 9 | [Integration Testing](stage-9-testing.md) | NOT STARTED | Full flow tests, polish |

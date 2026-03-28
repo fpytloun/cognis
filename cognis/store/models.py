@@ -219,6 +219,121 @@ class Secret(Base):
     )
 
 
+class Task(Base):
+    """Durable work items with queue semantics and workflow state.
+
+    Tasks own workflow execution state directly via the workflow_state
+    JSONB column. There is no separate workflow_runs table in MVP.
+    """
+
+    __tablename__ = "tasks"
+
+    task_id: Mapped[str] = mapped_column(String, primary_key=True)
+    title: Mapped[str] = mapped_column(String, nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String, nullable=False, default="draft")
+    priority: Mapped[int] = mapped_column(nullable=False, default=0)
+    created_by: Mapped[str] = mapped_column(String, ForeignKey("users.email"), nullable=False)
+    agent_id: Mapped[str] = mapped_column(String, ForeignKey("agents.agent_id"), nullable=False)
+    source_type: Mapped[str] = mapped_column(String, nullable=False, default="api")
+    source_ref: Mapped[str | None] = mapped_column(String, nullable=True)
+    delivery_mode: Mapped[str] = mapped_column(String, nullable=False, default="same_conversation")
+    delivery_target: Mapped[str | None] = mapped_column(String, nullable=True)
+    workflow_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    workflow_state: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    queue_name: Mapped[str] = mapped_column(String, nullable=False, default="default")
+    scheduled_for: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    started_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    result_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    result_data: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+
+class TaskDependency(Base):
+    """DAG edges between tasks."""
+
+    __tablename__ = "task_dependencies"
+
+    task_id: Mapped[str] = mapped_column(String, ForeignKey("tasks.task_id"), primary_key=True)
+    depends_on: Mapped[str] = mapped_column(String, ForeignKey("tasks.task_id"), primary_key=True)
+    required: Mapped[bool] = mapped_column(nullable=False, default=True)
+
+
+class WorkflowRow(Base):
+    """Portable workflow templates stored in DB."""
+
+    __tablename__ = "workflows"
+
+    workflow_id: Mapped[str] = mapped_column(String, primary_key=True)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    version: Mapped[int] = mapped_column(nullable=False, default=1)
+    definition: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    is_system: Mapped[bool] = mapped_column(nullable=False, default=False)
+    owner_email: Mapped[str | None] = mapped_column(
+        String, ForeignKey("users.email"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+
+class StepRun(Base):
+    """Individual step execution attempts within a workflow run."""
+
+    __tablename__ = "step_runs"
+
+    step_run_id: Mapped[str] = mapped_column(String, primary_key=True)
+    task_id: Mapped[str] = mapped_column(String, ForeignKey("tasks.task_id"), nullable=False)
+    step_name: Mapped[str] = mapped_column(String, nullable=False)
+    step_type: Mapped[str] = mapped_column(String, nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False, default="pending")
+    attempt: Mapped[int] = mapped_column(nullable=False, default=1)
+    agent_id: Mapped[str] = mapped_column(String, nullable=False)
+    session_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    intaris_session_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    output: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    evaluation: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    todos: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+
+class Schedule(Base):
+    """Cron-like task factory."""
+
+    __tablename__ = "schedules"
+
+    schedule_id: Mapped[str] = mapped_column(String, primary_key=True)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    cron_expr: Mapped[str] = mapped_column(String, nullable=False)
+    agent_id: Mapped[str] = mapped_column(String, ForeignKey("agents.agent_id"), nullable=False)
+    workflow_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    task_template: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    enabled: Mapped[bool] = mapped_column(nullable=False, default=True)
+    last_fired_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    next_fire_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    created_by: Mapped[str] = mapped_column(String, ForeignKey("users.email"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+
 class AuditLog(Base):
     """System-level audit events (NOT session content)."""
 
