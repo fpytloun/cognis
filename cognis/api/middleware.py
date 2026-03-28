@@ -61,18 +61,6 @@ class AuthenticationMiddleware(BaseHTTPMiddleware):
             token = authorization.removeprefix("Bearer ").strip()
             try:
                 claims = auth_provider.verify_jwt(token, audience=["cognis"])
-                context_token = current_user_email.set(str(claims["sub"]))
-                request.state.user = AuthenticatedUser(
-                    email=str(claims["sub"]),
-                    role=str(claims.get("role", "user")),
-                    name=claims.get("name"),
-                    auth_type="jwt",
-                )
-                request.state.claims = claims
-                try:
-                    return await call_next(request)
-                finally:
-                    current_user_email.reset(context_token)
             except Exception:
                 return JSONResponse(
                     status_code=401,
@@ -80,6 +68,18 @@ class AuthenticationMiddleware(BaseHTTPMiddleware):
                         error=ErrorBody(code="unauthorized", message="Invalid or expired token")
                     ).model_dump(),
                 )
+            context_token = current_user_email.set(str(claims["sub"]))
+            request.state.user = AuthenticatedUser(
+                email=str(claims["sub"]),
+                role=str(claims.get("role", "user")),
+                name=claims.get("name"),
+                auth_type="jwt",
+            )
+            request.state.claims = claims
+            try:
+                return await call_next(request)
+            finally:
+                current_user_email.reset(context_token)
 
         if api_key_header:
             parsed = parse_api_key(api_key_header)

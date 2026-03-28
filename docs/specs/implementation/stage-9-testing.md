@@ -1,6 +1,26 @@
 # Stage 9: Integration Testing + Polish
 
-**Status**: NOT STARTED
+**Status**: IN PROGRESS
+
+## Implementation Notes (Partial)
+
+- Built integration test infrastructure under `tests/integration/` with
+  auto-bootstrapped ES256 keys, subprocess Mnemory + Intaris via `uvx`,
+  and Cognis in-process via `TestClient` — all using isolated temp dirs.
+- Fixed 3 backend bugs discovered during integration testing:
+  1. Auth middleware `except Exception` was catching route handler errors
+     and returning 401 (moved JWT verification try/except before `call_next`).
+  2. Agent creation failed hard when Mnemory personality bootstrap timed out
+     (now gracefully degrades with a warning log).
+  3. Mnemory httpx client timeout was 10s, insufficient for embedded Qdrant
+     first-write initialization (increased to 30s).
+- 16 integration tests pass without a live server (API surface, agent CRUD,
+  health, degradation, settings, workflows, secrets, JWKS, tools, LLM
+  providers, escalation endpoint, recovery, task dependencies, performance).
+- 10 tests requiring WebSocket + LLM streaming are marked `live_server` and
+  deferred to Phase 2 (Starlette TestClient cannot handle async agent loop
+  + LLM streaming; needs Cognis as a subprocess too).
+- Accessibility polish deferred note carried from Stage 8.
 **Repo**: `cognis`
 **Depends on**: Stage 8 (all functionality must be wired)
 **Estimated effort**: 3-4 days

@@ -63,6 +63,10 @@ testpaths = ["tests"]
 filterwarnings = [
     "ignore::DeprecationWarning",
 ]
+markers = [
+    "integration: marks tests that require live Mnemory + Intaris (started via uvx)",
+    "live_server: marks tests that require a running Cognis server (not TestClient) for WebSocket/LLM flows",
+]
 
 [tool.ruff]
 target-version = "py312"

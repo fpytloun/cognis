@@ -19,6 +19,7 @@ from cognis.api.models import (
     CursorPage,
 )
 from cognis.api.serializers import agent_to_response
+from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.store.queries import (
     create_agent,
@@ -27,6 +28,8 @@ from cognis.store.queries import (
     set_agent_status,
     update_agent,
 )
+
+logger = get_logger(__name__)
 
 router = APIRouter(prefix="/api/v1/agents", tags=["agents"])
 
@@ -79,7 +82,13 @@ async def create_agent_route(request: Request, payload: AgentCreateRequest) -> A
         await session.refresh(row)
 
     definition = AgentDefinition.model_validate(agent_to_response(row).model_dump())
-    await request.app.state.providers.memory.bootstrap_agent(definition)
+    try:
+        await request.app.state.providers.memory.bootstrap_agent(definition)
+    except Exception:
+        logger.warning(
+            "Mnemory personality bootstrap failed for agent (retry via sync-personality)",
+            extra={"extra_data": {"agent_id": payload.agent_id}},
+        )
     return agent_to_response(row)
 
 
@@ -142,7 +151,13 @@ async def activate_agent(request: Request, agent_id: str) -> AgentResponse:
         await session.commit()
         await session.refresh(row)
     definition = AgentDefinition.model_validate(agent_to_response(row).model_dump())
-    await request.app.state.providers.memory.bootstrap_agent(definition)
+    try:
+        await request.app.state.providers.memory.bootstrap_agent(definition)
+    except Exception:
+        logger.warning(
+            "Mnemory personality bootstrap failed on activation (retry via sync-personality)",
+            extra={"extra_data": {"agent_id": agent_id}},
+        )
     return agent_to_response(row)
 
 

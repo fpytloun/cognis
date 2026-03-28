@@ -25,7 +25,7 @@ class MnemoryProvider:
         self.base_url = base_url.rstrip("/")
         self.auth_provider = auth_provider
         self.user_email = user_email
-        self.client = httpx.AsyncClient(base_url=self.base_url, timeout=10)
+        self.client = httpx.AsyncClient(base_url=self.base_url, timeout=30)
         self.breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=30.0)
 
     def _headers(
