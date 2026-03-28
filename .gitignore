@@ -8,3 +8,7 @@ __pycache__/
 dist/
 build/
 cognis.db
+ui/node_modules/
+ui/.svelte-kit/
+ui/build/
+ui/coverage/

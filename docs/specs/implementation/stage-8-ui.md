@@ -1,9 +1,29 @@
 # Stage 8: UI
 
-**Status**: NOT STARTED
+**Status**: DONE
 **Repo**: `cognis` (under `ui/`)
 **Depends on**: Stage 7 (API + WebSocket — the UI consumes them)
 **Estimated effort**: 5-7 days
+
+## Implementation Notes
+
+- Implemented a new SvelteKit + TypeScript + Tailwind UI under `ui/` with
+  adapter-node output (`node build`) and a Vite dev proxy for `/api`,
+  `/.well-known`, and `/api/ws` to the Cognis backend.
+- Added shared frontend infrastructure for auth persistence/refresh, typed
+  REST access, a reconnecting WebSocket client, safe markdown rendering via
+  `marked` + `DOMPurify`, and route-level error fallbacks.
+- Chat now supports conversation management, paginated history loading,
+  streaming assistant updates, tool/delegation cards, reconnect/replay, and
+  escalation polling with an MVP countdown fallback based on
+  `session.escalation_timeout_seconds`.
+- Added agent, task, workflow, and settings pages with CRUD flows that align
+  with the current Stage 7 backend behavior.
+- Updated the backend workflow read/duplicate routes so bundled system
+  workflows are listable, viewable, and duplicable through the API, which the
+  Stage 8 workflow editor depends on.
+- Accessibility polish (keyboard-first drag alternatives, deeper ARIA work,
+  and screen-reader pass) is deferred to Stage 9.
 
 ## Objective
 

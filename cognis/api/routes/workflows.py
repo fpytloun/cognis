@@ -18,7 +18,6 @@ from cognis.store.queries import (
     create_workflow,
     delete_workflow,
     get_workflow,
-    list_workflows,
     update_workflow,
 )
 
@@ -32,9 +31,8 @@ async def workflow_list(
     limit: int = Query(default=20, ge=1, le=100),
 ) -> CursorPage[WorkflowResponse]:
     user = require_current_user(request)
-    async with request.app.state.session_factory() as session:
-        rows = await list_workflows(session, owner_email=user.email, include_system=True)
-    items = [workflow_to_response(row) for row in rows]
+    workflows = await request.app.state.workflow_registry.list_all(owner_email=user.email)
+    items = [workflow_to_response(workflow) for workflow in workflows]
     page_items, next_cursor, has_more = paginate_items(
         items,
         limit=limit,
@@ -81,13 +79,16 @@ async def workflow_create(request: Request, payload: WorkflowRequest) -> Workflo
 @router.get("/{workflow_id}", response_model=WorkflowResponse)
 async def workflow_detail(request: Request, workflow_id: str) -> WorkflowResponse:
     user = require_current_user(request)
-    async with request.app.state.session_factory() as session:
-        row = await get_workflow(session, workflow_id)
-    if row is None:
+    workflow = await request.app.state.workflow_registry.get(workflow_id)
+    if workflow is None:
         raise api_exception(404, "not_found", "Workflow not found")
-    if not row.is_system and row.owner_email not in {user.email, None}:
+    if (
+        not workflow.is_system
+        and workflow.owner_email not in {user.email, None}
+        and user.role != "admin"
+    ):
         raise api_exception(403, "forbidden", "Workflow access denied")
-    return workflow_to_response(row)
+    return workflow_to_response(workflow)
 
 
 @router.put("/{workflow_id}", response_model=WorkflowResponse)
@@ -147,21 +148,31 @@ async def workflow_delete_route(request: Request, workflow_id: str) -> dict[str,
 async def workflow_duplicate(request: Request, workflow_id: str) -> WorkflowResponse:
     forbid_mutation_for_viewer(request)
     user = require_current_user(request)
+    workflow = await request.app.state.workflow_registry.get(workflow_id)
+    if workflow is None:
+        raise api_exception(404, "not_found", "Workflow not found")
+    if (
+        not workflow.is_system
+        and workflow.owner_email not in {user.email, None}
+        and user.role != "admin"
+    ):
+        raise api_exception(403, "forbidden", "Workflow access denied")
+
+    new_workflow_id = f"wf_{uuid.uuid4().hex[:12]}"
+    definition = workflow.model_dump(mode="json")
+    definition["workflow_id"] = new_workflow_id
+    definition["name"] = f"{workflow.name} Copy"
+    definition["is_system"] = False
+    definition["owner_email"] = user.email
+
     async with request.app.state.session_factory() as session:
-        row = await get_workflow(session, workflow_id)
-        if row is None:
-            raise api_exception(404, "not_found", "Workflow not found")
-        new_workflow_id = f"wf_{uuid.uuid4().hex[:12]}"
-        definition = dict(row.definition or {})
-        definition["workflow_id"] = new_workflow_id
-        definition["name"] = f"{row.name} Copy"
         new_row = await create_workflow(
             session,
             workflow_id=new_workflow_id,
-            name=f"{row.name} Copy",
-            description=row.description or "",
+            name=f"{workflow.name} Copy",
+            description=workflow.description or "",
             definition=definition,
-            version=row.version,
+            version=workflow.version,
             is_system=False,
             owner_email=user.email,
         )

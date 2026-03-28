@@ -1,0 +1,46 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+html,
+body,
+#svelte {
+  min-height: 100%;
+}
+
+body {
+  @apply bg-slate-950 text-slate-100 antialiased;
+  background-image:
+    radial-gradient(circle at top left, rgb(59 130 246 / 0.18), transparent 28%),
+    radial-gradient(circle at top right, rgb(14 165 233 / 0.12), transparent 24%),
+    linear-gradient(180deg, rgb(2 6 23) 0%, rgb(15 23 42) 100%);
+}
+
+a {
+  @apply text-sky-300 transition-colors hover:text-sky-200;
+}
+
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+[tabindex]:focus-visible {
+  @apply outline-none ring-2 ring-sky-400 ring-offset-2 ring-offset-slate-950;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+  @apply rounded-full bg-slate-700;
+}
+
+::-webkit-scrollbar-track {
+  @apply bg-slate-900/60;
+}

@@ -1,0 +1,117 @@
+<script lang="ts">
+  import { goto } from '$app/navigation';
+  import { onMount } from 'svelte';
+
+  import AgentAvatar from '$lib/components/AgentAvatar.svelte';
+  import LoadingState from '$lib/components/LoadingState.svelte';
+  import Button from '$lib/components/ui/Button.svelte';
+  import Card from '$lib/components/ui/Card.svelte';
+  import { api, asApiError } from '$lib/api/client';
+  import type { Agent, Workflow } from '$lib/types/api';
+
+  let loading = true;
+  let error = '';
+  let agents: Agent[] = [];
+  let workflows: Workflow[] = [];
+
+  async function loadAgents(): Promise<void> {
+    loading = true;
+    error = '';
+    try {
+      [agents, workflows] = await Promise.all([api.agents.listAll(), api.workflows.listAll()]);
+    } catch (caughtError) {
+      error = asApiError(caughtError).message;
+    } finally {
+      loading = false;
+    }
+  }
+
+  function defaultWorkflowLabel(agent: Agent): string {
+    const workflowId = typeof agent.execution?.default_workflow_id === 'string' ? agent.execution.default_workflow_id : null;
+    return workflows.find((workflow) => workflow.workflow_id === workflowId)?.name ?? workflowId ?? 'automatic';
+  }
+
+  async function toggleStatus(agent: Agent): Promise<void> {
+    try {
+      if (agent.status === 'active') {
+        await api.agents.suspend(agent.agent_id);
+      } else {
+        await api.agents.activate(agent.agent_id);
+      }
+      await loadAgents();
+    } catch (caughtError) {
+      error = asApiError(caughtError).message;
+    }
+  }
+
+  async function syncPersonality(agent: Agent): Promise<void> {
+    try {
+      await api.agents.syncPersonality(agent.agent_id);
+    } catch (caughtError) {
+      error = asApiError(caughtError).message;
+    }
+  }
+
+  onMount(() => {
+    void loadAgents();
+  });
+</script>
+
+<svelte:head>
+  <title>Agents · Cognis</title>
+</svelte:head>
+
+{#if loading}
+  <LoadingState label="Loading agents" description="Fetching your agent definitions and workflow defaults." />
+{:else}
+  <section class="space-y-5">
+    <div class="flex flex-wrap items-center justify-between gap-3">
+      <div>
+        <p class="text-sm uppercase tracking-[0.25em] text-slate-400">Agent management</p>
+        <h1 class="mt-1 text-2xl font-semibold text-white">Agents</h1>
+      </div>
+      <Button onclick={() => goto('/agents/new')}>Create agent</Button>
+    </div>
+
+    {#if error}
+      <p class="rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-100">{error}</p>
+    {/if}
+
+    <div class="grid gap-4 xl:grid-cols-2">
+      {#each agents as agent}
+        <Card class="p-5">
+          <div class="flex items-start justify-between gap-4">
+            <div class="flex items-start gap-4">
+              <AgentAvatar name={agent.display_name ?? agent.name} avatarUrl={agent.avatar_url} />
+              <div>
+                <h2 class="text-lg font-semibold text-white">{agent.display_name ?? agent.name}</h2>
+                <p class="text-sm text-slate-400">{agent.agent_id}</p>
+                <p class="mt-3 text-sm leading-6 text-slate-300">{agent.description ?? 'No description yet.'}</p>
+              </div>
+            </div>
+            <span class="rounded-full border border-slate-700 bg-slate-800 px-3 py-1 text-xs font-medium uppercase tracking-[0.2em] text-slate-200">
+              {agent.status}
+            </span>
+          </div>
+
+          <dl class="mt-4 grid gap-3 text-sm text-slate-300 md:grid-cols-2">
+            <div>
+              <dt class="text-xs uppercase tracking-[0.2em] text-slate-500">Default workflow</dt>
+              <dd class="mt-1">{defaultWorkflowLabel(agent)}</dd>
+            </div>
+            <div>
+              <dt class="text-xs uppercase tracking-[0.2em] text-slate-500">Model</dt>
+              <dd class="mt-1">{typeof agent.llm_config?.model === 'string' ? agent.llm_config.model : 'inherit'}</dd>
+            </div>
+          </dl>
+
+          <div class="mt-5 flex flex-wrap gap-2">
+            <Button size="sm" variant="secondary" onclick={() => goto(`/agents/${agent.agent_id}`)}>Open</Button>
+            <Button size="sm" variant="secondary" onclick={() => toggleStatus(agent)}>{agent.status === 'active' ? 'Suspend' : 'Activate'}</Button>
+            <Button size="sm" variant="secondary" onclick={() => syncPersonality(agent)}>Sync personality</Button>
+          </div>
+        </Card>
+      {/each}
+    </div>
+  </section>
+{/if}

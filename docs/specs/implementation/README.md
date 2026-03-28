@@ -12,7 +12,7 @@
 | 5 | [Orchestration Core](stage-5-orchestration.md) | DONE | Session manager, cache, context, compaction, decision engine |
 | 6 | [Agent Loop + Workflow Engine](stage-6-agent-loop.md) | DONE | Step runner, workflow engine, evaluator, task queue, gates, event bus, registry |
 | 7 | [API + WebSocket](stage-7-api.md) | DONE | REST + WS MVP surface, cursor pagination, sessions routes, task controls, reconnect support |
-| 8 | [UI](stage-8-ui.md) | NOT STARTED | SvelteKit: chat, agents, tasks/kanban, settings, workflows |
+| 8 | [UI](stage-8-ui.md) | DONE | SvelteKit UI under `ui/` with auth, chat, agents, tasks, workflows, settings, and Stage 8 workflow API alignment |
 | 9 | [Integration Testing](stage-9-testing.md) | NOT STARTED | Full flow tests, polish |
 
 ## Dependency Graph

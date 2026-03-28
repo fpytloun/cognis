@@ -139,10 +139,18 @@ uv pip install -e ".[dev]"
 # Run server
 uv run cognis serve
 
+# Run the SvelteKit UI
+cd ui && npm install && npm run dev
+
 # Run tests
 uv run pytest tests/unit/ -v          # Unit tests (fast, no services needed)
 uv run pytest tests/contract/ -v      # Contract tests (need Mnemory + Intaris)
 uv run pytest tests/integration/ -v   # Integration tests (need full stack)
+
+# UI checks and build
+cd ui && npm run check
+cd ui && npm run test
+cd ui && npm run build
 
 # Lint and type check
 ruff check cognis/ tests/

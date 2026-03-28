@@ -141,7 +141,9 @@ services:
     ports:
       - "3000:3000"
     environment:
-      COGNIS_API_URL: "http://cognis:8080"
+      PUBLIC_COGNIS_API_URL: "https://cognis.example.com"
+      PUBLIC_INTARIS_UI_URL: "https://cognis.example.com/intaris"
+      PUBLIC_MNEMORY_UI_URL: "https://cognis.example.com/mnemory"
     depends_on: [cognis]
 
   postgres:
@@ -178,8 +180,10 @@ secrets:
 ```
 
 Note: Mnemory and Intaris are NOT exposed to the host. Only the Cognis
-controller and UI have host port bindings. All service communication is
-internal to the Docker network.
+controller and UI have host port bindings. The UI uses browser-facing
+`PUBLIC_*` origins, so these values should point to externally reachable
+URLs (typically the reverse-proxied Cognis/Intaris/Mnemory routes), not
+container-internal service names.
 
 ### Dockerfile
 
@@ -245,6 +249,16 @@ Variables" above for the full reference.
 
 Managed via the UI Settings page or `GET/PUT /api/v1/settings`. Seeded
 with sensible defaults on first start.
+
+### UI Environment Variables
+
+The SvelteKit UI reads browser-visible environment variables:
+
+| Variable | Purpose |
+|----------|---------|
+| `PUBLIC_COGNIS_API_URL` | Cognis API origin used by the browser. Leave empty for same-origin/proxied deployments or set an explicit public backend URL. |
+| `PUBLIC_INTARIS_UI_URL` | Base URL used by the Settings page cross-service link to Intaris. |
+| `PUBLIC_MNEMORY_UI_URL` | Base URL used by the Settings page cross-service link to Mnemory. |
 
 | Category | Key | Default | Description |
 |----------|-----|---------|-------------|
