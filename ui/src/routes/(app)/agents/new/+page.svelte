@@ -18,8 +18,8 @@
   let workflows: Workflow[] = [];
   let providers: LLMProvider[] = [];
   let secrets: SecretMetadata[] = [];
-  let form = createEmptyAgentForm();
-  let initialSnapshot = JSON.stringify(form);
+  let form = $state(createEmptyAgentForm());
+  let initialSnapshot = '';
 
   function isDirty(): boolean {
     return JSON.stringify(form) !== initialSnapshot;
@@ -46,8 +46,9 @@
         providers = [];
       }
       // Re-create form with workflows so system workflows are pre-selected
-      form = createEmptyAgentForm(workflows);
-      form.systemPrompt = defaultSystemPrompt('');
+      const fresh = createEmptyAgentForm(workflows);
+      fresh.systemPrompt = defaultSystemPrompt('');
+      Object.assign(form, fresh);
       initialSnapshot = JSON.stringify(form);
     } catch (caughtError) {
       error = asApiError(caughtError).message;

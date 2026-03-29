@@ -22,7 +22,7 @@
   let secrets: SecretMetadata[] = [];
   let mcpTesting = false;
   let mcpTestResult: MCPServerTestResponse | null = null;
-  let form = agentToFormState({
+  let form = $state(agentToFormState({
     agent_id: '',
     owner_email: '',
     name: '',
@@ -42,8 +42,8 @@
     status: 'draft',
     created_at: null,
     updated_at: null
-  });
-  let initialSnapshot = JSON.stringify(form);
+  }));
+  let initialSnapshot = '';
 
   function agentIdFromRoute(): string {
     return $page.params.agentId ?? '';
@@ -74,7 +74,7 @@
       } catch {
         providers = [];
       }
-      form = agentToFormState(agent);
+      Object.assign(form, agentToFormState(agent));
       initialSnapshot = JSON.stringify(form);
     } catch (caughtError) {
       error = asApiError(caughtError).message;

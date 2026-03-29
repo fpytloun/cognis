@@ -94,12 +94,11 @@
 
   const errors = $derived(validationErrors());
   const canSubmit = $derived(Object.keys(errors).length === 0 && Boolean(form.name.trim()));
-  const derivedId = $derived(form.customId ? form.agentId : slugify(form.name));
 
-  // Keep agentId in sync with name when not customized
+  // Keep agentId in sync with name until user manually edits the ID field
   $effect(() => {
     if (!form.customId && mode === 'create') {
-      form.agentId = derivedId;
+      form.agentId = slugify(form.name);
     }
   });
 
@@ -187,22 +186,20 @@
               <span class="text-xs text-rose-300">{errors.name}</span>
             {/if}
           </label>
-          <div class="space-y-2 text-sm font-medium text-slate-200">
-            <span>ID</span>
-            {#if mode === 'edit'}
-              <Input value={form.agentId} disabled />
-            {:else if form.customId}
-              <div class="flex gap-2">
-                <Input bind:value={form.agentId} placeholder="custom-id" />
-                <Button size="sm" variant="secondary" type="button" onclick={() => (form.customId = false)}>Auto</Button>
-              </div>
-            {:else}
-              <div class="flex items-center gap-2">
-                <span class="rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-400">{derivedId || 'type a name...'}</span>
-                <Button size="sm" variant="secondary" type="button" onclick={() => { form.customId = true; form.agentId = derivedId; }}>Customize</Button>
-              </div>
+          <label class="space-y-2 text-sm font-medium text-slate-200">
+            <span>ID <span class="text-slate-500">(optional)</span></span>
+            <Input
+              bind:value={form.agentId}
+              disabled={mode === 'edit'}
+              placeholder="auto-generated from name"
+              oninput={() => { if (mode === 'create') form.customId = true; }}
+            />
+            {#if mode === 'create' && !form.customId}
+              <span class="text-xs text-slate-400">Auto-generated from name. Type here to override.</span>
+            {:else if mode === 'create' && form.customId}
+              <button type="button" class="text-xs text-sky-400 hover:text-sky-300" onclick={() => { form.customId = false; form.agentId = slugify(form.name); }}>Reset to auto</button>
             {/if}
-          </div>
+          </label>
           <label class="space-y-2 text-sm font-medium text-slate-200">
             <span>Avatar URL</span>
             <Input bind:value={form.avatarUrl} placeholder="https://…" />
