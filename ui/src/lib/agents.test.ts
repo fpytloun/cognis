@@ -13,7 +13,7 @@ describe('agent payload mapping', () => {
         name: 'filesystem',
         command: 'npx',
         argsText: '@modelcontextprotocol/server-filesystem\n/tmp/project',
-        envText: 'TOKEN=secret_name',
+        envVars: [{ key: 'TOKEN', value: 'secret_name', type: 'literal' }],
         timeoutSeconds: 45
       }
     ];

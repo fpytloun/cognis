@@ -1,10 +1,16 @@
 import type { Agent, LLMProvider, SecretMetadata, ToolDefinitionSummary, Workflow } from '$lib/types/api';
 
+export interface MCPEnvVar {
+  key: string;
+  value: string;
+  type: 'literal' | 'secret';
+}
+
 export interface MCPServerFormState {
   name: string;
   command: string;
   argsText: string;
-  envText: string;
+  envVars: MCPEnvVar[];
   timeoutSeconds: number;
 }
 
@@ -148,12 +154,14 @@ export function agentToFormState(agent: Agent): AgentFormState {
             argsText: Array.isArray(server.args)
               ? server.args.filter((value): value is string => typeof value === 'string').join('\n')
               : '',
-            envText:
+            envVars:
               server.env && typeof server.env === 'object'
-                ? Object.entries(server.env as Record<string, unknown>)
-                    .map(([key, value]) => `${key}=${String(value)}`)
-                    .join('\n')
-                : '',
+                ? Object.entries(server.env as Record<string, unknown>).map(([key, val]) => ({
+                    key,
+                    value: String(val),
+                    type: (String(val).startsWith('$secret:') ? 'secret' : 'literal') as 'literal' | 'secret'
+                  }))
+                : [],
             timeoutSeconds:
               typeof server.timeout_seconds === 'number' ? server.timeout_seconds : 30
           }))
@@ -202,12 +210,12 @@ export function formStateToPayload(form: AgentFormState): Record<string, unknown
           command: server.command.trim(),
           args: nonEmptyLines(server.argsText),
           env: Object.fromEntries(
-            nonEmptyLines(server.envText)
-              .map((line) => {
-                const [key, ...rest] = line.split('=');
-                return [key?.trim() ?? '', rest.join('=').trim()];
-              })
-              .filter(([key]) => key)
+            server.envVars
+              .filter((e) => e.key.trim())
+              .map((e) => [
+                e.key.trim(),
+                e.type === 'secret' ? `$secret:${e.value}` : e.value
+              ])
           ),
           timeout_seconds: server.timeoutSeconds || 30
         }))

@@ -8,6 +8,7 @@
     formStateToPayload,
     slugify,
     type AgentFormState,
+    type MCPEnvVar,
     type MCPServerFormState
   } from '$lib/agents';
   import type { LLMProvider, MCPServerTestResponse, SecretMetadata, ToolDefinitionSummary, Workflow } from '$lib/types/api';
@@ -55,7 +56,7 @@
   }
 
   function mcpServerError(server: MCPServerFormState): string | null {
-    const hasAnyField = server.name.trim() || server.command.trim() || server.argsText.trim() || server.envText.trim();
+    const hasAnyField = server.name.trim() || server.command.trim() || server.argsText.trim() || server.envVars.length > 0;
     if (!hasAnyField) {
       return null;
     }
@@ -65,10 +66,12 @@
     if (!server.command.trim()) {
       return 'Command is required.';
     }
-    const envLines = server.envText.split('\n').filter((line) => line.trim());
-    for (const line of envLines) {
-      if (!line.includes('=')) {
-        return `Environment variable "${line.trim()}" must use KEY=value format.`;
+    for (const envVar of server.envVars) {
+      if (!envVar.key.trim()) {
+        return 'Environment variable name is required.';
+      }
+      if (envVar.type === 'secret' && !envVar.value) {
+        return `Secret reference for ${envVar.key} is required.`;
       }
     }
     return null;
@@ -134,10 +137,18 @@
       name: '',
       command: '',
       argsText: '',
-      envText: '',
+      envVars: [],
       timeoutSeconds: 30
     };
     form.mcpServers = [...form.mcpServers, next];
+  }
+
+  function addEnvVar(server: MCPServerFormState): void {
+    server.envVars = [...server.envVars, { key: '', value: '', type: 'literal' }];
+  }
+
+  function removeEnvVar(server: MCPServerFormState, index: number): void {
+    server.envVars = server.envVars.filter((_: MCPEnvVar, i: number) => i !== index);
   }
 
   function removeMcpServer(index: number): void {
@@ -318,10 +329,32 @@
                 <span>Arguments (one per line)</span>
                 <textarea bind:value={server.argsText} class="min-h-[60px] w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 font-mono text-sm text-slate-100" placeholder="-y&#10;@modelcontextprotocol/server-filesystem&#10;/path/to/project"></textarea>
               </label>
-              <label class="block space-y-1 text-sm font-medium text-slate-200">
-                <span>Environment variables (KEY=value, one per line)</span>
-                <textarea bind:value={server.envText} class="min-h-[40px] w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 font-mono text-sm text-slate-100"></textarea>
-              </label>
+              <div class="space-y-2">
+                <div class="flex items-center justify-between gap-2">
+                  <span class="text-sm font-medium text-slate-200">Environment variables</span>
+                  <Button size="sm" variant="secondary" type="button" onclick={() => addEnvVar(server)}>Add variable</Button>
+                </div>
+                {#each server.envVars as envVar, envIndex}
+                  <div class="flex items-center gap-2">
+                    <Input bind:value={envVar.key} placeholder="KEY" class="w-36" />
+                    <select bind:value={envVar.type} class="w-24 rounded-lg border border-slate-700 bg-slate-950/80 px-2 py-2 text-xs text-slate-100">
+                      <option value="literal">Value</option>
+                      <option value="secret">Secret</option>
+                    </select>
+                    {#if envVar.type === 'secret'}
+                      <select bind:value={envVar.value} class="flex-1 rounded-lg border border-slate-700 bg-slate-950/80 px-2 py-2 text-xs text-slate-100">
+                        <option value="">Select secret...</option>
+                        {#each secrets as secret}
+                          <option value={secret.name}>{secret.name}</option>
+                        {/each}
+                      </select>
+                    {:else}
+                      <Input bind:value={envVar.value} placeholder="value" class="flex-1" />
+                    {/if}
+                    <button type="button" class="text-xs text-rose-400 hover:text-rose-300" onclick={() => removeEnvVar(server, envIndex)}>Remove</button>
+                  </div>
+                {/each}
+              </div>
               <div class="flex items-center gap-3">
                 <label class="space-y-1 text-sm font-medium text-slate-200">
                   <span>Timeout (s)</span>

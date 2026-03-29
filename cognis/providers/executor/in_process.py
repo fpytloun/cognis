@@ -237,7 +237,8 @@ class InProcessExecutorProvider:
         clients: dict[str, StdioMCPClient] = {}
         try:
             for server in config.mcp_servers:
-                client = StdioMCPClient(server, env={**server.env, **config.secrets})
+                resolved_env = _resolve_secret_refs(server.env, config.secrets)
+                client = StdioMCPClient(server, env={**resolved_env, **config.secrets})
                 await client.start()
                 clients[server.name] = client
         except Exception:
@@ -295,6 +296,23 @@ def _normalize_tool_result(result: Any, duration_ms: int) -> ToolResult:
     else:
         output = str(result)
     return ToolResult(output=output, duration_ms=duration_ms)
+
+
+def _resolve_secret_refs(env: dict[str, str], secrets: dict[str, str]) -> dict[str, str]:
+    """Resolve ``$secret:NAME`` references in MCP server environment variables.
+
+    Values starting with ``$secret:`` are replaced with the corresponding
+    secret from the resolved secrets dict.  All other values pass through
+    unchanged.
+    """
+    resolved: dict[str, str] = {}
+    for key, value in env.items():
+        if value.startswith("$secret:"):
+            secret_name = value[len("$secret:") :]
+            resolved[key] = secrets.get(secret_name, "")
+        else:
+            resolved[key] = value
+    return resolved
 
 
 def _validate_unique_server_names(config: ExecutorConfig) -> None:

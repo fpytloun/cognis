@@ -119,7 +119,7 @@ async def create_agent_route(request: Request, payload: AgentCreateRequest) -> A
     try:
         await asyncio.wait_for(
             request.app.state.providers.memory.bootstrap_agent(definition),
-            timeout=5.0,
+            timeout=60.0,
         )
         await _persist_sync_metadata(request, agent_id, True)
         row.sync_metadata = _sync_metadata(True)
@@ -197,7 +197,7 @@ async def activate_agent(request: Request, agent_id: str) -> AgentResponse:
     try:
         await asyncio.wait_for(
             request.app.state.providers.memory.bootstrap_agent(definition),
-            timeout=5.0,
+            timeout=60.0,
         )
         await _persist_sync_metadata(request, agent_id, True)
         row.sync_metadata = _sync_metadata(True)

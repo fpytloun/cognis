@@ -7,11 +7,14 @@ from typing import Any
 
 import httpx
 
+from cognis.logging import get_logger
 from cognis.models.config import ProviderHealth
 from cognis.models.session import EventAppendResult, EventReadResult, IntarisSession, SessionEvent
 from cognis.models.tool import EscalationRecord, EvaluationResult, ToolResult
 from cognis.providers.circuit_breaker import CircuitBreaker
 from cognis.runtime_context import current_user_email
+
+logger = get_logger(__name__)
 
 
 class IntarisProvider:
@@ -124,7 +127,9 @@ class IntarisProvider:
             headers=self._headers(user_email=current_user_email.get()),
         )
         response.raise_for_status()
-        return [EscalationRecord.model_validate(item) for item in response.json()]
+        data = response.json()
+        items = data.get("items", []) if isinstance(data, dict) else data
+        return [EscalationRecord.model_validate(item) for item in items]
 
     async def record_events(
         self,
@@ -141,6 +146,12 @@ class IntarisProvider:
             json=[event.model_dump() for event in events],
             headers=headers,
         )
+        if response.status_code == 404:
+            logger.warning(
+                "Intaris session not found during record_events — session may not have been created",
+                extra={"extra_data": {"session_id": session_id}},
+            )
+            return EventAppendResult(last_seq=0)
         response.raise_for_status()
         return EventAppendResult.model_validate(response.json())
 
