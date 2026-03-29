@@ -126,6 +126,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_session_lifecycle_columns)
         await conn.run_sync(_ensure_api_key_columns)
         await conn.run_sync(_ensure_agent_sync_metadata_column)
+        await conn.run_sync(_ensure_provider_is_default_column)
 
 
 def _ensure_session_lifecycle_columns(sync_conn: object) -> None:
@@ -160,6 +161,18 @@ def _ensure_agent_sync_metadata_column(sync_conn: object) -> None:
 
     if "sync_metadata" not in agent_columns:
         execute(text("ALTER TABLE agents ADD COLUMN sync_metadata JSON DEFAULT '{}'"))
+
+
+def _ensure_provider_is_default_column(sync_conn: object) -> None:
+    inspector = cast(Any, inspect(sync_conn))
+    try:
+        provider_columns = {column["name"] for column in inspector.get_columns("llm_providers")}
+    except Exception:
+        return  # table doesn't exist yet (create_all will handle it)
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+
+    if "is_default" not in provider_columns:
+        execute(text("ALTER TABLE llm_providers ADD COLUMN is_default BOOLEAN NOT NULL DEFAULT 0"))
 
 
 async def seed_default_settings(session: AsyncSession) -> None:
