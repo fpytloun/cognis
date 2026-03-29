@@ -79,7 +79,7 @@ class DecisionEngine:
                 db_session, "decision_engine.inline_max_length", 200
             )
             classifier_timeout_ms = await get_setting_value(
-                db_session, "decision_engine.classifier_timeout_ms", 500
+                db_session, "decision_engine.classifier_timeout_ms", 60000
             )
             classifier_fallback = await get_setting_value(
                 db_session, "decision_engine.classifier_fallback", "inline"
@@ -91,7 +91,7 @@ class DecisionEngine:
             llm=llm,
             inline_max_length=int(inline_max_length) if isinstance(inline_max_length, int) else 200,
             classifier_timeout_seconds=(
-                classifier_timeout_ms / 1000 if isinstance(classifier_timeout_ms, int) else 0.5
+                classifier_timeout_ms / 1000 if isinstance(classifier_timeout_ms, int) else 60.0
             ),
             classifier_fallback=(
                 classifier_fallback if isinstance(classifier_fallback, str) else "inline"

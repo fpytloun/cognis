@@ -53,6 +53,11 @@ STEP_REPROMPTS = Counter(
     "cognis_step_reprompts_total",
     "Re-prompts for missing step_complete",
 )
+DELEGATIONS_TOTAL = Counter(
+    "cognis_delegations_total",
+    "Sub-session delegations spawned",
+    labelnames=("status",),
+)
 
 # Controller-injected tool names
 STEP_COMPLETE = "step_complete"
@@ -457,6 +462,138 @@ class AgentLoop:
             duration = (datetime.now(UTC) - start_time).total_seconds()
             STEP_DURATION.labels(phase="total").observe(duration)
 
+    async def _run_child_session(
+        self,
+        *,
+        child_session: SessionModel,
+        conversation: ConversationModel,
+        agent: AgentDefinition,
+        task_description: str,
+        mode: str,
+        parent_session_id: str,
+        tool_registry: Any,
+        executor_connection: Any,
+    ) -> None:
+        """Run a delegated child session in the background.
+
+        Executes a single agent-loop turn on the child session using the
+        task description as the user message.  On completion (or failure)
+        the result is recorded as an Intaris event in the **parent**
+        session and a ``DELEGATION_COMPLETED`` / ``DELEGATION_FAILED``
+        event is published so the frontend can update the delegation card.
+        """
+        child_step = StepDefinition(name="delegation", type="run", prompt=task_description)
+        child_ctx = StepContext(
+            step_definition=child_step,
+            session=child_session,
+            conversation=conversation,
+            agent=agent,
+            is_direct=True,
+            user_message=task_description,
+            system_initiated=True,
+            interaction_mode="explicit_gates",
+            tool_registry=tool_registry,
+            executor_connection=executor_connection,
+        )
+        conversation_id = conversation.conversation_id
+        child_session_id = child_session.session_id
+        result_summary: str | None = None
+        try:
+            output = await self.run_step(child_ctx)
+            result_summary = output.summary if output and output.summary else "Completed."
+            async with self.session_manager.session_factory() as db:
+                from cognis.store.queries import set_session_status
+
+                await set_session_status(
+                    db,
+                    child_session_id,
+                    "completed",
+                    completed_at=datetime.now(UTC),
+                    result_summary=result_summary,
+                )
+                await db.commit()
+            # Record result in parent session so the parent agent sees it
+            await self.providers.guardrails.record_events(
+                session_id=parent_session_id,
+                events=[
+                    {
+                        "type": "delegation_completed",
+                        "data": {
+                            "child_session_id": child_session_id,
+                            "mode": mode,
+                            "result_summary": result_summary,
+                        },
+                    }
+                ],
+            )
+            await self.event_bus.publish(
+                Event(
+                    type=EventType.DELEGATION_COMPLETED,
+                    data={
+                        "conversation_id": conversation_id,
+                        "child_session_id": child_session_id,
+                        "parent_session_id": parent_session_id,
+                        "result_summary": result_summary,
+                    },
+                )
+            )
+            DELEGATIONS_TOTAL.labels(status="completed").inc()
+            logger.info(
+                "delegation: child session completed",
+                extra={
+                    "extra_data": {
+                        "child_session_id": child_session_id,
+                        "parent_session_id": parent_session_id,
+                    }
+                },
+            )
+        except Exception:
+            logger.exception(
+                "delegation: child session failed",
+                extra={
+                    "extra_data": {
+                        "child_session_id": child_session_id,
+                        "parent_session_id": parent_session_id,
+                    }
+                },
+            )
+            async with self.session_manager.session_factory() as db:
+                from cognis.store.queries import set_session_status
+
+                await set_session_status(
+                    db,
+                    child_session_id,
+                    "failed",
+                    completed_at=datetime.now(UTC),
+                    result_summary="Delegation failed",
+                )
+                await db.commit()
+            await self.providers.guardrails.record_events(
+                session_id=parent_session_id,
+                events=[
+                    {
+                        "type": "delegation_failed",
+                        "data": {
+                            "child_session_id": child_session_id,
+                            "mode": mode,
+                            "error": "Delegation execution failed",
+                        },
+                    }
+                ],
+            )
+            await self.event_bus.publish(
+                Event(
+                    type=EventType.DELEGATION_FAILED,
+                    data={
+                        "conversation_id": conversation_id,
+                        "child_session_id": child_session_id,
+                        "parent_session_id": parent_session_id,
+                        "reason": "Delegation execution failed",
+                    },
+                )
+            )
+            DELEGATIONS_TOTAL.labels(status="failed").inc()
+
     async def _execute_step(
         self,
         ctx: StepContext,
@@ -795,18 +932,50 @@ class AgentLoop:
 
                 elif is_orchestration_tool(tc.name):
                     # Orchestration tool — intercept as controller directive
+                    task_description = tc.arguments.get("task") or tc.arguments.get("reason", "")
                     events_to_record.append(
                         SessionEvent(
                             type="delegation",
-                            data={"mode": tc.name, "call_id": tc.call_id},
+                            data={
+                                "mode": tc.name,
+                                "call_id": tc.call_id,
+                                "task": task_description,
+                            },
                         )
                     )
-                    result = await handle_orchestration_tool_call(
+                    result, child_session = await handle_orchestration_tool_call(
                         tc,
                         session_manager=self.session_manager,
                         session=ctx.session,
                         agent=ctx.agent,
                     )
+                    if child_session is not None:
+                        await self.event_bus.publish(
+                            Event(
+                                type=EventType.DELEGATION_STARTED,
+                                data={
+                                    "conversation_id": ctx.conversation.conversation_id,
+                                    "parent_session_id": ctx.session.session_id,
+                                    "child_session_id": child_session.session_id,
+                                    "mode": tc.name,
+                                    "agent_id": child_session.agent_id,
+                                    "task": task_description,
+                                },
+                            )
+                        )
+                        asyncio.create_task(
+                            self._run_child_session(
+                                child_session=child_session,
+                                conversation=ctx.conversation,
+                                agent=ctx.agent,
+                                task_description=task_description,
+                                mode=tc.name,
+                                parent_session_id=ctx.session.session_id,
+                                tool_registry=ctx.tool_registry,
+                                executor_connection=ctx.executor_connection,
+                            )
+                        )
+                        DELEGATIONS_TOTAL.labels(status="spawned").inc()
                     messages.append(
                         {
                             "role": "tool",

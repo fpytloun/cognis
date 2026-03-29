@@ -1379,6 +1379,30 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
             "task_id": event.data.get("task_id"),
             "reason": event.data.get("result_summary") or "cancelled",
         }
+    if event.type == EventType.DELEGATION_STARTED:
+        return {
+            "type": "delegation_started",
+            "conversation_id": conversation_id,
+            "parent_session_id": event.data.get("parent_session_id"),
+            "child_session_id": event.data.get("child_session_id"),
+            "mode": event.data.get("mode"),
+            "agent_id": event.data.get("agent_id"),
+            "task": event.data.get("task"),
+        }
+    if event.type == EventType.DELEGATION_COMPLETED:
+        return {
+            "type": "delegation_completed",
+            "conversation_id": conversation_id,
+            "child_session_id": event.data.get("child_session_id"),
+            "result": event.data.get("result_summary"),
+        }
+    if event.type == EventType.DELEGATION_FAILED:
+        return {
+            "type": "delegation_failed",
+            "conversation_id": conversation_id,
+            "child_session_id": event.data.get("child_session_id"),
+            "reason": event.data.get("reason"),
+        }
     if event.type == EventType.SESSION_RECOVERED:
         return {
             "type": "session_recovered",

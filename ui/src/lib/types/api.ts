@@ -432,6 +432,20 @@ export interface WebSocketDelegationProgressEvent {
   progress?: string;
 }
 
+export interface WebSocketDelegationCompletedEvent {
+  type: 'delegation_completed';
+  conversation_id?: string;
+  child_session_id: string;
+  result?: string;
+}
+
+export interface WebSocketDelegationFailedEvent {
+  type: 'delegation_failed';
+  conversation_id?: string;
+  child_session_id: string;
+  reason?: string;
+}
+
 export interface WebSocketWorkflowStepStartedEvent {
   type: 'workflow_step_started';
   conversation_id?: string;
@@ -557,6 +571,8 @@ export type CognisWebSocketEvent =
   | WebSocketConversationUpdatedEvent
   | WebSocketDelegationStartedEvent
   | WebSocketDelegationProgressEvent
+  | WebSocketDelegationCompletedEvent
+  | WebSocketDelegationFailedEvent
   | WebSocketWorkflowStepStartedEvent
   | WebSocketWorkflowStepCompletedEvent
   | WebSocketWorkflowGateEvent

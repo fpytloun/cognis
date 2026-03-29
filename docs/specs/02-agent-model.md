@@ -62,11 +62,14 @@ class AgentPersonality(BaseModel):
 
 
 class AgentToolConfig(BaseModel):
-    builtin_tools: list[str] = ["*"]      # Built-in tool allowlist
+    builtin_tools: list[str] = ["*"]      # Built-in + executor tool allowlist
     mcp_servers: list[MCPServerRef] = []  # Local MCP servers for executor
-    intaris_mcp_servers: list[str] = []   # Intaris-managed remote MCP servers
+    intaris_mcp_servers: list[str] = []   # Intaris-managed remote MCP servers (auto-discovered)
     delegation_tools: bool = True
     custom_tools: list[CustomToolDef] = []
+    # Note: executor-native tools (read, write, edit, bash, glob, grep, etc.)
+    # are available to all agents by default. Use builtin_tools to restrict
+    # or permissions.tool_permissions to deny specific tools.
 
 
 class AgentPermissions(BaseModel):
@@ -197,18 +200,15 @@ personality:
   traits: ["analytical", "thorough", "patient"]
   expertise_areas: ["Python", "TypeScript", "Kubernetes"]
 tools:
-  builtin_tools: ["*"]
+  builtin_tools: ["*"]             # All executor-native + builtin tools
   delegation_tools: true
-  mcp_servers:
-    - name: "filesystem"
-      transport: "stdio"
-      command: "npx"
-      args: ["@modelcontextprotocol/server-filesystem", "/workspace"]
-  intaris_mcp_servers: ["github"]  # Managed by Intaris
+  intaris_mcp_servers: ["github"]  # Auto-discovered from Intaris
 permissions:
   tool_permissions:
     "*": "evaluate"
-    "read_file": "allow"
+    "read": "allow"                # Executor-native read
+    "glob": "allow"                # Executor-native glob
+    "grep": "allow"                # Executor-native grep
 llm:
   provider_id: "anthropic"
   model: "claude-sonnet-4-20250514"
@@ -224,7 +224,7 @@ name: "Code Reviewer"
 personality:
   system_prompt: "You are a meticulous code reviewer..."
 tools:
-  builtin_tools: ["read_file", "search", "glob"]
+  builtin_tools: ["read", "grep", "glob"]
   delegation_tools: false
 permissions:
   can_delegate_to: []
@@ -244,7 +244,7 @@ name: "Research Worker"
 personality:
   system_prompt: "Find relevant information efficiently. Return concise results."
 tools:
-  builtin_tools: ["search", "read_file", "web_fetch"]
+  builtin_tools: ["grep", "read", "web_fetch"]
   delegation_tools: false
 llm:
   model: "gpt-4.1-mini"
@@ -399,20 +399,22 @@ Served at:
 
 ## Skill System
 
-Skills are lazy-loaded instruction + tool bundles:
+Skills are DB-managed instruction + tool bundles with import/export support:
 
 ```python
 class SkillReference(BaseModel):
     skill_id: str
     name: str
     description: str
-    source: str         # "db", "file", "mcp"
-    path: str | None
+    source: str         # "db", "file"
     auto_load: bool = False
 ```
 
 Skills provide instructions (injected into LLM context when activated), tool
 definitions, and prompt templates. Loaded on demand to keep context lean.
+Skills are managed via the API (`/api/v1/skills`), the Tools & Skills UI
+page, and optionally by agents via the `skill_write` built-in tool.
+See [06-tool-system.md](06-tool-system.md) for the full skill system design.
 
 ## Default Agents
 

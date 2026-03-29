@@ -332,7 +332,7 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
       id: itemId,
       kind: 'delegation',
       taskId,
-      taskLabel: 'task' in event && typeof event.task === 'string' ? event.task : taskId,
+      taskLabel: 'task' in event && typeof event.task === 'string' ? event.task : 'Background task',
       status: event.type === 'delegation_started' ? 'started' : 'running',
       result: null,
       timestamp: new Date().toISOString()
@@ -345,12 +345,38 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
     return next;
   }
 
+  if (event.type === 'delegation_completed' || event.type === 'delegation_failed') {
+    const taskId = event.child_session_id;
+    const itemId = `delegation:${taskId}`;
+    const index = next.findIndex((item) => item.id === itemId && item.kind === 'delegation');
+    const status = event.type === 'delegation_completed' ? 'completed' : 'failed';
+    const result =
+      event.type === 'delegation_completed' ? event.result : event.reason;
+    const existing = index >= 0 ? (next[index] as DelegationTimelineItem) : null;
+    const delegation: DelegationTimelineItem = {
+      id: itemId,
+      kind: 'delegation',
+      taskId,
+      taskLabel: existing?.taskLabel ?? 'Background task',
+      status,
+      result: typeof result === 'string' ? result : null,
+      timestamp: new Date().toISOString()
+    };
+    if (index >= 0) {
+      next[index] = { ...existing!, ...delegation, taskLabel: existing!.taskLabel };
+      return next;
+    }
+    next.push(delegation);
+    return next;
+  }
+
   if (
     event.type === 'workflow_completed' ||
     event.type === 'workflow_failed' ||
     event.type === 'workflow_cancelled'
   ) {
-    const itemId = `delegation:${event.task_id}`;
+    const taskId = event.task_id;
+    const itemId = `delegation:${taskId}`;
     const index = next.findIndex((item) => item.id === itemId && item.kind === 'delegation');
     const status =
       event.type === 'workflow_completed'
@@ -364,17 +390,18 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
         : event.type === 'workflow_failed'
           ? event.reason
           : event.reason;
+    const existing = index >= 0 ? (next[index] as DelegationTimelineItem) : null;
     const delegation: DelegationTimelineItem = {
       id: itemId,
       kind: 'delegation',
-      taskId: event.task_id,
-      taskLabel: event.task_id,
+      taskId,
+      taskLabel: existing?.taskLabel ?? 'Background task',
       status,
       result: typeof result === 'string' ? result : null,
       timestamp: new Date().toISOString()
     };
     if (index >= 0) {
-      next[index] = { ...(next[index] as DelegationTimelineItem), ...delegation };
+      next[index] = { ...existing!, ...delegation, taskLabel: existing!.taskLabel };
       return next;
     }
     next.push(delegation);

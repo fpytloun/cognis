@@ -59,9 +59,10 @@ class EventType(StrEnum):
     ESCALATION_CREATED = "escalation_created"
     ESCALATION_RESOLVED = "escalation_resolved"
 
-    # Delegation
+    # Delegation (sub-session lifecycle)
     DELEGATION_STARTED = "delegation_started"
     DELEGATION_COMPLETED = "delegation_completed"
+    DELEGATION_FAILED = "delegation_failed"
 
 
 class Event(BaseModel):

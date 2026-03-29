@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from cognis.models.session import SessionModel
 from cognis.models.tool import ToolCall, ToolDefinition, ToolResult, ToolSource
 
 ORCHESTRATION_TOOL_NAMES = {"delegate", "spawn_worker", "fork"}
@@ -85,12 +86,15 @@ async def handle_orchestration_tool_call(
     session_manager: Any | None = None,
     session: Any | None = None,
     agent: Any | None = None,
-) -> ToolResult:
+) -> tuple[ToolResult, SessionModel | None]:
     """Handle orchestration tool calls as controller directives.
 
     Creates child sessions for delegation when session_manager is provided.
     Falls back to an accepted-response stub when the session layer is not
     available (e.g., direct invocation outside the agent loop).
+
+    Returns a ``(ToolResult, child_session)`` tuple.  *child_session* is
+    ``None`` when the session layer is unavailable or creation failed.
     """
     mode = tool_call.name
     args = tool_call.arguments
@@ -106,44 +110,53 @@ async def handle_orchestration_tool_call(
                 effective_agent_id=args.get("agent_id") or getattr(agent, "agent_id", ""),
                 expected_output=args.get("expected_output"),
             )
-            return ToolResult(
-                output=json.dumps(
-                    {
-                        "status": "accepted",
-                        "mode": mode,
-                        "call_id": tool_call.call_id,
-                        "session_id": child_session.session_id,
-                        "message": f"Delegation ({mode}) created. Working in background.",
-                    },
-                    sort_keys=True,
+            return (
+                ToolResult(
+                    output=json.dumps(
+                        {
+                            "status": "accepted",
+                            "mode": mode,
+                            "call_id": tool_call.call_id,
+                            "session_id": child_session.session_id,
+                            "message": f"Delegation ({mode}) created. Working in background.",
+                        },
+                        sort_keys=True,
+                    ),
+                    metadata={"orchestration": True, "mode": mode},
                 ),
-                metadata={"orchestration": True, "mode": mode},
+                child_session,
             )
         except Exception as exc:
-            return ToolResult(
-                output=json.dumps(
-                    {
-                        "status": "error",
-                        "mode": mode,
-                        "call_id": tool_call.call_id,
-                        "message": f"Delegation failed: {type(exc).__name__}",
-                    },
-                    sort_keys=True,
+            return (
+                ToolResult(
+                    output=json.dumps(
+                        {
+                            "status": "error",
+                            "mode": mode,
+                            "call_id": tool_call.call_id,
+                            "message": f"Delegation failed: {type(exc).__name__}",
+                        },
+                        sort_keys=True,
+                    ),
+                    is_error=True,
+                    metadata={"orchestration": True, "mode": mode},
                 ),
-                is_error=True,
-                metadata={"orchestration": True, "mode": mode},
+                None,
             )
 
     # Stub response when session layer is not available
-    return ToolResult(
-        output=json.dumps(
-            {
-                "status": "accepted",
-                "mode": mode,
-                "call_id": tool_call.call_id,
-                "message": "Delegation request accepted.",
-            },
-            sort_keys=True,
+    return (
+        ToolResult(
+            output=json.dumps(
+                {
+                    "status": "accepted",
+                    "mode": mode,
+                    "call_id": tool_call.call_id,
+                    "message": "Delegation request accepted.",
+                },
+                sort_keys=True,
+            ),
+            metadata={"orchestration": True, "mode": mode},
         ),
-        metadata={"orchestration": True, "mode": mode},
+        None,
     )

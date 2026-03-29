@@ -309,12 +309,13 @@ socket authenticates so stalled connections are detected proactively.
 // Conversation metadata
 {type: "conversation_updated", conversation_id, title?}
 
-// Delegations
+// Delegations (sub-session lifecycle)
 {type: "delegation_started", conversation_id, parent_session_id,
  child_session_id, mode, agent_id, task}
 {type: "delegation_progress", conversation_id, child_session_id,
  step, progress, token_usage}
 {type: "delegation_completed", conversation_id, child_session_id, result}
+{type: "delegation_failed", conversation_id, child_session_id, reason}
 
 // Escalations
 {type: "escalation", conversation_id, session_id, call_id, tool_name,
@@ -354,6 +355,13 @@ Notes:
   thinking, OpenAI reasoning content). Streamed incrementally like `chunk`.
 - `conversation_updated` notifies clients of metadata changes such as
   auto-generated titles. Fires asynchronously after the first turn.
+- Delegation events track sub-session lifecycle. When an agent calls
+  `spawn_worker`/`delegate`/`fork`, the controller creates a child
+  Intaris session under the parent and spawns a background agent loop.
+  `delegation_started` fires immediately, `delegation_completed` or
+  `delegation_failed` fires when the child session finishes. The child
+  session's result is also recorded as an Intaris event in the parent
+  session so the parent agent sees it on the next context assembly.
 - On reconnect, the server replays missed events since `last_seq` and
   sends `reconnected` when replay is complete. See
   [09-ui-ux.md](09-ui-ux.md) for the full reconnection protocol.

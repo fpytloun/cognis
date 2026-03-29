@@ -430,16 +430,38 @@ Main chat runs the `direct` workflow (single step, no evaluation). This
 means all execution goes through the workflow engine — foreground chat is
 just the simplest workflow. Background tasks use multi-step workflows.
 
+## Sub-Session Execution
+
+When an agent calls `spawn_worker`, `delegate`, or `fork` during a step:
+
+1. Controller creates a child session in Cognis DB and a child Intaris
+   session under the parent (via `create_child_session`)
+2. Controller publishes `DELEGATION_STARTED` event → frontend shows a
+   delegation card with the task description
+3. Controller spawns a background `asyncio.Task` that runs a full agent
+   loop on the child session using the task description as the user
+   message. The child reuses the parent's tool registry and executor.
+4. The parent agent loop continues immediately — the child runs
+   concurrently in the background
+
+This is distinct from the Decision Engine's "delegate" path, which
+creates a **Task** in the task queue. Orchestration tools create
+lightweight **sub-sessions** that run a single agent loop turn.
+
 ## Delegation Result Delivery
 
-When a child session completes while the parent is active:
+When a child session completes (or fails):
 
-1. Controller appends `delegation` event to parent's Intaris event stream
-   (type=`delegation`, data={child_session_id, result_summary, ...})
-2. Controller sends `delegation_completed` WebSocket message to client
-3. The next time ContextAssembler runs for the parent session, it picks up the
-   delegation result from Intaris events — no special queue needed
-4. If the parent is mid-turn, the result appears in the next context assembly
+1. Controller updates the child session status in Cognis DB
+2. Controller appends a `delegation_completed` (or `delegation_failed`)
+   event to the **parent** session's Intaris event stream
+   (data={child_session_id, result_summary, ...})
+3. Controller publishes `DELEGATION_COMPLETED` / `DELEGATION_FAILED`
+   event → frontend updates the delegation card
+4. The next time ContextAssembler runs for the parent session, it picks
+   up the delegation result from Intaris events — no special queue needed
+5. If the parent is mid-turn, the result appears in the next context
+   assembly
 
 This avoids lock contention — Intaris event append is independent of the
 parent's turn processing.

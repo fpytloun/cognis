@@ -36,7 +36,8 @@ SvelteKit Application
 | `/agents` | Agent list / gallery | MVP |
 | `/agents/new` | Agent creation wizard | MVP |
 | `/agents/:id` | Agent detail / edit | MVP |
-| `/settings` | Secrets, connections, config | MVP |
+| `/tools` | Tool registry + skill management | MVP |
+| `/settings` | Secrets, connections, executors, config | MVP |
 | `/tasks` | Task kanban / work queue | MVP |
 | `/tasks/:id` | Task detail + workflow progress | MVP |
 | `/workflows` | Workflow registry + editor | MVP |
@@ -86,7 +87,8 @@ When the user types while a turn processes:
 5-step wizard:
 1. **Identity** — name, ID, description, avatar (generate/upload)
 2. **Personality** — traits (checkboxes), style, expertise, system prompt
-3. **Skills & Tools** — MCP servers, skills, delegation permissions
+3. **Skills & Tools** — tool selection (opt-out), MCP servers, Intaris MCP
+   selection (auto-discovered), skills, delegation permissions
 4. **LLM Config** — provider selection (shows available providers + model catalog
    with capabilities, tier, cost), model override, temperature, reasoning effort
 5. **Review & Create** — summary, create button
@@ -95,15 +97,58 @@ System prompt auto-generated from personality selections, editable for power
 users. Model selection shows provider catalog with model capabilities, tier
 labels, and cost estimates.
 
+## Tools & Skills Page (`/tools`)
+
+Tab-based page with two tabs:
+
+### Tool Registry Tab
+
+Browse all registered tools grouped by source:
+
+- **Executor-native** — read, write, edit, bash, glob, grep, etc. (always available)
+- **Built-in** — delegate, spawn_worker, fork, list_agents, get_status
+- **Local MCP** — per-agent MCP server tools (shown with agent context)
+- **Intaris MCP** — remote MCP tools proxied through Intaris
+
+Each tool shows: name, description, source badge, category, read_only flag,
+non_bypassable flag. Expandable detail shows full parameter schema.
+
+Filter/search by name, source, category. Global default permissions section
+shows non-bypassable tool patterns (admin-editable).
+
+### Skills Tab
+
+List all available skills (DB-managed + filesystem):
+
+- Each skill shows: name, description, tool count, source (db/file), tags
+- Skill detail: instructions preview, bundled tool names, prompt templates
+- Create/edit skill definitions (DB-managed only; file-sourced are read-only)
+- Import/export skills as YAML
+- Delete skills (DB-managed only)
+
 ## Settings Page
 
-- **Profile**: name, email
+- **Providers**: LLM provider CRUD with status, model catalog, test
+- **Routing**: system-wide model routing policy
 - **Secrets**: CRUD for API keys and tokens (values masked)
-- **Connections**: Mnemory/Intaris status, test connectivity
-- **LLM Providers**: list of configured providers with status, model catalog,
-  and test availability. For OAuth-based providers (ChatGPT): "Connect"
-  button → OAuth redirect flow → "Connected" status with re-auth option
-- **Model Routing**: system-wide routing policy (classifier, compaction models)
+- **Executors**: executor status, type, capabilities, native tool toggles
+- **System**: readiness checklist, provider health, database info, env config
+- **Account**: password change, SSO launch, API key management
+
+### Executors Tab
+
+Dedicated executor management section:
+
+- **Status card**: executor type (in_process/docker/k8s), status (ready/error),
+  uptime, active connections count
+- **Capabilities**: list of native tools, inference support, inference models
+- **Native tools**: toggle list of executor-native tools (enable/disable globally).
+  Disabled tools are not available to any agent.
+- **Resource limits**: CPU, memory, timeout display
+- **Health history**: recent health check results
+
+For MVP, this is read-mostly (the in-process executor is auto-configured).
+Phase 2 adds executor pool CRUD and multi-executor management.
 
 ## Real-Time Communication
 

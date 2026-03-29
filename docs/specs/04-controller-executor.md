@@ -38,8 +38,9 @@ local models (e.g., ollama on a Mac Studio).
                        │ Executor    │  │  Executor    │  │  Executor   │
                        │ (MVP)       │  │  (Phase 2)   │  │  (Phase 2)  │
                        │             │  │              │  │             │
-                       │ Tools only  │  │ Tools only   │  │ Tools only  │
-                       │ + opt. LLM  │  │ + opt. LLM   │  │ + opt. LLM  │
+                        │ Native tools│  │ Native tools │  │ Native tools│
+                        │ + MCP       │  │ + MCP        │  │ + MCP       │
+                        │ + opt. LLM  │  │ + opt. LLM   │  │ + opt. LLM  │
                        └─────────────┘  └──────────────┘  └─────────────┘
 ```
 
@@ -270,17 +271,24 @@ Runs tools as async tasks in the controller's process. Uses the same
 JSON-RPC interface but communicates via direct async function calls instead
 of a real WebSocket. This ensures the same code path as remote executors.
 
+The in-process executor includes **native tool handlers** for common
+developer operations (filesystem, search, shell, web). These execute
+directly in the process without MCP overhead.
+
 ```python
 class InProcessExecutor(ExecutorProvider):
     """In-process executor for MVP. Same interface, no network."""
 
     async def spawn(self, config: ExecutorConfig) -> ExecutorHandle:
+        # Register native executor tools (read, write, edit, bash, etc.)
+        native_handlers = build_executor_tool_handlers()
+
         # Initialize MCP servers
         tools = ToolRegistry(config.tools, config.mcp_servers, config.secrets)
         await tools.initialize()
 
         # Create in-process bridge (mimics WebSocket JSON-RPC)
-        bridge = InProcessBridge(tools, config.inference)
+        bridge = InProcessBridge(tools, native_handlers, config.inference)
 
         return ExecutorHandle(
             executor_id=f"inproc-{uuid4().hex[:8]}",
@@ -288,6 +296,30 @@ class InProcessExecutor(ExecutorProvider):
             capabilities=bridge.capabilities,
         )
 ```
+
+### Native Tool Dispatch
+
+When the executor receives a `tool.execute` request, it checks native
+handlers first, then falls back to MCP dispatch:
+
+```python
+async def tool_execute(self, tool_call):
+    # 1. Check native executor tools
+    native_handler = self.native_handlers.get(tool_call.name)
+    if native_handler is not None:
+        return await native_handler(tool_call.arguments, context)
+
+    # 2. Fall back to MCP server dispatch
+    registered_tool = self.registry.get(tool_call.name)
+    if registered_tool and registered_tool.handler:
+        return await registered_tool.handler(tool_call.arguments, context)
+
+    return ToolResult(output="Tool not available on this executor.", is_error=True)
+```
+
+Native tools include: `read`, `write`, `edit`, `patch`, `multiedit`,
+`list_directory`, `glob`, `grep`, `bash`, `web_fetch`. See
+[06-tool-system.md](06-tool-system.md) for full definitions.
 
 ### Subprocess Executor
 

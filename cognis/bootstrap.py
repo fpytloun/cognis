@@ -34,7 +34,7 @@ DEFAULT_SETTINGS: Final[dict[str, tuple[str, object]]] = {
     "session.escalation_timeout_seconds": ("session", 300),
     "session.cache_max_entries": ("session", 200),
     "decision_engine.inline_max_length": ("decision_engine", 200),
-    "decision_engine.classifier_timeout_ms": ("decision_engine", 2000),
+    "decision_engine.classifier_timeout_ms": ("decision_engine", 60000),
     "decision_engine.classifier_fallback": ("decision_engine", "inline"),
     "security.non_bypassable_tools": (
         "security",
