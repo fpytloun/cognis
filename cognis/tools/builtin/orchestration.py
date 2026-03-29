@@ -16,16 +16,30 @@ ORCHESTRATION_TOOL_NAMES = {"delegate", "spawn_worker", "fork"}
 
 DELEGATE_TOOL = ToolDefinition(
     name="delegate",
-    description="Delegate a task to a specialized agent.",
+    description=(
+        "Delegate a task to a DIFFERENT agent with its own persona, tools, and "
+        "system prompt. Use when the task requires a specialist agent. The parent "
+        "turn ends immediately; a follow-up turn is triggered when the child "
+        "session completes."
+    ),
     parameters={
         "type": "object",
         "properties": {
-            "agent_id": {"type": "string", "description": "Agent ID or 'auto'."},
-            "task": {"type": "string", "description": "Task description."},
-            "context": {"type": "string", "description": "Background context."},
-            "expected_output": {"type": "string", "description": "Expected result."},
+            "agent_id": {
+                "type": "string",
+                "description": "ID of the target agent. Use 'auto' to let the controller choose.",
+            },
+            "task": {
+                "type": "string",
+                "description": "Clear description of what the agent should do.",
+            },
+            "context": {"type": "string", "description": "Background context the agent needs."},
+            "expected_output": {
+                "type": "string",
+                "description": "What the result should look like.",
+            },
         },
-        "required": ["task"],
+        "required": ["agent_id", "task"],
     },
     source=ToolSource(type="builtin"),
     category="orchestration",
@@ -34,14 +48,20 @@ DELEGATE_TOOL = ToolDefinition(
 
 SPAWN_WORKER_TOOL = ToolDefinition(
     name="spawn_worker",
-    description="Spawn a lightweight worker for focused tasks.",
+    description=(
+        "Spawn a background worker using the SAME agent (same persona and tools) "
+        "for a focused sub-task. Use for research, summarization, or any work "
+        "that should run in the background while keeping the main chat responsive. "
+        "The parent turn ends immediately; a follow-up turn is triggered when "
+        "the worker completes."
+    ),
     parameters={
         "type": "object",
         "properties": {
-            "task": {"type": "string"},
-            "worker_type": {
+            "task": {"type": "string", "description": "Clear description of the focused sub-task."},
+            "expected_output": {
                 "type": "string",
-                "enum": ["research", "summarize", "code", "general"],
+                "description": "What the result should look like.",
             },
         },
         "required": ["task"],
@@ -53,12 +73,24 @@ SPAWN_WORKER_TOOL = ToolDefinition(
 
 FORK_TOOL = ToolDefinition(
     name="fork",
-    description="Fork into an isolated child session for exploration.",
+    description=(
+        "Fork into an isolated child session for parallel exploration. Uses the "
+        "same agent and inherits the current context. Use when you want to "
+        "explore an approach without affecting the main session. The parent "
+        "turn ends immediately; a follow-up turn is triggered when the fork "
+        "completes."
+    ),
     parameters={
         "type": "object",
         "properties": {
-            "reason": {"type": "string"},
-            "context_summary": {"type": "string"},
+            "reason": {
+                "type": "string",
+                "description": "Why you are forking — what you want to explore.",
+            },
+            "context_summary": {
+                "type": "string",
+                "description": "Summary of relevant context to carry into the fork.",
+            },
         },
         "required": ["reason"],
     },

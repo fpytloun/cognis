@@ -48,13 +48,20 @@ def _follow_up_turn_prompt(status: str | None) -> str:
     status_name = (status or "updated").lower()
     if status_name == "failed":
         return (
-            "A background task failure was delivered to this conversation. "
-            "Review the recent task_failed event and provide a concise user-facing follow-up if warranted."
+            "A background task or delegated sub-session has failed. "
+            "Review the recent delegation_failed or task_failed event in the session "
+            "and provide a concise user-facing follow-up."
         )
     if status_name == "cancelled":
         return (
             "A background task cancellation was delivered to this conversation. "
             "Review the recent task_cancelled event and provide a concise user-facing follow-up if warranted."
+        )
+    if status_name == "completed":
+        return (
+            "A delegated sub-session has completed and its result has been recorded "
+            "in the session events. Review the delegation_completed event and present "
+            "the result to the user."
         )
     return (
         "A background task update was delivered to this conversation. "

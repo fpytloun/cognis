@@ -592,6 +592,16 @@ class AgentLoop:
                     )
                 )
                 DELEGATIONS_TOTAL.labels(status="completed").inc()
+                # Trigger a follow-up turn in the parent conversation
+                await self.event_bus.publish(
+                    Event(
+                        type=EventType.FOLLOW_UP_TURN_REQUESTED,
+                        data={
+                            "conversation_id": conversation_id,
+                            "status": "completed",
+                        },
+                    )
+                )
                 logger.info(
                     "delegation: child session completed",
                     extra={
@@ -658,6 +668,16 @@ class AgentLoop:
                     )
                 )
                 DELEGATIONS_TOTAL.labels(status="failed").inc()
+                # Trigger a follow-up turn in the parent conversation
+                await self.event_bus.publish(
+                    Event(
+                        type=EventType.FOLLOW_UP_TURN_REQUESTED,
+                        data={
+                            "conversation_id": conversation_id,
+                            "status": "failed",
+                        },
+                    )
+                )
 
     async def _execute_step(
         self,
@@ -834,6 +854,7 @@ class AgentLoop:
                     }
                 )
 
+            delegation_spawned = False
             for tc in tool_calls:
                 self._raise_if_cancelled(ctx)
                 tool_call_count += 1
@@ -852,34 +873,31 @@ class AgentLoop:
                     events_to_record.append(
                         SessionEvent(type="step_complete", data={"summary": step_output.summary})
                     )
+                    result_content = json.dumps({"status": "completed"})
                     messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tc.call_id,
-                            "content": json.dumps({"status": "completed"}),
-                        }
+                        {"role": "tool", "tool_call_id": tc.call_id, "content": result_content}
                     )
+                    if on_tool_result:
+                        await on_tool_result(tc.call_id, tc.name, result_content, False, None)
                     break
 
                 elif tc.name == STEP_TODO_WRITE:
                     ctx.todos = tc.arguments.get("todos", [])
+                    result_content = json.dumps({"status": "updated", "count": len(ctx.todos)})
                     messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tc.call_id,
-                            "content": json.dumps({"status": "updated", "count": len(ctx.todos)}),
-                        }
+                        {"role": "tool", "tool_call_id": tc.call_id, "content": result_content}
                     )
+                    if on_tool_result:
+                        await on_tool_result(tc.call_id, tc.name, result_content, False, None)
                     continue
 
                 elif tc.name == STEP_TODO_LIST:
+                    result_content = json.dumps({"todos": ctx.todos})
                     messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tc.call_id,
-                            "content": json.dumps({"todos": ctx.todos}),
-                        }
+                        {"role": "tool", "tool_call_id": tc.call_id, "content": result_content}
                     )
+                    if on_tool_result:
+                        await on_tool_result(tc.call_id, tc.name, result_content, False, None)
                     continue
 
                 elif tc.name == STEP_REQUEST_INPUT:
@@ -887,27 +905,25 @@ class AgentLoop:
                         ctx.interaction_mode != "step_requests"
                         or not ctx.step_definition.allow_questions
                     ):
-                        messages.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": tc.call_id,
-                                "content": json.dumps(
-                                    {"error": "Input requests are not enabled for this step."}
-                                ),
-                            }
+                        err_content = json.dumps(
+                            {"error": "Input requests are not enabled for this step."}
                         )
+                        messages.append(
+                            {"role": "tool", "tool_call_id": tc.call_id, "content": err_content}
+                        )
+                        if on_tool_result:
+                            await on_tool_result(tc.call_id, tc.name, err_content, True, None)
                         continue
 
                     recovered_response = self._get_recovered_step_response(ctx)
                     if recovered_response is not None:
                         await self._clear_interactive_pause_state(ctx)
+                        rec_content = json.dumps({"response": recovered_response})
                         messages.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": tc.call_id,
-                                "content": json.dumps({"response": recovered_response}),
-                            }
+                            {"role": "tool", "tool_call_id": tc.call_id, "content": rec_content}
                         )
+                        if on_tool_result:
+                            await on_tool_result(tc.call_id, tc.name, rec_content, False, None)
                         continue
 
                     # Pause and wait for input
@@ -971,24 +987,20 @@ class AgentLoop:
                         await self._clear_interactive_pause_state(ctx)
                         if resolution.decision == "cancel":
                             raise StepInterrupted("Step input request cancelled")
+                        resp_content = json.dumps({"response": resolution.data.get("response", "")})
                         messages.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": tc.call_id,
-                                "content": json.dumps(
-                                    {"response": resolution.data.get("response", "")}
-                                ),
-                            }
+                            {"role": "tool", "tool_call_id": tc.call_id, "content": resp_content}
                         )
+                        if on_tool_result:
+                            await on_tool_result(tc.call_id, tc.name, resp_content, False, None)
                     except TimeoutError:
                         await self._clear_interactive_pause_state(ctx)
+                        timeout_content = json.dumps({"error": "Input request timed out."})
                         messages.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": tc.call_id,
-                                "content": json.dumps({"error": "Input request timed out."}),
-                            }
+                            {"role": "tool", "tool_call_id": tc.call_id, "content": timeout_content}
                         )
+                        if on_tool_result:
+                            await on_tool_result(tc.call_id, tc.name, timeout_content, True, None)
                     continue
 
                 elif is_orchestration_tool(tc.name):
@@ -1082,6 +1094,7 @@ class AgentLoop:
                             lambda t: t.exception() if not t.cancelled() else None
                         )
                         DELEGATIONS_TOTAL.labels(status="spawned").inc()
+                        delegation_spawned = True
                     else:
                         # Child creation failed — record error event (#8)
                         events_to_record.append(
@@ -1188,6 +1201,15 @@ class AgentLoop:
 
             # Check if step_complete was called in this batch
             if step_output is not None:
+                break
+
+            # Delegation spawned — end the parent turn after processing
+            # the full tool batch.  The child runs in the background and
+            # a follow-up turn will be triggered on completion.
+            if delegation_spawned:
+                step_output = StepOutput(
+                    summary="Delegation spawned — working in background.",
+                )
                 break
 
             # Check tool call limit
