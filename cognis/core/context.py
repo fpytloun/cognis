@@ -389,40 +389,43 @@ def events_to_messages(events: list[Any]) -> list[dict[str, Any]]:
             if isinstance(tool_name, str):
                 messages.append({"role": "assistant", "content": f"[Tool call: {tool_name}]"})
         elif event_type == "delegation":
-            messages.append(
-                {
-                    "role": "system",
-                    "content": _format_delegation_status(event_data),
-                }
-            )
-        elif event_type == "delegation_completed":
-            child_id = event_data.get("child_session_id", "unknown")
-            mode = event_data.get("mode", "delegate")
-            result = event_data.get("result_summary", "No result provided.")
-            messages.append(
-                {
-                    "role": "system",
-                    "content": (
-                        f'<delegation_result session="{child_id}" mode="{mode}" status="completed">\n'
-                        f"{result}\n"
-                        f"</delegation_result>"
-                    ),
-                }
-            )
-        elif event_type == "delegation_failed":
-            child_id = event_data.get("child_session_id", "unknown")
-            mode = event_data.get("mode", "delegate")
-            error = event_data.get("error", "Unknown error")
-            messages.append(
-                {
-                    "role": "system",
-                    "content": (
-                        f'<delegation_result session="{child_id}" mode="{mode}" status="failed">\n'
-                        f"Error: {error}\n"
-                        f"</delegation_result>"
-                    ),
-                }
-            )
+            status = event_data.get("status")
+            if status == "completed":
+                child_id = event_data.get("child_session_id", "unknown")
+                mode = event_data.get("mode", "delegate")
+                result = event_data.get("result_summary", "No result provided.")
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            f'<delegation_result session="{child_id}" mode="{mode}" status="completed">\n'
+                            f"{result}\n"
+                            f"</delegation_result>"
+                        ),
+                    }
+                )
+            elif status == "failed":
+                child_id = event_data.get("child_session_id", "unknown")
+                mode = event_data.get("mode", "delegate")
+                error = event_data.get("error", "Unknown error")
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            f'<delegation_result session="{child_id}" mode="{mode}" status="failed">\n'
+                            f"Error: {error}\n"
+                            f"</delegation_result>"
+                        ),
+                    }
+                )
+            else:
+                # Initial delegation (no status or status="started")
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": _format_delegation_status(event_data),
+                    }
+                )
         elif event_type in {"task_result", "task_failed", "task_cancelled"}:
             messages.append(
                 {

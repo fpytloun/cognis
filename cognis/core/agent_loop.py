@@ -555,28 +555,34 @@ class AgentLoop:
                     logger.warning(
                         "delegation: failed to update child session status",
                         extra={"extra_data": {"child_session_id": child_session_id}},
+                        exc_info=True,
                     )
 
-                # Record result in parent Intaris session — guarded (#7, #10)
+                # Record result in parent Intaris session — guarded (#7)
+                # Use type="delegation" with status field (Intaris whitelist)
                 try:
                     await self.providers.guardrails.record_events(
                         session_id=parent_intaris_session_id,
                         events=[
                             SessionEvent(
-                                type="delegation_completed",
+                                type="delegation",
                                 data={
+                                    "status": "completed",
                                     "child_session_id": child_session_id,
                                     "mode": mode,
                                     "result_summary": result_summary,
                                 },
                             )
                         ],
-                        idempotency_key=f"delegation_completed_{child_session_id}",
+                        idempotency_key=(
+                            f"{parent_intaris_session_id}:delegation_completed_{child_session_id}"
+                        ),
                     )
                 except Exception:
                     logger.warning(
                         "delegation: failed to record completion in parent session",
                         extra={"extra_data": {"child_session_id": child_session_id}},
+                        exc_info=True,
                     )
 
                 # Always publish event bus event for frontend (#7)
@@ -635,25 +641,33 @@ class AgentLoop:
                         )
                         await db.commit()
                 except Exception:
-                    logger.warning("delegation: failed to mark child session as failed")
+                    logger.warning(
+                        "delegation: failed to mark child session as failed", exc_info=True
+                    )
 
                 try:
                     await self.providers.guardrails.record_events(
                         session_id=parent_intaris_session_id,
                         events=[
                             SessionEvent(
-                                type="delegation_failed",
+                                type="delegation",
                                 data={
+                                    "status": "failed",
                                     "child_session_id": child_session_id,
                                     "mode": mode,
                                     "error": "Delegation execution failed",
                                 },
                             )
                         ],
-                        idempotency_key=f"delegation_failed_{child_session_id}",
+                        idempotency_key=(
+                            f"{parent_intaris_session_id}:delegation_failed_{child_session_id}"
+                        ),
                     )
                 except Exception:
-                    logger.warning("delegation: failed to record failure in parent session")
+                    logger.warning(
+                        "delegation: failed to record failure in parent session",
+                        exc_info=True,
+                    )
 
                 # Always publish event bus event for frontend (#7)
                 await self.event_bus.publish(
@@ -1034,34 +1048,19 @@ class AgentLoop:
                     # Record delegation event AFTER child creation so we have
                     # child_session_id for consistent ID matching (#1, #8)
                     if child_session is not None:
-                        # Record immediately to Intaris (not batched) to
-                        # ensure causal ordering before child completes (#15)
                         parent_intaris_id = ctx.session.intaris_session_id or ctx.session.session_id
-                        try:
-                            await self.providers.guardrails.record_events(
-                                session_id=parent_intaris_id,
-                                events=[
-                                    SessionEvent(
-                                        type="delegation",
-                                        data={
-                                            "mode": tc.name,
-                                            "call_id": tc.call_id,
-                                            "task": task_description,
-                                            "child_session_id": child_session.session_id,
-                                        },
-                                    )
-                                ],
-                                idempotency_key=f"delegation_{child_session.session_id}",
-                            )
-                        except Exception:
-                            logger.warning(
-                                "delegation: failed to record delegation event",
-                                extra={
-                                    "extra_data": {
-                                        "child_session_id": child_session.session_id,
-                                    }
+                        # Add to batch (correct ordering with user_message)
+                        events_to_record.append(
+                            SessionEvent(
+                                type="delegation",
+                                data={
+                                    "mode": tc.name,
+                                    "call_id": tc.call_id,
+                                    "task": task_description,
+                                    "child_session_id": child_session.session_id,
                                 },
                             )
+                        )
 
                         await self.event_bus.publish(
                             Event(

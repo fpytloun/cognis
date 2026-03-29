@@ -106,9 +106,11 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
     }
 
     if (event.type === 'assistant_message') {
-      items.push(
-        createMessageItem(`event:${event.seq}:assistant`, 'assistant', content, event.timestamp, event.seq)
-      );
+      if (content.trim()) {
+        items.push(
+          createMessageItem(`event:${event.seq}:assistant`, 'assistant', content, event.timestamp, event.seq)
+        );
+      }
       continue;
     }
 
@@ -136,56 +138,40 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
 
     if (event.type === 'delegation') {
       const childSessionId = String(event.data.child_session_id ?? event.data.call_id ?? `del-${event.seq}`);
+      const itemId = `delegation:${childSessionId}`;
+      const delegationStatus = typeof event.data.status === 'string' ? event.data.status : 'started';
       const rawTask = event.data.task;
       const taskDesc = typeof rawTask === 'string' && rawTask.trim() ? rawTask.trim() : 'Background task';
-      items.push({
-        id: `delegation:${childSessionId}`,
-        kind: 'delegation',
-        taskId: childSessionId,
-        taskLabel: taskDesc,
-        status: 'started',
-        result: null,
-        timestamp: event.timestamp
-      });
-      continue;
-    }
 
-    if (event.type === 'delegation_completed') {
-      const childSessionId = String(event.data.child_session_id ?? `del-${event.seq}`);
-      const itemId = `delegation:${childSessionId}`;
-      const existingIdx = items.findIndex((i) => i.id === itemId && i.kind === 'delegation');
-      if (existingIdx >= 0) {
-        const existing = items[existingIdx] as DelegationTimelineItem;
-        items[existingIdx] = { ...existing, status: 'completed', result: typeof event.data.result_summary === 'string' ? event.data.result_summary : null };
+      if (delegationStatus === 'completed' || delegationStatus === 'failed') {
+        // Completion/failure event — update existing card or create new one
+        const existingIdx = items.findIndex((i) => i.id === itemId && i.kind === 'delegation');
+        const result = delegationStatus === 'completed'
+          ? (typeof event.data.result_summary === 'string' ? event.data.result_summary : null)
+          : (typeof event.data.error === 'string' ? event.data.error : 'Failed');
+        if (existingIdx >= 0) {
+          const existing = items[existingIdx] as DelegationTimelineItem;
+          items[existingIdx] = { ...existing, status: delegationStatus, result };
+        } else {
+          items.push({
+            id: itemId,
+            kind: 'delegation',
+            taskId: childSessionId,
+            taskLabel: taskDesc,
+            status: delegationStatus,
+            result,
+            timestamp: event.timestamp
+          });
+        }
       } else {
+        // Initial delegation event (started)
         items.push({
           id: itemId,
           kind: 'delegation',
           taskId: childSessionId,
-          taskLabel: String(event.data.mode ?? 'Background task'),
-          status: 'completed',
-          result: typeof event.data.result_summary === 'string' ? event.data.result_summary : null,
-          timestamp: event.timestamp
-        });
-      }
-      continue;
-    }
-
-    if (event.type === 'delegation_failed') {
-      const childSessionId = String(event.data.child_session_id ?? `del-${event.seq}`);
-      const itemId = `delegation:${childSessionId}`;
-      const existingIdx = items.findIndex((i) => i.id === itemId && i.kind === 'delegation');
-      if (existingIdx >= 0) {
-        const existing = items[existingIdx] as DelegationTimelineItem;
-        items[existingIdx] = { ...existing, status: 'failed', result: typeof event.data.error === 'string' ? event.data.error : 'Failed' };
-      } else {
-        items.push({
-          id: itemId,
-          kind: 'delegation',
-          taskId: childSessionId,
-          taskLabel: String(event.data.mode ?? 'Background task'),
-          status: 'failed',
-          result: typeof event.data.error === 'string' ? event.data.error : 'Failed',
+          taskLabel: taskDesc,
+          status: 'started',
+          result: null,
           timestamp: event.timestamp
         });
       }
@@ -295,7 +281,7 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
       return next;
     }
 
-    next.push(createMessageItem(itemId, 'assistant', '', new Date().toISOString(), event.seq, event.message_id));
+    // No chunks were received for this message — skip creating empty bubble
     return next;
   }
 

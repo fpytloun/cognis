@@ -832,39 +832,37 @@ class WebSocketConnectionManager:
                 replayed += 1
             elif event_type == "delegation":
                 data = item.get("data", {})
-                await connection.send_json(
-                    {
-                        "type": "delegation_started",
-                        "conversation_id": conversation_id,
-                        "parent_session_id": session.session_id,
-                        "child_session_id": data.get("child_session_id"),
-                        "mode": data.get("mode"),
-                        "agent_id": data.get("agent_id"),
-                        "task": data.get("task"),
-                    }
-                )
-                replayed += 1
-            elif event_type == "delegation_completed":
-                data = item.get("data", {})
-                await connection.send_json(
-                    {
-                        "type": "delegation_completed",
-                        "conversation_id": conversation_id,
-                        "child_session_id": data.get("child_session_id"),
-                        "result": data.get("result_summary"),
-                    }
-                )
-                replayed += 1
-            elif event_type == "delegation_failed":
-                data = item.get("data", {})
-                await connection.send_json(
-                    {
-                        "type": "delegation_failed",
-                        "conversation_id": conversation_id,
-                        "child_session_id": data.get("child_session_id"),
-                        "reason": data.get("error"),
-                    }
-                )
+                status = data.get("status")
+                if status == "completed":
+                    await connection.send_json(
+                        {
+                            "type": "delegation_completed",
+                            "conversation_id": conversation_id,
+                            "child_session_id": data.get("child_session_id"),
+                            "result": data.get("result_summary"),
+                        }
+                    )
+                elif status == "failed":
+                    await connection.send_json(
+                        {
+                            "type": "delegation_failed",
+                            "conversation_id": conversation_id,
+                            "child_session_id": data.get("child_session_id"),
+                            "reason": data.get("error"),
+                        }
+                    )
+                else:
+                    await connection.send_json(
+                        {
+                            "type": "delegation_started",
+                            "conversation_id": conversation_id,
+                            "parent_session_id": session.session_id,
+                            "child_session_id": data.get("child_session_id"),
+                            "mode": data.get("mode"),
+                            "agent_id": data.get("agent_id"),
+                            "task": data.get("task"),
+                        }
+                    )
                 replayed += 1
         pending_pauses = await _load_pending_task_prompts(self.app, conversation_id)
         for payload in pending_pauses:
