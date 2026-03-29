@@ -129,6 +129,7 @@ def llm_provider_to_response(row: Any) -> LLMProviderResponse:
         location=row.location,
         backend=row.backend,
         config=config,
+        is_default=getattr(row, "is_default", False),
         status=row.status,
         created_at=row.created_at,
         updated_at=row.updated_at,

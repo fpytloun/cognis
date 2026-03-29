@@ -10,7 +10,7 @@
   import Button from '$lib/components/ui/Button.svelte';
   import { installBeforeUnloadGuard, blockNavigationIfDirty } from '$lib/navigation/unsaved';
   import { addToast } from '$lib/stores/toasts';
-  import type { Agent, LLMProvider, MCPServerTestResponse, ToolDefinitionSummary, Workflow } from '$lib/types/api';
+  import type { Agent, LLMProvider, MCPServerTestResponse, SecretMetadata, ToolDefinitionSummary, Workflow } from '$lib/types/api';
 
   let loading = true;
   let saving = false;
@@ -19,6 +19,7 @@
   let tools: ToolDefinitionSummary[] = [];
   let workflows: Workflow[] = [];
   let providers: LLMProvider[] = [];
+  let secrets: SecretMetadata[] = [];
   let mcpTesting = false;
   let mcpTestResult: MCPServerTestResponse | null = null;
   let form = agentToFormState({
@@ -62,10 +63,11 @@
   async function loadAgent(): Promise<void> {
     loading = true;
     try {
-      [agent, tools, workflows] = await Promise.all([
+      [agent, tools, workflows, secrets] = await Promise.all([
         api.agents.detail(agentIdFromRoute()),
         api.tools.list(),
-        api.workflows.listAll()
+        api.workflows.listAll(),
+        api.secrets.list(),
       ]);
       try {
         providers = (await api.llmProviders.list()).items;
@@ -158,7 +160,7 @@
     <div class="space-y-3">
       <Button size="sm" variant="secondary" onclick={() => goto('/agents')}>Back to agents</Button>
       <p class="text-sm uppercase tracking-[0.25em] text-slate-400">Agent editor</p>
-      <h1 class="mt-1 text-2xl font-semibold text-white">{agent?.display_name ?? agent?.name ?? 'Agent'}</h1>
+      <h1 class="mt-1 text-2xl font-semibold text-white">{agent?.name ?? 'Agent'}</h1>
     </div>
     {#if agent && !agent.personality_synced}
       <div class="rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-4 text-sm text-amber-100">
@@ -171,6 +173,6 @@
         </div>
       </div>
     {/if}
-    <AgentForm mode="edit" {form} {tools} {workflows} {providers} {saving} {error} onSave={saveAgent} onTestMcp={testMcp} {mcpTesting} {mcpTestResult} />
+    <AgentForm mode="edit" {form} {tools} {workflows} {providers} {secrets} {saving} {error} onSave={saveAgent} onTestMcp={testMcp} {mcpTesting} {mcpTestResult} />
   </section>
 {/if}

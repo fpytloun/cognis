@@ -80,16 +80,27 @@ async def agent_list(
 async def create_agent_route(request: Request, payload: AgentCreateRequest) -> AgentResponse:
     forbid_mutation_for_viewer(request)
     user = require_current_user(request)
+
+    # Auto-generate agent_id from name if not provided
+    agent_id = payload.agent_id
+    if not agent_id:
+        from cognis.api.common import slugify
+
+        agent_id = slugify(payload.name)
+
+    # Use display_name as alias for name (backward compat)
+    name = payload.name or payload.display_name or agent_id
+
     async with request.app.state.session_factory() as session:
-        existing = await get_agent(session, payload.agent_id)
+        existing = await get_agent(session, agent_id)
         if existing is not None:
             raise api_exception(409, "conflict", "Agent already exists")
         row = await create_agent(
             session,
-            agent_id=payload.agent_id,
+            agent_id=agent_id,
             owner_email=user.email,
-            name=payload.name,
-            display_name=payload.display_name,
+            name=name,
+            display_name=name,  # keep display_name = name for backward compat
             description=payload.description,
             system_prompt=payload.system_prompt,
             personality=payload.personality,
@@ -110,16 +121,16 @@ async def create_agent_route(request: Request, payload: AgentCreateRequest) -> A
             request.app.state.providers.memory.bootstrap_agent(definition),
             timeout=5.0,
         )
-        await _persist_sync_metadata(request, payload.agent_id, True)
+        await _persist_sync_metadata(request, agent_id, True)
         row.sync_metadata = _sync_metadata(True)
     except Exception as exc:
         safe_detail = sanitize_client_error_detail(exc, fallback="Mnemory bootstrap failed")
         logger.warning(
             "Mnemory personality bootstrap failed for agent (retry via sync-personality)",
-            extra={"extra_data": {"agent_id": payload.agent_id}},
+            extra={"extra_data": {"agent_id": agent_id}},
             exc_info=True,
         )
-        await _persist_sync_metadata(request, payload.agent_id, False, safe_detail)
+        await _persist_sync_metadata(request, agent_id, False, safe_detail)
         row.sync_metadata = _sync_metadata(False, safe_detail)
     return agent_to_response(row)
 

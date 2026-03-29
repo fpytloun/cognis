@@ -1,4 +1,4 @@
-import type { Agent, LLMProvider, ToolDefinitionSummary, Workflow } from '$lib/types/api';
+import type { Agent, LLMProvider, SecretMetadata, ToolDefinitionSummary, Workflow } from '$lib/types/api';
 
 export interface MCPServerFormState {
   name: string;
@@ -10,8 +10,8 @@ export interface MCPServerFormState {
 
 export interface AgentFormState {
   agentId: string;
+  customId: boolean;
   name: string;
-  displayName: string;
   description: string;
   avatarUrl: string;
   systemPrompt: string;
@@ -19,7 +19,7 @@ export interface AgentFormState {
   temperament: string;
   purpose: string;
   behavioralRules: string;
-  allowedSecrets: string;
+  allowedSecrets: string[];
   canDelegate: boolean;
   maxDelegationDepth: number;
   toolPermissions: Record<string, string>;
@@ -27,6 +27,7 @@ export interface AgentFormState {
   model: string;
   temperature: string;
   maxTokens: string;
+  reasoningEffort: string;
   availableWorkflowIds: string[];
   defaultWorkflowId: string;
   workflowSelectionMode: string;
@@ -35,11 +36,35 @@ export interface AgentFormState {
   originalTools: Record<string, unknown>;
 }
 
-export function createEmptyAgentForm(): AgentFormState {
+const DEFAULT_SYSTEM_PROMPT = `You are {name}.
+
+Be helpful, direct, and concise.`;
+
+export function defaultSystemPrompt(name: string): string {
+  return DEFAULT_SYSTEM_PROMPT.replace('{name}', name || 'an AI assistant');
+}
+
+export function slugify(text: string): string {
+  return text
+    .toLowerCase()
+    .trim()
+    .replace(/[^\w\s-]/g, '')
+    .replace(/[\s_]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 64) || 'unnamed';
+}
+
+export function createEmptyAgentForm(workflows: Workflow[] = []): AgentFormState {
+  // Pre-select all system workflows for new agents
+  const systemWorkflowIds = workflows
+    .filter((w) => w.is_system)
+    .map((w) => w.workflow_id);
+
   return {
     agentId: '',
+    customId: false,
     name: '',
-    displayName: '',
     description: '',
     avatarUrl: '',
     systemPrompt: '',
@@ -47,7 +72,7 @@ export function createEmptyAgentForm(): AgentFormState {
     temperament: '',
     purpose: '',
     behavioralRules: '',
-    allowedSecrets: '',
+    allowedSecrets: [],
     canDelegate: true,
     maxDelegationDepth: 3,
     toolPermissions: {},
@@ -55,8 +80,9 @@ export function createEmptyAgentForm(): AgentFormState {
     model: '',
     temperature: '',
     maxTokens: '',
-    availableWorkflowIds: [],
-    defaultWorkflowId: '',
+    reasoningEffort: '',
+    availableWorkflowIds: systemWorkflowIds,
+    defaultWorkflowId: 'system:direct',
     workflowSelectionMode: 'automatic',
     stepAgentOverridesJson: '{}',
     mcpServers: [],
@@ -75,8 +101,8 @@ export function agentToFormState(agent: Agent): AgentFormState {
   return {
     ...form,
     agentId: agent.agent_id,
-    name: agent.name,
-    displayName: agent.display_name ?? '',
+    customId: true, // existing agent always has a custom ID
+    name: agent.display_name || agent.name,
     description: agent.description ?? '',
     avatarUrl: agent.avatar_url ?? '',
     systemPrompt: agent.system_prompt ?? '',
@@ -86,7 +112,9 @@ export function agentToFormState(agent: Agent): AgentFormState {
     behavioralRules: Array.isArray(personality.behavioral_rules)
       ? personality.behavioral_rules.join('\n')
       : '',
-    allowedSecrets: Array.isArray(permissions.allowed_secrets) ? permissions.allowed_secrets.join(', ') : '',
+    allowedSecrets: Array.isArray(permissions.allowed_secrets)
+      ? (permissions.allowed_secrets as unknown[]).filter((v): v is string => typeof v === 'string')
+      : [],
     canDelegate: permissions.can_delegate !== false,
     maxDelegationDepth:
       typeof permissions.max_delegation_depth === 'number' ? permissions.max_delegation_depth : 3,
@@ -99,6 +127,8 @@ export function agentToFormState(agent: Agent): AgentFormState {
     temperature:
       typeof llmConfig.temperature === 'number' ? String(llmConfig.temperature) : '',
     maxTokens: typeof llmConfig.max_tokens === 'number' ? String(llmConfig.max_tokens) : '',
+    reasoningEffort:
+      typeof llmConfig.reasoning_effort === 'string' ? llmConfig.reasoning_effort : '',
     availableWorkflowIds: Array.isArray(execution.available_workflow_ids)
       ? execution.available_workflow_ids.filter((value): value is string => typeof value === 'string')
       : [],
@@ -145,9 +175,8 @@ export function formStateToPayload(form: AgentFormState): Record<string, unknown
   );
 
   const payload: Record<string, unknown> = {
-    agent_id: form.agentId,
+    agent_id: form.agentId || undefined, // let backend auto-generate if empty
     name: form.name,
-    display_name: form.displayName || null,
     description: form.description || null,
     avatar_url: form.avatarUrl || null,
     system_prompt: form.systemPrompt || null,
@@ -159,10 +188,7 @@ export function formStateToPayload(form: AgentFormState): Record<string, unknown
     },
     permissions: {
       tool_permissions: toolPermissions,
-      allowed_secrets: form.allowedSecrets
-        .split(',')
-        .map((value) => value.trim())
-        .filter(Boolean),
+      allowed_secrets: form.allowedSecrets,
       can_delegate: form.canDelegate,
       max_delegation_depth: form.maxDelegationDepth
     },
@@ -190,7 +216,8 @@ export function formStateToPayload(form: AgentFormState): Record<string, unknown
       provider_id: form.providerId || undefined,
       model: form.model || undefined,
       temperature: form.temperature ? Number(form.temperature) : undefined,
-      max_tokens: form.maxTokens ? Number(form.maxTokens) : undefined
+      max_tokens: form.maxTokens ? Number(form.maxTokens) : undefined,
+      reasoning_effort: form.reasoningEffort || undefined
     },
     execution: {
       available_workflow_ids: form.availableWorkflowIds,
@@ -206,7 +233,7 @@ export function formStateToPayload(form: AgentFormState): Record<string, unknown
 export function buildBootstrapPreview(form: AgentFormState): string {
   const rules = nonEmptyLines(form.behavioralRules);
   return [
-    `Name: ${form.displayName || form.name || 'Unnamed Agent'}`,
+    `Name: ${form.name || 'Unnamed Agent'}`,
     `Purpose: ${form.purpose || 'No explicit purpose configured.'}`,
     `Tone: ${form.tone || 'adaptive'}`,
     `Temperament: ${form.temperament || 'balanced'}`,
@@ -232,4 +259,11 @@ export function workflowOptions(workflows: Workflow[]): Array<{ value: string; l
 
 export function toolOptions(tools: ToolDefinitionSummary[]): Array<{ value: string; label: string }> {
   return tools.map((tool) => ({ value: tool.name, label: tool.name }));
+}
+
+export function secretOptions(secrets: SecretMetadata[]): Array<{ name: string; label: string }> {
+  return secrets.map((s) => ({
+    name: s.name,
+    label: `${s.name}${s.description ? ` — ${s.description}` : ''} (${s.scope})`
+  }));
 }

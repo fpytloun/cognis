@@ -387,6 +387,12 @@ def events_to_messages(events: list[Any]) -> list[dict[str, Any]]:
 
 def _format_memory_context(recall_payload: dict[str, Any]) -> str | None:
     parts: list[str] = []
+
+    # Mnemory-managed instructions (memory system prompt, behavioral guidance)
+    instructions = recall_payload.get("instructions")
+    if isinstance(instructions, str) and instructions.strip():
+        parts.append(instructions.strip())
+
     core_memories = recall_payload.get("core_memories")
     if isinstance(core_memories, str) and core_memories.strip():
         parts.append("Core memories:\n" + core_memories.strip())

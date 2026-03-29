@@ -9,7 +9,10 @@ from collections.abc import Sequence
 from contextlib import suppress
 from typing import Any
 
+from cognis.logging import get_logger
 from cognis.models.tool import MCPServerConfig, ToolDefinition, ToolSource
+
+logger = get_logger(__name__)
 
 
 class StdioMCPClient:
@@ -43,6 +46,8 @@ class StdioMCPClient:
                 "capabilities": {},
             },
         )
+        # MCP spec requires notifications/initialized after handshake
+        await self._send_notification("notifications/initialized")
 
     async def list_tools(self) -> list[dict[str, Any]]:
         """Discover tools exposed by the MCP server."""
@@ -81,10 +86,31 @@ class StdioMCPClient:
         if process is None or process.stderr is None:
             return
         try:
-            while await process.stderr.read(1024):
-                continue
+            while True:
+                line = await process.stderr.readline()
+                if not line:
+                    break
+                text = line.decode("utf-8", errors="replace").rstrip()
+                if text:
+                    logger.debug(
+                        "MCP server stderr",
+                        extra={"extra_data": {"server": self.config.name, "line": text}},
+                    )
         except asyncio.CancelledError:
             raise
+
+    async def _send_notification(self, method: str, params: dict[str, Any] | None = None) -> None:
+        """Send a JSON-RPC notification (no id, no response expected)."""
+        process = self.process
+        if process is None or process.stdin is None:
+            return
+        payload: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            payload["params"] = params
+        body = json.dumps(payload).encode("utf-8")
+        message = f"Content-Length: {len(body)}\r\n\r\n".encode() + body
+        process.stdin.write(message)
+        await process.stdin.drain()
 
     async def _request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         process = self.process
@@ -104,12 +130,36 @@ class StdioMCPClient:
             message = f"Content-Length: {len(body)}\r\n\r\n".encode() + body
             process.stdin.write(message)
             await process.stdin.drain()
-            response = await asyncio.wait_for(
-                self._read_message(process.stdout), timeout=self.config.timeout_seconds
-            )
 
-        if response.get("id") != request_id:
-            raise RuntimeError("MCP response ID mismatch")
+            # Read messages until we get one with our request ID.
+            # MCP servers may send notifications (no "id" field)
+            # between request and response — skip those.
+            deadline = asyncio.get_event_loop().time() + self.config.timeout_seconds
+            while True:
+                remaining = deadline - asyncio.get_event_loop().time()
+                if remaining <= 0:
+                    raise TimeoutError(f"MCP request {method} timed out")
+                response = await asyncio.wait_for(
+                    self._read_message(process.stdout), timeout=remaining
+                )
+                # Notifications have no "id" — skip them
+                if "id" not in response:
+                    logger.debug(
+                        "MCP notification received (skipped)",
+                        extra={
+                            "extra_data": {
+                                "server": self.config.name,
+                                "method": response.get("method"),
+                            }
+                        },
+                    )
+                    continue
+                if response.get("id") != request_id:
+                    raise RuntimeError(
+                        f"MCP response ID mismatch: expected {request_id}, got {response.get('id')}"
+                    )
+                break
+
         if "error" in response:
             error = response["error"]
             raise RuntimeError(json.dumps(error, sort_keys=True))

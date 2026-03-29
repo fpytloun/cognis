@@ -172,6 +172,7 @@ class LLMProvider(Base):
     location: Mapped[str] = mapped_column(String, nullable=False)
     backend: Mapped[str] = mapped_column(String, nullable=False)
     config: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    is_default: Mapped[bool] = mapped_column(default=False, nullable=False, server_default="0")
     status: Mapped[str] = mapped_column(String, nullable=False, default="active")
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, default=_utcnow

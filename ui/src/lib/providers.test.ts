@@ -10,6 +10,7 @@ describe('provider presets', () => {
     location: 'controller',
     backend: 'litellm',
     config: { preset: 'openai', default_model: 'gpt-4o-mini', models: [{ model_id: 'gpt-4o-mini' }] },
+    is_default: false,
     status: 'active',
     created_at: null,
     updated_at: null,

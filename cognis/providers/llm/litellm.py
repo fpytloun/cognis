@@ -68,13 +68,21 @@ class LiteLLMProvider:
                 if provider is None:
                     provider = await self._find_provider_for_model(session, resolved)
                 return resolved, provider
-            provider = await session.get(LLMProviderRow, "default")
-            if provider is not None:
-                config = dict(provider.config)
+            # Try provider marked as default (is_default=True)
+            default_provider = (
+                await session.execute(
+                    select(LLMProviderRow).where(LLMProviderRow.is_default.is_(True)).limit(1)
+                )
+            ).scalar_one_or_none()
+            # Fall back to provider with ID "default" for backward compat
+            if default_provider is None:
+                default_provider = await session.get(LLMProviderRow, "default")
+            if default_provider is not None:
+                config = dict(default_provider.config)
                 default_model = config.get("default_model")
                 if isinstance(default_model, str):
                     await self._set_cached_resolved_model(task_type, default_model)
-                    return default_model, provider
+                    return default_model, default_provider
         raise ValueError("No LLM model configured")
 
     async def get_model_info(self, model_id: str) -> ModelInfo:
@@ -198,6 +206,7 @@ class LiteLLMProvider:
         base_url: str,
         api_key: str | None = None,
         secret_name: str | None = None,
+        env_var: str | None = None,
     ) -> list[dict[str, Any]]:
         """Discover models without a saved provider (preview mode).
 
@@ -207,6 +216,8 @@ class LiteLLMProvider:
         import contextlib
 
         resolved_key = api_key or ""
+        if not resolved_key and env_var:
+            resolved_key = os.environ.get(env_var, "")
         if not resolved_key and secret_name and self._secrets:
             with contextlib.suppress(Exception):
                 resolved_key = await self._secrets.get_secret(secret_name, "system", None)

@@ -117,13 +117,16 @@ async def llm_provider_list(request: Request) -> CursorPage[LLMProviderResponse]
 @router.post("/api/v1/llm-providers", response_model=LLMProviderResponse)
 async def llm_provider_create(request: Request, payload: LLMProviderRequest) -> LLMProviderResponse:
     require_admin(request)
+    from cognis.api.common import slugify
+
+    provider_id = payload.provider_id or slugify(payload.display_name)
     async with request.app.state.session_factory() as session:
-        existing = await get_llm_provider(session, payload.provider_id)
+        existing = await get_llm_provider(session, provider_id)
         if existing is not None:
             raise api_exception(409, "conflict", "LLM provider already exists")
         row = await create_llm_provider(
             session,
-            provider_id=payload.provider_id,
+            provider_id=provider_id,
             display_name=payload.display_name,
             location=payload.location,
             backend=payload.backend,
@@ -180,6 +183,25 @@ async def llm_provider_delete(request: Request, provider_id: str) -> dict[str, b
     return {"ok": ok}
 
 
+@router.post("/api/v1/llm-providers/{provider_id}/set-default")
+async def llm_provider_set_default(request: Request, provider_id: str) -> dict[str, Any]:
+    """Mark a provider as the default. Clears any existing default."""
+    require_admin(request)
+    from cognis.store.models import LLMProvider as LLMProviderRow
+
+    async with request.app.state.session_factory() as session:
+        target = await get_llm_provider(session, provider_id)
+        if target is None:
+            raise api_exception(404, "not_found", "LLM provider not found")
+        # Clear existing defaults
+        from sqlalchemy import update
+
+        await session.execute(update(LLMProviderRow).values(is_default=False))
+        target.is_default = True
+        await session.commit()
+    return {"ok": True, "provider_id": provider_id}
+
+
 @router.post("/api/v1/llm-providers/{provider_id}/test", response_model=LLMProviderTestResponse)
 async def llm_provider_test(request: Request, provider_id: str) -> LLMProviderTestResponse:
     require_admin(request)
@@ -207,9 +229,36 @@ async def llm_provider_test(request: Request, provider_id: str) -> LLMProviderTe
     return response
 
 
+@router.post("/api/v1/llm-providers/discover-models-preview")
+async def llm_provider_discover_models_preview(request: Request) -> dict[str, Any]:
+    """Discover models without a saved provider (preview mode)."""
+    require_admin(request)
+    body = await request.json()
+    preset = str(body.get("preset", ""))
+    base_url = str(body.get("base_url", ""))
+    api_key = body.get("api_key") or None
+    secret_name = body.get("secret_name") or None
+    env_var = body.get("env_var") or None
+    try:
+        models = await request.app.state.providers.llm.discover_models_preview(
+            preset=preset,
+            base_url=base_url,
+            api_key=api_key,
+            secret_name=secret_name,
+            env_var=env_var,
+        )
+    except Exception as exc:
+        raise api_exception(
+            502,
+            "provider_error",
+            f"Failed to discover models: {exc!s}"[:300],
+        ) from exc
+    return {"models": models}
+
+
 @router.post("/api/v1/llm-providers/{provider_id}/discover-models")
 async def llm_provider_discover_models(request: Request, provider_id: str) -> dict[str, Any]:
-    """Query the remote provider for available models."""
+    """Query a saved provider for available models."""
     require_admin(request)
     async with request.app.state.session_factory() as session:
         row = await get_llm_provider(session, provider_id)
@@ -224,31 +273,6 @@ async def llm_provider_discover_models(request: Request, provider_id: str) -> di
             f"Failed to discover models: {exc!s}"[:300],
         ) from exc
     return {"provider_id": provider_id, "models": models}
-
-
-@router.post("/api/v1/llm-providers/discover-models-preview")
-async def llm_provider_discover_models_preview(request: Request) -> dict[str, Any]:
-    """Discover models without a saved provider (preview mode)."""
-    require_admin(request)
-    body = await request.json()
-    preset = str(body.get("preset", ""))
-    base_url = str(body.get("base_url", ""))
-    api_key = body.get("api_key") or None
-    secret_name = body.get("secret_name") or None
-    try:
-        models = await request.app.state.providers.llm.discover_models_preview(
-            preset=preset,
-            base_url=base_url,
-            api_key=api_key,
-            secret_name=secret_name,
-        )
-    except Exception as exc:
-        raise api_exception(
-            502,
-            "provider_error",
-            f"Failed to discover models: {exc!s}"[:300],
-        ) from exc
-    return {"models": models}
 
 
 @router.get("/api/v1/model-routing", response_model=ModelRoutingResponse)

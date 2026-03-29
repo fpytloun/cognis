@@ -222,7 +222,7 @@
             ? { secret_name: providerForm.auth_secret_name }
             : {}),
           ...(providerForm.auth_mode === 'env' && providerForm.auth_env_var
-            ? {}
+            ? { env_var: providerForm.auth_env_var }
             : {})
         });
         models = result.models;
@@ -267,6 +267,24 @@
     } catch (caughtError) {
       error = asApiError(caughtError).message;
       addToast(error, 'error', 4_000, 'Unable to save credential');
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function setDefaultProvider(): Promise<void> {
+    if (!selectedProviderId) {
+      return;
+    }
+    busy = true;
+    error = '';
+    try {
+      await api.llmProviders.setDefault(selectedProviderId);
+      await refreshPageState();
+      addToast('Default provider set.', 'success');
+    } catch (caughtError) {
+      error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to set default');
     } finally {
       busy = false;
     }
@@ -660,7 +678,7 @@
               {#each providers as provider}
                 <button class="w-full rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3 text-left" onclick={() => selectProvider(provider)}>
                   <div class="flex items-center justify-between gap-3">
-                    <span class="font-medium text-slate-100">{provider.display_name}</span>
+                    <span class="font-medium text-slate-100">{provider.is_default ? '⭐ ' : ''}{provider.display_name}</span>
                     <ProviderStatusBadge status={provider.status} />
                   </div>
                   {#if provider.last_test}
@@ -678,13 +696,17 @@
           <!-- Identity -->
           <div class="grid gap-4 md:grid-cols-2">
             <label class="space-y-2 text-sm font-medium text-slate-200">
-              <span>Provider ID <span class="text-rose-300">*</span></span>
-              <Input bind:value={providerForm.provider_id} disabled={!!selectedProviderId} placeholder="default" />
-            </label>
-            <label class="space-y-2 text-sm font-medium text-slate-200">
-              <span>Display name <span class="text-rose-300">*</span></span>
+              <span>Name <span class="text-rose-300">*</span></span>
               <Input bind:value={providerForm.display_name} placeholder="My OpenAI" />
             </label>
+            <div class="space-y-2 text-sm font-medium text-slate-200">
+              <span>ID</span>
+              {#if selectedProviderId}
+                <Input value={providerForm.provider_id} disabled />
+              {:else}
+                <span class="block rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-400">{providerForm.provider_id || 'auto-generated from name'}</span>
+              {/if}
+            </div>
             <label class="space-y-2 text-sm font-medium text-slate-200">
               <span>Provider type</span>
               <select bind:value={providerForm.preset} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
@@ -801,6 +823,7 @@
             <Button variant="secondary" onclick={resetProviderForm} disabled={busy}>Reset</Button>
             {#if selectedProviderId}
               <Button variant="secondary" onclick={() => testProvider(selectedProviderId)} disabled={!isAdmin || busy}>Test provider</Button>
+              <Button variant="secondary" onclick={setDefaultProvider} disabled={!isAdmin || busy}>Set as default</Button>
               <Button variant="danger" onclick={() => deleteProvider(selectedProviderId)} disabled={!isAdmin || busy}>Delete</Button>
             {/if}
           </div>

@@ -195,7 +195,7 @@ class SessionCancelResponse(BaseModel):
 class AgentRequestBase(BaseModel):
     agent_id: str | None = None
     name: str
-    display_name: str | None = None
+    display_name: str | None = None  # backward compat alias for name
     description: str | None = None
     system_prompt: str | None = None
     personality: dict[str, Any] | None = None
@@ -209,13 +209,13 @@ class AgentRequestBase(BaseModel):
 
 
 class AgentCreateRequest(AgentRequestBase):
-    agent_id: str
+    agent_id: str | None = None  # optional: auto-generated from name
     status: str = "draft"
 
 
 class AgentUpdateRequest(BaseModel):
     name: str | None = None
-    display_name: str | None = None
+    display_name: str | None = None  # backward compat alias for name
     description: str | None = None
     system_prompt: str | None = None
     personality: dict[str, Any] | None = None
@@ -277,10 +277,10 @@ class SettingUpdateRequest(BaseModel):
 
 
 class LLMProviderRequest(BaseModel):
-    provider_id: str
+    provider_id: str | None = None  # optional: auto-generated from display_name
     display_name: str
-    location: str
-    backend: str
+    location: str = "controller"
+    backend: str = "litellm"
     config: dict[str, Any] = Field(default_factory=dict)
     status: str = "active"
 
@@ -299,6 +299,7 @@ class LLMProviderResponse(BaseModel):
     location: str
     backend: str
     config: dict[str, Any] = Field(default_factory=dict)
+    is_default: bool = False
     status: str
     created_at: datetime | None = None
     updated_at: datetime | None = None

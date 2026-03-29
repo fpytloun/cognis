@@ -518,11 +518,16 @@ export const api = {
       });
     },
 
+    setDefault(providerId: string): Promise<{ ok: boolean }> {
+      return request<{ ok: boolean }>(`/api/v1/llm-providers/${providerId}/set-default`, { method: 'POST' });
+    },
+
     discoverModelsPreview(payload: {
       preset: string;
       base_url: string;
       api_key?: string;
       secret_name?: string;
+      env_var?: string;
     }): Promise<{ models: Array<{ model_id: string; name: string }> }> {
       return request<{ models: Array<{ model_id: string; name: string }> }>('/api/v1/llm-providers/discover-models-preview', {
         method: 'POST',

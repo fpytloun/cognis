@@ -312,6 +312,7 @@ export interface LLMProvider {
   location: string;
   backend: string;
   config: Record<string, unknown>;
+  is_default: boolean;
   status: string;
   created_at: string | null;
   updated_at: string | null;

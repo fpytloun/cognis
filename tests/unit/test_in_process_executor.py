@@ -64,6 +64,9 @@ while True:
         request = read_message()
     except EOFError:
         break
+    # Skip notifications (no "id" field) — e.g. notifications/initialized
+    if "id" not in request:
+        continue
     method = request["method"]
     if method == "initialize":
         write_message({"jsonrpc": "2.0", "id": request["id"], "result": {"capabilities": {}}})

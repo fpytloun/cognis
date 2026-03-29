@@ -2,22 +2,23 @@
   import { beforeNavigate, goto } from '$app/navigation';
   import { onMount } from 'svelte';
 
-  import { createEmptyAgentForm } from '$lib/agents';
+  import { createEmptyAgentForm, defaultSystemPrompt } from '$lib/agents';
   import { api, asApiError } from '$lib/api/client';
   import AgentForm from '$lib/components/agents/AgentForm.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import { installBeforeUnloadGuard, blockNavigationIfDirty } from '$lib/navigation/unsaved';
   import { addToast } from '$lib/stores/toasts';
   import Button from '$lib/components/ui/Button.svelte';
-  import type { LLMProvider, ToolDefinitionSummary, Workflow } from '$lib/types/api';
+  import type { LLMProvider, SecretMetadata, ToolDefinitionSummary, Workflow } from '$lib/types/api';
 
-  const form = createEmptyAgentForm();
   let loading = true;
   let saving = false;
   let error = '';
   let tools: ToolDefinitionSummary[] = [];
   let workflows: Workflow[] = [];
   let providers: LLMProvider[] = [];
+  let secrets: SecretMetadata[] = [];
+  let form = createEmptyAgentForm();
   let initialSnapshot = JSON.stringify(form);
 
   function isDirty(): boolean {
@@ -34,12 +35,20 @@
   async function loadOptions(): Promise<void> {
     loading = true;
     try {
-      [tools, workflows] = await Promise.all([api.tools.list(), api.workflows.listAll()]);
+      [tools, workflows, secrets] = await Promise.all([
+        api.tools.list(),
+        api.workflows.listAll(),
+        api.secrets.list(),
+      ]);
       try {
         providers = (await api.llmProviders.list()).items;
       } catch {
         providers = [];
       }
+      // Re-create form with workflows so system workflows are pre-selected
+      form = createEmptyAgentForm(workflows);
+      form.systemPrompt = defaultSystemPrompt('');
+      initialSnapshot = JSON.stringify(form);
     } catch (caughtError) {
       error = asApiError(caughtError).message;
     } finally {
@@ -82,6 +91,6 @@
       <p class="text-sm uppercase tracking-[0.25em] text-slate-400">Agent creator</p>
       <h1 class="mt-1 text-2xl font-semibold text-white">Create agent</h1>
     </div>
-    <AgentForm mode="create" {form} {tools} {workflows} {providers} {saving} {error} onSave={saveAgent} />
+    <AgentForm mode="create" {form} {tools} {workflows} {providers} {secrets} {saving} {error} onSave={saveAgent} />
   </section>
 {/if}

@@ -4,11 +4,13 @@
   import Input from '$lib/components/ui/Input.svelte';
   import {
     buildBootstrapPreview,
+    defaultSystemPrompt,
     formStateToPayload,
+    slugify,
     type AgentFormState,
     type MCPServerFormState
   } from '$lib/agents';
-  import type { LLMProvider, MCPServerTestResponse, ToolDefinitionSummary, Workflow } from '$lib/types/api';
+  import type { LLMProvider, MCPServerTestResponse, SecretMetadata, ToolDefinitionSummary, Workflow } from '$lib/types/api';
 
   let {
     mode,
@@ -16,6 +18,7 @@
     tools,
     workflows,
     providers,
+    secrets = [],
     saving = false,
     error = '',
     onSave,
@@ -28,6 +31,7 @@
     tools: ToolDefinitionSummary[];
     workflows: Workflow[];
     providers: LLMProvider[];
+    secrets?: SecretMetadata[];
     saving?: boolean;
     error?: string;
     onSave: (payload: Record<string, unknown>) => void | Promise<void>;
@@ -45,37 +49,33 @@
     try {
       JSON.parse(value);
       return null;
-    } catch (error) {
+    } catch {
       return `${label} must be valid JSON.`;
     }
   }
 
   function mcpServerError(server: MCPServerFormState): string | null {
-    if (!server.name.trim() && !server.command.trim() && !server.argsText.trim() && !server.envText.trim()) {
+    const hasAnyField = server.name.trim() || server.command.trim() || server.argsText.trim() || server.envText.trim();
+    if (!hasAnyField) {
       return null;
     }
     if (!server.name.trim()) {
       return 'Server name is required.';
     }
     if (!server.command.trim()) {
-      return 'Server command is required.';
+      return 'Command is required.';
     }
-    const invalidEnvLine = server.envText
-      .split(/\n+/)
-      .map((line) => line.trim())
-      .filter(Boolean)
-      .find((line) => !line.includes('='));
-    if (invalidEnvLine) {
-      return 'Environment variables must use KEY=value format.';
+    const envLines = server.envText.split('\n').filter((line) => line.trim());
+    for (const line of envLines) {
+      if (!line.includes('=')) {
+        return `Environment variable "${line.trim()}" must use KEY=value format.`;
+      }
     }
     return null;
   }
 
   function validationErrors(): Record<string, string> {
     const errors: Record<string, string> = {};
-    if (!form.agentId.trim()) {
-      errors.agentId = 'Agent ID is required.';
-    }
     if (!form.name.trim()) {
       errors.name = 'Name is required.';
     }
@@ -93,7 +93,15 @@
   }
 
   const errors = $derived(validationErrors());
-  const canSubmit = $derived(Object.keys(errors).length === 0 && Boolean(form.agentId.trim() && form.name.trim()));
+  const canSubmit = $derived(Object.keys(errors).length === 0 && Boolean(form.name.trim()));
+  const derivedId = $derived(form.customId ? form.agentId : slugify(form.name));
+
+  // Keep agentId in sync with name when not customized
+  $effect(() => {
+    if (!form.customId && mode === 'create') {
+      form.agentId = derivedId;
+    }
+  });
 
   function toggleWorkflow(workflowId: string): void {
     if (form.availableWorkflowIds.includes(workflowId)) {
@@ -103,8 +111,15 @@
       }
       return;
     }
-
     form.availableWorkflowIds = [...form.availableWorkflowIds, workflowId];
+  }
+
+  function toggleSecret(secretName: string): void {
+    if (form.allowedSecrets.includes(secretName)) {
+      form.allowedSecrets = form.allowedSecrets.filter((v: string) => v !== secretName);
+    } else {
+      form.allowedSecrets = [...form.allowedSecrets, secretName];
+    }
   }
 
   async function handleSubmit(event: SubmitEvent): Promise<void> {
@@ -129,20 +144,42 @@
   function removeMcpServer(index: number): void {
     form.mcpServers = form.mcpServers.filter((_: MCPServerFormState, itemIndex: number) => itemIndex !== index);
   }
+
+  function resetSystemPrompt(): void {
+    form.systemPrompt = defaultSystemPrompt(form.name);
+  }
+
+  /** Get models configured on the currently selected provider */
+  function selectedProviderModels(): string[] {
+    if (!form.providerId) {
+      return [];
+    }
+    const provider = providers.find((p: LLMProvider) => p.provider_id === form.providerId);
+    if (!provider) {
+      return [];
+    }
+    const models: string[] = [];
+    const defaultModel = provider.config?.default_model;
+    if (typeof defaultModel === 'string' && defaultModel) {
+      models.push(defaultModel);
+    }
+    for (const m of provider.models ?? []) {
+      const id = typeof m.model_id === 'string' ? m.model_id : '';
+      if (id && !models.includes(id)) {
+        models.push(id);
+      }
+    }
+    return models;
+  }
 </script>
 
 <form class="space-y-5" onsubmit={handleSubmit}>
   <div class="grid gap-5 xl:grid-cols-[minmax(0,1fr)_360px]">
     <div class="space-y-5">
+      <!-- Identity -->
       <Card class="p-5">
+        <p class="mb-3 text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Identity</p>
         <div class="grid gap-4 md:grid-cols-2">
-          <label class="space-y-2 text-sm font-medium text-slate-200">
-            <span>Agent ID <span class="text-rose-300">*</span></span>
-            <Input aria-invalid={errors.agentId ? 'true' : 'false'} bind:value={form.agentId} disabled={mode === 'edit'} placeholder="research-assistant" />
-            {#if errors.agentId}
-              <span class="text-xs text-rose-300">{errors.agentId}</span>
-            {/if}
-          </label>
           <label class="space-y-2 text-sm font-medium text-slate-200">
             <span>Name <span class="text-rose-300">*</span></span>
             <Input aria-invalid={errors.name ? 'true' : 'false'} bind:value={form.name} placeholder="Research Assistant" />
@@ -150,23 +187,36 @@
               <span class="text-xs text-rose-300">{errors.name}</span>
             {/if}
           </label>
-          <label class="space-y-2 text-sm font-medium text-slate-200">
-            <span>Display name</span>
-            <Input bind:value={form.displayName} placeholder="Aria" />
-          </label>
+          <div class="space-y-2 text-sm font-medium text-slate-200">
+            <span>ID</span>
+            {#if mode === 'edit'}
+              <Input value={form.agentId} disabled />
+            {:else if form.customId}
+              <div class="flex gap-2">
+                <Input bind:value={form.agentId} placeholder="custom-id" />
+                <Button size="sm" variant="secondary" type="button" onclick={() => (form.customId = false)}>Auto</Button>
+              </div>
+            {:else}
+              <div class="flex items-center gap-2">
+                <span class="rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-400">{derivedId || 'type a name...'}</span>
+                <Button size="sm" variant="secondary" type="button" onclick={() => { form.customId = true; form.agentId = derivedId; }}>Customize</Button>
+              </div>
+            {/if}
+          </div>
           <label class="space-y-2 text-sm font-medium text-slate-200">
             <span>Avatar URL</span>
             <Input bind:value={form.avatarUrl} placeholder="https://…" />
           </label>
         </div>
-
         <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
           <span>Description</span>
           <textarea bind:value={form.description} class="min-h-[90px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500"></textarea>
         </label>
       </Card>
 
+      <!-- Personality -->
       <Card class="p-5">
+        <p class="mb-3 text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Personality</p>
         <div class="grid gap-4 md:grid-cols-3">
           <label class="space-y-2 text-sm font-medium text-slate-200">
             <span>Tone</span>
@@ -181,30 +231,28 @@
             <Input bind:value={form.purpose} placeholder="research specialist" />
           </label>
         </div>
-
         <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
-          <span>Behavioral rules</span>
-          <textarea bind:value={form.behavioralRules} class="min-h-[110px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500" placeholder="One rule per line"></textarea>
-        </label>
-
-        <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
-          <span>System prompt</span>
-          <textarea bind:value={form.systemPrompt} class="min-h-[180px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500"></textarea>
+          <span>Behavioral rules (one per line)</span>
+          <textarea bind:value={form.behavioralRules} class="min-h-[110px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500" placeholder="Always cite sources&#10;Prefer concise answers"></textarea>
         </label>
       </Card>
 
+      <!-- System prompt -->
       <Card class="p-5">
-        <div class="flex items-center justify-between gap-3">
-          <div>
-            <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Tools & permissions</p>
-            <h2 class="mt-1 text-lg font-semibold text-white">Execution controls</h2>
-          </div>
+        <div class="mb-3 flex items-center justify-between gap-3">
+          <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">System prompt</p>
+          <Button size="sm" variant="secondary" type="button" onclick={resetSystemPrompt}>Reset to default</Button>
         </div>
+        <textarea bind:value={form.systemPrompt} class="min-h-[180px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500" placeholder="You are {'{'}name{'}'}.&#10;&#10;Be helpful, direct, and concise."></textarea>
+        <p class="mt-2 text-xs text-slate-400">The agent's base instructions. Memory context and tool descriptions are injected separately at runtime.</p>
+      </Card>
 
-        <div class="mt-4 grid gap-4 md:grid-cols-2">
-          <label class="space-y-2 text-sm font-medium text-slate-200">
-            <span>Allowed secrets</span>
-            <Input bind:value={form.allowedSecrets} placeholder="openai_api_key, github_token" />
+      <!-- Tools & Permissions -->
+      <Card class="p-5">
+        <div class="grid gap-4 md:grid-cols-2">
+          <label class="flex items-center gap-3 text-sm font-medium text-slate-200">
+            <input bind:checked={form.canDelegate} class="h-4 w-4 rounded border-slate-600 bg-slate-950" type="checkbox" />
+            Can delegate
           </label>
           <label class="space-y-2 text-sm font-medium text-slate-200">
             <span>Max delegation depth</span>
@@ -212,141 +260,155 @@
           </label>
         </div>
 
-        <label class="mt-4 flex items-center gap-3 text-sm text-slate-200">
-          <input bind:checked={form.canDelegate} class="h-4 w-4 rounded border-slate-600 bg-slate-950" type="checkbox" />
-          <span>Allow delegation tools</span>
-        </label>
-
-        <div class="mt-5 overflow-hidden rounded-2xl border border-slate-800">
-          <table class="min-w-full divide-y divide-slate-800 text-sm">
-            <thead class="bg-slate-900/80 text-left text-slate-300">
-              <tr>
-                <th class="px-4 py-3 font-medium">Tool</th>
-                <th class="px-4 py-3 font-medium">Permission</th>
-              </tr>
-            </thead>
-            <tbody class="divide-y divide-slate-800 bg-slate-950/60">
+        {#if tools.length > 0}
+          <div class="mt-4 max-h-64 overflow-y-auto rounded-xl border border-slate-800 bg-slate-950/60 p-3">
+            <div class="space-y-2">
               {#each tools as tool}
-                <tr>
-                  <td class="px-4 py-3 text-slate-100">{tool.name}</td>
-                  <td class="px-4 py-3">
-                    <select bind:value={form.toolPermissions[tool.name]} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
-                      {#each permissionOptions as option}
-                        <option value={option}>{option || 'inherit'}</option>
-                      {/each}
-                    </select>
-                  </td>
-                </tr>
+                <div class="flex items-center justify-between gap-3 text-sm">
+                  <span class="text-slate-200">{tool.name}</span>
+                  <select bind:value={form.toolPermissions[tool.name]} class="w-32 rounded-lg border border-slate-700 bg-slate-950/80 px-2 py-1 text-xs text-slate-100">
+                    {#each permissionOptions as option}
+                      <option value={option}>{option || 'inherit'}</option>
+                    {/each}
+                  </select>
+                </div>
               {/each}
-            </tbody>
-          </table>
-        </div>
-      </Card>
-
-      <Card class="p-5">
-        <div class="flex items-center justify-between gap-3">
-          <div>
-            <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">MCP servers</p>
-            <h2 class="mt-1 text-lg font-semibold text-white">Local MCP integrations</h2>
-            <p class="mt-2 text-sm leading-6 text-slate-400">
-              Configure local MCP server commands that will be launched by the executor when this agent needs them.
-            </p>
+            </div>
           </div>
-          <Button type="button" variant="secondary" onclick={addMcpServer}>Add server</Button>
-        </div>
+        {/if}
 
-        <div class="mt-4 space-y-4">
-          {#if form.mcpServers.length === 0}
-            <p class="rounded-2xl border border-dashed border-slate-800 bg-slate-950/40 px-4 py-4 text-sm text-slate-400">
-              No MCP servers configured yet.
-            </p>
-          {/if}
+        <!-- Allowed secrets -->
+        {#if secrets.length > 0}
+          <div class="mt-4">
+            <p class="mb-2 text-sm font-medium text-slate-200">Allowed secrets</p>
+            <div class="grid gap-2 md:grid-cols-2">
+              {#each secrets as secret}
+                <label class="flex items-center gap-2 text-sm text-slate-200">
+                  <input
+                    checked={form.allowedSecrets.includes(secret.name)}
+                    class="h-4 w-4 rounded border-slate-600 bg-slate-950"
+                    type="checkbox"
+                    onchange={() => toggleSecret(secret.name)}
+                  />
+                  {secret.name}
+                  <span class="text-xs text-slate-400">({secret.scope})</span>
+                </label>
+              {/each}
+            </div>
+          </div>
+        {/if}
+
+        <!-- MCP Servers -->
+        <div class="mt-4 space-y-3">
+          <div class="flex items-center justify-between gap-3">
+            <p class="text-sm font-medium text-slate-200">MCP servers</p>
+            <Button size="sm" variant="secondary" type="button" onclick={addMcpServer}>Add server</Button>
+          </div>
 
           {#each form.mcpServers as server, index}
-            <div class="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
-              <div class="grid gap-4 md:grid-cols-2">
-                <label class="space-y-2 text-sm font-medium text-slate-200">
+            <div class="rounded-2xl border border-slate-800 bg-slate-950/60 p-4 space-y-3">
+              <div class="grid gap-3 md:grid-cols-2">
+                <label class="space-y-1 text-sm font-medium text-slate-200">
                   <span>Name</span>
                   <Input bind:value={server.name} placeholder="filesystem" />
                 </label>
-                <label class="space-y-2 text-sm font-medium text-slate-200">
+                <label class="space-y-1 text-sm font-medium text-slate-200">
                   <span>Command</span>
                   <Input bind:value={server.command} placeholder="npx" />
                 </label>
-                <label class="space-y-2 text-sm font-medium text-slate-200 md:col-span-2">
-                  <span>Args (one per line)</span>
-                  <textarea bind:value={server.argsText} class="min-h-[90px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 font-mono text-sm text-slate-100" placeholder="@modelcontextprotocol/server-filesystem&#10;/path/to/project"></textarea>
-                </label>
-                <label class="space-y-2 text-sm font-medium text-slate-200 md:col-span-2">
-                  <span>Environment variables (KEY=value per line)</span>
-                  <textarea bind:value={server.envText} class="min-h-[90px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 font-mono text-sm text-slate-100" placeholder="GITHUB_TOKEN=secret_name"></textarea>
-                </label>
-                <label class="space-y-2 text-sm font-medium text-slate-200">
-                  <span>Timeout seconds</span>
-                  <Input bind:value={server.timeoutSeconds} type="number" min="1" />
-                </label>
               </div>
-
-              <div class="mt-4 flex justify-end">
-                <Button type="button" variant="danger" size="sm" onclick={() => removeMcpServer(index)}>Remove</Button>
+              <label class="block space-y-1 text-sm font-medium text-slate-200">
+                <span>Arguments (one per line)</span>
+                <textarea bind:value={server.argsText} class="min-h-[60px] w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 font-mono text-sm text-slate-100" placeholder="-y&#10;@modelcontextprotocol/server-filesystem&#10;/path/to/project"></textarea>
+              </label>
+              <label class="block space-y-1 text-sm font-medium text-slate-200">
+                <span>Environment variables (KEY=value, one per line)</span>
+                <textarea bind:value={server.envText} class="min-h-[40px] w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 font-mono text-sm text-slate-100"></textarea>
+              </label>
+              <div class="flex items-center gap-3">
+                <label class="space-y-1 text-sm font-medium text-slate-200">
+                  <span>Timeout (s)</span>
+                  <Input bind:value={server.timeoutSeconds} type="number" />
+                </label>
+                <Button size="sm" variant="danger" type="button" onclick={() => removeMcpServer(index)}>Remove</Button>
               </div>
               {#if errors[`mcpServers.${index}`]}
-                <p class="mt-3 text-xs text-rose-300">{errors[`mcpServers.${index}`]}</p>
+                <p class="text-xs text-rose-300">{errors[`mcpServers.${index}`]}</p>
               {/if}
             </div>
           {/each}
-        </div>
 
-        {#if mode === 'edit' && onTestMcp}
-          <div class="mt-5 flex items-center gap-3">
-            <Button type="button" variant="secondary" onclick={() => onTestMcp?.()} disabled={mcpTesting || form.mcpServers.length === 0}>
-              {mcpTesting ? 'Testing MCP…' : 'Test MCP servers'}
+          {#if mode === 'edit' && onTestMcp}
+            <Button variant="secondary" type="button" disabled={mcpTesting} onclick={onTestMcp}>
+              {mcpTesting ? 'Testing…' : 'Test MCP servers'}
             </Button>
-          </div>
-        {/if}
-
-        {#if mcpTestResult}
-          <div class="mt-4 space-y-3">
-            {#each mcpTestResult.items as item}
-              <div class={`rounded-2xl border px-4 py-3 text-sm ${item.ok ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-100' : 'border-rose-500/30 bg-rose-500/10 text-rose-100'}`}>
-                <p class="font-medium">{item.name}</p>
-                {#if item.ok}
-                  <p class="mt-1">Discovered {item.tools.length} tool{item.tools.length === 1 ? '' : 's'}.</p>
-                {:else}
-                  <p class="mt-1">{item.error_detail ?? 'Unable to discover MCP tools.'}</p>
-                {/if}
+            {#if mcpTestResult}
+              <div class="space-y-2">
+                {#each mcpTestResult.servers as server}
+                  <div class={`rounded-xl border px-3 py-2 text-sm ${server.ok ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-100' : 'border-rose-500/30 bg-rose-500/10 text-rose-100'}`}>
+                    <span class="font-medium">{server.name}</span>
+                    {#if server.ok}
+                      — {server.tool_count} tools discovered
+                    {:else}
+                      — {server.error}
+                    {/if}
+                  </div>
+                {/each}
               </div>
-            {/each}
-          </div>
-        {/if}
+            {/if}
+          {/if}
+        </div>
       </Card>
 
+      <!-- Provider & Model -->
       <Card class="p-5">
+        <p class="mb-3 text-xs font-medium uppercase tracking-[0.25em] text-slate-400">LLM Configuration</p>
         <div class="grid gap-4 md:grid-cols-2">
           <label class="space-y-2 text-sm font-medium text-slate-200">
             <span>Provider</span>
             <select bind:value={form.providerId} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
-              <option value="">Manual / default</option>
+              <option value="">Use default provider</option>
               {#each providers as provider}
-                <option value={provider.provider_id}>{provider.display_name}</option>
+                <option value={provider.provider_id}>{provider.display_name}{provider.is_default ? ' ⭐' : ''}</option>
               {/each}
             </select>
+            <span class="block text-xs text-slate-400">Leave empty to use the system default.</span>
           </label>
           <label class="space-y-2 text-sm font-medium text-slate-200">
             <span>Model</span>
-            <Input bind:value={form.model} placeholder="gpt-5.4-mini" />
+            {#if selectedProviderModels().length > 0}
+              <select bind:value={form.model} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+                <option value="">Use provider default</option>
+                {#each selectedProviderModels() as modelId}
+                  <option value={modelId}>{modelId}</option>
+                {/each}
+              </select>
+            {:else}
+              <Input bind:value={form.model} placeholder="Use provider default" />
+            {/if}
+            <span class="block text-xs text-slate-400">Leave empty to use the provider's default model.</span>
           </label>
           <label class="space-y-2 text-sm font-medium text-slate-200">
             <span>Temperature</span>
-            <Input bind:value={form.temperature} type="number" placeholder="0.2" />
+            <Input bind:value={form.temperature} type="number" placeholder="default" />
           </label>
           <label class="space-y-2 text-sm font-medium text-slate-200">
             <span>Max tokens</span>
-            <Input bind:value={form.maxTokens} type="number" placeholder="4096" />
+            <Input bind:value={form.maxTokens} type="number" placeholder="default" />
+          </label>
+          <label class="space-y-2 text-sm font-medium text-slate-200">
+            <span>Reasoning effort</span>
+            <select bind:value={form.reasoningEffort} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+              <option value="">Default</option>
+              <option value="low">Low</option>
+              <option value="medium">Medium</option>
+              <option value="high">High</option>
+            </select>
           </label>
         </div>
       </Card>
 
+      <!-- Workflow Settings -->
       <Card class="p-5">
         <div class="space-y-4">
           <div>
@@ -370,7 +432,7 @@
             <label class="space-y-2 text-sm font-medium text-slate-200">
               <span>Default workflow</span>
               <select bind:value={form.defaultWorkflowId} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
-                <option value="">None</option>
+                <option value="">Automatic (decision engine)</option>
                 {#each workflows as workflow}
                   {#if form.availableWorkflowIds.includes(workflow.workflow_id)}
                     <option value={workflow.workflow_id}>{workflow.name}</option>

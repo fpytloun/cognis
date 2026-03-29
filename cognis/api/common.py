@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 from collections.abc import Callable
 from datetime import datetime
 from typing import Any, cast
@@ -133,3 +134,16 @@ def paginate_items[T](
     if has_more and page_items:
         next_cursor = encode_cursor({"id": get_item_id(page_items[-1])})
     return page_items, next_cursor, has_more
+
+
+def slugify(text: str) -> str:
+    """Convert text to a URL-friendly slug.
+
+    ``"Research Assistant"`` → ``"research-assistant"``
+    ``"My OpenAI (custom)"`` → ``"my-openai-custom"``
+    """
+    slug = text.lower().strip()
+    slug = re.sub(r"[^\w\s-]", "", slug)
+    slug = re.sub(r"[\s_]+", "-", slug)
+    slug = re.sub(r"-+", "-", slug)
+    return slug.strip("-")[:64] or "unnamed"
