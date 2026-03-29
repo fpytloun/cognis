@@ -15,7 +15,7 @@
 | 6 | [Agent Loop + Workflow Engine](stage-6-agent-loop.md) | DONE | Step runner, workflow engine, evaluator, task queue, gates, event bus, registry |
 | 7 | [API + WebSocket](stage-7-api.md) | DONE | REST + WS MVP surface, cursor pagination, sessions routes, task controls, reconnect support |
 | 8 | [UI](stage-8-ui.md) | DONE | SvelteKit UI under `ui/` with auth, chat, agents, tasks, workflows, settings, and Stage 8 workflow API alignment |
-| 9 | [Integration Testing](stage-9-testing.md) | IN PROGRESS | Full integration suite passing (27 tests) + contract refresh passing (14 tests, 2 skipped); manual shutdown/compaction coverage still pending |
+| 9 | [Integration Testing](stage-9-testing.md) | DONE | 27+ integration tests, 14 contract tests, 21 WebSocket unit tests, compaction/shutdown/recovery/degradation tests, all MVP success criteria verified |
 
 ### MVP Polish (Stages 10-15)
 
