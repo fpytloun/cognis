@@ -152,19 +152,19 @@ Verify degraded behavior is correct and user-facing messages are accurate.
 
 ## Acceptance Criteria
 
-- [ ] Provider outage banners appear automatically when services are down
-- [ ] Banners disappear automatically when services recover
-- [ ] Banners distinguish degraded (amber) from blocking (red) states
-- [ ] Chat errors show specific cause and actionable guidance
-- [ ] Task failures show specific reason on the task card/detail
-- [ ] Agent creation shows warning when Mnemory sync fails
-- [ ] Setup-incomplete states are visually distinct from failures
-- [ ] "No LLM provider" shows setup guidance, not an error
-- [ ] Retry buttons are available for: health check, personality sync,
+- [x] Provider outage banners appear automatically when services are down
+- [x] Banners disappear automatically when services recover
+- [x] Banners distinguish degraded (amber) from blocking (red) states
+- [x] Chat errors show specific cause and actionable guidance
+- [x] Task failures show specific reason on the task card/detail
+- [x] Agent creation shows warning when Mnemory sync fails
+- [x] Setup-incomplete states are visually distinct from failures
+- [x] "No LLM provider" shows setup guidance, not an error
+- [x] Retry buttons are available for: health check, personality sync,
       WebSocket reconnect, failed turn, escalation polling
-- [ ] WebSocket error messages include specific provider error codes
-- [ ] Degraded mode behavior is covered by integration tests
-- [ ] Provider recovery is tested (down → up → banner clears)
+- [x] WebSocket error messages include specific provider error codes
+- [x] Degraded mode behavior is covered by integration tests
+- [x] Provider recovery is tested (down → up → banner clears)
 
 ## Key References
 

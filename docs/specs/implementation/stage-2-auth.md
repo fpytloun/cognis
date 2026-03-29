@@ -1,6 +1,17 @@
 # Stage 2: Auth + Bootstrap + CLI
 
-**Status**: IMPLEMENTED*
+**Status**: DONE
+
+## Implementation Notes
+
+- ES256 JWT auth with auto-generated keypair on first start.
+- JWKS endpoint at `/.well-known/jwks.json`.
+- Argon2id password hashing with `time_cost=3, memory_cost=65536`.
+- Setup token with 15-minute TTL for first admin creation.
+- Login rate limiter (per-email sliding window).
+- Typer CLI commands: `serve`, `admin create-user`, `admin reset-password`,
+  `admin api-key`, `config init`, `status`.
+
 **Repo**: `cognis`
 **Depends on**: Stage 1
 **Estimated effort**: 2-3 days
@@ -103,21 +114,21 @@ can validate Cognis-issued tokens.
 
 ## Acceptance Criteria
 
-- [ ] `cognis serve` starts FastAPI on configured host/port
-- [ ] First start prints one-time setup URL with 15 min TTL
-- [ ] `POST /api/setup` creates first admin user (with valid token)
-- [ ] `POST /api/setup` returns 404 after first user exists
-- [ ] `cognis admin create-user` creates user directly in DB
-- [ ] `POST /api/auth/login` returns JWT for valid credentials
-- [ ] JWT contains correct `sub`, `aud`, `role` claims
-- [ ] `GET /.well-known/jwks.json` returns valid JWKS
-- [ ] Auth middleware rejects requests without valid JWT or API key
-- [ ] `cognis admin api-key create` generates working API key
-- [ ] `COGNIS_INITIAL_ADMIN_EMAIL` + `COGNIS_INITIAL_ADMIN_PASSWORD` seeds admin
-- [ ] Token exchange endpoint returns short-lived token
-- [ ] WebSocket rejects connections that don't auth within 10s
-- [ ] Unit tests for JWT sign/verify, auth middleware, password hashing
-- [ ] `ruff check` and `mypy` clean
+- [x] `cognis serve` starts FastAPI on configured host/port
+- [x] First start prints one-time setup URL with 15 min TTL
+- [x] `POST /api/setup` creates first admin user (with valid token)
+- [x] `POST /api/setup` returns 404 after first user exists
+- [x] `cognis admin create-user` creates user directly in DB
+- [x] `POST /api/auth/login` returns JWT for valid credentials
+- [x] JWT contains correct `sub`, `aud`, `role` claims
+- [x] `GET /.well-known/jwks.json` returns valid JWKS
+- [x] Auth middleware rejects requests without valid JWT or API key
+- [x] `cognis admin api-key create` generates working API key
+- [x] `COGNIS_INITIAL_ADMIN_EMAIL` + `COGNIS_INITIAL_ADMIN_PASSWORD` seeds admin
+- [x] Token exchange endpoint returns short-lived token
+- [x] WebSocket rejects connections that don't auth within 10s
+- [x] Unit tests for JWT sign/verify, auth middleware, password hashing
+- [x] `ruff check` and `mypy` clean
 
 ## Key References
 

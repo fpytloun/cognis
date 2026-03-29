@@ -145,31 +145,31 @@ delegation progress, resolve escalations, and configure LLM providers.
 
 ## Acceptance Criteria
 
-- [ ] `cd ui && npm install && npm run dev` starts on :5173
-- [ ] Login flow works (email + password → JWT → authenticated session)
-- [ ] Chat page sends messages and renders streaming responses
-- [ ] Tool calls display with status indicators
-- [ ] Delegation cards show progress and completed results
-- [ ] Escalation prompts appear with approve/deny and countdown
-- [ ] Reconnection works (disconnect → reconnect → replay missed events)
-- [ ] Agent list shows all agents with status
-- [ ] Agent creation form creates agent and bootstraps to Mnemory
-- [ ] Agent workflow settings (available workflows, default, step agent overrides)
-- [ ] Task kanban board shows tasks across all states (draft through done)
-- [ ] Create draft task, edit, set priority, set dependencies
-- [ ] Configure delivery target for task results/questions
-- [ ] Submit drafts (individual and batch)
-- [ ] Task detail shows workflow step progress with status per step
-- [ ] Gate prompts appear in task detail with action buttons
-- [ ] In-step question prompts appear and resume the same step
-- [ ] Workflow list shows system + user workflows
-- [ ] Workflow editor: create, edit, duplicate, export/import
-- [ ] Settings page manages LLM providers (add, test, remove)
-- [ ] Settings page manages secrets (add, edit, remove)
-- [ ] Model routing configuration works
-- [ ] Cross-service links open Intaris/Mnemory UIs correctly
-- [ ] UI handles error states gracefully (provider down, auth expired, etc.)
-- [ ] Build produces production bundle: `npm run build`
+- [x] `cd ui && npm install && npm run dev` starts on :5173
+- [x] Login flow works (email + password → JWT → authenticated session)
+- [x] Chat page sends messages and renders streaming responses
+- [x] Tool calls display with status indicators
+- [x] Delegation cards show progress and completed results
+- [x] Escalation prompts appear with approve/deny and countdown
+- [x] Reconnection works (disconnect → reconnect → replay missed events)
+- [x] Agent list shows all agents with status
+- [x] Agent creation form creates agent and bootstraps to Mnemory
+- [x] Agent workflow settings (available workflows, default, step agent overrides)
+- [x] Task kanban board shows tasks across all states (draft through done)
+- [x] Create draft task, edit, set priority, set dependencies
+- [x] Configure delivery target for task results/questions
+- [x] Submit drafts (individual and batch)
+- [x] Task detail shows workflow step progress with status per step
+- [x] Gate prompts appear in task detail with action buttons
+- [x] In-step question prompts appear and resume the same step
+- [x] Workflow list shows system + user workflows
+- [x] Workflow editor: create, edit, duplicate, export/import
+- [x] Settings page manages LLM providers (add, test, remove)
+- [x] Settings page manages secrets (add, edit, remove)
+- [x] Model routing configuration works
+- [x] Cross-service links open Intaris/Mnemory UIs correctly
+- [x] UI handles error states gracefully (provider down, auth expired, etc.)
+- [x] Build produces production bundle: `npm run build`
 
 ## Key References
 

@@ -1,6 +1,15 @@
 # Stage 0: Prerequisites
 
-**Status**: IN PROGRESS
+**Status**: DONE
+
+## Implementation Notes
+
+- Intaris I1-I6 deliverables completed: JWT validation, session CRUD,
+  evaluate endpoint, event store, reasoning recording, escalation flow.
+- Mnemory M1 completed: JWT-based auth alongside existing API key auth.
+- Contract tests written in `tests/contract/` validating Mnemory and
+  Intaris API shapes from the Cognis perspective.
+
 **Repos**: `intaris`, `mnemory`, `cognis` (contract tests only)
 **Depends on**: nothing
 **Estimated effort**: 1-2 weeks
@@ -92,11 +101,11 @@ in the Cognis repo.
 
 ## Acceptance Criteria
 
-- [ ] All 6 Intaris changes (I1-I6) merged and released
-- [ ] Mnemory M1 merged and released
-- [ ] `uvx mnemory` and `uvx intaris` accept Cognis-issued JWTs
-- [ ] Contract tests in `cognis/tests/contract/` pass against live services
-- [ ] Backward compatibility verified (API key auth still works)
+- [x] All 6 Intaris changes (I1-I6) merged and released
+- [x] Mnemory M1 merged and released
+- [x] `uvx mnemory` and `uvx intaris` accept Cognis-issued JWTs
+- [x] Contract tests in `cognis/tests/contract/` pass against live services
+- [x] Backward compatibility verified (API key auth still works)
 
 ## Key References
 

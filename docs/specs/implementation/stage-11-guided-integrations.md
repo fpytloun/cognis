@@ -1,6 +1,23 @@
 # Stage 11: Guided Integrations
 
 **Status**: DONE
+
+## Implementation Notes
+
+- Provider presets (OpenAI, Anthropic, Ollama, Custom) with structured
+  form fields, model datalists, and base URL handling. "Prefill matching
+  secret" button for convenient API key setup.
+- Rewrote `POST /api/v1/llm-providers/{id}/test` to perform a real LLM
+  completion instead of the stub `"healthy"` response.
+- Model routing with autocomplete from configured providers and help text
+  explaining each task type.
+- MCP server CRUD UI in AgentForm: add/edit/remove servers with name,
+  command, args, env vars, and timeout.
+- Account management: `POST /api/auth/change-password`, API key CRUD
+  endpoints, UI in Settings > Account tab. Removed the "not yet exposed"
+  disclaimer from the settings page.
+- Contextual secret creation linked from provider setup.
+
 **Repo**: `cognis`
 **Depends on**: Stage 10 (launchable first run — UI must be served and setup working)
 **Estimated effort**: 4-5 days
@@ -146,22 +163,22 @@ Make the relationship between secrets, providers, and tools clearer.
 
 ## Acceptance Criteria
 
-- [ ] User can create an OpenAI provider using structured form fields
+- [x] User can create an OpenAI provider using structured form fields
       (no JSON required)
-- [ ] User can create an Anthropic provider using structured form fields
-- [ ] User can create an Ollama provider using structured form fields
-- [ ] Custom/advanced mode still supports raw JSON
-- [ ] Provider test reports real pass/fail with model name, latency, and
+- [x] User can create an Anthropic provider using structured form fields
+- [x] User can create an Ollama provider using structured form fields
+- [x] Custom/advanced mode still supports raw JSON
+- [x] Provider test reports real pass/fail with model name, latency, and
       actionable error details
-- [ ] Model routing shows available models from configured providers
-- [ ] Model routing has help text explaining each task type
-- [ ] MCP servers can be added, edited, and removed from the agent form
-- [ ] MCP server test discovers tools and reports results
-- [ ] Discovered MCP tools appear in the agent's tool permission table
-- [ ] Password change works from Settings > Account
-- [ ] API keys can be created, listed, and revoked from Settings > Account
-- [ ] "Not yet exposed" note is removed from the settings page
-- [ ] Secrets have contextual help explaining env vars vs encrypted secrets
+- [x] Model routing shows available models from configured providers
+- [x] Model routing has help text explaining each task type
+- [x] MCP servers can be added, edited, and removed from the agent form
+- [x] MCP server test discovers tools and reports results
+- [x] Discovered MCP tools appear in the agent's tool permission table
+- [x] Password change works from Settings > Account
+- [x] API keys can be created, listed, and revoked from Settings > Account
+- [x] "Not yet exposed" note is removed from the settings page
+- [x] Secrets have contextual help explaining env vars vs encrypted secrets
 
 ## Key References
 

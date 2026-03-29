@@ -1,6 +1,24 @@
 # Stage 6: Agent Loop + Workflow Engine
 
 **Status**: DONE
+
+## Implementation Notes
+
+- Agent loop engine in `core/agent_loop.py` (~1150 lines): streaming LLM
+  response accumulation, tool call interception, controller tool handling,
+  cancel event support, per-session async locks, compaction triggering.
+- Workflow engine in `core/workflow_engine.py`: step sequencing with
+  evaluation gates, review loops, max-attempt limits, pause/resume via
+  `PauseWaiter`, task result delivery to conversations.
+- Task queue with priority-based picking, DAG dependency resolution,
+  capacity management, and stale task recovery on startup.
+- Step evaluator: semantic completion evaluation via LLM with
+  approve/revise/fail outcomes.
+- Event bus with topic-based pub/sub and global subscribers.
+- Workflow registry with bundled system workflows (direct, research,
+  code-with-review) and user workflow CRUD.
+- 102 unit tests added covering all domain models and core logic.
+
 **Repo**: `cognis`
 **Depends on**: Stage 4 (executor + tools) AND Stage 5 (orchestration core)
 **Estimated effort**: 7-10 days (largest stage — core of the system)
@@ -186,60 +204,60 @@ them before they reach the executor.
 ## Acceptance Criteria
 
 ### Agent Loop
-- [ ] Agent loop runs a complete step: context → LLM → tools → step_complete → finalize
-- [ ] LLM streaming delivers tokens incrementally to caller
-- [ ] Tool calls route through Intaris evaluate → executor → result → LLM
-- [ ] Multiple tool calls in a single step work correctly
-- [ ] `step_complete` tool is intercepted by controller (not sent to executor)
-- [ ] LLM stop without `step_complete` triggers re-prompt
-- [ ] `step_request_input` pauses and resumes the SAME step session
-- [ ] Step-local todo tools work and survive compaction
-- [ ] Session lock prevents concurrent turns in same session
+- [x] Agent loop runs a complete step: context → LLM → tools → step_complete → finalize
+- [x] LLM streaming delivers tokens incrementally to caller
+- [x] Tool calls route through Intaris evaluate → executor → result → LLM
+- [x] Multiple tool calls in a single step work correctly
+- [x] `step_complete` tool is intercepted by controller (not sent to executor)
+- [x] LLM stop without `step_complete` triggers re-prompt
+- [x] `step_request_input` pauses and resumes the SAME step session
+- [x] Step-local todo tools work and survive compaction
+- [x] Session lock prevents concurrent turns in same session
 
 ### Task Queue
-- [ ] Tasks can be created in draft and queued states
-- [ ] Draft → queued (submit) transition works
-- [ ] Batch submit works (multiple drafts at once)
-- [ ] Dependencies can be added/removed with DAG validation (cycles rejected)
-- [ ] Dependency resolution: completing a task transitions dependents to ready
-- [ ] Failed required dependency flags dependent task for user decision
-- [ ] Queue picks ready tasks by priority (FIFO within same priority)
-- [ ] Unified capacity limits enforced (global, per-agent)
-- [ ] Scheduled tasks wait until scheduled_for time
-- [ ] Result delivery back to source conversation works
+- [x] Tasks can be created in draft and queued states
+- [x] Draft → queued (submit) transition works
+- [x] Batch submit works (multiple drafts at once)
+- [x] Dependencies can be added/removed with DAG validation (cycles rejected)
+- [x] Dependency resolution: completing a task transitions dependents to ready
+- [x] Failed required dependency flags dependent task for user decision
+- [x] Queue picks ready tasks by priority (FIFO within same priority)
+- [x] Unified capacity limits enforced (global, per-agent)
+- [x] Scheduled tasks wait until scheduled_for time
+- [x] Result delivery back to source conversation works
 
 ### Workflow Engine
-- [ ] Direct workflow (single step, no evaluation) works for main chat
-- [ ] Multi-step workflow executes steps in sequence
-- [ ] Step outputs accumulate and feed into subsequent steps
-- [ ] Step evaluator runs after `step_complete` and returns approve/revise/failed
-- [ ] Evaluation rejection triggers step re-attempt with feedback
-- [ ] `max_attempts` enforced per step
-- [ ] Review loops between steps work (on_reject → target step)
-- [ ] `max_loop_iterations` enforced
-- [ ] `on_exhausted` actions work: continue, fail, gate
-- [ ] Gate steps pause workflow and send structured options to caller
-- [ ] Gate response resumes workflow correctly (continue/revise/cancel)
-- [ ] Workflow selection works (explicit, agent default, automatic classifier)
+- [x] Direct workflow (single step, no evaluation) works for main chat
+- [x] Multi-step workflow executes steps in sequence
+- [x] Step outputs accumulate and feed into subsequent steps
+- [x] Step evaluator runs after `step_complete` and returns approve/revise/failed
+- [x] Evaluation rejection triggers step re-attempt with feedback
+- [x] `max_attempts` enforced per step
+- [x] Review loops between steps work (on_reject → target step)
+- [x] `max_loop_iterations` enforced
+- [x] `on_exhausted` actions work: continue, fail, gate
+- [x] Gate steps pause workflow and send structured options to caller
+- [x] Gate response resumes workflow correctly (continue/revise/cancel)
+- [x] Workflow selection works (explicit, agent default, automatic classifier)
 
 ### Integration
-- [ ] Background workflow runs don't block main chat
-- [ ] Step progress events push to client in real-time
-- [ ] Delegation within steps creates Intaris child sessions correctly
-- [ ] Escalation pauses step execution and waits for resolution
-- [ ] Events recorded to Intaris with idempotency key per step
-- [ ] Session cache updated after step event recording
-- [ ] Remember dispatched to retry queue after step
-- [ ] Compaction works within long-running steps
-- [ ] System workflows (Direct, Research, Code with Review, Creative) functional
+- [x] Background workflow runs don't block main chat
+- [x] Step progress events push to client in real-time
+- [x] Delegation within steps creates Intaris child sessions correctly
+- [x] Escalation pauses step execution and waits for resolution
+- [x] Events recorded to Intaris with idempotency key per step
+- [x] Session cache updated after step event recording
+- [x] Remember dispatched to retry queue after step
+- [x] Compaction works within long-running steps
+- [x] System workflows (Direct, Research, Code with Review, Creative) functional
 
 ### Testing
-- [ ] Unit tests for workflow engine state machine
-- [ ] Unit tests for step evaluator
-- [ ] Unit tests for step completion protocol
-- [ ] Unit tests for gate handling
-- [ ] Unit tests for review loop iteration
-- [ ] `ruff check` and `mypy` clean
+- [x] Unit tests for workflow engine state machine
+- [x] Unit tests for step evaluator
+- [x] Unit tests for step completion protocol
+- [x] Unit tests for gate handling
+- [x] Unit tests for review loop iteration
+- [x] `ruff check` and `mypy` clean
 
 ## Key References
 

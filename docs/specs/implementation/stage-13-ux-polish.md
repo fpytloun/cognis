@@ -165,26 +165,26 @@ Make the app usable on tablets and phones.
 
 ## Acceptance Criteria
 
-- [ ] Toast notifications appear on all create/save/delete operations
-- [ ] All forms show required field indicators and inline validation
-- [ ] Destructive actions require confirmation dialog
-- [ ] Unsaved-changes warning on agent form, workflow editor, settings
-- [ ] Chat supports Enter-to-send with Shift+Enter for newlines
-- [ ] Messages show timestamps (relative, absolute on hover)
-- [ ] "Thinking" indicator shows during agent processing
-- [ ] Conversation sidebar has search and pagination
-- [ ] Keyboard shortcuts work: `/`, `Cmd+N`, `Escape`, `?`
-- [ ] Shortcut help overlay is accessible
-- [ ] Lucide icons appear in navigation, buttons, and empty states
-- [ ] Empty states show contextual guidance
-- [ ] Detail pages have back navigation links
-- [ ] ARIA labels on all interactive elements without visible labels
-- [ ] Skip-to-content link works
-- [ ] Drag-and-drop has keyboard alternatives
-- [ ] Core flows pass VoiceOver screen-reader test
-- [ ] App is navigable on mobile widths via hamburger menu
-- [ ] Chat works on mobile (list → detail navigation)
-- [ ] Login page renders correctly on mobile
+- [x] Toast notifications appear on all create/save/delete operations
+- [x] All forms show required field indicators and inline validation
+- [x] Destructive actions require confirmation dialog
+- [x] Unsaved-changes warning on agent form, workflow editor, settings
+- [x] Chat supports Enter-to-send with Shift+Enter for newlines
+- [x] Messages show timestamps (relative, absolute on hover)
+- [x] "Thinking" indicator shows during agent processing
+- [x] Conversation sidebar has search and pagination
+- [x] Keyboard shortcuts work: `/`, `Cmd+N`, `Escape`, `?`
+- [x] Shortcut help overlay is accessible
+- [x] Lucide icons appear in navigation, buttons, and empty states
+- [x] Empty states show contextual guidance
+- [x] Detail pages have back navigation links
+- [x] ARIA labels on all interactive elements without visible labels
+- [x] Skip-to-content link works
+- [x] Drag-and-drop has keyboard alternatives
+- [x] Core flows pass VoiceOver screen-reader test
+- [x] App is navigable on mobile widths via hamburger menu
+- [x] Chat works on mobile (list → detail navigation)
+- [x] Login page renders correctly on mobile
 
 ## Key References
 

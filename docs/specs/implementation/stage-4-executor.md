@@ -1,6 +1,18 @@
 # Stage 4: Executor + Tools
 
-**Status**: IMPLEMENTED*
+**Status**: DONE
+
+## Implementation Notes
+
+- In-process executor with JSON-RPC contract matching future Docker/K8s
+  executors. Tool execution sandboxed behind the provider interface.
+- MCP client in `tools/mcp.py` for stdio-based MCP server integration.
+- Tool router in `core/tool_router.py` classifies tools into orchestration
+  (controller-handled), Intaris MCP, and local execution paths.
+- Built-in tools: `step_complete`, `step_request_input`, `step_todo_write`,
+  `step_todo_list` for agent loop control flow.
+- Tool permissions enforced per-agent with `allow/evaluate/deny` per tool.
+
 **Repo**: `cognis`
 **Depends on**: Stage 3 (providers, especially Intaris for tool evaluation)
 **Can run in parallel with**: Stage 5

@@ -1,6 +1,22 @@
 # Stage 12: Honest Bootstrap and Documentation
 
 **Status**: DONE
+
+## Implementation Notes
+
+- Rewrote README.md Quick Start with honest step-by-step guide covering
+  all three services, JWT key sharing, and LLM API key setup.
+- In-app getting-started wizard with progress tracking (localStorage),
+  auto-detection of completed steps via diagnostics, and links to all
+  6 user guide documents.
+- Diagnostics in Settings > System: service connectivity, JWT key
+  fingerprint, DB status, "Copy env block" button.
+- All 6 user guides in `docs/guide/`: getting-started, configuring-providers,
+  creating-agents, using-chat, managing-tasks, troubleshooting. Linked
+  from the getting-started page (GitHub blob URLs).
+- README updated: removed "zero-config" language, documented bundled UI
+  and Docker deployment, accurate feature list.
+
 **Repo**: `cognis`
 **Depends on**: Stage 11 (guided integrations — docs should describe the guided config, not the raw JSON interim)
 **Estimated effort**: 2-3 days
@@ -129,18 +145,18 @@ Create a `docs/guide/` directory with user documentation.
 
 ## Acceptance Criteria
 
-- [ ] A new user can follow the Quick Start end-to-end on a clean machine
+- [x] A new user can follow the Quick Start end-to-end on a clean machine
       and reach a working chat
-- [ ] In-app setup guide walks through all required configuration steps
-- [ ] Setup guide tracks completion and is re-accessible
-- [ ] Diagnostics page shows all service/config status
-- [ ] Diagnostics page provides copy-paste env block
-- [ ] README accurately describes the current product capabilities
-- [ ] README documents bundled UI and Docker deployment
-- [ ] User guide covers: getting started, providers, agents, chat, tasks,
+- [x] In-app setup guide walks through all required configuration steps
+- [x] Setup guide tracks completion and is re-accessible
+- [x] Diagnostics page shows all service/config status
+- [x] Diagnostics page provides copy-paste env block
+- [x] README accurately describes the current product capabilities
+- [x] README documents bundled UI and Docker deployment
+- [x] User guide covers: getting started, providers, agents, chat, tasks,
       troubleshooting
-- [ ] No documentation claims features that do not exist
-- [ ] Docs are linked from the UI
+- [x] No documentation claims features that do not exist
+- [x] Docs are linked from the UI
 
 ## Key References
 

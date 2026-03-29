@@ -1,6 +1,21 @@
 # Stage 5: Orchestration Core
 
-**Status**: IMPLEMENTED*
+**Status**: DONE
+
+## Implementation Notes
+
+- Session manager with full lifecycle: create, recover stale, archive,
+  soft-delete, purge. Descendant failure cascade on recovery.
+- Session cache (L1 in-memory) for Intaris-derived state with incremental
+  fetch, warm-cache fallback, and compaction application.
+- Context assembler with parallel `asyncio.gather()` for memory recall,
+  event refresh, and intention read. Graceful degradation per source.
+- Compaction strategy: LLM-based summarization with mechanical fallback,
+  idempotent Intaris writes, configurable threshold and preserve_turns.
+- Decision engine: deterministic rules + LLM classifier for inline vs
+  delegation routing.
+- Remember retry queue: bounded async queue for failed Mnemory writes.
+
 **Repo**: `cognis`
 **Depends on**: Stage 3 (providers)
 **Can run in parallel with**: Stage 4

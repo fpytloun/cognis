@@ -1,6 +1,20 @@
 # Stage 7: API + WebSocket
 
 **Status**: DONE
+
+## Implementation Notes
+
+- Full REST API surface: conversations, agents, sessions, tasks, workflows,
+  settings, LLM providers, model routing, secrets, tools, escalations.
+- WebSocket handler (~1286 lines) with first-message auth, conversation
+  subscriptions, streaming chunk delivery, backpressure management,
+  reconnection with event replay, and event bus fanout.
+- Cursor-based pagination on all list endpoints.
+- Runtime support layer wiring providers, agent loop, workflow engine,
+  and task queue into the FastAPI lifespan.
+- Auth middleware supporting both JWT bearer tokens and API keys.
+- Structured error responses with sanitized error details.
+
 **Repo**: `cognis`
 **Depends on**: Stage 6 (agent loop — the API wires HTTP/WS to the loop)
 **Estimated effort**: 3-4 days

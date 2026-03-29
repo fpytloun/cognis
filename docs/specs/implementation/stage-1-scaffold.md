@@ -1,6 +1,17 @@
 # Stage 1: Project Scaffold + Config + Database
 
-**Status**: IMPLEMENTED*
+**Status**: DONE
+
+## Implementation Notes
+
+- Created `cognis/` package with hatchling build, pyproject.toml, and
+  all core dependencies (FastAPI, SQLAlchemy, LiteLLM, Typer, etc.).
+- Implemented `config.py` reading all env vars with sensible defaults.
+- Created SQLAlchemy ORM models for all metadata tables (users, agents,
+  conversations, sessions, tasks, workflows, settings, secrets, etc.).
+- Set up Alembic with async engine support for SQLite and PostgreSQL.
+- Bootstrap logic in `bootstrap.py` creates `~/.cognis/` with keys and DB.
+
 **Repo**: `cognis`
 **Depends on**: Stage 0 (contract tests written, not necessarily all merged)
 **Estimated effort**: 2-3 days
@@ -117,18 +128,18 @@ cognis/
 
 ## Acceptance Criteria
 
-- [ ] `uv pip install -e ".[dev]"` succeeds
-- [ ] `uvx cognis` or `uv run cognis` CLI starts (Typer help output)
-- [ ] `uv run cognis serve` runs without error (can exit immediately)
-- [ ] `~/.cognis/` auto-created with `keys/`, `secrets.key`, `cognis.db`
-- [ ] Database has all 10 tables with correct schema
-- [ ] `settings` table seeded with default values
-- [ ] `uv run alembic -c cognis/store/migrations/alembic.ini upgrade head` works
-- [ ] `uv run alembic -c cognis/store/migrations/alembic.ini downgrade base` works
-- [ ] Config loads all env vars with correct defaults
-- [ ] `uv run pytest tests/unit/test_config.py` passes
-- [ ] `ruff check cognis/` clean
-- [ ] `mypy cognis/` clean
+- [x] `uv pip install -e ".[dev]"` succeeds
+- [x] `uvx cognis` or `uv run cognis` CLI starts (Typer help output)
+- [x] `uv run cognis serve` runs without error (can exit immediately)
+- [x] `~/.cognis/` auto-created with `keys/`, `secrets.key`, `cognis.db`
+- [x] Database has all 10 tables with correct schema
+- [x] `settings` table seeded with default values
+- [x] `uv run alembic -c cognis/store/migrations/alembic.ini upgrade head` works
+- [x] `uv run alembic -c cognis/store/migrations/alembic.ini downgrade base` works
+- [x] Config loads all env vars with correct defaults
+- [x] `uv run pytest tests/unit/test_config.py` passes
+- [x] `ruff check cognis/` clean
+- [x] `mypy cognis/` clean
 
 ## Key References
 

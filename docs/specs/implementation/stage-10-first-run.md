@@ -1,6 +1,23 @@
 # Stage 10: Launchable First Run
 
 **Status**: DONE
+
+## Implementation Notes
+
+- Custom Hatch build hook (`build.py`) runs `npm ci && npm run build` and
+  copies output into `cognis/ui_dist/`. Switched to `adapter-static` with
+  SPA fallback for pure static output (no Node runtime at serve time).
+- `SPAStaticFiles` mount in `app.py` serves the bundled UI at `/`, with
+  API routes taking priority. `COGNIS_SERVE_UI` env var (default `true`).
+- Setup UI page at `/setup` with real form: email, name, password, confirm
+  password, client-side validation, auto-login on success.
+- Getting-started wizard at `/getting-started` with readiness checklist
+  derived from `GET /api/system/diagnostics`. Dismissible via localStorage.
+- Readiness banner in app layout when first-run conditions detected.
+- Startup probes Mnemory/Intaris and prints reachability status.
+- Multi-stage Dockerfile: Node builds UI, Python packages wheel with assets.
+  `COGNIS_SKIP_UI_BUILD=1` avoids redundant rebuilds in Docker.
+
 **Repo**: `cognis`
 **Depends on**: Stage 9 (integration testing complete)
 **Estimated effort**: 3-4 days
@@ -117,20 +134,20 @@ Single image that can serve both backend and frontend, or either alone.
 
 ## Acceptance Criteria
 
-- [ ] `pip install cognis` (or `uvx cognis`) includes built UI assets
-- [ ] `http://localhost:8080` serves the SvelteKit app without a separate
+- [x] `pip install cognis` (or `uvx cognis`) includes built UI assets
+- [x] `http://localhost:8080` serves the SvelteKit app without a separate
       Node process
-- [ ] `/setup?token=...` shows a real form with validation
-- [ ] Completing setup auto-logs in and redirects to `/chat`
-- [ ] Expired/invalid token shows actionable error with CLI fallback
-- [ ] First-run readiness checklist appears after first login
-- [ ] Readiness checklist is dismissible and re-accessible
-- [ ] `COGNIS_SERVE_UI=false` disables static serving
-- [ ] Dev workflow (`npm run dev` + `cognis serve`) still works unchanged
-- [ ] Docker build produces a single image
-- [ ] Docker image supports both combined and API-only modes
-- [ ] Startup logs show companion service reachability
-- [ ] Startup logs print the correct URL for the user to open
+- [x] `/setup?token=...` shows a real form with validation
+- [x] Completing setup auto-logs in and redirects to `/chat`
+- [x] Expired/invalid token shows actionable error with CLI fallback
+- [x] First-run readiness checklist appears after first login
+- [x] Readiness checklist is dismissible and re-accessible
+- [x] `COGNIS_SERVE_UI=false` disables static serving
+- [x] Dev workflow (`npm run dev` + `cognis serve`) still works unchanged
+- [x] Docker build produces a single image
+- [x] Docker image supports both combined and API-only modes
+- [x] Startup logs show companion service reachability
+- [x] Startup logs print the correct URL for the user to open
 
 ## Key References
 

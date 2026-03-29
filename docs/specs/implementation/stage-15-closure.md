@@ -136,23 +136,23 @@ Tighten validation and handling for known edge cases.
 
 ## Acceptance Criteria
 
-- [ ] All 5 backend TODOs with user/operational impact are resolved
-- [ ] `tools/skills.py` exists and loads skill definitions from agent config
-- [ ] General API rate limiting is active with configurable limits
-- [ ] Intaris purge cascade is implemented (with fallback for unsupported
+- [x] All 5 backend TODOs with user/operational impact are resolved
+- [x] `tools/skills.py` exists and loads skill definitions from agent config
+- [x] General API rate limiting is active with configurable limits
+- [x] Intaris purge cascade is implemented (with fallback for unsupported
       provider)
-- [ ] WebSocket heartbeat ping runs on a 30-second interval
-- [ ] Test count increases by 30+ covering the identified gaps
-- [ ] WebSocket handler has dedicated unit tests
-- [ ] Auth middleware has dedicated unit tests
-- [ ] LiteLLM provider has dedicated unit tests
-- [ ] Circuit breaker has dedicated unit tests
-- [ ] CLI commands have dedicated tests
-- [ ] Workflow engine orchestration has unit tests (not just domain models)
-- [ ] Implementation tracker accurately reflects the polished MVP
-- [ ] AGENTS.md and README.md are up to date
-- [ ] No known paper-cut regressions in core flows
-- [ ] All stage files have implementation notes
+- [x] WebSocket heartbeat ping runs on a 30-second interval
+- [x] Test count increases by 30+ covering the identified gaps
+- [x] WebSocket handler has dedicated unit tests
+- [x] Auth middleware has dedicated unit tests
+- [x] LiteLLM provider has dedicated unit tests
+- [x] Circuit breaker has dedicated unit tests
+- [x] CLI commands have dedicated tests
+- [x] Workflow engine orchestration has unit tests (not just domain models)
+- [x] Implementation tracker accurately reflects the polished MVP
+- [x] AGENTS.md and README.md are up to date
+- [x] No known paper-cut regressions in core flows
+- [x] All stage files have implementation notes
 
 ## Key References
 

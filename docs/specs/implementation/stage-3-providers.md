@@ -1,6 +1,21 @@
 # Stage 3: Provider Layer
 
-**Status**: IMPLEMENTED*
+**Status**: DONE
+
+## Implementation Notes
+
+- All 6 provider Protocols defined in `providers/base.py` and per-category
+  `protocol.py` files.
+- MnemoryProvider: httpx async client with JWT service auth, circuit breaker
+  (5 failures → 30s open), recall/remember/bootstrap methods.
+- IntarisProvider: httpx async client with JWT service auth, circuit breaker
+  (3 failures → 15s open), evaluate/record/session methods.
+- InProcessExecutorProvider: same-process execution with JSON-RPC contract.
+- LiteLLMProvider: DB-backed model resolution, caching, streaming support.
+- EncryptedDBSecretsProvider: AES-256-GCM encryption at rest.
+- JWTAuthProvider: ES256 signing/verification, token revocation in memory.
+- Provider registry in `providers/registry.py` with aggregate health check.
+
 **Repo**: `cognis`
 **Depends on**: Stage 2 (auth for JWT service tokens), Stage 0 (contract tests passing)
 **Estimated effort**: 4-5 days
@@ -116,18 +131,18 @@ and report provider health. Contract tests pass against real services.
 
 ## Acceptance Criteria
 
-- [ ] All 6 Protocol classes defined with typed signatures
-- [ ] Mnemory provider connects with JWT auth, recall and remember work
-- [ ] Intaris provider connects with JWT auth, evaluate and events work
-- [ ] LLM provider makes a real completion call (at least one provider)
-- [ ] Secrets provider encrypts/decrypts correctly
-- [ ] Token counting works for at least OpenAI models
-- [ ] Circuit breaker trips after 5 failures, recovers after 30s
-- [ ] Remember retry queue buffers and drains correctly
-- [ ] Contract tests pass against live Mnemory + Intaris
-- [ ] Provider health aggregation works
-- [ ] Unit tests for each provider (mocked HTTP where needed)
-- [ ] `ruff check` and `mypy` clean
+- [x] All 6 Protocol classes defined with typed signatures
+- [x] Mnemory provider connects with JWT auth, recall and remember work
+- [x] Intaris provider connects with JWT auth, evaluate and events work
+- [x] LLM provider makes a real completion call (at least one provider)
+- [x] Secrets provider encrypts/decrypts correctly
+- [x] Token counting works for at least OpenAI models
+- [x] Circuit breaker trips after 5 failures, recovers after 30s
+- [x] Remember retry queue buffers and drains correctly
+- [x] Contract tests pass against live Mnemory + Intaris
+- [x] Provider health aggregation works
+- [x] Unit tests for each provider (mocked HTTP where needed)
+- [x] `ruff check` and `mypy` clean
 
 ## Key References
 
