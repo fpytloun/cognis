@@ -15,7 +15,8 @@ from cognis.models.agent import AgentDefinition
 from cognis.models.session import SessionModel
 from cognis.models.tool import Permission, ToolCall, ToolResult
 from cognis.store.queries import get_setting_value
-from cognis.tools.builtin.orchestration import handle_orchestration_tool_call, is_orchestration_tool
+from cognis.tools.builtin.memory import handle_memory_tool, is_memory_tool
+from cognis.tools.builtin.orchestration import handle_delegate_tool_call, is_orchestration_tool
 from cognis.tools.registry import ToolRegistry
 
 TOOL_ROUTE_DECISIONS = Counter(
@@ -34,6 +35,7 @@ class ToolRoute(StrEnum):
     """Tool routing categories."""
 
     ORCHESTRATION = "orchestration"
+    MEMORY = "memory"
     INTARIS_MCP = "intaris_mcp"
     LOCAL = "local"
     UNKNOWN = "unknown"
@@ -51,8 +53,14 @@ class PermissionDecision:
 class ToolRouter:
     """Classify, evaluate, execute, and sanitize tool calls."""
 
-    def __init__(self, guardrails: Any, non_bypassable_patterns: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        guardrails: Any,
+        non_bypassable_patterns: list[str] | None = None,
+        memory: Any | None = None,
+    ) -> None:
         self.guardrails = guardrails
+        self.memory = memory
         self.non_bypassable_patterns = non_bypassable_patterns or []
 
     @classmethod
@@ -60,18 +68,25 @@ class ToolRouter:
         cls,
         guardrails: Any,
         session_factory: async_sessionmaker[AsyncSession],
+        memory: Any | None = None,
     ) -> ToolRouter:
         """Create a router with cached non-bypassable patterns from settings."""
 
         async with session_factory() as session:
             patterns = await get_setting_value(session, "security.non_bypassable_tools", [])
-        return cls(guardrails=guardrails, non_bypassable_patterns=_coerce_patterns(patterns))
+        return cls(
+            guardrails=guardrails,
+            non_bypassable_patterns=_coerce_patterns(patterns),
+            memory=memory,
+        )
 
     def classify(self, tool_name: str, registry: ToolRegistry) -> ToolRoute:
         """Classify a tool call by route category."""
 
         if is_orchestration_tool(tool_name):
             return ToolRoute.ORCHESTRATION
+        if is_memory_tool(tool_name):
+            return ToolRoute.MEMORY
         registered_tool = registry.get(tool_name)
         if registered_tool is None:
             return ToolRoute.UNKNOWN
@@ -146,8 +161,24 @@ class ToolRouter:
                 tool_call.name, ToolResult(output="Unknown tool.", is_error=True), 50_000
             )
         if route is ToolRoute.ORCHESTRATION:
-            result = await handle_orchestration_tool_call(tool_call)
+            result, _child = await handle_delegate_tool_call(tool_call)
             TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome="success").inc()
+            return self._sanitize_result(tool_call.name, result, 50_000)
+        if route is ToolRoute.MEMORY:
+            if self.memory is None:
+                result = ToolResult(output="Memory provider not available.", is_error=True)
+            else:
+                from cognis.runtime_context import current_user_email
+
+                result = await handle_memory_tool(
+                    tool_name=tool_call.name,
+                    arguments=dict(tool_call.arguments),
+                    memory_provider=self.memory,
+                    agent_id=agent.agent_id if agent else None,
+                    user_email=current_user_email.get(),
+                )
+            outcome = "success" if not result.is_error else "failure"
+            TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome=outcome).inc()
             return self._sanitize_result(tool_call.name, result, 50_000)
         if route is ToolRoute.INTARIS_MCP:
             result = await self._call_intaris_mcp(tool_call, session, registry)

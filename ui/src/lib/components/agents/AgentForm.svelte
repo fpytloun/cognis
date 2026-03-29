@@ -11,7 +11,7 @@
     type MCPEnvVar,
     type MCPServerFormState
   } from '$lib/agents';
-  import type { LLMProvider, MCPServerTestResponse, SecretMetadata, ToolDefinitionSummary, Workflow } from '$lib/types/api';
+  import type { IntarisMCPServer, LLMProvider, MCPServerTestResponse, SecretMetadata, ToolDefinitionSummary, Workflow } from '$lib/types/api';
 
   let {
     mode,
@@ -20,6 +20,7 @@
     workflows,
     providers,
     secrets = [],
+    intarisMcpServers = [],
     saving = false,
     error = '',
     onSave,
@@ -33,6 +34,7 @@
     workflows: Workflow[];
     providers: LLMProvider[];
     secrets?: SecretMetadata[];
+    intarisMcpServers?: IntarisMCPServer[];
     saving?: boolean;
     error?: string;
     onSave: (payload: Record<string, unknown>) => void | Promise<void>;
@@ -306,10 +308,40 @@
           </div>
         {/if}
 
-        <!-- MCP Servers -->
+        <!-- Intaris MCP Servers -->
+        {#if intarisMcpServers.length > 0}
+          <div class="mt-4 space-y-3">
+            <p class="text-sm font-medium text-slate-200">Intaris MCP servers</p>
+            <p class="text-xs text-slate-400">Remote MCP servers managed by Intaris. Select which servers this agent can use.</p>
+            <div class="flex flex-wrap gap-2">
+              {#each intarisMcpServers as server}
+                {@const selected = (form.intarisMcpServers || []).includes(server.name)}
+                <button
+                  type="button"
+                  class="px-3 py-1.5 rounded-lg text-sm border transition-colors {selected ? 'bg-blue-500/20 border-blue-500/50 text-blue-300' : 'bg-slate-900 border-slate-700 text-slate-400 hover:border-slate-600'}"
+                  onclick={() => {
+                    const current = form.intarisMcpServers || [];
+                    if (selected) {
+                      form.intarisMcpServers = current.filter((n: string) => n !== server.name);
+                    } else {
+                      form.intarisMcpServers = [...current, server.name];
+                    }
+                  }}
+                >
+                  {server.name}
+                  {#if server.tools_count > 0}
+                    <span class="ml-1 text-xs opacity-60">({server.tools_count} tools)</span>
+                  {/if}
+                </button>
+              {/each}
+            </div>
+          </div>
+        {/if}
+
+        <!-- Local MCP Servers -->
         <div class="mt-4 space-y-3">
           <div class="flex items-center justify-between gap-3">
-            <p class="text-sm font-medium text-slate-200">MCP servers</p>
+            <p class="text-sm font-medium text-slate-200">Local MCP servers</p>
             <Button size="sm" variant="secondary" type="button" onclick={addMcpServer}>Add server</Button>
           </div>
 

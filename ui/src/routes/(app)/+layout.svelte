@@ -15,6 +15,7 @@
     ShieldAlert,
     Wifi,
     Workflow,
+    Wrench,
     X
   } from 'lucide-svelte';
 
@@ -37,6 +38,7 @@
     { href: '/agents', label: 'Agents', icon: Bot },
     { href: '/tasks', label: 'Tasks', icon: ListTodo },
     { href: '/workflows', label: 'Workflows', icon: Workflow },
+    { href: '/tools', label: 'Tools', icon: Wrench },
     { href: '/settings', label: 'Settings', icon: Settings }
   ];
 

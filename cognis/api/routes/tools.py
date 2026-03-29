@@ -11,6 +11,8 @@ from fastapi import APIRouter, Request
 
 from cognis.api.common import api_exception, require_current_user, require_owner_or_admin
 from cognis.api.models import (
+    ExecutorStatusResponse,
+    IntarisMCPServerResponse,
     MCPServerResponse,
     MCPServerTestItemResponse,
     MCPServerTestResponse,
@@ -21,6 +23,7 @@ from cognis.api.serializers import agent_to_response, mcp_server_to_response, to
 from cognis.models.agent import AgentDefinition
 from cognis.models.tool import ExecutorConfig, MCPServerConfig
 from cognis.store.queries import get_agent, list_agents
+from cognis.tools.executor.definitions import executor_tool_definitions
 
 router = APIRouter(tags=["tools"])
 
@@ -69,6 +72,54 @@ async def _discover_local_mcp_tools(
 async def list_tools(request: Request) -> list[ToolResponse]:
     require_current_user(request)
     return [tool_to_response(tool) for tool in select_static_tools()]
+
+
+@router.get("/api/v1/tools/executor", response_model=list[ToolResponse])
+async def list_executor_tools(request: Request) -> list[ToolResponse]:
+    """List executor-native tools with their definitions."""
+    require_current_user(request)
+    return [tool_to_response(tool) for tool in executor_tool_definitions()]
+
+
+@router.get("/api/v1/executor/status", response_model=ExecutorStatusResponse)
+async def executor_status(request: Request) -> ExecutorStatusResponse:
+    """Get executor status and capabilities."""
+    require_current_user(request)
+    executor = request.app.state.providers.executor
+    active = await executor.list_active()
+    health = await executor.health()
+    native_tool_names = [t.name for t in executor_tool_definitions()]
+    return ExecutorStatusResponse(
+        executor_type="in_process",
+        status=health.status,
+        active_executors=len(active),
+        capabilities={
+            "inference": False,
+            "native_tools_count": len(native_tool_names),
+        },
+        native_tools=native_tool_names,
+    )
+
+
+@router.get("/api/v1/intaris/mcp/servers", response_model=list[IntarisMCPServerResponse])
+async def list_intaris_mcp_servers(request: Request) -> list[IntarisMCPServerResponse]:
+    """Auto-discover available MCP servers from Intaris."""
+    require_current_user(request)
+    guardrails = request.app.state.providers.guardrails
+    servers = await guardrails.list_mcp_servers(enabled_only=True)
+    return [
+        IntarisMCPServerResponse(
+            name=s.get("name", ""),
+            transport=s.get("transport"),
+            enabled=s.get("enabled", True),
+            tools_count=len(s.get("tools_cache") or [])
+            if isinstance(s.get("tools_cache"), list)
+            else 0,
+            agent_pattern=s.get("agent_pattern", "*"),
+        )
+        for s in servers
+        if isinstance(s, dict) and s.get("name")
+    ]
 
 
 @router.get("/api/v1/agents/{agent_id}/tools", response_model=list[ToolResponse])

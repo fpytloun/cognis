@@ -519,6 +519,7 @@ class SecretResponse(BaseModel):
 class ToolResponse(BaseModel):
     name: str
     description: str
+    parameters: dict[str, Any] = Field(default_factory=dict)
     category: str = "general"
     read_only: bool = False
     source: dict[str, Any] = Field(default_factory=dict)
@@ -544,6 +545,92 @@ class MCPServerTestItemResponse(BaseModel):
 class MCPServerTestResponse(BaseModel):
     ok: bool
     items: list[MCPServerTestItemResponse] = Field(default_factory=list)
+
+
+class SkillResponse(BaseModel):
+    skill_id: str
+    name: str
+    description: str | None = None
+    instructions: str
+    tools: list[dict[str, Any]] | None = None
+    prompt_templates: dict[str, Any] | None = None
+    tags: list[str] | None = None
+    auto_load: bool = False
+    source: str = "db"
+    owner_email: str | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class SkillCreateRequest(BaseModel):
+    name: str
+    description: str | None = None
+    instructions: str
+    tools: list[dict[str, Any]] | None = None
+    prompt_templates: dict[str, Any] | None = None
+    tags: list[str] | None = None
+    auto_load: bool = False
+
+
+class SkillUpdateRequest(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    instructions: str | None = None
+    tools: list[dict[str, Any]] | None = None
+    prompt_templates: dict[str, Any] | None = None
+    tags: list[str] | None = None
+    auto_load: bool | None = None
+
+
+class ExecutorStatusResponse(BaseModel):
+    executor_type: str
+    status: str
+    active_executors: int = 0
+    capabilities: dict[str, Any] = Field(default_factory=dict)
+    native_tools: list[str] = Field(default_factory=list)
+
+
+class IntarisMCPServerResponse(BaseModel):
+    name: str
+    transport: str | None = None
+    enabled: bool = True
+    tools_count: int = 0
+    agent_pattern: str = "*"
+
+
+class ExecutorConfigResponse(BaseModel):
+    executor_id: str
+    name: str
+    executor_type: str = "in_process"
+    labels: dict[str, Any] = Field(default_factory=dict)
+    enabled_tools: list[str] = Field(default_factory=list)
+    enabled_tool_groups: list[str] = Field(default_factory=list)
+    config: dict[str, Any] = Field(default_factory=dict)
+    status: str = "active"
+    is_default: bool = False
+    owner_email: str | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class ExecutorCreateRequest(BaseModel):
+    name: str
+    executor_type: str = "in_process"
+    labels: dict[str, Any] = Field(default_factory=dict)
+    enabled_tools: list[str] = Field(default_factory=list)
+    enabled_tool_groups: list[str] = Field(default_factory=list)
+    config: dict[str, Any] = Field(default_factory=dict)
+    is_default: bool = False
+
+
+class ExecutorUpdateRequest(BaseModel):
+    name: str | None = None
+    labels: dict[str, Any] | None = None
+    enabled_tools: list[str] | None = None
+    enabled_tool_groups: list[str] | None = None
+    config: dict[str, Any] | None = None
+    status: str | None = None
+    is_default: bool | None = None
 
 
 class EscalationResolveRequest(BaseModel):

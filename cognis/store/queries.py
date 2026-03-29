@@ -14,12 +14,14 @@ from cognis.store.models import (
     Agent,
     ApiKey,
     Conversation,
+    ExecutorRow,
     LLMProvider,
     ModelRouting,
     Schedule,
     Secret,
     Session,
     Setting,
+    SkillRow,
     StepRun,
     Task,
     TaskDependency,
@@ -808,6 +810,56 @@ async def update_task_workflow_state(
     return int(getattr(result, "rowcount", 0) or 0) > 0
 
 
+async def update_task_fields(
+    session: AsyncSession,
+    task_id: str,
+    *,
+    title: str | None = None,
+    description: str | None = None,
+    priority: int | None = None,
+    workflow_id: str | None = None,
+) -> bool:
+    """Update mutable task fields.  Only allowed for draft/queued tasks."""
+    values: dict[str, object] = {}
+    if title is not None:
+        values["title"] = title
+    if description is not None:
+        values["description"] = description
+    if priority is not None:
+        values["priority"] = priority
+    if workflow_id is not None:
+        values["workflow_id"] = workflow_id
+    if not values:
+        return False
+    stmt = (
+        update(Task)
+        .where(Task.task_id == task_id, Task.status.in_(["draft", "queued"]))
+        .values(**values)
+    )
+    result = await session.execute(stmt)
+    return int(getattr(result, "rowcount", 0) or 0) > 0
+
+
+async def list_tasks_for_agent(
+    session: AsyncSession,
+    agent_id: str,
+    *,
+    statuses: list[str] | None = None,
+    limit: int = 50,
+) -> list[Task]:
+    """List tasks for a specific agent, optionally filtered by status."""
+    query = (
+        select(Task)
+        .where(Task.agent_id == agent_id)
+        .order_by(Task.priority.desc(), Task.created_at.desc())
+        .limit(limit)
+    )
+    if statuses:
+        query = query.where(Task.status.in_(statuses))
+    result = await session.execute(query)
+    return list(result.scalars().all())
+
+
 async def list_tasks_by_status(
     session: AsyncSession,
     statuses: list[str],
@@ -1299,3 +1351,180 @@ async def get_schedule(session: AsyncSession, schedule_id: str) -> Schedule | No
     """Get a schedule by ID."""
     result = await session.execute(select(Schedule).where(Schedule.schedule_id == schedule_id))
     return result.scalar_one_or_none()
+
+
+# --- Skills ---
+
+
+async def list_skills(session: AsyncSession, owner_email: str | None = None) -> list[SkillRow]:
+    """List all skills, optionally filtered by owner."""
+    stmt = select(SkillRow).order_by(SkillRow.name)
+    if owner_email is not None:
+        stmt = stmt.where(
+            sa.or_(SkillRow.owner_email == owner_email, SkillRow.owner_email.is_(None))
+        )
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def get_skill(session: AsyncSession, skill_id: str) -> SkillRow | None:
+    """Get a skill by ID."""
+    result = await session.execute(select(SkillRow).where(SkillRow.skill_id == skill_id))
+    return result.scalar_one_or_none()
+
+
+async def create_skill(
+    session: AsyncSession,
+    *,
+    skill_id: str | None = None,
+    name: str,
+    description: str | None = None,
+    instructions: str,
+    tools: list[dict[str, Any]] | dict[str, Any] | None = None,
+    prompt_templates: dict[str, Any] | None = None,
+    tags: list[str] | None = None,
+    auto_load: bool = False,
+    source: str = "db",
+    owner_email: str | None = None,
+) -> SkillRow:
+    """Create a skill record."""
+    row = SkillRow(
+        skill_id=skill_id or f"skill_{uuid.uuid4().hex[:12]}",
+        name=name,
+        description=description,
+        instructions=instructions,
+        tools=tools,
+        prompt_templates=prompt_templates,
+        tags=tags,
+        auto_load=auto_load,
+        source=source,
+        owner_email=owner_email,
+    )
+    session.add(row)
+    await session.flush()
+    return row
+
+
+async def update_skill(
+    session: AsyncSession,
+    skill_id: str,
+    **kwargs: Any,
+) -> SkillRow | None:
+    """Update a skill by ID."""
+    row = await get_skill(session, skill_id)
+    if row is None:
+        return None
+    if row.source != "db":
+        raise ValueError("Cannot update file-sourced skills")
+    for key, value in kwargs.items():
+        if hasattr(row, key):
+            setattr(row, key, value)
+    await session.flush()
+    return row
+
+
+async def delete_skill(session: AsyncSession, skill_id: str) -> bool:
+    """Delete a skill by ID. Only DB-managed skills can be deleted."""
+    row = await get_skill(session, skill_id)
+    if row is None:
+        return False
+    if row.source != "db":
+        raise ValueError("Cannot delete file-sourced skills")
+    await session.execute(delete(SkillRow).where(SkillRow.skill_id == skill_id))
+    return True
+
+
+# --- Executors ---
+
+
+async def list_executors(session: AsyncSession) -> list[ExecutorRow]:
+    """List all executor configurations."""
+    result = await session.execute(select(ExecutorRow).order_by(ExecutorRow.name))
+    return list(result.scalars().all())
+
+
+async def get_executor_row(session: AsyncSession, executor_id: str) -> ExecutorRow | None:
+    """Get an executor by ID."""
+    result = await session.execute(
+        select(ExecutorRow).where(ExecutorRow.executor_id == executor_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_default_executor(session: AsyncSession) -> ExecutorRow | None:
+    """Get the default executor (is_default=True)."""
+    result = await session.execute(
+        select(ExecutorRow).where(ExecutorRow.is_default.is_(True)).limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def create_executor(
+    session: AsyncSession,
+    *,
+    executor_id: str | None = None,
+    name: str,
+    executor_type: str = "in_process",
+    labels: dict[str, Any] | None = None,
+    enabled_tools: list[str] | None = None,
+    enabled_tool_groups: list[str] | None = None,
+    config: dict[str, Any] | None = None,
+    is_default: bool = False,
+    owner_email: str | None = None,
+) -> ExecutorRow:
+    """Create an executor configuration."""
+    row = ExecutorRow(
+        executor_id=executor_id or f"exec_{uuid.uuid4().hex[:12]}",
+        name=name,
+        executor_type=executor_type,
+        labels=labels,
+        enabled_tools=enabled_tools or [],
+        enabled_tool_groups=enabled_tool_groups or [],
+        config=config,
+        is_default=is_default,
+        owner_email=owner_email,
+    )
+    session.add(row)
+    await session.flush()
+    return row
+
+
+async def update_executor(
+    session: AsyncSession,
+    executor_id: str,
+    **kwargs: Any,
+) -> ExecutorRow | None:
+    """Update an executor by ID."""
+    row = await get_executor_row(session, executor_id)
+    if row is None:
+        return None
+    for key, value in kwargs.items():
+        if hasattr(row, key):
+            setattr(row, key, value)
+    await session.flush()
+    return row
+
+
+async def delete_executor(session: AsyncSession, executor_id: str) -> bool:
+    """Delete an executor by ID."""
+    row = await get_executor_row(session, executor_id)
+    if row is None:
+        return False
+    await session.execute(delete(ExecutorRow).where(ExecutorRow.executor_id == executor_id))
+    return True
+
+
+async def ensure_default_executor(session: AsyncSession) -> ExecutorRow:
+    """Ensure a default in-process executor exists. Create one if missing."""
+    existing = await get_default_executor(session)
+    if existing is not None:
+        return existing
+    return await create_executor(
+        session,
+        executor_id="default_inprocess",
+        name="Local (in-process)",
+        executor_type="in_process",
+        enabled_tools=[],
+        enabled_tool_groups=[],
+        is_default=True,
+    )

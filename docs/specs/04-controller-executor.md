@@ -297,6 +297,55 @@ class InProcessExecutor(ExecutorProvider):
         )
 ```
 
+### Executor Configuration Table
+
+Each executor has a DB-managed configuration that declares which tools
+it supports:
+
+```sql
+CREATE TABLE executors (
+    executor_id         TEXT PRIMARY KEY,
+    name                TEXT NOT NULL,
+    executor_type       TEXT NOT NULL DEFAULT 'in_process',
+    labels              JSON,              -- k8s-style labels for agent matching
+    enabled_tools       JSON,              -- ["read", "glob"] or ["*"]
+    enabled_tool_groups JSON,              -- ["filesystem", "search"]
+    config              JSON,              -- type-specific config
+    status              TEXT NOT NULL DEFAULT 'active',
+    is_default          INTEGER NOT NULL DEFAULT 0,
+    owner_email         TEXT REFERENCES users(email),
+    created_at          TIMESTAMP NOT NULL,
+    updated_at          TIMESTAMP NOT NULL
+);
+```
+
+A tool is enabled on an executor if:
+- `"*"` is in `enabled_tools`, OR
+- `tool.name` is in `enabled_tools`, OR
+- `tool.category` is in `enabled_tool_groups`
+
+The default in-process executor is created on first start with
+`enabled_tools=[]` (no tools enabled). Users enable tools via the
+Executors settings tab.
+
+### Executor Selection
+
+Agent `execution` config specifies executor preferences:
+
+```python
+class AgentExecutionConfig(BaseModel):
+    executor_id: str | None = None         # Explicit executor
+    executor_selector: dict[str, str] = {} # Label matching
+    timeout_seconds: int = 300
+```
+
+Resolution order:
+1. If `executor_id` is set → use that specific executor
+2. If `executor_selector` is set → find executor matching all labels
+3. Else → use the default executor (`is_default=True`)
+4. Among matching executors, verify the required tool is enabled
+5. If no match → error: "No executor available for tool X"
+
 ### Native Tool Dispatch
 
 When the executor receives a `tool.execute` request, it checks native

@@ -39,6 +39,7 @@ export interface AgentFormState {
   workflowSelectionMode: string;
   stepAgentOverridesJson: string;
   mcpServers: MCPServerFormState[];
+  intarisMcpServers: string[];
   originalTools: Record<string, unknown>;
 }
 
@@ -92,6 +93,7 @@ export function createEmptyAgentForm(workflows: Workflow[] = []): AgentFormState
     workflowSelectionMode: 'automatic',
     stepAgentOverridesJson: '{}',
     mcpServers: [],
+    intarisMcpServers: [],
     originalTools: {}
   };
 }
@@ -166,6 +168,9 @@ export function agentToFormState(agent: Agent): AgentFormState {
               typeof server.timeout_seconds === 'number' ? server.timeout_seconds : 30
           }))
       : [],
+    intarisMcpServers: Array.isArray(tools.intaris_mcp_servers)
+      ? tools.intaris_mcp_servers.filter((v): v is string => typeof v === 'string')
+      : [],
     originalTools: tools
   };
 }
@@ -218,7 +223,8 @@ export function formStateToPayload(form: AgentFormState): Record<string, unknown
               ])
           ),
           timeout_seconds: server.timeoutSeconds || 30
-        }))
+        })),
+      intaris_mcp_servers: form.intarisMcpServers.length > 0 ? form.intarisMcpServers : undefined
     },
     llm_config: {
       provider_id: form.providerId || undefined,

@@ -1,0 +1,113 @@
+"""Executor selection and tool enablement resolution.
+
+Resolves which executor to use for a given agent and whether a specific
+tool is enabled on that executor.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from cognis.logging import get_logger
+from cognis.models.tool import ToolDefinition
+
+logger = get_logger(__name__)
+
+
+def is_tool_enabled(
+    tool: ToolDefinition,
+    enabled_tools: list[str] | None,
+    enabled_tool_groups: list[str] | None,
+) -> bool:
+    """Check if a tool is enabled on an executor.
+
+    A tool is enabled if:
+    - "*" is in enabled_tools, OR
+    - tool.name is in enabled_tools, OR
+    - tool.category is in enabled_tool_groups
+    """
+    tools = enabled_tools or []
+    groups = enabled_tool_groups or []
+
+    if "*" in tools:
+        return True
+    if tool.name in tools:
+        return True
+    return tool.category in groups
+
+
+def filter_tools_by_executor(
+    tools: list[ToolDefinition],
+    enabled_tools: list[str] | None,
+    enabled_tool_groups: list[str] | None,
+) -> list[ToolDefinition]:
+    """Filter tool definitions to only those enabled on an executor."""
+    return [t for t in tools if is_tool_enabled(t, enabled_tools, enabled_tool_groups)]
+
+
+def labels_match(
+    executor_labels: dict[str, Any] | None,
+    selector: dict[str, str],
+) -> bool:
+    """Check if executor labels satisfy an agent's label selector.
+
+    All selector key-value pairs must match (AND logic).
+    Empty selector matches any executor.
+    """
+    if not selector:
+        return True
+    if not executor_labels:
+        return False
+    return all(str(executor_labels.get(key)) == str(value) for key, value in selector.items())
+
+
+def select_executor_for_agent(
+    executors: list[Any],
+    agent_execution: dict[str, Any] | None,
+) -> Any | None:
+    """Select the best executor for an agent based on its execution config.
+
+    Resolution order:
+    1. If executor_id is set -> use that specific executor
+    2. If executor_selector is set -> find executor matching all labels
+    3. Else -> use the default executor (is_default=True)
+
+    Returns the executor row or None if no match.
+    """
+    execution = agent_execution or {}
+    explicit_id = execution.get("executor_id")
+    selector = execution.get("executor_selector") or {}
+
+    # 1. Explicit executor ID
+    if explicit_id:
+        for ex in executors:
+            if ex.executor_id == explicit_id and ex.status == "active":
+                return ex
+        logger.warning(
+            "executor_resolution: explicit executor not found or inactive",
+            extra={"extra_data": {"executor_id": explicit_id}},
+        )
+        return None
+
+    # 2. Label selector matching
+    if selector:
+        for ex in executors:
+            if ex.status == "active" and labels_match(ex.labels, selector):
+                return ex
+        logger.warning(
+            "executor_resolution: no executor matches selector",
+            extra={"extra_data": {"selector": selector}},
+        )
+        return None
+
+    # 3. Default executor
+    for ex in executors:
+        if ex.is_default and ex.status == "active":
+            return ex
+
+    # 4. Fallback: first active executor
+    for ex in executors:
+        if ex.status == "active":
+            return ex
+
+    return None

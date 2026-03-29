@@ -337,6 +337,56 @@ class Schedule(Base):
     )
 
 
+class ExecutorRow(Base):
+    """Executor configurations with tool assignment."""
+
+    __tablename__ = "executors"
+
+    executor_id: Mapped[str] = mapped_column(String, primary_key=True)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    executor_type: Mapped[str] = mapped_column(String, nullable=False, default="in_process")
+    labels: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    enabled_tools: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    enabled_tool_groups: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    config: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    status: Mapped[str] = mapped_column(String, nullable=False, default="active")
+    is_default: Mapped[bool] = mapped_column(nullable=False, default=False, server_default="0")
+    owner_email: Mapped[str | None] = mapped_column(
+        String, ForeignKey("users.email"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+
+class SkillRow(Base):
+    """DB-managed skill definitions (instruction + tool bundles)."""
+
+    __tablename__ = "skills"
+
+    skill_id: Mapped[str] = mapped_column(String, primary_key=True)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    instructions: Mapped[str] = mapped_column(Text, nullable=False)
+    tools: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    prompt_templates: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    tags: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    auto_load: Mapped[bool] = mapped_column(nullable=False, default=False, server_default="0")
+    source: Mapped[str] = mapped_column(String, nullable=False, default="db")
+    owner_email: Mapped[str | None] = mapped_column(
+        String, ForeignKey("users.email"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+
 class AuditLog(Base):
     """System-level audit events (NOT session content)."""
 

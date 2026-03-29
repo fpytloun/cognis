@@ -64,6 +64,19 @@ async def diagnostics(request: Request) -> SystemDiagnosticsResponse:
     async with request.app.state.session_factory() as session:
         agents = await list_agents(session)
         providers = await list_llm_providers(session)
+        from cognis.store.queries import get_default_executor
+
+        default_executor = await get_default_executor(session)
+        executor_has_tools = bool(
+            default_executor
+            and (
+                (default_executor.enabled_tools and len(default_executor.enabled_tools) > 0)
+                or (
+                    default_executor.enabled_tool_groups
+                    and len(default_executor.enabled_tool_groups) > 0
+                )
+            )
+        )
 
     provider_test_results: dict[str, Any] = getattr(request.app.state, "provider_test_results", {})
     provider_rows = []
@@ -87,6 +100,7 @@ async def diagnostics(request: Request) -> SystemDiagnosticsResponse:
             "mnemory_reachable": provider_health["memory"].status == "healthy",
             "intaris_reachable": provider_health["guardrails"].status == "healthy",
             "llm_provider_configured": len(providers) > 0,
+            "executor_tools_configured": executor_has_tools,
             "agent_created": len(agents) > 0,
             "chat_ready": len(providers) > 0 and len(agents) > 0,
         },

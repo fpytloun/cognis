@@ -18,6 +18,7 @@
   import type {
     ApiKeyCreateResponse,
     ApiKeyMetadata,
+    ExecutorConfig,
     HealthResponse,
     LLMProvider,
     ModelRouting,
@@ -25,12 +26,13 @@
     SecretMetadata,
     Setting,
     SettingsCategory,
-    SystemDiagnostics
+    SystemDiagnostics,
+    ToolDefinitionSummary
   } from '$lib/types/api';
 
-  type SettingsTab = 'providers' | 'routing' | 'secrets' | 'system' | 'account';
+  type SettingsTab = 'providers' | 'routing' | 'secrets' | 'executors' | 'system' | 'account';
 
-  const tabs: SettingsTab[] = ['providers', 'routing', 'secrets', 'system', 'account'];
+  const tabs: SettingsTab[] = ['providers', 'routing', 'secrets', 'executors', 'system', 'account'];
   let activeTab: SettingsTab = 'providers';
   let loading = true;
   let busy = false;
@@ -42,6 +44,11 @@
   let secrets: SecretMetadata[] = [];
   let health: HealthResponse | null = null;
   let diagnostics: SystemDiagnostics | null = null;
+  let executorConfigs: ExecutorConfig[] = [];
+  let executorTools: ToolDefinitionSummary[] = [];
+  let editingExecutor: ExecutorConfig | null = null;
+  let showExecutorForm = false;
+  let executorForm = { name: '', executor_type: 'in_process', labels: '' };
   let isAdmin = false;
   let selectedProviderId = '';
   let selectedSettingKey = '';
@@ -311,15 +318,19 @@
     };
 
     if (isAdmin) {
-      [providers, diagnostics, agents] = await Promise.all([
+      [providers, diagnostics, agents, executorConfigs, executorTools] = await Promise.all([
         api.llmProviders.list().then((page) => page.items),
         api.system.diagnostics(),
         api.agents.list().then((page) => page.items.map((a) => ({ agent_id: a.agent_id, name: a.name }))),
+        api.executor.list().catch(() => []),
+        api.tools.executorTools().catch(() => []),
       ]);
     } else {
       providers = [];
       diagnostics = null;
       agents = [];
+      executorConfigs = [];
+      executorTools = [];
     }
 
     if (selectedProviderId) {
@@ -963,6 +974,194 @@
             {/each}
           </div>
         </Card>
+      </div>
+    {:else if activeTab === 'executors'}
+      <div class="space-y-5">
+        <div class="flex items-center justify-between">
+          <div>
+            <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Executors</p>
+            <h2 class="mt-1 text-lg font-semibold text-white">Tool Execution</h2>
+            <p class="mt-2 text-sm text-slate-400">
+              Executors handle tool execution. Enable tools on each executor to make them available to agents.
+            </p>
+          </div>
+          <Button variant="primary" size="sm" onclick={() => { executorForm = { name: '', executor_type: 'in_process', labels: '' }; editingExecutor = null; showExecutorForm = true; }}>New executor</Button>
+        </div>
+
+        {#if showExecutorForm}
+          <Card class="p-5 space-y-4">
+            <h3 class="text-lg font-medium text-white">{editingExecutor ? 'Edit Executor' : 'New Executor'}</h3>
+            <div class="grid gap-4 md:grid-cols-2">
+              <label class="space-y-1 text-sm text-slate-200">
+                <span>Name</span>
+                <Input bind:value={executorForm.name} placeholder="e.g. Local Developer" />
+              </label>
+              <label class="space-y-1 text-sm text-slate-200">
+                <span>Labels (key=value, comma-separated)</span>
+                <Input bind:value={executorForm.labels} placeholder="tier=standard, gpu=false" />
+              </label>
+            </div>
+            <div class="flex gap-2 justify-end">
+              <Button variant="secondary" size="sm" onclick={() => showExecutorForm = false}>Cancel</Button>
+              <Button variant="primary" size="sm" disabled={!executorForm.name.trim()} onclick={async () => {
+                const labels = Object.fromEntries(
+                  executorForm.labels.split(',').map(s => s.trim()).filter(Boolean).map(s => {
+                    const [k, ...v] = s.split('=');
+                    return [k.trim(), v.join('=').trim()];
+                  })
+                );
+                try {
+                  if (editingExecutor) {
+                    await api.executor.update(editingExecutor.executor_id, { name: executorForm.name, labels });
+                  } else {
+                    await api.executor.create({ name: executorForm.name, executor_type: executorForm.executor_type, labels });
+                  }
+                  showExecutorForm = false;
+                  await refreshPageState();
+                  addToast(editingExecutor ? 'Executor updated.' : 'Executor created.', 'success');
+                } catch (e) { error = asApiError(e).message; }
+              }}>{editingExecutor ? 'Update' : 'Create'}</Button>
+            </div>
+          </Card>
+        {/if}
+
+        {#each executorConfigs as exec}
+          {@const toolGroups = [...new Set(executorTools.map(t => t.category))].sort()}
+          <Card class="p-5 space-y-4">
+            <div class="flex items-center justify-between">
+              <div class="flex items-center gap-3">
+                <h3 class="text-lg font-medium text-white">{exec.name}</h3>
+                <span class="px-2 py-0.5 bg-zinc-700 text-zinc-300 text-xs font-mono rounded">{exec.executor_type}</span>
+                <span class="px-2 py-0.5 rounded text-xs {exec.status === 'active' ? 'bg-emerald-500/20 text-emerald-300' : 'bg-zinc-700 text-zinc-400'}">{exec.status}</span>
+                {#if exec.is_default}
+                  <span class="px-2 py-0.5 bg-blue-500/20 text-blue-300 text-xs rounded">default</span>
+                {/if}
+              </div>
+              <div class="flex gap-2">
+                <Button variant="secondary" size="sm" onclick={() => {
+                  editingExecutor = exec;
+                  executorForm = {
+                    name: exec.name,
+                    executor_type: exec.executor_type,
+                    labels: Object.entries(exec.labels || {}).map(([k, v]) => `${k}=${v}`).join(', ')
+                  };
+                  showExecutorForm = true;
+                }}>Edit</Button>
+                {#if !exec.is_default}
+                  <Button variant="danger" size="sm" onclick={async () => {
+                    const confirmed = await confirmAction({ title: 'Delete executor', message: `Delete "${exec.name}"? This cannot be undone.` });
+                    if (confirmed) {
+                      await api.executor.delete(exec.executor_id);
+                      await refreshPageState();
+                      addToast('Executor deleted.', 'success');
+                    }
+                  }}>Delete</Button>
+                {/if}
+              </div>
+            </div>
+
+            {#if Object.keys(exec.labels || {}).length > 0}
+              <div class="flex flex-wrap gap-1.5">
+                {#each Object.entries(exec.labels || {}) as [k, v]}
+                  <span class="px-2 py-0.5 bg-zinc-800 text-zinc-300 text-xs font-mono rounded border border-zinc-700">{k}={v}</span>
+                {/each}
+              </div>
+            {/if}
+
+            <!-- Quick presets -->
+            <div class="flex flex-wrap gap-2">
+              <span class="text-xs text-slate-400 self-center">Presets:</span>
+              <Button variant="secondary" size="sm" onclick={async () => {
+                const readOnly = executorTools.filter(t => t.read_only).map(t => t.name);
+                await api.executor.update(exec.executor_id, { enabled_tools: readOnly, enabled_tool_groups: [] });
+                await refreshPageState();
+                addToast('Enabled read-only tools.', 'success');
+              }}>Read-only tools</Button>
+              <Button variant="secondary" size="sm" onclick={async () => {
+                await api.executor.update(exec.executor_id, { enabled_tools: ['*'], enabled_tool_groups: [] });
+                await refreshPageState();
+                addToast('Enabled all tools.', 'success');
+              }}>All tools</Button>
+              <Button variant="secondary" size="sm" onclick={async () => {
+                await api.executor.update(exec.executor_id, { enabled_tools: [], enabled_tool_groups: [] });
+                await refreshPageState();
+                addToast('Disabled all tools.', 'success');
+              }}>None</Button>
+            </div>
+
+            <!-- Tool group toggles -->
+            <div>
+              <span class="text-xs uppercase tracking-wider text-slate-400">Tool groups</span>
+              <div class="mt-2 flex flex-wrap gap-2">
+                {#each toolGroups as group}
+                  {@const enabled = (exec.enabled_tool_groups || []).includes(group) || (exec.enabled_tools || []).includes('*')}
+                  {@const groupToolCount = executorTools.filter(t => t.category === group).length}
+                  <button
+                    class="px-3 py-1.5 rounded-lg text-sm border transition-colors {enabled ? 'bg-emerald-500/20 border-emerald-500/50 text-emerald-300' : 'bg-slate-900 border-slate-700 text-slate-400 hover:border-slate-600'}"
+                    onclick={async () => {
+                      const groups = [...(exec.enabled_tool_groups || [])];
+                      if (enabled && groups.includes(group)) {
+                        groups.splice(groups.indexOf(group), 1);
+                      } else if (!enabled) {
+                        groups.push(group);
+                      }
+                      const tools = (exec.enabled_tools || []).filter((t: string) => t !== '*');
+                      await api.executor.update(exec.executor_id, { enabled_tool_groups: groups, enabled_tools: tools });
+                      await refreshPageState();
+                    }}
+                  >
+                    {group} ({groupToolCount})
+                  </button>
+                {/each}
+              </div>
+            </div>
+
+            <!-- Individual tool toggles -->
+            <div>
+              <span class="text-xs uppercase tracking-wider text-slate-400">Individual tools</span>
+              <div class="mt-2 grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-1.5">
+                {#each executorTools as tool}
+                  {@const enabledByGroup = (exec.enabled_tool_groups || []).includes(tool.category)}
+                  {@const enabledByName = (exec.enabled_tools || []).includes(tool.name) || (exec.enabled_tools || []).includes('*')}
+                  {@const enabled = enabledByGroup || enabledByName}
+                  <button
+                    class="px-2.5 py-1.5 rounded text-xs text-left border transition-colors {enabled ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-200' : 'bg-slate-900 border-slate-700 text-slate-500 hover:border-slate-600'}"
+                    title="{tool.description} ({tool.category}){enabledByGroup ? ' — enabled via group' : ''}"
+                    onclick={async () => {
+                      if (enabledByGroup) return;
+                      const tools = [...(exec.enabled_tools || [])].filter((t: string) => t !== '*');
+                      if (enabledByName) {
+                        const idx = tools.indexOf(tool.name);
+                        if (idx >= 0) tools.splice(idx, 1);
+                      } else {
+                        tools.push(tool.name);
+                      }
+                      await api.executor.update(exec.executor_id, { enabled_tools: tools });
+                      await refreshPageState();
+                    }}
+                  >
+                    <span class="font-mono">{tool.name}</span>
+                    {#if tool.non_bypassable}
+                      <span class="text-amber-400 ml-0.5" title="Non-bypassable">!</span>
+                    {/if}
+                  </button>
+                {/each}
+              </div>
+            </div>
+
+            <div class="text-xs text-slate-500">
+              {(exec.enabled_tools || []).includes('*')
+                ? 'All tools enabled'
+                : `${(exec.enabled_tools || []).length} individual + ${(exec.enabled_tool_groups || []).length} group(s) enabled`}
+            </div>
+          </Card>
+        {/each}
+
+        {#if executorConfigs.length === 0}
+          <Card class="p-5 text-center text-slate-400">
+            <p>No executors configured. A default executor will be created on next restart.</p>
+          </Card>
+        {/if}
       </div>
     {:else if activeTab === 'system'}
       <div class="space-y-5">

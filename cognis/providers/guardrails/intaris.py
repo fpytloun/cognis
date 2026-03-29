@@ -272,6 +272,44 @@ class IntarisProvider:
         response.raise_for_status()
         return ToolResult.model_validate(response.json())
 
+    async def list_mcp_servers(self, enabled_only: bool = True) -> list[dict[str, Any]]:
+        """List available MCP servers from Intaris."""
+        params: dict[str, str] = {}
+        if enabled_only:
+            params["enabled_only"] = "true"
+        try:
+            response = await self.client.get(
+                "/api/v1/mcp/servers",
+                params=params,
+                headers=self._headers(user_email=current_user_email.get()),
+            )
+            response.raise_for_status()
+            data = response.json()
+            items: list[dict[str, Any]] = (
+                data.get("items", []) if isinstance(data, dict) else list(data)
+            )
+            return items
+        except Exception:
+            logger.warning("intaris: list_mcp_servers failed", exc_info=True)
+            return []
+
+    async def list_mcp_tools(self) -> list[dict[str, Any]]:
+        """List all aggregated MCP tools from Intaris."""
+        try:
+            response = await self.client.get(
+                "/api/v1/mcp/tools",
+                headers=self._headers(user_email=current_user_email.get()),
+            )
+            response.raise_for_status()
+            data = response.json()
+            tools: list[dict[str, Any]] = (
+                data.get("tools", []) if isinstance(data, dict) else list(data)
+            )
+            return tools
+        except Exception:
+            logger.warning("intaris: list_mcp_tools failed", exc_info=True)
+            return []
+
     async def health(self) -> ProviderHealth:
         start = perf_counter()
         try:

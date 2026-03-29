@@ -250,6 +250,7 @@ def tool_to_response(row: Any) -> ToolResponse:
     return ToolResponse(
         name=row.name,
         description=row.description,
+        parameters=row.parameters if isinstance(row.parameters, dict) else {},
         category=row.category,
         read_only=row.read_only,
         source=row.source.model_dump(mode="json")

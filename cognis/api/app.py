@@ -189,7 +189,9 @@ def create_app() -> FastAPI:
         )
         pause_waiter = PauseWaiter()
         session_lock = SessionLock()
-        tool_router = await ToolRouter.from_session_factory(providers.guardrails, session_factory)
+        tool_router = await ToolRouter.from_session_factory(
+            providers.guardrails, session_factory, memory=providers.memory
+        )
         workflow_registry = WorkflowRegistry(session_factory)
         step_evaluator = await StepEvaluator.from_session_factory(
             session_factory=session_factory,

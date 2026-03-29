@@ -10,8 +10,13 @@ import type {
   Conversation,
   CursorPage,
   Escalation,
+  ExecutorConfig,
+  ExecutorCreateRequest,
+  ExecutorStatus,
+  ExecutorUpdateRequest,
   ExchangeTokenResponse,
   HealthResponse,
+  IntarisMCPServer,
   LLMProvider,
   MCPServerTestResponse,
   MCPServer,
@@ -23,6 +28,9 @@ import type {
   SessionEventsResponse,
   Setting,
   SettingsCategory,
+  Skill,
+  SkillCreate,
+  SkillUpdate,
   SystemDiagnostics,
   StepRun,
   Task,
@@ -340,14 +348,70 @@ export const api = {
       return request<ToolDefinitionSummary[]>('/api/v1/tools');
     },
 
+    executorTools(): Promise<ToolDefinitionSummary[]> {
+      return request<ToolDefinitionSummary[]>('/api/v1/tools/executor');
+    },
+
     mcpServers(): Promise<MCPServer[]> {
       return request<MCPServer[]>('/api/v1/mcp/servers');
+    },
+
+    intarisMcpServers(): Promise<IntarisMCPServer[]> {
+      return request<IntarisMCPServer[]>('/api/v1/intaris/mcp/servers');
     },
 
     testAgentMcp(agentId: string): Promise<MCPServerTestResponse> {
       return request<MCPServerTestResponse>(`/api/v1/agents/${agentId}/mcp/test`, {
         method: 'POST'
       });
+    }
+  },
+
+  executor: {
+    status(): Promise<ExecutorStatus> {
+      return request<ExecutorStatus>('/api/v1/executor/status');
+    },
+
+    list(): Promise<ExecutorConfig[]> {
+      return request<ExecutorConfig[]>('/api/v1/executors');
+    },
+
+    get(executorId: string): Promise<ExecutorConfig> {
+      return request<ExecutorConfig>(`/api/v1/executors/${executorId}`);
+    },
+
+    create(data: ExecutorCreateRequest): Promise<ExecutorConfig> {
+      return request<ExecutorConfig>('/api/v1/executors', { method: 'POST', body: JSON.stringify(data) });
+    },
+
+    update(executorId: string, data: ExecutorUpdateRequest): Promise<ExecutorConfig> {
+      return request<ExecutorConfig>(`/api/v1/executors/${executorId}`, { method: 'PUT', body: JSON.stringify(data) });
+    },
+
+    delete(executorId: string): Promise<void> {
+      return request<void>(`/api/v1/executors/${executorId}`, { method: 'DELETE' });
+    }
+  },
+
+  skills: {
+    list(): Promise<Skill[]> {
+      return request<Skill[]>('/api/v1/skills');
+    },
+
+    get(skillId: string): Promise<Skill> {
+      return request<Skill>(`/api/v1/skills/${skillId}`);
+    },
+
+    create(data: SkillCreate): Promise<Skill> {
+      return request<Skill>('/api/v1/skills', { method: 'POST', body: JSON.stringify(data) });
+    },
+
+    update(skillId: string, data: SkillUpdate): Promise<Skill> {
+      return request<Skill>(`/api/v1/skills/${skillId}`, { method: 'PUT', body: JSON.stringify(data) });
+    },
+
+    delete(skillId: string): Promise<void> {
+      return request<void>(`/api/v1/skills/${skillId}`, { method: 'DELETE' });
     }
   },
 

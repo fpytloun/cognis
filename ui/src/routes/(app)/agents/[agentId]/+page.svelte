@@ -10,7 +10,7 @@
   import Button from '$lib/components/ui/Button.svelte';
   import { installBeforeUnloadGuard, blockNavigationIfDirty } from '$lib/navigation/unsaved';
   import { addToast } from '$lib/stores/toasts';
-  import type { Agent, LLMProvider, MCPServerTestResponse, SecretMetadata, ToolDefinitionSummary, Workflow } from '$lib/types/api';
+  import type { Agent, IntarisMCPServer, LLMProvider, MCPServerTestResponse, SecretMetadata, ToolDefinitionSummary, Workflow } from '$lib/types/api';
 
   let loading = $state(true);
   let saving = $state(false);
@@ -20,6 +20,7 @@
   let workflows = $state<Workflow[]>([]);
   let providers = $state<LLMProvider[]>([]);
   let secrets = $state<SecretMetadata[]>([]);
+  let intarisMcpServers = $state<IntarisMCPServer[]>([]);
   let mcpTesting = $state(false);
   let mcpTestResult = $state<MCPServerTestResponse | null>(null);
   let form = $state(agentToFormState({
@@ -63,11 +64,12 @@
   async function loadAgent(): Promise<void> {
     loading = true;
     try {
-      [agent, tools, workflows, secrets] = await Promise.all([
+      [agent, tools, workflows, secrets, intarisMcpServers] = await Promise.all([
         api.agents.detail(agentIdFromRoute()),
         api.tools.list(),
         api.workflows.listAll(),
         api.secrets.list(),
+        api.tools.intarisMcpServers().catch(() => []),
       ]);
       try {
         providers = (await api.llmProviders.list()).items;
@@ -109,6 +111,7 @@
           item.tools.map((toolName) => ({
             name: toolName,
             description: 'Discovered MCP tool',
+            parameters: {},
             category: 'mcp',
             read_only: false,
             source: { type: 'local_mcp', server_name: item.name },
@@ -173,6 +176,6 @@
         </div>
       </div>
     {/if}
-    <AgentForm mode="edit" {form} {tools} {workflows} {providers} {secrets} {saving} {error} onSave={saveAgent} onTestMcp={testMcp} {mcpTesting} {mcpTestResult} />
+    <AgentForm mode="edit" {form} {tools} {workflows} {providers} {secrets} {intarisMcpServers} {saving} {error} onSave={saveAgent} onTestMcp={testMcp} {mcpTesting} {mcpTestResult} />
   </section>
 {/if}

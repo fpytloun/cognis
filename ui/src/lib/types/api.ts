@@ -145,9 +145,25 @@ export interface Agent {
   updated_at: string | null;
 }
 
+export interface ToolParameterProperty {
+  type: string;
+  description?: string;
+  enum?: string[];
+  items?: Record<string, unknown>;
+  properties?: Record<string, ToolParameterProperty>;
+  required?: string[];
+}
+
+export interface ToolParameters {
+  type?: string;
+  properties?: Record<string, ToolParameterProperty>;
+  required?: string[];
+}
+
 export interface ToolDefinitionSummary {
   name: string;
   description: string;
+  parameters: ToolParameters;
   category: string;
   read_only: boolean;
   source: Record<string, unknown>;
@@ -173,6 +189,92 @@ export interface MCPServerTestItem {
 export interface MCPServerTestResponse {
   ok: boolean;
   items: MCPServerTestItem[];
+}
+
+export interface IntarisMCPServer {
+  name: string;
+  transport: string | null;
+  enabled: boolean;
+  tools_count: number;
+  agent_pattern: string;
+}
+
+export interface ExecutorStatus {
+  executor_type: string;
+  status: string;
+  active_executors: number;
+  capabilities: Record<string, unknown>;
+  native_tools: string[];
+}
+
+export interface ExecutorConfig {
+  executor_id: string;
+  name: string;
+  executor_type: string;
+  labels: Record<string, string>;
+  enabled_tools: string[];
+  enabled_tool_groups: string[];
+  config: Record<string, unknown>;
+  status: string;
+  is_default: boolean;
+  owner_email: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface ExecutorCreateRequest {
+  name: string;
+  executor_type?: string;
+  labels?: Record<string, string>;
+  enabled_tools?: string[];
+  enabled_tool_groups?: string[];
+  config?: Record<string, unknown>;
+  is_default?: boolean;
+}
+
+export interface ExecutorUpdateRequest {
+  name?: string;
+  labels?: Record<string, string>;
+  enabled_tools?: string[];
+  enabled_tool_groups?: string[];
+  config?: Record<string, unknown>;
+  status?: string;
+  is_default?: boolean;
+}
+
+export interface Skill {
+  skill_id: string;
+  name: string;
+  description: string | null;
+  instructions: string;
+  tools: Record<string, unknown>[] | null;
+  prompt_templates: Record<string, unknown> | null;
+  tags: string[] | null;
+  auto_load: boolean;
+  source: string;
+  owner_email: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface SkillCreate {
+  name: string;
+  description?: string;
+  instructions: string;
+  tools?: Record<string, unknown>[];
+  prompt_templates?: Record<string, unknown>;
+  tags?: string[];
+  auto_load?: boolean;
+}
+
+export interface SkillUpdate {
+  name?: string;
+  description?: string;
+  instructions?: string;
+  tools?: Record<string, unknown>[];
+  prompt_templates?: Record<string, unknown>;
+  tags?: string[];
+  auto_load?: boolean;
 }
 
 export interface TaskDelivery {

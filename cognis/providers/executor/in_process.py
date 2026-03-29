@@ -160,6 +160,7 @@ class InProcessExecutorProvider:
             metadata=dict(config.metadata),
         )
         system_handlers = build_system_tool_handlers(self.session_factory, self.status_provider)
+        native_handlers = executor_tool_handlers()
         mcp_clients: dict[str, StdioMCPClient] = {}
         try:
             mcp_clients = await self.breaker.call(lambda: self._start_mcp_clients(config))
@@ -168,7 +169,9 @@ class InProcessExecutorProvider:
             handle.capabilities = ExecutorCapabilities(tools=[tool.name for tool in runtime_tools])
             registry = ToolRegistry()
             for tool in runtime_tools:
-                handler = _build_runtime_handler(tool, system_handlers, mcp_clients)
+                handler = _build_runtime_handler(
+                    tool, system_handlers, mcp_clients, native_handlers
+                )
                 registry.register(RegisteredTool(definition=tool, handler=cast(Any, handler)))
             connection = InProcessExecutorConnection(
                 handle,
@@ -265,7 +268,10 @@ def _build_runtime_handler(
     tool: Any,
     system_handlers: dict[str, Callable[[dict[str, Any], ToolExecutionContext], Awaitable[Any]]],
     mcp_clients: dict[str, StdioMCPClient],
+    native_handlers: dict[str, Any] | None = None,
 ) -> Callable[[dict[str, Any], ToolExecutionContext], Awaitable[Any]] | None:
+    if tool.source.type == "executor" and native_handlers:
+        return native_handlers.get(tool.name)
     if tool.source.type == "builtin":
         return system_handlers.get(tool.name)
     if tool.source.type == "local_mcp" and tool.source.server_name is not None:

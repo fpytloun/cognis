@@ -9,7 +9,7 @@
   import { installBeforeUnloadGuard, blockNavigationIfDirty } from '$lib/navigation/unsaved';
   import { addToast } from '$lib/stores/toasts';
   import Button from '$lib/components/ui/Button.svelte';
-  import type { LLMProvider, SecretMetadata, ToolDefinitionSummary, Workflow } from '$lib/types/api';
+  import type { IntarisMCPServer, LLMProvider, SecretMetadata, ToolDefinitionSummary, Workflow } from '$lib/types/api';
 
   let loading = $state(true);
   let saving = $state(false);
@@ -18,6 +18,7 @@
   let workflows = $state<Workflow[]>([]);
   let providers = $state<LLMProvider[]>([]);
   let secrets = $state<SecretMetadata[]>([]);
+  let intarisMcpServers = $state<IntarisMCPServer[]>([]);
   let form: AgentFormState = $state(createEmptyAgentForm());
   let initialSnapshot = '';
 
@@ -45,6 +46,7 @@
       // These are non-critical — load gracefully
       try { secrets = await api.secrets.list(); } catch { secrets = []; }
       try { providers = (await api.llmProviders.list()).items; } catch { providers = []; }
+      try { intarisMcpServers = await api.tools.intarisMcpServers(); } catch { intarisMcpServers = []; }
 
       // Update form with system workflows pre-selected
       const systemWorkflowIds = workflows.filter((w) => w.is_system).map((w) => w.workflow_id);
@@ -94,6 +96,6 @@
       <p class="text-sm uppercase tracking-[0.25em] text-slate-400">Agent creator</p>
       <h1 class="mt-1 text-2xl font-semibold text-white">Create agent</h1>
     </div>
-    <AgentForm mode="create" {form} {tools} {workflows} {providers} {secrets} {saving} {error} onSave={saveAgent} />
+    <AgentForm mode="create" {form} {tools} {workflows} {providers} {secrets} {intarisMcpServers} {saving} {error} onSave={saveAgent} />
   </section>
 {/if}

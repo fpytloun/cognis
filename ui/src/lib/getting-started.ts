@@ -28,6 +28,13 @@ export function deriveGettingStartedSteps(diagnostics: SystemDiagnostics): Getti
       done: Boolean(readiness.llm_provider_configured)
     },
     {
+      id: 'executor',
+      label: 'Configure executor tools',
+      description: 'Enable tools on the executor so agents can use them.',
+      href: '/settings?tab=executors',
+      done: Boolean(readiness.executor_tools_configured)
+    },
+    {
       id: 'agents',
       label: 'Create your first agent',
       description: 'Create an agent with identity, tools, and model settings.',
