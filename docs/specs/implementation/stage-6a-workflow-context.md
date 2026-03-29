@@ -1,6 +1,6 @@
 # Stage 6a: Step Input Context Assembly + Iteration Semantics
 
-**Status**: NOT STARTED
+**Status**: DONE
 **Repo**: `cognis`
 **Depends on**: Stage 5 (orchestration core — session manager, session cache, context assembler)
 **Estimated effort**: 2-3 days
@@ -128,23 +128,23 @@ See `docs/specs/14-workflow-engine.md` — "Step Input Context Assembly" and
 
 ## Acceptance Criteria
 
-- [ ] `StepInputConfig` model validates correctly (full rejects list source)
-- [ ] Default input resolution works (last from previous, null for first step)
-- [ ] `null` input: step gets only prompt + task description + agent memory
-- [ ] `full` input: complete event history from source step injected as context
-- [ ] `summary` input: LLM-generated summary injected with provenance labels
-- [ ] `last` input: step_complete output injected with provenance labels
-- [ ] Multiple sources assembled in order with correct labels
-- [ ] `full` auto-fallback to `summary` when context budget exceeded
-- [ ] Iteration: same session continues with feedback appended (no new session)
-- [ ] Iteration: no input re-assembly on re-attempt
-- [ ] Step output stored in workflow_state after step_complete
-- [ ] Step output includes session references for full/summary lookups
-- [ ] Token budget respected across all input types
-- [ ] Unit tests for each input type
-- [ ] Unit tests for iteration feedback injection
-- [ ] Unit tests for default resolution
-- [ ] `ruff check` and `mypy` clean
+- [x] `StepInputConfig` model validates correctly (full rejects list source)
+- [x] Default input resolution works (last from previous, null for first step)
+- [x] `null` input: step gets only prompt + task description + agent memory
+- [x] `full` input: complete event history from source step injected as context
+- [x] `summary` input: LLM-generated summary injected with provenance labels
+- [x] `last` input: step_complete output injected with provenance labels
+- [x] Multiple sources assembled in order with correct labels
+- [x] `full` auto-fallback to `summary` when context budget exceeded
+- [x] Iteration: same session continues with feedback appended (no new session)
+- [x] Iteration: no input re-assembly on re-attempt
+- [x] Step output stored in workflow_state after step_complete
+- [x] Step output includes session references for full/summary lookups
+- [x] Token budget respected across all input types
+- [x] Unit tests for each input type
+- [x] Unit tests for iteration feedback injection
+- [x] Unit tests for default resolution
+- [x] `ruff check` and `mypy` clean
 
 ## Key References
 

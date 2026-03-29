@@ -356,11 +356,14 @@ class StepContext:
     task_id: str | None = None
     step_run_id: str | None = None
     is_direct: bool = False  # True for main chat (Direct workflow)
+    is_retry: bool = False  # True for re-attempt within the same step
     user_message: str = ""
     interaction_mode: str = "explicit_gates"
     tool_registry: Any = None  # ToolRegistry instance for this step
     executor_connection: Any = None  # ExecutorConnection for this step
     workflow_state: WorkflowState | None = None
+    workflow_steps: list[StepDefinition] | None = None  # All steps for source resolution
+    step_index: int = 0  # Index of current step in workflow
     cancel_event: asyncio.Event | None = None
     system_initiated: bool = False
 
@@ -386,6 +389,7 @@ class AgentLoop:
         event_bus: EventBus,
         session_lock: SessionLock,
         pause_waiter: PauseWaiter,
+        step_context_assembler: Any = None,
     ) -> None:
         self.providers = providers
         self.session_manager = session_manager
@@ -397,6 +401,7 @@ class AgentLoop:
         self.event_bus = event_bus
         self.session_lock = session_lock
         self.pause_waiter = pause_waiter
+        self.step_context_assembler = step_context_assembler
 
     async def run_step(
         self,
@@ -451,24 +456,67 @@ class AgentLoop:
         controller_tool_schemas = self._build_controller_tool_schemas(ctx)
 
         # Assemble initial context
-        context_result = await self.context_assembler.assemble(
-            session=ctx.session,
-            conversation=ctx.conversation,
-            agent=ctx.agent,
-            user_message=ctx.user_message or ctx.step_definition.prompt,
-            user_message_role="system" if ctx.system_initiated else "user",
-            tool_definitions=None,
-            active_delegations=None,
-        )
-        messages = context_result.messages
-
-        # Add step objective as a system instruction if not direct
-        if not ctx.is_direct and ctx.step_definition.prompt:
+        if not ctx.is_direct and not ctx.is_retry and self.step_context_assembler is not None:
+            # First-attempt workflow step → use StepContextAssembler
             step_prompt = self._build_step_prompt(ctx)
-            messages.append({"role": "user", "content": step_prompt})
+            context_result = await self.step_context_assembler.assemble(
+                session=ctx.session,
+                conversation=ctx.conversation,
+                agent=ctx.agent,
+                step_definition=ctx.step_definition,
+                step_index=ctx.step_index,
+                workflow_steps=ctx.workflow_steps or [],
+                workflow_state=ctx.workflow_state or WorkflowState(),
+                step_prompt=step_prompt,
+            )
+            messages = context_result.messages
             events_to_record.append(
                 SessionEvent(type="user_message", data={"content": step_prompt})
             )
+        elif not ctx.is_direct and ctx.is_retry:
+            # Retry → use regular assembler on existing session (which has
+            # original prompt, prior work, and evaluation feedback already).
+            # If state has fallback feedback (Intaris write failed), include it.
+            feedback_text = ""
+            if ctx.workflow_state is not None and ctx.workflow_state.last_evaluation_feedback:
+                feedback_text = (
+                    f"\n\n<evaluation_feedback>\n"
+                    f"{ctx.workflow_state.last_evaluation_feedback}\n"
+                    f"</evaluation_feedback>\n\n"
+                )
+                ctx.workflow_state.last_evaluation_feedback = None
+            retry_message = (
+                f"{feedback_text}Address the evaluation feedback above and complete this step."
+            )
+            context_result = await self.context_assembler.assemble(
+                session=ctx.session,
+                conversation=ctx.conversation,
+                agent=ctx.agent,
+                user_message=retry_message,
+                user_message_role="user",
+                tool_definitions=None,
+                active_delegations=None,
+            )
+            messages = context_result.messages
+            events_to_record.append(
+                SessionEvent(type="user_message", data={"content": retry_message})
+            )
+            messages = context_result.messages
+            events_to_record.append(
+                SessionEvent(type="user_message", data={"content": retry_message})
+            )
+        else:
+            # Direct chat or fallback
+            context_result = await self.context_assembler.assemble(
+                session=ctx.session,
+                conversation=ctx.conversation,
+                agent=ctx.agent,
+                user_message=ctx.user_message or ctx.step_definition.prompt,
+                user_message_role="system" if ctx.system_initiated else "user",
+                tool_definitions=None,
+                active_delegations=None,
+            )
+            messages = context_result.messages
 
         # Record user message event for direct workflow
         if ctx.is_direct and ctx.user_message and not ctx.system_initiated:
@@ -972,20 +1020,17 @@ class AgentLoop:
         return str(response)
 
     def _build_step_prompt(self, ctx: StepContext) -> str:
-        """Build the step objective prompt with inputs from previous steps.
+        """Build the step objective prompt.
 
-        Uses ctx.user_message when available (may include evaluator feedback
-        for retry attempts), falling back to step_definition.prompt.
+        For first-attempt workflow steps the ``StepContextAssembler``
+        handles prior-step input injection, so this method only includes
+        the step objective and any in-progress todos.
+
+        For retries the regular ``ContextAssembler`` reads session history
+        directly, so there is no step_inputs section here either.
         """
         prompt_text = ctx.user_message or ctx.step_definition.prompt
         parts = [f"## Step: {ctx.step_definition.name}\n\n{prompt_text}"]
-
-        if ctx.step_inputs:
-            parts.append("\n\n## Inputs from previous steps:\n")
-            for name, output in ctx.step_inputs.items():
-                parts.append(f"\n### {name}\n{output.summary}")
-                if output.outputs:
-                    parts.append(f"\nOutputs: {json.dumps(output.outputs, default=str)[:2000]}")
 
         if ctx.todos:
             parts.append("\n\n## Your step todos:\n")

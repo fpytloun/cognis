@@ -40,6 +40,7 @@ from cognis.core.events import EventBus
 from cognis.core.remember_queue import RememberRetryQueue
 from cognis.core.session import SessionManager
 from cognis.core.session_cache import SessionCache
+from cognis.core.step_context import StepContextAssembler
 from cognis.core.step_evaluator import StepEvaluator
 from cognis.core.task_queue import TaskQueue
 from cognis.core.tool_router import ToolRouter
@@ -201,6 +202,12 @@ def create_app() -> FastAPI:
             shared_registry=shared_tool_registry,
             shared_connection=shared_executor_connection,
         )
+        step_context_assembler = StepContextAssembler(
+            context_assembler=context_assembler,
+            session_cache=session_cache,
+            guardrails=providers.guardrails,
+            llm=providers.llm,
+        )
         agent_loop = AgentLoop(
             providers=providers,
             session_manager=session_manager,
@@ -212,6 +219,7 @@ def create_app() -> FastAPI:
             event_bus=event_bus,
             session_lock=session_lock,
             pause_waiter=pause_waiter,
+            step_context_assembler=step_context_assembler,
         )
         workflow_engine = WorkflowEngine(
             session_factory=session_factory,

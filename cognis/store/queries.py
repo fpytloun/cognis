@@ -1079,6 +1079,31 @@ async def get_step_run(session: AsyncSession, step_run_id: str) -> StepRun | Non
     return result.scalar_one_or_none()
 
 
+async def get_latest_step_run_for_task_step(
+    session: AsyncSession,
+    task_id: str,
+    step_name: str,
+) -> StepRun | None:
+    """Return the most recent step run for a given task and step name.
+
+    Ordered by ``attempt`` descending with deterministic tiebreakers
+    (``started_at``, ``step_run_id``) so the latest attempt is returned
+    even when duplicate attempt numbers exist.
+    Used by the workflow engine to reuse a prior session on retry.
+    """
+    result = await session.execute(
+        select(StepRun)
+        .where(StepRun.task_id == task_id, StepRun.step_name == step_name)
+        .order_by(
+            StepRun.attempt.desc(),
+            StepRun.started_at.desc(),
+            StepRun.step_run_id.desc(),
+        )
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
 async def fail_running_step_runs_for_task(
     session: AsyncSession,
     task_id: str,

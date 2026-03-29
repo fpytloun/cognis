@@ -415,10 +415,12 @@ Task / workflow state (Cognis metadata only — no Intaris session)
   └── StepRun: review      → Intaris parent session
 ```
 
-- Each executable workflow step gets one Intaris parent session per attempt.
+- Each executable workflow step gets one Intaris parent session.
 - Sub-agents spawned within the step are Intaris child sessions.
-- Step re-attempts (after evaluation rejection) create new Intaris sessions
-  (context reset with feedback from the evaluator).
+- Step re-attempts (after evaluation rejection) **continue the same
+  Intaris session** — the evaluator feedback is appended as an
+  ``evaluation_feedback`` event, and the agent resumes with its prior
+  work context intact. No new session is created on retry.
 - The workflow-level structure is tracked in Cognis metadata only
   (`tasks.workflow_state` and `step_runs` tables).
 

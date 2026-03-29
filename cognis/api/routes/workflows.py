@@ -24,43 +24,28 @@ from cognis.store.queries import (
 router = APIRouter(prefix="/api/v1/workflows", tags=["workflows"])
 
 
-def _parse_step_inputs(step: dict[str, object]) -> list[str]:
-    raw_input = step.get("input", [])
-    if isinstance(raw_input, list):
-        return [value for value in raw_input if isinstance(value, str) and value.strip()]
-    return []
+def _validate_workflow_payload(definition: dict[str, object]) -> None:
+    """Validate a workflow payload by parsing through the domain model.
 
+    Uses ``Workflow.model_validate`` to leverage Pydantic coercion (including
+    backward-compatible ``list[str]`` → ``StepInputConfig``) and then runs the
+    shared registry validation for reference integrity.
+    """
+    from cognis.core.workflow_registry import _validate_workflow
+    from cognis.models.workflow import Workflow
 
-def _validate_workflow_steps(steps: list[dict[str, object]]) -> None:
-    if not steps:
+    steps = definition.get("steps")
+    if not isinstance(steps, list) or not steps:
         raise api_exception(400, "validation_error", "Workflow must contain at least one step")
 
-    seen_names: set[str] = set()
-    prior_names: list[str] = []
-    for index, step in enumerate(steps, start=1):
-        name = step.get("name")
-        if not isinstance(name, str) or not name.strip():
-            raise api_exception(400, "validation_error", f"Workflow step {index} is missing a name")
-        if name in seen_names:
-            raise api_exception(400, "validation_error", f"Duplicate workflow step: {name}")
-        for input_name in _parse_step_inputs(step):
-            if input_name not in prior_names:
-                raise api_exception(
-                    400,
-                    "validation_error",
-                    f"Workflow step {name} references missing or later input: {input_name}",
-                )
-        seen_names.add(name)
-        prior_names.append(name)
-
-
-def _validate_workflow_payload(definition: dict[str, object]) -> None:
-    steps = definition.get("steps")
-    if not isinstance(steps, list):
-        raise api_exception(400, "validation_error", "Workflow steps must be a list")
-    if not all(isinstance(step, dict) for step in steps):
-        raise api_exception(400, "validation_error", "Workflow steps must be objects")
-    _validate_workflow_steps([step for step in steps if isinstance(step, dict)])
+    try:
+        workflow = Workflow.model_validate(definition)
+    except Exception as exc:
+        raise api_exception(400, "validation_error", str(exc)) from exc
+    try:
+        _validate_workflow(workflow)
+    except ValueError as exc:
+        raise api_exception(400, "validation_error", str(exc)) from exc
 
 
 @router.get("", response_model=CursorPage[WorkflowResponse])

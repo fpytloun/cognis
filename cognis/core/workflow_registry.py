@@ -12,8 +12,10 @@ from cognis.models.workflow import (
     InteractionMode,
     OnRejectConfig,
     StepDefinition,
+    StepInputConfig,
     Workflow,
     WorkflowDefaults,
+    resolve_effective_input,
 )
 from cognis.store.queries import create_workflow, get_workflow, list_workflows
 
@@ -37,6 +39,7 @@ DIRECT_WORKFLOW = Workflow(
             name="execute",
             type="run",
             prompt="{user_message}",
+            input=StepInputConfig(type="null"),
             completion=CompletionConfig(evaluate=False),
         ),
     ],
@@ -55,20 +58,21 @@ RESEARCH_WORKFLOW = Workflow(
             name="plan",
             type="run",
             prompt="Create a research plan for this task. Identify key questions, sources, and methodology.",
+            input=StepInputConfig(type="null"),
             completion=CompletionConfig(evaluate=True, max_attempts=2),
         ),
         StepDefinition(
             name="research",
             type="run",
             prompt="Execute the research plan. Gather information from available sources.",
-            input=["plan"],
+            input=StepInputConfig(type="full", source="plan"),
             completion=CompletionConfig(evaluate=True, max_attempts=2),
         ),
         StepDefinition(
             name="synthesize",
             type="run",
             prompt="Synthesize findings into a coherent report with key insights and recommendations.",
-            input=["plan", "research"],
+            input=StepInputConfig(type="summary", source=["plan", "research"]),
             completion=CompletionConfig(evaluate=True),
         ),
     ],
@@ -87,13 +91,14 @@ CODE_WITH_REVIEW_WORKFLOW = Workflow(
             name="plan",
             type="run",
             prompt="Break down this task into implementation steps. Include success criteria, test strategy, and documentation plan.",
+            input=StepInputConfig(type="null"),
             completion=CompletionConfig(evaluate=True, max_attempts=2),
         ),
         StepDefinition(
             name="architect_review",
             type="run",
             prompt="Review this plan critically. Check for missing edge cases, security concerns, and architectural issues.",
-            input=["plan"],
+            input=StepInputConfig(type="full", source="plan"),
             completion=CompletionConfig(evaluate=True),
             on_reject=OnRejectConfig(target="plan", max_loop_iterations=2, on_exhausted="gate"),
         ),
@@ -101,14 +106,14 @@ CODE_WITH_REVIEW_WORKFLOW = Workflow(
             name="implement",
             type="run",
             prompt="Implement the plan with tests and documentation.",
-            input=["plan", "architect_review"],
+            input=StepInputConfig(type="summary", source=["plan", "architect_review"]),
             completion=CompletionConfig(evaluate=True, max_attempts=3),
         ),
         StepDefinition(
             name="run_tests",
             type="run",
             prompt="Run the test suite and fix any failures.",
-            input=["implement"],
+            # Default: type=last, source=implement (previous step)
             completion=CompletionConfig(evaluate=True, max_attempts=2),
             on_reject=OnRejectConfig(
                 target="implement",
@@ -120,7 +125,7 @@ CODE_WITH_REVIEW_WORKFLOW = Workflow(
             name="code_review",
             type="run",
             prompt="Review code quality, test coverage, documentation.",
-            input=["plan", "implement", "run_tests"],
+            input=StepInputConfig(type="summary", source=["plan", "implement", "run_tests"]),
             completion=CompletionConfig(evaluate=True),
             on_reject=OnRejectConfig(
                 target="implement",
@@ -132,14 +137,14 @@ CODE_WITH_REVIEW_WORKFLOW = Workflow(
             name="commit",
             type="run",
             prompt="Create a conventional commit with a clear message.",
-            input=["implement"],
+            # Default: type=last, source=code_review (previous step)
             completion=CompletionConfig(evaluate=False),
         ),
         StepDefinition(
             name="update_memory",
             type="run",
             prompt="Store key findings and decisions as memories for future reference.",
-            input=["plan", "implement", "code_review"],
+            input=StepInputConfig(type="last", source=["plan", "implement", "code_review"]),
             completion=CompletionConfig(evaluate=False),
         ),
     ],
@@ -158,6 +163,7 @@ CREATIVE_WORKFLOW = Workflow(
             name="generate",
             type="run",
             prompt="Create the requested content. Focus on quality, originality, and meeting the stated requirements.",
+            input=StepInputConfig(type="null"),
             completion=CompletionConfig(evaluate=True, max_attempts=5, on_exhausted="continue"),
         ),
     ],
@@ -232,17 +238,18 @@ class WorkflowRegistry:
 
 
 def _validate_workflow(workflow: Workflow) -> None:
-    """Validate workflow definition: step references, on_reject targets."""
-    step_names = [s.name for s in workflow.steps]
+    """Validate workflow definition: step references, input sources, on_reject targets."""
     seen_names: set[str] = set()
+    step_names = [s.name for s in workflow.steps]
 
     for i, step in enumerate(workflow.steps):
         if step.name in seen_names:
             raise ValueError(f"Duplicate step name: {step.name!r}")
         seen_names.add(step.name)
 
-        # Validate input references
-        for ref in step.input:
+        # Validate input source references point to earlier steps
+        effective = resolve_effective_input(step, i, workflow.steps)
+        for ref in effective.source_names():
             if ref not in seen_names:
                 raise ValueError(f"Step {step.name!r} references unknown/later input: {ref!r}")
 

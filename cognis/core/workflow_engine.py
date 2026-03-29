@@ -38,11 +38,13 @@ from cognis.models.workflow import (
     StepOutput,
     Workflow,
     WorkflowState,
+    resolve_source_names,
 )
 from cognis.store.queries import (
     create_step_run,
     get_agent,
     get_latest_active_conversation_for_agent,
+    get_latest_step_run_for_task_step,
     update_step_run,
     update_task_status,
     update_task_workflow_state,
@@ -228,7 +230,9 @@ class WorkflowEngine:
                 # Evaluate if configured
                 completion = self._resolve_completion(step_def, workflow)
                 if completion and completion.evaluate:
-                    evaluation = await self._evaluate_step(step_def, step_result, state, task)
+                    evaluation = await self._evaluate_step(
+                        step_def, step_result, state, task, workflow
+                    )
 
                     if evaluation.decision == "revise":
                         # Store feedback for retry
@@ -357,19 +361,21 @@ class WorkflowEngine:
             )
             return None
 
-        # Gather inputs from previous steps
-        step_inputs: dict[str, StepOutput] = {}
-        for input_name in step_def.input:
-            raw = state.step_outputs.get(input_name)
-            if raw:
-                step_inputs[input_name] = StepOutput.model_validate(raw)
+        # Determine if this is a retry (re-attempt of a previously-run step)
+        attempt = state.loop_iterations.get(f"attempts:{step_def.name}", 1)
+        is_retry = attempt > 1
 
-        # Create step session
-        conversation, session = await self._create_step_session(task, step_def, agent)
+        # Determine step index
+        step_index = self._find_step_index(workflow, step_def.name) or 0
+
+        # Session handling: reuse on retry, create new on first attempt
+        if is_retry:
+            conversation, session = await self._reuse_or_create_step_session(task, step_def, agent)
+        else:
+            conversation, session = await self._create_step_session(task, step_def, agent)
 
         # Create StepRun record
         step_run_id = f"sr_{uuid.uuid4().hex}"
-        attempt = state.loop_iterations.get(f"attempts:{step_def.name}", 1)
         async with self._session_factory() as db_session:
             await create_step_run(
                 db_session,
@@ -401,16 +407,6 @@ class WorkflowEngine:
             )
         )
 
-        # Build step prompt with evaluator feedback if retrying
-        step_prompt = step_def.prompt
-        if state.last_evaluation_feedback:
-            step_prompt = (
-                f"{step_def.prompt}\n\n"
-                f"## Feedback from previous attempt:\n{state.last_evaluation_feedback}\n\n"
-                f"Please address the feedback above in this attempt."
-            )
-            state.last_evaluation_feedback = None  # Clear after injection
-
         # Resolve tool registry and executor for this step
         tool_registry, executor_connection, cleanup = await self._resolve_step_runtime(
             agent=agent,
@@ -423,15 +419,17 @@ class WorkflowEngine:
             session=session,
             conversation=conversation,
             agent=agent,
-            step_inputs=step_inputs,
             task_id=task.task_id,
             step_run_id=step_run_id,
             is_direct=False,
-            user_message=step_prompt,
+            is_retry=is_retry,
+            user_message=step_def.prompt,
             interaction_mode=workflow.interaction.mode,
             tool_registry=tool_registry,
             executor_connection=executor_connection,
             workflow_state=state,
+            workflow_steps=workflow.steps,
+            step_index=step_index,
             cancel_event=cancel_event,
         )
 
@@ -452,6 +450,12 @@ class WorkflowEngine:
         finally:
             await cleanup()
 
+        # Enrich output with session metadata
+        if output is not None:
+            output.completed_at = datetime.now(UTC)
+            output.session_id = session.session_id
+            output.intaris_session_id = session.intaris_session_id
+
         # Update StepRun record
         async with self._session_factory() as db_session:
             await update_step_run(
@@ -471,13 +475,17 @@ class WorkflowEngine:
         step_output: StepOutput,
         state: WorkflowState,
         task: TaskModel,
+        workflow: Workflow,
     ) -> StepEvaluation:
         """Run the step evaluator."""
+        step_index = self._find_step_index(workflow, step_def.name) or 0
+        source_names = resolve_source_names(step_def, step_index, workflow.steps)
+
         step_inputs: dict[str, StepOutput] = {}
-        for input_name in step_def.input:
-            raw = state.step_outputs.get(input_name)
+        for source_name in source_names:
+            raw = state.step_outputs.get(source_name)
             if raw:
-                step_inputs[input_name] = StepOutput.model_validate(raw)
+                step_inputs[source_name] = StepOutput.model_validate(raw)
 
         return await self._step_evaluator.evaluate(
             step_definition=step_def,
@@ -623,6 +631,10 @@ class WorkflowEngine:
     ) -> bool:
         """Handle step revision (re-attempt with feedback).
 
+        Records evaluation feedback to the existing step Intaris session
+        (so the agent sees it on retry), then increments the attempt
+        counter.
+
         Returns True if revision is possible, False if exhausted.
         """
         completion = self._resolve_completion(step_def, workflow)
@@ -636,10 +648,67 @@ class WorkflowEngine:
             exhausted_action = self._get_on_exhausted(step_def, workflow)
             return await self._handle_exhausted(task, step_def, state, workflow, exhausted_action)
 
+        # Record evaluation feedback to the existing step session in Intaris
+        await self._record_evaluation_feedback(task, step_def, state, evaluation)
+
         state.loop_iterations[attempt_key] = current_attempts + 1
         await self._persist_workflow_state(task)
         # Stay on the same step — the main loop will re-execute it
         return True
+
+    async def _record_evaluation_feedback(
+        self,
+        task: TaskModel,
+        step_def: StepDefinition,
+        state: WorkflowState,
+        evaluation: StepEvaluation,
+    ) -> None:
+        """Append evaluation feedback event to the step's Intaris session.
+
+        If Intaris recording fails, fall back to
+        ``state.last_evaluation_feedback`` which will be consumed by the
+        agent loop on retry (fail-open for feedback).
+        """
+        attempt = state.loop_iterations.get(f"attempts:{step_def.name}", 1)
+        feedback_text = evaluation.feedback or evaluation.reasoning
+
+        # Look up the step's Intaris session
+        try:
+            async with self._session_factory() as db_session:
+                prior_run = await get_latest_step_run_for_task_step(
+                    db_session, task.task_id, step_def.name
+                )
+            if prior_run is None or prior_run.intaris_session_id is None:
+                # No prior run — store feedback in state as fallback
+                state.last_evaluation_feedback = feedback_text
+                return
+
+            event = SessionEvent(
+                type="evaluation_feedback",
+                data={
+                    "attempt": attempt,
+                    "decision": evaluation.decision,
+                    "feedback": feedback_text,
+                },
+            )
+            await self._providers.guardrails.record_events(
+                session_id=prior_run.intaris_session_id,
+                events=[event],
+                source="cognis",
+            )
+            # Clear in-state fallback — the event is now in Intaris
+            state.last_evaluation_feedback = None
+        except Exception:
+            logger.warning(
+                "Failed to record evaluation feedback to Intaris, using state fallback",
+                extra={
+                    "extra_data": {
+                        "task_id": task.task_id,
+                        "step_name": step_def.name,
+                    }
+                },
+            )
+            state.last_evaluation_feedback = feedback_text
 
     async def _handle_exhausted(
         self,
@@ -888,6 +957,60 @@ class WorkflowEngine:
             intention=f"Workflow step: {step_def.name} — {step_def.description or step_def.prompt[:100]}",
         )
         return conversation, session
+
+    async def _reuse_or_create_step_session(
+        self,
+        task: TaskModel,
+        step_def: StepDefinition,
+        agent: AgentDefinition,
+    ) -> tuple[Any, Any]:
+        """Reuse the prior step session on retry, or create a new one.
+
+        On retry, the spec requires continuing the same Intaris session
+        so the agent keeps its prior work and sees evaluation feedback.
+        """
+        try:
+            async with self._session_factory() as db_session:
+                prior_run = await get_latest_step_run_for_task_step(
+                    db_session, task.task_id, step_def.name
+                )
+            if prior_run is not None and prior_run.session_id is not None:
+                # Recover session and conversation from the prior run
+                from cognis.store.queries import get_conversation, get_session_row
+
+                async with self._session_factory() as db_session:
+                    session_row = await get_session_row(db_session, prior_run.session_id)
+                    if session_row is not None:
+                        conv_row = await get_conversation(db_session, session_row.conversation_id)
+                        if conv_row is not None:
+                            from cognis.models.session import ConversationModel, SessionModel
+
+                            conversation = ConversationModel.model_validate(
+                                {
+                                    c.name: getattr(conv_row, c.name)
+                                    for c in conv_row.__table__.columns
+                                }
+                            )
+                            session = SessionModel.model_validate(
+                                {
+                                    c.name: getattr(session_row, c.name)
+                                    for c in session_row.__table__.columns
+                                }
+                            )
+                            return conversation, session
+        except Exception:
+            logger.warning(
+                "Could not reuse prior step session, creating new one",
+                extra={
+                    "extra_data": {
+                        "task_id": task.task_id,
+                        "step_name": step_def.name,
+                    }
+                },
+            )
+
+        # Fallback — create a fresh session
+        return await self._create_step_session(task, step_def, agent)
 
     def _resolve_completion(
         self, step_def: StepDefinition, workflow: Workflow

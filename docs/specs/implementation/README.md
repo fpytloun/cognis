@@ -89,7 +89,7 @@ bring the codebase in line with the updated specs.
 
 | Stage | Name | Status | Notes |
 |-------|------|--------|-------|
-| 6a | [Step Input Context Assembly](stage-6a-workflow-context.md) | NOT STARTED | null/full/summary/last input types, iteration semantics, step output storage |
+| 6a | [Step Input Context Assembly](stage-6a-workflow-context.md) | DONE | null/full/summary/last input types, iteration semantics, step output storage, same-session retry |
 
 ## Scope Boundary
 

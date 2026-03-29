@@ -24,6 +24,7 @@ EVENT_TYPES_FOR_CONTEXT = [
     "task_result",
     "task_failed",
     "task_cancelled",
+    "evaluation_feedback",
 ]
 
 
@@ -106,6 +107,7 @@ class ContextAssembler:
         user_message_role: str = "user",
         tool_definitions: list[ToolDefinition] | None = None,
         active_delegations: list[dict[str, Any]] | None = None,
+        skip_user_message: bool = False,
     ) -> ContextAssemblyResult:
         """Build the LLM message list for a single turn."""
 
@@ -213,7 +215,8 @@ class ContextAssembler:
             messages.append(
                 {"role": "system", "content": _format_active_delegations(active_delegations)}
             )
-        messages.append({"role": user_message_role, "content": user_message})
+        if not skip_user_message:
+            messages.append({"role": user_message_role, "content": user_message})
 
         messages = self._prune_messages(
             messages=messages,
@@ -260,39 +263,7 @@ class ContextAssembler:
         return system_prompt_tokens, tool_schema_tokens
 
     def _events_to_messages(self, events: list[Any]) -> list[dict[str, Any]]:
-        messages: list[dict[str, Any]] = []
-        for event in events:
-            if event.type == "user_message":
-                content = event.data.get("content")
-                if isinstance(content, str):
-                    messages.append({"role": "user", "content": content})
-            elif event.type == "assistant_message":
-                content = event.data.get("content")
-                if isinstance(content, str):
-                    messages.append({"role": "assistant", "content": content})
-            elif event.type == "tool_result":
-                output = event.data.get("output")
-                if isinstance(output, str):
-                    messages.append({"role": "system", "content": output})
-            elif event.type == "tool_call":
-                tool_name = event.data.get("tool_name")
-                if isinstance(tool_name, str):
-                    messages.append({"role": "assistant", "content": f"[Tool call: {tool_name}]"})
-            elif event.type == "delegation":
-                messages.append(
-                    {
-                        "role": "system",
-                        "content": _format_delegation_status(event.data),
-                    }
-                )
-            elif event.type in {"task_result", "task_failed", "task_cancelled"}:
-                messages.append(
-                    {
-                        "role": "system",
-                        "content": _format_task_update(event.type, event.data),
-                    }
-                )
-        return messages
+        return events_to_messages(events)
 
     def _prune_messages(
         self,
@@ -347,6 +318,71 @@ class ContextAssembler:
                 break
             pruned_messages.pop(removable_history_index)
         return pruned_messages
+
+
+def events_to_messages(events: list[Any]) -> list[dict[str, Any]]:
+    """Convert session events to LLM message dicts.
+
+    This is the canonical event-to-message formatter used by both the
+    ``ContextAssembler`` and the ``StepContextAssembler``.  It supports
+    both ``CachedEvent`` objects (with ``.type`` / ``.data`` attributes)
+    and raw ``dict`` events from Intaris reads.
+    """
+    messages: list[dict[str, Any]] = []
+    for event in events:
+        if isinstance(event, dict):
+            event_type = str(event.get("type", ""))
+            event_data: dict[str, Any] = event.get("data", {})
+        else:
+            event_type = event.type
+            event_data = event.data
+
+        if event_type == "user_message":
+            content = event_data.get("content")
+            if isinstance(content, str):
+                messages.append({"role": "user", "content": content})
+        elif event_type == "assistant_message":
+            content = event_data.get("content")
+            if isinstance(content, str):
+                messages.append({"role": "assistant", "content": content})
+        elif event_type == "tool_result":
+            output = event_data.get("output")
+            if isinstance(output, str):
+                messages.append({"role": "system", "content": output})
+        elif event_type == "tool_call":
+            tool_name = event_data.get("tool_name") or event_data.get("name")
+            if isinstance(tool_name, str):
+                messages.append({"role": "assistant", "content": f"[Tool call: {tool_name}]"})
+        elif event_type == "delegation":
+            messages.append(
+                {
+                    "role": "system",
+                    "content": _format_delegation_status(event_data),
+                }
+            )
+        elif event_type in {"task_result", "task_failed", "task_cancelled"}:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": _format_task_update(event_type, event_data),
+                }
+            )
+        elif event_type == "evaluation_feedback":
+            attempt = event_data.get("attempt", "?")
+            decision = event_data.get("decision", "revise")
+            feedback = event_data.get("feedback", "")
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        f'<evaluation_feedback attempt="{attempt}">\n'
+                        f"Decision: {decision}\n"
+                        f"Feedback: {feedback}\n"
+                        f"</evaluation_feedback>"
+                    ),
+                }
+            )
+    return messages
 
 
 def _format_memory_context(recall_payload: dict[str, Any]) -> str | None:
