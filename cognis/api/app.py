@@ -21,9 +21,11 @@ from cognis.api.routes.agents import router as agents_router
 from cognis.api.routes.auth import router as auth_router
 from cognis.api.routes.conversations import router as conversations_router
 from cognis.api.routes.escalations import router as escalations_router
+from cognis.api.routes.executors import router as executors_router
 from cognis.api.routes.secrets import router as secrets_router
 from cognis.api.routes.sessions import router as sessions_router
 from cognis.api.routes.settings import router as settings_router
+from cognis.api.routes.skills import router as skills_router
 from cognis.api.routes.system import router as system_router
 from cognis.api.routes.tasks import router as tasks_router
 from cognis.api.routes.tools import router as tools_router
@@ -128,7 +130,10 @@ def create_app() -> FastAPI:
         await _print_startup_status(config_runtime, providers, ui_build_dir)
 
         async with session_factory() as session:
-            from cognis.store.queries import count_users, get_setting_value
+            from cognis.store.queries import count_users, ensure_default_executor, get_setting_value
+
+            await ensure_default_executor(session)
+            await session.commit()
 
             auth_provider.token_ttl_seconds = _as_int(
                 await get_setting_value(session, "security.token_ttl_seconds", 3600), 3600
@@ -137,10 +142,10 @@ def create_app() -> FastAPI:
                 await get_setting_value(session, "security.ws_auth_timeout_seconds", 10), 10
             )
             api_read_requests_per_minute = _as_int(
-                await get_setting_value(session, "security.api_read_requests_per_minute", 60), 60
+                await get_setting_value(session, "security.api_read_requests_per_minute", 600), 600
             )
             api_write_requests_per_minute = _as_int(
-                await get_setting_value(session, "security.api_write_requests_per_minute", 20), 20
+                await get_setting_value(session, "security.api_write_requests_per_minute", 200), 200
             )
             cache_max_entries = _as_int(
                 await get_setting_value(session, "session.cache_max_entries", 200), 200
@@ -195,6 +200,7 @@ def create_app() -> FastAPI:
             shared_executor_connection,
             shared_runtime_cleanup,
         ) = await build_shared_runtime(providers)
+        providers._session_factory = session_factory  # type: ignore[attr-defined]
         providers._tool_registry = shared_tool_registry  # type: ignore[attr-defined]
         providers._executor_connection = shared_executor_connection  # type: ignore[attr-defined]
         providers._step_runtime_factory = build_step_runtime_factory(  # type: ignore[attr-defined]
@@ -317,6 +323,8 @@ def create_app() -> FastAPI:
     app.include_router(workflows_router)
     app.include_router(secrets_router)
     app.include_router(tools_router)
+    app.include_router(skills_router)
+    app.include_router(executors_router)
     app.include_router(escalations_router)
 
     @app.exception_handler(StarletteHTTPException)

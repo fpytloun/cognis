@@ -95,8 +95,8 @@ class RequestRateLimiter:
     def __init__(
         self,
         *,
-        read_requests_per_minute: int = 60,
-        write_requests_per_minute: int = 20,
+        read_requests_per_minute: int = 600,
+        write_requests_per_minute: int = 200,
         window_seconds: int = 60,
     ) -> None:
         self.read_requests_per_minute = read_requests_per_minute
