@@ -119,26 +119,30 @@ class TextFormatter(logging.Formatter):
     """Human-readable text formatter for local development."""
 
     def format(self, record: logging.LogRecord) -> str:
-        parts = [
-            datetime.fromtimestamp(record.created, tz=UTC).strftime("%Y-%m-%d %H:%M:%S"),
-            record.levelname.ljust(8),
-            record.name,
-            record.getMessage(),
-        ]
+        ts = datetime.fromtimestamp(record.created, tz=UTC).strftime("%H:%M:%S")
+        level = record.levelname.ljust(5)
+        name = record.name.removeprefix("cognis.")
+        msg = record.getMessage()
 
         # Add correlation context
         ctx_parts = []
         for ctx_var, key in [
-            (correlation_session_id, "session"),
-            (correlation_agent_id, "agent"),
+            (correlation_session_id, "ses"),
+            (correlation_agent_id, "agt"),
         ]:
             value = ctx_var.get()
             if value is not None:
                 ctx_parts.append(f"{key}={value}")
-        if ctx_parts:
-            parts.insert(3, f"[{' '.join(ctx_parts)}]")
 
-        line = " | ".join(parts)
+        # Add extra_data fields inline
+        extra_data = getattr(record, "extra_data", None)
+        if isinstance(extra_data, dict):
+            redacted = _redact_dict(cast(dict[str, Any], extra_data))
+            for key, value in redacted.items():
+                ctx_parts.append(f"{key}={value}")
+
+        ctx = f" ({', '.join(ctx_parts)})" if ctx_parts else ""
+        line = f"{ts} {level} [{name}] {msg}{ctx}"
 
         if record.exc_info and record.exc_info[1] is not None:
             line += f"\n  {type(record.exc_info[1]).__name__}: {record.exc_info[1]}"
@@ -168,9 +172,19 @@ def setup_logging(level: str = "info", fmt: str = "json") -> None:
 
     root.addHandler(handler)
 
-    # Suppress noisy third-party loggers
-    for name in ("httpx", "httpcore", "uvicorn.access", "litellm"):
-        logging.getLogger(name).setLevel(logging.WARNING)
+    # Suppress noisy third-party loggers and force them through our formatter
+    for name in ("httpx", "httpcore", "litellm"):
+        third_party = logging.getLogger(name)
+        third_party.setLevel(logging.WARNING)
+        third_party.handlers.clear()
+        third_party.propagate = True
+
+    # Uvicorn: keep access logs at WARNING, error logs at our level
+    for name in ("uvicorn", "uvicorn.access", "uvicorn.error"):
+        uv_logger = logging.getLogger(name)
+        uv_logger.handlers.clear()
+        uv_logger.propagate = True
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
 
 def get_logger(name: str) -> logging.Logger:

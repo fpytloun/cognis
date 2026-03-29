@@ -658,16 +658,13 @@ class WebSocketConnectionManager:
             )
             return
         self.subscribe(connection, conversation_id)
-        allow_missing_stream = False
-        if session.started_at is not None:
-            allow_missing_stream = (
-                datetime.now(UTC) - _normalize_utc(session.started_at) <= _NEW_SESSION_STREAM_GRACE
-            )
+        # Always tolerate missing event streams on reconnect — the stream
+        # may not exist yet (new session) or may have been purged.
         result = await self.app.state.providers.guardrails.read_events(
             session_id=session.intaris_session_id or session.session_id,
             after_seq=last_seq,
             limit=DEFAULT_REPLAY_LIMIT,
-            allow_missing_stream=allow_missing_stream,
+            allow_missing_stream=True,
         )
         replayed = 0
         for item in result.events:

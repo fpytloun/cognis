@@ -37,11 +37,11 @@ ui-check: ## Run SvelteKit checks (types, lint)
 # Server
 # ---------------------------------------------------------------------------
 
-serve: ## Start Cognis
-	$(COGNIS) serve
+serve: dev ## Install deps, build UI, and start Cognis (text logs)
+	COGNIS_LOG_FORMAT=text $(COGNIS) serve
 
-run: ## Start Cognis (assumes deps already installed)
-	$(COGNIS) serve
+run: ## Start Cognis with text logs (assumes deps already installed)
+	COGNIS_LOG_FORMAT=text $(COGNIS) serve
 
 # ---------------------------------------------------------------------------
 # Testing
