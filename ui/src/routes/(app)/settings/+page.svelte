@@ -48,6 +48,10 @@
   let settingValueText = '';
   let providerForm: ProviderFormState = createProviderForm();
   let providerTestResult: ProviderTestResult | null = null;
+  let showSecretModal = false;
+  let secretModalName = '';
+  let secretModalValue = '';
+  let agents: Array<{ agent_id: string; name: string }> = [];
   let apiKeys: ApiKeyMetadata[] = [];
   let createdApiKey: ApiKeyCreateResponse | null = null;
   let newApiKeyName = '';
@@ -201,41 +205,30 @@
     initialSnapshot = snapshotState();
   }
 
-  function providerModelSuggestions(): string[] {
-    const values = new Set<string>();
-
-    for (const m of providerForm.discovered_models) {
-      values.add(m.model_id);
-    }
-
-    if (providerForm.default_model.trim()) {
-      values.add(providerForm.default_model.trim());
-    }
-
-    providerForm.additional_models
-      .split(/\n+/)
-      .map((value) => value.trim())
-      .filter(Boolean)
-      .forEach((value) => values.add(value));
-
-    for (const option of modelOptions()) {
-      values.add(option.value);
-    }
-
-    return [...values].sort((left, right) => left.localeCompare(right));
-  }
-
   async function discoverModels(): Promise<void> {
-    if (!selectedProviderId) {
-      error = 'Save the provider first, then discover models.';
-      return;
-    }
     busy = true;
     error = '';
     try {
-      const result = await api.llmProviders.discoverModels(selectedProviderId);
-      providerForm.discovered_models = result.models;
-      addToast(`Discovered ${result.models.length} models.`, 'success');
+      let models: Array<{ model_id: string; name: string }>;
+      if (selectedProviderId) {
+        const result = await api.llmProviders.discoverModels(selectedProviderId);
+        models = result.models;
+      } else {
+        // Preview mode: pass form values directly
+        const result = await api.llmProviders.discoverModelsPreview({
+          preset: providerForm.preset,
+          base_url: providerForm.base_url,
+          ...(providerForm.auth_mode === 'secret' && providerForm.auth_secret_name
+            ? { secret_name: providerForm.auth_secret_name }
+            : {}),
+          ...(providerForm.auth_mode === 'env' && providerForm.auth_env_var
+            ? {}
+            : {})
+        });
+        models = result.models;
+      }
+      providerForm.discovered_models = models;
+      addToast(`Discovered ${models.length} models.`, 'success');
     } catch (caughtError) {
       error = asApiError(caughtError).message;
       addToast(error, 'error', 4_000, 'Model discovery failed');
@@ -244,8 +237,14 @@
     }
   }
 
-  async function saveAuthSecret(): Promise<void> {
-    if (!providerForm.auth_secret_name.trim() || !providerForm.auth_secret_value.trim()) {
+  function openSecretModal(): void {
+    secretModalName = providerForm.auth_secret_name || `${providerForm.preset}_api_key`;
+    secretModalValue = '';
+    showSecretModal = true;
+  }
+
+  async function saveSecretFromModal(): Promise<void> {
+    if (!secretModalName.trim() || !secretModalValue.trim()) {
       error = 'Secret name and value are required.';
       return;
     }
@@ -253,13 +252,17 @@
     error = '';
     try {
       await api.secrets.upsert({
-        name: providerForm.auth_secret_name,
-        value: providerForm.auth_secret_value,
+        name: secretModalName,
+        value: secretModalValue,
         scope: 'global',
         agent_id: null,
         description: `API key for provider ${providerForm.display_name || providerForm.provider_id}`
       });
-      providerForm.auth_secret_value = '';
+      providerForm.auth_secret_name = secretModalName;
+      secretModalValue = '';
+      showSecretModal = false;
+      // Refresh secrets list
+      secrets = await api.secrets.list();
       addToast('Credential saved to encrypted store.', 'success');
     } catch (caughtError) {
       error = asApiError(caughtError).message;
@@ -290,10 +293,15 @@
     };
 
     if (isAdmin) {
-      [providers, diagnostics] = await Promise.all([api.llmProviders.list().then((page) => page.items), api.system.diagnostics()]);
+      [providers, diagnostics, agents] = await Promise.all([
+        api.llmProviders.list().then((page) => page.items),
+        api.system.diagnostics(),
+        api.agents.list().then((page) => page.items.map((a) => ({ agent_id: a.agent_id, name: a.name }))),
+      ]);
     } else {
       providers = [];
       diagnostics = null;
+      agents = [];
     }
 
     if (selectedProviderId) {
@@ -342,6 +350,7 @@
         await api.llmProviders.update(selectedProviderId, payload);
       } else {
         await api.llmProviders.create(payload);
+        selectedProviderId = providerForm.provider_id;
       }
       await refreshPageState();
       notice = 'Provider saved.';
@@ -704,7 +713,7 @@
             {#if presetNeedsAuth(providerForm.preset)}
               <div class="rounded-2xl border border-slate-800 bg-slate-900/60 p-4">
                 <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Credentials</p>
-                <div class="mt-3 grid gap-3 md:grid-cols-3">
+                <div class="mt-3 grid gap-3 md:grid-cols-2">
                   <label class="space-y-2 text-sm font-medium text-slate-200">
                     <span>Auth mode</span>
                     <select bind:value={providerForm.auth_mode} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
@@ -714,24 +723,29 @@
                   </label>
 
                   {#if providerForm.auth_mode === 'env'}
-                    <label class="space-y-2 text-sm font-medium text-slate-200 md:col-span-2">
+                    <label class="space-y-2 text-sm font-medium text-slate-200">
                       <span>Env variable name</span>
                       <Input bind:value={providerForm.auth_env_var} placeholder="OPENAI_API_KEY" />
                       <span class="block text-xs text-slate-400">Must be set before starting Cognis.</span>
                     </label>
                   {:else}
-                    <label class="space-y-2 text-sm font-medium text-slate-200">
-                      <span>Secret name</span>
-                      <Input bind:value={providerForm.auth_secret_name} placeholder="openai_api_key" />
-                    </label>
-                    <label class="space-y-2 text-sm font-medium text-slate-200">
-                      <span>API key value</span>
+                    <div class="space-y-2 text-sm font-medium text-slate-200">
+                      <span>Credential</span>
                       <div class="flex gap-2">
-                        <Input bind:value={providerForm.auth_secret_value} type="password" placeholder="sk-..." />
-                        <Button size="sm" variant="secondary" onclick={saveAuthSecret} disabled={busy || !providerForm.auth_secret_value}>Save key</Button>
+                        <select bind:value={providerForm.auth_secret_name} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+                          <option value="">Select credential...</option>
+                          {#each secrets.filter((s) => s.scope === 'global' || s.scope === 'user') as secret}
+                            <option value={secret.name}>{secret.name}{secret.description ? ` — ${secret.description}` : ''}</option>
+                          {/each}
+                        </select>
+                        <Button size="sm" variant="secondary" onclick={openSecretModal}>New</Button>
                       </div>
-                      <span class="block text-xs text-slate-400">Encrypted at rest. Leave empty to keep existing.</span>
-                    </label>
+                      {#if providerForm.auth_secret_name}
+                        <span class="block text-xs text-slate-400">Using credential: {providerForm.auth_secret_name}</span>
+                      {:else}
+                        <span class="block text-xs text-amber-300">No credential selected. Create or select one.</span>
+                      {/if}
+                    </div>
                   {/if}
                 </div>
               </div>
@@ -740,7 +754,7 @@
             <!-- Connection -->
             {#if presetHasBaseUrl(providerForm.preset)}
               <label class="block space-y-2 text-sm font-medium text-slate-200">
-                <span>Base URL {providerForm.preset === 'ollama' ? '' : '<span class="text-rose-300">*</span>'}</span>
+                <span>Base URL {#if providerForm.preset !== 'ollama'}<span class="text-rose-300">*</span>{/if}</span>
                 <Input bind:value={providerForm.base_url} placeholder={providerForm.preset === 'ollama' ? 'http://localhost:11434' : 'https://your-provider.example.com/v1'} />
               </label>
             {/if}
@@ -749,11 +763,9 @@
             <div class="rounded-2xl border border-slate-800 bg-slate-900/60 p-4">
               <div class="flex items-center justify-between gap-3">
                 <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Models</p>
-                {#if selectedProviderId}
-                  <Button size="sm" variant="secondary" onclick={discoverModels} disabled={busy}>
-                    Discover models
-                  </Button>
-                {/if}
+                <Button size="sm" variant="secondary" onclick={discoverModels} disabled={busy}>
+                  Discover models
+                </Button>
               </div>
 
               {#if providerForm.discovered_models.length > 0}
@@ -769,15 +781,10 @@
                 <p class="mt-2 text-xs text-slate-400">Click a model to set it as default.</p>
               {/if}
 
-              <div class="mt-3 grid gap-4 md:grid-cols-2">
+              <div class="mt-3">
                 <label class="space-y-2 text-sm font-medium text-slate-200">
                   <span>Default model <span class="text-rose-300">*</span></span>
-                  <Input bind:value={providerForm.default_model} list="provider-model-suggestions" placeholder="model id" />
-                  <datalist id="provider-model-suggestions">
-                    {#each providerModelSuggestions() as model}
-                      <option value={model}></option>
-                    {/each}
-                  </datalist>
+                  <Input bind:value={providerForm.default_model} placeholder="model id (type or pick from discovered)" />
                 </label>
               </div>
 
@@ -884,13 +891,39 @@
         <Card class="p-5">
           <div class="space-y-4">
             <p class="text-sm leading-6 text-slate-400">
-              Use encrypted secrets for tool execution sandboxes. LLM provider API keys are typically read from environment variables before Cognis starts.
+              Encrypted secrets for tool execution sandboxes and LLM provider credentials.
             </p>
-            <label class="space-y-2 text-sm font-medium text-slate-200"><span>Name</span><Input bind:value={secretForm.name} /></label>
-            <label class="space-y-2 text-sm font-medium text-slate-200"><span>Value</span><Input bind:value={secretForm.value} type="password" placeholder="write-only secret" /></label>
-            <label class="space-y-2 text-sm font-medium text-slate-200"><span>Scope</span><Input bind:value={secretForm.scope} /></label>
-            <label class="space-y-2 text-sm font-medium text-slate-200"><span>Agent ID</span><Input bind:value={secretForm.agent_id} /></label>
-            <label class="space-y-2 text-sm font-medium text-slate-200"><span>Description</span><Input bind:value={secretForm.description} /></label>
+            <label class="space-y-2 text-sm font-medium text-slate-200">
+              <span>Name <span class="text-rose-300">*</span></span>
+              <Input bind:value={secretForm.name} placeholder="openai_api_key" />
+            </label>
+            <label class="space-y-2 text-sm font-medium text-slate-200">
+              <span>Value <span class="text-rose-300">*</span></span>
+              <Input bind:value={secretForm.value} type="password" placeholder="write-only secret" />
+            </label>
+            <label class="space-y-2 text-sm font-medium text-slate-200">
+              <span>Scope</span>
+              <select bind:value={secretForm.scope} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+                <option value="global">Global (all users and agents)</option>
+                <option value="user">User (current user only)</option>
+                <option value="agent">Agent-specific</option>
+              </select>
+            </label>
+            {#if secretForm.scope === 'agent'}
+              <label class="space-y-2 text-sm font-medium text-slate-200">
+                <span>Agent</span>
+                <select bind:value={secretForm.agent_id} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+                  <option value="">Select agent...</option>
+                  {#each agents as agent}
+                    <option value={agent.agent_id}>{agent.name} ({agent.agent_id})</option>
+                  {/each}
+                </select>
+              </label>
+            {/if}
+            <label class="space-y-2 text-sm font-medium text-slate-200">
+              <span>Description</span>
+              <Input bind:value={secretForm.description} placeholder="What this secret is for" />
+            </label>
             <Button class="w-full justify-center" onclick={saveSecret} disabled={busy}>Save secret</Button>
           </div>
         </Card>
@@ -1046,4 +1079,28 @@
       </div>
     {/if}
   </section>
+{/if}
+
+<!-- Secret creation modal -->
+{#if showSecretModal}
+  <div class="fixed inset-0 z-[80] flex items-center justify-center bg-slate-950/80 backdrop-blur" role="dialog" aria-modal="true">
+    <div class="w-full max-w-md rounded-3xl border border-slate-800 bg-slate-950 p-6 shadow-card">
+      <p class="text-xs uppercase tracking-[0.25em] text-slate-400">New credential</p>
+      <h3 class="mt-1 text-lg font-semibold text-white">Create API key secret</h3>
+      <div class="mt-4 space-y-4">
+        <label class="space-y-2 text-sm font-medium text-slate-200">
+          <span>Secret name</span>
+          <Input bind:value={secretModalName} placeholder="openai_api_key" />
+        </label>
+        <label class="space-y-2 text-sm font-medium text-slate-200">
+          <span>API key value</span>
+          <Input bind:value={secretModalValue} type="password" placeholder="sk-..." />
+        </label>
+      </div>
+      <div class="mt-5 flex justify-end gap-2">
+        <Button variant="secondary" onclick={() => (showSecretModal = false)}>Cancel</Button>
+        <Button onclick={saveSecretFromModal} disabled={busy || !secretModalName.trim() || !secretModalValue.trim()}>Save credential</Button>
+      </div>
+    </div>
+  </div>
 {/if}

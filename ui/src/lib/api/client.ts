@@ -516,6 +516,18 @@ export const api = {
       return request<{ provider_id: string; models: Array<{ model_id: string; name: string }> }>(`/api/v1/llm-providers/${providerId}/discover-models`, {
         method: 'POST'
       });
+    },
+
+    discoverModelsPreview(payload: {
+      preset: string;
+      base_url: string;
+      api_key?: string;
+      secret_name?: string;
+    }): Promise<{ models: Array<{ model_id: string; name: string }> }> {
+      return request<{ models: Array<{ model_id: string; name: string }> }>('/api/v1/llm-providers/discover-models-preview', {
+        method: 'POST',
+        body: JSON.stringify(payload)
+      });
     }
   },
 

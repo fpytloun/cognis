@@ -226,6 +226,31 @@ async def llm_provider_discover_models(request: Request, provider_id: str) -> di
     return {"provider_id": provider_id, "models": models}
 
 
+@router.post("/api/v1/llm-providers/discover-models-preview")
+async def llm_provider_discover_models_preview(request: Request) -> dict[str, Any]:
+    """Discover models without a saved provider (preview mode)."""
+    require_admin(request)
+    body = await request.json()
+    preset = str(body.get("preset", ""))
+    base_url = str(body.get("base_url", ""))
+    api_key = body.get("api_key") or None
+    secret_name = body.get("secret_name") or None
+    try:
+        models = await request.app.state.providers.llm.discover_models_preview(
+            preset=preset,
+            base_url=base_url,
+            api_key=api_key,
+            secret_name=secret_name,
+        )
+    except Exception as exc:
+        raise api_exception(
+            502,
+            "provider_error",
+            f"Failed to discover models: {exc!s}"[:300],
+        ) from exc
+    return {"models": models}
+
+
 @router.get("/api/v1/model-routing", response_model=ModelRoutingResponse)
 async def model_routing_get(request: Request) -> ModelRoutingResponse:
     require_current_user(request)

@@ -179,8 +179,6 @@ class LiteLLMProvider:
         the OpenAI-compatible ``/v1/models`` endpoint.  For Ollama,
         calls ``/api/tags`` instead.
         """
-        import httpx
-
         async with self.session_factory() as session:
             provider = await session.get(LLMProviderRow, provider_id)
         if provider is None:
@@ -190,8 +188,36 @@ class LiteLLMProvider:
         request_kwargs = await self._resolve_provider_kwargs(provider)
         api_key = request_kwargs.get("api_key", "")
         base_url = request_kwargs.get("api_base") or request_kwargs.get("base_url") or ""
+        preset = str(config.get("preset", ""))
 
-        preset = config.get("preset", "")
+        return await self._discover_models_remote(preset, base_url, api_key)
+
+    async def discover_models_preview(
+        self,
+        preset: str,
+        base_url: str,
+        api_key: str | None = None,
+        secret_name: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Discover models without a saved provider (preview mode).
+
+        Accepts inline credentials so the user can discover models before
+        saving the provider configuration.
+        """
+        import contextlib
+
+        resolved_key = api_key or ""
+        if not resolved_key and secret_name and self._secrets:
+            with contextlib.suppress(Exception):
+                resolved_key = await self._secrets.get_secret(secret_name, "system", None)
+        return await self._discover_models_remote(preset, base_url, resolved_key)
+
+    async def _discover_models_remote(
+        self, preset: str, base_url: str, api_key: str
+    ) -> list[dict[str, Any]]:
+        """Shared implementation for model discovery."""
+        import httpx
+
         headers: dict[str, str] = {}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
