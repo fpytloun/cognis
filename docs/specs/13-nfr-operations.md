@@ -158,6 +158,10 @@ cognis_provider_requests_total{provider, operation, status}
 cognis_provider_request_duration_seconds{provider, operation}
 cognis_provider_circuit_breaker_state{provider}
     # state: closed, open, half_open
+cognis_executor_spawns_total{outcome}
+cognis_executor_spawn_duration_seconds{outcome}
+cognis_tool_route_decisions_total{route}
+cognis_tool_route_outcomes_total{route, outcome}
 ```
 
 #### Cache

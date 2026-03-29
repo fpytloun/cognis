@@ -241,6 +241,9 @@ class AgentResponse(BaseModel):
     permissions: dict[str, Any] | None = None
     llm_config: dict[str, Any] | None = None
     execution: dict[str, Any] | None = None
+    personality_synced: bool = True
+    personality_sync_error: str | None = None
+    personality_sync_checked_at: datetime | None = None
     avatar_url: str | None = None
     status: str
     created_at: datetime | None = None
@@ -559,6 +562,7 @@ class WebSocketError(BaseModel):
     code: str
     message: str
     recoverable: bool = False
+    error_detail: str | None = None
     detail: dict[str, Any] | None = None
 
 

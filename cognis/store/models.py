@@ -76,6 +76,7 @@ class Agent(Base):
     permissions: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     llm_config: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     execution: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    sync_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True, default=dict)
     avatar_url: Mapped[str | None] = mapped_column(String, nullable=True)
     status: Mapped[str] = mapped_column(String, nullable=False, default="active")
     created_at: Mapped[datetime] = mapped_column(

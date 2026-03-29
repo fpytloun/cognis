@@ -7,6 +7,7 @@
   import Button from '$lib/components/ui/Button.svelte';
   import Card from '$lib/components/ui/Card.svelte';
   import { api, asApiError } from '$lib/api/client';
+  import { addToast } from '$lib/stores/toasts';
   import type { Agent, Workflow } from '$lib/types/api';
 
   let loading = true;
@@ -39,16 +40,20 @@
         await api.agents.activate(agent.agent_id);
       }
       await loadAgents();
+      addToast(`Agent ${agent.status === 'active' ? 'suspended' : 'activated'}.`, 'success');
     } catch (caughtError) {
       error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to update agent status');
     }
   }
 
   async function syncPersonality(agent: Agent): Promise<void> {
     try {
       await api.agents.syncPersonality(agent.agent_id);
+      addToast('Personality sync requested.', 'success');
     } catch (caughtError) {
       error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to sync personality');
     }
   }
 
@@ -104,6 +109,13 @@
               <dd class="mt-1">{typeof agent.llm_config?.model === 'string' ? agent.llm_config.model : 'inherit'}</dd>
             </div>
           </dl>
+
+          {#if !agent.personality_synced}
+            <div class="mt-4 rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
+              <p class="font-medium">Personality was not synced to Mnemory.</p>
+              <p class="mt-1 text-amber-50/90">{agent.personality_sync_error ?? 'Retry the sync to bootstrap this agent into memory.'}</p>
+            </div>
+          {/if}
 
           <div class="mt-5 flex flex-wrap gap-2">
             <Button size="sm" variant="secondary" onclick={() => goto(`/agents/${agent.agent_id}`)}>Open</Button>

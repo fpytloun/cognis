@@ -21,6 +21,9 @@ EVENT_TYPES_FOR_CONTEXT = [
     "tool_call",
     "tool_result",
     "delegation",
+    "task_result",
+    "task_failed",
+    "task_cancelled",
 ]
 
 
@@ -100,6 +103,7 @@ class ContextAssembler:
         conversation: ConversationModel,
         agent: AgentDefinition,
         user_message: str,
+        user_message_role: str = "user",
         tool_definitions: list[ToolDefinition] | None = None,
         active_delegations: list[dict[str, Any]] | None = None,
     ) -> ContextAssemblyResult:
@@ -209,7 +213,7 @@ class ContextAssembler:
             messages.append(
                 {"role": "system", "content": _format_active_delegations(active_delegations)}
             )
-        messages.append({"role": "user", "content": user_message})
+        messages.append({"role": user_message_role, "content": user_message})
 
         messages = self._prune_messages(
             messages=messages,
@@ -279,6 +283,13 @@ class ContextAssembler:
                     {
                         "role": "system",
                         "content": _format_delegation_status(event.data),
+                    }
+                )
+            elif event.type in {"task_result", "task_failed", "task_cancelled"}:
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": _format_task_update(event.type, event.data),
                     }
                 )
         return messages
@@ -385,3 +396,14 @@ def _format_active_delegations(active_delegations: list[dict[str, Any]]) -> str:
             line = f"{line} ({task})"
         lines.append(line)
     return "\n".join(lines)
+
+
+def _format_task_update(event_type: str, data: dict[str, Any]) -> str:
+    title = data.get("title") or data.get("task_title") or data.get("task_id") or "Background task"
+    result_summary = data.get("result_summary") or "No summary provided."
+    status = {
+        "task_result": "completed",
+        "task_failed": "failed",
+        "task_cancelled": "cancelled",
+    }.get(event_type, "updated")
+    return f"Task update: {title} {status}. Summary: {result_summary}"

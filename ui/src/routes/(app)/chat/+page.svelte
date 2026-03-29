@@ -14,7 +14,7 @@
   onMount(() => {
     void (async () => {
       try {
-        conversations = await api.conversations.listAll();
+        conversations = (await api.conversations.list()).items;
         const target = conversations[0]?.conversation_id;
         await goto(target ? `/chat/${target}` : '/chat/new', { replaceState: true });
       } catch (caughtError) {

@@ -42,6 +42,7 @@ from cognis.models.workflow import (
 from cognis.store.queries import (
     create_step_run,
     get_agent,
+    get_latest_active_conversation_for_agent,
     update_step_run,
     update_task_status,
     update_task_workflow_state,
@@ -110,6 +111,7 @@ class WorkflowEngine:
         session: Any,
         agent: AgentDefinition,
         user_message: str,
+        system_initiated: bool = False,
         on_progress: ProgressCallback | None = None,
         on_tool_call: ToolCallCallback | None = None,
         cancel_event: asyncio.Event | None = None,
@@ -132,6 +134,7 @@ class WorkflowEngine:
             agent=agent,
             is_direct=True,
             user_message=user_message,
+            system_initiated=system_initiated,
             interaction_mode="explicit_gates",
             tool_registry=tool_registry,
             executor_connection=executor_connection,
@@ -699,8 +702,13 @@ class WorkflowEngine:
         elif delivery_mode == "specific_conversation":
             target_conversation_id = task.delivery.target
         elif delivery_mode in ("latest_active_for_agent", "preferred_channel"):
-            # TODO: resolve latest active conversation for user+agent
-            target_conversation_id = task.source_ref  # Fallback
+            async with self._session_factory() as db_session:
+                latest = await get_latest_active_conversation_for_agent(
+                    db_session, task.created_by, task.agent_id
+                )
+            target_conversation_id = (
+                latest.conversation_id if latest is not None else task.source_ref
+            )
         elif delivery_mode == "silent":
             return
 
@@ -724,6 +732,7 @@ class WorkflowEngine:
         )
 
         # Record to target conversation's Intaris session
+        recorded_to_intaris = False
         try:
             # Resolve the conversation's root session Intaris ID
             async with self._session_factory() as db_session:
@@ -740,6 +749,7 @@ class WorkflowEngine:
                             events=[event],
                             source="cognis",
                         )
+                        recorded_to_intaris = True
         except Exception:
             logger.warning(
                 "Failed to deliver task result to conversation",
@@ -757,13 +767,26 @@ class WorkflowEngine:
                 type=event_type,
                 data={
                     "task_id": task.task_id,
+                    "task_title": task.title,
+                    "title": task.title,
                     "conversation_id": target_conversation_id,
                     "result_summary": task.result_summary,
                 },
             )
         )
-
-        # TODO: trigger new agent turn for idle conversations on task result delivery
+        if recorded_to_intaris:
+            await self._event_bus.publish(
+                Event(
+                    type=EventType.FOLLOW_UP_TURN_REQUESTED,
+                    data={
+                        "conversation_id": target_conversation_id,
+                        "task_id": task.task_id,
+                        "agent_id": task.agent_id,
+                        "user_email": task.created_by,
+                        "status": str(task.status),
+                    },
+                )
+            )
 
     async def _persist_workflow_state(self, task: TaskModel) -> None:
         """Persist workflow state to DB after a step transition."""

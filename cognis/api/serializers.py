@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+from datetime import datetime
 from typing import Any
 
 from cognis.api.models import (
@@ -74,6 +76,13 @@ def session_to_response(row: Any) -> SessionResponse:
 
 
 def agent_to_response(row: Any) -> AgentResponse:
+    sync_metadata = (
+        row.sync_metadata if isinstance(getattr(row, "sync_metadata", None), dict) else {}
+    )
+    checked_at = sync_metadata.get("personality_sync_checked_at")
+    if isinstance(checked_at, str):
+        with contextlib.suppress(ValueError):
+            checked_at = datetime.fromisoformat(checked_at)
     return AgentResponse(
         agent_id=row.agent_id,
         owner_email=row.owner_email,
@@ -87,6 +96,13 @@ def agent_to_response(row: Any) -> AgentResponse:
         permissions=row.permissions,
         llm_config=row.llm_config,
         execution=row.execution,
+        personality_synced=bool(sync_metadata.get("personality_synced", True)),
+        personality_sync_error=(
+            str(sync_metadata.get("personality_sync_error"))
+            if sync_metadata.get("personality_sync_error")
+            else None
+        ),
+        personality_sync_checked_at=checked_at if isinstance(checked_at, datetime) else None,
         avatar_url=row.avatar_url,
         status=row.status,
         created_at=row.created_at,

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import secrets
 import uuid
+from collections import deque
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -51,6 +53,11 @@ class LoginRateLimitState:
     failures: list[datetime]
 
 
+@dataclass
+class ApiRateLimitState:
+    requests: deque[datetime]
+
+
 class LoginRateLimiter:
     """Simple in-memory login rate limiter."""
 
@@ -80,3 +87,53 @@ class LoginRateLimiter:
 
     def clear(self, email: str) -> None:
         self._state.pop(email, None)
+
+
+class RequestRateLimiter:
+    """In-memory aggregate per-user read/write request rate limiter."""
+
+    def __init__(
+        self,
+        *,
+        read_requests_per_minute: int = 60,
+        write_requests_per_minute: int = 20,
+        window_seconds: int = 60,
+    ) -> None:
+        self.read_requests_per_minute = read_requests_per_minute
+        self.write_requests_per_minute = write_requests_per_minute
+        self.window = timedelta(seconds=window_seconds)
+        self._state: dict[str, ApiRateLimitState] = {}
+        self._lock = asyncio.Lock()
+
+    def update_limits(
+        self,
+        *,
+        read_requests_per_minute: int | None = None,
+        write_requests_per_minute: int | None = None,
+    ) -> None:
+        if read_requests_per_minute is not None:
+            self.read_requests_per_minute = read_requests_per_minute
+        if write_requests_per_minute is not None:
+            self.write_requests_per_minute = write_requests_per_minute
+
+    async def allow(self, *, user_key: str, path: str, method: str) -> bool:
+        del path
+        async with self._lock:
+            now = datetime.now(UTC)
+            bucket_name = "read" if method.upper() in {"GET", "HEAD", "OPTIONS"} else "write"
+            state_key = f"{user_key}:{bucket_name}"
+            bucket = self._state.setdefault(state_key, ApiRateLimitState(requests=deque()))
+            while bucket.requests and now - bucket.requests[0] >= self.window:
+                bucket.requests.popleft()
+            if not bucket.requests:
+                self._state.pop(state_key, None)
+                bucket = self._state.setdefault(state_key, ApiRateLimitState(requests=deque()))
+            limit = (
+                self.read_requests_per_minute
+                if method.upper() in {"GET", "HEAD", "OPTIONS"}
+                else self.write_requests_per_minute
+            )
+            if len(bucket.requests) >= limit:
+                return False
+            bucket.requests.append(now)
+            return True

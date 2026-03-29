@@ -131,14 +131,33 @@ async def purge_conversation(request: Request, conversation_id: str) -> dict[str
     forbid_mutation_for_viewer(request)
     async with request.app.state.session_factory() as session:
         row = await get_conversation(session, conversation_id)
+        sessions = (
+            await list_conversation_sessions(session, conversation_id) if row is not None else []
+        )
     if row is None:
         raise api_exception(404, "not_found", "Conversation not found")
     require_owner_or_admin(request, row.user_email)
     ok = await request.app.state.session_manager.purge_conversation(conversation_id)
+    delete_session = getattr(request.app.state.providers.guardrails, "delete_session", None)
+    if not callable(delete_session):
+        return {
+            "ok": ok,
+            "intaris_cascade": False,
+            "warning": "Intaris purge is not supported by the current provider contract.",
+        }
+
+    cascade_ok = True
+    for session_row in sessions:
+        intaris_session_id = session_row.intaris_session_id or session_row.session_id
+        try:
+            await delete_session(intaris_session_id)
+        except Exception:
+            cascade_ok = False
+            break
     return {
         "ok": ok,
-        "intaris_cascade": False,
-        "warning": "Intaris purge is not supported by the current provider contract.",
+        "intaris_cascade": cascade_ok,
+        "warning": None if cascade_ok else "Intaris session purge failed for one or more sessions.",
     }
 
 

@@ -7,6 +7,7 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from cognis.core.events import Event, EventBus, EventType
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.session import ConversationContext, ConversationModel, SessionModel
@@ -24,10 +25,12 @@ class SessionManager:
         session_factory: async_sessionmaker[AsyncSession],
         providers: Any,
         session_cache: Any,
+        event_bus: EventBus | None = None,
     ) -> None:
         self.session_factory = session_factory
         self.providers = providers
         self.session_cache = session_cache
+        self.event_bus = event_bus
 
     async def create_conversation(
         self,
@@ -318,7 +321,14 @@ class SessionManager:
                 "Recovered stale sessions",
                 extra={"extra_data": {"recovered_count": len(recovered_ids)}},
             )
-            # TODO: emit SESSION_RECOVERED event when the internal event bus exists.
+            if self.event_bus is not None:
+                for recovered_id in recovered_ids:
+                    await self.event_bus.publish(
+                        Event(
+                            type=EventType.SESSION_RECOVERED,
+                            data={"session_id": recovered_id},
+                        )
+                    )
         return recovered_ids
 
     async def archive_conversation(self, conversation_id: str) -> bool:

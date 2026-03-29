@@ -343,7 +343,7 @@ uv run alembic -c cognis/store/migrations/alembic.ini downgrade -1
 |---|---|---|
 | `users` | `email` | User accounts (email is user_id everywhere) |
 | `api_keys` | `key_id` | API keys for programmatic access |
-| `agents` | `agent_id` | Agent definitions |
+| `agents` | `agent_id` | Agent definitions + sync metadata |
 | `conversations` | `conversation_id` | Conversation metadata |
 | `sessions` | `session_id` | Session metadata (NO event seq/compaction fields) |
 | `tasks` | `task_id` | Durable work items (kanban cards, queue items) |

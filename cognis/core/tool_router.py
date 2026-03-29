@@ -8,6 +8,7 @@ from enum import StrEnum
 from fnmatch import fnmatchcase
 from typing import Any
 
+from prometheus_client import Counter
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cognis.models.agent import AgentDefinition
@@ -16,6 +17,17 @@ from cognis.models.tool import Permission, ToolCall, ToolResult
 from cognis.store.queries import get_setting_value
 from cognis.tools.builtin.orchestration import handle_orchestration_tool_call, is_orchestration_tool
 from cognis.tools.registry import ToolRegistry
+
+TOOL_ROUTE_DECISIONS = Counter(
+    "cognis_tool_route_decisions_total",
+    "Tool route decisions",
+    labelnames=("route",),
+)
+TOOL_ROUTE_OUTCOMES = Counter(
+    "cognis_tool_route_outcomes_total",
+    "Tool route outcomes",
+    labelnames=("route", "outcome"),
+)
 
 
 class ToolRoute(StrEnum):
@@ -127,27 +139,35 @@ class ToolRouter:
         """Execute a tool call using the appropriate route."""
 
         route = self.classify(tool_call.name, registry)
+        TOOL_ROUTE_DECISIONS.labels(route=str(route)).inc()
         if route is ToolRoute.UNKNOWN:
+            TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome="unknown").inc()
             return self._sanitize_result(
                 tool_call.name, ToolResult(output="Unknown tool.", is_error=True), 50_000
             )
         if route is ToolRoute.ORCHESTRATION:
             result = await handle_orchestration_tool_call(tool_call)
+            TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome="success").inc()
             return self._sanitize_result(tool_call.name, result, 50_000)
         if route is ToolRoute.INTARIS_MCP:
             result = await self._call_intaris_mcp(tool_call, session, registry)
+            TOOL_ROUTE_OUTCOMES.labels(
+                route=str(route), outcome="success" if not result.is_error else "failure"
+            ).inc()
             return self._sanitize_result(
                 tool_call.name, result, _tool_max_size(registry, tool_call.name)
             )
 
         decision = await self.evaluate_tool_call(tool_call, agent, session, registry)
         if decision.decision == "deny":
+            TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome="denied").inc()
             return self._sanitize_result(
                 tool_call.name,
                 ToolResult(output=decision.reasoning or "Tool execution denied.", is_error=True),
                 _tool_max_size(registry, tool_call.name),
             )
         if decision.decision == "escalate":
+            TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome="escalated").inc()
             return self._sanitize_result(
                 tool_call.name,
                 ToolResult(
@@ -171,7 +191,15 @@ class ToolRouter:
         except TimeoutError:
             await executor.cancel_call(tool_call.call_id)
             result = ToolResult(output="Tool execution timed out.", is_error=True)
-        # TODO: emit metrics for tool route decisions and execution outcomes.
+            TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome="timeout").inc()
+            return self._sanitize_result(
+                tool_call.name,
+                result,
+                registered_tool.definition.max_result_size,
+            )
+        TOOL_ROUTE_OUTCOMES.labels(
+            route=str(route), outcome="success" if not result.is_error else "failure"
+        ).inc()
         return self._sanitize_result(
             tool_call.name,
             result,

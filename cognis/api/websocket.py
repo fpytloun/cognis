@@ -9,10 +9,12 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import httpx
 from fastapi import WebSocket, WebSocketDisconnect
 from prometheus_client import Counter, Gauge
 from sqlalchemy import select
 
+from cognis.api.error_sanitizer import sanitize_client_error_detail
 from cognis.api.models import (
     WebSocketAuthenticated,
     WebSocketChunkGap,
@@ -34,6 +36,107 @@ from cognis.store.queries import get_agent, get_conversation, get_session_row, g
 logger = get_logger(__name__)
 
 _NEW_SESSION_STREAM_GRACE = timedelta(seconds=30)
+
+
+def _follow_up_turn_prompt(status: str | None) -> str:
+    status_name = (status or "updated").lower()
+    if status_name == "failed":
+        return (
+            "A background task failure was delivered to this conversation. "
+            "Review the recent task_failed event and provide a concise user-facing follow-up if warranted."
+        )
+    if status_name == "cancelled":
+        return (
+            "A background task cancellation was delivered to this conversation. "
+            "Review the recent task_cancelled event and provide a concise user-facing follow-up if warranted."
+        )
+    return (
+        "A background task update was delivered to this conversation. "
+        "Review the recent task_result event and provide a concise user-facing follow-up if warranted."
+    )
+
+
+class SessionCreationFailedError(RuntimeError):
+    """Raised when the controller cannot create or recover a root session."""
+
+
+async def _classify_turn_error(
+    app: Any, error: Exception
+) -> tuple[str, str, bool, dict[str, Any] | None]:
+    lowered = str(error).lower()
+    safe_detail = sanitize_client_error_detail(error, fallback="request failed")
+
+    if isinstance(error, SessionCreationFailedError):
+        return (
+            "session_creation_failed",
+            "Could not create a session. Try again or check the diagnostics page.",
+            True,
+            {"error_detail": safe_detail},
+        )
+    if isinstance(error, ValueError) and "no llm model configured" in lowered:
+        return (
+            "provider_not_configured:llm",
+            "No LLM provider is configured. Go to Settings > Providers to add one.",
+            True,
+            {"error_detail": safe_detail},
+        )
+
+    provider_checks = []
+    for provider_name in ("guardrails", "llm", "memory"):
+        provider = getattr(app.state.providers, provider_name, None)
+        if provider is None:
+            continue
+        try:
+            provider_checks.append((provider_name, await provider.health()))
+        except Exception:
+            continue
+
+    for provider_name, health in provider_checks:
+        if health.status == "healthy":
+            continue
+        if provider_name == "guardrails":
+            return (
+                "provider_unreachable:guardrails",
+                "Guardrails service is unreachable — tool calls are blocked until it recovers. Check that Intaris is running.",
+                True,
+                {"error_detail": safe_detail},
+            )
+        if provider_name == "llm":
+            if "no llm model configured" in lowered or "not configured" in lowered:
+                return (
+                    "provider_not_configured:llm",
+                    "No LLM provider is configured. Go to Settings > Providers to add one.",
+                    True,
+                    {"error_detail": safe_detail},
+                )
+            return (
+                "provider_error:llm",
+                "LLM provider returned an error. Check your provider configuration in Settings.",
+                True,
+                {"error_detail": safe_detail},
+            )
+        if provider_name == "memory":
+            return (
+                "provider_unreachable:memory",
+                "Memory is currently unavailable — this conversation won't have access to past context.",
+                True,
+                {"error_detail": safe_detail},
+            )
+
+    if isinstance(error, (httpx.HTTPError, TimeoutError)):
+        return (
+            "provider_error:llm",
+            "A provider request failed while processing this turn.",
+            True,
+            {"error_detail": safe_detail},
+        )
+
+    return (
+        "turn_failed",
+        "Turn execution failed.",
+        True,
+        {"error_detail": safe_detail},
+    )
 
 
 def _normalize_utc(value: datetime) -> datetime:
@@ -173,11 +276,15 @@ class WebSocketConnectionManager:
         recoverable: bool,
         detail: dict[str, Any] | None = None,
     ) -> None:
+        error_detail = None
+        if detail is not None and isinstance(detail.get("error_detail"), str):
+            error_detail = str(detail["error_detail"])
         await connection.send_json(
             WebSocketError(
                 code=code,
                 message=message,
                 recoverable=recoverable,
+                error_detail=error_detail,
                 detail=detail,
             ).model_dump()
         )
@@ -262,6 +369,7 @@ class WebSocketConnectionManager:
         session: SessionModel,
         agent: Any,
         content: str,
+        system_initiated: bool = False,
     ) -> None:
         control = asyncio.Event()
         conversation_id = conversation.conversation_id
@@ -272,6 +380,7 @@ class WebSocketConnectionManager:
                 session=session,
                 agent=agent,
                 content=content,
+                system_initiated=system_initiated,
                 cancel_event=control,
             )
         )
@@ -290,6 +399,7 @@ class WebSocketConnectionManager:
         session: SessionModel,
         agent: Any,
         content: str,
+        system_initiated: bool,
         cancel_event: asyncio.Event,
     ) -> None:
         conversation_id = conversation.conversation_id
@@ -297,12 +407,15 @@ class WebSocketConnectionManager:
         try:
             current_user_email.set(session.user_email)
             current_agent_id.set(agent.agent_id)
-            decision = await self.app.state.decision_engine.decide(
-                user_message=content,
-                agent=agent,
-            )
+            if not system_initiated:
+                decision = await self.app.state.decision_engine.decide(
+                    user_message=content,
+                    agent=agent,
+                )
+            else:
+                decision = None
 
-            if decision.decision == "delegate":
+            if decision is not None and decision.decision == "delegate":
                 workflow_id = await self._select_workflow(agent, content)
                 task = await self.app.state.task_queue.submit(
                     created_by=session.user_email,
@@ -383,6 +496,7 @@ class WebSocketConnectionManager:
                 session=session,
                 agent=agent,
                 user_message=content,
+                system_initiated=system_initiated,
                 on_progress=on_token,
                 on_tool_call=on_tool_call,
                 cancel_event=cancel_event,
@@ -408,17 +522,29 @@ class WebSocketConnectionManager:
                     "queued_count": len(self._queued_messages.get(conversation_id, [])),
                 },
             )
-        except Exception:
+        except asyncio.CancelledError:
+            await self.send_to_conversation(
+                conversation_id,
+                WebSocketError(
+                    code="turn_cancelled",
+                    message="The current turn was cancelled.",
+                    recoverable=True,
+                ).model_dump(),
+            )
+        except Exception as exc:
             logger.exception(
                 "WebSocket turn failed",
                 extra={"extra_data": {"conversation_id": conversation_id}},
             )
+            code, message, recoverable, detail = await _classify_turn_error(self.app, exc)
             await self.send_to_conversation(
                 conversation_id,
                 WebSocketError(
-                    code="turn_failed",
-                    message="Turn execution failed",
-                    recoverable=True,
+                    code=code,
+                    message=message,
+                    recoverable=recoverable,
+                    error_detail=detail.get("error_detail") if detail else None,
+                    detail=detail,
                 ).model_dump(),
             )
         finally:
@@ -581,6 +707,9 @@ class WebSocketConnectionManager:
         WS_MISSED_EVENTS_REPLAYED.inc(replayed)
 
     async def _handle_event(self, event: Event) -> None:
+        if event.type == EventType.FOLLOW_UP_TURN_REQUESTED:
+            await self._handle_follow_up_turn_request(event)
+            return
         conversation_id = await self._resolve_conversation_id(event)
         if conversation_id is None:
             return
@@ -589,17 +718,47 @@ class WebSocketConnectionManager:
             return
         await self.send_to_conversation(conversation_id, payload)
 
+    async def _handle_follow_up_turn_request(self, event: Event) -> None:
+        conversation_id = event.data.get("conversation_id")
+        if not isinstance(conversation_id, str):
+            return
+        if not self._by_conversation.get(conversation_id):
+            return
+        if conversation_id in self._active_turns and not self._active_turns[conversation_id].done():
+            return
+        runtime = await _load_conversation_runtime(self.app, conversation_id)
+        if runtime is None:
+            return
+        conversation, session, agent = runtime
+        if conversation.status != "active":
+            return
+        self._launch_turn(
+            conversation=conversation,
+            session=session,
+            agent=agent,
+            content=_follow_up_turn_prompt(
+                event.data.get("status") if isinstance(event.data.get("status"), str) else None
+            ),
+            system_initiated=True,
+        )
+
     async def _resolve_conversation_id(self, event: Event) -> str | None:
         if isinstance(event.data.get("conversation_id"), str):
             return str(event.data["conversation_id"])
+        session_id = event.data.get("session_id")
+        if isinstance(session_id, str):
+            async with self.app.state.session_factory() as session:
+                session_row = await get_session_row(session, session_id)
+            if session_row is not None:
+                return session_row.conversation_id
         task_id = event.data.get("task_id")
         if not isinstance(task_id, str):
             return None
         async with self.app.state.session_factory() as session:
-            row = await get_task(session, task_id)
-        if row is None or row.source_type != "chat":
+            task_row = await get_task(session, task_id)
+        if task_row is None or task_row.source_type != "chat":
             return None
-        return row.source_ref
+        return task_row.source_ref
 
 
 async def handle_websocket(websocket: WebSocket) -> None:
@@ -928,12 +1087,15 @@ async def _load_conversation_runtime(
                 or agent_row.description
                 or f"Conversation with {agent_row.name}"
             )
-            root_session = await app.state.session_manager.create_root_session(
-                conversation_id=conversation_row.conversation_id,
-                user_email=conversation_row.user_email,
-                agent_id=conversation_row.agent_id,
-                intention=intention,
-            )
+            try:
+                root_session = await app.state.session_manager.create_root_session(
+                    conversation_id=conversation_row.conversation_id,
+                    user_email=conversation_row.user_email,
+                    agent_id=conversation_row.agent_id,
+                    intention=intention,
+                )
+            except Exception as exc:
+                raise SessionCreationFailedError("Could not create a session") from exc
             conversation_model.root_session_id = root_session.session_id
             return conversation_model, root_session, agent_model
         session_row = await get_session_row(session, conversation_row.root_session_id)
@@ -1067,6 +1229,13 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
             "conversation_id": conversation_id,
             "task_id": event.data.get("task_id"),
             "reason": event.data.get("result_summary") or "cancelled",
+        }
+    if event.type == EventType.SESSION_RECOVERED:
+        return {
+            "type": "session_recovered",
+            "conversation_id": conversation_id,
+            "session_id": event.data.get("session_id"),
+            "reason": event.data.get("reason") or "controller_restart",
         }
     return None
 

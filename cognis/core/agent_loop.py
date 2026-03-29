@@ -362,6 +362,7 @@ class StepContext:
     executor_connection: Any = None  # ExecutorConnection for this step
     workflow_state: WorkflowState | None = None
     cancel_event: asyncio.Event | None = None
+    system_initiated: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -455,6 +456,7 @@ class AgentLoop:
             conversation=ctx.conversation,
             agent=ctx.agent,
             user_message=ctx.user_message or ctx.step_definition.prompt,
+            user_message_role="system" if ctx.system_initiated else "user",
             tool_definitions=None,
             active_delegations=None,
         )
@@ -469,7 +471,7 @@ class AgentLoop:
             )
 
         # Record user message event for direct workflow
-        if ctx.is_direct and ctx.user_message:
+        if ctx.is_direct and ctx.user_message and not ctx.system_initiated:
             events_to_record.append(
                 SessionEvent(type="user_message", data={"content": ctx.user_message})
             )

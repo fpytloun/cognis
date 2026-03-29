@@ -40,6 +40,8 @@ DEFAULT_SETTINGS: Final[dict[str, tuple[str, object]]] = {
         "security",
         ["shell", "bash", "write_file", "delete_file"],
     ),
+    "security.api_read_requests_per_minute": ("security", 60),
+    "security.api_write_requests_per_minute": ("security", 20),
     "security.token_ttl_seconds": ("security", 3600),
     "security.max_connections": ("security", 100),
     "security.ws_auth_timeout_seconds": ("security", 10),
@@ -123,6 +125,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(Base.metadata.create_all)
         await conn.run_sync(_ensure_session_lifecycle_columns)
         await conn.run_sync(_ensure_api_key_columns)
+        await conn.run_sync(_ensure_agent_sync_metadata_column)
 
 
 def _ensure_session_lifecycle_columns(sync_conn: object) -> None:
@@ -148,6 +151,15 @@ def _ensure_api_key_columns(sync_conn: object) -> None:
 
     if "last_used_at" not in api_key_columns:
         execute(text("ALTER TABLE api_keys ADD COLUMN last_used_at TIMESTAMP WITH TIME ZONE"))
+
+
+def _ensure_agent_sync_metadata_column(sync_conn: object) -> None:
+    inspector = cast(Any, inspect(sync_conn))
+    agent_columns = {column["name"] for column in inspector.get_columns("agents")}
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+
+    if "sync_metadata" not in agent_columns:
+        execute(text("ALTER TABLE agents ADD COLUMN sync_metadata JSON DEFAULT '{}'"))
 
 
 async def seed_default_settings(session: AsyncSession) -> None:

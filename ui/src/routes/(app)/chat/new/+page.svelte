@@ -6,11 +6,17 @@
   import Button from '$lib/components/ui/Button.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import { api } from '$lib/api/client';
-  import type { Agent } from '$lib/types/api';
+  import type { Agent, HealthResponse } from '$lib/types/api';
 
   let loading = true;
   let error = '';
   let agents: Agent[] = [];
+  let health: HealthResponse | null = null;
+
+  function isLlmUnavailableForSetup(): boolean {
+    const llmDetails = JSON.stringify(health?.providers?.llm ?? {}).toLowerCase();
+    return llmDetails.includes('no llm model configured') || llmDetails.includes('not configured');
+  }
 
   async function createConversation(): Promise<void> {
     const requestedAgentId = $page.url.searchParams.get('agent_id');
@@ -21,6 +27,12 @@
 
     if (!selectedAgent) {
       error = 'Create an agent first before starting a conversation.';
+      loading = false;
+      return;
+    }
+
+    if (isLlmUnavailableForSetup()) {
+      error = 'Configure an LLM provider before starting a conversation.';
       loading = false;
       return;
     }
@@ -40,6 +52,7 @@
   onMount(() => {
     void (async () => {
       try {
+        health = await api.system.health();
         agents = await api.agents.listAll();
         await createConversation();
       } catch (caughtError) {

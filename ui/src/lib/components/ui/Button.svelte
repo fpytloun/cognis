@@ -1,4 +1,5 @@
 <script lang="ts">
+  import type { HTMLButtonAttributes } from 'svelte/elements';
   import type { Snippet } from 'svelte';
 
   import { cva, type VariantProps } from 'class-variance-authority';
@@ -34,7 +35,7 @@
     disabled?: boolean;
     onclick?: ((event: MouseEvent) => void) | null;
     children?: Snippet;
-  };
+  } & HTMLButtonAttributes;
 
   let {
     variant,
@@ -43,10 +44,11 @@
     class: className = '',
     disabled = false,
     onclick = null,
-    children
+    children,
+    ...rest
   }: Props = $props();
 </script>
 
-<button class={cn(buttonVariants({ variant, size }), className)} {type} {disabled} {onclick}>
+<button class={cn(buttonVariants({ variant, size }), className)} {type} {disabled} {onclick} {...rest}>
   {@render children?.()}
 </button>

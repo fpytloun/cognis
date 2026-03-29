@@ -27,6 +27,8 @@ class CognisWebSocketClient {
   private subscriptions = new Map<string, number>();
   private queuedMessages: string[] = [];
   private reconnectTimer: number | null = null;
+  private heartbeatTimer: number | null = null;
+  private pongTimeout: number | null = null;
   private reconnectAttempts = 0;
   private authenticated = false;
   private manualDisconnect = false;
@@ -121,6 +123,8 @@ class CognisWebSocketClient {
       window.clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+    this.clearHeartbeat();
+    this.clearPongTimeout();
     this.socket?.close();
     this.socket = null;
     this.authenticated = false;
@@ -173,7 +177,11 @@ class CognisWebSocketClient {
   }
 
   ping(): void {
-    this.sendRaw({ type: 'ping' });
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN || !this.authenticated) {
+      return;
+    }
+    this.socket.send(JSON.stringify({ type: 'ping' }));
+    this.startPongTimeout();
   }
 
   private sendRaw(payload: Record<string, unknown>): void {
@@ -209,7 +217,9 @@ class CognisWebSocketClient {
       if (payload.type === 'authenticated') {
         this.authenticated = true;
         this.reconnectAttempts = 0;
+        this.clearPongTimeout();
         this.state.set({ status: 'connected', attempts: 0, lastError: null });
+        this.startHeartbeat();
         for (const [conversationId, lastSeq] of this.subscriptions.entries()) {
           this.sendRaw({ type: 'reconnect', conversation_id: conversationId, last_seq: lastSeq });
         }
@@ -225,6 +235,10 @@ class CognisWebSocketClient {
         this.state.update((state) => ({ ...state, lastError: payload.message }));
       }
 
+      if (payload.type === 'pong') {
+        this.clearPongTimeout();
+      }
+
       for (const listener of this.listeners) {
         listener(payload);
       }
@@ -234,6 +248,8 @@ class CognisWebSocketClient {
   }
 
   private scheduleReconnect(): void {
+    this.clearHeartbeat();
+    this.clearPongTimeout();
     if (typeof window === 'undefined') {
       return;
     }
@@ -259,6 +275,45 @@ class CognisWebSocketClient {
       this.reconnectTimer = null;
       this.connect();
     }, delay);
+  }
+
+  private startHeartbeat(): void {
+    if (typeof window === 'undefined') {
+      return;
+    }
+    this.clearHeartbeat();
+    this.heartbeatTimer = window.setInterval(() => {
+      this.ping();
+    }, 30_000);
+  }
+
+  private clearHeartbeat(): void {
+    if (typeof window !== 'undefined' && this.heartbeatTimer !== null) {
+      window.clearInterval(this.heartbeatTimer);
+    }
+    this.heartbeatTimer = null;
+  }
+
+  private startPongTimeout(): void {
+    if (typeof window === 'undefined') {
+      return;
+    }
+    this.clearPongTimeout();
+    this.pongTimeout = window.setTimeout(() => {
+      this.state.update((state) => ({
+        ...state,
+        status: 'stalled',
+        lastError: 'Heartbeat timed out. Reconnecting…'
+      }));
+      this.socket?.close();
+    }, 10_000);
+  }
+
+  private clearPongTimeout(): void {
+    if (typeof window !== 'undefined' && this.pongTimeout !== null) {
+      window.clearTimeout(this.pongTimeout);
+    }
+    this.pongTimeout = null;
   }
 }
 

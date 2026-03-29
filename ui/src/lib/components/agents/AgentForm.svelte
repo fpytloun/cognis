@@ -38,6 +38,63 @@
 
   const permissionOptions = ['', 'allow', 'evaluate', 'deny'];
 
+  function validateJson(value: string, label: string): string | null {
+    if (!value.trim()) {
+      return null;
+    }
+    try {
+      JSON.parse(value);
+      return null;
+    } catch (error) {
+      return `${label} must be valid JSON.`;
+    }
+  }
+
+  function mcpServerError(server: MCPServerFormState): string | null {
+    if (!server.name.trim() && !server.command.trim() && !server.argsText.trim() && !server.envText.trim()) {
+      return null;
+    }
+    if (!server.name.trim()) {
+      return 'Server name is required.';
+    }
+    if (!server.command.trim()) {
+      return 'Server command is required.';
+    }
+    const invalidEnvLine = server.envText
+      .split(/\n+/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .find((line) => !line.includes('='));
+    if (invalidEnvLine) {
+      return 'Environment variables must use KEY=value format.';
+    }
+    return null;
+  }
+
+  function validationErrors(): Record<string, string> {
+    const errors: Record<string, string> = {};
+    if (!form.agentId.trim()) {
+      errors.agentId = 'Agent ID is required.';
+    }
+    if (!form.name.trim()) {
+      errors.name = 'Name is required.';
+    }
+    const stepJsonError = validateJson(form.stepAgentOverridesJson, 'Step agent overrides');
+    if (stepJsonError) {
+      errors.stepAgentOverridesJson = stepJsonError;
+    }
+    const mcpErrors = form.mcpServers
+      .map((server: MCPServerFormState, index: number) => [index, mcpServerError(server)] as const)
+      .filter((entry: readonly [number, string | null]): entry is readonly [number, string] => Boolean(entry[1]));
+    for (const [index, value] of mcpErrors) {
+      errors[`mcpServers.${index}`] = value;
+    }
+    return errors;
+  }
+
+  const errors = $derived(validationErrors());
+  const canSubmit = $derived(Object.keys(errors).length === 0 && Boolean(form.agentId.trim() && form.name.trim()));
+
   function toggleWorkflow(workflowId: string): void {
     if (form.availableWorkflowIds.includes(workflowId)) {
       form.availableWorkflowIds = form.availableWorkflowIds.filter((value: string) => value !== workflowId);
@@ -52,6 +109,9 @@
 
   async function handleSubmit(event: SubmitEvent): Promise<void> {
     event.preventDefault();
+    if (!canSubmit) {
+      return;
+    }
     await onSave(formStateToPayload(form));
   }
 
@@ -77,12 +137,18 @@
       <Card class="p-5">
         <div class="grid gap-4 md:grid-cols-2">
           <label class="space-y-2 text-sm font-medium text-slate-200">
-            <span>Agent ID</span>
-            <Input bind:value={form.agentId} disabled={mode === 'edit'} placeholder="research-assistant" />
+            <span>Agent ID <span class="text-rose-300">*</span></span>
+            <Input aria-invalid={errors.agentId ? 'true' : 'false'} bind:value={form.agentId} disabled={mode === 'edit'} placeholder="research-assistant" />
+            {#if errors.agentId}
+              <span class="text-xs text-rose-300">{errors.agentId}</span>
+            {/if}
           </label>
           <label class="space-y-2 text-sm font-medium text-slate-200">
-            <span>Name</span>
-            <Input bind:value={form.name} placeholder="Research Assistant" />
+            <span>Name <span class="text-rose-300">*</span></span>
+            <Input aria-invalid={errors.name ? 'true' : 'false'} bind:value={form.name} placeholder="Research Assistant" />
+            {#if errors.name}
+              <span class="text-xs text-rose-300">{errors.name}</span>
+            {/if}
           </label>
           <label class="space-y-2 text-sm font-medium text-slate-200">
             <span>Display name</span>
@@ -224,6 +290,9 @@
               <div class="mt-4 flex justify-end">
                 <Button type="button" variant="danger" size="sm" onclick={() => removeMcpServer(index)}>Remove</Button>
               </div>
+              {#if errors[`mcpServers.${index}`]}
+                <p class="mt-3 text-xs text-rose-300">{errors[`mcpServers.${index}`]}</p>
+              {/if}
             </div>
           {/each}
         </div>
@@ -322,7 +391,10 @@
 
           <label class="block space-y-2 text-sm font-medium text-slate-200">
             <span>Step agent overrides (JSON)</span>
-            <textarea bind:value={form.stepAgentOverridesJson} class="min-h-[150px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 font-mono text-sm text-slate-100 placeholder:text-slate-500"></textarea>
+            <textarea aria-invalid={errors.stepAgentOverridesJson ? 'true' : 'false'} bind:value={form.stepAgentOverridesJson} class="min-h-[150px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 font-mono text-sm text-slate-100 placeholder:text-slate-500"></textarea>
+            {#if errors.stepAgentOverridesJson}
+              <span class="text-xs text-rose-300">{errors.stepAgentOverridesJson}</span>
+            {/if}
           </label>
         </div>
       </Card>
@@ -334,7 +406,7 @@
       {/if}
 
       <div class="flex justify-end gap-3">
-        <Button type="submit" disabled={saving}>{saving ? 'Saving…' : mode === 'create' ? 'Create agent' : 'Save changes'}</Button>
+        <Button type="submit" disabled={saving || !canSubmit}>{saving ? 'Saving…' : mode === 'create' ? 'Create agent' : 'Save changes'}</Button>
       </div>
     </div>
 

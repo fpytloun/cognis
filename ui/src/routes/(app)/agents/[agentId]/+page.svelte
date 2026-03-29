@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { beforeNavigate, goto } from '$app/navigation';
   import { page } from '$app/stores';
   import { onMount } from 'svelte';
 
@@ -6,6 +7,9 @@
   import { api, asApiError } from '$lib/api/client';
   import AgentForm from '$lib/components/agents/AgentForm.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
+  import Button from '$lib/components/ui/Button.svelte';
+  import { installBeforeUnloadGuard, blockNavigationIfDirty } from '$lib/navigation/unsaved';
+  import { addToast } from '$lib/stores/toasts';
   import type { Agent, LLMProvider, MCPServerTestResponse, ToolDefinitionSummary, Workflow } from '$lib/types/api';
 
   let loading = true;
@@ -30,15 +34,30 @@
     permissions: null,
     llm_config: null,
     execution: null,
+    personality_synced: true,
+    personality_sync_error: null,
+    personality_sync_checked_at: null,
     avatar_url: null,
     status: 'draft',
     created_at: null,
     updated_at: null
   });
+  let initialSnapshot = JSON.stringify(form);
 
   function agentIdFromRoute(): string {
     return $page.params.agentId ?? '';
   }
+
+  function isDirty(): boolean {
+    return JSON.stringify(form) !== initialSnapshot;
+  }
+
+  beforeNavigate((navigation) => {
+    if (saving) {
+      return;
+    }
+    blockNavigationIfDirty(navigation, isDirty);
+  });
 
   async function loadAgent(): Promise<void> {
     loading = true;
@@ -54,6 +73,7 @@
         providers = [];
       }
       form = agentToFormState(agent);
+      initialSnapshot = JSON.stringify(form);
     } catch (caughtError) {
       error = asApiError(caughtError).message;
     } finally {
@@ -67,8 +87,10 @@
     try {
       await api.agents.update(agentIdFromRoute(), payload);
       await loadAgent();
+      addToast('Agent updated.', 'success');
     } catch (caughtError) {
       error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to save agent');
     } finally {
       saving = false;
     }
@@ -79,6 +101,7 @@
     error = '';
     try {
       mcpTestResult = await api.tools.testAgentMcp(agentIdFromRoute());
+      addToast(mcpTestResult.ok ? 'MCP discovery succeeded.' : 'MCP discovery finished with issues.', mcpTestResult.ok ? 'success' : 'warning');
       if (mcpTestResult.ok) {
         const discoveredTools = mcpTestResult.items.flatMap((item) =>
           item.tools.map((toolName) => ({
@@ -99,13 +122,28 @@
       }
     } catch (caughtError) {
       error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to test MCP');
     } finally {
       mcpTesting = false;
     }
   }
 
+  async function retrySyncPersonality(): Promise<void> {
+    error = '';
+    try {
+      await api.agents.syncPersonality(agentIdFromRoute());
+      await loadAgent();
+      addToast('Personality synced.', 'success');
+    } catch (caughtError) {
+      error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to sync personality');
+    }
+  }
+
   onMount(() => {
+    const cleanup = installBeforeUnloadGuard(isDirty);
     void loadAgent();
+    return cleanup;
   });
 </script>
 
@@ -117,10 +155,22 @@
   <LoadingState label="Loading agent" description="Fetching the agent definition, tools, workflows, and LLM options." />
 {:else}
   <section class="space-y-5">
-    <div>
+    <div class="space-y-3">
+      <Button size="sm" variant="secondary" onclick={() => goto('/agents')}>Back to agents</Button>
       <p class="text-sm uppercase tracking-[0.25em] text-slate-400">Agent editor</p>
       <h1 class="mt-1 text-2xl font-semibold text-white">{agent?.display_name ?? agent?.name ?? 'Agent'}</h1>
     </div>
+    {#if agent && !agent.personality_synced}
+      <div class="rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-4 text-sm text-amber-100">
+        <div class="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <p class="font-medium">Personality was not synced to Mnemory.</p>
+            <p class="mt-1 text-amber-50/90">{agent.personality_sync_error ?? 'Retry the sync to bootstrap this agent into memory.'}</p>
+          </div>
+          <Button size="sm" variant="secondary" onclick={retrySyncPersonality}>Retry sync</Button>
+        </div>
+      </div>
+    {/if}
     <AgentForm mode="edit" {form} {tools} {workflows} {providers} {saving} {error} onSave={saveAgent} onTestMcp={testMcp} {mcpTesting} {mcpTestResult} />
   </section>
 {/if}

@@ -420,6 +420,26 @@ async def list_conversations(session: AsyncSession, user_email: str) -> list[Con
     return list(result.scalars().all())
 
 
+async def get_latest_active_conversation_for_agent(
+    session: AsyncSession, user_email: str, agent_id: str
+) -> Conversation | None:
+    """Return the most recent active conversation for one user/agent pair."""
+
+    result = await session.execute(
+        select(Conversation)
+        .where(Conversation.user_email == user_email)
+        .where(Conversation.agent_id == agent_id)
+        .where(Conversation.status == "active")
+        .order_by(
+            Conversation.last_message_at.desc().nullslast(),
+            Conversation.updated_at.desc(),
+            Conversation.conversation_id.asc(),
+        )
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
 async def update_conversation(
     session: AsyncSession,
     conversation_id: str,

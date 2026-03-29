@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { beforeNavigate } from '$app/navigation';
   import { onMount } from 'svelte';
 
   import { api, asApiError } from '$lib/api/client';
@@ -6,6 +7,9 @@
   import Button from '$lib/components/ui/Button.svelte';
   import Card from '$lib/components/ui/Card.svelte';
   import Input from '$lib/components/ui/Input.svelte';
+  import { confirmAction } from '$lib/stores/confirm';
+  import { addToast } from '$lib/stores/toasts';
+  import { blockNavigationIfDirty, installBeforeUnloadGuard } from '$lib/navigation/unsaved';
   import {
     createEmptyStep,
     createEmptyWorkflowForm,
@@ -26,6 +30,29 @@
   let selectedWorkflow: Workflow | null = null;
   let form: WorkflowFormState = createEmptyWorkflowForm();
   let dragIndex = -1;
+  let initialSnapshot = JSON.stringify(form);
+
+  function isDirty(): boolean {
+    return JSON.stringify(form) !== initialSnapshot;
+  }
+
+  beforeNavigate((navigation) => {
+    if (saving) {
+      return;
+    }
+    blockNavigationIfDirty(navigation, isDirty);
+  });
+
+  async function confirmDiscardChanges(): Promise<boolean> {
+    if (!isDirty()) {
+      return true;
+    }
+    return confirmAction({
+      title: 'Discard unsaved workflow changes?',
+      message: 'Switching workflows will replace the current editor contents.',
+      confirmLabel: 'Discard changes'
+    });
+  }
 
   async function loadWorkflows(selectedId?: string): Promise<void> {
     loading = true;
@@ -40,6 +67,7 @@
         selectedWorkflow = null;
         form = createEmptyWorkflowForm();
       }
+      initialSnapshot = JSON.stringify(form);
     } catch (caughtError) {
       error = asApiError(caughtError).message;
     } finally {
@@ -47,16 +75,24 @@
     }
   }
 
-  function selectWorkflow(workflow: Workflow): void {
+  async function selectWorkflow(workflow: Workflow): Promise<void> {
+    if (!(await confirmDiscardChanges())) {
+      return;
+    }
     selectedWorkflow = workflow;
     form = workflowToFormState(workflow);
     error = '';
+    initialSnapshot = JSON.stringify(form);
   }
 
-  function newWorkflow(): void {
+  async function newWorkflow(): Promise<void> {
+    if (!(await confirmDiscardChanges())) {
+      return;
+    }
     selectedWorkflow = null;
     form = createEmptyWorkflowForm();
     error = '';
+    initialSnapshot = JSON.stringify(form);
   }
 
   async function duplicateSelectedWorkflow(): Promise<void> {
@@ -66,8 +102,11 @@
     try {
       const duplicated = await api.workflows.duplicate(selectedWorkflow.workflow_id);
       await loadWorkflows(duplicated.workflow_id);
+      addToast('Workflow duplicated.', 'success');
+      initialSnapshot = JSON.stringify(form);
     } catch (caughtError) {
       error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to duplicate workflow');
     }
   }
 
@@ -87,8 +126,11 @@
         const created = await api.workflows.create(payload);
         await loadWorkflows(created.workflow_id);
       }
+      addToast('Workflow saved.', 'success');
+      initialSnapshot = JSON.stringify(form);
     } catch (caughtError) {
       error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to save workflow');
     } finally {
       saving = false;
     }
@@ -98,12 +140,23 @@
     if (!selectedWorkflow || selectedWorkflow.is_system) {
       return;
     }
+    const confirmed = await confirmAction({
+      title: 'Delete workflow?',
+      message: 'This permanently removes the selected workflow definition.',
+      confirmLabel: 'Delete workflow'
+    });
+    if (!confirmed) {
+      return;
+    }
     try {
       await api.workflows.remove(selectedWorkflow.workflow_id);
-      newWorkflow();
+      await newWorkflow();
       await loadWorkflows();
+      addToast('Workflow deleted.', 'success');
+      initialSnapshot = JSON.stringify(form);
     } catch (caughtError) {
       error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to delete workflow');
     }
   }
 
@@ -142,13 +195,18 @@
       form = importWorkflowYaml(importText);
       selectedWorkflow = null;
       error = '';
+      addToast('Workflow imported into the editor.', 'success');
+      initialSnapshot = JSON.stringify(form);
     } catch (caughtError) {
       error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to import workflow');
     }
   }
 
   onMount(() => {
+    const cleanup = installBeforeUnloadGuard(isDirty);
     void loadWorkflows();
+    return cleanup;
   });
 </script>
 

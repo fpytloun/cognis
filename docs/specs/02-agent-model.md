@@ -7,6 +7,10 @@ capabilities. Agents are stored in the database and managed via the UI or API.
 They can be created through a wizard-like experience (character creator) or
 programmatically. Export/import as YAML is supported for GitOps workflows.
 
+For the MVP skill loader shipped in stage 15, `agent.skills` is stored inline
+as JSON with `items[*].tool_names` references to existing builtin/static tool
+names. MCP tool references are ignored in MVP and reserved for future phases.
+
 ## Agent Definition Schema
 
 ```python

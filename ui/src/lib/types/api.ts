@@ -136,6 +136,9 @@ export interface Agent {
   permissions: Record<string, unknown> | null;
   llm_config: Record<string, unknown> | null;
   execution: Record<string, unknown> | null;
+  personality_synced: boolean;
+  personality_sync_error: string | null;
+  personality_sync_checked_at: string | null;
   avatar_url: string | null;
   status: string;
   created_at: string | null;
@@ -505,6 +508,7 @@ export interface WebSocketErrorEvent {
   code: string;
   message: string;
   recoverable: boolean;
+  error_detail?: string | null;
   detail?: Record<string, unknown> | null;
 }
 

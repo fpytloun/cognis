@@ -105,6 +105,11 @@ POST   /api/v1/agents/:id/sync-personality   → Sync to Mnemory
 GET    /api/v1/agents/:id/card                → A2A Agent Card (deferred unless public discovery metadata is available)
 ```
 
+Agent responses also include read-only Mnemory bootstrap fields:
+- `personality_synced`
+- `personality_sync_error`
+- `personality_sync_checked_at`
+
 ### Sessions
 
 ```
@@ -196,6 +201,9 @@ GET    /api/v1/settings/:key                  → Get single setting
 PUT    /api/v1/settings/:key                  → Update setting (admin only)
 ```
 
+Unknown setting keys are rejected. Known settings validate value types against
+the seeded application schema.
+
 ### LLM Providers
 
 ```
@@ -266,6 +274,9 @@ Connections that do not send a valid auth message within the timeout are closed.
 {type: "ping"}
 ```
 
+The web client sends a heartbeat `ping` roughly every 30 seconds after the
+socket authenticates so stalled connections are detected proactively.
+
 ### Server → Client
 ```typescript
 // Streaming
@@ -305,7 +316,7 @@ Connections that do not send a valid auth message within the timeout are closed.
 {type: "session_recovered", conversation_id, session_id, reason}
 
 // Errors
-{type: "error", conversation_id?, code, message, recoverable}
+{type: "error", conversation_id?, code, message, recoverable, error_detail?, detail?}
 
 {type: "pong"}
 ```

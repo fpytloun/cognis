@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { goto } from '$app/navigation';
   import { page } from '$app/stores';
   import { onMount } from 'svelte';
 
@@ -7,6 +8,8 @@
   import Button from '$lib/components/ui/Button.svelte';
   import Card from '$lib/components/ui/Card.svelte';
   import Input from '$lib/components/ui/Input.svelte';
+  import { confirmAction } from '$lib/stores/confirm';
+  import { addToast } from '$lib/stores/toasts';
   import type { Agent, Conversation, Task, TaskDetail, Workflow } from '$lib/types/api';
 
   let loading = true;
@@ -115,8 +118,10 @@
         delivery_target: editForm.delivery_mode === 'specific_conversation' ? editForm.delivery_target : null
       });
       task = await api.tasks.detail(updatedTask.task_id);
+      addToast('Task updated.', 'success');
     } catch (caughtError) {
       error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to update task');
     } finally {
       saving = false;
     }
@@ -130,8 +135,10 @@
       await api.tasks.addDependency(task.task_id, dependencyTaskId, true);
       dependencyTaskId = '';
       task = await api.tasks.detail(task.task_id);
+      addToast('Dependency added.', 'success');
     } catch (caughtError) {
       error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to add dependency');
     }
   }
 
@@ -139,11 +146,21 @@
     if (!task) {
       return;
     }
+    const confirmed = await confirmAction({
+      title: 'Remove dependency?',
+      message: 'The task will no longer wait for this dependency before running.',
+      confirmLabel: 'Remove dependency'
+    });
+    if (!confirmed) {
+      return;
+    }
     try {
       await api.tasks.removeDependency(task.task_id, dependsOn);
       task = await api.tasks.detail(task.task_id);
+      addToast('Dependency removed.', 'success');
     } catch (caughtError) {
       error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to remove dependency');
     }
   }
 
@@ -214,6 +231,9 @@
   <section class="space-y-5">
     <div class="flex flex-wrap items-center justify-between gap-3">
       <div>
+        <div class="mb-3">
+          <Button size="sm" variant="secondary" onclick={() => goto('/tasks')}>Back to task board</Button>
+        </div>
         <p class="text-sm uppercase tracking-[0.25em] text-slate-400">Task detail</p>
         <h1 class="mt-1 text-2xl font-semibold text-white">{task.title}</h1>
       </div>

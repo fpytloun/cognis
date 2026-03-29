@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { DelegationTimelineItem } from '$lib/chat';
+  import { formatAbsoluteTime, formatRelativeTime } from '$lib/time';
 
   let { item } = $props<{ item: DelegationTimelineItem }>();
 
@@ -17,6 +18,9 @@
     <div>
       <p class="text-xs font-medium uppercase tracking-[0.25em] opacity-80">Delegation</p>
       <h3 class="mt-1 text-base font-semibold">{item.taskLabel}</h3>
+      <p class="mt-2 text-xs uppercase tracking-[0.2em] opacity-75" title={formatAbsoluteTime(item.timestamp)}>
+        {formatRelativeTime(item.timestamp)}
+      </p>
     </div>
     <span class="rounded-full border border-current/30 px-3 py-1 text-xs font-semibold uppercase tracking-[0.2em]">
       {item.status}

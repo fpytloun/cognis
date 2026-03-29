@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from time import perf_counter
 from typing import Any, cast
 
+from prometheus_client import Counter, Histogram
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cognis.models.config import ProviderHealth
@@ -24,6 +25,17 @@ from cognis.providers.circuit_breaker import CircuitBreaker
 from cognis.tools.builtin.system import StatusProvider, build_system_tool_handlers
 from cognis.tools.mcp import StdioMCPClient, mcp_tools_to_definitions
 from cognis.tools.registry import RegisteredTool, ToolExecutionContext, ToolRegistry
+
+EXECUTOR_SPAWN_TOTAL = Counter(
+    "cognis_executor_spawns_total",
+    "Executor spawn attempts",
+    labelnames=("outcome",),
+)
+EXECUTOR_SPAWN_DURATION = Histogram(
+    "cognis_executor_spawn_duration_seconds",
+    "Executor spawn duration",
+    labelnames=("outcome",),
+)
 
 
 @dataclass(slots=True)
@@ -138,6 +150,7 @@ class InProcessExecutorProvider:
     async def spawn(self, config: ExecutorConfig) -> ExecutorHandle:
         """Spawn a new in-process executor runtime."""
 
+        start = perf_counter()
         _validate_unique_server_names(config)
         handle = ExecutorHandle(
             executor_id=config.executor_id,
@@ -162,7 +175,16 @@ class InProcessExecutorProvider:
                 CircuitBreaker(failure_threshold=5, recovery_timeout=30.0),
                 config.metadata,
             )
+        except TimeoutError:
+            outcome = "timeout"
+            EXECUTOR_SPAWN_TOTAL.labels(outcome=outcome).inc()
+            EXECUTOR_SPAWN_DURATION.labels(outcome=outcome).observe(perf_counter() - start)
+            await _close_clients(mcp_clients)
+            raise
         except Exception:
+            outcome = "failure"
+            EXECUTOR_SPAWN_TOTAL.labels(outcome=outcome).inc()
+            EXECUTOR_SPAWN_DURATION.labels(outcome=outcome).observe(perf_counter() - start)
             await _close_clients(mcp_clients)
             raise
         self._active[handle.executor_id] = _ExecutorRuntime(
@@ -170,7 +192,8 @@ class InProcessExecutorProvider:
             connection=connection,
             mcp_clients=mcp_clients,
         )
-        # TODO: emit metrics for executor spawn timing/outcome.
+        EXECUTOR_SPAWN_TOTAL.labels(outcome="success").inc()
+        EXECUTOR_SPAWN_DURATION.labels(outcome="success").observe(perf_counter() - start)
         return handle
 
     async def get_executor(self, handle: ExecutorHandle) -> InProcessExecutorConnection:

@@ -12,7 +12,9 @@
     onPause,
     onResume,
     onCancel,
-    onSelect
+    onSelect,
+    onMoveUp,
+    onMoveDown
   } = $props<{
     task: Task;
     workflowName: string;
@@ -24,6 +26,8 @@
     onResume?: (() => void) | null;
     onCancel?: (() => void) | null;
     onSelect?: (() => void) | null;
+    onMoveUp?: (() => void) | null;
+    onMoveDown?: (() => void) | null;
   }>();
 </script>
 
@@ -40,6 +44,12 @@
 
   {#if task.description}
     <p class="mt-3 text-sm leading-6 text-slate-300">{task.description}</p>
+  {/if}
+
+  {#if task.result_summary}
+    <p class="mt-3 rounded-2xl border border-slate-800 bg-slate-950 px-3 py-2 text-xs leading-6 text-slate-300">
+      {task.result_summary}
+    </p>
   {/if}
 
   <dl class="mt-4 grid gap-3 text-xs text-slate-400">
@@ -72,6 +82,12 @@
     {/if}
     {#if onCancel}
       <Button size="sm" variant="danger" onclick={onCancel}>Cancel</Button>
+    {/if}
+    {#if onMoveUp}
+      <Button size="sm" variant="secondary" onclick={onMoveUp}>Move up</Button>
+    {/if}
+    {#if onMoveDown}
+      <Button size="sm" variant="secondary" onclick={onMoveDown}>Move down</Button>
     {/if}
   </div>
 </article>

@@ -54,6 +54,7 @@ class AuthenticationMiddleware(BaseHTTPMiddleware):
         auth_provider = app_state.auth_provider
         password_hasher = app_state.password_hasher
         session_factory = app_state.session_factory
+        api_rate_limiter = getattr(app_state, "api_rate_limiter", None)
 
         authorization = request.headers.get("Authorization")
         api_key_header = request.headers.get("X-API-Key")
@@ -77,6 +78,17 @@ class AuthenticationMiddleware(BaseHTTPMiddleware):
                 auth_type="jwt",
             )
             request.state.claims = claims
+            if api_rate_limiter is not None and not await api_rate_limiter.allow(
+                user_key=str(claims["sub"]),
+                path=request.url.path,
+                method=request.method,
+            ):
+                return JSONResponse(
+                    status_code=429,
+                    content=ErrorResponse(
+                        error=ErrorBody(code="rate_limited", message="API rate limit exceeded")
+                    ).model_dump(),
+                )
             try:
                 return await call_next(request)
             finally:
@@ -127,6 +139,17 @@ class AuthenticationMiddleware(BaseHTTPMiddleware):
                     email=user.email, role=user.role, name=user.name, auth_type="api_key"
                 )
                 context_token = current_user_email.set(user.email)
+                if api_rate_limiter is not None and not await api_rate_limiter.allow(
+                    user_key=user.email,
+                    path=request.url.path,
+                    method=request.method,
+                ):
+                    return JSONResponse(
+                        status_code=429,
+                        content=ErrorResponse(
+                            error=ErrorBody(code="rate_limited", message="API rate limit exceeded")
+                        ).model_dump(),
+                    )
                 try:
                     return await call_next(request)
                 finally:

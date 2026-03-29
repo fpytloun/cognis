@@ -1,0 +1,49 @@
+<script lang="ts">
+  import { AlertCircle, CheckCircle2, Info, TriangleAlert } from 'lucide-svelte';
+
+  import { removeToast, toastStore, type ToastItem } from '$lib/stores/toasts';
+
+  const variants = {
+    success: {
+      className: 'border-emerald-500/40 bg-emerald-500/15 text-emerald-50',
+      icon: CheckCircle2
+    },
+    error: {
+      className: 'border-rose-500/40 bg-rose-500/15 text-rose-50',
+      icon: AlertCircle
+    },
+    warning: {
+      className: 'border-amber-500/40 bg-amber-500/15 text-amber-50',
+      icon: TriangleAlert
+    },
+    info: {
+      className: 'border-sky-500/40 bg-sky-500/15 text-sky-50',
+      icon: Info
+    }
+  } as const;
+
+  function variantConfig(toast: ToastItem) {
+    return variants[toast.variant];
+  }
+</script>
+
+{#if $toastStore.length > 0}
+  <div aria-live="polite" class="pointer-events-none fixed right-4 top-4 z-[80] flex w-[min(22rem,calc(100vw-2rem))] flex-col gap-3">
+    {#each $toastStore as toast (toast.id)}
+      {@const config = variantConfig(toast)}
+      <button
+        class={`pointer-events-auto flex w-full items-start gap-3 rounded-2xl border px-4 py-3 text-left shadow-card backdrop-blur transition hover:translate-y-[-1px] ${config.className}`}
+        onclick={() => removeToast(toast.id)}
+        type="button"
+      >
+        <svelte:component this={config.icon} class="mt-0.5 h-5 w-5 shrink-0" />
+        <div class="min-w-0 flex-1">
+          {#if toast.title}
+            <p class="font-medium">{toast.title}</p>
+          {/if}
+          <p class={`text-sm leading-6 ${toast.title ? 'mt-1 opacity-90' : ''}`}>{toast.message}</p>
+        </div>
+      </button>
+    {/each}
+  </div>
+{/if}

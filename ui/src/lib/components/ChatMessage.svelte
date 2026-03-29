@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { MessageTimelineItem } from '$lib/chat';
+  import { formatAbsoluteTime, formatRelativeTime } from '$lib/time';
 
   let { item } = $props<{ item: MessageTimelineItem }>();
 
@@ -20,7 +21,10 @@
   {/if}
 
   <div class="mt-3 flex items-center justify-between gap-4 text-[11px] uppercase tracking-[0.2em] opacity-70">
-    <span>{item.role}</span>
+    <div class="flex items-center gap-3">
+      <span>{item.role}</span>
+      <span title={formatAbsoluteTime(item.timestamp)}>{formatRelativeTime(item.timestamp)}</span>
+    </div>
     {#if item.streaming}
       <span>streaming</span>
     {/if}

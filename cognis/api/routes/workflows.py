@@ -24,6 +24,45 @@ from cognis.store.queries import (
 router = APIRouter(prefix="/api/v1/workflows", tags=["workflows"])
 
 
+def _parse_step_inputs(step: dict[str, object]) -> list[str]:
+    raw_input = step.get("input", [])
+    if isinstance(raw_input, list):
+        return [value for value in raw_input if isinstance(value, str) and value.strip()]
+    return []
+
+
+def _validate_workflow_steps(steps: list[dict[str, object]]) -> None:
+    if not steps:
+        raise api_exception(400, "validation_error", "Workflow must contain at least one step")
+
+    seen_names: set[str] = set()
+    prior_names: list[str] = []
+    for index, step in enumerate(steps, start=1):
+        name = step.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise api_exception(400, "validation_error", f"Workflow step {index} is missing a name")
+        if name in seen_names:
+            raise api_exception(400, "validation_error", f"Duplicate workflow step: {name}")
+        for input_name in _parse_step_inputs(step):
+            if input_name not in prior_names:
+                raise api_exception(
+                    400,
+                    "validation_error",
+                    f"Workflow step {name} references missing or later input: {input_name}",
+                )
+        seen_names.add(name)
+        prior_names.append(name)
+
+
+def _validate_workflow_payload(definition: dict[str, object]) -> None:
+    steps = definition.get("steps")
+    if not isinstance(steps, list):
+        raise api_exception(400, "validation_error", "Workflow steps must be a list")
+    if not all(isinstance(step, dict) for step in steps):
+        raise api_exception(400, "validation_error", "Workflow steps must be objects")
+    _validate_workflow_steps([step for step in steps if isinstance(step, dict)])
+
+
 @router.get("", response_model=CursorPage[WorkflowResponse])
 async def workflow_list(
     request: Request,
@@ -60,6 +99,7 @@ async def workflow_create(request: Request, payload: WorkflowRequest) -> Workflo
         "is_system": False,
         "owner_email": user.email,
     }
+    _validate_workflow_payload(definition)
     async with request.app.state.session_factory() as session:
         row = await create_workflow(
             session,
@@ -110,6 +150,7 @@ async def workflow_update_route(
         definition = dict(row.definition or {})
         updates = payload.model_dump(exclude_none=True)
         definition.update(updates)
+        _validate_workflow_payload(definition)
         ok = await update_workflow(
             session,
             workflow_id,
@@ -164,6 +205,7 @@ async def workflow_duplicate(request: Request, workflow_id: str) -> WorkflowResp
     definition["name"] = f"{workflow.name} Copy"
     definition["is_system"] = False
     definition["owner_email"] = user.email
+    _validate_workflow_payload(definition)
 
     async with request.app.state.session_factory() as session:
         new_row = await create_workflow(

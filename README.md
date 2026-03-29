@@ -26,6 +26,8 @@ Part of the [Openclaw](https://github.com/openclaw) ecosystem: Cognis controller
 - **Decision Engine** -- Deterministic rules + lightweight LLM classifier decide whether a request runs inline or gets delegated to a background sub-session.
 - **Context management** -- Parallel context assembly (Mnemory recall + Intaris events + intention read via `asyncio.gather`). LLM-based compaction with mechanical fallback for long conversations.
 - **Web UI** -- SvelteKit application served by Cognis on `:8080` by default, with setup flow, diagnostics, provider presets, and account management.
+- **Polished workspace UX** -- Global toasts, confirmation dialogs, keyboard shortcuts, mobile navigation, chat timestamps, and unsaved-change protection.
+- **Degraded-mode guidance** -- Provider outage banners, setup-incomplete states, retry affordances, and contextual chat/task failure messaging.
 - **CLI** -- Typer-based CLI for server management and administration.
 - **Quick local bootstrap** -- `uvx cognis` creates local keys and a SQLite database, then serves the web UI on `:8080`.
 - **JWT service auth** -- Cognis issues ES256 JWTs. Mnemory and Intaris validate them. No API keys between services.

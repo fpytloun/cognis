@@ -8,6 +8,9 @@
   import Button from '$lib/components/ui/Button.svelte';
   import Card from '$lib/components/ui/Card.svelte';
   import Input from '$lib/components/ui/Input.svelte';
+  import { confirmAction } from '$lib/stores/confirm';
+  import { addToast } from '$lib/stores/toasts';
+  import { workspaceHealth } from '$lib/system';
   import { TASK_BOARD_COLUMNS, boardColumnForStatus, matchesTaskFilters, sortTasks, type TaskFilterState, type TaskBoardColumnId } from '$lib/tasks';
   import type { Agent, Conversation, Task, Workflow } from '$lib/types/api';
 
@@ -39,6 +42,11 @@
     delivery_mode: 'same_conversation',
     delivery_target: ''
   };
+
+  function isLlmUnavailableForSetup(): boolean {
+    const llmDetails = JSON.stringify($workspaceHealth.health?.providers?.llm ?? {}).toLowerCase();
+    return llmDetails.includes('no llm model configured') || llmDetails.includes('not configured');
+  }
 
   function workflowName(workflowId: string | null): string {
     if (!workflowId) {
@@ -111,6 +119,14 @@
   }
 
   async function createDraftTask(): Promise<void> {
+    if (!draftForm.title.trim()) {
+      error = 'Task title is required.';
+      return;
+    }
+    if (!draftForm.agent_id) {
+      error = 'Select an agent for the task.';
+      return;
+    }
     creating = true;
     error = '';
     try {
@@ -131,8 +147,10 @@
         delivery_target: ''
       };
       await refreshTasksOnly();
+      addToast('Draft task created.', 'success');
     } catch (caughtError) {
       error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to create draft');
     } finally {
       creating = false;
     }
@@ -152,12 +170,24 @@
       await api.tasks.batchSubmit(selectedDraftIds);
       selectedDraftIds = [];
       await refreshTasksOnly();
+      addToast('Selected drafts submitted.', 'success');
     } catch (caughtError) {
       error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to submit drafts');
     }
   }
 
   async function changeTaskState(taskId: string, action: 'submit' | 'pause' | 'resume' | 'cancel'): Promise<void> {
+    if (action === 'cancel') {
+      const confirmed = await confirmAction({
+        title: 'Cancel task?',
+        message: 'This stops the task and marks it as cancelled.',
+        confirmLabel: 'Cancel task'
+      });
+      if (!confirmed) {
+        return;
+      }
+    }
     try {
       if (action === 'submit') {
         await api.tasks.submit(taskId);
@@ -169,25 +199,27 @@
         await api.tasks.cancel(taskId);
       }
       await refreshTasksOnly();
+      addToast(`Task ${action} completed.`, 'success');
     } catch (caughtError) {
       error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to update task');
     }
   }
 
-  async function reorderWithinColumn(targetTaskId: string, columnId: TaskBoardColumnId): Promise<void> {
+  async function reorderWithinColumn(targetTaskId: string, columnId: TaskBoardColumnId, sourceTaskId = dragState?.taskId ?? ''): Promise<void> {
     if (filtersActive()) {
       dragState = null;
       error = 'Clear active filters before reordering priorities.';
       return;
     }
-    if (!dragState || dragState.column !== columnId || dragState.taskId === targetTaskId) {
+    if (!sourceTaskId || (dragState && dragState.column !== columnId) || sourceTaskId === targetTaskId) {
       dragState = null;
       return;
     }
 
     const previousTasks = [...tasks];
     const columnTasks = tasksForColumn(columnId);
-    const sourceIndex = columnTasks.findIndex((task) => task.task_id === dragState?.taskId);
+    const sourceIndex = columnTasks.findIndex((task) => task.task_id === sourceTaskId);
     const targetIndex = columnTasks.findIndex((task) => task.task_id === targetTaskId);
     if (sourceIndex < 0 || targetIndex < 0) {
       dragState = null;
@@ -216,6 +248,16 @@
     } finally {
       dragState = null;
     }
+  }
+
+  async function moveTaskByOffset(taskId: string, columnId: TaskBoardColumnId, offset: -1 | 1): Promise<void> {
+    const columnTasks = tasksForColumn(columnId);
+    const currentIndex = columnTasks.findIndex((task) => task.task_id === taskId);
+    const target = columnTasks[currentIndex + offset];
+    if (currentIndex < 0 || !target) {
+      return;
+    }
+    await reorderWithinColumn(target.task_id, columnId, taskId);
   }
 
   onMount(() => {
@@ -250,6 +292,24 @@
   <LoadingState label="Loading task board" description="Fetching draft, queued, running, paused, and completed work items." />
 {:else}
   <section class="space-y-5">
+    {#if agents.length === 0}
+      <Card class="p-5">
+        <p class="text-sm font-medium text-white">Create an agent before using the task board.</p>
+        <p class="mt-2 text-sm leading-6 text-slate-400">Tasks need an execution agent and workflow before they can be queued.</p>
+        <div class="mt-4">
+          <Button onclick={() => goto('/agents/new')}>Create agent</Button>
+        </div>
+      </Card>
+    {:else if isLlmUnavailableForSetup()}
+      <Card class="p-5">
+        <p class="text-sm font-medium text-white">Configure an LLM provider before submitting tasks.</p>
+        <p class="mt-2 text-sm leading-6 text-slate-400">Background workflows need a configured provider to execute.</p>
+        <div class="mt-4">
+          <Button onclick={() => goto('/settings?tab=providers')}>Open providers</Button>
+        </div>
+      </Card>
+    {/if}
+
     <div class="flex flex-wrap items-center justify-between gap-3">
       <div>
         <p class="text-sm uppercase tracking-[0.25em] text-slate-400">Workflow queue</p>
@@ -306,7 +366,8 @@
       {/if}
     </Card>
 
-    <div class="grid gap-4 xl:grid-cols-5">
+    <div class="overflow-x-auto">
+      <div class="grid min-w-[1200px] gap-4 xl:grid-cols-5">
       {#each TASK_BOARD_COLUMNS as column}
         <section class="flex min-h-[720px] flex-col rounded-3xl border border-slate-800/80 bg-slate-900/70 p-4 shadow-card">
           <div class="mb-4 flex items-center justify-between gap-2">
@@ -377,12 +438,15 @@
                   onPause={task.status === 'running' ? () => changeTaskState(task.task_id, 'pause') : null}
                   onResume={task.status === 'paused' ? () => changeTaskState(task.task_id, 'resume') : null}
                   onCancel={['queued', 'ready', 'running', 'paused', 'draft'].includes(task.status) ? () => changeTaskState(task.task_id, 'cancel') : null}
+                  onMoveUp={!filtersActive() ? () => moveTaskByOffset(task.task_id, column.id, -1) : null}
+                  onMoveDown={!filtersActive() ? () => moveTaskByOffset(task.task_id, column.id, 1) : null}
                 />
               </div>
             {/each}
           </div>
         </section>
       {/each}
+      </div>
     </div>
   </section>
 {/if}

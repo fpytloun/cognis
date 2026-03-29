@@ -1,0 +1,57 @@
+"""Validation helpers for DB-backed application settings."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from cognis.bootstrap import DEFAULT_SETTINGS
+
+_POSITIVE_INT_KEYS = {
+    "security.api_read_requests_per_minute",
+    "security.api_write_requests_per_minute",
+}
+
+
+def known_setting_keys() -> set[str]:
+    return set(DEFAULT_SETTINGS)
+
+
+def setting_category(key: str) -> str:
+    if key not in DEFAULT_SETTINGS:
+        raise ValueError("Unknown setting key")
+    return DEFAULT_SETTINGS[key][0]
+
+
+def validate_setting_value(key: str, value: Any) -> None:
+    if key not in DEFAULT_SETTINGS:
+        raise ValueError(f"Unknown setting key: {key}")
+
+    expected = DEFAULT_SETTINGS[key][1]
+    if isinstance(expected, bool):
+        if not isinstance(value, bool):
+            raise ValueError(f"Setting {key} must be a boolean")
+        return
+    if isinstance(expected, int):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"Setting {key} must be an integer")
+        if key in _POSITIVE_INT_KEYS and value <= 0:
+            raise ValueError(f"Setting {key} must be greater than zero")
+        return
+    if isinstance(expected, float):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"Setting {key} must be a number")
+        return
+    if isinstance(expected, str):
+        if not isinstance(value, str):
+            raise ValueError(f"Setting {key} must be a string")
+        return
+    if isinstance(expected, list):
+        if not isinstance(value, list):
+            raise ValueError(f"Setting {key} must be a list")
+        if (
+            expected
+            and all(isinstance(item, str) for item in expected)
+            and not all(isinstance(item, str) for item in value)
+        ):
+            raise ValueError(f"Setting {key} must be a list of strings")
+        return

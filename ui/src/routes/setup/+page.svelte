@@ -127,7 +127,7 @@
 
         <form class="space-y-4" onsubmit={handleSubmit}>
           <label class="block space-y-2 text-sm font-medium text-slate-200">
-            <span>Email</span>
+            <span>Email <span class="text-rose-300">*</span></span>
             <Input bind:value={form.email} type="email" placeholder="admin@example.com" />
           </label>
           <label class="block space-y-2 text-sm font-medium text-slate-200">
@@ -135,11 +135,11 @@
             <Input bind:value={form.name} placeholder="Admin" />
           </label>
           <label class="block space-y-2 text-sm font-medium text-slate-200">
-            <span>Password</span>
+            <span>Password <span class="text-rose-300">*</span></span>
             <Input bind:value={form.password} type="password" placeholder="••••••••" />
           </label>
           <label class="block space-y-2 text-sm font-medium text-slate-200">
-            <span>Confirm password</span>
+            <span>Confirm password <span class="text-rose-300">*</span></span>
             <Input bind:value={form.confirmPassword} type="password" placeholder="••••••••" />
           </label>
 

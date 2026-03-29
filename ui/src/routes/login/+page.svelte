@@ -40,9 +40,9 @@
   <title>Log In · Cognis</title>
 </svelte:head>
 
-<div class="mx-auto flex min-h-screen max-w-6xl items-center justify-center px-6 py-16">
+<div class="mx-auto flex min-h-screen max-w-6xl items-center justify-center px-4 py-10 sm:px-6 sm:py-16">
   <Card class="grid w-full max-w-5xl overflow-hidden lg:grid-cols-[1.2fr_0.8fr]">
-    <section class="hidden border-r border-slate-800/80 bg-slate-950/80 p-10 lg:block">
+    <section class="border-b border-slate-800/80 bg-slate-950/80 p-8 lg:block lg:border-b-0 lg:border-r lg:p-10">
       <p class="text-sm font-medium uppercase tracking-[0.3em] text-sky-300">Cognis</p>
       <h1 class="mt-6 text-4xl font-semibold leading-tight text-white">
         Decoupled control plane for safe, streaming agent workflows.
@@ -66,12 +66,12 @@
 
         <form class="space-y-5" onsubmit={handleSubmit}>
           <label class="block space-y-2 text-sm font-medium text-slate-200">
-            <span>Email</span>
+            <span>Email <span class="text-rose-300">*</span></span>
             <Input bind:value={email} name="email" type="email" placeholder="admin@example.com" />
           </label>
 
           <label class="block space-y-2 text-sm font-medium text-slate-200">
-            <span>Password</span>
+            <span>Password <span class="text-rose-300">*</span></span>
             <Input bind:value={password} name="password" type="password" placeholder="••••••••" />
           </label>
 

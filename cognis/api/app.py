@@ -48,7 +48,7 @@ from cognis.core.workflow_registry import WorkflowRegistry
 from cognis.logging import get_logger, setup_logging
 from cognis.providers.auth.jwt import JWTAuthProvider
 from cognis.providers.registry import build_provider_registry
-from cognis.security import LoginRateLimiter, create_password_hasher
+from cognis.security import LoginRateLimiter, RequestRateLimiter, create_password_hasher
 from cognis.ui_assets import SPAStaticFiles, resolve_ui_build_dir
 
 
@@ -135,6 +135,12 @@ def create_app() -> FastAPI:
             app.state.ws_auth_timeout_seconds = _as_int(
                 await get_setting_value(session, "security.ws_auth_timeout_seconds", 10), 10
             )
+            api_read_requests_per_minute = _as_int(
+                await get_setting_value(session, "security.api_read_requests_per_minute", 60), 60
+            )
+            api_write_requests_per_minute = _as_int(
+                await get_setting_value(session, "security.api_write_requests_per_minute", 20), 20
+            )
             cache_max_entries = _as_int(
                 await get_setting_value(session, "session.cache_max_entries", 200), 200
             )
@@ -152,8 +158,11 @@ def create_app() -> FastAPI:
                     )
                 sys.stdout.flush()
 
+        event_bus = EventBus()
         session_cache = SessionCache(providers.guardrails, max_entries=cache_max_entries)
-        session_manager = SessionManager(session_factory, providers, session_cache)
+        session_manager = SessionManager(
+            session_factory, providers, session_cache, event_bus=event_bus
+        )
         context_assembler = await ContextAssembler.from_session_factory(
             session_factory=session_factory,
             memory=providers.memory,
@@ -172,7 +181,6 @@ def create_app() -> FastAPI:
             session_factory=session_factory,
             llm=providers.llm,
         )
-        event_bus = EventBus()
         pause_waiter = PauseWaiter()
         session_lock = SessionLock()
         tool_router = await ToolRouter.from_session_factory(providers.guardrails, session_factory)
@@ -234,6 +242,10 @@ def create_app() -> FastAPI:
         app.state.auth_provider = auth_provider
         app.state.providers = providers
         app.state.login_rate_limiter = LoginRateLimiter()
+        app.state.api_rate_limiter = RequestRateLimiter(
+            read_requests_per_minute=api_read_requests_per_minute,
+            write_requests_per_minute=api_write_requests_per_minute,
+        )
         app.state.provider_test_results = {}
         app.state.provider_test_cooldowns = {}
         app.state.remember_queue = remember_queue

@@ -21,6 +21,7 @@ from cognis.api.models import (
     SettingUpdateRequest,
 )
 from cognis.api.serializers import llm_provider_to_response, setting_to_response
+from cognis.settings_schema import setting_category, validate_setting_value
 from cognis.store.queries import (
     create_llm_provider,
     delete_llm_provider,
@@ -77,7 +78,11 @@ async def setting_update(
     request: Request, key: str, payload: SettingUpdateRequest
 ) -> SettingResponse:
     user = require_admin(request)
-    category = key.split(".", 1)[0] if "." in key else "general"
+    try:
+        validate_setting_value(key, payload.value)
+        category = setting_category(key)
+    except ValueError as exc:
+        raise api_exception(400, "validation_error", str(exc)) from exc
     async with request.app.state.session_factory() as session:
         row = await upsert_setting(
             session,
@@ -88,6 +93,14 @@ async def setting_update(
         )
         await session.commit()
         await session.refresh(row)
+    if key == "security.api_read_requests_per_minute":
+        request.app.state.api_rate_limiter.update_limits(
+            read_requests_per_minute=int(payload.value)
+        )
+    elif key == "security.api_write_requests_per_minute":
+        request.app.state.api_rate_limiter.update_limits(
+            write_requests_per_minute=int(payload.value)
+        )
     return setting_to_response(row)
 
 

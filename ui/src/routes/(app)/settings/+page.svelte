@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { goto } from '$app/navigation';
+  import { beforeNavigate, goto } from '$app/navigation';
   import { onMount } from 'svelte';
 
   import { api, asApiError } from '$lib/api/client';
@@ -11,6 +11,9 @@
   import Card from '$lib/components/ui/Card.svelte';
   import Input from '$lib/components/ui/Input.svelte';
   import { getIntarisUiUrl, getMnemoryUiUrl } from '$lib/config';
+  import { confirmAction } from '$lib/stores/confirm';
+  import { addToast } from '$lib/stores/toasts';
+  import { blockNavigationIfDirty, installBeforeUnloadGuard } from '$lib/navigation/unsaved';
   import { auth } from '$lib/stores/auth';
   import type {
     ApiKeyCreateResponse,
@@ -52,6 +55,7 @@
   let createdApiKey: ApiKeyCreateResponse | null = null;
   let newApiKeyName = '';
   let newApiKeyExpiresInDays = '';
+  let initialSnapshot = '';
 
   let routingForm = {
     default: '',
@@ -75,6 +79,43 @@
     confirm_password: ''
   };
 
+  function snapshotState(): string {
+    return JSON.stringify({
+      providerForm,
+      routingForm,
+      secretForm,
+      passwordForm,
+      newApiKeyName,
+      newApiKeyExpiresInDays,
+      selectedSettingKey,
+      settingValueText,
+      selectedProviderId,
+      activeTab
+    });
+  }
+
+  function isDirty(): boolean {
+    return snapshotState() !== initialSnapshot;
+  }
+
+  beforeNavigate((navigation) => {
+    if (busy) {
+      return;
+    }
+    blockNavigationIfDirty(navigation, isDirty);
+  });
+
+  async function confirmDiscardChanges(): Promise<boolean> {
+    if (!isDirty()) {
+      return true;
+    }
+    return confirmAction({
+      title: 'Discard unsaved changes?',
+      message: 'Switching tabs or providers will replace the current unsaved edits.',
+      confirmLabel: 'Discard changes'
+    });
+  }
+
   function syncTabFromUrl(): void {
     const url = new URL(window.location.href);
     const tab = url.searchParams.get('tab');
@@ -83,11 +124,15 @@
     }
   }
 
-  function setActiveTab(tab: SettingsTab): void {
+  async function setActiveTab(tab: SettingsTab): Promise<void> {
+    if (!(await confirmDiscardChanges())) {
+      return;
+    }
     activeTab = tab;
     const url = new URL(window.location.href);
     url.searchParams.set('tab', tab);
     window.history.replaceState({}, '', url);
+    initialSnapshot = snapshotState();
   }
 
   function groupedSettings(): Setting[] {
@@ -134,22 +179,38 @@
     }
   }
 
-  function selectProvider(provider: LLMProvider): void {
+  function applySelectedProvider(provider: LLMProvider): void {
     selectedProviderId = provider.provider_id;
     providerForm = createProviderForm(provider);
     providerTestResult = provider.last_test;
   }
 
-  function resetProviderForm(): void {
+  async function selectProvider(provider: LLMProvider): Promise<void> {
+    if (!(await confirmDiscardChanges())) {
+      return;
+    }
+    applySelectedProvider(provider);
+    initialSnapshot = snapshotState();
+  }
+
+  function clearProviderSelection(): void {
     selectedProviderId = '';
     providerForm = createProviderForm();
     providerTestResult = null;
   }
 
-  function prefillSecretForPreset(): void {
+  async function resetProviderForm(): Promise<void> {
+    if (!(await confirmDiscardChanges())) {
+      return;
+    }
+    clearProviderSelection();
+    initialSnapshot = snapshotState();
+  }
+
+  async function prefillSecretForPreset(): Promise<void> {
     const name = providerForm.preset === 'anthropic' ? 'anthropic_api_key' : 'openai_api_key';
     secretForm = { ...secretForm, name, description: `${providerForm.display_name || providerForm.provider_id} credential` };
-    setActiveTab('secrets');
+    await setActiveTab('secrets');
   }
 
   async function refreshPageState(): Promise<void> {
@@ -180,9 +241,10 @@
     if (selectedProviderId) {
       const next = providers.find((provider) => provider.provider_id === selectedProviderId);
       if (next) {
-        selectProvider(next);
+        applySelectedProvider(next);
       }
     }
+    initialSnapshot = snapshotState();
   }
 
   async function loadSettings(): Promise<void> {
@@ -192,6 +254,7 @@
     try {
       await refreshPageState();
       syncTabFromUrl();
+      initialSnapshot = snapshotState();
     } catch (caughtError) {
       error = asApiError(caughtError).message;
     } finally {
@@ -200,6 +263,18 @@
   }
 
   async function saveProvider(): Promise<void> {
+    if (!providerForm.provider_id.trim() || !providerForm.display_name.trim()) {
+      error = 'Provider ID and display name are required.';
+      return;
+    }
+    if (providerForm.preset === 'custom') {
+      try {
+        JSON.parse(providerForm.custom_json || '{}');
+      } catch {
+        error = 'Provider config JSON must be valid.';
+        return;
+      }
+    }
     busy = true;
     error = '';
     notice = '';
@@ -212,23 +287,37 @@
       }
       await refreshPageState();
       notice = 'Provider saved.';
+      addToast('Provider saved.', 'success');
+      initialSnapshot = snapshotState();
     } catch (caughtError) {
       error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to save provider');
     } finally {
       busy = false;
     }
   }
 
   async function deleteProvider(providerId: string): Promise<void> {
+    const confirmed = await confirmAction({
+      title: 'Delete provider?',
+      message: 'This removes the configured provider from Cognis.',
+      confirmLabel: 'Delete provider'
+    });
+    if (!confirmed) {
+      return;
+    }
     busy = true;
     error = '';
     try {
       await api.llmProviders.remove(providerId);
-      resetProviderForm();
+      clearProviderSelection();
       await refreshPageState();
       notice = 'Provider removed.';
+      addToast('Provider removed.', 'success');
+      initialSnapshot = snapshotState();
     } catch (caughtError) {
       error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to delete provider');
     } finally {
       busy = false;
     }
@@ -243,14 +332,22 @@
       providerTestResult = result;
       await refreshPageState();
       notice = result.ok ? 'Provider test succeeded.' : 'Provider test failed.';
+      addToast(notice, result.ok ? 'success' : 'warning');
     } catch (caughtError) {
       error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to test provider');
     } finally {
       busy = false;
     }
   }
 
   async function saveRouting(): Promise<void> {
+    try {
+      JSON.parse(routingForm.extraJson || '{}');
+    } catch {
+      error = 'Additional task routes must be valid JSON.';
+      return;
+    }
     busy = true;
     error = '';
     try {
@@ -262,8 +359,11 @@
         items: JSON.parse(routingForm.extraJson || '{}')
       });
       notice = 'Model routing updated.';
+      addToast('Model routing updated.', 'success');
+      initialSnapshot = snapshotState();
     } catch (caughtError) {
       error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to save routing');
     } finally {
       busy = false;
     }
@@ -282,6 +382,10 @@
   }
 
   async function saveSecret(): Promise<void> {
+    if (!secretForm.name.trim() || !secretForm.value.trim()) {
+      error = 'Secret name and value are required.';
+      return;
+    }
     busy = true;
     error = '';
     try {
@@ -295,22 +399,36 @@
       secretForm = { ...secretForm, name: '', value: '', agent_id: '', description: '' };
       secrets = await api.secrets.list();
       notice = 'Secret saved.';
+      addToast('Secret saved.', 'success');
+      initialSnapshot = snapshotState();
     } catch (caughtError) {
       error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to save secret');
     } finally {
       busy = false;
     }
   }
 
   async function deleteSecret(secret: SecretMetadata): Promise<void> {
+    const confirmed = await confirmAction({
+      title: 'Delete secret?',
+      message: `Delete ${secret.name}? The secret value cannot be recovered after deletion.`,
+      confirmLabel: 'Delete secret'
+    });
+    if (!confirmed) {
+      return;
+    }
     busy = true;
     error = '';
     try {
       await api.secrets.remove(secret.name, secret.scope, secret.agent_id);
       secrets = await api.secrets.list();
       notice = 'Secret deleted.';
+      addToast('Secret deleted.', 'success');
+      initialSnapshot = snapshotState();
     } catch (caughtError) {
       error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to delete secret');
     } finally {
       busy = false;
     }
@@ -322,14 +440,23 @@
   }
 
   async function saveSetting(): Promise<void> {
+    try {
+      JSON.parse(settingValueText);
+    } catch {
+      error = 'Setting value must be valid JSON.';
+      return;
+    }
     busy = true;
     error = '';
     try {
       await api.settings.update(selectedSettingKey, JSON.parse(settingValueText));
       settings = await api.settings.list();
       notice = 'Setting updated.';
+      addToast('Setting updated.', 'success');
+      initialSnapshot = snapshotState();
     } catch (caughtError) {
       error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to save setting');
     } finally {
       busy = false;
     }
@@ -344,6 +471,7 @@
       window.open(url.toString(), '_blank', 'noopener,noreferrer');
     } catch (caughtError) {
       error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to open linked UI');
     }
   }
 
@@ -361,14 +489,21 @@
       });
       passwordForm = { current_password: '', new_password: '', confirm_password: '' };
       notice = 'Password updated.';
+      addToast('Password updated.', 'success');
+      initialSnapshot = snapshotState();
     } catch (caughtError) {
       error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to change password');
     } finally {
       busy = false;
     }
   }
 
   async function createApiKey(): Promise<void> {
+    if (!newApiKeyName.trim()) {
+      error = 'API key name is required.';
+      return;
+    }
     busy = true;
     error = '';
     try {
@@ -380,29 +515,45 @@
       newApiKeyName = '';
       newApiKeyExpiresInDays = '';
       notice = 'API key created. Copy it now — it will not be shown again.';
+      addToast('API key created. Copy it now.', 'success');
+      initialSnapshot = snapshotState();
     } catch (caughtError) {
       error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to create API key');
     } finally {
       busy = false;
     }
   }
 
   async function revokeApiKey(keyId: string): Promise<void> {
+    const confirmed = await confirmAction({
+      title: 'Revoke API key?',
+      message: 'The selected API key will stop working immediately.',
+      confirmLabel: 'Revoke key'
+    });
+    if (!confirmed) {
+      return;
+    }
     busy = true;
     error = '';
     try {
       await api.auth.revokeApiKey(keyId);
       apiKeys = await api.auth.listApiKeys();
       notice = 'API key revoked.';
+      addToast('API key revoked.', 'success');
+      initialSnapshot = snapshotState();
     } catch (caughtError) {
       error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to revoke API key');
     } finally {
       busy = false;
     }
   }
 
   onMount(() => {
+    const cleanup = installBeforeUnloadGuard(isDirty);
     void loadSettings();
+    return cleanup;
   });
 </script>
 

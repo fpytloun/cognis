@@ -12,6 +12,7 @@ from cognis.providers.executor.in_process import InProcessExecutorConnection
 from cognis.tools.builtin.orchestration import orchestration_tools
 from cognis.tools.builtin.system import system_tools
 from cognis.tools.registry import RegisteredTool, ToolRegistry
+from cognis.tools.skills import load_skill_tool_names
 
 RuntimeFactory = Callable[
     [AgentDefinition, str], Awaitable[tuple[ToolRegistry, Any, Callable[[], Awaitable[None]]]]
@@ -35,6 +36,7 @@ def select_static_tools(agent: Any | None = None) -> list[ToolDefinition]:
 
     builtin_allow = agent.tools.get("builtin_tools")
     allowlist = builtin_allow if isinstance(builtin_allow, list) else None
+    skill_tool_names = load_skill_tool_names(agent)
     allow_all_builtins = allowlist is None or "*" in allowlist
     delegation_enabled = bool(agent.tools.get("delegation_tools", True))
 
@@ -44,7 +46,11 @@ def select_static_tools(agent: Any | None = None) -> list[ToolDefinition]:
             if delegation_enabled:
                 selected.append(tool)
             continue
-        if allow_all_builtins or (allowlist is not None and tool.name in allowlist):
+        if (
+            allow_all_builtins
+            or (allowlist is not None and tool.name in allowlist)
+            or tool.name in skill_tool_names
+        ):
             selected.append(tool)
     return selected
 
