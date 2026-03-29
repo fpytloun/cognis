@@ -395,6 +395,34 @@ def events_to_messages(events: list[Any]) -> list[dict[str, Any]]:
                     "content": _format_delegation_status(event_data),
                 }
             )
+        elif event_type == "delegation_completed":
+            child_id = event_data.get("child_session_id", "unknown")
+            mode = event_data.get("mode", "delegate")
+            result = event_data.get("result_summary", "No result provided.")
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        f'<delegation_result session="{child_id}" mode="{mode}" status="completed">\n'
+                        f"{result}\n"
+                        f"</delegation_result>"
+                    ),
+                }
+            )
+        elif event_type == "delegation_failed":
+            child_id = event_data.get("child_session_id", "unknown")
+            mode = event_data.get("mode", "delegate")
+            error = event_data.get("error", "Unknown error")
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        f'<delegation_result session="{child_id}" mode="{mode}" status="failed">\n'
+                        f"Error: {error}\n"
+                        f"</delegation_result>"
+                    ),
+                }
+            )
         elif event_type in {"task_result", "task_failed", "task_cancelled"}:
             messages.append(
                 {
@@ -453,13 +481,16 @@ def _format_memory_context(recall_payload: dict[str, Any]) -> str | None:
 
 
 def _format_delegation_status(data: dict[str, Any]) -> str:
-    child_session_id = data.get("child_session_id", "unknown")
-    status = data.get("status", "unknown")
-    result_summary = data.get("result_summary")
-    summary = f"Delegation {child_session_id}: {status}"
-    if isinstance(result_summary, str) and result_summary:
-        summary = f"{summary}\nResult: {result_summary}"
-    return summary
+    mode = data.get("mode", "delegate")
+    task = data.get("task", "")
+    child_session_id = data.get("child_session_id", "")
+    parts = [f"[Delegated ({mode})"]
+    if task:
+        parts.append(f": {task}")
+    parts.append("]")
+    if child_session_id:
+        parts.append(f" session={child_session_id}")
+    return "".join(parts)
 
 
 def _format_active_delegations(active_delegations: list[dict[str, Any]]) -> str:

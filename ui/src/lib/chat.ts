@@ -115,7 +115,7 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
     if (event.type === 'tool_call') {
       const toolName = String(event.data.name ?? event.data.tool_name ?? 'unknown');
       // Orchestration tools are displayed as delegation cards, not tool blocks
-      if (['delegate', 'spawn_worker', 'fork'].includes(toolName)) continue;
+      if (['delegate', 'fork'].includes(toolName)) continue;
       const callId = String(event.data.call_id ?? `tc-${event.seq}`);
       const args = typeof event.data.arguments === 'object' && event.data.arguments !== null
         ? (event.data.arguments as Record<string, unknown>)
@@ -301,7 +301,7 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
 
   if (event.type === 'tool_call') {
     // Orchestration tools are displayed as delegation cards, not tool blocks
-    if (['delegate', 'spawn_worker', 'fork'].includes(event.tool_name)) return next;
+    if (['delegate', 'fork'].includes(event.tool_name)) return next;
     const itemId = `tool:${event.call_id}`;
     const index = next.findIndex((item) => item.id === itemId && item.kind === 'tool_call');
     const toolItem: ToolCallTimelineItem = {

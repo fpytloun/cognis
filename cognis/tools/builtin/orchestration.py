@@ -12,53 +12,36 @@ from typing import Any
 from cognis.models.session import SessionModel
 from cognis.models.tool import ToolCall, ToolDefinition, ToolResult, ToolSource
 
-ORCHESTRATION_TOOL_NAMES = {"delegate", "spawn_worker", "fork"}
+ORCHESTRATION_TOOL_NAMES = {"delegate", "fork"}
 
 DELEGATE_TOOL = ToolDefinition(
     name="delegate",
     description=(
-        "Delegate a task to a DIFFERENT agent with its own persona, tools, and "
-        "system prompt. Use when the task requires a specialist agent. The parent "
-        "turn ends immediately; a follow-up turn is triggered when the child "
-        "session completes."
+        "Delegate a task to a background sub-session. The sub-session runs "
+        "independently while the main chat stays responsive. Use for research, "
+        "summarization, code generation, or any work that benefits from focused "
+        "execution. Optionally specify a different agent_id for specialist "
+        "delegation; omit it to use the current agent. The parent turn ends "
+        "immediately; a follow-up turn is triggered when the sub-session completes."
     ),
     parameters={
         "type": "object",
         "properties": {
-            "agent_id": {
-                "type": "string",
-                "description": "ID of the target agent. Use 'auto' to let the controller choose.",
-            },
             "task": {
                 "type": "string",
-                "description": "Clear description of what the agent should do.",
+                "description": "Clear description of what the sub-session should do.",
             },
-            "context": {"type": "string", "description": "Background context the agent needs."},
-            "expected_output": {
+            "agent_id": {
                 "type": "string",
-                "description": "What the result should look like.",
+                "description": (
+                    "Optional agent ID for specialist delegation. Omit to use "
+                    "the current agent (same persona and tools)."
+                ),
             },
-        },
-        "required": ["agent_id", "task"],
-    },
-    source=ToolSource(type="builtin"),
-    category="orchestration",
-    read_only=True,
-)
-
-SPAWN_WORKER_TOOL = ToolDefinition(
-    name="spawn_worker",
-    description=(
-        "Spawn a background worker using the SAME agent (same persona and tools) "
-        "for a focused sub-task. Use for research, summarization, or any work "
-        "that should run in the background while keeping the main chat responsive. "
-        "The parent turn ends immediately; a follow-up turn is triggered when "
-        "the worker completes."
-    ),
-    parameters={
-        "type": "object",
-        "properties": {
-            "task": {"type": "string", "description": "Clear description of the focused sub-task."},
+            "context": {
+                "type": "string",
+                "description": "Background context the sub-session needs.",
+            },
             "expected_output": {
                 "type": "string",
                 "description": "What the result should look like.",
@@ -103,7 +86,7 @@ FORK_TOOL = ToolDefinition(
 def orchestration_tools() -> list[ToolDefinition]:
     """Return all built-in orchestration tool definitions."""
 
-    return [DELEGATE_TOOL, SPAWN_WORKER_TOOL, FORK_TOOL]
+    return [DELEGATE_TOOL, FORK_TOOL]
 
 
 def is_orchestration_tool(tool_name: str) -> bool:
