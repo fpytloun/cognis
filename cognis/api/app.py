@@ -50,7 +50,7 @@ from cognis.logging import get_logger, setup_logging
 from cognis.providers.auth.jwt import JWTAuthProvider
 from cognis.providers.registry import build_provider_registry
 from cognis.security import LoginRateLimiter, RequestRateLimiter, create_password_hasher
-from cognis.ui_assets import SPAStaticFiles, resolve_ui_build_dir
+from cognis.ui_assets import SPAMiddleware, resolve_ui_build_dir
 
 
 def _as_int(value: object, default: int) -> int:
@@ -292,6 +292,13 @@ def create_app() -> FastAPI:
         await engine.dispose()
 
     app = FastAPI(title="Cognis", version="0.1.0", lifespan=lifespan)
+
+    # Middleware stack (execution order is bottom-to-top):
+    # 1. SPA middleware — serves UI static files for non-API paths
+    # 2. Auth middleware — authenticates /api/* routes
+    # 3. CORS middleware — handles CORS preflight and headers
+    if config.serve_ui and ui_build_dir is not None:
+        app.add_middleware(SPAMiddleware, directory=ui_build_dir)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=config.cors_origins,
@@ -347,7 +354,8 @@ def create_app() -> FastAPI:
     async def websocket_endpoint(websocket: WebSocket) -> None:
         await handle_websocket(websocket)
 
-    if config.serve_ui and ui_build_dir is not None:
-        app.mount("/", SPAStaticFiles(directory=ui_build_dir, html=True), name="ui")
+    # NOTE: SPA serving moved to SPAMiddleware (added above) which runs
+    # before the FastAPI router, avoiding the 404 exception handler
+    # intercepting requests meant for the UI.
 
     return app

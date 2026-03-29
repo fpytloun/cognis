@@ -197,7 +197,7 @@ class IntarisProvider:
     async def health(self) -> ProviderHealth:
         start = perf_counter()
         try:
-            response = await self.client.get("/health")
+            response = await self.client.get("/health", headers=self._headers())
             latency_ms = (perf_counter() - start) * 1000
             if response.is_success:
                 return ProviderHealth(
