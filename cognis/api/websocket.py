@@ -1153,7 +1153,7 @@ async def _load_conversation_runtime(
             }
         },
     )
-    return conversation_model, session_model, agent_model, agent_model
+    return conversation_model, session_model, agent_model
 
 
 async def _load_pending_task_prompts(app: Any, conversation_id: str) -> list[dict[str, Any]]:
