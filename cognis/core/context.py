@@ -9,11 +9,14 @@ from typing import Any
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.session import ConversationModel, SessionModel
 from cognis.models.tool import ToolDefinition
 from cognis.runtime_context import scoped_runtime_context
 from cognis.store.queries import get_setting_value
+
+logger = get_logger(__name__)
 
 EVENT_TYPES_FOR_CONTEXT = [
     "user_message",
@@ -111,6 +114,10 @@ class ContextAssembler:
     ) -> ContextAssemblyResult:
         """Build the LLM message list for a single turn."""
 
+        logger.debug(
+            "context: assembly started",
+            extra={"extra_data": {"session_id": session.session_id, "agent_id": agent.agent_id}},
+        )
         cached_intention = self.session_cache.get_intention(session.session_id)
         search_mode = "find" if session.mnemory_session_id is None else "search"
 
@@ -140,11 +147,19 @@ class ContextAssembler:
             cache_entry = self.session_cache.get_entry(session.session_id)
             if cache_entry is None or not cache_entry.initialized:
                 raise cache_result
+            logger.warning(
+                "context: degraded source=events",
+                extra={"extra_data": {"session_id": session.session_id}},
+            )
             degraded_sources.append("events")
         else:
             cache_entry = cache_result
 
         if isinstance(intention_result, Exception):
+            logger.warning(
+                "context: degraded source=intention",
+                extra={"extra_data": {"session_id": session.session_id}},
+            )
             degraded_sources.append("intention")
         else:
             await self.session_cache.update_intention(
@@ -154,6 +169,10 @@ class ContextAssembler:
 
         memory_block = None
         if isinstance(recall_result, Exception):
+            logger.warning(
+                "context: degraded source=memory",
+                extra={"extra_data": {"session_id": session.session_id}},
+            )
             degraded_sources.append("memory")
             recall_payload: dict[str, Any] | None = None
         else:
@@ -231,6 +250,18 @@ class ContextAssembler:
         recommend_compaction = (
             max_context_tokens > 0
             and (prompt_tokens / max_context_tokens) >= self.compaction_threshold
+        )
+        logger.info(
+            "context: assembly completed",
+            extra={
+                "extra_data": {
+                    "session_id": session.session_id,
+                    "degraded": bool(degraded_sources),
+                    "degraded_sources": sorted(set(degraded_sources)),
+                    "prompt_tokens": prompt_tokens,
+                    "recommend_compaction": recommend_compaction,
+                }
+            },
         )
         return ContextAssemblyResult(
             messages=messages,

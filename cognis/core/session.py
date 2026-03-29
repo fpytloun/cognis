@@ -73,6 +73,16 @@ class SessionManager:
     ) -> SessionModel:
         """Create a root session and corresponding Intaris session."""
 
+        logger.info(
+            "session: creating root session",
+            extra={
+                "extra_data": {
+                    "conversation_id": conversation_id,
+                    "agent_id": agent_id,
+                    "user_email": user_email,
+                }
+            },
+        )
         async with self.session_factory() as db_session:
             try:
                 session_row = await queries.create_session(
@@ -100,6 +110,16 @@ class SessionManager:
                 await db_session.rollback()
                 raise
         session_row.intaris_session_id = session_row.session_id
+        logger.info(
+            "session: root session created",
+            extra={
+                "extra_data": {
+                    "session_id": session_row.session_id,
+                    "conversation_id": conversation_id,
+                    "agent_id": agent_id,
+                }
+            },
+        )
         return _to_session_model(session_row)
 
     async def create_conversation_with_root_session(

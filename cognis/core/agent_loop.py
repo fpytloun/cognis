@@ -418,6 +418,16 @@ class AgentLoop:
         Returns StepOutput if the step completed, None if it failed.
         """
         start_time = datetime.now(UTC)
+        logger.info(
+            "agent: step started",
+            extra={
+                "extra_data": {
+                    "session_id": ctx.session.session_id,
+                    "step": ctx.step_definition.name,
+                    "is_direct": ctx.is_direct,
+                }
+            },
+        )
         await self.session_lock.acquire(ctx.session.session_id)
         try:
             return await self._execute_step(ctx, on_token=on_token, on_tool_call=on_tool_call)
@@ -911,10 +921,22 @@ class AgentLoop:
             )
             # Update session cache with recorded events
             await self.session_cache.append_recorded_events(ctx.session, events, append_result)
+            logger.info(
+                "agent: events recorded",
+                extra={
+                    "extra_data": {
+                        "session_id": ctx.session.session_id,
+                        "event_count": len(events),
+                        "last_seq": append_result.last_seq,
+                    }
+                },
+            )
         except Exception:
             logger.exception(
-                "Failed to record step events to Intaris",
-                extra={"extra_data": {"session_id": ctx.session.session_id}},
+                "agent: failed to record events to Intaris",
+                extra={
+                    "extra_data": {"session_id": ctx.session.session_id, "event_count": len(events)}
+                },
             )
 
         # Dispatch remember to retry queue
@@ -924,7 +946,7 @@ class AgentLoop:
             if e.type == "assistant_message" and e.data.get("content")
         )
         if assistant_content:
-            self.remember_queue.enqueue(
+            await self.remember_queue.enqueue(
                 {
                     "session_id": ctx.session.mnemory_session_id,
                     "messages": [{"role": "assistant", "content": assistant_content[:5000]}],

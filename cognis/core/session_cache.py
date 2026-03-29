@@ -10,7 +10,10 @@ from typing import Any
 
 from prometheus_client import Counter, Gauge
 
+from cognis.logging import get_logger
 from cognis.models.session import EventAppendResult, SessionEvent, SessionModel
+
+logger = get_logger(__name__)
 
 CACHE_HITS = Counter("cognis_session_cache_hits_total", "Session cache hits")
 CACHE_MISSES = Counter("cognis_session_cache_misses_total", "Session cache misses")
@@ -69,13 +72,34 @@ class SessionCache:
         async with entry.lock:
             if not entry.initialized:
                 await self._cold_load(entry, session)
+                logger.debug(
+                    "cache: cold load complete",
+                    extra={
+                        "extra_data": {
+                            "session_id": entry.session_id,
+                            "event_count": len(entry.events),
+                            "last_seq": entry.last_event_seq,
+                        }
+                    },
+                )
             else:
                 event_read = await self.guardrails.read_events(
                     session_id=entry.intaris_session_id,
                     after_seq=entry.last_event_seq,
+                    allow_missing_stream=True,
                 )
                 self._apply_intaris_events(entry, event_read.events)
                 entry.last_event_seq = max(entry.last_event_seq, event_read.last_seq)
+                logger.debug(
+                    "cache: warm refresh complete",
+                    extra={
+                        "extra_data": {
+                            "session_id": entry.session_id,
+                            "new_events": len(event_read.events),
+                            "last_seq": entry.last_event_seq,
+                        }
+                    },
+                )
             entry.touched_at = monotonic()
         return entry
 
@@ -186,6 +210,15 @@ class SessionCache:
                 )
                 self._entries[session.session_id] = entry
                 CACHE_SIZE.set(len(self._entries))
+                logger.debug(
+                    "cache: entry created",
+                    extra={
+                        "extra_data": {
+                            "session_id": session.session_id,
+                            "intaris_session_id": entry.intaris_session_id,
+                        }
+                    },
+                )
             else:
                 CACHE_HITS.inc()
                 entry.intaris_session_id = session.intaris_session_id or session.session_id

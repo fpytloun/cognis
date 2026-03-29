@@ -46,6 +46,17 @@ class IntarisProvider:
         policy: dict[str, Any] | None = None,
         details: dict[str, Any] | None = None,
     ) -> None:
+        logger.info(
+            "intaris: create_session",
+            extra={
+                "extra_data": {
+                    "session_id": session_id,
+                    "agent_id": agent_id,
+                    "user_id": user_id,
+                    "parent_session_id": parent_session_id,
+                }
+            },
+        )
         response = await self.client.post(
             "/api/v1/intention",
             json={
@@ -57,7 +68,18 @@ class IntarisProvider:
             },
             headers=self._headers(agent_id, user_id),
         )
+        if not response.is_success:
+            logger.error(
+                "intaris: create_session failed",
+                extra={
+                    "extra_data": {"session_id": session_id, "status_code": response.status_code}
+                },
+            )
         response.raise_for_status()
+        logger.info(
+            "intaris: session created",
+            extra={"extra_data": {"session_id": session_id, "agent_id": agent_id}},
+        )
 
     async def evaluate(
         self,
@@ -66,6 +88,10 @@ class IntarisProvider:
         arguments: dict[str, Any],
         context: dict[str, Any] | None = None,
     ) -> EvaluationResult:
+        logger.debug(
+            "intaris: evaluate",
+            extra={"extra_data": {"session_id": session_id, "tool_name": tool_name}},
+        )
         response = await self.breaker.call(
             lambda: self.client.post(
                 "/api/v1/evaluate",
@@ -148,12 +174,23 @@ class IntarisProvider:
         )
         if response.status_code == 404:
             logger.warning(
-                "Intaris session not found during record_events — session may not have been created",
-                extra={"extra_data": {"session_id": session_id}},
+                "intaris: record_events 404 — session not found",
+                extra={"extra_data": {"session_id": session_id, "event_count": len(events)}},
             )
-            return EventAppendResult(last_seq=0)
+            return EventAppendResult(ok=False, count=0, first_seq=0, last_seq=0)
         response.raise_for_status()
-        return EventAppendResult.model_validate(response.json())
+        result = EventAppendResult.model_validate(response.json())
+        logger.debug(
+            "intaris: events recorded",
+            extra={
+                "extra_data": {
+                    "session_id": session_id,
+                    "count": result.count,
+                    "last_seq": result.last_seq,
+                }
+            },
+        )
+        return result
 
     async def read_events(
         self,
@@ -171,15 +208,45 @@ class IntarisProvider:
             params["type"] = ",".join(types)
         if last_n is not None:
             params["last_n"] = last_n
+        logger.debug(
+            "intaris: read_events",
+            extra={
+                "extra_data": {
+                    "session_id": session_id,
+                    "after_seq": after_seq,
+                    "allow_missing_stream": allow_missing_stream,
+                }
+            },
+        )
         response = await self.client.get(
             f"/api/v1/session/{session_id}/events",
             params=params,
             headers=self._headers(user_email=current_user_email.get()),
         )
-        if response.status_code == 404 and allow_missing_stream:
-            return EventReadResult(events=[], last_seq=0, has_more=False)
+        if response.status_code == 404:
+            if allow_missing_stream:
+                logger.debug(
+                    "intaris: read_events 404 — new session, returning empty",
+                    extra={"extra_data": {"session_id": session_id}},
+                )
+                return EventReadResult(events=[], last_seq=0, has_more=False)
+            logger.warning(
+                "intaris: read_events 404 — event stream not found",
+                extra={"extra_data": {"session_id": session_id, "after_seq": after_seq}},
+            )
         response.raise_for_status()
-        return EventReadResult.model_validate(response.json())
+        result = EventReadResult.model_validate(response.json())
+        logger.debug(
+            "intaris: read_events complete",
+            extra={
+                "extra_data": {
+                    "session_id": session_id,
+                    "event_count": len(result.events),
+                    "last_seq": result.last_seq,
+                }
+            },
+        )
+        return result
 
     async def get_last_seq(self, session_id: str) -> int:
         result = await self.read_events(session_id=session_id, last_n=1)

@@ -407,6 +407,19 @@ class WebSocketConnectionManager:
         try:
             current_user_email.set(session.user_email)
             current_agent_id.set(agent.agent_id)
+            logger.info(
+                "turn: started",
+                extra={
+                    "extra_data": {
+                        "conversation_id": conversation_id,
+                        "session_id": session.session_id,
+                        "intaris_session_id": session.intaris_session_id,
+                        "agent_id": agent.agent_id,
+                        "user_email": session.user_email,
+                        "system_initiated": system_initiated,
+                    }
+                },
+            )
             if not system_initiated:
                 decision = await self.app.state.decision_engine.decide(
                     user_message=content,
@@ -509,7 +522,23 @@ class WebSocketConnectionManager:
                     row.updated_at = row.last_message_at
                     await db_session.commit()
 
-            entry = await self.app.state.session_cache.refresh(session)
+            last_seq = 0
+            try:
+                entry = await self.app.state.session_cache.refresh(session)
+                last_seq = entry.last_event_seq
+            except Exception:
+                logger.warning(
+                    "Post-turn session cache refresh failed (response already sent)",
+                    extra={
+                        "extra_data": {
+                            "conversation_id": conversation_id,
+                            "session_id": session.session_id,
+                        }
+                    },
+                )
+                cached = self.app.state.session_cache.get_entry(session.session_id)
+                if cached is not None:
+                    last_seq = cached.last_event_seq
             await self.send_to_conversation(
                 conversation_id,
                 {
@@ -517,9 +546,19 @@ class WebSocketConnectionManager:
                     "conversation_id": conversation_id,
                     "session_id": session.session_id,
                     "message_id": message_id,
-                    "seq": entry.last_event_seq,
+                    "seq": last_seq,
                     "token_usage": None,
                     "queued_count": len(self._queued_messages.get(conversation_id, [])),
+                },
+            )
+            logger.info(
+                "turn: completed",
+                extra={
+                    "extra_data": {
+                        "conversation_id": conversation_id,
+                        "session_id": session.session_id,
+                        "last_seq": last_seq,
+                    }
                 },
             )
         except asyncio.CancelledError:
@@ -1101,7 +1140,20 @@ async def _load_conversation_runtime(
         session_row = await get_session_row(session, conversation_row.root_session_id)
     if session_row is None:
         return None
-    return conversation_model, _to_session_model(session_row), agent_model
+    session_model = _to_session_model(session_row)
+    logger.debug(
+        "ws: conversation runtime loaded",
+        extra={
+            "extra_data": {
+                "conversation_id": conversation_id,
+                "session_id": session_model.session_id,
+                "intaris_session_id": session_model.intaris_session_id,
+                "agent_id": conversation_model.agent_id,
+                "is_new_session": False,
+            }
+        },
+    )
+    return conversation_model, session_model, agent_model, agent_model
 
 
 async def _load_pending_task_prompts(app: Any, conversation_id: str) -> list[dict[str, Any]]:

@@ -58,14 +58,44 @@ class MnemoryProvider:
             "labels": labels or {},
             "ttl": 86400,
         }
+        logger.info(
+            "mnemory: recall started",
+            extra={
+                "extra_data": {
+                    "session_id": session_id,
+                    "search_mode": search_mode,
+                    "query_len": len(query),
+                }
+            },
+        )
         try:
             response = await self.breaker.call(
                 lambda: self.client.post("/api/recall", json=payload, headers=self._headers())
             )
             response.raise_for_status()
-            return dict(response.json())
+            result = dict(response.json())
+            stats = result.get("stats", {})
+            logger.info(
+                "mnemory: recall complete",
+                extra={
+                    "extra_data": {
+                        "session_id": session_id,
+                        "mnemory_session": result.get("session_id"),
+                        "has_instructions": bool(result.get("instructions")),
+                        "has_core": bool(result.get("core_memories")),
+                        "core_count": stats.get("core_count", 0),
+                        "search_count": stats.get("search_count", 0),
+                        "new_count": stats.get("new_count", 0),
+                        "latency_ms": stats.get("latency_ms", 0),
+                    }
+                },
+            )
+            return result
         except Exception:
-            logger.warning("Mnemory recall degraded")
+            logger.warning(
+                "mnemory: recall failed",
+                extra={"extra_data": {"session_id": session_id, "search_mode": search_mode}},
+            )
             return {
                 "session_id": session_id or "",
                 "instructions": None,
@@ -89,6 +119,10 @@ class MnemoryProvider:
         context: str | None = None,
         user_email: str | None = None,
     ) -> None:
+        logger.info(
+            "mnemory: remember",
+            extra={"extra_data": {"session_id": session_id, "message_count": len(messages)}},
+        )
         payload = {
             "session_id": session_id,
             "messages": messages,
@@ -96,10 +130,17 @@ class MnemoryProvider:
             "labels": labels or {},
             "context": context,
         }
-        response = await self.client.post(
-            "/api/remember", json=payload, headers=self._headers(user_email=user_email)
-        )
-        response.raise_for_status()
+        try:
+            response = await self.client.post(
+                "/api/remember", json=payload, headers=self._headers(user_email=user_email)
+            )
+            response.raise_for_status()
+        except Exception:
+            logger.warning(
+                "mnemory: remember failed",
+                extra={"extra_data": {"session_id": session_id}},
+            )
+            raise
 
     async def add_memory(
         self,
@@ -159,6 +200,15 @@ class MnemoryProvider:
             return []
 
     async def bootstrap_agent(self, agent: AgentDefinition) -> None:
+        logger.info(
+            "mnemory: bootstrap started",
+            extra={
+                "extra_data": {
+                    "agent_id": agent.agent_id,
+                    "has_system_prompt": bool(agent.system_prompt),
+                }
+            },
+        )
         if agent.system_prompt:
             await self.add_memory(
                 content=agent.system_prompt,
@@ -166,6 +216,15 @@ class MnemoryProvider:
                 pinned=True,
                 agent_id=agent.agent_id,
                 user_email=agent.owner_email,
+            )
+            logger.info(
+                "mnemory: bootstrap complete",
+                extra={"extra_data": {"agent_id": agent.agent_id}},
+            )
+        else:
+            logger.info(
+                "mnemory: bootstrap skipped (no system_prompt)",
+                extra={"extra_data": {"agent_id": agent.agent_id}},
             )
 
     async def health(self) -> ProviderHealth:
