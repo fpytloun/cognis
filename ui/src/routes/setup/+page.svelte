@@ -125,7 +125,7 @@
           </p>
         </div>
 
-        <form class="space-y-4" onsubmit={handleSubmit}>
+        <form class="space-y-4" onsubmit={handleSubmit} novalidate>
           <label class="block space-y-2 text-sm font-medium text-slate-200">
             <span>Email <span class="text-rose-300">*</span></span>
             <Input bind:value={form.email} type="email" placeholder="admin@example.com" />
