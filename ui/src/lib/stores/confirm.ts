@@ -1,5 +1,7 @@
 import { writable } from 'svelte/store';
 
+import { createId } from '$lib/utils';
+
 export interface ConfirmOptions {
   title: string;
   message: string;
@@ -20,7 +22,7 @@ export function confirmAction(options: ConfirmOptions): Promise<boolean> {
     resolver(false);
   }
   state.set({
-    id: `confirm-${crypto.randomUUID()}`,
+    id: createId('confirm'),
     confirmLabel: 'Confirm',
     cancelLabel: 'Cancel',
     variant: 'danger',

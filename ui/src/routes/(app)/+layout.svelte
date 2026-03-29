@@ -9,6 +9,7 @@
     ListTodo,
     Menu,
     MessageSquareText,
+    RefreshCw,
     ServerCrash,
     Settings,
     ShieldAlert,
@@ -244,7 +245,7 @@
       <main class="flex min-h-[calc(100vh-2rem)] min-w-0 flex-1 flex-col gap-4 rounded-3xl border border-slate-800/80 bg-slate-950/70 p-4 shadow-card backdrop-blur lg:p-6" id="main-content">
         <header class="flex flex-col gap-3 rounded-2xl border border-slate-800/80 bg-slate-900/80 px-4 py-4 sm:flex-row sm:items-center sm:justify-between">
           <div>
-            <p class="text-sm font-medium uppercase tracking-[0.25em] text-slate-400">Openclaw Controller</p>
+            <p class="text-sm font-medium uppercase tracking-[0.25em] text-slate-400">Cognis</p>
             <h2 class="mt-1 text-xl font-semibold text-white">{currentTitle($page.url.pathname)}</h2>
           </div>
 
@@ -284,8 +285,14 @@
                     </div>
                   </div>
                   <div class="flex flex-wrap gap-2">
-                    <Button size="sm" variant="secondary" onclick={() => workspaceHealth.refresh()}>Retry</Button>
-                    <Button size="sm" variant="secondary" onclick={() => goto(banner.href)}>Check</Button>
+                    <Button size="sm" variant="secondary" onclick={() => workspaceHealth.refresh()}>
+                      <RefreshCw class="mr-1.5 h-3.5 w-3.5" />
+                      Refresh
+                    </Button>
+                    <Button size="sm" variant="secondary" onclick={() => goto(banner.href)}>
+                      <Settings class="mr-1.5 h-3.5 w-3.5" />
+                      Configure
+                    </Button>
                   </div>
                 </div>
               </div>

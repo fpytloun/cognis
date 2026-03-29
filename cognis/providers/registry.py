@@ -48,6 +48,6 @@ def build_provider_registry(
         guardrails=IntarisProvider(config.intaris_url, auth_provider),
         executor=InProcessExecutorProvider(session_factory=session_factory),
         secrets=secrets_provider,
-        llm=LiteLLMProvider(session_factory),
+        llm=LiteLLMProvider(session_factory, secrets_provider=secrets_provider),
         auth=auth_provider,
     )

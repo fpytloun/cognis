@@ -7,6 +7,7 @@ export interface WorkflowStepFormState {
   name: string;
   type: 'run' | 'gate';
   prompt: string;
+  inputMode: 'auto' | 'null' | 'last' | 'full' | 'summary';
   inputText: string;
   allowQuestions: boolean;
   evaluate: boolean;
@@ -38,6 +39,7 @@ export function createEmptyStep(): WorkflowStepFormState {
     name: '',
     type: 'run',
     prompt: '',
+    inputMode: 'null',
     inputText: '',
     allowQuestions: false,
     evaluate: true,
@@ -73,6 +75,63 @@ function joinOptions(options: Array<Record<string, unknown>>): string {
     .join('\n');
 }
 
+function workflowInputSourceNames(input: Workflow['steps'][number]['input']): string[] {
+  if (!input) {
+    return [];
+  }
+
+  if (typeof input === 'string') {
+    return [input];
+  }
+
+  if (Array.isArray(input)) {
+    return input.filter((item): item is string => typeof item === 'string');
+  }
+
+  if (typeof input.source === 'string') {
+    return [input.source];
+  }
+
+  if (Array.isArray(input.source)) {
+    return input.source.filter((item): item is string => typeof item === 'string');
+  }
+
+  return [];
+}
+
+function workflowInputMode(input: Workflow['steps'][number]['input']): WorkflowStepFormState['inputMode'] {
+  if (input == null) {
+    return 'auto';
+  }
+  if (typeof input === 'string' || Array.isArray(input)) {
+    return 'last';
+  }
+  if (input.type === 'full' || input.type === 'summary' || input.type === 'last' || input.type === 'null') {
+    return input.type;
+  }
+  return 'auto';
+}
+
+function formInputToPayload(
+  inputMode: WorkflowStepFormState['inputMode'],
+  inputText: string
+): { type: string; source?: string | string[] } | undefined {
+  const refs = parseList(inputText);
+  if (inputMode === 'auto') {
+    return undefined;
+  }
+  if (inputMode === 'null' || refs.length === 0) {
+    return inputMode === 'null' ? { type: 'null' } : { type: inputMode };
+  }
+  if (inputMode === 'full') {
+    return { type: 'full', source: refs[0] };
+  }
+  if (refs.length === 1) {
+    return { type: inputMode, source: refs[0] };
+  }
+  return { type: inputMode, source: refs };
+}
+
 export function workflowToFormState(workflow: Workflow): WorkflowFormState {
   return {
     workflowId: workflow.workflow_id,
@@ -91,7 +150,8 @@ export function workflowToFormState(workflow: Workflow): WorkflowFormState {
       name: step.name,
       type: (step.type as 'run' | 'gate') ?? 'run',
       prompt: step.prompt ?? '',
-      inputText: step.input?.join(', ') ?? '',
+      inputMode: workflowInputMode(step.input),
+      inputText: workflowInputSourceNames(step.input).join(', '),
       allowQuestions: step.allow_questions ?? false,
       evaluate: step.completion?.evaluate !== false,
       maxAttempts:
@@ -149,7 +209,7 @@ export function formStateToWorkflowPayload(form: WorkflowFormState): Record<stri
       name: step.name,
       type: step.type,
       prompt: step.prompt,
-      input: parseList(step.inputText),
+      ...(formInputToPayload(step.inputMode, step.inputText) ? { input: formInputToPayload(step.inputMode, step.inputText) } : {}),
       allow_questions: step.allowQuestions,
       completion:
         step.type === 'run'
@@ -194,7 +254,10 @@ export function validateWorkflowForm(form: WorkflowFormState): string[] {
       issues.push(`Gate step ${step.name || index + 1} requires a gate message.`);
     }
 
-    const referencedInputs = parseList(step.inputText);
+    const referencedInputs = step.inputMode === 'null' || step.inputMode === 'auto' ? [] : parseList(step.inputText);
+    if (step.inputMode === 'full' && referencedInputs.length !== 1) {
+      issues.push(`Step ${step.name || index + 1} uses full input and requires exactly one source step.`);
+    }
     referencedInputs.forEach((inputName) => {
       const previousNames = form.steps.slice(0, index).map((item) => item.name);
       if (!previousNames.includes(inputName)) {

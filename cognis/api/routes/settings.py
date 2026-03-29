@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from time import monotonic
+from typing import Any
 
 from fastapi import APIRouter, Request
 
@@ -204,6 +205,25 @@ async def llm_provider_test(request: Request, provider_id: str) -> LLMProviderTe
     response = LLMProviderTestResponse(provider_id=provider_id, **result)
     request.app.state.provider_test_results[provider_id] = response.model_dump(mode="json")
     return response
+
+
+@router.post("/api/v1/llm-providers/{provider_id}/discover-models")
+async def llm_provider_discover_models(request: Request, provider_id: str) -> dict[str, Any]:
+    """Query the remote provider for available models."""
+    require_admin(request)
+    async with request.app.state.session_factory() as session:
+        row = await get_llm_provider(session, provider_id)
+    if row is None:
+        raise api_exception(404, "not_found", "LLM provider not found")
+    try:
+        models = await request.app.state.providers.llm.discover_models(provider_id)
+    except Exception as exc:
+        raise api_exception(
+            502,
+            "provider_error",
+            f"Failed to discover models: {exc!s}"[:300],
+        ) from exc
+    return {"provider_id": provider_id, "models": models}
 
 
 @router.get("/api/v1/model-routing", response_model=ModelRoutingResponse)

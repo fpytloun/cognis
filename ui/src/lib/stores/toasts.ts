@@ -1,5 +1,7 @@
 import { writable } from 'svelte/store';
 
+import { createId } from '$lib/utils';
+
 export type ToastVariant = 'success' | 'error' | 'warning' | 'info';
 
 export interface ToastItem {
@@ -35,7 +37,7 @@ export function addToast(
   duration = 4_000,
   title: string | null = null
 ): string {
-  const id = `toast-${crypto.randomUUID()}`;
+  const id = createId('toast');
   const item: ToastItem = {
     id,
     title,

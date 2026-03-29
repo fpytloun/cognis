@@ -15,6 +15,7 @@ describe('validateWorkflowForm', () => {
       {
         ...form.steps[0],
         name: 'plan',
+        inputMode: 'last',
         inputText: 'review',
         prompt: 'Duplicate and invalid input'
       }

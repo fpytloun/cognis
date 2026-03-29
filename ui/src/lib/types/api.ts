@@ -269,7 +269,10 @@ export interface WorkflowStep {
   type: string;
   description?: string;
   prompt?: string;
-  input?: string[];
+  input?: {
+    type: string;
+    source?: string | string[] | null;
+  } | string | string[] | null;
   allow_questions?: boolean;
   completion?: Record<string, unknown> | null;
   gate?: Record<string, unknown> | null;

@@ -79,10 +79,16 @@
     if (!(await confirmDiscardChanges())) {
       return;
     }
-    selectedWorkflow = workflow;
-    form = workflowToFormState(workflow);
-    error = '';
-    initialSnapshot = JSON.stringify(form);
+    try {
+      const nextForm = workflowToFormState(workflow);
+      selectedWorkflow = workflow;
+      form = nextForm;
+      error = '';
+      initialSnapshot = JSON.stringify(form);
+    } catch (caughtError) {
+      error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to open workflow');
+    }
   }
 
   async function newWorkflow(): Promise<void> {
@@ -260,6 +266,18 @@
       </aside>
 
       <div class="space-y-5">
+        {#if selectedWorkflow?.is_system}
+          <Card class="border border-sky-500/30 bg-sky-500/10 p-4 text-sm text-sky-100">
+            <div class="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <p class="font-medium">System workflow</p>
+                <p class="mt-1 text-sky-100/80">This bundled workflow is read-only. Duplicate it to create an editable copy.</p>
+              </div>
+              <Button variant="secondary" onclick={duplicateSelectedWorkflow}>Duplicate to edit</Button>
+            </div>
+          </Card>
+        {/if}
+
         <Card class="p-5">
           <div class="grid gap-4 md:grid-cols-2">
             <label class="space-y-2 text-sm font-medium text-slate-200">
@@ -268,26 +286,26 @@
             </label>
             <label class="space-y-2 text-sm font-medium text-slate-200">
               <span>Name</span>
-              <Input bind:value={form.name} />
+                <Input bind:value={form.name} disabled={!!selectedWorkflow?.is_system} />
             </label>
             <label class="space-y-2 text-sm font-medium text-slate-200">
               <span>Version</span>
-              <Input bind:value={form.version} type="number" />
+                <Input bind:value={form.version} disabled={!!selectedWorkflow?.is_system} type="number" />
             </label>
             <label class="space-y-2 text-sm font-medium text-slate-200">
               <span>Tags</span>
-              <Input bind:value={form.tagsText} placeholder="code, review" />
+                <Input bind:value={form.tagsText} disabled={!!selectedWorkflow?.is_system} placeholder="code, review" />
             </label>
           </div>
 
           <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
             <span>Description</span>
-            <textarea bind:value={form.description} class="min-h-[90px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100"></textarea>
+            <textarea bind:value={form.description} class="min-h-[90px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}></textarea>
           </label>
 
           <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
             <span>Selection criteria</span>
-            <textarea bind:value={form.criteria} class="min-h-[90px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100"></textarea>
+            <textarea bind:value={form.criteria} class="min-h-[90px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}></textarea>
           </label>
         </Card>
 
@@ -295,7 +313,7 @@
           <div class="grid gap-4 md:grid-cols-3">
             <label class="space-y-2 text-sm font-medium text-slate-200">
               <span>Interaction mode</span>
-              <select bind:value={form.interactionMode} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+                <select bind:value={form.interactionMode} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}>
                 <option value="none">none</option>
                 <option value="explicit_gates">explicit_gates</option>
                 <option value="step_requests">step_requests</option>
@@ -303,11 +321,11 @@
             </label>
             <label class="space-y-2 text-sm font-medium text-slate-200">
               <span>Default max attempts</span>
-              <Input bind:value={form.defaultMaxAttempts} type="number" />
+              <Input bind:value={form.defaultMaxAttempts} disabled={!!selectedWorkflow?.is_system} type="number" />
             </label>
             <label class="space-y-2 text-sm font-medium text-slate-200">
               <span>On exhausted</span>
-              <select bind:value={form.defaultOnExhausted} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+                <select bind:value={form.defaultOnExhausted} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}>
                 <option value="continue">continue</option>
                 <option value="fail">fail</option>
                 <option value="gate">gate</option>
@@ -315,7 +333,7 @@
             </label>
           </div>
           <label class="mt-4 flex items-center gap-3 text-sm text-slate-200">
-            <input bind:checked={form.defaultEvaluate} class="h-4 w-4 rounded border-slate-600 bg-slate-950" type="checkbox" />
+            <input bind:checked={form.defaultEvaluate} class="h-4 w-4 rounded border-slate-600 bg-slate-950" disabled={!!selectedWorkflow?.is_system} type="checkbox" />
             <span>Evaluate run steps by default</span>
           </label>
         </Card>
@@ -326,20 +344,20 @@
               <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Step editor</p>
               <h2 class="mt-1 text-lg font-semibold text-white">Workflow steps</h2>
             </div>
-            <Button size="sm" variant="secondary" onclick={addStep}>Add step</Button>
+            <Button size="sm" variant="secondary" onclick={addStep} disabled={!!selectedWorkflow?.is_system}>Add step</Button>
           </div>
 
           <div class="mt-4 space-y-4">
             {#each form.steps as step, index}
-              <article class="rounded-2xl border border-slate-800 bg-slate-950/70 p-4" draggable={true} ondragstart={() => (dragIndex = index)} ondragover={(event) => event.preventDefault()} ondrop={() => moveStep(index)}>
+              <article class="rounded-2xl border border-slate-800 bg-slate-950/70 p-4" draggable={!selectedWorkflow?.is_system} ondragstart={() => (dragIndex = index)} ondragover={(event) => event.preventDefault()} ondrop={() => moveStep(index)}>
                 <div class="grid gap-4 md:grid-cols-2">
                   <label class="space-y-2 text-sm font-medium text-slate-200">
                     <span>Name</span>
-                    <Input bind:value={step.name} />
+                    <Input bind:value={step.name} disabled={!!selectedWorkflow?.is_system} />
                   </label>
                   <label class="space-y-2 text-sm font-medium text-slate-200">
                     <span>Type</span>
-                    <select bind:value={step.type} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+                    <select bind:value={step.type} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}>
                       <option value="run">run</option>
                       <option value="gate">gate</option>
                     </select>
@@ -348,21 +366,31 @@
 
                 <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
                   <span>Prompt</span>
-                  <textarea bind:value={step.prompt} class="min-h-[110px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100"></textarea>
+                  <textarea bind:value={step.prompt} class="min-h-[110px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}></textarea>
                 </label>
 
-                <div class="mt-4 grid gap-4 md:grid-cols-3">
+                <div class="mt-4 grid gap-4 md:grid-cols-4">
                   <label class="space-y-2 text-sm font-medium text-slate-200">
-                    <span>Input refs</span>
-                    <Input bind:value={step.inputText} placeholder="plan, review" />
+                    <span>Input mode</span>
+                    <select bind:value={step.inputMode} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}>
+                      <option value="auto">auto</option>
+                      <option value="null">null</option>
+                      <option value="last">last</option>
+                      <option value="full">full</option>
+                      <option value="summary">summary</option>
+                    </select>
+                  </label>
+                  <label class="space-y-2 text-sm font-medium text-slate-200">
+                    <span>Input sources</span>
+                    <Input bind:value={step.inputText} disabled={!!selectedWorkflow?.is_system || step.inputMode === 'null'} placeholder={step.inputMode === 'full' ? 'plan' : 'plan, review'} />
                   </label>
                   <label class="space-y-2 text-sm font-medium text-slate-200">
                     <span>Max attempts</span>
-                    <Input bind:value={step.maxAttempts} type="number" />
+                    <Input bind:value={step.maxAttempts} disabled={!!selectedWorkflow?.is_system} type="number" />
                   </label>
                   <label class="space-y-2 text-sm font-medium text-slate-200">
                     <span>On exhausted</span>
-                    <select bind:value={step.onExhausted} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+                    <select bind:value={step.onExhausted} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}>
                       <option value="continue">continue</option>
                       <option value="fail">fail</option>
                       <option value="gate">gate</option>
@@ -371,38 +399,38 @@
                 </div>
 
                 <label class="mt-4 flex items-center gap-3 text-sm text-slate-200">
-                  <input bind:checked={step.allowQuestions} class="h-4 w-4 rounded border-slate-600 bg-slate-950" type="checkbox" />
+                  <input bind:checked={step.allowQuestions} class="h-4 w-4 rounded border-slate-600 bg-slate-950" disabled={!!selectedWorkflow?.is_system} type="checkbox" />
                   <span>Allow in-step questions</span>
                 </label>
 
                 <label class="mt-2 flex items-center gap-3 text-sm text-slate-200">
-                  <input bind:checked={step.evaluate} class="h-4 w-4 rounded border-slate-600 bg-slate-950" type="checkbox" />
+                  <input bind:checked={step.evaluate} class="h-4 w-4 rounded border-slate-600 bg-slate-950" disabled={!!selectedWorkflow?.is_system} type="checkbox" />
                   <span>Evaluate completion</span>
                 </label>
 
                 {#if step.type === 'gate'}
                   <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
                     <span>Gate message</span>
-                    <textarea bind:value={step.gateMessage} class="min-h-[90px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100"></textarea>
+                    <textarea bind:value={step.gateMessage} class="min-h-[90px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}></textarea>
                   </label>
                   <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
                     <span>Gate options</span>
-                    <textarea bind:value={step.gateOptionsText} class="min-h-[90px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 font-mono text-sm text-slate-100" placeholder="Approve|continue\nRequest changes|revise(plan)"></textarea>
+                    <textarea bind:value={step.gateOptionsText} class="min-h-[90px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 font-mono text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system} placeholder="Approve|continue\nRequest changes|revise(plan)"></textarea>
                   </label>
                 {/if}
 
                 <div class="mt-4 grid gap-4 md:grid-cols-3">
                   <label class="space-y-2 text-sm font-medium text-slate-200">
                     <span>Reject target</span>
-                    <Input bind:value={step.rejectTarget} placeholder="implement" />
+                    <Input bind:value={step.rejectTarget} disabled={!!selectedWorkflow?.is_system} placeholder="implement" />
                   </label>
                   <label class="space-y-2 text-sm font-medium text-slate-200">
                     <span>Reject max loops</span>
-                    <Input bind:value={step.rejectMaxLoops} type="number" />
+                    <Input bind:value={step.rejectMaxLoops} disabled={!!selectedWorkflow?.is_system} type="number" />
                   </label>
                   <label class="space-y-2 text-sm font-medium text-slate-200">
                     <span>Reject on exhausted</span>
-                    <select bind:value={step.rejectOnExhausted} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+                    <select bind:value={step.rejectOnExhausted} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}>
                       <option value="continue">continue</option>
                       <option value="fail">fail</option>
                       <option value="gate">gate</option>
@@ -411,7 +439,7 @@
                 </div>
 
                 <div class="mt-4 flex justify-end">
-                  <Button size="sm" variant="danger" onclick={() => removeStep(index)}>Remove step</Button>
+                  <Button size="sm" variant="danger" onclick={() => removeStep(index)} disabled={!!selectedWorkflow?.is_system}>Remove step</Button>
                 </div>
               </article>
             {/each}

@@ -4,7 +4,7 @@
 
   import { api, asApiError } from '$lib/api/client';
   import { deriveGettingStartedSteps } from '$lib/getting-started';
-  import { collectModelOptions, createProviderForm, providerFormToPayload, type ProviderFormState } from '$lib/providers';
+  import { collectModelOptions, createProviderForm, presetHasBaseUrl, presetNeedsAuth, PRESET_LABELS, providerFormToPayload, type ProviderFormState, type ProviderPreset } from '$lib/providers';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import ProviderStatusBadge from '$lib/components/ProviderStatusBadge.svelte';
   import Button from '$lib/components/ui/Button.svelte';
@@ -31,9 +31,6 @@
   type SettingsTab = 'providers' | 'routing' | 'secrets' | 'system' | 'account';
 
   const tabs: SettingsTab[] = ['providers', 'routing', 'secrets', 'system', 'account'];
-  const openAiModels = ['gpt-4o', 'gpt-4o-mini', 'gpt-5.4-mini', 'gpt-5.4-nano', 'o3-mini'];
-  const anthropicModels = ['claude-sonnet-4-20250514', 'claude-3-7-sonnet-latest', 'claude-3-5-haiku-latest'];
-
   let activeTab: SettingsTab = 'providers';
   let loading = true;
   let busy = false;
@@ -87,10 +84,7 @@
       passwordForm,
       newApiKeyName,
       newApiKeyExpiresInDays,
-      selectedSettingKey,
-      settingValueText,
-      selectedProviderId,
-      activeTab
+      settingValueText
     });
   }
 
@@ -207,11 +201,75 @@
     initialSnapshot = snapshotState();
   }
 
-  async function prefillSecretForPreset(): Promise<void> {
-    const name = providerForm.preset === 'anthropic' ? 'anthropic_api_key' : 'openai_api_key';
-    secretForm = { ...secretForm, name, description: `${providerForm.display_name || providerForm.provider_id} credential` };
-    await setActiveTab('secrets');
+  function providerModelSuggestions(): string[] {
+    const values = new Set<string>();
+
+    for (const m of providerForm.discovered_models) {
+      values.add(m.model_id);
+    }
+
+    if (providerForm.default_model.trim()) {
+      values.add(providerForm.default_model.trim());
+    }
+
+    providerForm.additional_models
+      .split(/\n+/)
+      .map((value) => value.trim())
+      .filter(Boolean)
+      .forEach((value) => values.add(value));
+
+    for (const option of modelOptions()) {
+      values.add(option.value);
+    }
+
+    return [...values].sort((left, right) => left.localeCompare(right));
   }
+
+  async function discoverModels(): Promise<void> {
+    if (!selectedProviderId) {
+      error = 'Save the provider first, then discover models.';
+      return;
+    }
+    busy = true;
+    error = '';
+    try {
+      const result = await api.llmProviders.discoverModels(selectedProviderId);
+      providerForm.discovered_models = result.models;
+      addToast(`Discovered ${result.models.length} models.`, 'success');
+    } catch (caughtError) {
+      error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Model discovery failed');
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function saveAuthSecret(): Promise<void> {
+    if (!providerForm.auth_secret_name.trim() || !providerForm.auth_secret_value.trim()) {
+      error = 'Secret name and value are required.';
+      return;
+    }
+    busy = true;
+    error = '';
+    try {
+      await api.secrets.upsert({
+        name: providerForm.auth_secret_name,
+        value: providerForm.auth_secret_value,
+        scope: 'global',
+        agent_id: null,
+        description: `API key for provider ${providerForm.display_name || providerForm.provider_id}`
+      });
+      providerForm.auth_secret_value = '';
+      addToast('Credential saved to encrypted store.', 'success');
+    } catch (caughtError) {
+      error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to save credential');
+    } finally {
+      busy = false;
+    }
+  }
+
+  const presetOptions: ProviderPreset[] = ['openai', 'openai_compatible', 'anthropic', 'ollama', 'custom'];
 
   async function refreshPageState(): Promise<void> {
     isAdmin = auth.getSnapshot().user?.role === 'admin';
@@ -437,6 +495,7 @@
   function selectSetting(setting: Setting): void {
     selectedSettingKey = setting.key;
     settingValueText = JSON.stringify(setting.value, null, 2);
+    initialSnapshot = snapshotState();
   }
 
   async function saveSetting(): Promise<void> {
@@ -606,23 +665,23 @@
           </div>
         </Card>
 
-        <Card class="p-5">
+        <Card class="space-y-5 p-5">
+          <!-- Identity -->
           <div class="grid gap-4 md:grid-cols-2">
             <label class="space-y-2 text-sm font-medium text-slate-200">
-              <span>Provider ID</span>
+              <span>Provider ID <span class="text-rose-300">*</span></span>
               <Input bind:value={providerForm.provider_id} disabled={!!selectedProviderId} placeholder="default" />
             </label>
             <label class="space-y-2 text-sm font-medium text-slate-200">
-              <span>Display name</span>
-              <Input bind:value={providerForm.display_name} placeholder="OpenAI" />
+              <span>Display name <span class="text-rose-300">*</span></span>
+              <Input bind:value={providerForm.display_name} placeholder="My OpenAI" />
             </label>
             <label class="space-y-2 text-sm font-medium text-slate-200">
-              <span>Preset</span>
+              <span>Provider type</span>
               <select bind:value={providerForm.preset} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
-                <option value="openai">OpenAI</option>
-                <option value="anthropic">Anthropic</option>
-                <option value="ollama">Ollama</option>
-                <option value="custom">Custom</option>
+                {#each presetOptions as preset}
+                  <option value={preset}>{PRESET_LABELS[preset]}</option>
+                {/each}
               </select>
             </label>
             <label class="space-y-2 text-sm font-medium text-slate-200">
@@ -635,41 +694,102 @@
           </div>
 
           {#if providerForm.preset === 'custom'}
-            <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
+            <!-- Custom: raw JSON -->
+            <label class="block space-y-2 text-sm font-medium text-slate-200">
               <span>Config JSON</span>
               <textarea bind:value={providerForm.custom_json} class="min-h-[240px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 font-mono text-sm text-slate-100"></textarea>
             </label>
           {:else}
-            <div class="mt-4 grid gap-4 md:grid-cols-2">
-              <label class="space-y-2 text-sm font-medium text-slate-200">
-                <span>Base URL {providerForm.preset === 'ollama' ? '' : '(optional)'}</span>
-                <Input bind:value={providerForm.base_url} placeholder={providerForm.preset === 'ollama' ? 'http://localhost:11434' : 'https://api.openai.com/v1'} />
-              </label>
-              <label class="space-y-2 text-sm font-medium text-slate-200">
-                <span>Default model</span>
-                <Input bind:value={providerForm.default_model} list={`${providerForm.preset}-models`} placeholder="gpt-4o-mini" />
-                <datalist id={`${providerForm.preset}-models`}>
-                  {#each providerForm.preset === 'openai' ? openAiModels : providerForm.preset === 'anthropic' ? anthropicModels : ['ollama/llama3.2', 'ollama/qwen2.5-coder'] as model}
-                    <option value={model}></option>
-                  {/each}
-                </datalist>
-              </label>
-            </div>
-            <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
-              <span>Additional models (one per line)</span>
-              <textarea bind:value={providerForm.additional_models} class="min-h-[120px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 font-mono text-sm text-slate-100"></textarea>
-            </label>
-            <div class="mt-4 rounded-2xl border border-slate-800 bg-slate-950/50 px-4 py-4 text-sm text-slate-300">
-              <p>LiteLLM reads API keys from environment variables. Use secrets only for executor-side tool sandboxes.</p>
-              {#if providerForm.preset !== 'ollama'}
-                <div class="mt-3 flex flex-wrap gap-2">
-                  <Button type="button" size="sm" variant="secondary" onclick={prefillSecretForPreset}>Prefill matching secret</Button>
+            <!-- Credentials -->
+            {#if presetNeedsAuth(providerForm.preset)}
+              <div class="rounded-2xl border border-slate-800 bg-slate-900/60 p-4">
+                <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Credentials</p>
+                <div class="mt-3 grid gap-3 md:grid-cols-3">
+                  <label class="space-y-2 text-sm font-medium text-slate-200">
+                    <span>Auth mode</span>
+                    <select bind:value={providerForm.auth_mode} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+                      <option value="env">Environment variable</option>
+                      <option value="secret">Credential store</option>
+                    </select>
+                  </label>
+
+                  {#if providerForm.auth_mode === 'env'}
+                    <label class="space-y-2 text-sm font-medium text-slate-200 md:col-span-2">
+                      <span>Env variable name</span>
+                      <Input bind:value={providerForm.auth_env_var} placeholder="OPENAI_API_KEY" />
+                      <span class="block text-xs text-slate-400">Must be set before starting Cognis.</span>
+                    </label>
+                  {:else}
+                    <label class="space-y-2 text-sm font-medium text-slate-200">
+                      <span>Secret name</span>
+                      <Input bind:value={providerForm.auth_secret_name} placeholder="openai_api_key" />
+                    </label>
+                    <label class="space-y-2 text-sm font-medium text-slate-200">
+                      <span>API key value</span>
+                      <div class="flex gap-2">
+                        <Input bind:value={providerForm.auth_secret_value} type="password" placeholder="sk-..." />
+                        <Button size="sm" variant="secondary" onclick={saveAuthSecret} disabled={busy || !providerForm.auth_secret_value}>Save key</Button>
+                      </div>
+                      <span class="block text-xs text-slate-400">Encrypted at rest. Leave empty to keep existing.</span>
+                    </label>
+                  {/if}
                 </div>
+              </div>
+            {/if}
+
+            <!-- Connection -->
+            {#if presetHasBaseUrl(providerForm.preset)}
+              <label class="block space-y-2 text-sm font-medium text-slate-200">
+                <span>Base URL {providerForm.preset === 'ollama' ? '' : '<span class="text-rose-300">*</span>'}</span>
+                <Input bind:value={providerForm.base_url} placeholder={providerForm.preset === 'ollama' ? 'http://localhost:11434' : 'https://your-provider.example.com/v1'} />
+              </label>
+            {/if}
+
+            <!-- Models -->
+            <div class="rounded-2xl border border-slate-800 bg-slate-900/60 p-4">
+              <div class="flex items-center justify-between gap-3">
+                <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Models</p>
+                {#if selectedProviderId}
+                  <Button size="sm" variant="secondary" onclick={discoverModels} disabled={busy}>
+                    Discover models
+                  </Button>
+                {/if}
+              </div>
+
+              {#if providerForm.discovered_models.length > 0}
+                <div class="mt-3 max-h-48 overflow-y-auto rounded-xl border border-slate-800 bg-slate-950/80 p-2">
+                  <div class="space-y-1">
+                    {#each providerForm.discovered_models as m}
+                      <button type="button" class="w-full rounded-lg px-3 py-1.5 text-left text-xs text-slate-200 transition hover:bg-slate-800" onclick={() => (providerForm.default_model = m.model_id)}>
+                        {m.model_id}
+                      </button>
+                    {/each}
+                  </div>
+                </div>
+                <p class="mt-2 text-xs text-slate-400">Click a model to set it as default.</p>
               {/if}
+
+              <div class="mt-3 grid gap-4 md:grid-cols-2">
+                <label class="space-y-2 text-sm font-medium text-slate-200">
+                  <span>Default model <span class="text-rose-300">*</span></span>
+                  <Input bind:value={providerForm.default_model} list="provider-model-suggestions" placeholder="model id" />
+                  <datalist id="provider-model-suggestions">
+                    {#each providerModelSuggestions() as model}
+                      <option value={model}></option>
+                    {/each}
+                  </datalist>
+                </label>
+              </div>
+
+              <label class="mt-3 block space-y-2 text-sm font-medium text-slate-200">
+                <span>Additional models (one per line, optional)</span>
+                <textarea bind:value={providerForm.additional_models} class="min-h-[80px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 font-mono text-sm text-slate-100" placeholder="gpt-4o&#10;gpt-4o-mini"></textarea>
+              </label>
             </div>
           {/if}
 
-          <div class="mt-5 flex flex-wrap gap-2">
+          <!-- Actions -->
+          <div class="flex flex-wrap gap-2 border-t border-slate-800 pt-4">
             <Button onclick={saveProvider} disabled={!isAdmin || busy}>{selectedProviderId ? 'Save provider' : 'Create provider'}</Button>
             <Button variant="secondary" onclick={resetProviderForm} disabled={busy}>Reset</Button>
             {#if selectedProviderId}
@@ -679,7 +799,7 @@
           </div>
 
           {#if providerTestResult}
-            <div class={`mt-4 rounded-2xl border px-4 py-3 text-sm ${providerTestResult.ok ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-100' : 'border-rose-500/30 bg-rose-500/10 text-rose-100'}`}>
+            <div class={`rounded-2xl border px-4 py-3 text-sm ${providerTestResult.ok ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-100' : 'border-rose-500/30 bg-rose-500/10 text-rose-100'}`}>
               {#if providerTestResult.ok}
                 <p>Resolved model: {providerTestResult.model_resolved}</p>
                 <p class="mt-1">Latency: {providerTestResult.latency_ms} ms</p>

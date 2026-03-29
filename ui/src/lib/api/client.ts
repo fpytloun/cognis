@@ -510,6 +510,12 @@ export const api = {
       return request<ProviderTestResult & { provider_id: string }>(`/api/v1/llm-providers/${providerId}/test`, {
         method: 'POST'
       });
+    },
+
+    discoverModels(providerId: string): Promise<{ provider_id: string; models: Array<{ model_id: string; name: string }> }> {
+      return request<{ provider_id: string; models: Array<{ model_id: string; name: string }> }>(`/api/v1/llm-providers/${providerId}/discover-models`, {
+        method: 'POST'
+      });
     }
   },
 

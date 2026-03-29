@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
@@ -27,8 +28,13 @@ SAFE_PROVIDER_KWARGS = {"api_base", "api_version", "base_url", "max_retries", "t
 class LiteLLMProvider:
     """Load provider/model config from DB and route through LiteLLM."""
 
-    def __init__(self, session_factory: async_sessionmaker[Any]) -> None:
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[Any],
+        secrets_provider: Any | None = None,
+    ) -> None:
         self.session_factory = session_factory
+        self._secrets = secrets_provider
         self._cache_lock = asyncio.Lock()
         self._resolved_model_cache: dict[str, tuple[str, float]] = {}
         self._model_info_cache: dict[str, tuple[ModelInfo, float]] = {}
@@ -107,7 +113,7 @@ class LiteLLMProvider:
         **kwargs: Any,
     ) -> dict[str, Any]:
         resolved_model, provider = await self._resolve_model_target(model, task_type=task_type)
-        request_kwargs = {**self._provider_request_kwargs(provider), **kwargs}
+        request_kwargs = {**await self._resolve_provider_kwargs(provider), **kwargs}
         response = await litellm.acompletion(
             model=resolved_model, messages=messages, stream=False, **request_kwargs
         )
@@ -121,7 +127,7 @@ class LiteLLMProvider:
         **kwargs: Any,
     ) -> AsyncIterator[dict[str, Any]]:
         resolved_model, provider = await self._resolve_model_target(model, task_type=task_type)
-        request_kwargs = {**self._provider_request_kwargs(provider), **kwargs}
+        request_kwargs = {**await self._resolve_provider_kwargs(provider), **kwargs}
         stream = await litellm.acompletion(
             model=resolved_model, messages=messages, stream=True, **request_kwargs
         )
@@ -166,6 +172,64 @@ class LiteLLMProvider:
                             )
             return models
 
+    async def discover_models(self, provider_id: str) -> list[dict[str, Any]]:
+        """Query the remote provider for available models.
+
+        Uses the provider's configured base_url and credentials to call
+        the OpenAI-compatible ``/v1/models`` endpoint.  For Ollama,
+        calls ``/api/tags`` instead.
+        """
+        import httpx
+
+        async with self.session_factory() as session:
+            provider = await session.get(LLMProviderRow, provider_id)
+        if provider is None:
+            raise ValueError("LLM provider not found")
+
+        config = dict(provider.config)
+        request_kwargs = await self._resolve_provider_kwargs(provider)
+        api_key = request_kwargs.get("api_key", "")
+        base_url = request_kwargs.get("api_base") or request_kwargs.get("base_url") or ""
+
+        preset = config.get("preset", "")
+        headers: dict[str, str] = {}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        async with httpx.AsyncClient(timeout=15) as client:
+            if preset == "ollama" or "ollama" in base_url.lower():
+                # Ollama: GET /api/tags
+                ollama_url = base_url.rstrip("/") or "http://localhost:11434"
+                response = await client.get(f"{ollama_url}/api/tags", headers=headers)
+                response.raise_for_status()
+                data = response.json()
+                return [
+                    {"model_id": f"ollama/{m['name']}", "name": m.get("name", "")}
+                    for m in data.get("models", [])
+                ]
+
+            if preset == "anthropic":
+                # Anthropic doesn't have a /v1/models endpoint;
+                # return well-known models
+                return [
+                    {"model_id": "claude-sonnet-4-20250514", "name": "Claude Sonnet 4"},
+                    {"model_id": "claude-3-7-sonnet-latest", "name": "Claude 3.7 Sonnet"},
+                    {"model_id": "claude-3-5-haiku-latest", "name": "Claude 3.5 Haiku"},
+                    {"model_id": "claude-opus-4-20250514", "name": "Claude Opus 4"},
+                ]
+
+            # OpenAI-compatible: GET /v1/models
+            openai_url = base_url.rstrip("/") if base_url else "https://api.openai.com"
+            response = await client.get(f"{openai_url}/v1/models", headers=headers)
+            response.raise_for_status()
+            data = response.json()
+            models = data.get("data", [])
+            return [
+                {"model_id": m.get("id", ""), "name": m.get("id", "")}
+                for m in models
+                if isinstance(m, dict) and m.get("id")
+            ]
+
     async def get_cost(self, usage: TokenUsage, model: str) -> Cost:
         return Cost(
             model=model, provider="litellm", total_cost=0.0, input_cost=0.0, output_cost=0.0
@@ -195,7 +259,7 @@ class LiteLLMProvider:
         if not isinstance(default_model, str) or not default_model:
             raise ValueError("Provider default_model is not configured")
 
-        request_kwargs = self._provider_request_kwargs(provider)
+        request_kwargs = await self._resolve_provider_kwargs(provider)
         configured_timeout = request_kwargs.get("timeout")
         request_kwargs["timeout"] = (
             min(timeout_seconds, configured_timeout)
@@ -264,6 +328,84 @@ class LiteLLMProvider:
                 request_kwargs[key] = value
         if "base_url" in request_kwargs and "api_base" not in request_kwargs:
             request_kwargs["api_base"] = request_kwargs["base_url"]
+
+        # Resolve API key from auth_config
+        api_key = self._resolve_api_key(config)
+        if api_key:
+            request_kwargs["api_key"] = api_key
+        return request_kwargs
+
+    def _resolve_api_key(self, config: dict[str, Any]) -> str | None:
+        """Resolve API key from provider auth configuration.
+
+        Supports three modes via config.auth_config:
+        - ``secret``: read from the encrypted secrets store by secret_name
+        - ``env``: read from an environment variable by env_var name
+        - fallback: if auth_config is absent, return None and let LiteLLM
+          use its own standard env-var lookup
+        """
+        auth_config = config.get("auth_config")
+        if not isinstance(auth_config, dict):
+            return None
+
+        mode = auth_config.get("mode")
+        if mode == "secret":
+            secret_name = auth_config.get("secret_name")
+            if not isinstance(secret_name, str) or not secret_name:
+                return None
+            if self._secrets is None:
+                logger.warning(
+                    "Provider auth_config references secret but secrets provider unavailable"
+                )
+                return None
+            # _resolve_api_key_from_secret is async; callers should use
+            # resolve_provider_kwargs instead for the async path.
+            return None
+        elif mode == "env":
+            env_var = auth_config.get("env_var")
+            if isinstance(env_var, str) and env_var:
+                return os.environ.get(env_var)
+        return None
+
+    async def _resolve_api_key_async(self, config: dict[str, Any]) -> str | None:
+        """Async version of API key resolution (supports secrets store)."""
+        auth_config = config.get("auth_config")
+        if not isinstance(auth_config, dict):
+            return None
+
+        mode = auth_config.get("mode")
+        if mode == "secret":
+            secret_name = auth_config.get("secret_name")
+            if not isinstance(secret_name, str) or not secret_name:
+                return None
+            if self._secrets is None:
+                return None
+            try:
+                return await self._secrets.get_secret(secret_name, "system", None)
+            except Exception:
+                logger.warning("Failed to read secret for LLM provider auth")
+                return None
+        elif mode == "env":
+            env_var = auth_config.get("env_var")
+            if isinstance(env_var, str) and env_var:
+                return os.environ.get(env_var)
+        return None
+
+    async def _resolve_provider_kwargs(self, provider: LLMProviderRow | None) -> dict[str, Any]:
+        """Async version of _provider_request_kwargs — resolves secrets."""
+        if provider is None:
+            return {}
+        config = dict(provider.config)
+        request_kwargs: dict[str, Any] = {}
+        for key in SAFE_PROVIDER_KWARGS:
+            value = config.get(key)
+            if value is not None:
+                request_kwargs[key] = value
+        if "base_url" in request_kwargs and "api_base" not in request_kwargs:
+            request_kwargs["api_base"] = request_kwargs["base_url"]
+        api_key = await self._resolve_api_key_async(config)
+        if api_key:
+            request_kwargs["api_key"] = api_key
         return request_kwargs
 
     def _classify_provider_error(self, error: Exception) -> str:

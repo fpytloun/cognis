@@ -19,27 +19,30 @@ describe('provider presets', () => {
 
   it('detects preset and builds form state', () => {
     expect(detectProviderPreset(provider)).toBe('openai');
-    expect(createProviderForm(provider).default_model).toBe('gpt-4o-mini');
+    const form = createProviderForm(provider);
+    expect(form.default_model).toBe('gpt-4o-mini');
+    expect(form.auth_mode).toBe('env');
+    expect(form.auth_env_var).toBe('OPENAI_API_KEY');
   });
 
   it('maps structured form state back to provider payload', () => {
-    const payload = providerFormToPayload({
-      provider_id: 'default',
-      display_name: 'OpenAI',
-      location: 'controller',
-      backend: 'litellm',
-      status: 'active',
-      preset: 'openai',
-      base_url: '',
-      default_model: 'gpt-4o-mini',
-      additional_models: 'gpt-4o',
-      custom_json: '{}'
-    });
-    expect(payload.config).toEqual({
-      preset: 'openai',
-      default_model: 'gpt-4o-mini',
-      models: [{ model_id: 'gpt-4o-mini' }, { model_id: 'gpt-4o' }]
-    });
+    const form = createProviderForm(provider);
+    form.additional_models = 'gpt-4o';
+    const payload = providerFormToPayload(form);
+    const config = payload.config as Record<string, unknown>;
+    expect(config.preset).toBe('openai');
+    expect(config.default_model).toBe('gpt-4o-mini');
+    expect(config.auth_config).toEqual({ mode: 'env', env_var: 'OPENAI_API_KEY' });
+    expect(config.models).toEqual([{ model_id: 'gpt-4o-mini' }, { model_id: 'gpt-4o' }]);
+  });
+
+  it('maps secret auth mode to payload', () => {
+    const form = createProviderForm(provider);
+    form.auth_mode = 'secret';
+    form.auth_secret_name = 'my_openai_key';
+    const payload = providerFormToPayload(form);
+    const config = payload.config as Record<string, unknown>;
+    expect(config.auth_config).toEqual({ mode: 'secret', secret_name: 'my_openai_key' });
   });
 
   it('collects model options with provider metadata', () => {

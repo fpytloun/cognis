@@ -49,7 +49,7 @@
       </h1>
       <p class="mt-6 max-w-xl text-sm leading-7 text-slate-300">
         Log in to manage agents, watch delegated work progress in real time, review workflow gates,
-        and configure the Openclaw controller from one browser workspace.
+        and configure Cognis from one browser workspace.
       </p>
     </section>
 
