@@ -2,7 +2,7 @@
   import { beforeNavigate, goto } from '$app/navigation';
   import { onMount } from 'svelte';
 
-  import { createEmptyAgentForm, defaultSystemPrompt } from '$lib/agents';
+  import { createEmptyAgentForm, defaultSystemPrompt, type AgentFormState } from '$lib/agents';
   import { api, asApiError } from '$lib/api/client';
   import AgentForm from '$lib/components/agents/AgentForm.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
@@ -11,18 +11,18 @@
   import Button from '$lib/components/ui/Button.svelte';
   import type { LLMProvider, SecretMetadata, ToolDefinitionSummary, Workflow } from '$lib/types/api';
 
-  let loading = true;
-  let saving = false;
-  let error = '';
-  let tools: ToolDefinitionSummary[] = [];
-  let workflows: Workflow[] = [];
-  let providers: LLMProvider[] = [];
-  let secrets: SecretMetadata[] = [];
-  let form = $state(createEmptyAgentForm());
+  let loading = $state(true);
+  let saving = $state(false);
+  let error = $state('');
+  let tools = $state<ToolDefinitionSummary[]>([]);
+  let workflows = $state<Workflow[]>([]);
+  let providers = $state<LLMProvider[]>([]);
+  let secrets = $state<SecretMetadata[]>([]);
+  let form: AgentFormState = $state(createEmptyAgentForm());
   let initialSnapshot = '';
 
   function isDirty(): boolean {
-    return JSON.stringify(form) !== initialSnapshot;
+    return JSON.stringify($state.snapshot(form)) !== initialSnapshot;
   }
 
   beforeNavigate((navigation) => {
@@ -35,21 +35,23 @@
   async function loadOptions(): Promise<void> {
     loading = true;
     try {
-      [tools, workflows, secrets] = await Promise.all([
+      const [loadedTools, loadedWorkflows] = await Promise.all([
         api.tools.list(),
         api.workflows.listAll(),
-        api.secrets.list(),
       ]);
-      try {
-        providers = (await api.llmProviders.list()).items;
-      } catch {
-        providers = [];
-      }
-      // Re-create form with workflows so system workflows are pre-selected
-      const fresh = createEmptyAgentForm(workflows);
-      fresh.systemPrompt = defaultSystemPrompt('');
-      Object.assign(form, fresh);
-      initialSnapshot = JSON.stringify(form);
+      tools = loadedTools;
+      workflows = loadedWorkflows;
+
+      // These are non-critical — load gracefully
+      try { secrets = await api.secrets.list(); } catch { secrets = []; }
+      try { providers = (await api.llmProviders.list()).items; } catch { providers = []; }
+
+      // Update form with system workflows pre-selected
+      const systemWorkflowIds = workflows.filter((w) => w.is_system).map((w) => w.workflow_id);
+      form.availableWorkflowIds = systemWorkflowIds;
+      form.defaultWorkflowId = 'system:direct';
+      form.systemPrompt = defaultSystemPrompt('');
+      initialSnapshot = JSON.stringify($state.snapshot(form));
     } catch (caughtError) {
       error = asApiError(caughtError).message;
     } finally {

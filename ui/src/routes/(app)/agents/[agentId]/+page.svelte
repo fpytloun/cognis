@@ -12,16 +12,16 @@
   import { addToast } from '$lib/stores/toasts';
   import type { Agent, LLMProvider, MCPServerTestResponse, SecretMetadata, ToolDefinitionSummary, Workflow } from '$lib/types/api';
 
-  let loading = true;
-  let saving = false;
-  let error = '';
-  let agent: Agent | null = null;
-  let tools: ToolDefinitionSummary[] = [];
-  let workflows: Workflow[] = [];
-  let providers: LLMProvider[] = [];
-  let secrets: SecretMetadata[] = [];
-  let mcpTesting = false;
-  let mcpTestResult: MCPServerTestResponse | null = null;
+  let loading = $state(true);
+  let saving = $state(false);
+  let error = $state('');
+  let agent = $state<Agent | null>(null);
+  let tools = $state<ToolDefinitionSummary[]>([]);
+  let workflows = $state<Workflow[]>([]);
+  let providers = $state<LLMProvider[]>([]);
+  let secrets = $state<SecretMetadata[]>([]);
+  let mcpTesting = $state(false);
+  let mcpTestResult = $state<MCPServerTestResponse | null>(null);
   let form = $state(agentToFormState({
     agent_id: '',
     owner_email: '',
@@ -50,7 +50,7 @@
   }
 
   function isDirty(): boolean {
-    return JSON.stringify(form) !== initialSnapshot;
+    return JSON.stringify($state.snapshot(form)) !== initialSnapshot;
   }
 
   beforeNavigate((navigation) => {
@@ -75,7 +75,7 @@
         providers = [];
       }
       Object.assign(form, agentToFormState(agent));
-      initialSnapshot = JSON.stringify(form);
+      initialSnapshot = JSON.stringify($state.snapshot(form));
     } catch (caughtError) {
       error = asApiError(caughtError).message;
     } finally {
