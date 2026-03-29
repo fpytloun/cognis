@@ -27,7 +27,7 @@
     className
   )}
   {type}
-  {value}
+  bind:value
   {placeholder}
   {disabled}
   {name}
