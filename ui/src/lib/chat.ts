@@ -113,8 +113,10 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
     }
 
     if (event.type === 'tool_call') {
-      const callId = String(event.data.call_id ?? `tc-${event.seq}`);
       const toolName = String(event.data.name ?? event.data.tool_name ?? 'unknown');
+      // Orchestration tools are displayed as delegation cards, not tool blocks
+      if (['delegate', 'spawn_worker', 'fork'].includes(toolName)) continue;
+      const callId = String(event.data.call_id ?? `tc-${event.seq}`);
       const args = typeof event.data.arguments === 'object' && event.data.arguments !== null
         ? (event.data.arguments as Record<string, unknown>)
         : undefined;
@@ -129,6 +131,63 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
       };
       toolCallIndexByCallId.set(callId, items.length);
       items.push(item);
+      continue;
+    }
+
+    if (event.type === 'delegation') {
+      const childSessionId = String(event.data.child_session_id ?? event.data.call_id ?? `del-${event.seq}`);
+      const taskDesc = String(event.data.task ?? event.data.mode ?? 'Background task');
+      items.push({
+        id: `delegation:${childSessionId}`,
+        kind: 'delegation',
+        taskId: childSessionId,
+        taskLabel: taskDesc,
+        status: 'started',
+        result: null,
+        timestamp: event.timestamp
+      });
+      continue;
+    }
+
+    if (event.type === 'delegation_completed') {
+      const childSessionId = String(event.data.child_session_id ?? `del-${event.seq}`);
+      const itemId = `delegation:${childSessionId}`;
+      const existingIdx = items.findIndex((i) => i.id === itemId && i.kind === 'delegation');
+      if (existingIdx >= 0) {
+        const existing = items[existingIdx] as DelegationTimelineItem;
+        items[existingIdx] = { ...existing, status: 'completed', result: typeof event.data.result_summary === 'string' ? event.data.result_summary : null };
+      } else {
+        items.push({
+          id: itemId,
+          kind: 'delegation',
+          taskId: childSessionId,
+          taskLabel: String(event.data.mode ?? 'Background task'),
+          status: 'completed',
+          result: typeof event.data.result_summary === 'string' ? event.data.result_summary : null,
+          timestamp: event.timestamp
+        });
+      }
+      continue;
+    }
+
+    if (event.type === 'delegation_failed') {
+      const childSessionId = String(event.data.child_session_id ?? `del-${event.seq}`);
+      const itemId = `delegation:${childSessionId}`;
+      const existingIdx = items.findIndex((i) => i.id === itemId && i.kind === 'delegation');
+      if (existingIdx >= 0) {
+        const existing = items[existingIdx] as DelegationTimelineItem;
+        items[existingIdx] = { ...existing, status: 'failed', result: typeof event.data.error === 'string' ? event.data.error : 'Failed' };
+      } else {
+        items.push({
+          id: itemId,
+          kind: 'delegation',
+          taskId: childSessionId,
+          taskLabel: String(event.data.mode ?? 'Background task'),
+          status: 'failed',
+          result: typeof event.data.error === 'string' ? event.data.error : 'Failed',
+          timestamp: event.timestamp
+        });
+      }
       continue;
     }
 
@@ -240,6 +299,8 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
   }
 
   if (event.type === 'tool_call') {
+    // Orchestration tools are displayed as delegation cards, not tool blocks
+    if (['delegate', 'spawn_worker', 'fork'].includes(event.tool_name)) return next;
     const itemId = `tool:${event.call_id}`;
     const index = next.findIndex((item) => item.id === itemId && item.kind === 'tool_call');
     const toolItem: ToolCallTimelineItem = {

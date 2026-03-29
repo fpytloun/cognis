@@ -516,14 +516,14 @@ class AgentLoop:
             await self.providers.guardrails.record_events(
                 session_id=parent_session_id,
                 events=[
-                    {
-                        "type": "delegation_completed",
-                        "data": {
+                    SessionEvent(
+                        type="delegation_completed",
+                        data={
                             "child_session_id": child_session_id,
                             "mode": mode,
                             "result_summary": result_summary,
                         },
-                    }
+                    )
                 ],
             )
             await self.event_bus.publish(
@@ -571,14 +571,14 @@ class AgentLoop:
             await self.providers.guardrails.record_events(
                 session_id=parent_session_id,
                 events=[
-                    {
-                        "type": "delegation_failed",
-                        "data": {
+                    SessionEvent(
+                        type="delegation_failed",
+                        data={
                             "child_session_id": child_session_id,
                             "mode": mode,
                             "error": "Delegation execution failed",
                         },
-                    }
+                    )
                 ],
             )
             await self.event_bus.publish(

@@ -11,7 +11,8 @@ from cognis.models.tool import ExecutorHandle, ToolDefinition, ToolResult
 logger = get_logger(__name__)
 
 SOURCE_PRIORITIES: dict[str, int] = {
-    "builtin": 400,
+    "builtin": 500,
+    "executor": 400,
     "skill": 300,
     "local_mcp": 200,
     "intaris_mcp": 100,

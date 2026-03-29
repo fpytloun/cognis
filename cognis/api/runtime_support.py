@@ -11,6 +11,7 @@ from cognis.models.tool import ExecutorConfig, MCPServerConfig, ToolDefinition
 from cognis.providers.executor.in_process import InProcessExecutorConnection
 from cognis.tools.builtin.orchestration import orchestration_tools
 from cognis.tools.builtin.system import system_tools
+from cognis.tools.executor.definitions import executor_tool_definitions
 from cognis.tools.registry import RegisteredTool, ToolRegistry
 from cognis.tools.skills import load_skill_tool_names
 
@@ -24,8 +25,11 @@ async def noop_cleanup() -> None:
 
 
 def static_tool_definitions() -> list[ToolDefinition]:
-    """Return the static builtin tool definitions available to Cognis."""
-    return [*system_tools(), *orchestration_tools()]
+    """Return all static tool definitions available to Cognis.
+
+    Includes builtin controller tools and executor-native tools.
+    """
+    return [*system_tools(), *orchestration_tools(), *executor_tool_definitions()]
 
 
 def select_static_tools(agent: Any | None = None) -> list[ToolDefinition]:

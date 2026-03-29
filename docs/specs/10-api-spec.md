@@ -137,10 +137,31 @@ POST   /api/v1/sessions/:id/cancel            → Cancel
 ### Tools
 
 ```
-GET    /api/v1/tools                          → List all available tools
-GET    /api/v1/agents/:id/tools               → Tools for agent
+GET    /api/v1/tools                          → List all available tools (all sources)
+GET    /api/v1/tools/executor                 → List executor-native tools with status
+GET    /api/v1/agents/:id/tools               → Tools for agent (filtered by agent config)
 POST   /api/v1/agents/:id/mcp/test           → Test local MCP server discovery for agent
-GET    /api/v1/mcp/servers                    → List MCP servers
+GET    /api/v1/mcp/servers                    → List MCP servers (local + Intaris)
+GET    /api/v1/intaris/mcp/servers            → Auto-discover Intaris MCP servers
+GET    /api/v1/intaris/mcp/tools              → List all Intaris MCP tools
+```
+
+### Skills
+
+```
+GET    /api/v1/skills                         → List all skills
+POST   /api/v1/skills                         → Create skill
+GET    /api/v1/skills/:id                     → Get skill detail
+PUT    /api/v1/skills/:id                     → Update skill
+DELETE /api/v1/skills/:id                     → Delete skill (DB-managed only)
+POST   /api/v1/skills/:id/export             → Export skill as YAML
+POST   /api/v1/skills/import                  → Import skill from YAML
+```
+
+### Executor
+
+```
+GET    /api/v1/executor/status                → Executor status and capabilities
 ```
 
 ### Secrets

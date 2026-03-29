@@ -60,6 +60,11 @@
   let editingTitle = false;
   let editTitleValue = '';
   let sessionIdCopied = false;
+  let subSessionPanelOpen = false;
+  let subSessionId = '';
+  let subSessionTimeline: TimelineItem[] = [];
+  let subSessionLoading = false;
+  let subSessionError = '';
 
   const escalationFirstSeen = new Map<string, number>();
   const sessionIds = new Set<string>();
@@ -585,8 +590,27 @@
     persistSelectedAgent();
   }
 
-  function handleViewSession(_taskId: string): void {
-    // Placeholder for Phase 2E sub-session panel
+  async function handleViewSession(sessionId: string): Promise<void> {
+    if (!currentConversation) return;
+    subSessionId = sessionId;
+    subSessionPanelOpen = true;
+    subSessionLoading = true;
+    subSessionError = '';
+    subSessionTimeline = [];
+    try {
+      const result = await api.conversations.sessionEvents(currentConversation.conversation_id, sessionId, 0, 200);
+      subSessionTimeline = normalizeHistory(result.items ?? []);
+    } catch (err) {
+      subSessionError = asApiError(err)?.message ?? 'Failed to load session events';
+    } finally {
+      subSessionLoading = false;
+    }
+  }
+
+  function closeSubSessionPanel(): void {
+    subSessionPanelOpen = false;
+    subSessionId = '';
+    subSessionTimeline = [];
   }
 
   $: if ($page.params.conversationId && $page.params.conversationId !== activeConversationId) {
@@ -643,7 +667,7 @@
 {#if loading}
   <LoadingState label="Loading conversation" description="Fetching history, restoring workflow prompts, and preparing the live stream." />
 {:else}
-  <div class="grid min-h-[calc(100vh-12rem)] gap-4 xl:grid-cols-[320px_minmax(0,1fr)]">
+  <div class={`grid min-h-[calc(100vh-12rem)] gap-4 ${subSessionPanelOpen ? 'xl:grid-cols-[320px_minmax(0,1fr)_420px]' : 'xl:grid-cols-[320px_minmax(0,1fr)]'}`}>
     <!-- Sidebar -->
     <aside class={`${mobileListOpen || !currentConversation ? 'block' : 'hidden'} space-y-4 rounded-3xl border border-slate-800/80 bg-slate-900/70 p-4 shadow-card backdrop-blur xl:block`}>
       {#if agents.length === 0}
@@ -993,5 +1017,44 @@
         {/if}
       </div>
     </section>
+
+    <!-- Sub-session panel (slide-out) -->
+    {#if subSessionPanelOpen}
+      <aside class="flex min-h-0 w-full flex-col rounded-3xl border border-slate-800/80 bg-slate-900/70 shadow-card backdrop-blur xl:w-[420px]">
+        <div class="flex items-center justify-between border-b border-slate-800/80 px-4 py-3">
+          <div class="min-w-0">
+            <p class="text-xs font-medium uppercase tracking-[0.2em] text-slate-400">Sub-session</p>
+            <p class="mt-0.5 truncate font-mono text-xs text-slate-500">{subSessionId.slice(0, 16)}</p>
+          </div>
+          <Button size="sm" variant="ghost" onclick={closeSubSessionPanel}>Close</Button>
+        </div>
+        <div class="flex-1 overflow-y-auto px-4 py-4 space-y-4">
+          {#if subSessionLoading}
+            <LoadingState />
+          {:else if subSessionError}
+            <p class="text-sm text-rose-400">{subSessionError}</p>
+          {:else if subSessionTimeline.length === 0}
+            <p class="text-sm text-slate-500">No events recorded yet.</p>
+          {:else}
+            {#each subSessionTimeline as item (item.id)}
+              {#if item.kind === 'message'}
+                <ChatMessage {item} />
+              {:else if item.kind === 'tool_call'}
+                <ToolCallBlock {item} />
+              {:else if item.kind === 'reasoning'}
+                <ReasoningBlock {item} />
+              {:else if item.kind === 'delegation'}
+                <DelegationCard {item} />
+              {:else if item.kind === 'notice'}
+                <div class="rounded-xl border border-slate-800/60 bg-slate-900/50 px-3 py-2 text-xs text-slate-400">
+                  <p class="font-medium">{item.title}</p>
+                  {#if item.description}<p class="mt-1 opacity-75">{item.description}</p>{/if}
+                </div>
+              {/if}
+            {/each}
+          {/if}
+        </div>
+      </aside>
+    {/if}
   </div>
 {/if}

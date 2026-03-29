@@ -23,6 +23,7 @@ from cognis.models.tool import (
 )
 from cognis.providers.circuit_breaker import CircuitBreaker
 from cognis.tools.builtin.system import StatusProvider, build_system_tool_handlers
+from cognis.tools.executor.definitions import executor_tool_handlers
 from cognis.tools.mcp import StdioMCPClient, mcp_tools_to_definitions
 from cognis.tools.registry import RegisteredTool, ToolExecutionContext, ToolRegistry
 
