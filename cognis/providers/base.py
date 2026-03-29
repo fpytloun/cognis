@@ -27,6 +27,8 @@ class MemoryProvider(Protocol):
         context: str | None = None,
         search_mode: str = "find",
         include_instructions: bool = False,
+        managed: bool = False,
+        instruction_mode: str | None = None,
     ) -> dict[str, Any]: ...
 
     async def remember(

@@ -172,12 +172,28 @@ def setup_logging(level: str = "info", fmt: str = "json") -> None:
 
     root.addHandler(handler)
 
-    # Suppress noisy third-party loggers and force them through our formatter
-    for name in ("httpx", "httpcore", "litellm"):
+    # Suppress noisy third-party loggers and force them through our formatter.
+    # LiteLLM uses PascalCase logger names internally.
+    for name in (
+        "httpx",
+        "httpcore",
+        "litellm",
+        "LiteLLM",
+        "LiteLLM Router",
+        "LiteLLM Proxy",
+    ):
         third_party = logging.getLogger(name)
         third_party.setLevel(logging.WARNING)
         third_party.handlers.clear()
         third_party.propagate = True
+
+    # Silence LiteLLM's own console debug output
+    try:
+        import litellm as _litellm
+
+        _litellm.suppress_debug_info = True
+    except ImportError:
+        pass
 
     # Uvicorn: keep access logs at WARNING, error logs at our level
     for name in ("uvicorn", "uvicorn.access", "uvicorn.error"):

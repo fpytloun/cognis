@@ -11,4 +11,10 @@ from cognis.config import load_config
 def serve() -> None:
     """Start the FastAPI server."""
     config = load_config()
-    uvicorn.run(create_app(), host=config.host, port=config.port)
+    uvicorn.run(
+        create_app(),
+        host=config.host,
+        port=config.port,
+        log_config=None,
+        access_log=False,
+    )

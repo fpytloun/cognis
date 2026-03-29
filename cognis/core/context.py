@@ -119,7 +119,8 @@ class ContextAssembler:
             extra={"extra_data": {"session_id": session.session_id, "agent_id": agent.agent_id}},
         )
         cached_intention = self.session_cache.get_intention(session.session_id)
-        search_mode = "find" if session.mnemory_session_id is None else "search"
+        is_first_recall = session.mnemory_session_id is None
+        search_mode = "find" if is_first_recall else "search"
 
         with scoped_runtime_context(user_email=session.user_email, agent_id=session.agent_id):
             recall_task = self.memory.recall(
@@ -128,6 +129,9 @@ class ContextAssembler:
                 labels=conversation.context.memory_labels,
                 context=cached_intention,
                 search_mode=search_mode,
+                include_instructions=is_first_recall,
+                managed=True,
+                instruction_mode="personality" if is_first_recall else None,
             )
             refresh_task = self.session_cache.refresh(session)
             intention_task = self.guardrails.get_session(

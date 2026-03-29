@@ -47,17 +47,22 @@ class MnemoryProvider:
         context: str | None = None,
         search_mode: str = "find",
         include_instructions: bool = False,
+        managed: bool = False,
+        instruction_mode: str | None = None,
     ) -> dict[str, Any]:
-        payload = {
+        payload: dict[str, Any] = {
             "session_id": session_id,
             "query": query,
             "messages": [{"role": "user", "content": query}],
             "include_instructions": include_instructions,
+            "managed": managed,
             "search_mode": search_mode,
             "context": context,
             "labels": labels or {},
             "ttl": 86400,
         }
+        if instruction_mode is not None:
+            payload["instruction_mode"] = instruction_mode
         logger.info(
             "mnemory: recall started",
             extra={

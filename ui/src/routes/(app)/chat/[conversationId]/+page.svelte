@@ -231,14 +231,24 @@
     }
   }
 
+  const ESCALATION_POLL_ACTIVE_MS = 5_000;
+  const ESCALATION_POLL_IDLE_MS = 15_000;
+
   function startEscalationPolling(): void {
     stopEscalationPolling();
     if (typeof document === 'undefined' || document.hidden) {
       return;
     }
+    const interval = escalations.length > 0 ? ESCALATION_POLL_ACTIVE_MS : ESCALATION_POLL_IDLE_MS;
     escalationPollTimer = window.setInterval(() => {
-      void refreshEscalations();
-    }, 5000);
+      void refreshEscalations().then(() => {
+        // Adapt interval: restart with shorter interval if escalations appeared
+        const nextInterval = escalations.length > 0 ? ESCALATION_POLL_ACTIVE_MS : ESCALATION_POLL_IDLE_MS;
+        if (nextInterval !== interval) {
+          startEscalationPolling();
+        }
+      });
+    }, interval);
   }
 
   function syncVisibleWindow(): void {
