@@ -421,22 +421,32 @@ async def list_conversations(session: AsyncSession, user_email: str) -> list[Con
 
 
 async def get_latest_active_conversation_for_agent(
-    session: AsyncSession, user_email: str, agent_id: str
+    session: AsyncSession,
+    user_email: str,
+    agent_id: str,
+    *,
+    context_type: str | None = None,
 ) -> Conversation | None:
-    """Return the most recent active conversation for one user/agent pair."""
+    """Return the most recent active conversation for one user/agent pair.
 
-    result = await session.execute(
+    When *context_type* is provided the query is further narrowed to
+    conversations with a matching ``context_type`` column.
+    """
+
+    query = (
         select(Conversation)
         .where(Conversation.user_email == user_email)
         .where(Conversation.agent_id == agent_id)
         .where(Conversation.status == "active")
-        .order_by(
-            Conversation.last_message_at.desc().nullslast(),
-            Conversation.updated_at.desc(),
-            Conversation.conversation_id.asc(),
-        )
-        .limit(1)
     )
+    if context_type is not None:
+        query = query.where(Conversation.context_type == context_type)
+    query = query.order_by(
+        Conversation.last_message_at.desc().nullslast(),
+        Conversation.updated_at.desc(),
+        Conversation.conversation_id.asc(),
+    ).limit(1)
+    result = await session.execute(query)
     return result.scalar_one_or_none()
 
 

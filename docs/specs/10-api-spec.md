@@ -52,16 +52,32 @@ POST   /api/v1/auth/exchange-token → Issue short-lived token for Intaris/Mnemo
 ### Conversations
 
 ```
-GET    /api/v1/conversations                  → List conversations
-POST   /api/v1/conversations                  → Create conversation
-GET    /api/v1/conversations/:id              → Get details
-PATCH  /api/v1/conversations/:id              → Update (title, archive)
-DELETE /api/v1/conversations/:id              → Delete
-DELETE /api/v1/conversations/:id/purge        → Purge metadata (+ Intaris cascade when provider contract supports it)
-GET    /api/v1/conversations/:id/messages     → Get history (from Intaris events)
-GET    /api/v1/conversations/:id/sessions     → List sessions
-GET    /api/v1/conversations/:id/delegations  → Active delegations
+GET    /api/v1/conversations                              → List conversations
+POST   /api/v1/conversations                              → Create conversation
+POST   /api/v1/conversations/resolve                      → Find-or-create default conversation
+GET    /api/v1/conversations/:id                          → Get details
+PATCH  /api/v1/conversations/:id                          → Update (title, archive)
+DELETE /api/v1/conversations/:id                          → Delete
+DELETE /api/v1/conversations/:id/purge                    → Purge metadata (+ Intaris cascade)
+GET    /api/v1/conversations/:id/messages                 → Get history (from Intaris events)
+GET    /api/v1/conversations/:id/sessions                 → List sessions
+GET    /api/v1/conversations/:id/delegations              → Active delegations
+GET    /api/v1/conversations/:id/sessions/:sid/events     → Session event stream
 ```
+
+#### Resolve Conversation (find-or-create)
+```http
+POST /api/v1/conversations/resolve
+{ "agent_id": "aria", "context_type": "web" }
+
+→ 200 OK  (existing or newly created)
+{ "conversation_id": "conv_abc", "agent_id": "aria", "context": {...}, ... }
+```
+
+Used by the web UI to ensure a persistent default conversation exists for
+each agent. If an active conversation matching the (user, agent, context_type)
+triple exists, it is returned. Otherwise a new one is created with
+`context_ref=web:user:<email>:default`.
 
 #### Get Messages (proxied from Intaris events)
 ```http
@@ -282,10 +298,16 @@ socket authenticates so stalled connections are detected proactively.
 // Streaming
 {type: "chunk", conversation_id, session_id, message_id, content, index}
 {type: "message_complete", conversation_id, message_id, seq, token_usage, queued_count}
+{type: "reasoning", conversation_id, session_id, message_id, content}
 
 // Tool calls
 {type: "tool_call", conversation_id, session_id, call_id, tool_name,
- arguments, status, result_preview?}
+ arguments?, status}
+{type: "tool_result", conversation_id, session_id, call_id, tool_name,
+ result, is_error, duration_ms}
+
+// Conversation metadata
+{type: "conversation_updated", conversation_id, title?}
 
 // Delegations
 {type: "delegation_started", conversation_id, parent_session_id,
@@ -324,6 +346,14 @@ socket authenticates so stalled connections are detected proactively.
 Notes:
 - `seq` in `message_complete` is the Intaris event sequence number. The
   client tracks this for reconnection.
+- `tool_call` events now include `arguments` (optional) when status is `"started"`.
+  A separate `tool_result` event delivers the result after execution completes.
+  For direct chat, the controller also emits a second `tool_call` with
+  `status: "completed"` alongside `tool_result`.
+- `reasoning` events carry LLM thinking/reasoning tokens (Anthropic extended
+  thinking, OpenAI reasoning content). Streamed incrementally like `chunk`.
+- `conversation_updated` notifies clients of metadata changes such as
+  auto-generated titles. Fires asynchronously after the first turn.
 - On reconnect, the server replays missed events since `last_seq` and
   sends `reconnected` when replay is complete. See
   [09-ui-ux.md](09-ui-ux.md) for the full reconnection protocol.

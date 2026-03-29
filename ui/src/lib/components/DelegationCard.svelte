@@ -1,8 +1,12 @@
 <script lang="ts">
   import type { DelegationTimelineItem } from '$lib/chat';
   import { formatAbsoluteTime, formatRelativeTime } from '$lib/time';
+  import Button from '$lib/components/ui/Button.svelte';
 
-  let { item } = $props<{ item: DelegationTimelineItem }>();
+  let { item, onViewSession } = $props<{
+    item: DelegationTimelineItem;
+    onViewSession?: ((taskId: string) => void) | undefined;
+  }>();
 
   function toneClass(): string {
     return item.status === 'completed'
@@ -22,12 +26,24 @@
         {formatRelativeTime(item.timestamp)}
       </p>
     </div>
-    <span class="rounded-full border border-current/30 px-3 py-1 text-xs font-semibold uppercase tracking-[0.2em]">
-      {item.status}
-    </span>
+    <div class="flex items-center gap-2">
+      <span class="rounded-full border border-current/30 px-3 py-1 text-xs font-semibold uppercase tracking-[0.2em]">
+        {item.status}
+      </span>
+    </div>
   </div>
 
   {#if item.result}
     <p class="mt-3 text-sm leading-6 opacity-90">{item.result}</p>
   {/if}
+
+  <div class="mt-3 flex justify-end">
+    <Button
+      size="sm"
+      variant="ghost"
+      onclick={() => onViewSession?.(item.taskId)}
+    >
+      View session
+    </Button>
+  </div>
 </article>

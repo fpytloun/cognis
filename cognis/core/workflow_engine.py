@@ -23,6 +23,7 @@ from cognis.core.agent_loop import (
     StepInterrupted,
     TokenCallback,
     ToolCallCallback,
+    ToolResultCallback,
 )
 from cognis.core.events import Event, EventBus, EventType
 from cognis.core.step_evaluator import StepEvaluator
@@ -116,6 +117,7 @@ class WorkflowEngine:
         system_initiated: bool = False,
         on_progress: ProgressCallback | None = None,
         on_tool_call: ToolCallCallback | None = None,
+        on_tool_result: ToolResultCallback | None = None,
         cancel_event: asyncio.Event | None = None,
     ) -> StepOutput | None:
         """Run the hot-path direct workflow through a workflow-engine entrypoint.
@@ -148,6 +150,7 @@ class WorkflowEngine:
                 ctx,
                 on_token=on_progress,
                 on_tool_call=on_tool_call,
+                on_tool_result=on_tool_result,
             )
         finally:
             await cleanup()

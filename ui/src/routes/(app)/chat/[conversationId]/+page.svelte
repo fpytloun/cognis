@@ -2,14 +2,15 @@
   import { goto } from '$app/navigation';
   import { page } from '$app/stores';
   import { onMount } from 'svelte';
-  import { ArrowLeft, Search } from 'lucide-svelte';
+  import { ArrowLeft, Search, Copy, Check } from 'lucide-svelte';
 
   import AgentAvatar from '$lib/components/AgentAvatar.svelte';
   import ChatMessage from '$lib/components/ChatMessage.svelte';
   import DelegationCard from '$lib/components/DelegationCard.svelte';
   import EscalationPrompt from '$lib/components/EscalationPrompt.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
-  import ToolCallCard from '$lib/components/ToolCallCard.svelte';
+  import ReasoningBlock from '$lib/components/ReasoningBlock.svelte';
+  import ToolCallBlock from '$lib/components/ToolCallBlock.svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import Card from '$lib/components/ui/Card.svelte';
   import Input from '$lib/components/ui/Input.svelte';
@@ -21,6 +22,7 @@
   import {
     appendOptimisticUserMessage,
     applyWebSocketEvent,
+    finalizeReasoningItems,
     normalizeHistory,
     type TimelineItem
   } from '$lib/chat';
@@ -38,9 +40,7 @@
   let sessions: Session[] = [];
   let composer = '';
   let composerElement: HTMLTextAreaElement | null = null;
-  let createTitle = '';
   let selectedAgentId = '';
-  let creatingConversation = false;
   let archivingConversation = false;
   let deletingConversation = false;
   let mobileListOpen = false;
@@ -57,6 +57,9 @@
   let turnInProgress = false;
   let lastSubmittedMessage = '';
   let lastRecoverableMessage = '';
+  let editingTitle = false;
+  let editTitleValue = '';
+  let sessionIdCopied = false;
 
   const escalationFirstSeen = new Map<string, number>();
   const sessionIds = new Set<string>();
@@ -77,12 +80,42 @@
     return status !== 'healthy' && status !== 'unknown';
   }
 
+  function isWebConversation(conversation: Conversation | null): boolean {
+    return conversation?.context?.type?.toLowerCase() === 'web';
+  }
+
+  function isReadOnly(conversation: Conversation | null): boolean {
+    if (!conversation) return true;
+    if (conversation.status !== 'active') return true;
+    if (!isWebConversation(conversation)) return true;
+    return false;
+  }
+
+  function contextTypeBadge(conversation: Conversation): string {
+    const t = conversation.context?.type ?? 'unknown';
+    return t.charAt(0).toUpperCase() + t.slice(1).toLowerCase();
+  }
+
   function filteredConversations(): Conversation[] {
     const query = conversationSearch.trim().toLowerCase();
-    if (!query) {
-      return conversations;
+    const list = query
+      ? conversations.filter((c) => conversationTitle(c).toLowerCase().includes(query))
+      : conversations;
+    return list;
+  }
+
+  function groupedConversations(): { web: Conversation[]; other: Conversation[] } {
+    const filtered = filteredConversations();
+    const web: Conversation[] = [];
+    const other: Conversation[] = [];
+    for (const c of filtered) {
+      if (c.context?.type?.toLowerCase() === 'web') {
+        web.push(c);
+      } else {
+        other.push(c);
+      }
     }
-    return conversations.filter((conversation) => conversationTitle(conversation).toLowerCase().includes(query));
+    return { web, other };
   }
 
   function socketErrorMessage(event: import('$lib/types/api').WebSocketErrorEvent): string {
@@ -116,17 +149,28 @@
   }
 
   function persistEnterToSendPreference(): void {
-    if (typeof window === 'undefined') {
-      return;
-    }
+    if (typeof window === 'undefined') return;
     window.localStorage.setItem('cognis-chat-enter-to-send', enterToSend ? '1' : '0');
   }
 
   function restoreEnterToSendPreference(): void {
-    if (typeof window === 'undefined') {
-      return;
-    }
+    if (typeof window === 'undefined') return;
     enterToSend = window.localStorage.getItem('cognis-chat-enter-to-send') !== '0';
+  }
+
+  function restoreSelectedAgent(): void {
+    if (typeof window === 'undefined') return;
+    const stored = window.localStorage.getItem('cognis-chat-selected-agent');
+    if (stored && agents.some((a) => a.agent_id === stored && a.status === 'active')) {
+      selectedAgentId = stored;
+    } else {
+      selectedAgentId = agents.find((a) => a.status === 'active')?.agent_id ?? agents[0]?.agent_id ?? '';
+    }
+  }
+
+  function persistSelectedAgent(): void {
+    if (typeof window === 'undefined' || !selectedAgentId) return;
+    window.localStorage.setItem('cognis-chat-selected-agent', selectedAgentId);
   }
 
   function conversationIdFromRoute(): string {
@@ -184,7 +228,7 @@
   async function refreshSidebarData(): Promise<void> {
     [agents] = await Promise.all([api.agents.listAll()]);
     await loadConversationPage(true);
-    selectedAgentId = selectedAgentId || agents.find((agent) => agent.status === 'active')?.agent_id || agents[0]?.agent_id || '';
+    restoreSelectedAgent();
   }
 
   function resetSessionFilter(): void {
@@ -198,9 +242,7 @@
   }
 
   async function refreshEscalations(): Promise<void> {
-    if (document.hidden) {
-      return;
-    }
+    if (document.hidden) return;
 
     try {
       const allEscalations = await api.escalations.list();
@@ -236,13 +278,10 @@
 
   function startEscalationPolling(): void {
     stopEscalationPolling();
-    if (typeof document === 'undefined' || document.hidden) {
-      return;
-    }
+    if (typeof document === 'undefined' || document.hidden) return;
     const interval = escalations.length > 0 ? ESCALATION_POLL_ACTIVE_MS : ESCALATION_POLL_IDLE_MS;
     escalationPollTimer = window.setInterval(() => {
       void refreshEscalations().then(() => {
-        // Adapt interval: restart with shorter interval if escalations appeared
         const nextInterval = escalations.length > 0 ? ESCALATION_POLL_ACTIVE_MS : ESCALATION_POLL_IDLE_MS;
         if (nextInterval !== interval) {
           startEscalationPolling();
@@ -256,9 +295,7 @@
   }
 
   async function openConversation(conversationId: string): Promise<void> {
-    if (!conversationId || conversationId === activeConversationId) {
-      return;
-    }
+    if (!conversationId || conversationId === activeConversationId) return;
 
     loading = true;
     error = '';
@@ -287,6 +324,7 @@
       turnInProgress = false;
       awaitingAssistantStart = false;
       lastRecoverableMessage = '';
+      editingTitle = false;
 
       wsClient.subscribeConversation(conversationId, latestSeq(events));
       await refreshEscalations();
@@ -310,17 +348,17 @@
     }
   }
 
-  async function createConversation(): Promise<void> {
+  async function createNewConversation(): Promise<void> {
     if (!selectedAgentId) {
       error = 'Create or activate an agent before starting a conversation.';
       return;
     }
 
-    creatingConversation = true;
+    persistSelectedAgent();
+
     try {
       const conversation = await api.conversations.create({
         agent_id: selectedAgentId,
-        title: createTitle || null,
         context: {
           type: 'web',
           ref: null,
@@ -328,31 +366,24 @@
           memory_labels: {}
         }
       });
-      createTitle = '';
       await refreshSidebarData();
       addToast('Conversation created.', 'success');
       await goto(`/chat/${conversation.conversation_id}`);
     } catch (caughtError) {
       error = asApiError(caughtError).message;
       addToast(error, 'error', 4_000, 'Unable to create conversation');
-    } finally {
-      creatingConversation = false;
     }
   }
 
   async function archiveConversation(): Promise<void> {
-    if (!currentConversation) {
-      return;
-    }
+    if (!currentConversation) return;
 
     const confirmed = await confirmAction({
       title: 'Archive conversation?',
       message: 'The conversation will become read-only until you manually reactivate it.',
       confirmLabel: 'Archive conversation'
     });
-    if (!confirmed) {
-      return;
-    }
+    if (!confirmed) return;
 
     archivingConversation = true;
     try {
@@ -368,24 +399,20 @@
   }
 
   async function deleteConversation(): Promise<void> {
-    if (!currentConversation) {
-      return;
-    }
+    if (!currentConversation) return;
 
     const confirmed = await confirmAction({
       title: 'Delete conversation?',
       message: 'This removes the conversation from the workspace. Use purge from the API only when you need permanent deletion.',
       confirmLabel: 'Delete conversation'
     });
-    if (!confirmed) {
-      return;
-    }
+    if (!confirmed) return;
 
     deletingConversation = true;
     try {
       await api.conversations.remove(currentConversation.conversation_id);
       await refreshSidebarData();
-      const nextConversation = conversations.find((conversation) => conversation.conversation_id !== currentConversation?.conversation_id);
+      const nextConversation = conversations.find((c) => c.conversation_id !== currentConversation?.conversation_id);
       addToast('Conversation deleted.', 'success');
       await goto(nextConversation ? `/chat/${nextConversation.conversation_id}` : '/chat/new');
     } catch (caughtError) {
@@ -396,11 +423,56 @@
     }
   }
 
+  async function saveTitle(): Promise<void> {
+    if (!currentConversation) return;
+    const newTitle = editTitleValue.trim();
+    editingTitle = false;
+    if (!newTitle || newTitle === (currentConversation.title ?? '').trim()) return;
+
+    try {
+      currentConversation = await api.conversations.update(currentConversation.conversation_id, { title: newTitle });
+      // Update sidebar
+      const idx = conversations.findIndex((c) => c.conversation_id === currentConversation?.conversation_id);
+      if (idx >= 0 && currentConversation) {
+        conversations[idx] = currentConversation;
+        conversations = [...conversations];
+      }
+    } catch (caughtError) {
+      addToast(asApiError(caughtError).message, 'error', 4_000, 'Unable to update title');
+    }
+  }
+
+  function startEditTitle(): void {
+    if (!currentConversation) return;
+    editTitleValue = currentConversation.title ?? '';
+    editingTitle = true;
+  }
+
+  function handleTitleKeydown(event: KeyboardEvent): void {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      void saveTitle();
+    }
+    if (event.key === 'Escape') {
+      editingTitle = false;
+    }
+  }
+
+  async function copySessionId(): Promise<void> {
+    const sid = currentConversation?.root_session_id;
+    if (!sid) return;
+    try {
+      await navigator.clipboard.writeText(sid);
+      sessionIdCopied = true;
+      setTimeout(() => { sessionIdCopied = false; }, 2000);
+    } catch {
+      addToast('Failed to copy session ID', 'error');
+    }
+  }
+
   async function handleSend(): Promise<void> {
     const content = composer.trim();
-    if (!content || !currentConversation || currentConversation.status !== 'active') {
-      return;
-    }
+    if (!content || !currentConversation || isReadOnly(currentConversation)) return;
 
     timeline = appendOptimisticUserMessage(timeline, content);
     lastSubmittedMessage = content;
@@ -414,17 +486,13 @@
   }
 
   async function retryLastTurn(): Promise<void> {
-    if (!currentConversation || !lastSubmittedMessage) {
-      return;
-    }
+    if (!currentConversation || !lastSubmittedMessage) return;
     composer = lastSubmittedMessage;
     await handleSend();
   }
 
   function handleComposerKeydown(event: KeyboardEvent): void {
-    if (!enterToSend || event.key !== 'Enter' || event.shiftKey) {
-      return;
-    }
+    if (!enterToSend || event.key !== 'Enter' || event.shiftKey) return;
     event.preventDefault();
     void handleSend();
   }
@@ -472,17 +540,33 @@
       return;
     }
 
-    if (event.type === 'chunk' || event.type === 'tool_call' || event.type === 'delegation_started') {
+    if (event.type === 'chunk' || event.type === 'tool_call' || event.type === 'delegation_started' || event.type === 'reasoning') {
       awaitingAssistantStart = false;
     }
 
     if (event.type === 'message_complete' || event.type === 'workflow_failed' || event.type === 'workflow_cancelled') {
       awaitingAssistantStart = false;
       turnInProgress = false;
+      timeline = finalizeReasoningItems(timeline);
+    }
+
+    // Handle conversation_updated for title changes
+    if (event.type === 'conversation_updated') {
+      if (currentConversation && event.conversation_id === currentConversation.conversation_id) {
+        if (typeof event.title === 'string') {
+          currentConversation = { ...currentConversation, title: event.title };
+          const idx = conversations.findIndex((c) => c.conversation_id === currentConversation?.conversation_id);
+          if (idx >= 0 && currentConversation) {
+            conversations[idx] = { ...conversations[idx], title: event.title };
+            conversations = [...conversations];
+          }
+        }
+      }
+      return;
     }
 
     timeline = applyWebSocketEvent(timeline, event);
-    if (event.type !== 'tool_call') {
+    if (event.type !== 'tool_call' && event.type !== 'tool_result' && event.type !== 'reasoning') {
       syncVisibleWindow();
     }
 
@@ -495,6 +579,14 @@
     ) {
       void refreshEscalations();
     }
+  }
+
+  function handleAgentFilterChange(): void {
+    persistSelectedAgent();
+  }
+
+  function handleViewSession(_taskId: string): void {
+    // Placeholder for Phase 2E sub-session panel
   }
 
   $: if ($page.params.conversationId && $page.params.conversationId !== activeConversationId) {
@@ -552,6 +644,7 @@
   <LoadingState label="Loading conversation" description="Fetching history, restoring workflow prompts, and preparing the live stream." />
 {:else}
   <div class="grid min-h-[calc(100vh-12rem)] gap-4 xl:grid-cols-[320px_minmax(0,1fr)]">
+    <!-- Sidebar -->
     <aside class={`${mobileListOpen || !currentConversation ? 'block' : 'hidden'} space-y-4 rounded-3xl border border-slate-800/80 bg-slate-900/70 p-4 shadow-card backdrop-blur xl:block`}>
       {#if agents.length === 0}
         <Card class="p-4">
@@ -572,41 +665,33 @@
           </div>
         </Card>
       {:else}
-        <Card class="p-4">
-          <div class="space-y-4">
-            <div>
-              <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">New conversation</p>
-              <h2 class="mt-1 text-lg font-semibold text-white">Create chat</h2>
-            </div>
-
-            <label class="block space-y-2 text-sm font-medium text-slate-200">
-              <span>Agent <span class="text-rose-300">*</span></span>
-              <select bind:value={selectedAgentId} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
-                {#each agents as agent}
-                  <option value={agent.agent_id}>{agent.display_name ?? agent.name}</option>
-                {/each}
-              </select>
-            </label>
-
-            <label class="block space-y-2 text-sm font-medium text-slate-200">
-              <span>Title</span>
-              <Input bind:value={createTitle} placeholder="Optional conversation title" />
-            </label>
-
-            <Button class="w-full justify-center" disabled={creatingConversation || !selectedAgentId} onclick={createConversation}>
-              {creatingConversation ? 'Creating…' : 'Start conversation'}
-            </Button>
-          </div>
-        </Card>
+        <!-- Agent filter -->
+        <label class="block space-y-2">
+          <span class="text-xs font-medium uppercase tracking-widest text-slate-500">Agent</span>
+          <select
+            bind:value={selectedAgentId}
+            onchange={handleAgentFilterChange}
+            class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+          >
+            {#each agents.filter((a) => a.status === 'active') as agent}
+              <option value={agent.agent_id}>{agent.display_name ?? agent.name}</option>
+            {/each}
+          </select>
+        </label>
       {/if}
 
+      <!-- Conversation list -->
       <Card class="p-4">
         <div class="flex items-center justify-between gap-3">
           <div>
             <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Conversations</p>
             <h2 class="mt-1 text-lg font-semibold text-white">History</h2>
           </div>
-          <Button size="sm" variant="secondary" onclick={() => goto('/chat/new')}>New</Button>
+          <button
+            class="text-xs font-medium text-sky-400 transition hover:text-sky-300"
+            onclick={createNewConversation}
+            type="button"
+          >+ New</button>
         </div>
 
         <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
@@ -617,28 +702,54 @@
           </div>
         </label>
 
-        <div class="mt-4 space-y-2">
+        <div class="mt-4 space-y-1">
           {#if filteredConversations().length === 0}
             <p class="rounded-2xl border border-dashed border-slate-700 px-4 py-6 text-sm text-slate-400">
               No conversations loaded yet.
             </p>
           {:else}
-            {#each filteredConversations() as conversation}
-              {@const agent = conversationAgent(conversation)}
-              <a
-                class={`flex items-start gap-3 rounded-2xl border px-3 py-3 transition ${conversation.conversation_id === currentConversation?.conversation_id ? 'border-sky-400/40 bg-sky-500/10' : 'border-transparent bg-slate-950/60 hover:border-slate-700 hover:bg-slate-900'}`}
-                href={`/chat/${conversation.conversation_id}`}
-                onclick={() => {
-                  mobileListOpen = false;
-                }}
-              >
-                <AgentAvatar name={agent?.display_name ?? agent?.name ?? conversation.agent_id} avatarUrl={agent?.avatar_url ?? null} class="h-9 w-9" />
-                <div class="min-w-0 flex-1">
-                  <p class="truncate text-sm font-medium text-white">{conversationTitle(conversation)}</p>
-                  <p class="mt-1 truncate text-xs text-slate-400">{agent?.display_name ?? agent?.name ?? conversation.agent_id}</p>
-                </div>
-              </a>
-            {/each}
+            {@const grouped = groupedConversations()}
+
+            <!-- Web conversations -->
+            {#if grouped.web.length > 0}
+              <p class="px-1 pb-1 pt-2 text-[10px] font-semibold uppercase tracking-widest text-slate-500">Web</p>
+              {#each grouped.web as conversation}
+                {@const agent = conversationAgent(conversation)}
+                <a
+                  class={`flex items-start gap-3 rounded-2xl border px-3 py-2.5 transition ${conversation.conversation_id === currentConversation?.conversation_id ? 'border-sky-400/40 bg-sky-500/10' : 'border-transparent bg-slate-950/60 hover:border-slate-700 hover:bg-slate-900'}`}
+                  href={`/chat/${conversation.conversation_id}`}
+                  onclick={() => { mobileListOpen = false; }}
+                >
+                  <AgentAvatar name={agent?.display_name ?? agent?.name ?? conversation.agent_id} avatarUrl={agent?.avatar_url ?? null} class="h-8 w-8" />
+                  <div class="min-w-0 flex-1">
+                    <p class="truncate text-sm font-medium text-white">{conversationTitle(conversation)}</p>
+                    <p class="mt-0.5 truncate text-xs text-slate-400">{agent?.display_name ?? agent?.name ?? conversation.agent_id}</p>
+                  </div>
+                </a>
+              {/each}
+            {/if}
+
+            <!-- Non-web conversations -->
+            {#if grouped.other.length > 0}
+              <p class="px-1 pb-1 pt-3 text-[10px] font-semibold uppercase tracking-widest text-slate-500">Other channels</p>
+              {#each grouped.other as conversation}
+                {@const agent = conversationAgent(conversation)}
+                <a
+                  class={`flex items-start gap-3 rounded-2xl border px-3 py-2.5 opacity-70 transition ${conversation.conversation_id === currentConversation?.conversation_id ? 'border-sky-400/40 bg-sky-500/10 opacity-100' : 'border-transparent bg-slate-950/60 hover:border-slate-700 hover:bg-slate-900'}`}
+                  href={`/chat/${conversation.conversation_id}`}
+                  onclick={() => { mobileListOpen = false; }}
+                >
+                  <AgentAvatar name={agent?.display_name ?? agent?.name ?? conversation.agent_id} avatarUrl={agent?.avatar_url ?? null} class="h-8 w-8" />
+                  <div class="min-w-0 flex-1">
+                    <div class="flex items-center gap-1.5">
+                      <span class="text-xs text-slate-500" title="Non-web channel (read-only)">&#128274;</span>
+                      <p class="truncate text-sm font-medium text-slate-300">{conversationTitle(conversation)}</p>
+                    </div>
+                    <p class="mt-0.5 truncate text-xs text-slate-500">{agent?.display_name ?? agent?.name ?? conversation.agent_id}</p>
+                  </div>
+                </a>
+              {/each}
+            {/if}
           {/if}
 
           {#if conversationsHasMore}
@@ -650,28 +761,88 @@
       </Card>
     </aside>
 
+    <!-- Main chat area -->
     <section class={`${mobileListOpen && currentConversation ? 'hidden' : 'flex'} min-h-0 flex-col rounded-3xl border border-slate-800/80 bg-slate-900/70 shadow-card backdrop-blur xl:flex`}>
+      <!-- Header -->
       <div class="border-b border-slate-800/80 px-5 py-4">
-        <div class="flex flex-wrap items-center justify-between gap-3">
-          <div>
+        <div class="flex flex-wrap items-start justify-between gap-3">
+          <div class="min-w-0 flex-1">
             <div class="mb-2 xl:hidden">
               <Button size="sm" variant="secondary" onclick={() => (mobileListOpen = true)}>
                 <ArrowLeft class="mr-2 h-4 w-4" />
                 Conversations
               </Button>
             </div>
-            <h1 class="text-xl font-semibold text-white">{currentConversation ? conversationTitle(currentConversation) : 'Conversation'}</h1>
-            <p class="mt-1 text-sm text-slate-400">
-              {currentConversation ? currentConversation.agent_id : 'No active conversation selected'}
-            </p>
+
+            <!-- Editable title -->
+            {#if editingTitle}
+              <!-- svelte-ignore a11y_autofocus -->
+              <input
+                class="w-full rounded-lg border border-sky-500/50 bg-slate-950/80 px-2 py-1 text-xl font-semibold text-white focus:outline-none focus:ring-1 focus:ring-sky-400"
+                bind:value={editTitleValue}
+                onblur={saveTitle}
+                onkeydown={handleTitleKeydown}
+                autofocus
+              />
+            {:else}
+              <button
+                class="text-left text-xl font-semibold text-white transition hover:text-sky-300"
+                onclick={startEditTitle}
+                type="button"
+                title="Click to edit title"
+              >
+                {currentConversation ? conversationTitle(currentConversation) : 'Conversation'}
+              </button>
+            {/if}
+
+            <!-- Sub-header info row -->
+            <div class="mt-1.5 flex flex-wrap items-center gap-3 text-sm text-slate-400">
+              {#if currentConversation}
+                {@const agent = conversationAgent(currentConversation)}
+                {#if agent}
+                  <div class="flex items-center gap-1.5">
+                    <AgentAvatar name={agent.display_name ?? agent.name} avatarUrl={agent.avatar_url ?? null} class="h-5 w-5" />
+                    <span>{agent.display_name ?? agent.name}</span>
+                  </div>
+                {/if}
+
+                {#if currentConversation.root_session_id}
+                  <button
+                    class="flex items-center gap-1 font-mono text-xs text-slate-500 transition hover:text-slate-300"
+                    onclick={copySessionId}
+                    type="button"
+                    title="Copy full session ID"
+                  >
+                    {currentConversation.root_session_id.slice(0, 12)}
+                    {#if sessionIdCopied}
+                      <Check class="h-3 w-3 text-emerald-400" />
+                    {:else}
+                      <Copy class="h-3 w-3" />
+                    {/if}
+                  </button>
+                {/if}
+
+                <span class="rounded-full border border-slate-700 bg-slate-800/60 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-widest text-slate-400">
+                  {contextTypeBadge(currentConversation)}
+                </span>
+
+                {#if sessions.length > 1}
+                  <span class="rounded-full border border-slate-700 bg-slate-800/60 px-2 py-0.5 text-[10px] font-medium text-slate-400" title="Sub-sessions">
+                    {sessions.length} sessions
+                  </span>
+                {/if}
+              {:else}
+                <span>No active conversation selected</span>
+              {/if}
+            </div>
           </div>
 
           <div class="flex flex-wrap gap-2">
             <Button size="sm" variant="secondary" disabled={!currentConversation || archivingConversation} onclick={archiveConversation}>
-              {archivingConversation ? 'Archiving…' : 'Archive'}
+              {archivingConversation ? 'Archiving...' : 'Archive'}
             </Button>
             <Button size="sm" variant="danger" disabled={!currentConversation || deletingConversation} onclick={deleteConversation}>
-              {deletingConversation ? 'Deleting…' : 'Delete'}
+              {deletingConversation ? 'Deleting...' : 'Delete'}
             </Button>
           </div>
         </div>
@@ -694,6 +865,7 @@
         {/if}
       </div>
 
+      <!-- Message area + composer -->
       <div class="flex min-h-0 flex-1 flex-col gap-4 p-4">
         {#if isMemoryDegraded()}
           <div class="rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
@@ -705,7 +877,7 @@
           <div class="rounded-2xl border border-sky-500/30 bg-sky-500/10 px-4 py-3 text-sm text-sky-100">
             <div class="flex flex-wrap items-center justify-between gap-3">
               <div class="flex items-center gap-3">
-                <span class="font-medium">Agent is working…</span>
+                <span class="font-medium">Agent is working...</span>
                 {#if awaitingAssistantStart}
                   <span class="inline-flex items-center gap-1 text-sky-100/80">
                     <span class="h-2 w-2 animate-pulse rounded-full bg-sky-200"></span>
@@ -745,7 +917,8 @@
           </div>
         {/if}
 
-        <div class="min-h-0 flex-1 space-y-4 overflow-y-auto rounded-3xl border border-slate-800/80 bg-slate-950/60 p-4">
+        <!-- Timeline -->
+        <div class="min-h-0 flex-1 space-y-3 overflow-y-auto rounded-3xl border border-slate-800/80 bg-slate-950/60 p-4">
           {#if visibleStartIndex > 0}
             <div class="flex justify-center">
               <Button size="sm" variant="secondary" onclick={loadOlder}>Load older messages</Button>
@@ -760,12 +933,14 @@
             {#each displayedTimeline as item (item.id)}
               {#if item.kind === 'message'}
                 <div class={`flex ${item.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                  <ChatMessage item={item} />
+                  <ChatMessage {item} />
                 </div>
               {:else if item.kind === 'tool_call'}
-                <ToolCallCard item={item} />
+                <ToolCallBlock {item} />
+              {:else if item.kind === 'reasoning'}
+                <ReasoningBlock {item} />
               {:else if item.kind === 'delegation'}
-                <DelegationCard item={item} />
+                <DelegationCard {item} onViewSession={handleViewSession} />
               {:else}
                 <article class={`rounded-3xl border px-4 py-4 text-sm shadow-card ${item.tone === 'warning' ? 'border-amber-500/30 bg-amber-500/10 text-amber-100' : item.tone === 'error' ? 'border-rose-500/30 bg-rose-500/10 text-rose-100' : 'border-slate-700 bg-slate-900 text-slate-200'}`}>
                   <h3 class="font-semibold">{item.title}</h3>
@@ -776,35 +951,46 @@
           {/if}
         </div>
 
-        <form class="space-y-3 rounded-3xl border border-slate-800/80 bg-slate-900/80 p-4" onsubmit={(event) => { event.preventDefault(); void handleSend(); }}>
-          <textarea
-            bind:this={composerElement}
-            bind:value={composer}
-            class="min-h-[110px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500"
-            disabled={!currentConversation || currentConversation.status !== 'active' || isLlmUnavailableForSetup()}
-            onkeydown={handleComposerKeydown}
-            placeholder={isLlmUnavailableForSetup() ? 'Configure an LLM provider to start chatting.' : currentConversation?.status === 'active' ? 'Send a message to Cognis…' : 'Archived conversations are read-only.'}
-          ></textarea>
-          <div class="flex flex-wrap items-center justify-between gap-3">
-            <div class="space-y-1">
-              <p class="text-xs uppercase tracking-[0.2em] text-slate-500">
-                Reconnect-safe streaming via first-message-auth WebSocket
-              </p>
-              <label class="flex items-center gap-2 text-xs text-slate-400">
-                <input bind:checked={enterToSend} class="h-4 w-4 rounded border-slate-700 bg-slate-950" onchange={persistEnterToSendPreference} type="checkbox" />
-                <span>Press Enter to send</span>
-              </label>
-            </div>
-            <div class="flex gap-2">
-              <Button size="sm" variant="secondary" type="button" onclick={() => currentConversation && wsClient.cancelTurn(currentConversation.conversation_id)}>
-                Cancel turn
-              </Button>
-              <Button size="sm" type="submit" disabled={!composer.trim() || !currentConversation || currentConversation.status !== 'active' || isLlmUnavailableForSetup()}>
-                Send
-              </Button>
-            </div>
+        <!-- Composer or read-only banner -->
+        {#if currentConversation && !isWebConversation(currentConversation)}
+          <div class="rounded-2xl border border-slate-700/60 bg-slate-900/60 px-4 py-3 text-center text-sm text-slate-400">
+            This conversation is from <span class="font-medium text-slate-300">{contextTypeBadge(currentConversation)}</span>. Read-only in web UI.
           </div>
-        </form>
+        {:else if currentConversation && currentConversation.status !== 'active'}
+          <div class="rounded-2xl border border-slate-700/60 bg-slate-900/60 px-4 py-3 text-center text-sm text-slate-400">
+            This conversation is archived.
+          </div>
+        {:else}
+          <form class="space-y-3 rounded-3xl border border-slate-800/80 bg-slate-900/80 p-4" onsubmit={(event) => { event.preventDefault(); void handleSend(); }}>
+            <textarea
+              bind:this={composerElement}
+              bind:value={composer}
+              class="min-h-[110px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500"
+              disabled={!currentConversation || isReadOnly(currentConversation) || isLlmUnavailableForSetup()}
+              onkeydown={handleComposerKeydown}
+              placeholder={isLlmUnavailableForSetup() ? 'Configure an LLM provider to start chatting.' : 'Send a message to Cognis...'}
+            ></textarea>
+            <div class="flex flex-wrap items-center justify-between gap-3">
+              <div class="space-y-1">
+                <p class="text-xs uppercase tracking-[0.2em] text-slate-500">
+                  Reconnect-safe streaming via first-message-auth WebSocket
+                </p>
+                <label class="flex items-center gap-2 text-xs text-slate-400">
+                  <input bind:checked={enterToSend} class="h-4 w-4 rounded border-slate-700 bg-slate-950" onchange={persistEnterToSendPreference} type="checkbox" />
+                  <span>Press Enter to send</span>
+                </label>
+              </div>
+              <div class="flex gap-2">
+                <Button size="sm" variant="secondary" type="button" onclick={() => currentConversation && wsClient.cancelTurn(currentConversation.conversation_id)}>
+                  Cancel turn
+                </Button>
+                <Button size="sm" type="submit" disabled={!composer.trim() || !currentConversation || isReadOnly(currentConversation) || isLlmUnavailableForSetup()}>
+                  Send
+                </Button>
+              </div>
+            </div>
+          </form>
+        {/if}
       </div>
     </section>
   </div>

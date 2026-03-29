@@ -63,11 +63,20 @@ CONTROLLER_TOOLS = {STEP_COMPLETE, STEP_REQUEST_INPUT, STEP_TODO_WRITE, STEP_TOD
 
 # Callback types
 TokenCallback = Callable[[str], Coroutine[Any, Any, None]]
-ToolCallCallback = Callable[[str, str], Coroutine[Any, Any, None]]
+ToolCallCallback = Callable[[str, str, dict[str, Any]], Coroutine[Any, Any, None]]
+ToolResultCallback = Callable[[str, str, str, bool, int | None], Coroutine[Any, Any, None]]
 
 # Default limits
 DEFAULT_MAX_TOOL_CALLS = 50
 DEFAULT_STEP_TIMEOUT_SECONDS = 600  # 10 minutes
+_MAX_TOOL_DATA_BYTES = 10_240  # 10 KB truncation limit for tool args/results
+
+
+def _truncate_tool_data(text: str) -> str:
+    """Truncate tool data to a bounded size for WS events and Intaris recording."""
+    if len(text) <= _MAX_TOOL_DATA_BYTES:
+        return text
+    return text[:_MAX_TOOL_DATA_BYTES] + f"\n... (truncated, {len(text)} bytes total)"
 
 
 # ---------------------------------------------------------------------------
@@ -409,6 +418,7 @@ class AgentLoop:
         *,
         on_token: TokenCallback | None = None,
         on_tool_call: ToolCallCallback | None = None,
+        on_tool_result: ToolResultCallback | None = None,
     ) -> StepOutput | None:
         """Run a single step as a full agentic loop.
 
@@ -430,7 +440,9 @@ class AgentLoop:
         )
         await self.session_lock.acquire(ctx.session.session_id)
         try:
-            return await self._execute_step(ctx, on_token=on_token, on_tool_call=on_tool_call)
+            return await self._execute_step(
+                ctx, on_token=on_token, on_tool_call=on_tool_call, on_tool_result=on_tool_result
+            )
         except StepInterrupted:
             raise
         except Exception:
@@ -451,6 +463,7 @@ class AgentLoop:
         *,
         on_token: TokenCallback | None = None,
         on_tool_call: ToolCallCallback | None = None,
+        on_tool_result: ToolResultCallback | None = None,
     ) -> StepOutput | None:
         """Core step execution loop."""
         max_tool_calls = DEFAULT_MAX_TOOL_CALLS
@@ -629,7 +642,7 @@ class AgentLoop:
                 STEP_TOOL_CALLS.labels(tool_name=tc.name).inc()
 
                 if on_tool_call:
-                    await on_tool_call(tc.name, tc.call_id)
+                    await on_tool_call(tc.name, tc.call_id, tc.arguments)
 
                 # Controller tool interception
                 if tc.name == STEP_COMPLETE:
@@ -821,7 +834,14 @@ class AgentLoop:
                     )
                     events_to_record.append(
                         SessionEvent(
-                            type="tool_call", data={"name": tc.name, "call_id": tc.call_id}
+                            type="tool_call",
+                            data={
+                                "name": tc.name,
+                                "call_id": tc.call_id,
+                                "arguments": _truncate_tool_data(
+                                    json.dumps(tc.arguments, default=str)
+                                ),
+                            },
                         )
                     )
 
@@ -833,16 +853,27 @@ class AgentLoop:
                         self._get_executor(ctx),
                     )
 
+                    truncated_output = _truncate_tool_data(result.output)
                     events_to_record.append(
                         SessionEvent(
                             type="tool_result",
                             data={
                                 "call_id": tc.call_id,
+                                "name": tc.name,
                                 "is_error": result.is_error,
                                 "duration_ms": result.duration_ms,
+                                "result": truncated_output,
                             },
                         )
                     )
+                    if on_tool_result:
+                        await on_tool_result(
+                            tc.call_id,
+                            tc.name,
+                            truncated_output,
+                            result.is_error,
+                            result.duration_ms,
+                        )
                     messages.append(
                         {
                             "role": "tool",

@@ -18,14 +18,23 @@
     return llmDetails.includes('no llm model configured') || llmDetails.includes('not configured');
   }
 
-  async function createConversation(): Promise<void> {
+  function getSelectedAgentId(): string {
     const requestedAgentId = $page.url.searchParams.get('agent_id');
-    const selectedAgent =
-      agents.find((agent) => agent.agent_id === requestedAgentId) ??
-      agents.find((agent) => agent.status === 'active') ??
-      agents[0];
+    if (requestedAgentId && agents.some((a) => a.agent_id === requestedAgentId)) {
+      return requestedAgentId;
+    }
+    if (typeof window !== 'undefined') {
+      const stored = window.localStorage.getItem('cognis-chat-selected-agent');
+      if (stored && agents.some((a) => a.agent_id === stored && a.status === 'active')) {
+        return stored;
+      }
+    }
+    return agents.find((a) => a.status === 'active')?.agent_id ?? agents[0]?.agent_id ?? '';
+  }
 
-    if (!selectedAgent) {
+  async function createConversation(): Promise<void> {
+    const agentId = getSelectedAgentId();
+    if (!agentId) {
       error = 'Create an agent first before starting a conversation.';
       loading = false;
       return;
@@ -38,7 +47,7 @@
     }
 
     const conversation = await api.conversations.create({
-      agent_id: selectedAgent.agent_id,
+      agent_id: agentId,
       context: {
         type: 'web',
         ref: null,
@@ -46,6 +55,12 @@
         memory_labels: {}
       }
     });
+
+    // Persist the agent choice
+    if (typeof window !== 'undefined') {
+      window.localStorage.setItem('cognis-chat-selected-agent', agentId);
+    }
+
     await goto(`/chat/${conversation.conversation_id}`, { replaceState: true });
   }
 
@@ -69,7 +84,7 @@
 </svelte:head>
 
 {#if loading}
-  <LoadingState label="Starting conversation" description="Creating a new root conversation and session for your selected agent." />
+  <LoadingState label="Starting conversation" description="Creating a new web conversation for your selected agent." />
 {:else if error}
   <section class="rounded-3xl border border-amber-500/30 bg-amber-500/10 px-6 py-10 text-center text-sm text-amber-100">
     <p>{error}</p>

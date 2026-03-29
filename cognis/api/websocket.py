@@ -31,7 +31,13 @@ from cognis.models.session import ConversationModel, SessionModel
 from cognis.models.task import TaskDelivery
 from cognis.runtime_context import current_agent_id, current_user_email
 from cognis.store.models import Task
-from cognis.store.queries import get_agent, get_conversation, get_session_row, get_task
+from cognis.store.queries import (
+    get_agent,
+    get_conversation,
+    get_session_row,
+    get_task,
+    update_conversation,
+)
 
 logger = get_logger(__name__)
 
@@ -155,6 +161,16 @@ WS_MISSED_EVENTS_REPLAYED = Counter(
 WS_CHUNK_GAP_FRAMES_TOTAL = Counter(
     "cognis_ws_chunk_gap_frames_total",
     "Chunk gap frames emitted due to dropped streaming chunks",
+)
+AUTO_TITLE_TOTAL = Counter(
+    "cognis_auto_title_total",
+    "Auto-title generation attempts",
+    labelnames=("status",),
+)
+
+_AUTO_TITLE_SYSTEM_PROMPT = (
+    "Generate a concise 3-6 word title for a conversation that starts with "
+    "the following user message. Return ONLY the title text, nothing else."
 )
 
 MAX_QUEUED_MESSAGES = 5
@@ -491,7 +507,42 @@ class WebSocketConnectionManager:
                     },
                 )
 
-            async def on_tool_call(tool_name: str, call_id: str) -> None:
+            async def on_tool_call(
+                tool_name: str, call_id: str, arguments: dict[str, Any] | None = None
+            ) -> None:
+                payload: dict[str, Any] = {
+                    "type": "tool_call",
+                    "conversation_id": conversation_id,
+                    "session_id": session.session_id,
+                    "call_id": call_id,
+                    "tool_name": tool_name,
+                    "status": "started",
+                }
+                if arguments:
+                    payload["arguments"] = arguments
+                await self.send_to_conversation(conversation_id, payload)
+
+            async def on_tool_result(
+                call_id: str,
+                tool_name: str,
+                result: str,
+                is_error: bool,
+                duration_ms: int | None,
+            ) -> None:
+                await self.send_to_conversation(
+                    conversation_id,
+                    {
+                        "type": "tool_result",
+                        "conversation_id": conversation_id,
+                        "session_id": session.session_id,
+                        "call_id": call_id,
+                        "tool_name": tool_name,
+                        "result": result,
+                        "is_error": is_error,
+                        "duration_ms": duration_ms,
+                    },
+                )
+                # Also send a tool_call status update for completion
                 await self.send_to_conversation(
                     conversation_id,
                     {
@@ -500,7 +551,7 @@ class WebSocketConnectionManager:
                         "session_id": session.session_id,
                         "call_id": call_id,
                         "tool_name": tool_name,
-                        "status": "started",
+                        "status": "completed",
                     },
                 )
 
@@ -512,6 +563,7 @@ class WebSocketConnectionManager:
                 system_initiated=system_initiated,
                 on_progress=on_token,
                 on_tool_call=on_tool_call,
+                on_tool_result=on_tool_result,
                 cancel_event=cancel_event,
             )
 
@@ -551,6 +603,10 @@ class WebSocketConnectionManager:
                     "queued_count": len(self._queued_messages.get(conversation_id, [])),
                 },
             )
+            # Fire-and-forget auto-title generation for untitled conversations
+            if not system_initiated and conversation.title is None:
+                asyncio.create_task(self._generate_auto_title(conversation_id, content))
+
             logger.info(
                 "turn: completed",
                 extra={
@@ -601,6 +657,50 @@ class WebSocketConnectionManager:
                         agent=next_agent,
                         content=queued.content,
                     )
+
+    async def _generate_auto_title(self, conversation_id: str, user_message: str) -> None:
+        """Generate a conversation title from the first user message.
+
+        Runs as a fire-and-forget task so it never blocks the turn lifecycle.
+        """
+        try:
+            messages = [
+                {"role": "system", "content": _AUTO_TITLE_SYSTEM_PROMPT},
+                {"role": "user", "content": user_message[:500]},
+            ]
+            accumulated = ""
+            async for chunk in self.app.state.providers.llm.stream_generate(
+                messages, task_type="classifier", tools=[]
+            ):
+                choices = chunk.get("choices")
+                if choices:
+                    delta_text = choices[0].get("delta", {}).get("content")
+                    if delta_text:
+                        accumulated += delta_text
+            title = accumulated.strip().strip('"').strip("'")[:120]
+            if not title:
+                AUTO_TITLE_TOTAL.labels(status="empty").inc()
+                return
+            async with self.app.state.session_factory() as db_session:
+                ok = await update_conversation(db_session, conversation_id, title=title)
+                if ok:
+                    await db_session.commit()
+            if ok:
+                await self.send_to_conversation(
+                    conversation_id,
+                    {
+                        "type": "conversation_updated",
+                        "conversation_id": conversation_id,
+                        "title": title,
+                    },
+                )
+            AUTO_TITLE_TOTAL.labels(status="ok").inc()
+        except Exception:
+            AUTO_TITLE_TOTAL.labels(status="error").inc()
+            logger.warning(
+                "Auto-title generation failed",
+                extra={"extra_data": {"conversation_id": conversation_id}},
+            )
 
     async def _select_workflow(self, agent: Any, task_description: str) -> str:
         execution = agent.execution or {}

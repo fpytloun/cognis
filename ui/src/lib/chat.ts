@@ -5,6 +5,7 @@ export type TimelineItem =
   | MessageTimelineItem
   | ToolCallTimelineItem
   | DelegationTimelineItem
+  | ReasoningTimelineItem
   | NoticeTimelineItem;
 
 export interface MessageTimelineItem {
@@ -26,6 +27,10 @@ export interface ToolCallTimelineItem {
   toolName: string;
   status: string;
   timestamp: string | null;
+  arguments?: Record<string, unknown>;
+  result?: string;
+  isError?: boolean;
+  durationMs?: number;
 }
 
 export interface DelegationTimelineItem {
@@ -35,6 +40,15 @@ export interface DelegationTimelineItem {
   taskLabel: string;
   status: 'started' | 'running' | 'completed' | 'failed' | 'cancelled';
   result: string | null;
+  timestamp: string | null;
+}
+
+export interface ReasoningTimelineItem {
+  id: string;
+  kind: 'reasoning';
+  messageId: string;
+  content: string;
+  streaming: boolean;
   timestamp: string | null;
 }
 
@@ -82,6 +96,7 @@ function createNotice(title: string, description: string, tone: NoticeTimelineIt
 
 export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
   const items: TimelineItem[] = [];
+  const toolCallIndexByCallId = new Map<string, number>();
 
   for (const event of events) {
     const content = typeof event.data.content === 'string' ? event.data.content : '';
@@ -94,6 +109,55 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
       items.push(
         createMessageItem(`event:${event.seq}:assistant`, 'assistant', content, event.timestamp, event.seq)
       );
+      continue;
+    }
+
+    if (event.type === 'tool_call') {
+      const callId = String(event.data.call_id ?? `tc-${event.seq}`);
+      const toolName = String(event.data.name ?? event.data.tool_name ?? 'unknown');
+      const args = typeof event.data.arguments === 'object' && event.data.arguments !== null
+        ? (event.data.arguments as Record<string, unknown>)
+        : undefined;
+      const item: ToolCallTimelineItem = {
+        id: `tool:${callId}`,
+        kind: 'tool_call',
+        callId,
+        toolName,
+        status: typeof event.data.status === 'string' ? event.data.status : 'started',
+        timestamp: event.timestamp,
+        arguments: args
+      };
+      toolCallIndexByCallId.set(callId, items.length);
+      items.push(item);
+      continue;
+    }
+
+    if (event.type === 'tool_result') {
+      const callId = String(event.data.call_id ?? '');
+      const index = toolCallIndexByCallId.get(callId);
+      if (index !== undefined && items[index]?.kind === 'tool_call') {
+        const existing = items[index] as ToolCallTimelineItem;
+        items[index] = {
+          ...existing,
+          status: event.data.is_error ? 'failed' : 'completed',
+          result: typeof event.data.result === 'string' ? event.data.result : undefined,
+          isError: typeof event.data.is_error === 'boolean' ? event.data.is_error : undefined,
+          durationMs: typeof event.data.duration_ms === 'number' ? event.data.duration_ms : undefined
+        };
+      }
+      continue;
+    }
+
+    if (event.type === 'reasoning') {
+      const messageId = String(event.data.message_id ?? `reasoning-${event.seq}`);
+      items.push({
+        id: `reasoning:${messageId}:${event.seq}`,
+        kind: 'reasoning',
+        messageId,
+        content,
+        streaming: false,
+        timestamp: event.timestamp
+      });
       continue;
     }
 
@@ -184,13 +248,79 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
       callId: event.call_id,
       toolName: event.tool_name,
       status: event.status,
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
+      arguments: event.arguments
     };
     if (index >= 0) {
-      next[index] = toolItem;
+      const existing = next[index] as ToolCallTimelineItem;
+      next[index] = {
+        ...existing,
+        ...toolItem,
+        // Preserve result fields if already set
+        result: existing.result,
+        isError: existing.isError,
+        durationMs: existing.durationMs
+      };
       return next;
     }
     next.push(toolItem);
+    return next;
+  }
+
+  if (event.type === 'tool_result') {
+    const itemId = `tool:${event.call_id}`;
+    const index = next.findIndex((item) => item.id === itemId && item.kind === 'tool_call');
+    if (index >= 0) {
+      const existing = next[index] as ToolCallTimelineItem;
+      next[index] = {
+        ...existing,
+        status: event.is_error ? 'failed' : 'completed',
+        result: event.result,
+        isError: event.is_error,
+        durationMs: event.duration_ms ?? undefined
+      };
+      return next;
+    }
+    // tool_result arrived before tool_call — create a placeholder
+    next.push({
+      id: itemId,
+      kind: 'tool_call',
+      callId: event.call_id,
+      toolName: event.tool_name,
+      status: event.is_error ? 'failed' : 'completed',
+      timestamp: new Date().toISOString(),
+      result: event.result,
+      isError: event.is_error,
+      durationMs: event.duration_ms ?? undefined
+    });
+    return next;
+  }
+
+  if (event.type === 'reasoning') {
+    const itemId = `reasoning:${event.message_id}`;
+    const index = next.findIndex((item) => item.id === itemId && item.kind === 'reasoning');
+    if (index >= 0) {
+      const existing = next[index] as ReasoningTimelineItem;
+      next[index] = {
+        ...existing,
+        content: `${existing.content}${event.content}`,
+        streaming: true
+      };
+      return next;
+    }
+    next.push({
+      id: itemId,
+      kind: 'reasoning',
+      messageId: event.message_id,
+      content: event.content,
+      streaming: true,
+      timestamp: new Date().toISOString()
+    });
+    return next;
+  }
+
+  if (event.type === 'conversation_updated') {
+    // Title updates are handled by the page handler directly, not the timeline
     return next;
   }
 
@@ -278,4 +408,17 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
   }
 
   return next;
+}
+
+/** Mark all in-flight reasoning items as done streaming (e.g. on message_complete). */
+export function finalizeReasoningItems(items: TimelineItem[]): TimelineItem[] {
+  let changed = false;
+  const next = items.map((item) => {
+    if (item.kind === 'reasoning' && item.streaming) {
+      changed = true;
+      return { ...item, streaming: false };
+    }
+    return item;
+  });
+  return changed ? next : items;
 }

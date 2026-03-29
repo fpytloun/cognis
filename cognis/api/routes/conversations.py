@@ -13,10 +13,12 @@ from cognis.api.common import (
 )
 from cognis.api.models import (
     ConversationCreateRequest,
+    ConversationResolveRequest,
     ConversationResponse,
     ConversationUpdateRequest,
     CursorPage,
     MessageHistoryResponse,
+    SessionEventsResponse,
     SessionResponse,
 )
 from cognis.api.serializers import conversation_to_response, event_to_response, session_to_response
@@ -24,6 +26,7 @@ from cognis.models.session import ConversationContext
 from cognis.store.queries import (
     get_agent,
     get_conversation,
+    get_latest_active_conversation_for_agent,
     get_session_row,
     list_conversation_sessions,
     list_conversations,
@@ -49,6 +52,49 @@ async def conversation_list(
         get_item_id=lambda item: item.conversation_id,
     )
     return CursorPage(items=page_items, cursor=next_cursor, has_more=has_more)
+
+
+@router.post("/resolve", response_model=ConversationResponse)
+async def resolve_conversation(
+    request: Request,
+    payload: ConversationResolveRequest,
+) -> ConversationResponse:
+    """Find an existing conversation for the given agent and context type, or create one.
+
+    This is the "persistent channel" endpoint: the web UI calls it to ensure
+    there is always a default conversation for a given agent.
+    """
+    forbid_mutation_for_viewer(request)
+    user = require_current_user(request)
+    async with request.app.state.session_factory() as session:
+        agent = await get_agent(session, payload.agent_id)
+        if agent is None:
+            raise api_exception(404, "not_found", "Agent not found")
+        require_owner_or_admin(request, agent.owner_email)
+        existing = await get_latest_active_conversation_for_agent(
+            session,
+            user.email,
+            payload.agent_id,
+            context_type=payload.context_type,
+        )
+    if existing is not None:
+        return conversation_to_response(existing)
+    context_ref = f"{payload.context_type}:user:{user.email}:default"
+    (
+        conversation,
+        _root_session,
+    ) = await request.app.state.session_manager.create_conversation_with_root_session(
+        user_email=user.email,
+        agent_id=payload.agent_id,
+        context=ConversationContext(
+            type=payload.context_type,
+            ref=context_ref,
+            platform_data={},
+            memory_labels={},
+        ),
+        title=None,
+    )
+    return conversation_to_response(conversation)
 
 
 @router.post("", response_model=ConversationResponse)
@@ -207,3 +253,39 @@ async def active_delegations(request: Request, conversation_id: str) -> list[Ses
     return [
         item for item in sessions if item.parent_session_id is not None and item.status == "active"
     ]
+
+
+@router.get(
+    "/{conversation_id}/sessions/{session_id}/events",
+    response_model=SessionEventsResponse,
+)
+async def session_events(
+    request: Request,
+    conversation_id: str,
+    session_id: str,
+    after_seq: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=500),
+) -> SessionEventsResponse:
+    """Read events for a specific session within a conversation.
+
+    Used by the sub-session panel to fetch a child session's event stream.
+    """
+    async with request.app.state.session_factory() as session:
+        row = await get_conversation(session, conversation_id)
+        if row is None:
+            raise api_exception(404, "not_found", "Conversation not found")
+        require_owner_or_admin(request, row.user_email)
+        session_row = await get_session_row(session, session_id)
+    if session_row is None or session_row.conversation_id != conversation_id:
+        raise api_exception(404, "not_found", "Session not found in this conversation")
+    event_result = await request.app.state.providers.guardrails.read_events(
+        session_id=session_row.intaris_session_id or session_row.session_id,
+        after_seq=after_seq,
+        limit=limit,
+    )
+    return SessionEventsResponse(
+        session_id=session_id,
+        items=[event_to_response(item) for item in event_result.events],
+        last_seq=event_result.last_seq,
+        has_more=event_result.has_more,
+    )

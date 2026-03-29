@@ -411,6 +411,7 @@ export interface WebSocketToolCallEvent {
   call_id: string;
   tool_name: string;
   status: string;
+  arguments?: Record<string, unknown>;
 }
 
 export interface WebSocketDelegationStartedEvent {
@@ -507,6 +508,31 @@ export interface WebSocketSessionRecoveredEvent {
   reason?: string;
 }
 
+export interface WebSocketConversationUpdatedEvent {
+  type: 'conversation_updated';
+  conversation_id?: string;
+  title?: string;
+}
+
+export interface WebSocketToolResultEvent {
+  type: 'tool_result';
+  conversation_id?: string;
+  session_id?: string;
+  call_id: string;
+  tool_name: string;
+  result: string;
+  is_error: boolean;
+  duration_ms: number | null;
+}
+
+export interface WebSocketReasoningEvent {
+  type: 'reasoning';
+  conversation_id?: string;
+  session_id?: string;
+  message_id: string;
+  content: string;
+}
+
 export interface WebSocketErrorEvent {
   type: 'error';
   code: string;
@@ -526,6 +552,9 @@ export type CognisWebSocketEvent =
   | WebSocketChunkGapEvent
   | WebSocketMessageCompleteEvent
   | WebSocketToolCallEvent
+  | WebSocketToolResultEvent
+  | WebSocketReasoningEvent
+  | WebSocketConversationUpdatedEvent
   | WebSocketDelegationStartedEvent
   | WebSocketDelegationProgressEvent
   | WebSocketWorkflowStepStartedEvent

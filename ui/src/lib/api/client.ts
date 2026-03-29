@@ -271,6 +271,19 @@ export const api = {
 
     delegations(conversationId: string): Promise<Session[]> {
       return request<Session[]>(`/api/v1/conversations/${conversationId}/delegations`);
+    },
+
+    resolve(payload: { agent_id: string; context_type?: string }): Promise<Conversation> {
+      return request<Conversation>('/api/v1/conversations/resolve', {
+        method: 'POST',
+        body: JSON.stringify(payload)
+      });
+    },
+
+    sessionEvents(conversationId: string, sessionId: string, afterSeq = 0, limit = 50): Promise<SessionEventsResponse> {
+      return request<SessionEventsResponse>(
+        `/api/v1/conversations/${conversationId}/sessions/${sessionId}/events${encodeQuery({ after_seq: afterSeq, limit })}`
+      );
     }
   },
 

@@ -125,6 +125,13 @@ class ConversationContextModel(BaseModel):
     memory_labels: dict[str, str] = Field(default_factory=dict)
 
 
+class ConversationResolveRequest(BaseModel):
+    """Find-or-create a conversation for a given agent and context type."""
+
+    agent_id: str
+    context_type: str = "web"
+
+
 class ConversationCreateRequest(BaseModel):
     agent_id: str
     title: str | None = None
