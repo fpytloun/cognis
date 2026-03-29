@@ -240,6 +240,7 @@ class AuthenticatedWebSocket:
 @dataclass(slots=True)
 class QueuedMessage:
     content: str
+    system_initiated: bool = False
     received_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
@@ -663,6 +664,7 @@ class WebSocketConnectionManager:
                         session=next_session,
                         agent=next_agent,
                         content=queued.content,
+                        system_initiated=queued.system_initiated,
                     )
 
     async def _generate_auto_title(self, conversation_id: str, user_message: str) -> None:
@@ -904,7 +906,14 @@ class WebSocketConnectionManager:
             return
         if not self._by_conversation.get(conversation_id):
             return
+        prompt = _follow_up_turn_prompt(
+            event.data.get("status") if isinstance(event.data.get("status"), str) else None
+        )
         if conversation_id in self._active_turns and not self._active_turns[conversation_id].done():
+            # Turn already active — queue the follow-up instead of dropping it
+            self._queued_messages[conversation_id].append(
+                QueuedMessage(content=prompt, system_initiated=True)
+            )
             return
         runtime = await _load_conversation_runtime(self.app, conversation_id)
         if runtime is None:
@@ -916,9 +925,7 @@ class WebSocketConnectionManager:
             conversation=conversation,
             session=session,
             agent=agent,
-            content=_follow_up_turn_prompt(
-                event.data.get("status") if isinstance(event.data.get("status"), str) else None
-            ),
+            content=prompt,
             system_initiated=True,
         )
 
