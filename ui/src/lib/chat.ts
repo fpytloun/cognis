@@ -136,7 +136,8 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
 
     if (event.type === 'delegation') {
       const childSessionId = String(event.data.child_session_id ?? event.data.call_id ?? `del-${event.seq}`);
-      const taskDesc = String(event.data.task ?? event.data.mode ?? 'Background task');
+      const rawTask = event.data.task;
+      const taskDesc = typeof rawTask === 'string' && rawTask.trim() ? rawTask.trim() : 'Background task';
       items.push({
         id: `delegation:${childSessionId}`,
         kind: 'delegation',

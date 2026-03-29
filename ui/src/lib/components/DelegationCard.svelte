@@ -37,13 +37,15 @@
     <p class="mt-3 text-sm leading-6 opacity-90">{item.result}</p>
   {/if}
 
-  <div class="mt-3 flex justify-end">
-    <Button
-      size="sm"
-      variant="ghost"
-      onclick={() => onViewSession?.(item.taskId)}
-    >
-      View session
-    </Button>
-  </div>
+  {#if onViewSession}
+    <div class="mt-3 flex justify-end">
+      <Button
+        size="sm"
+        variant="ghost"
+        onclick={() => onViewSession?.(item.taskId)}
+      >
+        View session
+      </Button>
+    </div>
+  {/if}
 </article>

@@ -549,7 +549,7 @@
       awaitingAssistantStart = false;
     }
 
-    if (event.type === 'message_complete' || event.type === 'workflow_failed' || event.type === 'workflow_cancelled') {
+    if (event.type === 'message_complete' || event.type === 'workflow_completed' || event.type === 'workflow_failed' || event.type === 'workflow_cancelled') {
       awaitingAssistantStart = false;
       turnInProgress = false;
       timeline = finalizeReasoningItems(timeline);

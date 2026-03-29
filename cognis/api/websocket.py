@@ -797,6 +797,7 @@ class WebSocketConnectionManager:
                 await connection.send_json(
                     {
                         "type": "workflow_completed",
+                        "conversation_id": conversation_id,
                         "task_id": item.get("data", {}).get("task_id"),
                         "result": item.get("data", {}).get("result_summary"),
                     }
@@ -806,6 +807,7 @@ class WebSocketConnectionManager:
                 await connection.send_json(
                     {
                         "type": "workflow_failed",
+                        "conversation_id": conversation_id,
                         "task_id": item.get("data", {}).get("task_id"),
                         "reason": item.get("data", {}).get("result_summary"),
                     }
@@ -815,8 +817,45 @@ class WebSocketConnectionManager:
                 await connection.send_json(
                     {
                         "type": "workflow_cancelled",
+                        "conversation_id": conversation_id,
                         "task_id": item.get("data", {}).get("task_id"),
                         "reason": item.get("data", {}).get("result_summary") or "cancelled",
+                    }
+                )
+                replayed += 1
+            elif event_type == "delegation":
+                data = item.get("data", {})
+                await connection.send_json(
+                    {
+                        "type": "delegation_started",
+                        "conversation_id": conversation_id,
+                        "parent_session_id": session.session_id,
+                        "child_session_id": data.get("child_session_id"),
+                        "mode": data.get("mode"),
+                        "agent_id": data.get("agent_id"),
+                        "task": data.get("task"),
+                    }
+                )
+                replayed += 1
+            elif event_type == "delegation_completed":
+                data = item.get("data", {})
+                await connection.send_json(
+                    {
+                        "type": "delegation_completed",
+                        "conversation_id": conversation_id,
+                        "child_session_id": data.get("child_session_id"),
+                        "result": data.get("result_summary"),
+                    }
+                )
+                replayed += 1
+            elif event_type == "delegation_failed":
+                data = item.get("data", {})
+                await connection.send_json(
+                    {
+                        "type": "delegation_failed",
+                        "conversation_id": conversation_id,
+                        "child_session_id": data.get("child_session_id"),
+                        "reason": data.get("error"),
                     }
                 )
                 replayed += 1

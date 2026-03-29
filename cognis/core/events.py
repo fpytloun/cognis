@@ -11,6 +11,7 @@ events (session recording) are a separate concern.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections import defaultdict
 from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime
@@ -143,7 +144,3 @@ async def _safe_call(handler: EventHandler, event: Event) -> None:
             "Event handler raised exception",
             extra={"extra_data": {"event_type": event.type}},
         )
-
-
-# Module-level import for contextlib (used in unsubscribe).
-import contextlib  # noqa: E402
