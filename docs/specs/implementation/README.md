@@ -80,9 +80,21 @@ Stage 4 (executor + tools)    Stage 5 (orchestration core)
 Stages 4 and 5 can run in parallel after Stage 3 is complete.
 Stages 12 and 13 can run in parallel after Stage 11 is complete.
 
+### Spec Alignment (Post-MVP)
+
+Specs have evolved since the MVP build with significant new design:
+workflow step input context model, task delivery routing, step questions,
+collaboration/sharing model, and channel-aware conversations. These stages
+bring the codebase in line with the updated specs.
+
+| Stage | Name | Status | Notes |
+|-------|------|--------|-------|
+| 6a | [Step Input Context Assembly](stage-6a-workflow-context.md) | NOT STARTED | null/full/summary/last input types, iteration semantics, step output storage |
+
 ## Scope Boundary
 
 Stages 0-9 build the MVP. Stages 10-15 polish it into a usable product.
+Stages 6a+ align the codebase with spec refinements made during design review.
 
 **Out of scope for all stages** (Phase 2+): multi-user, scheduler
 execution, Docker/K8s executors, platform integrations (Slack/Discord),

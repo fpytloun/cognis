@@ -268,8 +268,10 @@ class StepDefinition:
     description: str
     prompt: str                # objective for the step runner
 
-    # Inputs from previous steps
-    input: list[str]           # step names whose outputs feed into this step
+    # Context from previous steps (see Step Input Context Model below)
+    input: StepInputConfig | None = None
+    # Default: type="last", source=<previous step>
+    # First step default: type="null"
 
     # Completion and evaluation (run steps only)
     completion: CompletionConfig | None
@@ -280,6 +282,32 @@ class StepDefinition:
     # Gate configuration (gate steps only)
     gate: GateConfig | None
 ```
+
+### StepInputConfig
+
+Controls what context flows from previous steps into this step.
+
+```python
+class StepInputConfig:
+    type: str              # "null" | "full" | "summary" | "last"
+    source: str | list[str] | None = None
+    # Step name or list of step names.
+    # For "full": single step only.
+    # For "summary"/"last": single or list.
+    # If None and type is "last": defaults to previous step.
+```
+
+| Type | What flows | Cost | Source |
+|------|-----------|------|--------|
+| `null` | Nothing from previous steps. Only step prompt + task description + agent memory. | Zero | None |
+| `full` | Complete event history from source step's session, injected as conversation context into a **new** session. | Expensive — consumes context window | Single step only |
+| `summary` | LLM-generated summary of source step session(s). More complete and objective than the agent's self-reported summary. | One cheap LLM call per source | Single or list |
+| `last` (default) | `step_complete` output from source step(s) — the agent's own summary + claims + structured outputs. Already available, no extra LLM call. | Minimal | Single or list; if omitted, previous step |
+
+Default behavior:
+- If `input` is not specified: `type="last"`, `source=<previous step>`
+- If first step and `input` not specified: `type="null"`
+- If `input.type` is `"null"`: fresh context, no previous step data
 
 ### CompletionConfig
 
@@ -300,7 +328,7 @@ How a gate step interacts with the caller.
 ```python
 class GateConfig:
     message: str               # displayed to caller
-    input: list[str]           # step outputs to include in gate context
+    context_from: list[str]    # step names whose outputs are included in gate context
     options: list[GateOption]
 ```
 
@@ -448,10 +476,11 @@ Agent runs step (full agentic loop)
   │     ├── Evaluator: "approved"
   │     │     → step advances, workflow continues
   │     │
-  │     ├── Evaluator: "revise"
-  │     │     → increment attempt counter
-  │     │     → if under max_attempts: re-run step with feedback
-  │     │     → if exhausted: execute on_exhausted action
+    │     ├── Evaluator: "revise"
+    │     │     → increment attempt counter
+    │     │     → if under max_attempts: append feedback to SAME session,
+    │     │       resume agent loop (no context reset)
+    │     │     → if exhausted: execute on_exhausted action
   │     │
   │     └── Evaluator: "failed"
   │           → step fails, on_exhausted action
@@ -514,6 +543,65 @@ They are NOT controller truth — just cognitive aids for the agent.
 
 The controller never infers completion from todo state. Only
 `step_complete` may advance a run step.
+
+## Step Input Context Assembly
+
+Each step always creates its own Intaris session. No session reuse across
+steps. This keeps audit boundaries clean and allows review loops to go
+back to any step without contamination.
+
+### How context is assembled per input type
+
+**`null`**:
+```
+New Intaris session for this step.
+Context: step prompt + task description + agent memory (Mnemory recall).
+No previous step data injected.
+```
+
+**`full`** (single source only):
+```
+New Intaris session for this step.
+1. Read complete event history from source step's session (from cache).
+2. Inject events as conversation context into the new session.
+3. Append this step's prompt as the next user message.
+The step sees the full source discussion but has its own session.
+```
+
+**`summary`** (single or multiple sources):
+```
+New Intaris session for this step.
+1. For each source step: generate LLM summary of the step's session.
+2. Inject summaries as labeled system context:
+   <step_context source="plan" type="summary">
+   Created 5-step implementation plan covering auth endpoints...
+   </step_context>
+3. Append this step's prompt.
+```
+
+**`last`** (single or multiple sources, default):
+```
+New Intaris session for this step.
+1. For each source step: take the step_complete output (summary + claims + outputs).
+2. Inject as labeled context:
+   <step_output source="plan">
+   Summary: Created 5-step implementation plan...
+   Claims: covers auth endpoints, includes test strategy, ...
+   Outputs: {plan: [...], criteria: [...]}
+   </step_output>
+3. Append this step's prompt.
+```
+
+### Iteration context (re-attempts)
+
+On re-attempt after evaluation rejection or review loop rejection:
+- the step's **own session continues** (same Intaris session)
+- evaluator/reviewer feedback is appended as a message
+- the agent sees all its own prior work plus specific feedback
+- no input re-assembly — original context is already in the session
+- this applies regardless of the step's `input.type`
+
+This is the step's OWN session continuing, not another step's session.
 
 ## Step Evaluation
 
@@ -650,7 +738,7 @@ A step can route back to a previous step on rejection:
 - name: code_review
   type: run
   prompt: "Review code quality, tests, documentation..."
-  input: [plan, implement]
+  input: {type: summary, source: [plan, implement]}
   completion:
     evaluate: true
     max_attempts: 2
@@ -705,13 +793,20 @@ structure in its own metadata.
 
 ### Step attempt sessions
 
-Each step attempt gets its own Intaris session (context reset):
+First attempt creates a new Intaris session. Subsequent attempts (after
+evaluation rejection) **continue the same session** with evaluator feedback
+appended. The agent keeps its own context and reasoning from prior attempts.
 
 ```
-StepRun: implement (attempt 1) → Intaris session A
-StepRun: implement (attempt 2) → Intaris session B (new, with feedback)
-StepRun: implement (attempt 3) → Intaris session C (new, with feedback)
+StepRun: implement (attempt 1) → Intaris session A (new)
+StepRun: implement (attempt 2) → Intaris session A (continues, feedback appended)
+StepRun: implement (attempt 3) → Intaris session A (continues, feedback appended)
 ```
+
+This is critical: the agent should not lose its own work when iterating.
+Only the first attempt assembles context from the step's `input` config.
+Subsequent attempts just see the evaluator's feedback added to their
+existing session.
 
 ## Main Chat As Workflow
 
@@ -726,6 +821,7 @@ steps:
   - name: execute
     type: run
     prompt: "{user_message}"
+    input: {type: "null"}
     completion:
       evaluate: false
 ```
@@ -772,8 +868,8 @@ name: Direct
 steps:
   - name: execute
     type: run
-    completion:
-      evaluate: false
+    input: {type: "null"}
+    completion: {evaluate: false}
 ```
 
 **Research** — plan, research, synthesize, evaluate:
@@ -783,16 +879,18 @@ steps:
   - name: plan
     type: run
     prompt: "Create a research plan..."
+    input: {type: "null"}
     completion: {evaluate: true}
   - name: research
     type: run
     prompt: "Execute the research plan..."
-    input: [plan]
+    input: {type: full, source: plan}
+    # Full context from planning — researcher sees reasoning and decisions
     completion: {evaluate: true, max_attempts: 2}
   - name: synthesize
     type: run
     prompt: "Synthesize findings into a coherent report..."
-    input: [plan, research]
+    input: {type: summary, source: [plan, research]}
     completion: {evaluate: true}
 ```
 
@@ -803,39 +901,42 @@ steps:
   - name: plan
     type: run
     prompt: "Break down this task into implementation steps..."
+    input: {type: "null"}
     completion: {evaluate: true, max_attempts: 2}
   - name: architect_review
     type: run
     prompt: "Review this plan critically..."
-    input: [plan]
+    input: {type: full, source: plan}
+    # Reviewer sees the FULL planning session
     completion: {evaluate: true}
     on_reject: {target: plan, max_loop_iterations: 2, on_exhausted: gate}
   - name: implement
     type: run
     prompt: "Implement the plan with tests and documentation..."
-    input: [plan, architect_review]
+    input: {type: summary, source: [plan, architect_review]}
+    # Summary saves context window for actual coding work
     completion: {evaluate: true, max_attempts: 3}
   - name: run_tests
     type: run
     prompt: "Run the test suite and fix any failures..."
-    input: [implement]
+    # input not specified → default: type=last, source=implement
     completion: {evaluate: true, max_attempts: 2}
     on_reject: {target: implement, max_loop_iterations: 2, on_exhausted: continue}
   - name: code_review
     type: run
     prompt: "Review code quality, test coverage, documentation..."
-    input: [plan, implement, run_tests]
+    input: {type: summary, source: [plan, implement, run_tests]}
     completion: {evaluate: true}
     on_reject: {target: implement, max_loop_iterations: 2, on_exhausted: continue}
   - name: commit
     type: run
     prompt: "Create a conventional commit..."
-    input: [implement]
+    # input not specified → default: type=last, source=code_review
     completion: {evaluate: false}
   - name: update_memory
     type: run
     prompt: "Store key findings and decisions as memories..."
-    input: [plan, implement, code_review]
+    input: {type: last, source: [plan, implement, code_review]}
     completion: {evaluate: false}
 ```
 
@@ -846,6 +947,7 @@ steps:
   - name: generate
     type: run
     prompt: "Create the requested content..."
+    input: {type: "null"}
     completion: {evaluate: true, max_attempts: 5, on_exhausted: continue}
 ```
 

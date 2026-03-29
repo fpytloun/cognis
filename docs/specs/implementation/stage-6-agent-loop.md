@@ -40,7 +40,8 @@ full design.
 
 - `cognis/core/agent_loop.py`
   - Runs a single step session as a full agentic loop:
-    1. Receive step objective (prompt + inputs from previous steps)
+    1. Receive step objective and assemble step input context
+       (see Step Input Context Assembly below)
     2. Context assembly (parallel fetches via ContextAssembler)
     3. LLM call (streaming via LLMProvider)
     4. Process response:
