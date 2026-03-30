@@ -599,6 +599,7 @@
     { command: '/thinking', description: 'Set reasoning effort' },
     { command: '/context', description: 'Show context usage' },
     { command: '/info', description: 'Show session details' },
+    { command: '/lsp', description: 'Show LSP diagnostics status' },
     { command: '/compact', description: 'Compact conversation' },
     { command: '/new', description: 'Start new conversation' },
     { command: '/approve', description: 'Approve tool escalation' },
