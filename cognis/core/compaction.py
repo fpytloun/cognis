@@ -111,9 +111,21 @@ class CompactionStrategy:
             {
                 "role": "system",
                 "content": (
-                    "Summarize the older conversation history for future context. "
-                    "Keep goals, constraints, completed actions, open questions, and delegation/tool outcomes. "
-                    "Do not add new facts."
+                    "Summarize the older conversation history into a structured "
+                    "handoff document for the same assistant to continue from. "
+                    "Use exactly these sections (omit empty sections):\n\n"
+                    "## Goal\nWhat the user is trying to accomplish.\n\n"
+                    "## Key Instructions\nConstraints, preferences, and rules "
+                    "the user stated or that emerged during the conversation.\n\n"
+                    "## Discoveries\nImportant findings, decisions, or conclusions "
+                    "reached during the conversation.\n\n"
+                    "## Relevant Files\nFiles read, created, or modified "
+                    "(with brief purpose for each).\n\n"
+                    "## Accomplished\nCompleted actions and their outcomes.\n\n"
+                    "## Current Work\nWhat was in progress when this history "
+                    "ended. Include any open questions or pending decisions.\n\n"
+                    "Be concise. Do not invent information not present in the "
+                    "history. Prefer bullet points over prose."
                 ),
             },
             {"role": "user", "content": _format_events_for_compaction(older_events)},
@@ -232,9 +244,37 @@ def _split_events(events: list[Any], preserve_turns: int) -> tuple[list[Any], li
 def _format_events_for_compaction(events: list[Any]) -> str:
     lines: list[str] = []
     for event in events:
-        content = event.data.get("content")
-        payload = content if isinstance(content, str) else str(event.data)
-        lines.append(f"[{event.seq}] {event.type}: {payload}")
+        etype = event.type
+        data = event.data
+
+        if etype in ("user_message", "assistant_message"):
+            payload = data.get("content", "")
+        elif etype == "tool_call":
+            name = data.get("name", "unknown")
+            args = data.get("arguments", "")
+            # Truncate large arguments for the compaction prompt
+            if isinstance(args, str) and len(args) > 500:
+                args = args[:500] + "..."
+            payload = f"{name}({args})"
+        elif etype == "tool_result":
+            name = data.get("name", "")
+            result = data.get("result") or data.get("output", "")
+            is_error = data.get("is_error", False)
+            prefix = f"[ERROR] {name}: " if is_error else f"{name}: "
+            # Truncate large results for the compaction prompt
+            if isinstance(result, str) and len(result) > 1000:
+                result = result[:1000] + "..."
+            payload = prefix + str(result)
+        elif etype == "delegation":
+            status = data.get("status", "")
+            mode = data.get("mode", "")
+            summary = data.get("result_summary", "")
+            payload = f"[{mode}/{status}] {summary}"
+        else:
+            content = data.get("content")
+            payload = content if isinstance(content, str) else str(data)
+
+        lines.append(f"[{event.seq}] {etype}: {payload}")
     return "\n".join(lines)
 
 

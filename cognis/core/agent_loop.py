@@ -23,6 +23,7 @@ from prometheus_client import Counter, Histogram
 
 from cognis.core.compaction import ROTATION_TOTAL
 from cognis.core.events import Event, EventBus, EventType
+from cognis.core.pruning import prune_tool_outputs
 from cognis.core.truncation import middle_truncate
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
@@ -948,6 +949,17 @@ class AgentLoop:
         reprompted = False
         while True:
             self._raise_if_cancelled(ctx)
+
+            # Prune old tool outputs before each LLM call to keep the
+            # context window lean.  Uses tiktoken via the LLM provider for
+            # accurate token estimation.
+            resolved_model = getattr(context_result, "resolved_model", "")
+            messages = prune_tool_outputs(
+                messages,
+                token_counter=lambda text, _m=resolved_model: self.providers.llm.count_tokens(
+                    text, _m
+                ),
+            )
 
             # Stream LLM response
             accumulator = StreamAccumulator()

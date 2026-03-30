@@ -45,6 +45,7 @@ from cognis.core.session_cache import SessionCache
 from cognis.core.step_context import StepContextAssembler
 from cognis.core.step_evaluator import StepEvaluator
 from cognis.core.task_queue import TaskQueue
+from cognis.core.tool_output_store import ToolOutputStore
 from cognis.core.tool_router import ToolRouter
 from cognis.core.workflow_engine import WorkflowEngine
 from cognis.core.workflow_registry import WorkflowRegistry
@@ -189,8 +190,13 @@ def create_app() -> FastAPI:
         )
         pause_waiter = PauseWaiter()
         session_lock = SessionLock()
+        tool_output_store = ToolOutputStore(Path(config_runtime.data_dir))
+        await tool_output_store.cleanup_expired()
         tool_router = await ToolRouter.from_session_factory(
-            providers.guardrails, session_factory, memory=providers.memory
+            providers.guardrails,
+            session_factory,
+            memory=providers.memory,
+            tool_output_store=tool_output_store,
         )
         workflow_registry = WorkflowRegistry(session_factory)
         step_evaluator = await StepEvaluator.from_session_factory(
@@ -228,6 +234,7 @@ def create_app() -> FastAPI:
             session_lock=session_lock,
             pause_waiter=pause_waiter,
             step_context_assembler=step_context_assembler,
+            tool_output_store=tool_output_store,
         )
         workflow_engine = WorkflowEngine(
             session_factory=session_factory,
