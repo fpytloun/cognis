@@ -83,7 +83,6 @@
     switch (category) {
       case 'memory': return BrainCircuit;
       case 'filesystem': return FileText;
-      case 'search': return Search;
       case 'shell': return Terminal;
       case 'web': return Globe;
       case 'workflow': return ListChecks;
@@ -97,7 +96,6 @@
     switch (category) {
       case 'memory': return 'Memory';
       case 'filesystem': return 'Filesystem';
-      case 'search': return 'Search';
       case 'shell': return 'Shell';
       case 'web': return 'Web';
       case 'workflow': return 'Workflow';
@@ -108,7 +106,7 @@
   }
 
   // Fixed display order for categories
-  const CATEGORY_ORDER = ['memory', 'filesystem', 'search', 'shell', 'web', 'workflow', 'orchestration', 'system'];
+  const CATEGORY_ORDER = ['memory', 'filesystem', 'shell', 'web', 'workflow', 'orchestration', 'system'];
 
   $: filteredTools = tools.filter(tool => {
     const matchesSearch = !searchQuery ||

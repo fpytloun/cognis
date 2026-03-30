@@ -4,6 +4,10 @@
   let { item } = $props<{ item: ToolCallTimelineItem }>();
 
   let expanded = $state(false);
+  let inputExpanded = $state(false);
+  let outputExpanded = $state(false);
+
+  const LINES_PER_PAGE = 50;
 
   function toggle(): void {
     expanded = !expanded;
@@ -69,17 +73,23 @@
     }
   }
 
-  const MAX_OUTPUT_LINES = 50;
+  /** Strip <tool_result> XML wrapper tags injected by the tool router. */
+  function cleanResult(raw: string): string {
+    return raw
+      .replace(/^<tool_result[^>]*>\n?/, '')
+      .replace(/\n?<\/tool_result>\s*$/, '');
+  }
 
-  function truncatedResult(): { text: string; hiddenCount: number } {
-    if (!item.result) return { text: '', hiddenCount: 0 };
-    const lines = item.result.split('\n');
-    if (lines.length <= MAX_OUTPUT_LINES) {
-      return { text: item.result, hiddenCount: 0 };
+  function paginatedText(raw: string, showAll: boolean): { text: string; totalLines: number; hiddenCount: number } {
+    const lines = raw.split('\n');
+    const totalLines = lines.length;
+    if (showAll || totalLines <= LINES_PER_PAGE) {
+      return { text: raw, totalLines, hiddenCount: 0 };
     }
     return {
-      text: lines.slice(0, MAX_OUTPUT_LINES).join('\n'),
-      hiddenCount: lines.length - MAX_OUTPUT_LINES
+      text: lines.slice(0, LINES_PER_PAGE).join('\n'),
+      totalLines,
+      hiddenCount: totalLines - LINES_PER_PAGE
     };
   }
 
@@ -121,18 +131,37 @@
   {#if expanded}
     <div class="space-y-3 border-t border-slate-800/60 px-4 py-3">
       {#if item.arguments && Object.keys(item.arguments).length > 0}
+        {@const inputData = paginatedText(formatArguments(), inputExpanded)}
         <div>
           <p class="mb-1 text-xs font-medium uppercase tracking-widest text-slate-500">Input</p>
-          <pre class="max-h-[40vh] overflow-auto rounded-lg border border-slate-800/60 bg-slate-950/60 p-3 text-xs leading-5 text-slate-300">{formatArguments()}</pre>
+          <pre class="max-h-[40vh] overflow-auto rounded-lg border border-slate-800/60 bg-slate-950/60 p-3 text-xs leading-5 text-slate-300">{inputData.text}</pre>
+          {#if inputData.hiddenCount > 0}
+            <button
+              class="mt-1 text-xs text-sky-400 hover:text-sky-300"
+              onclick={() => { inputExpanded = !inputExpanded; }}
+              type="button"
+            >
+              {inputExpanded ? 'Show less' : `Show all (${inputData.totalLines} lines)`}
+            </button>
+          {/if}
         </div>
       {/if}
 
       {#if item.result != null}
-        {@const output = truncatedResult()}
+        {@const cleaned = cleanResult(item.result)}
+        {@const outputData = paginatedText(cleaned, outputExpanded)}
         <div>
           <p class="mb-1 text-xs font-medium uppercase tracking-widest text-slate-500">Output</p>
-          <pre class={`max-h-[40vh] overflow-auto rounded-lg border bg-slate-950/60 p-3 text-xs leading-5 ${item.isError ? 'border-rose-500/30 text-rose-300' : 'border-slate-800/60 text-slate-300'}`}>{output.text}{#if output.hiddenCount > 0}
-{`\n... ${output.hiddenCount} more lines`}{/if}</pre>
+          <pre class={`max-h-[40vh] overflow-auto rounded-lg border bg-slate-950/60 p-3 text-xs leading-5 ${item.isError ? 'border-rose-500/30 text-rose-300' : 'border-slate-800/60 text-slate-300'}`}>{outputData.text}</pre>
+          {#if outputData.hiddenCount > 0}
+            <button
+              class="mt-1 text-xs text-sky-400 hover:text-sky-300"
+              onclick={() => { outputExpanded = !outputExpanded; }}
+              type="button"
+            >
+              {outputExpanded ? 'Show less' : `Show all (${outputData.totalLines} lines)`}
+            </button>
+          {/if}
         </div>
       {/if}
     </div>

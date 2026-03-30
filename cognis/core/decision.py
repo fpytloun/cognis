@@ -1,4 +1,11 @@
-"""Decision engine for inline vs delegated turns."""
+"""Decision engine for inline vs delegated turns.
+
+Uses deterministic fast-path rules only.  The main agent is the
+orchestrator and decides whether to delegate via its ``delegate``
+and ``create_task`` tools during the turn.  The decision engine
+handles only unambiguous cases (explicit slash commands, keywords,
+conversational messages) to short-circuit the turn lifecycle.
+"""
 
 from __future__ import annotations
 
@@ -21,18 +28,10 @@ DECISIONS_TOTAL = Counter(
     "Decision engine outcomes",
     labelnames=("decision", "source"),
 )
-CLASSIFIER_TIMEOUTS = Counter(
-    "cognis_decision_classifier_timeouts_total",
-    "Decision classifier timeouts",
-)
-CLASSIFIER_FAILURES = Counter(
-    "cognis_decision_classifier_failures_total",
-    "Decision classifier failures",
-)
 
 INLINE_OVERRIDE_KEYWORDS = ("just answer", "don't delegate", "do not delegate")
 DELEGATE_OVERRIDE_KEYWORDS = ("run in background", "background task", "delegate this")
-DELEGATE_PREFIXES = ("/research", "/implement", "/delegate", "/fork", "/worker")
+DELEGATE_PREFIXES = ("/research", "/implement", "/delegate", "/task")
 CONVERSATIONAL_PREFIXES = ("hi", "hello", "hey", "thanks", "thank you", "what do you think")
 
 
@@ -48,21 +47,23 @@ class DecisionResult(BaseModel):
 
 
 class DecisionEngine:
-    """Combine deterministic rules with a lightweight LLM classifier."""
+    """Deterministic fast-path rules for inline vs delegate classification.
+
+    The LLM classifier has been removed — the main agent decides whether
+    to delegate via its orchestration tools (``delegate``, ``create_task``).
+    This engine only handles unambiguous cases: explicit slash commands,
+    keyword overrides, and conversational messages.
+    """
 
     def __init__(
         self,
         *,
         llm: Any,
         inline_max_length: int,
-        classifier_timeout_seconds: float,
-        classifier_fallback: str,
         max_delegation_depth: int,
     ) -> None:
         self.llm = llm
         self.inline_max_length = inline_max_length
-        self.classifier_timeout_seconds = classifier_timeout_seconds
-        self.classifier_fallback = classifier_fallback
         self.max_delegation_depth = max_delegation_depth
 
     @classmethod
@@ -78,24 +79,12 @@ class DecisionEngine:
             inline_max_length = await get_setting_value(
                 db_session, "decision_engine.inline_max_length", 200
             )
-            classifier_timeout_ms = await get_setting_value(
-                db_session, "decision_engine.classifier_timeout_ms", 60000
-            )
-            classifier_fallback = await get_setting_value(
-                db_session, "decision_engine.classifier_fallback", "inline"
-            )
             max_delegation_depth = await get_setting_value(
                 db_session, "session.max_delegation_depth", 5
             )
         return cls(
             llm=llm,
             inline_max_length=int(inline_max_length) if isinstance(inline_max_length, int) else 200,
-            classifier_timeout_seconds=(
-                classifier_timeout_ms / 1000 if isinstance(classifier_timeout_ms, int) else 60.0
-            ),
-            classifier_fallback=(
-                classifier_fallback if isinstance(classifier_fallback, str) else "inline"
-            ),
             max_delegation_depth=(
                 int(max_delegation_depth) if isinstance(max_delegation_depth, int) else 5
             ),
@@ -109,7 +98,11 @@ class DecisionEngine:
         current_depth: int = 0,
         override: str | None = None,
     ) -> DecisionResult:
-        """Classify a user message as inline, delegate, or ask_user."""
+        """Classify a user message using deterministic rules only.
+
+        All ambiguous messages default to ``inline`` — the agent decides
+        whether to delegate during its turn via orchestration tools.
+        """
 
         text = user_message.strip()
         if override in {"inline", "delegate", "ask_user"}:
@@ -168,65 +161,14 @@ class DecisionEngine:
                 source="rules",
             )
 
-        if len(text) <= self.inline_max_length and "?" in text and len(text.split()) <= 16:
-            return self._result(
-                decision="inline",
-                reason="Short direct question",
-                confidence=0.75,
-                predicted_tool_intensity="low",
-                source="rules",
-            )
-
-        return await self._classify_with_model(text)
-
-    async def _classify_with_model(self, user_message: str) -> DecisionResult:
-        prompt = [
-            {
-                "role": "system",
-                "content": (
-                    "Classify the user request for orchestration. Return JSON only with keys: "
-                    "decision (inline|delegate|ask_user), reason, confidence, predicted_tool_intensity (low|medium|high)."
-                ),
-            },
-            {"role": "user", "content": user_message},
-        ]
-        try:
-            response = await asyncio.wait_for(
-                self.llm.generate(prompt, task_type="classifier", temperature=0),
-                timeout=self.classifier_timeout_seconds,
-            )
-            content = _extract_text_from_response(response)
-            payload = _parse_classifier_payload(content)
-            decision = payload.get("decision")
-            if decision not in {"inline", "delegate", "ask_user"}:
-                raise ValueError("Invalid classifier decision")
-            return self._result(
-                decision=decision,
-                reason=str(payload.get("reason") or "Classifier decision"),
-                confidence=float(payload.get("confidence") or 0.5),
-                predicted_tool_intensity=str(payload.get("predicted_tool_intensity") or "medium"),
-                source="classifier",
-            )
-        except TimeoutError:
-            CLASSIFIER_TIMEOUTS.inc()
-            logger.warning(
-                "Decision classifier timed out",
-                extra={"extra_data": {"fallback": self.classifier_fallback}},
-            )
-        except Exception:
-            CLASSIFIER_FAILURES.inc()
-            logger.warning(
-                "Decision classifier failed",
-                extra={"extra_data": {"fallback": self.classifier_fallback}},
-            )
-
+        # All other messages: inline by default.
+        # The agent decides whether to delegate during its turn.
         return self._result(
-            decision=self.classifier_fallback,
-            reason="Classifier fallback",
-            confidence=0.4,
+            decision="inline",
+            reason="Default inline — agent orchestrates via tools",
+            confidence=0.9,
             predicted_tool_intensity="medium",
-            source="fallback",
-            degraded=True,
+            source="rules",
         )
 
     def _can_delegate(self, agent: AgentDefinition, current_depth: int) -> bool:

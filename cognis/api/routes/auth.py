@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, HTTPException, Request
+from starlette.responses import JSONResponse, Response
 
 from cognis.api.common import api_exception, require_jwt_user
 from cognis.api.models import (
@@ -34,9 +35,29 @@ from cognis.store.queries import (
 
 router = APIRouter()
 
+COOKIE_NAME = "cognis_session"
+
 
 def _as_int(value: object, default: int) -> int:
     return value if isinstance(value, int) else default
+
+
+def _set_session_cookie(response: Response, token: str, max_age: int) -> None:
+    """Set the cross-service session cookie on a response."""
+    response.set_cookie(
+        key=COOKIE_NAME,
+        value=token,
+        max_age=max_age,
+        path="/",
+        httponly=True,
+        samesite="lax",
+        secure=False,  # localhost dev; production behind TLS termination
+    )
+
+
+def _clear_session_cookie(response: Response) -> None:
+    """Clear the cross-service session cookie."""
+    response.delete_cookie(key=COOKIE_NAME, path="/", samesite="lax")
 
 
 def _api_key_prefix(key_id: str) -> str:
@@ -101,12 +122,15 @@ async def login(request: Request, payload: LoginRequest) -> TokenResponse:
         ttl = _as_int(await get_setting_value(session, "security.token_ttl_seconds", 3600), 3600)
         token = app_state.auth_provider.sign_access_token(user.email, user.name, user.role)
         refresh_token = app_state.auth_provider.sign_refresh_token(user.email)
-        return TokenResponse(
+        body = TokenResponse(
             token=token,
             refresh_token=refresh_token,
             expires_in=ttl,
             user={"email": user.email, "name": user.name, "role": user.role},
         )
+        response = JSONResponse(content=body.model_dump())
+        _set_session_cookie(response, token, ttl)
+        return response  # type: ignore[return-value]
 
 
 @router.post("/api/auth/refresh", response_model=TokenResponse)
@@ -125,16 +149,19 @@ async def refresh(request: Request, payload: RefreshRequest) -> TokenResponse:
         ttl = _as_int(await get_setting_value(session, "security.token_ttl_seconds", 3600), 3600)
         token = app_state.auth_provider.sign_access_token(user.email, user.name, user.role)
         refresh_token = app_state.auth_provider.sign_refresh_token(user.email)
-        return TokenResponse(
+        body = TokenResponse(
             token=token,
             refresh_token=refresh_token,
             expires_in=ttl,
             user={"email": user.email, "name": user.name, "role": user.role},
         )
+        response = JSONResponse(content=body.model_dump())
+        _set_session_cookie(response, token, ttl)
+        return response  # type: ignore[return-value]
 
 
 @router.post("/api/auth/logout")
-async def logout(request: Request, payload: LogoutRequest) -> dict[str, bool]:
+async def logout(request: Request, payload: LogoutRequest) -> Response:
     claims = getattr(request.state, "claims", None)
     auth_provider = request.app.state.auth_provider
     if claims is not None and (jti := claims.get("jti")) is not None:
@@ -147,7 +174,9 @@ async def logout(request: Request, payload: LogoutRequest) -> dict[str, bool]:
         jti = refresh_claims.get("jti")
         if jti is not None:
             auth_provider.revoke_token(str(jti))
-    return {"ok": True}
+    response = JSONResponse(content={"ok": True})
+    _clear_session_cookie(response)
+    return response
 
 
 @router.get("/api/auth/me")

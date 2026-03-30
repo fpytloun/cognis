@@ -284,8 +284,13 @@ def test_events_to_messages_handles_dict_events() -> None:
 def test_events_to_messages_handles_evaluation_feedback() -> None:
     events = [
         {
-            "type": "evaluation_feedback",
-            "data": {"attempt": 1, "decision": "revise", "feedback": "Add tests"},
+            "type": "evaluation",
+            "data": {
+                "event": "evaluation_feedback",
+                "attempt": 1,
+                "decision": "revise",
+                "feedback": "Add tests",
+            },
         },
     ]
     messages = events_to_messages(events)

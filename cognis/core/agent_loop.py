@@ -11,6 +11,7 @@ for multi-step background tasks.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import uuid
 from collections.abc import Callable, Coroutine
@@ -24,12 +25,15 @@ from cognis.core.events import Event, EventBus, EventType
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.session import ConversationModel, SessionEvent, SessionModel
-from cognis.models.tool import ToolCall
+from cognis.models.tool import ToolCall, ToolResult
 from cognis.models.workflow import StepDefinition, StepOutput, WorkflowState
 from cognis.runtime_context import scoped_runtime_context  # noqa: F401 — used in delegation
 from cognis.tools.builtin.orchestration import (
-    handle_orchestration_tool_call,
+    OrchestrationMode,
+    handle_delegate_tool_call,
     is_orchestration_tool,
+    is_subsession_tool,
+    is_task_tool,
 )
 
 logger = get_logger(__name__)
@@ -76,6 +80,7 @@ ToolResultCallback = Callable[[str, str, str, bool, int | None], Coroutine[Any, 
 DEFAULT_MAX_TOOL_CALLS = 50
 DEFAULT_STEP_TIMEOUT_SECONDS = 600  # 10 minutes
 _MAX_TOOL_DATA_BYTES = 10_240  # 10 KB truncation limit for tool args/results
+_MAX_TODO_REPROMPTS = 3  # Max re-prompts for incomplete todos before force-completing
 
 
 def _truncate_tool_data(text: str) -> str:
@@ -381,7 +386,7 @@ class StepContext:
     step_index: int = 0  # Index of current step in workflow
     cancel_event: asyncio.Event | None = None
     system_initiated: bool = False
-    disable_orchestration: bool = False  # True for child sessions (prevent recursive delegation)
+    orchestration_mode: OrchestrationMode = OrchestrationMode.FULL
 
 
 # ---------------------------------------------------------------------------
@@ -418,6 +423,9 @@ class AgentLoop:
         self.session_lock = session_lock
         self.pause_waiter = pause_waiter
         self.step_context_assembler = step_context_assembler
+        # Track active child sessions per parent session for /stop cancellation
+        self._active_children: dict[str, dict[str, asyncio.Task[Any]]] = {}
+        self._children_lock = asyncio.Lock()
 
     async def run_step(
         self,
@@ -488,6 +496,41 @@ class AgentLoop:
             )
         return parent_agent
 
+    # ------------------------------------------------------------------
+    # Child session tracking (for /stop cancellation)
+    # ------------------------------------------------------------------
+
+    async def _track_child(
+        self, parent_session_id: str, child_session_id: str, task: asyncio.Task[Any]
+    ) -> None:
+        """Register an active child session task."""
+        async with self._children_lock:
+            self._active_children.setdefault(parent_session_id, {})[child_session_id] = task
+
+    async def _untrack_child(self, parent_session_id: str, child_session_id: str) -> None:
+        """Remove a child session from tracking."""
+        async with self._children_lock:
+            children = self._active_children.get(parent_session_id)
+            if children:
+                children.pop(child_session_id, None)
+                if not children:
+                    self._active_children.pop(parent_session_id, None)
+
+    async def cancel_children(self, parent_session_id: str) -> int:
+        """Cancel all active child sessions for a parent. Returns count cancelled."""
+        async with self._children_lock:
+            children = self._active_children.pop(parent_session_id, {})
+        cancelled = 0
+        for _child_id, task in children.items():
+            if not task.done():
+                task.cancel()
+                cancelled += 1
+        return cancelled
+
+    # ------------------------------------------------------------------
+    # Child session execution
+    # ------------------------------------------------------------------
+
     async def _run_child_session(
         self,
         *,
@@ -495,23 +538,31 @@ class AgentLoop:
         conversation: ConversationModel,
         agent: AgentDefinition,
         task_description: str,
-        mode: str,
         parent_intaris_session_id: str,
         tool_registry: Any,
         executor_connection: Any,
-    ) -> None:
-        """Run a delegated child session in the background.
+        on_token: TokenCallback | None = None,
+        on_tool_call: ToolCallCallback | None = None,
+        on_tool_result: ToolResultCallback | None = None,
+    ) -> StepOutput | None:
+        """Run a delegated child session.
 
         Executes a single agent-loop turn on the child session using the
-        task description as the user message.  On completion (or failure)
-        the result is recorded as an Intaris event in the **parent**
-        session and a ``DELEGATION_COMPLETED`` / ``DELEGATION_FAILED``
-        event is published so the frontend can update the delegation card.
+        task description as the user message.  The child session requires
+        explicit ``step_complete`` (is_direct=False) to prevent premature
+        completion.
+
+        Returns the StepOutput on success, None on failure.
+
+        Side effects (always executed):
+        - Updates child session status in Cognis DB
+        - Records delegation result in parent Intaris session
+        - Publishes event bus events for frontend
         """
         conversation_id = conversation.conversation_id
         child_session_id = child_session.session_id
 
-        # Resolve the correct agent if the child uses a different one (#3)
+        # Resolve the correct agent if the child uses a different one
         resolved_agent = await self._resolve_child_agent(child_session.agent_id, agent)
 
         child_step = StepDefinition(name="delegation", type="run", prompt=task_description)
@@ -520,25 +571,33 @@ class AgentLoop:
             session=child_session,
             conversation=conversation,
             agent=resolved_agent,
-            is_direct=True,
+            is_direct=False,  # Require step_complete for sub-sessions
             user_message=task_description,
             system_initiated=True,
             interaction_mode="explicit_gates",
             tool_registry=tool_registry,
             executor_connection=executor_connection,
-            disable_orchestration=True,  # Prevent recursive delegation (#11)
+            orchestration_mode=OrchestrationMode.NONE,  # Sub-sessions cannot delegate
         )
 
-        # Set runtime context for JWT headers (#14)
+        output: StepOutput | None = None
+
+        # Set runtime context for JWT headers
         with scoped_runtime_context(
             user_email=child_session.user_email,
             agent_id=resolved_agent.agent_id,
         ):
             try:
-                output = await self.run_step(child_ctx)
+                output = await self.run_step(
+                    child_ctx,
+                    on_token=on_token,
+                    on_tool_call=on_tool_call,
+                    on_tool_result=on_tool_result,
+                )
                 result_summary = output.summary if output and output.summary else "Completed."
+                result_content = output.content if output and output.content else ""
 
-                # Update child session status — guarded (#7)
+                # Update child session status — guarded
                 try:
                     async with self.session_manager.session_factory() as db:
                         from cognis.store.queries import set_session_status
@@ -558,8 +617,7 @@ class AgentLoop:
                         exc_info=True,
                     )
 
-                # Record result in parent Intaris session — guarded (#7)
-                # Use type="delegation" with status field (Intaris whitelist)
+                # Record result in parent Intaris session — guarded
                 try:
                     await self.providers.guardrails.record_events(
                         session_id=parent_intaris_session_id,
@@ -569,8 +627,9 @@ class AgentLoop:
                                 data={
                                     "status": "completed",
                                     "child_session_id": child_session_id,
-                                    "mode": mode,
+                                    "mode": "delegate",
                                     "result_summary": result_summary,
+                                    "result_content": result_content,
                                 },
                             )
                         ],
@@ -585,7 +644,7 @@ class AgentLoop:
                         exc_info=True,
                     )
 
-                # Always publish event bus event for frontend (#7)
+                # Publish event bus event for frontend
                 await self.event_bus.publish(
                     Event(
                         type=EventType.DELEGATION_COMPLETED,
@@ -598,16 +657,6 @@ class AgentLoop:
                     )
                 )
                 DELEGATIONS_TOTAL.labels(status="completed").inc()
-                # Trigger a follow-up turn in the parent conversation
-                await self.event_bus.publish(
-                    Event(
-                        type=EventType.FOLLOW_UP_TURN_REQUESTED,
-                        data={
-                            "conversation_id": conversation_id,
-                            "status": "completed",
-                        },
-                    )
-                )
                 logger.info(
                     "delegation: child session completed",
                     extra={
@@ -627,7 +676,7 @@ class AgentLoop:
                         }
                     },
                 )
-                # Each operation guarded independently (#7)
+                # Each operation guarded independently
                 try:
                     async with self.session_manager.session_factory() as db:
                         from cognis.store.queries import set_session_status
@@ -654,7 +703,7 @@ class AgentLoop:
                                 data={
                                     "status": "failed",
                                     "child_session_id": child_session_id,
-                                    "mode": mode,
+                                    "mode": "delegate",
                                     "error": "Delegation execution failed",
                                 },
                             )
@@ -669,7 +718,7 @@ class AgentLoop:
                         exc_info=True,
                     )
 
-                # Always publish event bus event for frontend (#7)
+                # Publish event bus event for frontend
                 await self.event_bus.publish(
                     Event(
                         type=EventType.DELEGATION_FAILED,
@@ -682,16 +731,56 @@ class AgentLoop:
                     )
                 )
                 DELEGATIONS_TOTAL.labels(status="failed").inc()
-                # Trigger a follow-up turn in the parent conversation
-                await self.event_bus.publish(
-                    Event(
-                        type=EventType.FOLLOW_UP_TURN_REQUESTED,
-                        data={
-                            "conversation_id": conversation_id,
-                            "status": "failed",
-                        },
-                    )
-                )
+
+        return output
+
+    async def _run_child_session_async(
+        self,
+        *,
+        child_session: SessionModel,
+        conversation: ConversationModel,
+        agent: AgentDefinition,
+        task_description: str,
+        parent_intaris_session_id: str,
+        tool_registry: Any,
+        executor_connection: Any,
+    ) -> None:
+        """Async wrapper for _run_child_session that triggers follow-up turns.
+
+        Used for wait=false (background) delegations.  After the child
+        completes, publishes FOLLOW_UP_TURN_REQUESTED so the parent
+        conversation gets a new system-initiated turn with the result.
+        """
+        parent_session_id = child_session.parent_session_id or ""
+        child_session_id = child_session.session_id
+        conversation_id = conversation.conversation_id
+
+        try:
+            output = await self._run_child_session(
+                child_session=child_session,
+                conversation=conversation,
+                agent=agent,
+                task_description=task_description,
+                parent_intaris_session_id=parent_intaris_session_id,
+                tool_registry=tool_registry,
+                executor_connection=executor_connection,
+            )
+            status = "completed" if output else "failed"
+        except Exception:
+            status = "failed"
+        finally:
+            await self._untrack_child(parent_session_id, child_session_id)
+
+        # Trigger a follow-up turn in the parent conversation
+        await self.event_bus.publish(
+            Event(
+                type=EventType.FOLLOW_UP_TURN_REQUESTED,
+                data={
+                    "conversation_id": conversation_id,
+                    "status": status,
+                },
+            )
+        )
 
     async def _execute_step(
         self,
@@ -707,9 +796,11 @@ class AgentLoop:
             max_tool_calls = ctx.agent.execution.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
 
         tool_call_count = 0
+        todo_reprompt_count = 0
         step_output: StepOutput | None = None
         events_to_record: list[SessionEvent] = []
         messages: list[dict[str, Any]] = []
+        assistant_content_parts: list[str] = []  # Accumulate full assistant output
 
         # Build tool definitions for LLM (controller-injected tools)
         controller_tool_schemas = self._build_controller_tool_schemas(ctx)
@@ -804,26 +895,50 @@ class AgentLoop:
                     SessionEvent(type="assistant_message", data={"content": content})
                 )
                 messages.append({"role": "assistant", "content": content})
+                assistant_content_parts.append(content)
 
             # No tool calls — check if step is complete
             if not tool_calls:
                 if ctx.is_direct:
-                    # Direct workflow: step completes when LLM finishes
+                    # Direct workflow (main chat): check for incomplete todos
+                    incomplete_todos = self._get_incomplete_todos(ctx)
+                    if incomplete_todos and todo_reprompt_count < _MAX_TODO_REPROMPTS:
+                        todo_reprompt_count += 1
+                        STEP_REPROMPTS.inc()
+                        todo_list = "\n".join(
+                            f"  - [{t.get('status', 'pending')}] {t.get('content', '')}"
+                            for t in incomplete_todos
+                        )
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"You have {len(incomplete_todos)} incomplete todos:\n"
+                                    f"{todo_list}\n\n"
+                                    "Continue working on them, delegate to sub-sessions "
+                                    "or tasks for longer work, or cancel remaining todos "
+                                    "via step_todo_write if they are no longer needed."
+                                ),
+                            }
+                        )
+                        continue
+                    # Todos done (or max re-prompts reached) — complete
                     step_output = StepOutput(
                         summary=content[:500] if content else "",
+                        content="\n\n".join(assistant_content_parts),
                         outputs={},
                         claims=[],
                     )
                     break
                 elif not reprompted:
-                    # Re-prompt once for missing step_complete
+                    # Non-direct (sub-session / workflow step): require step_complete
                     STEP_REPROMPTS.inc()
                     reprompted = True
                     messages.append(
                         {
                             "role": "user",
                             "content": (
-                                "You must call step_complete to finish this workflow step. "
+                                "You must call step_complete to finish this step. "
                                 "Please summarize what you have accomplished and call step_complete."
                             ),
                         }
@@ -879,13 +994,61 @@ class AgentLoop:
 
                 # Controller tool interception
                 if tc.name == STEP_COMPLETE:
+                    # Reject step_complete in direct mode (main chat)
+                    if ctx.is_direct:
+                        err_content = json.dumps(
+                            {
+                                "status": "error",
+                                "message": (
+                                    "step_complete is not available in this context. "
+                                    "Simply respond to the user directly."
+                                ),
+                            }
+                        )
+                        messages.append(
+                            {"role": "tool", "tool_call_id": tc.call_id, "content": err_content}
+                        )
+                        if on_tool_result:
+                            await on_tool_result(tc.call_id, tc.name, err_content, True, None)
+                        continue
+
+                    # Enforce todo completion for non-direct steps
+                    incomplete_todos = self._get_incomplete_todos(ctx)
+                    if incomplete_todos and not ctx.is_direct:
+                        todo_list = ", ".join(t.get("content", "?") for t in incomplete_todos[:5])
+                        err_content = json.dumps(
+                            {
+                                "status": "rejected",
+                                "reason": "incomplete_todos",
+                                "message": (
+                                    f"Cannot complete: {len(incomplete_todos)} todos still "
+                                    f"pending ({todo_list}). Complete or cancel them first "
+                                    "via step_todo_write."
+                                ),
+                            }
+                        )
+                        messages.append(
+                            {"role": "tool", "tool_call_id": tc.call_id, "content": err_content}
+                        )
+                        if on_tool_result:
+                            await on_tool_result(tc.call_id, tc.name, err_content, True, None)
+                        continue
+
                     step_output = StepOutput(
                         summary=tc.arguments.get("summary", ""),
+                        content="\n\n".join(assistant_content_parts),
                         outputs=tc.arguments.get("outputs", {}),
                         claims=tc.arguments.get("claims", []),
                     )
                     events_to_record.append(
-                        SessionEvent(type="step_complete", data={"summary": step_output.summary})
+                        SessionEvent(
+                            type="lifecycle",
+                            data={
+                                "event": "step_complete",
+                                "status": "completed",
+                                "summary": step_output.summary,
+                            },
+                        )
                     )
                     result_content = json.dumps({"status": "completed"})
                     messages.append(
@@ -1019,102 +1182,32 @@ class AgentLoop:
 
                 elif is_orchestration_tool(tc.name):
                     # Orchestration tool — intercept as controller directive
-                    task_description = tc.arguments.get("task") or tc.arguments.get("reason", "")
-
-                    # Prevent recursive delegation in child sessions (#11)
-                    if ctx.disable_orchestration:
-                        messages.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": tc.call_id,
-                                "content": json.dumps(
-                                    {
-                                        "status": "error",
-                                        "message": "Delegation is not available in sub-sessions. "
-                                        "Complete the task directly.",
-                                    }
-                                ),
-                            }
-                        )
-                        continue
-
-                    result, child_session = await handle_orchestration_tool_call(
+                    orch_result = await self._handle_orchestration_tool(
                         tc,
-                        session_manager=self.session_manager,
-                        session=ctx.session,
-                        agent=ctx.agent,
+                        ctx=ctx,
+                        events_to_record=events_to_record,
+                        on_token=on_token,
+                        on_tool_call=on_tool_call,
+                        on_tool_result=on_tool_result,
                     )
-
-                    # Record delegation event AFTER child creation so we have
-                    # child_session_id for consistent ID matching (#1, #8)
-                    if child_session is not None:
-                        parent_intaris_id = ctx.session.intaris_session_id or ctx.session.session_id
-                        # Add to batch (correct ordering with user_message)
-                        events_to_record.append(
-                            SessionEvent(
-                                type="delegation",
-                                data={
-                                    "mode": tc.name,
-                                    "call_id": tc.call_id,
-                                    "task": task_description,
-                                    "child_session_id": child_session.session_id,
-                                },
-                            )
-                        )
-
-                        await self.event_bus.publish(
-                            Event(
-                                type=EventType.DELEGATION_STARTED,
-                                data={
-                                    "conversation_id": ctx.conversation.conversation_id,
-                                    "parent_session_id": ctx.session.session_id,
-                                    "child_session_id": child_session.session_id,
-                                    "mode": tc.name,
-                                    "agent_id": child_session.agent_id,
-                                    "task": task_description,
-                                },
-                            )
-                        )
-
-                        # Spawn background execution — retain task ref (#9)
-                        _child_task = asyncio.create_task(
-                            self._run_child_session(
-                                child_session=child_session,
-                                conversation=ctx.conversation,
-                                agent=ctx.agent,
-                                task_description=task_description,
-                                mode=tc.name,
-                                parent_intaris_session_id=parent_intaris_id,
-                                tool_registry=ctx.tool_registry,
-                                executor_connection=ctx.executor_connection,
-                            )
-                        )
-                        _child_task.add_done_callback(
-                            lambda t: t.exception() if not t.cancelled() else None
-                        )
-                        DELEGATIONS_TOTAL.labels(status="spawned").inc()
-                        delegation_spawned = True
-                    else:
-                        # Child creation failed — record error event (#8)
-                        events_to_record.append(
-                            SessionEvent(
-                                type="delegation",
-                                data={
-                                    "mode": tc.name,
-                                    "call_id": tc.call_id,
-                                    "task": task_description,
-                                    "error": "Child session creation failed",
-                                },
-                            )
-                        )
-
                     messages.append(
                         {
                             "role": "tool",
                             "tool_call_id": tc.call_id,
-                            "content": result.output,
+                            "content": orch_result.output,
                         }
                     )
+                    if on_tool_result:
+                        await on_tool_result(
+                            tc.call_id,
+                            tc.name,
+                            orch_result.output,
+                            orch_result.is_error,
+                            None,
+                        )
+                    # Check if an async delegation was spawned
+                    if orch_result.metadata and orch_result.metadata.get("delegation_spawned"):
+                        delegation_spawned = True
                     continue
 
                 else:
@@ -1208,6 +1301,7 @@ class AgentLoop:
             if delegation_spawned:
                 step_output = StepOutput(
                     summary="Delegation spawned — working in background.",
+                    content="\n\n".join(assistant_content_parts),
                 )
                 break
 
@@ -1242,6 +1336,560 @@ class AgentLoop:
 
         return step_output
 
+    # ------------------------------------------------------------------
+    # Orchestration tool dispatch
+    # ------------------------------------------------------------------
+
+    async def _handle_orchestration_tool(
+        self,
+        tc: ToolCall,
+        *,
+        ctx: StepContext,
+        events_to_record: list[SessionEvent],
+        on_token: TokenCallback | None = None,
+        on_tool_call: ToolCallCallback | None = None,
+        on_tool_result: ToolResultCallback | None = None,
+    ) -> ToolResult:
+        """Dispatch an orchestration tool call.
+
+        Returns a ToolResult.  For async delegations the metadata includes
+        ``delegation_spawned=True`` so the caller can end the parent turn.
+        """
+        # Check orchestration mode
+        if ctx.orchestration_mode == OrchestrationMode.NONE:
+            return ToolResult(
+                output=json.dumps(
+                    {
+                        "status": "error",
+                        "message": (
+                            "Orchestration tools are not available in sub-sessions. "
+                            "Complete the task directly."
+                        ),
+                    }
+                ),
+                is_error=True,
+            )
+
+        # In DELEGATE_SYNC_ONLY mode, only delegate is allowed (and always sync)
+        if ctx.orchestration_mode == OrchestrationMode.DELEGATE_SYNC_ONLY and tc.name != "delegate":
+            return ToolResult(
+                output=json.dumps(
+                    {
+                        "status": "error",
+                        "message": (
+                            f"Tool '{tc.name}' is not available in task steps. "
+                            "Only 'delegate' (sync) is available."
+                        ),
+                    }
+                ),
+                is_error=True,
+            )
+
+        # Dispatch by tool name
+        if tc.name == "delegate":
+            return await self._handle_delegate(
+                tc,
+                ctx=ctx,
+                events_to_record=events_to_record,
+                on_token=on_token,
+                on_tool_call=on_tool_call,
+                on_tool_result=on_tool_result,
+            )
+        elif is_subsession_tool(tc.name):
+            return await self._handle_subsession_management(tc, ctx=ctx)
+        elif is_task_tool(tc.name):
+            return await self._handle_task_tool(tc, ctx=ctx)
+        else:
+            return ToolResult(
+                output=json.dumps({"status": "error", "message": f"Unknown tool: {tc.name}"}),
+                is_error=True,
+            )
+
+    async def _handle_delegate(
+        self,
+        tc: ToolCall,
+        *,
+        ctx: StepContext,
+        events_to_record: list[SessionEvent],
+        on_token: TokenCallback | None = None,
+        on_tool_call: ToolCallCallback | None = None,
+        on_tool_result: ToolResultCallback | None = None,
+    ) -> ToolResult:
+        """Handle the delegate tool — create and optionally run a child session."""
+        task_description = tc.arguments.get("task", "")
+        wait = tc.arguments.get("wait", False)
+
+        # In DELEGATE_SYNC_ONLY mode (task steps), force sync
+        if ctx.orchestration_mode == OrchestrationMode.DELEGATE_SYNC_ONLY:
+            wait = True
+
+        result, child_session = await handle_delegate_tool_call(
+            tc,
+            session_manager=self.session_manager,
+            session=ctx.session,
+            agent=ctx.agent,
+        )
+
+        if child_session is None:
+            # Creation failed — record error event
+            events_to_record.append(
+                SessionEvent(
+                    type="delegation",
+                    data={
+                        "mode": "delegate",
+                        "call_id": tc.call_id,
+                        "task": task_description,
+                        "error": "Child session creation failed",
+                    },
+                )
+            )
+            return result
+
+        parent_intaris_id = ctx.session.intaris_session_id or ctx.session.session_id
+
+        # Record delegation started event
+        events_to_record.append(
+            SessionEvent(
+                type="delegation",
+                data={
+                    "mode": "delegate",
+                    "call_id": tc.call_id,
+                    "task": task_description,
+                    "child_session_id": child_session.session_id,
+                    "wait": wait,
+                },
+            )
+        )
+
+        await self.event_bus.publish(
+            Event(
+                type=EventType.DELEGATION_STARTED,
+                data={
+                    "conversation_id": ctx.conversation.conversation_id,
+                    "parent_session_id": ctx.session.session_id,
+                    "child_session_id": child_session.session_id,
+                    "mode": "delegate",
+                    "agent_id": child_session.agent_id,
+                    "task": task_description,
+                    "wait": wait,
+                },
+            )
+        )
+
+        if wait:
+            # Synchronous delegation — await inline, return output as tool result
+            DELEGATIONS_TOTAL.labels(status="sync_started").inc()
+            output = await self._run_child_session(
+                child_session=child_session,
+                conversation=ctx.conversation,
+                agent=ctx.agent,
+                task_description=task_description,
+                parent_intaris_session_id=parent_intaris_id,
+                tool_registry=ctx.tool_registry,
+                executor_connection=ctx.executor_connection,
+                on_token=on_token,
+                on_tool_call=on_tool_call,
+                on_tool_result=on_tool_result,
+            )
+            if output:
+                # Prefer full content over summary for delegation results
+                result_text = output.content if output.content else output.summary
+                return ToolResult(
+                    output=json.dumps(
+                        {
+                            "status": "completed",
+                            "session_id": child_session.session_id,
+                            "summary": output.summary,
+                            "result": result_text,
+                            "outputs": output.outputs,
+                        },
+                        default=str,
+                    ),
+                    metadata={"orchestration": True, "mode": "delegate", "wait": True},
+                )
+            else:
+                return ToolResult(
+                    output=json.dumps(
+                        {
+                            "status": "failed",
+                            "session_id": child_session.session_id,
+                            "message": "Sub-session failed to complete.",
+                        }
+                    ),
+                    is_error=True,
+                    metadata={"orchestration": True, "mode": "delegate", "wait": True},
+                )
+        else:
+            # Asynchronous delegation — spawn background task
+            child_task = asyncio.create_task(
+                self._run_child_session_async(
+                    child_session=child_session,
+                    conversation=ctx.conversation,
+                    agent=ctx.agent,
+                    task_description=task_description,
+                    parent_intaris_session_id=parent_intaris_id,
+                    tool_registry=ctx.tool_registry,
+                    executor_connection=ctx.executor_connection,
+                )
+            )
+            child_task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+            await self._track_child(ctx.session.session_id, child_session.session_id, child_task)
+            DELEGATIONS_TOTAL.labels(status="spawned").inc()
+            # Mark delegation_spawned in metadata so the caller ends the turn
+            result_with_flag = ToolResult(
+                output=result.output,
+                metadata={
+                    **(result.metadata or {}),
+                    "delegation_spawned": True,
+                },
+            )
+            return result_with_flag
+
+    async def _handle_subsession_management(self, tc: ToolCall, *, ctx: StepContext) -> ToolResult:
+        """Handle list_subsessions, get_subsession, cancel_subsession."""
+        from cognis.store.queries import get_session_row, list_child_sessions, set_session_status
+
+        parent_session_id = ctx.session.session_id
+
+        if tc.name == "list_subsessions":
+            status_filter = tc.arguments.get("status", "all")
+            async with self.session_manager.session_factory() as db:
+                children = await list_child_sessions(db, parent_session_id)
+            items = []
+            for child in children:
+                if status_filter != "all" and child.status != status_filter:
+                    continue
+                items.append(
+                    {
+                        "session_id": child.session_id,
+                        "agent_id": child.agent_id,
+                        "status": child.status,
+                        "task": child.delegation_task,
+                        "result_summary": child.result_summary,
+                        "started_at": str(child.started_at) if child.started_at else None,
+                        "completed_at": str(child.completed_at) if child.completed_at else None,
+                    }
+                )
+            return ToolResult(
+                output=json.dumps({"subsessions": items, "count": len(items)}, default=str),
+            )
+
+        elif tc.name == "get_subsession":
+            target_id = tc.arguments.get("session_id", "")
+            async with self.session_manager.session_factory() as db:
+                target_row = await get_session_row(db, target_id)
+            if target_row is None or target_row.parent_session_id != parent_session_id:
+                return ToolResult(
+                    output=json.dumps(
+                        {
+                            "status": "error",
+                            "message": "Sub-session not found or not a child of this session.",
+                        }
+                    ),
+                    is_error=True,
+                )
+            return ToolResult(
+                output=json.dumps(
+                    {
+                        "session_id": target_row.session_id,
+                        "agent_id": target_row.agent_id,
+                        "status": target_row.status,
+                        "task": target_row.delegation_task,
+                        "result_summary": target_row.result_summary,
+                        "started_at": str(target_row.started_at) if target_row.started_at else None,
+                        "completed_at": (
+                            str(target_row.completed_at) if target_row.completed_at else None
+                        ),
+                    },
+                    default=str,
+                ),
+            )
+
+        elif tc.name == "cancel_subsession":
+            cancel_id = tc.arguments.get("session_id", "")
+            # Verify it's a child of this session
+            async with self.session_manager.session_factory() as db:
+                cancel_row = await get_session_row(db, cancel_id)
+            if cancel_row is None or cancel_row.parent_session_id != parent_session_id:
+                return ToolResult(
+                    output=json.dumps(
+                        {
+                            "status": "error",
+                            "message": "Sub-session not found or not a child of this session.",
+                        }
+                    ),
+                    is_error=True,
+                )
+            if cancel_row.status != "active":
+                return ToolResult(
+                    output=json.dumps(
+                        {
+                            "status": "error",
+                            "message": f"Sub-session is already {cancel_row.status}.",
+                        }
+                    ),
+                    is_error=True,
+                )
+            # Cancel the asyncio task if tracked
+            async with self._children_lock:
+                active_children = self._active_children.get(parent_session_id, {})
+                child_task = active_children.pop(cancel_id, None)
+            if child_task and not child_task.done():
+                child_task.cancel()
+            # Mark as failed in DB
+            async with self.session_manager.session_factory() as db:
+                await set_session_status(
+                    db,
+                    cancel_id,
+                    "failed",
+                    completed_at=datetime.now(UTC),
+                    result_summary="Cancelled by parent session",
+                )
+                await db.commit()
+            return ToolResult(
+                output=json.dumps({"status": "cancelled", "session_id": cancel_id}),
+            )
+
+        return ToolResult(
+            output=json.dumps({"status": "error", "message": f"Unknown tool: {tc.name}"}),
+            is_error=True,
+        )
+
+    async def _handle_task_tool(self, tc: ToolCall, *, ctx: StepContext) -> ToolResult:
+        """Handle create_task, list_tasks, get_task, update_task, cancel_task."""
+        from cognis.store.queries import (
+            get_task,
+            list_tasks_for_agent,
+            update_task_fields,
+            update_task_status,
+        )
+
+        if tc.name == "create_task":
+            task_queue = getattr(self.session_manager, "_task_queue", None)
+            if task_queue is None:
+                # Try to get from app state via providers
+                task_queue = getattr(self.providers, "_task_queue", None)
+            if task_queue is None:
+                return ToolResult(
+                    output=json.dumps(
+                        {
+                            "status": "error",
+                            "message": "Task queue is not available.",
+                        }
+                    ),
+                    is_error=True,
+                )
+            try:
+                from cognis.models.task import TaskDelivery
+
+                task = await task_queue.submit(
+                    created_by=ctx.session.user_email,
+                    agent_id=tc.arguments.get("agent_id") or ctx.agent.agent_id,
+                    title=tc.arguments.get("title", "Untitled task"),
+                    description=tc.arguments.get("description", ""),
+                    priority=tc.arguments.get("priority", 0),
+                    source_type="agent",
+                    source_ref=ctx.conversation.conversation_id,
+                    delivery=TaskDelivery(mode="same_conversation"),
+                    workflow_id=tc.arguments.get("workflow_id"),
+                )
+                return ToolResult(
+                    output=json.dumps(
+                        {
+                            "status": "created",
+                            "task_id": task.task_id,
+                            "title": task.title,
+                            "message": "Task created and queued for execution.",
+                        }
+                    ),
+                )
+            except Exception as exc:
+                return ToolResult(
+                    output=json.dumps(
+                        {
+                            "status": "error",
+                            "message": f"Failed to create task: {exc}",
+                        }
+                    ),
+                    is_error=True,
+                )
+
+        elif tc.name == "list_tasks":
+            status_filter = tc.arguments.get("status", "all")
+            statuses = None if status_filter == "all" else [status_filter]
+            async with self.session_manager.session_factory() as db:
+                tasks = await list_tasks_for_agent(db, ctx.agent.agent_id, statuses=statuses)
+            items = []
+            for t in tasks:
+                items.append(
+                    {
+                        "task_id": t.task_id,
+                        "title": t.title,
+                        "status": t.status,
+                        "priority": t.priority,
+                        "workflow_id": t.workflow_id,
+                        "created_at": str(t.created_at) if t.created_at else None,
+                        "result_summary": t.result_summary,
+                    }
+                )
+            return ToolResult(
+                output=json.dumps({"tasks": items, "count": len(items)}, default=str),
+            )
+
+        elif tc.name == "get_task":
+            task_id = tc.arguments.get("task_id", "")
+            async with self.session_manager.session_factory() as db:
+                task_row = await get_task(db, task_id)
+            if task_row is None:
+                return ToolResult(
+                    output=json.dumps({"status": "error", "message": "Task not found."}),
+                    is_error=True,
+                )
+            # Verify agent access
+            if task_row.agent_id != ctx.agent.agent_id:
+                return ToolResult(
+                    output=json.dumps(
+                        {
+                            "status": "error",
+                            "message": "Task belongs to a different agent.",
+                        }
+                    ),
+                    is_error=True,
+                )
+            return ToolResult(
+                output=json.dumps(
+                    {
+                        "task_id": task_row.task_id,
+                        "title": task_row.title,
+                        "description": task_row.description,
+                        "status": task_row.status,
+                        "priority": task_row.priority,
+                        "workflow_id": task_row.workflow_id,
+                        "created_at": str(task_row.created_at) if task_row.created_at else None,
+                        "started_at": str(task_row.started_at) if task_row.started_at else None,
+                        "completed_at": str(task_row.completed_at)
+                        if task_row.completed_at
+                        else None,
+                        "result_summary": task_row.result_summary,
+                    },
+                    default=str,
+                ),
+            )
+
+        elif tc.name == "update_task":
+            task_id = tc.arguments.get("task_id", "")
+            async with self.session_manager.session_factory() as db:
+                task_row = await get_task(db, task_id)
+                if task_row is None:
+                    return ToolResult(
+                        output=json.dumps({"status": "error", "message": "Task not found."}),
+                        is_error=True,
+                    )
+                if task_row.agent_id != ctx.agent.agent_id:
+                    return ToolResult(
+                        output=json.dumps(
+                            {
+                                "status": "error",
+                                "message": "Task belongs to a different agent.",
+                            }
+                        ),
+                        is_error=True,
+                    )
+                if task_row.status not in ("draft", "queued"):
+                    return ToolResult(
+                        output=json.dumps(
+                            {
+                                "status": "error",
+                                "message": (
+                                    f"Cannot update task in '{task_row.status}' status. "
+                                    "Only draft or queued tasks can be updated."
+                                ),
+                            }
+                        ),
+                        is_error=True,
+                    )
+                ok = await update_task_fields(
+                    db,
+                    task_id,
+                    title=tc.arguments.get("title"),
+                    description=tc.arguments.get("description"),
+                    priority=tc.arguments.get("priority"),
+                    workflow_id=tc.arguments.get("workflow_id"),
+                )
+                await db.commit()
+            if ok:
+                return ToolResult(
+                    output=json.dumps({"status": "updated", "task_id": task_id}),
+                )
+            return ToolResult(
+                output=json.dumps(
+                    {
+                        "status": "error",
+                        "message": "No fields to update or update failed.",
+                    }
+                ),
+                is_error=True,
+            )
+
+        elif tc.name == "cancel_task":
+            task_id = tc.arguments.get("task_id", "")
+            async with self.session_manager.session_factory() as db:
+                task_row = await get_task(db, task_id)
+            if task_row is None:
+                return ToolResult(
+                    output=json.dumps({"status": "error", "message": "Task not found."}),
+                    is_error=True,
+                )
+            if task_row.agent_id != ctx.agent.agent_id:
+                return ToolResult(
+                    output=json.dumps(
+                        {
+                            "status": "error",
+                            "message": "Task belongs to a different agent.",
+                        }
+                    ),
+                    is_error=True,
+                )
+            if task_row.status in ("completed", "failed", "cancelled"):
+                return ToolResult(
+                    output=json.dumps(
+                        {
+                            "status": "error",
+                            "message": f"Task is already {task_row.status}.",
+                        }
+                    ),
+                    is_error=True,
+                )
+            # Use task queue cancel if available, otherwise direct DB update
+            task_queue = getattr(self.session_manager, "_task_queue", None)
+            if task_queue is None:
+                task_queue = getattr(self.providers, "_task_queue", None)
+            if task_queue is not None:
+                with contextlib.suppress(Exception):
+                    await task_queue.cancel_task(task_id)
+            else:
+                async with self.session_manager.session_factory() as db:
+                    await update_task_status(
+                        db,
+                        task_id,
+                        "cancelled",
+                        completed_at=datetime.now(UTC),
+                    )
+                    await db.commit()
+            return ToolResult(
+                output=json.dumps({"status": "cancelled", "task_id": task_id}),
+            )
+
+        return ToolResult(
+            output=json.dumps({"status": "error", "message": f"Unknown tool: {tc.name}"}),
+            is_error=True,
+        )
+
+    @staticmethod
+    def _get_incomplete_todos(ctx: StepContext) -> list[dict[str, Any]]:
+        """Return todos that are not done or cancelled."""
+        return [t for t in ctx.todos if t.get("status") not in ("done", "cancelled")]
+
     async def _finalize_step(
         self,
         ctx: StepContext,
@@ -1251,7 +1899,8 @@ class AgentLoop:
         if not events:
             return
 
-        idempotency_key = f"step_{ctx.session.session_id}_{uuid.uuid4().hex[:8]}"
+        intaris_id = ctx.session.intaris_session_id or ctx.session.session_id
+        idempotency_key = f"{intaris_id}:step_{uuid.uuid4().hex[:8]}"
 
         try:
             append_result = await self.providers.guardrails.record_events(
@@ -1406,9 +2055,11 @@ class AgentLoop:
 
     def _build_controller_tool_schemas(self, ctx: StepContext) -> list[dict[str, Any]]:
         """Build JSON schemas for controller-injected tools."""
+        from cognis.tools.builtin.orchestration import orchestration_tools
+
         tools: list[dict[str, Any]] = []
 
-        # step_complete — always available for run steps (except direct)
+        # step_complete — available for non-direct steps (sub-sessions, workflow steps)
         if not ctx.is_direct:
             tools.append(
                 {
@@ -1416,8 +2067,9 @@ class AgentLoop:
                     "function": {
                         "name": STEP_COMPLETE,
                         "description": (
-                            "Signal that this workflow step is complete. You MUST call this "
-                            "when the step objective is satisfied."
+                            "Signal that this step is complete. You MUST call this "
+                            "when the objective is satisfied. All todos must be "
+                            "completed or cancelled before calling this."
                         ),
                         "parameters": {
                             "type": "object",
@@ -1480,7 +2132,10 @@ class AgentLoop:
                     "type": "function",
                     "function": {
                         "name": STEP_TODO_WRITE,
-                        "description": "Track progress within this step. Survives compaction.",
+                        "description": (
+                            "Track progress within this step. Use status 'cancelled' "
+                            "to mark todos that are no longer needed."
+                        ),
                         "parameters": {
                             "type": "object",
                             "properties": {
@@ -1492,7 +2147,12 @@ class AgentLoop:
                                             "content": {"type": "string"},
                                             "status": {
                                                 "type": "string",
-                                                "enum": ["pending", "in_progress", "done"],
+                                                "enum": [
+                                                    "pending",
+                                                    "in_progress",
+                                                    "done",
+                                                    "cancelled",
+                                                ],
                                             },
                                         },
                                     },
@@ -1514,6 +2174,19 @@ class AgentLoop:
             ]
         )
 
+        # Orchestration tools — based on orchestration_mode
+        for tool_def in orchestration_tools(ctx.orchestration_mode):
+            tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool_def.name,
+                        "description": tool_def.description,
+                        "parameters": tool_def.parameters,
+                    },
+                }
+            )
+
         return tools
 
     def _get_executor_tool_schemas(self, ctx: StepContext) -> list[dict[str, Any]]:
@@ -1525,10 +2198,12 @@ class AgentLoop:
         if registry is None:
             return []
 
+        from cognis.tools.builtin.orchestration import ORCHESTRATION_TOOL_NAMES
+
         schemas: list[dict[str, Any]] = []
         for tool_def in registry.list_tools():
-            # Skip controller tools (handled separately)
-            if tool_def.name in CONTROLLER_TOOLS:
+            # Skip controller and orchestration tools (handled separately)
+            if tool_def.name in CONTROLLER_TOOLS or tool_def.name in ORCHESTRATION_TOOL_NAMES:
                 continue
             schemas.append(
                 {

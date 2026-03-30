@@ -750,29 +750,7 @@
                     <p class="mt-0.5 truncate text-xs text-slate-400">{agent?.display_name ?? agent?.name ?? conversation.agent_id}</p>
                   </div>
                 </a>
-              {/each}
-            {/if}
-
-            <!-- Non-web conversations -->
-            {#if grouped.other.length > 0}
-              <p class="px-1 pb-1 pt-3 text-[10px] font-semibold uppercase tracking-widest text-slate-500">Other channels</p>
-              {#each grouped.other as conversation}
-                {@const agent = conversationAgent(conversation)}
-                <a
-                  class={`flex items-start gap-3 rounded-2xl border px-3 py-2.5 opacity-70 transition ${conversation.conversation_id === currentConversation?.conversation_id ? 'border-sky-400/40 bg-sky-500/10 opacity-100' : 'border-transparent bg-slate-950/60 hover:border-slate-700 hover:bg-slate-900'}`}
-                  href={`/chat/${conversation.conversation_id}`}
-                  onclick={() => { mobileListOpen = false; }}
-                >
-                  <AgentAvatar name={agent?.display_name ?? agent?.name ?? conversation.agent_id} avatarUrl={agent?.avatar_url ?? null} class="h-8 w-8" />
-                  <div class="min-w-0 flex-1">
-                    <div class="flex items-center gap-1.5">
-                      <span class="text-xs text-slate-500" title="Non-web channel (read-only)">&#128274;</span>
-                      <p class="truncate text-sm font-medium text-slate-300">{conversationTitle(conversation)}</p>
-                    </div>
-                    <p class="mt-0.5 truncate text-xs text-slate-500">{agent?.display_name ?? agent?.name ?? conversation.agent_id}</p>
-                  </div>
-                </a>
-              {/each}
+            {/each}
             {/if}
           {/if}
 
@@ -897,27 +875,6 @@
           </div>
         {/if}
 
-        {#if turnInProgress}
-          <div class="rounded-2xl border border-sky-500/30 bg-sky-500/10 px-4 py-3 text-sm text-sky-100">
-            <div class="flex flex-wrap items-center justify-between gap-3">
-              <div class="flex items-center gap-3">
-                <span class="font-medium">Agent is working...</span>
-                {#if awaitingAssistantStart}
-                  <span class="inline-flex items-center gap-1 text-sky-100/80">
-                    <span class="h-2 w-2 animate-pulse rounded-full bg-sky-200"></span>
-                    <span class="h-2 w-2 animate-pulse rounded-full bg-sky-200 [animation-delay:120ms]"></span>
-                    <span class="h-2 w-2 animate-pulse rounded-full bg-sky-200 [animation-delay:240ms]"></span>
-                    <span>Thinking</span>
-                  </span>
-                {/if}
-              </div>
-              {#if currentConversation}
-                <Button size="sm" variant="secondary" onclick={() => currentConversation && wsClient.cancelTurn(currentConversation.conversation_id)}>Cancel turn</Button>
-              {/if}
-            </div>
-          </div>
-        {/if}
-
         {#if escalationError}
           <div class="rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
             <div class="flex flex-wrap items-center justify-between gap-3">
@@ -972,6 +929,16 @@
                 </article>
               {/if}
             {/each}
+          {/if}
+
+          {#if turnInProgress && awaitingAssistantStart}
+            <div class="flex items-center gap-3 px-2 py-2">
+              <div class="flex items-center gap-1.5 rounded-2xl border border-slate-800 bg-slate-900/80 px-4 py-2.5">
+                <span class="h-2 w-2 animate-bounce rounded-full bg-sky-400 [animation-delay:0ms]"></span>
+                <span class="h-2 w-2 animate-bounce rounded-full bg-sky-400 [animation-delay:150ms]"></span>
+                <span class="h-2 w-2 animate-bounce rounded-full bg-sky-400 [animation-delay:300ms]"></span>
+              </div>
+            </div>
           {/if}
         </div>
 

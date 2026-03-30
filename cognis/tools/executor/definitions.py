@@ -167,7 +167,7 @@ GLOB_TOOL = ToolDefinition(
         "required": ["pattern"],
     },
     source=_EXECUTOR_SOURCE,
-    category="search",
+    category="filesystem",
     read_only=True,
     timeout_seconds=30,
 )
@@ -188,7 +188,7 @@ GREP_TOOL = ToolDefinition(
         "required": ["pattern"],
     },
     source=_EXECUTOR_SOURCE,
-    category="search",
+    category="filesystem",
     read_only=True,
     timeout_seconds=30,
 )

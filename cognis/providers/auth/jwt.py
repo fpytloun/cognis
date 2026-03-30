@@ -52,7 +52,13 @@ class JWTAuthProvider:
 
     def sign_access_token(self, subject: str, name: str | None, role: str) -> str:
         return self._sign(
-            {"sub": subject, "name": name, "role": role, "aud": ["cognis"], "typ": "access"},
+            {
+                "sub": subject,
+                "name": name,
+                "role": role,
+                "aud": ["cognis", "intaris", "mnemory"],
+                "typ": "access",
+            },
             self.token_ttl_seconds,
         )
 

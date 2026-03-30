@@ -254,6 +254,7 @@ class WebSocketConnectionManager:
         self._by_user: dict[str, set[str]] = defaultdict(set)
         self._active_turns: dict[str, asyncio.Task[None]] = {}
         self._turn_controls: dict[str, asyncio.Event] = {}
+        self._turn_sessions: dict[str, str] = {}  # conversation_id → session_id
         self._queued_messages: dict[str, deque[QueuedMessage]] = defaultdict(deque)
         self._event_bus_registered = False
         self._register_event_bus_handler()
@@ -398,6 +399,7 @@ class WebSocketConnectionManager:
         control = asyncio.Event()
         conversation_id = conversation.conversation_id
         self._turn_controls[conversation_id] = control
+        self._turn_sessions[conversation_id] = session.session_id
         self._active_turns[conversation_id] = asyncio.create_task(
             self._run_turn(
                 conversation=conversation,
@@ -410,10 +412,21 @@ class WebSocketConnectionManager:
         )
 
     async def cancel_turn(self, conversation_id: str) -> bool:
+        """Cancel the active turn and all its child sub-sessions."""
         control = self._turn_controls.get(conversation_id)
         if control is None:
             return False
         control.set()
+        # Also cancel child sub-sessions via the agent loop
+        session_id = self._turn_sessions.get(conversation_id)
+        if session_id:
+            agent_loop = self.app.state.workflow_engine._agent_loop  # noqa: SLF001
+            cancelled = await agent_loop.cancel_children(session_id)
+            if cancelled:
+                logger.info(
+                    "cancel_turn: cancelled child sub-sessions",
+                    extra={"extra_data": {"count": cancelled, "session_id": session_id}},
+                )
         return True
 
     async def _run_turn(
@@ -653,6 +666,7 @@ class WebSocketConnectionManager:
         finally:
             self._active_turns.pop(conversation_id, None)
             self._turn_controls.pop(conversation_id, None)
+            self._turn_sessions.pop(conversation_id, None)
             queue = self._queued_messages.get(conversation_id)
             if queue:
                 queued = queue.popleft()

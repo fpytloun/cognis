@@ -171,6 +171,7 @@ class StepOutput(BaseModel):
     """What a step produces when the agent calls step_complete."""
 
     summary: str
+    content: str = ""  # Full assistant output (for delegation result delivery)
     outputs: dict[str, Any] = {}
     claims: list[str] = []
     completed_at: datetime | None = None

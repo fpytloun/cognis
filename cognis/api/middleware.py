@@ -58,6 +58,7 @@ class AuthenticationMiddleware(BaseHTTPMiddleware):
 
         authorization = request.headers.get("Authorization")
         api_key_header = request.headers.get("X-API-Key")
+        cookie_token = request.cookies.get("cognis_session")
 
         if authorization and authorization.startswith("Bearer "):
             token = authorization.removeprefix("Bearer ").strip()
@@ -154,6 +155,41 @@ class AuthenticationMiddleware(BaseHTTPMiddleware):
                     return await call_next(request)
                 finally:
                     current_user_email.reset(context_token)
+
+        # Fallback: check cognis_session cookie (cross-service SSO)
+        if cookie_token:
+            try:
+                claims = auth_provider.verify_jwt(cookie_token, audience=["cognis"])
+            except Exception:
+                return JSONResponse(
+                    status_code=401,
+                    content=ErrorResponse(
+                        error=ErrorBody(code="unauthorized", message="Invalid session cookie")
+                    ).model_dump(),
+                )
+            context_token = current_user_email.set(str(claims["sub"]))
+            request.state.user = AuthenticatedUser(
+                email=str(claims["sub"]),
+                role=str(claims.get("role", "user")),
+                name=claims.get("name"),
+                auth_type="cookie",
+            )
+            request.state.claims = claims
+            if api_rate_limiter is not None and not await api_rate_limiter.allow(
+                user_key=str(claims["sub"]),
+                path=request.url.path,
+                method=request.method,
+            ):
+                return JSONResponse(
+                    status_code=429,
+                    content=ErrorResponse(
+                        error=ErrorBody(code="rate_limited", message="API rate limit exceeded")
+                    ).model_dump(),
+                )
+            try:
+                return await call_next(request)
+            finally:
+                current_user_email.reset(context_token)
 
         return JSONResponse(
             status_code=401,

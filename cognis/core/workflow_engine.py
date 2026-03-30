@@ -130,6 +130,8 @@ class WorkflowEngine:
             agent=agent,
             user_email=session.user_email,
         )
+        from cognis.tools.builtin.orchestration import OrchestrationMode
+
         direct_step = StepDefinition(name="direct", type="run", prompt=user_message)
         ctx = StepContext(
             step_definition=direct_step,
@@ -143,6 +145,7 @@ class WorkflowEngine:
             tool_registry=tool_registry,
             executor_connection=executor_connection,
             cancel_event=cancel_event,
+            orchestration_mode=OrchestrationMode.FULL,
         )
 
         try:
@@ -416,7 +419,9 @@ class WorkflowEngine:
             user_email=task.created_by,
         )
 
-        # Build step context
+        from cognis.tools.builtin.orchestration import OrchestrationMode
+
+        # Build step context — task steps can delegate (sync only)
         ctx = StepContext(
             step_definition=step_def,
             session=session,
@@ -434,6 +439,7 @@ class WorkflowEngine:
             workflow_steps=workflow.steps,
             step_index=step_index,
             cancel_event=cancel_event,
+            orchestration_mode=OrchestrationMode.DELEGATE_SYNC_ONLY,
         )
 
         # Run agent loop
@@ -687,8 +693,9 @@ class WorkflowEngine:
                 return
 
             event = SessionEvent(
-                type="evaluation_feedback",
+                type="evaluation",
                 data={
+                    "event": "evaluation_feedback",
                     "attempt": attempt,
                     "decision": evaluation.decision,
                     "feedback": feedback_text,
@@ -787,15 +794,16 @@ class WorkflowEngine:
         if target_conversation_id is None:
             return
 
-        event_type = {
+        task_event = {
             TaskStatus.COMPLETED: "task_result",
             TaskStatus.FAILED: "task_failed",
             TaskStatus.CANCELLED: "task_cancelled",
         }.get(task.status, "task_status")
 
         event = SessionEvent(
-            type=event_type,
+            type="lifecycle",
             data={
+                "event": task_event,
                 "task_id": task.task_id,
                 "title": task.title,
                 "status": task.status,

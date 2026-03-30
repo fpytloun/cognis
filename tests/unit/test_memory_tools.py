@@ -249,7 +249,6 @@ class TestStaticToolDefinitionsComplete:
         assert "workflow" in categories
         assert "memory" in categories
         assert "filesystem" in categories
-        assert "search" in categories
         assert "shell" in categories
         assert "web" in categories
 

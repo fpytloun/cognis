@@ -83,9 +83,11 @@ function createMessageItem(
   };
 }
 
+let _noticeCounter = 0;
+
 function createNotice(title: string, description: string, tone: NoticeTimelineItem['tone'] = 'info'): NoticeTimelineItem {
   return {
-    id: `notice:${title}:${description}`,
+    id: `notice:${++_noticeCounter}:${title}`,
     kind: 'notice',
     title,
     description,
@@ -164,16 +166,22 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
           });
         }
       } else {
-        // Initial delegation event (started)
-        items.push({
-          id: itemId,
-          kind: 'delegation',
-          taskId: childSessionId,
-          taskLabel: taskDesc,
-          status: 'started',
-          result: null,
-          timestamp: event.timestamp
-        });
+        // Initial delegation event (started/running) — update existing or create new
+        const existingIdx = items.findIndex((i) => i.id === itemId && i.kind === 'delegation');
+        if (existingIdx >= 0) {
+          const existing = items[existingIdx] as DelegationTimelineItem;
+          items[existingIdx] = { ...existing, status: delegationStatus as DelegationTimelineItem['status'] };
+        } else {
+          items.push({
+            id: itemId,
+            kind: 'delegation',
+            taskId: childSessionId,
+            taskLabel: taskDesc,
+            status: 'started',
+            result: null,
+            timestamp: event.timestamp
+          });
+        }
       }
       continue;
     }
@@ -208,28 +216,46 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
     }
 
     if (event.type === 'task_result') {
-      items.push({
-        id: `delegation:${String(event.data.task_id ?? event.seq)}`,
+      const taskId = String(event.data.task_id ?? event.seq);
+      const itemId = `delegation:${taskId}`;
+      const existingIdx = items.findIndex((i) => i.id === itemId && i.kind === 'delegation');
+      const delegation: DelegationTimelineItem = {
+        id: itemId,
         kind: 'delegation',
         taskId: String(event.data.task_id ?? 'unknown-task'),
         taskLabel: String(event.data.task_title ?? event.data.task_id ?? 'Background task'),
         status: 'completed',
         result: typeof event.data.result_summary === 'string' ? event.data.result_summary : null,
         timestamp: event.timestamp
-      });
+      };
+      if (existingIdx >= 0) {
+        const existing = items[existingIdx] as DelegationTimelineItem;
+        items[existingIdx] = { ...existing, ...delegation, taskLabel: existing.taskLabel || delegation.taskLabel };
+      } else {
+        items.push(delegation);
+      }
       continue;
     }
 
     if (event.type === 'task_failed' || event.type === 'task_cancelled') {
-      items.push({
-        id: `delegation:${String(event.data.task_id ?? event.seq)}`,
+      const taskId = String(event.data.task_id ?? event.seq);
+      const itemId = `delegation:${taskId}`;
+      const existingIdx = items.findIndex((i) => i.id === itemId && i.kind === 'delegation');
+      const delegation: DelegationTimelineItem = {
+        id: itemId,
         kind: 'delegation',
         taskId: String(event.data.task_id ?? 'unknown-task'),
         taskLabel: String(event.data.task_title ?? event.data.task_id ?? 'Background task'),
         status: event.type === 'task_failed' ? 'failed' : 'cancelled',
         result: typeof event.data.result_summary === 'string' ? event.data.result_summary : null,
         timestamp: event.timestamp
-      });
+      };
+      if (existingIdx >= 0) {
+        const existing = items[existingIdx] as DelegationTimelineItem;
+        items[existingIdx] = { ...existing, ...delegation, taskLabel: existing.taskLabel || delegation.taskLabel };
+      } else {
+        items.push(delegation);
+      }
     }
   }
 

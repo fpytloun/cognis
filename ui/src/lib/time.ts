@@ -16,6 +16,15 @@ export function formatAbsoluteTime(value: string | null): string {
   return parsed.toLocaleString();
 }
 
+/** Format as "HH:MM" (24h). */
+export function formatShortTime(value: string | null): string {
+  const parsed = normalizeDate(value);
+  if (!parsed) {
+    return '';
+  }
+  return parsed.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+}
+
 export function formatRelativeTime(value: string | null, now = new Date()): string {
   const parsed = normalizeDate(value);
   if (!parsed) {
@@ -54,4 +63,14 @@ export function formatRelativeTime(value: string | null, now = new Date()): stri
 
   const diffYears = Math.round(diffMonths / 12);
   return relativeFormatter.format(diffYears, 'year');
+}
+
+/** Format as "20:34 · 3 min ago". Updates via the `now` parameter. */
+export function formatCompactTime(value: string | null, now = new Date()): string {
+  const short = formatShortTime(value);
+  if (!short) {
+    return 'just now';
+  }
+  const relative = formatRelativeTime(value, now);
+  return `${short} · ${relative}`;
 }

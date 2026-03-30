@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import asyncio
-
 import pytest
 
 from cognis.core.decision import DecisionEngine
@@ -9,11 +7,7 @@ from cognis.models.agent import AgentDefinition, AgentLLMConfig, AgentPermission
 
 
 class _LLM:
-    def __init__(self, delay: float = 0.0, payload: str | None = None) -> None:
-        self.delay = delay
-        self.payload = payload or (
-            '{"decision":"delegate","reason":"complex task","confidence":0.9,"predicted_tool_intensity":"high"}'
-        )
+    """Stub LLM for testing (not used by the rules-only decision engine)."""
 
     async def generate(
         self,
@@ -23,9 +17,7 @@ class _LLM:
         **kwargs: object,
     ) -> dict[str, object]:
         del messages, model, task_type, kwargs
-        if self.delay:
-            await asyncio.sleep(self.delay)
-        return {"choices": [{"message": {"content": self.payload}}]}
+        return {"choices": [{"message": {"content": "{}"}}]}
 
 
 def _agent(can_delegate: bool = True, max_depth: int = 5) -> AgentDefinition:
@@ -43,8 +35,6 @@ async def test_decision_engine_honors_explicit_inline_override() -> None:
     engine = DecisionEngine(
         llm=_LLM(),
         inline_max_length=200,
-        classifier_timeout_seconds=0.05,
-        classifier_fallback="inline",
         max_delegation_depth=5,
     )
 
@@ -55,12 +45,11 @@ async def test_decision_engine_honors_explicit_inline_override() -> None:
 
 
 @pytest.mark.asyncio
-async def test_decision_engine_uses_classifier_for_ambiguous_messages() -> None:
+async def test_decision_engine_defaults_ambiguous_to_inline() -> None:
+    """Ambiguous messages default to inline — the agent decides via tools."""
     engine = DecisionEngine(
         llm=_LLM(),
         inline_max_length=20,
-        classifier_timeout_seconds=0.1,
-        classifier_fallback="inline",
         max_delegation_depth=5,
     )
 
@@ -69,27 +58,28 @@ async def test_decision_engine_uses_classifier_for_ambiguous_messages() -> None:
         agent=_agent(),
     )
 
-    assert result.decision == "delegate"
-    assert result.predicted_tool_intensity == "high"
+    # No LLM classifier — ambiguous messages go inline by default
+    assert result.decision == "inline"
+    assert result.confidence == 0.9
+    assert result.degraded is False
 
 
 @pytest.mark.asyncio
-async def test_decision_engine_times_out_to_inline_fallback() -> None:
+async def test_decision_engine_explicit_delegate_prefix() -> None:
+    """Slash commands like /research trigger delegation."""
     engine = DecisionEngine(
-        llm=_LLM(delay=0.2),
-        inline_max_length=10,
-        classifier_timeout_seconds=0.01,
-        classifier_fallback="inline",
+        llm=_LLM(),
+        inline_max_length=200,
         max_delegation_depth=5,
     )
 
     result = await engine.decide(
-        user_message="This should require classification because it is too long.",
+        user_message="/research best practices for async Python",
         agent=_agent(),
     )
 
-    assert result.decision == "inline"
-    assert result.degraded is True
+    assert result.decision == "delegate"
+    assert result.override_source == "keyword"
 
 
 @pytest.mark.asyncio
@@ -97,8 +87,6 @@ async def test_decision_engine_blocks_delegation_when_depth_limit_reached() -> N
     engine = DecisionEngine(
         llm=_LLM(),
         inline_max_length=200,
-        classifier_timeout_seconds=0.05,
-        classifier_fallback="inline",
         max_delegation_depth=3,
     )
 
@@ -110,3 +98,18 @@ async def test_decision_engine_blocks_delegation_when_depth_limit_reached() -> N
 
     assert result.decision == "ask_user"
     assert "limit" in result.reason.lower()
+
+
+@pytest.mark.asyncio
+async def test_decision_engine_conversational_is_inline() -> None:
+    """Short conversational messages are always inline."""
+    engine = DecisionEngine(
+        llm=_LLM(),
+        inline_max_length=200,
+        max_delegation_depth=5,
+    )
+
+    result = await engine.decide(user_message="hello, how are you?", agent=_agent())
+
+    assert result.decision == "inline"
+    assert result.confidence == 0.85

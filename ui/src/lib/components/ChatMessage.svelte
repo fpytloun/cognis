@@ -1,8 +1,16 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import type { MessageTimelineItem } from '$lib/chat';
-  import { formatAbsoluteTime, formatRelativeTime } from '$lib/time';
+  import { formatAbsoluteTime, formatCompactTime } from '$lib/time';
 
   let { item } = $props<{ item: MessageTimelineItem }>();
+
+  let now = $state(new Date());
+
+  onMount(() => {
+    const interval = setInterval(() => { now = new Date(); }, 30_000);
+    return () => clearInterval(interval);
+  });
 
   function bubbleClass(): string {
     return item.role === 'user'
@@ -23,7 +31,7 @@
   <div class="mt-3 flex items-center justify-between gap-4 text-[11px] uppercase tracking-[0.2em] opacity-70">
     <div class="flex items-center gap-3">
       <span>{item.role}</span>
-      <span title={formatAbsoluteTime(item.timestamp)}>{formatRelativeTime(item.timestamp)}</span>
+      <span title={formatAbsoluteTime(item.timestamp)}>{formatCompactTime(item.timestamp, now)}</span>
     </div>
     {#if item.streaming}
       <span>streaming</span>

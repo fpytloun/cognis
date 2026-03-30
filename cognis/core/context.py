@@ -24,10 +24,8 @@ EVENT_TYPES_FOR_CONTEXT = [
     "tool_call",
     "tool_result",
     "delegation",
-    "task_result",
-    "task_failed",
-    "task_cancelled",
-    "evaluation_feedback",
+    "lifecycle",
+    "evaluation",
 ]
 
 
@@ -393,13 +391,16 @@ def events_to_messages(events: list[Any]) -> list[dict[str, Any]]:
             if status == "completed":
                 child_id = event_data.get("child_session_id", "unknown")
                 mode = event_data.get("mode", "delegate")
-                result = event_data.get("result_summary", "No result provided.")
+                # Prefer full content over summary for delegation results
+                result_content = event_data.get("result_content", "")
+                result_summary = event_data.get("result_summary", "No result provided.")
+                result_text = result_content if result_content else result_summary
                 messages.append(
                     {
                         "role": "system",
                         "content": (
                             f'<delegation_result session="{child_id}" mode="{mode}" status="completed">\n'
-                            f"{result}\n"
+                            f"{result_text}\n"
                             f"</delegation_result>"
                         ),
                     }
@@ -426,28 +427,42 @@ def events_to_messages(events: list[Any]) -> list[dict[str, Any]]:
                         "content": _format_delegation_status(event_data),
                     }
                 )
-        elif event_type in {"task_result", "task_failed", "task_cancelled"}:
-            messages.append(
-                {
-                    "role": "system",
-                    "content": _format_task_update(event_type, event_data),
-                }
-            )
-        elif event_type == "evaluation_feedback":
-            attempt = event_data.get("attempt", "?")
-            decision = event_data.get("decision", "revise")
-            feedback = event_data.get("feedback", "")
-            messages.append(
-                {
-                    "role": "system",
-                    "content": (
-                        f'<evaluation_feedback attempt="{attempt}">\n'
-                        f"Decision: {decision}\n"
-                        f"Feedback: {feedback}\n"
-                        f"</evaluation_feedback>"
-                    ),
-                }
-            )
+        elif event_type == "lifecycle":
+            lifecycle_event = event_data.get("event", "")
+            if lifecycle_event in {"task_result", "task_failed", "task_cancelled"}:
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": _format_task_update(lifecycle_event, event_data),
+                    }
+                )
+            elif lifecycle_event == "step_complete":
+                summary = event_data.get("summary", "")
+                if summary:
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": f"Step completed: {summary}",
+                        }
+                    )
+            # Other lifecycle events (task_status, etc.) are informational — skip
+        elif event_type == "evaluation":
+            eval_event = event_data.get("event", "")
+            if eval_event == "evaluation_feedback":
+                attempt = event_data.get("attempt", "?")
+                decision = event_data.get("decision", "revise")
+                feedback = event_data.get("feedback", "")
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            f'<evaluation_feedback attempt="{attempt}">\n'
+                            f"Decision: {decision}\n"
+                            f"Feedback: {feedback}\n"
+                            f"</evaluation_feedback>"
+                        ),
+                    }
+                )
     return messages
 
 
@@ -509,12 +524,12 @@ def _format_active_delegations(active_delegations: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def _format_task_update(event_type: str, data: dict[str, Any]) -> str:
+def _format_task_update(lifecycle_event: str, data: dict[str, Any]) -> str:
     title = data.get("title") or data.get("task_title") or data.get("task_id") or "Background task"
     result_summary = data.get("result_summary") or "No summary provided."
-    status = {
+    status = data.get("status") or {
         "task_result": "completed",
         "task_failed": "failed",
         "task_cancelled": "cancelled",
-    }.get(event_type, "updated")
+    }.get(lifecycle_event, "updated")
     return f"Task update: {title} {status}. Summary: {result_summary}"
