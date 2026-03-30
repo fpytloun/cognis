@@ -68,6 +68,23 @@ class _SlowExecutor(_Executor):
         return ToolResult(output="too slow")
 
 
+def _registry_with_result_limit(max_result_size: int = 20) -> ToolRegistry:
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="filesystem/read_file",
+                description="local",
+                parameters={"type": "object", "properties": {}},
+                source=ToolSource(type="local_mcp", server_name="filesystem"),
+                timeout_seconds=1,
+                max_result_size=max_result_size,
+            )
+        )
+    )
+    return registry
+
+
 def _registry() -> ToolRegistry:
     registry = ToolRegistry()
     registry.register(
@@ -182,13 +199,16 @@ async def test_tool_router_enforces_non_bypassable_guardrails() -> None:
 @pytest.mark.asyncio
 async def test_tool_router_truncates_and_wraps_local_results() -> None:
     router = ToolRouter(guardrails=_Guardrails(), non_bypassable_patterns=[])
-    executor = _Executor(result=ToolResult(output="x" * 100))
+    # Output exceeds max_result_size (20 chars) but middle-truncation has
+    # a minimum size of 500 chars.  Use a larger output and a larger limit
+    # to verify the middle-truncation path works.
+    executor = _Executor(result=ToolResult(output="x" * 2000))
 
     result = await router.execute(
         ToolCall(call_id="3", name="filesystem/read_file", arguments={}),
         _session(),
         _agent(),
-        _registry(),
+        _registry_with_result_limit(600),
         executor,
     )
 
@@ -197,7 +217,7 @@ async def test_tool_router_truncates_and_wraps_local_results() -> None:
     assert result.metadata["wrapped"] is True
     assert result.metadata["truncated"] is True
     assert result.metadata["evaluation"]["decision"] == "approve"
-    assert "[truncated:" in result.output
+    assert "middle truncated" in result.output
 
 
 @pytest.mark.asyncio

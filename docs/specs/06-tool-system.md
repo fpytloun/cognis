@@ -727,14 +727,48 @@ def _wrap_memory_context(self, recall: RecallResult) -> str:
 This is not a security boundary — the LLM can still be influenced — but it
 makes the trust level explicit in the prompt and enables future filtering.
 
-#### Layer 2: Output Size Limits (MVP)
+#### Layer 2: Output Size Limits and Context Management (MVP)
 
-Cap raw tool output before injection into context:
+Three-layer context management for tool outputs:
 
-- Default max tool result size: 50,000 characters (configurable per tool).
-- Truncate with notice: `"[truncated: {original_size} chars → {max_size}]"`.
-- Large outputs should be stored as artifacts (Mnemory) with a reference
-  injected into context instead of the full content.
+**2a. Per-tool truncation** at execution time:
+- Each executor tool applies its own output cap (shell: 50K, web_fetch: 500K,
+  read: 2K lines × 2K chars, grep: 200 files × 500 matches).
+- The tool router's `_sanitize_result()` applies **middle-truncation**
+  to `max_result_size` (default 50,000 chars): the head and tail of the
+  output are preserved, the middle is removed. The truncation marker
+  includes the `call_id` so the LLM can recover the full output via
+  `read_tool_output`.
+- Full output (after executor truncation, before context truncation) is
+  saved to the **ToolOutputStore** on the controller's local filesystem
+  (`{COGNIS_DATA_DIR}/tool-outputs/{call_id}.txt`) with TTL-based cleanup.
+
+**2b. Per-turn pruning** after each agent turn:
+- Walks backwards through tool result messages in the LLM context.
+- Protects the most recent ~40K tokens of tool outputs.
+- Replaces older tool results with:
+  `[Tool result cleared — use read_tool_output(call_id='...') to view]`
+- Also clears large tool call arguments (>1K chars serialized) in the
+  pruned zone.
+- This is a view-layer operation — Intaris events and the ToolOutputStore
+  are unaffected.
+
+**2c. Exploration tools** for recovering cleared/truncated output:
+- `read_tool_output(call_id, offset?, limit?)` — paginated line-by-line
+  read from the ToolOutputStore, similar to the file read tool.
+- `search_tool_output(call_id, pattern, context_lines?)` — regex search
+  with context lines, similar to grep.
+- These are controller-side built-in tools (read-only, no guardrails
+  evaluation needed).
+
+**Storage layers:**
+
+| Layer | Content | TTL | Purpose |
+|-------|---------|-----|---------|
+| LLM context | Middle-truncated + pruned | Current turn | What the LLM reasons over |
+| Intaris event | Middle-truncated preview (~50K) | Session lifetime | Compaction, audit, replay |
+| ToolOutputStore | Full executor output | 24h (configurable) | LLM exploration via tools |
+| WebSocket | Head-truncated (10KB) | Ephemeral | UI display |
 
 #### Layer 3: Post-Execution Content Evaluation (Phase 2)
 

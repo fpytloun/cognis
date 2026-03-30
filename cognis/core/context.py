@@ -500,9 +500,18 @@ def events_to_messages(events: list[Any]) -> list[dict[str, Any]]:
             if isinstance(content, str):
                 messages.append({"role": "assistant", "content": content})
         elif event_type == "tool_result":
-            output = event_data.get("output")
+            # The agent loop stores tool output under key "result";
+            # fall back to "output" for forward-compatibility.
+            output = event_data.get("result") or event_data.get("output")
+            call_id = event_data.get("call_id", "")
             if isinstance(output, str):
-                messages.append({"role": "system", "content": output})
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": output,
+                    }
+                )
         elif event_type == "tool_call":
             tool_name = event_data.get("tool_name") or event_data.get("name")
             if isinstance(tool_name, str):

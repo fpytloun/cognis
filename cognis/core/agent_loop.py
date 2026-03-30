@@ -23,6 +23,7 @@ from prometheus_client import Counter, Histogram
 
 from cognis.core.compaction import ROTATION_TOTAL
 from cognis.core.events import Event, EventBus, EventType
+from cognis.core.truncation import middle_truncate
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.session import ConversationModel, SessionEvent, SessionModel
@@ -89,12 +90,13 @@ ToolResultCallback = Callable[
 # Default limits
 DEFAULT_MAX_TOOL_CALLS = 50
 DEFAULT_STEP_TIMEOUT_SECONDS = 600  # 10 minutes
-_MAX_TOOL_DATA_BYTES = 10_240  # 10 KB truncation limit for tool args/results
+_MAX_TOOL_DATA_BYTES = 10_240  # 10 KB truncation limit for WS events
+_MAX_INTARIS_TOOL_RESULT = 50_000  # Intaris gets the middle-truncated preview
 _MAX_TODO_REPROMPTS = 3  # Max re-prompts for incomplete todos before force-completing
 
 
 def _truncate_tool_data(text: str) -> str:
-    """Truncate tool data to a bounded size for WS events and Intaris recording."""
+    """Truncate tool data to a bounded size for WS events."""
     if len(text) <= _MAX_TOOL_DATA_BYTES:
         return text
     return text[:_MAX_TOOL_DATA_BYTES] + f"\n... (truncated, {len(text)} bytes total)"
@@ -431,6 +433,7 @@ class AgentLoop:
         session_lock: SessionLock,
         pause_waiter: PauseWaiter,
         step_context_assembler: Any = None,
+        tool_output_store: Any = None,
     ) -> None:
         self.providers = providers
         self.session_manager = session_manager
@@ -443,6 +446,7 @@ class AgentLoop:
         self.session_lock = session_lock
         self.pause_waiter = pause_waiter
         self.step_context_assembler = step_context_assembler
+        self.tool_output_store = tool_output_store
         # Track active child sessions per parent session for /stop cancellation
         self._active_children: dict[str, dict[str, asyncio.Task[Any]]] = {}
         self._children_lock = asyncio.Lock()
@@ -1332,7 +1336,22 @@ class AgentLoop:
                         result, tc, ctx, events_to_record, on_tool_result
                     )
 
-                    truncated_output = _truncate_tool_data(result.output)
+                    # Save full output to the tool output store for later
+                    # exploration via read_tool_output / search_tool_output.
+                    # The raw output (before XML wrapping) is what we store.
+                    raw_output = result.metadata.get("_raw_output") if result.metadata else None
+                    if raw_output and self.tool_output_store is not None:
+                        await self.tool_output_store.save(tc.call_id, raw_output)
+
+                    # Intaris gets a middle-truncated preview (larger than
+                    # the WS preview) so compaction and audit have useful
+                    # context without bloating the event stream.
+                    intaris_preview, _ = middle_truncate(
+                        result.output, _MAX_INTARIS_TOOL_RESULT, call_id=tc.call_id
+                    )
+                    original_size = (
+                        result.metadata.get("original_size") if result.metadata else None
+                    )
                     events_to_record.append(
                         SessionEvent(
                             type="tool_result",
@@ -1341,16 +1360,19 @@ class AgentLoop:
                                 "name": tc.name,
                                 "is_error": result.is_error,
                                 "duration_ms": result.duration_ms,
-                                "result": truncated_output,
+                                "result": intaris_preview,
+                                "output_size": original_size or len(result.output),
+                                "has_full_output": raw_output is not None,
                             },
                         )
                     )
+                    ws_preview = _truncate_tool_data(result.output)
                     eval_meta = result.metadata.get("evaluation") if result.metadata else None
                     if on_tool_result:
                         await on_tool_result(
                             tc.call_id,
                             tc.name,
-                            truncated_output,
+                            ws_preview,
                             result.is_error,
                             result.duration_ms,
                             eval_meta,

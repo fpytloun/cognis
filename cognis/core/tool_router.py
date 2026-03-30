@@ -11,12 +11,14 @@ from typing import Any
 from prometheus_client import Counter
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from cognis.core.truncation import middle_truncate
 from cognis.models.agent import AgentDefinition
 from cognis.models.session import SessionModel
 from cognis.models.tool import Permission, ToolCall, ToolResult
 from cognis.store.queries import get_setting_value
 from cognis.tools.builtin.memory import handle_memory_tool, is_memory_tool
 from cognis.tools.builtin.orchestration import handle_delegate_tool_call, is_orchestration_tool
+from cognis.tools.builtin.tool_output import handle_tool_output_tool, is_tool_output_tool
 from cognis.tools.registry import ToolRegistry
 
 TOOL_ROUTE_DECISIONS = Counter(
@@ -36,6 +38,7 @@ class ToolRoute(StrEnum):
 
     ORCHESTRATION = "orchestration"
     MEMORY = "memory"
+    TOOL_OUTPUT = "tool_output"
     INTARIS_MCP = "intaris_mcp"
     LOCAL = "local"
     UNKNOWN = "unknown"
@@ -62,9 +65,11 @@ class ToolRouter:
         guardrails: Any,
         non_bypassable_patterns: list[str] | None = None,
         memory: Any | None = None,
+        tool_output_store: Any | None = None,
     ) -> None:
         self.guardrails = guardrails
         self.memory = memory
+        self.tool_output_store = tool_output_store
         self.non_bypassable_patterns = non_bypassable_patterns or []
 
     @classmethod
@@ -73,6 +78,7 @@ class ToolRouter:
         guardrails: Any,
         session_factory: async_sessionmaker[AsyncSession],
         memory: Any | None = None,
+        tool_output_store: Any | None = None,
     ) -> ToolRouter:
         """Create a router with cached non-bypassable patterns from settings."""
 
@@ -82,6 +88,7 @@ class ToolRouter:
             guardrails=guardrails,
             non_bypassable_patterns=_coerce_patterns(patterns),
             memory=memory,
+            tool_output_store=tool_output_store,
         )
 
     def classify(self, tool_name: str, registry: ToolRegistry) -> ToolRoute:
@@ -91,6 +98,8 @@ class ToolRouter:
             return ToolRoute.ORCHESTRATION
         if is_memory_tool(tool_name):
             return ToolRoute.MEMORY
+        if is_tool_output_tool(tool_name):
+            return ToolRoute.TOOL_OUTPUT
         registered_tool = registry.get(tool_name)
         if registered_tool is None:
             return ToolRoute.UNKNOWN
@@ -165,17 +174,21 @@ class ToolRouter:
     ) -> ToolResult:
         """Execute a tool call using the appropriate route."""
 
+        cid = tool_call.call_id
         route = self.classify(tool_call.name, registry)
         TOOL_ROUTE_DECISIONS.labels(route=str(route)).inc()
         if route is ToolRoute.UNKNOWN:
             TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome="unknown").inc()
             return self._sanitize_result(
-                tool_call.name, ToolResult(output="Unknown tool.", is_error=True), 50_000
+                tool_call.name,
+                ToolResult(output="Unknown tool.", is_error=True),
+                50_000,
+                call_id=cid,
             )
         if route is ToolRoute.ORCHESTRATION:
             result, _child = await handle_delegate_tool_call(tool_call)
             TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome="success").inc()
-            return self._sanitize_result(tool_call.name, result, 50_000)
+            return self._sanitize_result(tool_call.name, result, 50_000, call_id=cid)
         if route is ToolRoute.MEMORY:
             if self.memory is None:
                 result = ToolResult(output="Memory provider not available.", is_error=True)
@@ -191,14 +204,29 @@ class ToolRouter:
                 )
             outcome = "success" if not result.is_error else "failure"
             TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome=outcome).inc()
-            return self._sanitize_result(tool_call.name, result, 50_000)
+            return self._sanitize_result(tool_call.name, result, 50_000, call_id=cid)
+        if route is ToolRoute.TOOL_OUTPUT:
+            if self.tool_output_store is None:
+                result = ToolResult(output="Tool output store not available.", is_error=True)
+            else:
+                result = await handle_tool_output_tool(
+                    tool_name=tool_call.name,
+                    arguments=dict(tool_call.arguments),
+                    store=self.tool_output_store,
+                )
+            outcome = "success" if not result.is_error else "failure"
+            TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome=outcome).inc()
+            return self._sanitize_result(tool_call.name, result, 50_000, call_id=cid)
         if route is ToolRoute.INTARIS_MCP:
             result = await self._call_intaris_mcp(tool_call, session, registry)
             TOOL_ROUTE_OUTCOMES.labels(
                 route=str(route), outcome="success" if not result.is_error else "failure"
             ).inc()
             return self._sanitize_result(
-                tool_call.name, result, _tool_max_size(registry, tool_call.name)
+                tool_call.name,
+                result,
+                _tool_max_size(registry, tool_call.name),
+                call_id=cid,
             )
 
         decision = await self.evaluate_tool_call(tool_call, agent, session, registry)
@@ -219,7 +247,10 @@ class ToolRouter:
                 metadata={"evaluation": eval_meta},
             )
             return self._sanitize_result(
-                tool_call.name, denied_result, _tool_max_size(registry, tool_call.name)
+                tool_call.name,
+                denied_result,
+                _tool_max_size(registry, tool_call.name),
+                call_id=cid,
             )
         if decision.decision == "escalate":
             TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome="escalated").inc()
@@ -229,7 +260,10 @@ class ToolRouter:
                 metadata={"evaluation": eval_meta},
             )
             return self._sanitize_result(
-                tool_call.name, escalated_result, _tool_max_size(registry, tool_call.name)
+                tool_call.name,
+                escalated_result,
+                _tool_max_size(registry, tool_call.name),
+                call_id=cid,
             )
 
         registered_tool = registry.get(tool_call.name)
@@ -252,6 +286,7 @@ class ToolRouter:
                 tool_call.name,
                 result,
                 registered_tool.definition.max_result_size,
+                call_id=cid,
             )
         # Attach evaluation metadata to the result
         if result.metadata is None:
@@ -267,6 +302,7 @@ class ToolRouter:
             tool_call.name,
             result,
             registered_tool.definition.max_result_size,
+            call_id=cid,
         )
 
     def _is_non_bypassable(self, tool_name: str, explicit_flag: bool) -> bool:
@@ -294,14 +330,24 @@ class ToolRouter:
             return result
         return ToolResult.model_validate(result)
 
-    def _sanitize_result(self, tool_name: str, result: ToolResult, max_size: int) -> ToolResult:
-        output = result.output
-        if len(output) > max_size:
-            output = f"{output[:max_size]}\n[truncated: {len(result.output)} chars -> {max_size}]"
+    def _sanitize_result(
+        self,
+        tool_name: str,
+        result: ToolResult,
+        max_size: int,
+        *,
+        call_id: str | None = None,
+    ) -> ToolResult:
+        raw_output = result.output
+        output, was_truncated = middle_truncate(raw_output, max_size, call_id=call_id)
         wrapped = f'<tool_result name="{tool_name}" trust="untrusted">\n{output}\n</tool_result>'
         metadata = dict(result.metadata or {})
         metadata["wrapped"] = True
-        metadata["truncated"] = len(result.output) > max_size
+        metadata["truncated"] = was_truncated
+        metadata["original_size"] = len(raw_output)
+        # Preserve raw output for the ToolOutputStore (before wrapping/truncation).
+        # The agent loop reads this to save the full output to disk.
+        metadata["_raw_output"] = raw_output
         return result.model_copy(update={"output": wrapped, "metadata": metadata})
 
 

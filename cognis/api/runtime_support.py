@@ -14,6 +14,7 @@ from cognis.providers.executor.in_process import InProcessExecutorConnection
 from cognis.tools.builtin.memory import memory_tools
 from cognis.tools.builtin.orchestration import orchestration_tools
 from cognis.tools.builtin.system import build_system_tool_handlers, system_tools
+from cognis.tools.builtin.tool_output import tool_output_tools
 from cognis.tools.builtin.workflow import workflow_tools
 from cognis.tools.executor.definitions import executor_tool_definitions, executor_tool_handlers
 from cognis.tools.registry import RegisteredTool, ToolRegistry
@@ -41,6 +42,7 @@ def static_tool_definitions() -> list[ToolDefinition]:
         *orchestration_tools(),
         *workflow_tools(),
         *memory_tools(),
+        *tool_output_tools(),
         *executor_tool_definitions(),
     ]
 

@@ -256,8 +256,8 @@ class TestStaticToolDefinitionsComplete:
         from cognis.api.runtime_support import static_tool_definitions
 
         defs = static_tool_definitions()
-        # 2 system + 9 orchestration + 4 workflow + 14 memory + 10 executor = 39
-        assert len(defs) == 39
+        # 2 system + 9 orchestration + 4 workflow + 14 memory + 2 tool_output + 10 executor = 41
+        assert len(defs) == 41
 
 
 class TestToolRouterMemoryClassification:

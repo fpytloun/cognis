@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
 from time import monotonic
 from typing import Any
 
@@ -19,14 +18,6 @@ CACHE_HITS = Counter("cognis_session_cache_hits_total", "Session cache hits")
 CACHE_MISSES = Counter("cognis_session_cache_misses_total", "Session cache misses")
 CACHE_EVICTIONS = Counter("cognis_session_cache_evictions_total", "Session cache evictions")
 CACHE_SIZE = Gauge("cognis_session_cache_size", "Session cache entry count")
-
-_NEW_SESSION_STREAM_GRACE = timedelta(seconds=30)
-
-
-def _normalize_utc(value: datetime) -> datetime:
-    if value.tzinfo is None:
-        return value.replace(tzinfo=UTC)
-    return value
 
 
 @dataclass(slots=True)
@@ -262,16 +253,16 @@ class SessionCache:
             return entry
 
     async def _cold_load(self, entry: CachedSessionState, session: SessionModel) -> None:
-        allow_missing_stream = False
-        if session.started_at is not None:
-            allow_missing_stream = (
-                datetime.now(UTC) - _normalize_utc(session.started_at) <= _NEW_SESSION_STREAM_GRACE
-            )
-
+        # Always allow missing streams on cold load.  A 404 from Intaris
+        # simply means the session has no recorded events (e.g. pre-Intaris
+        # sessions, failed create_session calls, or very new sessions whose
+        # stream hasn't been created yet).  The cache initialises as empty
+        # and callers degrade gracefully (compaction returns noop, context
+        # assembly works with no history).
         event_read = await self.guardrails.read_events(
             session_id=entry.intaris_session_id,
             after_seq=0,
-            allow_missing_stream=allow_missing_stream,
+            allow_missing_stream=True,
         )
         self._apply_intaris_events(entry, event_read.events)
         entry.last_event_seq = event_read.last_seq
