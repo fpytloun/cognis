@@ -12,7 +12,7 @@ from cognis.models.config import ProviderHealth
 from cognis.models.session import EventAppendResult, EventReadResult, IntarisSession, SessionEvent
 from cognis.models.tool import EscalationRecord, EvaluationResult, ToolResult
 from cognis.providers.circuit_breaker import CircuitBreaker
-from cognis.runtime_context import current_user_email
+from cognis.runtime_context import current_agent_id, current_user_email
 
 logger = get_logger(__name__)
 
@@ -31,9 +31,12 @@ class IntarisProvider:
 
     def _headers(self, agent_id: str = "system", user_email: str | None = None) -> dict[str, str]:
         subject = user_email or current_user_email.get() or self.user_email
+        resolved_agent_id = (
+            agent_id if agent_id != "system" else (current_agent_id.get() or "system")
+        )
         return {
-            "Authorization": f"Bearer {self.auth_provider.sign_service_jwt(subject, agent_id, ['intaris'])}",
-            "X-Agent-Id": agent_id,
+            "Authorization": f"Bearer {self.auth_provider.sign_service_jwt(subject, resolved_agent_id, ['intaris'])}",
+            "X-Agent-Id": resolved_agent_id,
         }
 
     async def create_session(

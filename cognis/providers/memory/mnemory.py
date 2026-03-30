@@ -11,7 +11,7 @@ from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.config import ProviderHealth
 from cognis.providers.circuit_breaker import CircuitBreaker
-from cognis.runtime_context import current_user_email
+from cognis.runtime_context import current_agent_id, current_user_email
 
 logger = get_logger(__name__)
 
@@ -32,11 +32,12 @@ class MnemoryProvider:
         self, agent_id: str | None = None, user_email: str | None = None
     ) -> dict[str, str]:
         subject = user_email or current_user_email.get() or self.user_email
+        resolved_agent_id = agent_id or current_agent_id.get()
         headers = {
-            "Authorization": f"Bearer {self.auth_provider.sign_service_jwt(subject, agent_id or 'system', ['mnemory'])}",
+            "Authorization": f"Bearer {self.auth_provider.sign_service_jwt(subject, resolved_agent_id or 'system', ['mnemory'])}",
         }
-        if agent_id is not None:
-            headers["X-Agent-Id"] = agent_id
+        if resolved_agent_id is not None:
+            headers["X-Agent-Id"] = resolved_agent_id
         return headers
 
     async def recall(
