@@ -22,6 +22,7 @@ from cognis.core.workflow_registry import WorkflowRegistry
 from cognis.logging import get_logger
 from cognis.models.task import TaskDelivery, TaskModel, TaskStatus
 from cognis.models.workflow import WorkflowState
+from cognis.runtime_context import scoped_runtime_context
 from cognis.store.queries import (
     count_active_steps,
     create_task,
@@ -563,90 +564,99 @@ class TaskQueue:
         self._launch_task_run(task)
 
     async def _run_task(self, task: TaskModel) -> None:
-        """Execute a task's workflow."""
+        """Execute a task's workflow.
+
+        Runs inside ``scoped_runtime_context`` so that all downstream
+        Intaris calls (event recording, evaluation, delivery) use the
+        correct user identity instead of the default ``system@example.com``.
+        """
         cancel_event = self._run_controls.setdefault(task.task_id, asyncio.Event())
-        try:
-            # Resolve workflow
-            workflow_id = task.workflow_id or "system:direct"
-            workflow = await self._workflow_registry.get(workflow_id)
-            if workflow is None:
-                logger.warning(
-                    "Unknown workflow for task",
-                    extra={"extra_data": {"task_id": task.task_id, "workflow_id": workflow_id}},
+        with scoped_runtime_context(
+            user_email=task.created_by,
+            agent_id=task.agent_id,
+        ):
+            try:
+                # Resolve workflow
+                workflow_id = task.workflow_id or "system:direct"
+                workflow = await self._workflow_registry.get(workflow_id)
+                if workflow is None:
+                    logger.warning(
+                        "Unknown workflow for task",
+                        extra={"extra_data": {"task_id": task.task_id, "workflow_id": workflow_id}},
+                    )
+                    async with self._session_factory() as db_session:
+                        await update_task_status(
+                            db_session,
+                            task.task_id,
+                            "failed",
+                            result_summary=f"Unknown workflow: {workflow_id}",
+                            completed_at=datetime.now(UTC),
+                        )
+                        await db_session.commit()
+                    return
+
+                # Initialize workflow state
+                task.workflow_state = task.workflow_state or WorkflowState()
+                async with self._session_factory() as db_session:
+                    await update_task_workflow_state(
+                        db_session,
+                        task.task_id,
+                        task.workflow_state.model_dump(mode="json"),
+                    )
+                    await db_session.commit()
+
+                # Execute
+                result = await self._workflow_engine.execute_workflow(
+                    task,
+                    workflow,
+                    cancel_event=cancel_event,
+                )
+
+                # Resolve dependencies
+                if result.status == TaskStatus.COMPLETED:
+                    await self.resolve_dependencies(result.task_id)
+
+            except asyncio.CancelledError:
+                logger.info(
+                    "Task execution cancelled",
+                    extra={"extra_data": {"task_id": task.task_id}},
+                )
+                async with self._session_factory() as db_session:
+                    task_row = await get_task(db_session, task.task_id)
+                    current_status = str(task_row.status) if task_row is not None else "failed"
+                    step_run_status = {
+                        "cancelled": "cancelled",
+                        "paused": "paused",
+                        "queued": "failed",
+                        "running": "failed",
+                    }.get(current_status, "failed")
+                    await fail_running_step_runs_for_task(
+                        db_session,
+                        task.task_id,
+                        datetime.now(UTC),
+                        final_status=step_run_status,
+                    )
+                    await db_session.commit()
+            except Exception:
+                logger.exception(
+                    "Task execution failed",
+                    extra={"extra_data": {"task_id": task.task_id}},
                 )
                 async with self._session_factory() as db_session:
                     await update_task_status(
                         db_session,
                         task.task_id,
                         "failed",
-                        result_summary=f"Unknown workflow: {workflow_id}",
                         completed_at=datetime.now(UTC),
                     )
                     await db_session.commit()
-                return
-
-            # Initialize workflow state
-            task.workflow_state = task.workflow_state or WorkflowState()
-            async with self._session_factory() as db_session:
-                await update_task_workflow_state(
-                    db_session,
-                    task.task_id,
-                    task.workflow_state.model_dump(mode="json"),
-                )
-                await db_session.commit()
-
-            # Execute
-            result = await self._workflow_engine.execute_workflow(
-                task,
-                workflow,
-                cancel_event=cancel_event,
-            )
-
-            # Resolve dependencies
-            if result.status == TaskStatus.COMPLETED:
-                await self.resolve_dependencies(result.task_id)
-
-        except asyncio.CancelledError:
-            logger.info(
-                "Task execution cancelled",
-                extra={"extra_data": {"task_id": task.task_id}},
-            )
-            async with self._session_factory() as db_session:
-                task_row = await get_task(db_session, task.task_id)
-                current_status = str(task_row.status) if task_row is not None else "failed"
-                step_run_status = {
-                    "cancelled": "cancelled",
-                    "paused": "paused",
-                    "queued": "failed",
-                    "running": "failed",
-                }.get(current_status, "failed")
-                await fail_running_step_runs_for_task(
-                    db_session,
-                    task.task_id,
-                    datetime.now(UTC),
-                    final_status=step_run_status,
-                )
-                await db_session.commit()
-        except Exception:
-            logger.exception(
-                "Task execution failed",
-                extra={"extra_data": {"task_id": task.task_id}},
-            )
-            async with self._session_factory() as db_session:
-                await update_task_status(
-                    db_session,
-                    task.task_id,
-                    "failed",
-                    completed_at=datetime.now(UTC),
-                )
-                await db_session.commit()
-        finally:
-            self._active_runs.pop(task.task_id, None)
-            self._run_controls.pop(task.task_id, None)
-            # Update queue depth metric
-            async with self._session_factory() as db_session:
-                queued = await list_tasks_by_status(db_session, ["queued", "ready"])
-            QUEUE_DEPTH.labels(queue="default").set(len(queued))
+            finally:
+                self._active_runs.pop(task.task_id, None)
+                self._run_controls.pop(task.task_id, None)
+                # Update queue depth metric
+                async with self._session_factory() as db_session:
+                    queued = await list_tasks_by_status(db_session, ["queued", "ready"])
+                QUEUE_DEPTH.labels(queue="default").set(len(queued))
 
     async def _has_capacity(self, agent_id: str | None = None) -> bool:
         """Check if there's capacity to run another step.

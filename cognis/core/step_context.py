@@ -251,13 +251,34 @@ class StepContextAssembler:
             if cache_entry is not None and cache_entry.initialized:
                 return events_to_messages(cache_entry.events)
 
-        # Cache miss — direct Intaris read
+        # Cache miss — direct Intaris read.
+        # Use allow_missing_stream so a source step whose events were never
+        # persisted (e.g. identity mismatch before the runtime-context fix)
+        # degrades to an empty list instead of crashing with a 404.
         CACHE_BYPASS_DIRECT_READ.inc()
-        event_read = await self.guardrails.read_events(
-            session_id=intaris_session_id,
-            after_seq=0,
-        )
-        return events_to_messages(event_read.events)
+        try:
+            event_read = await self.guardrails.read_events(
+                session_id=intaris_session_id,
+                after_seq=0,
+                allow_missing_stream=True,
+            )
+            if not event_read.events:
+                logger.warning(
+                    "step context: source step has no events in Intaris",
+                    extra={
+                        "extra_data": {"source_step": source_name, "session_id": intaris_session_id}
+                    },
+                )
+            return events_to_messages(event_read.events)
+        except Exception:
+            logger.warning(
+                "step context: failed to load source step events",
+                extra={
+                    "extra_data": {"source_step": source_name, "session_id": intaris_session_id}
+                },
+                exc_info=True,
+            )
+            return []
 
     # ------------------------------------------------------------------
     # summary

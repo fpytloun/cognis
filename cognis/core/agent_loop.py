@@ -2254,19 +2254,30 @@ class AgentLoop:
                 source="cognis",
                 idempotency_key=idempotency_key,
             )
-            # Update session cache with recorded events
-            await self.session_cache.append_recorded_events(ctx.session, events, append_result)
-            events_recorded = True
-            logger.info(
-                "agent: events recorded",
-                extra={
-                    "extra_data": {
-                        "session_id": ctx.session.session_id,
-                        "event_count": len(events),
-                        "last_seq": append_result.last_seq,
-                    }
-                },
-            )
+            if append_result.ok:
+                # Update session cache with recorded events
+                await self.session_cache.append_recorded_events(ctx.session, events, append_result)
+                events_recorded = True
+                logger.info(
+                    "agent: events recorded",
+                    extra={
+                        "extra_data": {
+                            "session_id": ctx.session.session_id,
+                            "event_count": len(events),
+                            "last_seq": append_result.last_seq,
+                        }
+                    },
+                )
+            else:
+                logger.warning(
+                    "agent: record_events returned ok=False, events not persisted",
+                    extra={
+                        "extra_data": {
+                            "session_id": ctx.session.session_id,
+                            "event_count": len(events),
+                        }
+                    },
+                )
         except Exception:
             logger.exception(
                 "agent: failed to record events to Intaris",

@@ -14,26 +14,31 @@
   import { TASK_BOARD_COLUMNS, boardColumnForStatus, matchesTaskFilters, sortTasks, type TaskFilterState, type TaskBoardColumnId } from '$lib/tasks';
   import type { Agent, Conversation, Task, Workflow } from '$lib/types/api';
 
-  let loading = true;
-  let creating = false;
-  let error = '';
-  let tasks: Task[] = [];
-  let agents: Agent[] = [];
-  let workflows: Workflow[] = [];
-  let conversations: Conversation[] = [];
-  let selectedDraftIds: string[] = [];
-  let dragState: { taskId: string; column: TaskBoardColumnId } | null = null;
+  // ---------------------------------------------------------------------------
+  // Reactive state (Svelte 5 runes)
+  // ---------------------------------------------------------------------------
+
+  let loading = $state(true);
+  let creating = $state(false);
+  let error = $state('');
+  let tasks = $state<Task[]>([]);
+  let agents = $state<Agent[]>([]);
+  let workflows = $state<Workflow[]>([]);
+  let conversations = $state<Conversation[]>([]);
+  let selectedDraftIds = $state<string[]>([]);
+  let dragState = $state<{ taskId: string; column: TaskBoardColumnId } | null>(null);
+  let dropTargetColumn = $state<TaskBoardColumnId | null>(null);
   let pollTimer: number | null = null;
   let visibilityHandler: (() => void) | null = null;
 
-  let filters: TaskFilterState = {
+  let filters = $state<TaskFilterState>({
     search: '',
     agentId: '',
     workflowId: '',
     status: ''
-  };
+  });
 
-  let draftForm = {
+  let draftForm = $state({
     title: '',
     description: '',
     agent_id: '',
@@ -41,7 +46,40 @@
     priority: 0,
     delivery_mode: 'same_conversation',
     delivery_target: ''
+  });
+
+  // ---------------------------------------------------------------------------
+  // Derived state
+  // ---------------------------------------------------------------------------
+
+  let filtersActive = $derived(Boolean(filters.search || filters.agentId || filters.workflowId || filters.status));
+
+  let filteredTasks = $derived(sortTasks(tasks.filter((task) => matchesTaskFilters(task, filters))));
+
+  // ---------------------------------------------------------------------------
+  // Valid cross-column drag transitions
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Maps `sourceColumn->targetColumn` to the API action to execute.
+   * Missing entries mean the transition is not allowed.
+   */
+  const DRAG_TRANSITIONS: Record<string, 'submit' | 'pause' | 'resume' | 'cancel'> = {
+    'draft->queued': 'submit',
+    'running->paused': 'pause',
+    'paused->queued': 'resume',
+    // Any column -> done is cancel (handled separately below)
   };
+
+  function isDragTransitionValid(source: TaskBoardColumnId, target: TaskBoardColumnId): boolean {
+    if (source === target) return true; // reorder within column
+    if (target === 'done') return source !== 'done';
+    return `${source}->${target}` in DRAG_TRANSITIONS;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Helpers
+  // ---------------------------------------------------------------------------
 
   function isLlmUnavailableForSetup(): boolean {
     const llmDetails = JSON.stringify($workspaceHealth.health?.providers?.llm ?? {}).toLowerCase();
@@ -55,21 +93,17 @@
     return workflows.find((workflow) => workflow.workflow_id === workflowId)?.name ?? workflowId;
   }
 
-  function filtersActive(): boolean {
-    return Boolean(filters.search || filters.agentId || filters.workflowId || filters.status);
-  }
-
-  function filteredTasks(): Task[] {
-    return sortTasks(tasks.filter((task) => matchesTaskFilters(task, filters)));
-  }
-
   function tasksForColumn(columnId: TaskBoardColumnId): Task[] {
-    return filteredTasks().filter((task) => boardColumnForStatus(task.status) === columnId);
+    return filteredTasks.filter((task) => boardColumnForStatus(task.status) === columnId);
   }
 
   function defaultAgentId(): string {
     return agents.find((agent) => agent.status === 'active')?.agent_id ?? agents[0]?.agent_id ?? '';
   }
+
+  // ---------------------------------------------------------------------------
+  // Data loading
+  // ---------------------------------------------------------------------------
 
   async function loadBoardData(): Promise<void> {
     loading = true;
@@ -118,6 +152,10 @@
     }, 15000);
   }
 
+  // ---------------------------------------------------------------------------
+  // Task actions
+  // ---------------------------------------------------------------------------
+
   async function createDraftTask(): Promise<void> {
     if (!draftForm.title.trim()) {
       error = 'Task title is required.';
@@ -140,12 +178,9 @@
         delivery_target: draftForm.delivery_mode === 'specific_conversation' ? draftForm.delivery_target : null,
         status: 'draft'
       });
-      draftForm = {
-        ...draftForm,
-        title: '',
-        description: '',
-        delivery_target: ''
-      };
+      draftForm.title = '';
+      draftForm.description = '';
+      draftForm.delivery_target = '';
       await refreshTasksOnly();
       addToast('Draft task created.', 'success');
     } catch (caughtError) {
@@ -157,9 +192,11 @@
   }
 
   function toggleDraftSelection(taskId: string): void {
-    selectedDraftIds = selectedDraftIds.includes(taskId)
-      ? selectedDraftIds.filter((value) => value !== taskId)
-      : [...selectedDraftIds, taskId];
+    if (selectedDraftIds.includes(taskId)) {
+      selectedDraftIds = selectedDraftIds.filter((value) => value !== taskId);
+    } else {
+      selectedDraftIds = [...selectedDraftIds, taskId];
+    }
   }
 
   async function batchSubmit(): Promise<void> {
@@ -206,14 +243,46 @@
     }
   }
 
-  async function reorderWithinColumn(targetTaskId: string, columnId: TaskBoardColumnId, sourceTaskId = dragState?.taskId ?? ''): Promise<void> {
-    if (filtersActive()) {
-      dragState = null;
+  // ---------------------------------------------------------------------------
+  // Drag-and-drop
+  // ---------------------------------------------------------------------------
+
+  async function handleColumnDrop(targetColumnId: TaskBoardColumnId, targetTaskId?: string): Promise<void> {
+    dropTargetColumn = null;
+    if (!dragState) return;
+
+    const { taskId: sourceTaskId, column: sourceColumnId } = dragState;
+    dragState = null;
+
+    if (sourceColumnId === targetColumnId && targetTaskId) {
+      // Reorder within same column
+      await reorderWithinColumn(targetTaskId, targetColumnId, sourceTaskId);
+      return;
+    }
+
+    if (sourceColumnId === targetColumnId) return; // dropped on same column container — noop
+
+    // Cross-column transition
+    if (targetColumnId === 'done') {
+      await changeTaskState(sourceTaskId, 'cancel');
+      return;
+    }
+
+    const key = `${sourceColumnId}->${targetColumnId}`;
+    const action = DRAG_TRANSITIONS[key];
+    if (action) {
+      await changeTaskState(sourceTaskId, action);
+    } else {
+      addToast(`Cannot move task from "${sourceColumnId}" to "${targetColumnId}".`, 'error', 3_000);
+    }
+  }
+
+  async function reorderWithinColumn(targetTaskId: string, columnId: TaskBoardColumnId, sourceTaskId: string): Promise<void> {
+    if (filtersActive) {
       error = 'Clear active filters before reordering priorities.';
       return;
     }
-    if (!sourceTaskId || (dragState && dragState.column !== columnId) || sourceTaskId === targetTaskId) {
-      dragState = null;
+    if (!sourceTaskId || sourceTaskId === targetTaskId) {
       return;
     }
 
@@ -222,7 +291,6 @@
     const sourceIndex = columnTasks.findIndex((task) => task.task_id === sourceTaskId);
     const targetIndex = columnTasks.findIndex((task) => task.task_id === targetTaskId);
     if (sourceIndex < 0 || targetIndex < 0) {
-      dragState = null;
       return;
     }
 
@@ -245,8 +313,6 @@
     } catch (caughtError) {
       tasks = previousTasks;
       error = asApiError(caughtError).message;
-    } finally {
-      dragState = null;
     }
   }
 
@@ -259,6 +325,10 @@
     }
     await reorderWithinColumn(target.task_id, columnId, taskId);
   }
+
+  // ---------------------------------------------------------------------------
+  // Lifecycle
+  // ---------------------------------------------------------------------------
 
   onMount(() => {
     visibilityHandler = () => {
@@ -361,7 +431,7 @@
           </select>
         </label>
       </div>
-      {#if filtersActive()}
+      {#if filtersActive}
         <p class="mt-3 text-sm text-amber-200">Priority drag reordering is disabled while filters are active.</p>
       {/if}
     </Card>
@@ -369,7 +439,23 @@
     <div class="overflow-x-auto">
       <div class="grid min-w-[1200px] gap-4 xl:grid-cols-5">
       {#each TASK_BOARD_COLUMNS as column}
-        <section class="flex min-h-[720px] flex-col rounded-3xl border border-slate-800/80 bg-slate-900/70 p-4 shadow-card">
+        <section
+          class="flex min-h-[720px] flex-col rounded-3xl border p-4 shadow-card transition-colors {dropTargetColumn === column.id && dragState && dragState.column !== column.id ? 'border-blue-500/50 bg-blue-950/20' : 'border-slate-800/80 bg-slate-900/70'}"
+          ondragover={(event: DragEvent) => {
+            if (dragState && isDragTransitionValid(dragState.column, column.id)) {
+              event.preventDefault();
+              dropTargetColumn = column.id;
+            }
+          }}
+          ondragleave={(event: DragEvent) => {
+            const target = event.currentTarget as HTMLElement;
+            if (!target.contains(event.relatedTarget as Node)) {
+              if (dropTargetColumn === column.id) dropTargetColumn = null;
+            }
+          }}
+          ondrop={() => handleColumnDrop(column.id)}
+          aria-label={column.label}
+        >
           <div class="mb-4 flex items-center justify-between gap-2">
             <div>
               <p class="text-sm font-semibold text-white">{column.label}</p>
@@ -418,14 +504,15 @@
             </Card>
           {/if}
 
-          <div class="space-y-4 overflow-y-auto">
+          <div class="flex-1 space-y-4 overflow-y-auto">
             {#each tasksForColumn(column.id) as task (task.task_id)}
               <div
                 aria-label={`Reorder task ${task.title}`}
-                draggable={!filtersActive()}
+                draggable={!filtersActive}
                 ondragstart={() => (dragState = { taskId: task.task_id, column: column.id })}
-                ondragover={(event) => event.preventDefault()}
-                ondrop={() => reorderWithinColumn(task.task_id, column.id)}
+                ondragend={() => { dragState = null; dropTargetColumn = null; }}
+                ondragover={(event: DragEvent) => event.preventDefault()}
+                ondrop={(event: DragEvent) => { event.stopPropagation(); handleColumnDrop(column.id, task.task_id); }}
                 role="listitem"
               >
                 <TaskCard
@@ -438,8 +525,8 @@
                   onPause={task.status === 'running' ? () => changeTaskState(task.task_id, 'pause') : null}
                   onResume={task.status === 'paused' ? () => changeTaskState(task.task_id, 'resume') : null}
                   onCancel={['queued', 'ready', 'running', 'paused', 'draft'].includes(task.status) ? () => changeTaskState(task.task_id, 'cancel') : null}
-                  onMoveUp={!filtersActive() ? () => moveTaskByOffset(task.task_id, column.id, -1) : null}
-                  onMoveDown={!filtersActive() ? () => moveTaskByOffset(task.task_id, column.id, 1) : null}
+                  onMoveUp={!filtersActive ? () => moveTaskByOffset(task.task_id, column.id, -1) : null}
+                  onMoveDown={!filtersActive ? () => moveTaskByOffset(task.task_id, column.id, 1) : null}
                 />
               </div>
             {/each}
