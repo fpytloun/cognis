@@ -5,6 +5,8 @@
   import {
     Bot,
     BrainCircuit,
+    ChevronsLeft,
+    ChevronsRight,
     CircleHelp,
     ListTodo,
     Menu,
@@ -42,9 +44,32 @@
     { href: '/settings', label: 'Settings', icon: Settings }
   ];
 
-  let bootstrapped = false;
-  let diagnostics: SystemDiagnostics | null = null;
-  let mobileNavOpen = false;
+  let bootstrapped = $state(false);
+  let diagnostics = $state<SystemDiagnostics | null>(null);
+  let mobileNavOpen = $state(false);
+  let sidebarCollapsed = $state(false);
+  let sidebarHovered = $state(false);
+
+  function restoreSidebarState(): void {
+    if (typeof window === 'undefined') return;
+    const stored = window.localStorage.getItem('cognis-sidebar-collapsed');
+    if (stored !== null) {
+      sidebarCollapsed = stored === '1';
+    } else {
+      // Default: collapsed below xl (1280px), expanded at xl+
+      sidebarCollapsed = window.innerWidth < 1280;
+    }
+  }
+
+  function toggleSidebar(): void {
+    sidebarCollapsed = !sidebarCollapsed;
+    sidebarHovered = false;
+    if (typeof window !== 'undefined') {
+      window.localStorage.setItem('cognis-sidebar-collapsed', sidebarCollapsed ? '1' : '0');
+    }
+  }
+
+  let sidebarExpanded = $derived(!sidebarCollapsed || sidebarHovered);
 
   function isTextInputTarget(target: EventTarget | null): boolean {
     if (!(target instanceof HTMLElement)) {
@@ -165,6 +190,7 @@
   }
 
   onMount(() => {
+    restoreSidebarState();
     void auth.bootstrap().then(async () => {
       bootstrapped = true;
       if (auth.getSnapshot().status !== 'authenticated') {
@@ -205,46 +231,68 @@
   <ToastViewport />
   <ConfirmDialog />
   <ShortcutHelp />
-  <div class="min-h-screen">
-    <div class="mx-auto flex min-h-screen max-w-[1600px] gap-6 px-4 py-4 lg:px-6">
-      <aside class="hidden w-72 shrink-0 rounded-3xl border border-slate-800/80 bg-slate-900/80 p-5 shadow-card backdrop-blur lg:flex lg:flex-col lg:justify-between">
-        <div>
-          <div class="space-y-3 border-b border-slate-800/80 pb-6">
-            <p class="text-sm font-medium uppercase tracking-[0.3em] text-sky-300">Cognis</p>
-            <div>
-              <h1 class="text-2xl font-semibold text-white">Agent workspace</h1>
-              <p class="mt-2 text-sm leading-6 text-slate-400">
-                Manage conversations, workflows, and controller settings from one SPA shell.
-              </p>
+  <div class="h-screen overflow-hidden">
+    <div class="mx-auto flex h-screen max-w-[1600px] gap-6 overflow-hidden px-4 py-4 lg:px-6">
+      <!-- svelte-ignore a11y_no_static_element_interactions -->
+      <aside
+        class={`hidden shrink-0 overflow-hidden whitespace-nowrap rounded-3xl border border-slate-800/80 bg-slate-900/80 shadow-card backdrop-blur transition-all duration-200 ease-in-out md:flex md:flex-col md:justify-between ${sidebarExpanded ? 'w-72 p-5' : 'w-16 p-3'}`}
+        onmouseenter={() => { sidebarHovered = true; }}
+        onmouseleave={() => { sidebarHovered = false; }}
+      >
+        <div class="min-w-0 overflow-hidden">
+          {#if sidebarExpanded}
+            <div class="space-y-2 border-b border-slate-800/80 pb-5">
+              <p class="text-sm font-medium uppercase tracking-[0.3em] text-sky-300">Cognis</p>
+              <h1 class="text-xl font-semibold text-white">Agent workspace</h1>
             </div>
-          </div>
+          {:else}
+            <div class="flex justify-center border-b border-slate-800/80 pb-4">
+              <span class="text-lg font-bold text-sky-300">C</span>
+            </div>
+          {/if}
 
-          <nav class="mt-6 space-y-2">
+          <nav class={`space-y-1 ${sidebarExpanded ? 'mt-6 space-y-2' : 'mt-4'}`}>
             {#each navigationItems as item}
               <a
                 aria-label={`Open ${item.label}`}
-                class={`flex items-center justify-between rounded-2xl px-4 py-3 text-sm transition ${$page.url.pathname.startsWith(item.href) ? 'bg-sky-500/20 text-white' : 'text-slate-300 hover:bg-slate-800 hover:text-white'}`}
+                class={`flex items-center rounded-2xl text-sm transition ${$page.url.pathname.startsWith(item.href) ? 'bg-sky-500/20 text-white' : 'text-slate-300 hover:bg-slate-800 hover:text-white'} ${sidebarExpanded ? 'gap-3 px-4 py-3' : 'justify-center px-2 py-3'}`}
                 href={item.href}
+                title={sidebarExpanded ? undefined : item.label}
               >
-                <span class="flex items-center gap-3">
-                  <svelte:component this={item.icon} class="h-4 w-4" />
+                <svelte:component this={item.icon} class="h-4 w-4 shrink-0" />
+                {#if sidebarExpanded}
                   <span>{item.label}</span>
-                </span>
+                {/if}
               </a>
             {/each}
           </nav>
         </div>
 
-        <div class="space-y-4 border-t border-slate-800/80 pt-6">
-          <div class="space-y-1">
-            <p class="text-sm font-medium text-white">{$auth.user?.name ?? $auth.user?.email}</p>
-            <p class="text-xs text-slate-400">{$auth.user?.email}</p>
-          </div>
-          <Button class="w-full justify-center" variant="secondary" onclick={handleLogout}>Sign out</Button>
+        <div class={`space-y-4 border-t border-slate-800/80 ${sidebarExpanded ? 'pt-6' : 'pt-4'}`}>
+          {#if sidebarExpanded}
+            <div class="space-y-1">
+              <p class="text-sm font-medium text-white">{$auth.user?.name ?? $auth.user?.email}</p>
+              <p class="text-xs text-slate-400">{$auth.user?.email}</p>
+            </div>
+            <Button class="w-full justify-center" variant="secondary" onclick={handleLogout}>Sign out</Button>
+          {/if}
+          <button
+            class={`flex items-center rounded-xl text-xs text-slate-400 transition hover:bg-slate-800 hover:text-white ${sidebarExpanded ? 'w-full justify-center gap-2 px-3 py-2' : 'w-full justify-center py-2'}`}
+            onclick={toggleSidebar}
+            type="button"
+            title={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+          >
+            {#if sidebarCollapsed}
+              <ChevronsRight class="h-4 w-4" />
+            {:else}
+              <ChevronsLeft class="h-4 w-4" />
+              <span>Collapse</span>
+            {/if}
+          </button>
         </div>
       </aside>
 
-      <main class="flex min-h-[calc(100vh-2rem)] min-w-0 flex-1 flex-col gap-4 rounded-3xl border border-slate-800/80 bg-slate-950/70 p-4 shadow-card backdrop-blur lg:p-6" id="main-content">
+      <main class="flex h-[calc(100vh-2rem)] min-w-0 flex-1 flex-col gap-4 overflow-hidden rounded-3xl border border-slate-800/80 bg-slate-950/70 p-4 shadow-card backdrop-blur lg:p-6" id="main-content">
         <header class="flex flex-col gap-3 rounded-2xl border border-slate-800/80 bg-slate-900/80 px-4 py-4 sm:flex-row sm:items-center sm:justify-between">
           <div>
             <p class="text-sm font-medium uppercase tracking-[0.25em] text-slate-400">Cognis</p>
@@ -252,7 +300,7 @@
           </div>
 
           <div class="flex flex-wrap items-center gap-2">
-            <Button aria-label="Open navigation" class="lg:hidden" size="sm" variant="secondary" onclick={() => (mobileNavOpen = true)}>
+            <Button aria-label="Open navigation" class="md:hidden" size="sm" variant="secondary" onclick={() => (mobileNavOpen = true)}>
               <Menu class="h-4 w-4" />
             </Button>
             <Button size="sm" variant="secondary" onclick={() => goto('/getting-started')}>Getting started</Button>
@@ -314,7 +362,7 @@
           </div>
         {/if}
 
-        <div class="min-h-0 flex-1">
+        <div class="min-h-0 flex-1 overflow-y-auto">
           <slot />
         </div>
       </main>
@@ -322,7 +370,7 @@
   </div>
 
   {#if mobileNavOpen}
-    <div class="fixed inset-0 z-[70] bg-slate-950/80 backdrop-blur lg:hidden" role="presentation">
+    <div class="fixed inset-0 z-[70] bg-slate-950/80 backdrop-blur md:hidden" role="presentation">
       <div class="ml-auto flex h-full w-[min(22rem,100vw)] flex-col border-l border-slate-800 bg-slate-950 px-5 py-5 shadow-card">
         <div class="flex items-center justify-between gap-3 border-b border-slate-800 pb-5">
           <div>

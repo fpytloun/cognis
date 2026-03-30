@@ -123,6 +123,17 @@ export interface SessionEventsResponse {
   has_more: boolean;
 }
 
+export interface IntarisSessionDetail {
+  session_id: string;
+  intaris_session_id: string;
+  intention: string | null;
+  status: string;
+  total_calls: number;
+  approved_count: number;
+  denied_count: number;
+  escalated_count: number;
+}
+
 export interface Agent {
   agent_id: string;
   owner_email: string;
@@ -472,6 +483,8 @@ export interface Escalation {
   resolved: boolean;
   reasoning: string | null;
   risk: string | null;
+  timeout_seconds?: number;
+  received_at?: number;
 }
 
 export interface WebSocketAuthenticatedEvent {
@@ -639,6 +652,13 @@ export interface WebSocketToolResultEvent {
   result: string;
   is_error: boolean;
   duration_ms: number | null;
+  evaluation?: {
+    decision: string;
+    reasoning?: string;
+    risk?: string;
+    path?: string;
+    latency_ms?: number;
+  };
 }
 
 export interface WebSocketReasoningEvent {
@@ -662,6 +682,31 @@ export interface WebSocketPongEvent {
   type: 'pong';
 }
 
+export interface WebSocketSystemMessageEvent {
+  type: 'system_message';
+  conversation_id?: string;
+  text: string;
+}
+
+export interface WebSocketEscalationEvent {
+  type: 'escalation';
+  conversation_id?: string;
+  session_id?: string;
+  call_id: string;
+  tool_name: string | null;
+  risk: string | null;
+  reasoning: string | null;
+  timeout_seconds: number;
+}
+
+export interface WebSocketEscalationResolvedEvent {
+  type: 'escalation_resolved';
+  conversation_id?: string;
+  call_id: string;
+  decision: string;
+  reason?: string | null;
+}
+
 export type CognisWebSocketEvent =
   | WebSocketAuthenticatedEvent
   | WebSocketChunkEvent
@@ -682,6 +727,9 @@ export type CognisWebSocketEvent =
   | WebSocketWorkflowCompletedEvent
   | WebSocketWorkflowFailedEvent
   | WebSocketWorkflowCancelledEvent
+  | WebSocketSystemMessageEvent
+  | WebSocketEscalationEvent
+  | WebSocketEscalationResolvedEvent
   | WebSocketQueuedEvent
   | WebSocketReconnectedEvent
   | WebSocketSessionRecoveredEvent

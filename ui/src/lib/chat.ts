@@ -6,7 +6,8 @@ export type TimelineItem =
   | ToolCallTimelineItem
   | DelegationTimelineItem
   | ReasoningTimelineItem
-  | NoticeTimelineItem;
+  | NoticeTimelineItem
+  | SystemMessageTimelineItem;
 
 export interface MessageTimelineItem {
   id: string;
@@ -20,6 +21,14 @@ export interface MessageTimelineItem {
   streaming?: boolean;
 }
 
+export interface ToolCallEvaluation {
+  decision: string;
+  reasoning?: string;
+  risk?: string;
+  path?: string;
+  latency_ms?: number;
+}
+
 export interface ToolCallTimelineItem {
   id: string;
   kind: 'tool_call';
@@ -31,6 +40,7 @@ export interface ToolCallTimelineItem {
   result?: string;
   isError?: boolean;
   durationMs?: number;
+  evaluation?: ToolCallEvaluation;
 }
 
 export interface DelegationTimelineItem {
@@ -61,6 +71,13 @@ export interface NoticeTimelineItem {
   timestamp: string | null;
 }
 
+export interface SystemMessageTimelineItem {
+  id: string;
+  kind: 'system_message';
+  text: string;
+  timestamp: string | null;
+}
+
 function createMessageItem(
   id: string,
   role: 'user' | 'assistant' | 'system',
@@ -75,7 +92,7 @@ function createMessageItem(
     kind: 'message',
     role,
     content,
-    html: role === 'assistant' ? renderMarkdown(content) : '',
+    html: role !== 'system' ? renderMarkdown(content) : '',
     seq,
     timestamp,
     messageId,
@@ -121,9 +138,12 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
       // Orchestration tools are displayed as delegation cards, not tool blocks
       if (['delegate', 'fork'].includes(toolName)) continue;
       const callId = String(event.data.call_id ?? `tc-${event.seq}`);
-      const args = typeof event.data.arguments === 'object' && event.data.arguments !== null
-        ? (event.data.arguments as Record<string, unknown>)
-        : undefined;
+      let args: Record<string, unknown> | undefined;
+      if (typeof event.data.arguments === 'object' && event.data.arguments !== null) {
+        args = event.data.arguments as Record<string, unknown>;
+      } else if (typeof event.data.arguments === 'string') {
+        try { args = JSON.parse(event.data.arguments as string); } catch { args = undefined; }
+      }
       const item: ToolCallTimelineItem = {
         id: `tool:${callId}`,
         kind: 'tool_call',
@@ -343,6 +363,7 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
 
   if (event.type === 'tool_result') {
     const itemId = `tool:${event.call_id}`;
+    const evaluation = event.evaluation ?? undefined;
     const index = next.findIndex((item) => item.id === itemId && item.kind === 'tool_call');
     if (index >= 0) {
       const existing = next[index] as ToolCallTimelineItem;
@@ -351,7 +372,8 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
         status: event.is_error ? 'failed' : 'completed',
         result: event.result,
         isError: event.is_error,
-        durationMs: event.duration_ms ?? undefined
+        durationMs: event.duration_ms ?? undefined,
+        evaluation
       };
       return next;
     }
@@ -365,7 +387,8 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
       timestamp: new Date().toISOString(),
       result: event.result,
       isError: event.is_error,
-      durationMs: event.duration_ms ?? undefined
+      durationMs: event.duration_ms ?? undefined,
+      evaluation
     });
     return next;
   }
@@ -479,6 +502,16 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
       return next;
     }
     next.push(delegation);
+    return next;
+  }
+
+  if (event.type === 'system_message') {
+    next.push({
+      id: `sysmsg:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`,
+      kind: 'system_message',
+      text: event.text,
+      timestamp: new Date().toISOString(),
+    });
     return next;
   }
 

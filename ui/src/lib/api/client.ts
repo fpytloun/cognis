@@ -17,6 +17,7 @@ import type {
   ExchangeTokenResponse,
   HealthResponse,
   IntarisMCPServer,
+  IntarisSessionDetail,
   LLMProvider,
   MCPServerTestResponse,
   MCPServer,
@@ -656,6 +657,10 @@ export const api = {
 
     cancel(sessionId: string): Promise<{ ok: boolean; session_id: string }> {
       return request<{ ok: boolean; session_id: string }>(`/api/v1/sessions/${sessionId}/cancel`, { method: 'POST' });
+    },
+
+    intarisDetail(sessionId: string): Promise<IntarisSessionDetail> {
+      return request<IntarisSessionDetail>(`/api/v1/sessions/${sessionId}/intaris`);
     }
   },
 

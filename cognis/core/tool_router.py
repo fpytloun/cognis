@@ -48,6 +48,10 @@ class PermissionDecision:
     decision: str
     reasoning: str | None = None
     source: str | None = None
+    risk: str | None = None
+    path: str | None = None
+    latency_ms: int = 0
+    call_id: str | None = None  # Intaris evaluation call_id (for escalation tracking)
 
 
 class ToolRouter:
@@ -119,6 +123,10 @@ class ToolRouter:
                 decision=evaluation.decision,
                 reasoning=evaluation.reasoning,
                 source="guardrails",
+                risk=evaluation.risk,
+                path=evaluation.path,
+                latency_ms=evaluation.latency_ms,
+                call_id=evaluation.call_id,
             )
 
         permission = Permission.EVALUATE
@@ -141,6 +149,10 @@ class ToolRouter:
             decision=evaluation.decision,
             reasoning=evaluation.reasoning,
             source="guardrails",
+            risk=evaluation.risk,
+            path=evaluation.path,
+            latency_ms=evaluation.latency_ms,
+            call_id=evaluation.call_id,
         )
 
     async def execute(
@@ -190,21 +202,34 @@ class ToolRouter:
             )
 
         decision = await self.evaluate_tool_call(tool_call, agent, session, registry)
+        eval_meta: dict[str, Any] = {
+            "decision": decision.decision,
+            "reasoning": decision.reasoning,
+            "source": decision.source,
+            "risk": decision.risk,
+            "path": decision.path,
+            "latency_ms": decision.latency_ms,
+            "call_id": decision.call_id,
+        }
         if decision.decision == "deny":
             TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome="denied").inc()
+            denied_result = ToolResult(
+                output=decision.reasoning or "Tool execution denied.",
+                is_error=True,
+                metadata={"evaluation": eval_meta},
+            )
             return self._sanitize_result(
-                tool_call.name,
-                ToolResult(output=decision.reasoning or "Tool execution denied.", is_error=True),
-                _tool_max_size(registry, tool_call.name),
+                tool_call.name, denied_result, _tool_max_size(registry, tool_call.name)
             )
         if decision.decision == "escalate":
             TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome="escalated").inc()
+            escalated_result = ToolResult(
+                output=decision.reasoning or "Tool requires user approval.",
+                is_error=True,
+                metadata={"evaluation": eval_meta},
+            )
             return self._sanitize_result(
-                tool_call.name,
-                ToolResult(
-                    output=decision.reasoning or "Tool requires user approval.", is_error=True
-                ),
-                _tool_max_size(registry, tool_call.name),
+                tool_call.name, escalated_result, _tool_max_size(registry, tool_call.name)
             )
 
         registered_tool = registry.get(tool_call.name)
@@ -227,6 +252,13 @@ class ToolRouter:
                 tool_call.name,
                 result,
                 registered_tool.definition.max_result_size,
+            )
+        # Attach evaluation metadata to the result
+        if result.metadata is None:
+            result = result.model_copy(update={"metadata": {"evaluation": eval_meta}})
+        else:
+            result = result.model_copy(
+                update={"metadata": {**result.metadata, "evaluation": eval_meta}}
             )
         TOOL_ROUTE_OUTCOMES.labels(
             route=str(route), outcome="success" if not result.is_error else "failure"

@@ -22,8 +22,8 @@
 </script>
 
 <article class={`max-w-[80%] rounded-3xl px-4 py-3 shadow-card ${bubbleClass()}`}>
-  {#if item.role === 'assistant'}
-    <div class="prose prose-invert max-w-none prose-pre:overflow-x-auto prose-code:text-sky-200">{@html item.html}</div>
+  {#if item.html}
+    <div class={`prose max-w-none prose-pre:overflow-x-auto ${item.role === 'user' ? 'prose-user prose-headings:text-slate-950 prose-p:text-slate-950 prose-strong:text-slate-950 prose-code:text-slate-800 prose-a:text-slate-900 prose-a:underline' : 'prose-invert prose-code:text-sky-200'}`}>{@html item.html}</div>
   {:else}
     <p class="whitespace-pre-wrap text-sm leading-6">{item.content}</p>
   {/if}

@@ -21,7 +21,18 @@ class _Guardrails:
     ) -> object:
         del session_id, tool_name, arguments, context
         self.evaluate_calls += 1
-        return type("Evaluation", (), {"decision": "approve", "reasoning": None})()
+        return type(
+            "Evaluation",
+            (),
+            {
+                "decision": "approve",
+                "reasoning": None,
+                "risk": None,
+                "path": None,
+                "latency_ms": 0,
+                "call_id": "eval_mock",
+            },
+        )()
 
     async def call_mcp_tool(
         self, session_id: str, server_name: str, tool_name: str, arguments: dict
@@ -182,7 +193,10 @@ async def test_tool_router_truncates_and_wraps_local_results() -> None:
     )
 
     assert executor.calls == 1
-    assert result.metadata == {"wrapped": True, "truncated": True}
+    assert result.metadata is not None
+    assert result.metadata["wrapped"] is True
+    assert result.metadata["truncated"] is True
+    assert result.metadata["evaluation"]["decision"] == "approve"
     assert "[truncated:" in result.output
 
 

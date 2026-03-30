@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
+from typing import Any
 
 from fastapi import APIRouter, Query, Request
 
@@ -10,6 +12,8 @@ from cognis.api.common import api_exception, forbid_mutation_for_viewer, require
 from cognis.api.models import SessionCancelResponse, SessionEventsResponse, SessionResponse
 from cognis.api.serializers import event_to_response, session_to_response
 from cognis.store.queries import get_session_row, set_session_status
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/sessions", tags=["sessions"])
 
@@ -22,6 +26,34 @@ async def session_detail(request: Request, session_id: str) -> SessionResponse:
         raise api_exception(404, "not_found", "Session not found")
     require_owner_or_admin(request, row.user_email)
     return session_to_response(row)
+
+
+@router.get("/{session_id}/intaris")
+async def session_intaris_detail(request: Request, session_id: str) -> dict[str, Any]:
+    """Fetch Intaris session details (intention, call stats) for a session."""
+    async with request.app.state.session_factory() as session:
+        row = await get_session_row(session, session_id)
+    if row is None:
+        raise api_exception(404, "not_found", "Session not found")
+    require_owner_or_admin(request, row.user_email)
+    intaris_sid = row.intaris_session_id or row.session_id
+    try:
+        intaris_session = await request.app.state.providers.guardrails.get_session(intaris_sid)
+        return {
+            "session_id": session_id,
+            "intaris_session_id": intaris_sid,
+            "intention": intaris_session.intention,
+            "status": intaris_session.status,
+            "total_calls": intaris_session.total_calls,
+            "approved_count": intaris_session.approved_count,
+            "denied_count": intaris_session.denied_count,
+            "escalated_count": intaris_session.escalated_count,
+        }
+    except Exception as exc:
+        logger.warning("Failed to fetch Intaris session %s", intaris_sid, exc_info=True)
+        raise api_exception(
+            502, "intaris_unavailable", "Unable to fetch session details from Intaris"
+        ) from exc
 
 
 @router.get("/{session_id}/events", response_model=SessionEventsResponse)

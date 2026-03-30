@@ -2,7 +2,7 @@
   import { goto } from '$app/navigation';
   import { page } from '$app/stores';
   import { onMount } from 'svelte';
-  import { ArrowLeft, Search, Copy, Check } from 'lucide-svelte';
+  import { ArrowDown, ArrowLeft, ChevronsLeft, ChevronsRight, Search, Copy, Check, Info } from 'lucide-svelte';
 
   import AgentAvatar from '$lib/components/AgentAvatar.svelte';
   import ChatMessage from '$lib/components/ChatMessage.svelte';
@@ -53,6 +53,7 @@
   let escalations: Escalation[] = [];
   let escalationBusyCallId: string | null = null;
   let escalationError = '';
+  let escalationCountdownTimer: number | null = null;
   let awaitingAssistantStart = false;
   let turnInProgress = false;
   let lastSubmittedMessage = '';
@@ -61,19 +62,36 @@
   let editTitleValue = '';
   let sessionIdCopied = false;
   let subSessionPanelOpen = false;
+  let subSessionClosing = false;
   let subSessionId = '';
   let subSessionTimeline: TimelineItem[] = [];
   let subSessionLoading = false;
   let subSessionError = '';
+  let timelineEl: HTMLDivElement | null = null;
+  let userScrolledUp = false;
+  let selectedChannel = 'all';
+  let chatSidebarCollapsed = false;
+  interface SessionInfoData {
+    intention: string | null;
+    status: string;
+    total_calls: number;
+    approved_count: number;
+    denied_count: number;
+    escalated_count: number;
+  }
+  let sessionInfoOpen = false;
+  let sessionInfo: SessionInfoData | null = null;
+  let sessionInfoLoading = false;
+  let subSessionInfoOpen = false;
+  let subSessionInfo: SessionInfoData | null = null;
+  let subSessionInfoLoading = false;
 
-  const escalationFirstSeen = new Map<string, number>();
   const sessionIds = new Set<string>();
 
   let unsubscribeWs: (() => void) | null = null;
   let unsubscribeComposerFocus: (() => void) | null = null;
   let unsubscribeCancelTurn: (() => void) | null = null;
   let visibilityHandler: (() => void) | null = null;
-  let escalationPollTimer: number | null = null;
 
   function isLlmUnavailableForSetup(): boolean {
     const llmDetails = JSON.stringify($workspaceHealth.health?.providers?.llm ?? {}).toLowerCase();
@@ -102,25 +120,15 @@
   }
 
   function filteredConversations(): Conversation[] {
-    const query = conversationSearch.trim().toLowerCase();
-    const list = query
-      ? conversations.filter((c) => conversationTitle(c).toLowerCase().includes(query))
-      : conversations;
-    return list;
-  }
-
-  function groupedConversations(): { web: Conversation[]; other: Conversation[] } {
-    const filtered = filteredConversations();
-    const web: Conversation[] = [];
-    const other: Conversation[] = [];
-    for (const c of filtered) {
-      if (c.context?.type?.toLowerCase() === 'web') {
-        web.push(c);
-      } else {
-        other.push(c);
-      }
+    let list = conversations;
+    if (selectedChannel !== 'all') {
+      list = list.filter((c) => (c.context?.type?.toLowerCase() ?? 'unknown') === selectedChannel);
     }
-    return { web, other };
+    const query = conversationSearch.trim().toLowerCase();
+    if (query) {
+      list = list.filter((c) => conversationTitle(c).toLowerCase().includes(query));
+    }
+    return list;
   }
 
   function socketErrorMessage(event: import('$lib/types/api').WebSocketErrorEvent): string {
@@ -218,18 +226,6 @@
     }
   }
 
-  async function loadEscalationTimeout(): Promise<void> {
-    try {
-      const groups = await api.settings.list();
-      const setting = groups.flatMap((group) => group.items).find((item) => item.key === 'session.escalation_timeout_seconds');
-      if (typeof setting?.value === 'number') {
-        escalationTimeoutSeconds = setting.value;
-      }
-    } catch {
-      escalationTimeoutSeconds = 300;
-    }
-  }
-
   async function refreshSidebarData(): Promise<void> {
     [agents] = await Promise.all([api.agents.listAll()]);
     await loadConversationPage(true);
@@ -246,57 +242,149 @@
     }
   }
 
+  /** Seed escalation list from Intaris on conversation open (catch up). */
   async function refreshEscalations(): Promise<void> {
     if (document.hidden) return;
-
     try {
       const allEscalations = await api.escalations.list();
-      const filtered = allEscalations.filter((item) => sessionIds.size === 0 || item.session_id === null || sessionIds.has(item.session_id));
+      const filtered = allEscalations.filter(
+        (item) => sessionIds.size === 0 || item.session_id === null || sessionIds.has(item.session_id)
+      );
       const now = Date.now();
-      const present = new Set(filtered.map((item) => item.call_id));
       for (const item of filtered) {
-        if (!escalationFirstSeen.has(item.call_id)) {
-          escalationFirstSeen.set(item.call_id, now);
-        }
-      }
-      for (const key of [...escalationFirstSeen.keys()]) {
-        if (!present.has(key)) {
-          escalationFirstSeen.delete(key);
+        if (!escalations.some((e) => e.call_id === item.call_id)) {
+          item.received_at = now;
+          item.timeout_seconds = escalationTimeoutSeconds;
         }
       }
       escalations = filtered;
       escalationError = '';
+      startEscalationCountdown();
     } catch (caughtError) {
       escalationError = asApiError(caughtError).message;
     }
   }
 
-  function stopEscalationPolling(): void {
-    if (escalationPollTimer !== null) {
-      window.clearInterval(escalationPollTimer);
-      escalationPollTimer = null;
-    }
+  function startEscalationCountdown(): void {
+    stopEscalationCountdown();
+    if (escalations.length === 0) return;
+    escalationCountdownTimer = window.setInterval(() => {
+      // Force reactivity so countdown timers re-render
+      escalations = [...escalations];
+      // Auto-remove expired escalations (server handles timeout, this is UI cleanup)
+      const now = Date.now();
+      escalations = escalations.filter((e) => {
+        const elapsed = (now - (e.received_at ?? now)) / 1000;
+        const timeout = e.timeout_seconds ?? escalationTimeoutSeconds;
+        return elapsed < timeout + 5; // 5s grace for network latency
+      });
+      if (escalations.length === 0) stopEscalationCountdown();
+    }, 1000);
   }
 
-  const ESCALATION_POLL_ACTIVE_MS = 5_000;
-  const ESCALATION_POLL_IDLE_MS = 15_000;
-
-  function startEscalationPolling(): void {
-    stopEscalationPolling();
-    if (typeof document === 'undefined' || document.hidden) return;
-    const interval = escalations.length > 0 ? ESCALATION_POLL_ACTIVE_MS : ESCALATION_POLL_IDLE_MS;
-    escalationPollTimer = window.setInterval(() => {
-      void refreshEscalations().then(() => {
-        const nextInterval = escalations.length > 0 ? ESCALATION_POLL_ACTIVE_MS : ESCALATION_POLL_IDLE_MS;
-        if (nextInterval !== interval) {
-          startEscalationPolling();
-        }
-      });
-    }, interval);
+  function stopEscalationCountdown(): void {
+    if (escalationCountdownTimer !== null) {
+      window.clearInterval(escalationCountdownTimer);
+      escalationCountdownTimer = null;
+    }
   }
 
   function syncVisibleWindow(): void {
     visibleStartIndex = Math.max(0, timeline.length - 100);
+  }
+
+  function scrollToBottom(): void {
+    if (!timelineEl || userScrolledUp) return;
+    requestAnimationFrame(() => {
+      if (timelineEl) {
+        timelineEl.scrollTop = timelineEl.scrollHeight;
+      }
+    });
+  }
+
+  function handleTimelineScroll(): void {
+    if (!timelineEl) return;
+    const distanceFromBottom = timelineEl.scrollHeight - timelineEl.scrollTop - timelineEl.clientHeight;
+    userScrolledUp = distanceFromBottom > 80;
+  }
+
+  function jumpToBottom(): void {
+    userScrolledUp = false;
+    if (timelineEl) {
+      timelineEl.scrollTop = timelineEl.scrollHeight;
+    }
+  }
+
+  function channelTypes(): string[] {
+    const types = new Set<string>();
+    for (const c of conversations) {
+      types.add(c.context?.type?.toLowerCase() ?? 'unknown');
+    }
+    return [...types].sort();
+  }
+
+  function persistSelectedChannel(): void {
+    if (typeof window === 'undefined') return;
+    window.localStorage.setItem('cognis-chat-selected-channel', selectedChannel);
+  }
+
+  function restoreSelectedChannel(): void {
+    if (typeof window === 'undefined') return;
+    const stored = window.localStorage.getItem('cognis-chat-selected-channel');
+    if (stored) selectedChannel = stored;
+  }
+
+  function restoreChatSidebarState(): void {
+    if (typeof window === 'undefined') return;
+    chatSidebarCollapsed = window.localStorage.getItem('cognis-chat-sidebar-collapsed') === '1';
+  }
+
+  function toggleChatSidebar(): void {
+    chatSidebarCollapsed = !chatSidebarCollapsed;
+    if (typeof window !== 'undefined') {
+      window.localStorage.setItem('cognis-chat-sidebar-collapsed', chatSidebarCollapsed ? '1' : '0');
+    }
+  }
+
+  async function loadSessionInfo(): Promise<void> {
+    const sid = currentConversation?.root_session_id;
+    if (!sid) return;
+    sessionInfoLoading = true;
+    try {
+      const detail = await api.sessions.intarisDetail(sid);
+      sessionInfo = {
+        intention: detail.intention,
+        status: detail.status,
+        total_calls: detail.total_calls,
+        approved_count: detail.approved_count,
+        denied_count: detail.denied_count,
+        escalated_count: detail.escalated_count
+      };
+    } catch {
+      sessionInfo = null;
+    } finally {
+      sessionInfoLoading = false;
+    }
+  }
+
+  async function loadSubSessionInfo(): Promise<void> {
+    if (!subSessionId) return;
+    subSessionInfoLoading = true;
+    try {
+      const detail = await api.sessions.intarisDetail(subSessionId);
+      subSessionInfo = {
+        intention: detail.intention,
+        status: detail.status,
+        total_calls: detail.total_calls,
+        approved_count: detail.approved_count,
+        denied_count: detail.denied_count,
+        escalated_count: detail.escalated_count
+      };
+    } catch {
+      subSessionInfo = null;
+    } finally {
+      subSessionInfoLoading = false;
+    }
   }
 
   async function openConversation(conversationId: string): Promise<void> {
@@ -337,6 +425,15 @@
       error = asApiError(caughtError).message;
     } finally {
       loading = false;
+      // Scroll to bottom after DOM renders the timeline
+      userScrolledUp = false;
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          if (timelineEl) {
+            timelineEl.scrollTop = timelineEl.scrollHeight;
+          }
+        });
+      });
     }
   }
 
@@ -345,7 +442,7 @@
     error = '';
 
     try {
-      await Promise.all([refreshSidebarData(), loadEscalationTimeout()]);
+      await refreshSidebarData();
       await openConversation(conversationIdFromRoute());
     } catch (caughtError) {
       error = asApiError(caughtError).message;
@@ -475,18 +572,27 @@
     }
   }
 
+  /** Slash commands that are handled as system actions, not chat messages. */
+  const SYSTEM_SLASH_COMMANDS = ['/approve', '/deny'];
+
   async function handleSend(): Promise<void> {
     const content = composer.trim();
     if (!content || !currentConversation || isReadOnly(currentConversation)) return;
 
-    timeline = appendOptimisticUserMessage(timeline, content);
-    lastSubmittedMessage = content;
-    lastRecoverableMessage = '';
-    turnInProgress = true;
-    awaitingAssistantStart = true;
+    const isSlashCommand = SYSTEM_SLASH_COMMANDS.some((cmd) => content.startsWith(cmd));
+
+    if (!isSlashCommand) {
+      timeline = appendOptimisticUserMessage(timeline, content);
+      lastSubmittedMessage = content;
+      lastRecoverableMessage = '';
+      turnInProgress = true;
+      awaitingAssistantStart = true;
+    }
     error = '';
     composer = '';
     syncVisibleWindow();
+    userScrolledUp = false;
+    scrollToBottom();
     wsClient.sendMessage(currentConversation.conversation_id, content);
   }
 
@@ -504,21 +610,21 @@
 
   async function handleEscalationDecision(callId: string, decision: 'approve' | 'deny'): Promise<void> {
     escalationBusyCallId = callId;
-    try {
-      await api.escalations.resolve(callId, { decision });
-      await refreshEscalations();
-      addToast(`Escalation ${decision}d.`, 'success');
-    } catch (caughtError) {
-      error = asApiError(caughtError).message;
-      addToast(error, 'error', 4_000, 'Unable to resolve escalation');
-    } finally {
-      escalationBusyCallId = null;
-    }
+    wsClient.resolveEscalation(callId, decision);
+    // Optimistically remove after a short delay (server push will confirm)
+    setTimeout(() => {
+      if (escalationBusyCallId === callId) {
+        escalations = escalations.filter((e) => e.call_id !== callId);
+        escalationBusyCallId = null;
+        if (escalations.length === 0) stopEscalationCountdown();
+      }
+    }, 3000);
   }
 
-  function escalationSecondsRemaining(callId: string): number {
-    const firstSeen = escalationFirstSeen.get(callId) ?? Date.now();
-    return escalationTimeoutSeconds - Math.floor((Date.now() - firstSeen) / 1000);
+  function escalationSecondsRemaining(esc: Escalation): number {
+    const timeout = esc.timeout_seconds ?? escalationTimeoutSeconds;
+    const elapsed = (Date.now() - (esc.received_at ?? Date.now())) / 1000;
+    return Math.max(0, Math.ceil(timeout - elapsed));
   }
 
   function loadOlder(): void {
@@ -529,6 +635,14 @@
     const currentId = conversationIdFromRoute();
     if ('conversation_id' in event && event.conversation_id && event.conversation_id !== currentId) {
       return;
+    }
+
+    // Filter sub-session tool/chunk events from the main timeline (defense-in-depth)
+    const rootSid = currentConversation?.root_session_id;
+    if (rootSid && 'session_id' in event && event.session_id && event.session_id !== rootSid) {
+      if (event.type === 'tool_call' || event.type === 'tool_result' || event.type === 'chunk' || event.type === 'reasoning') {
+        return;
+      }
     }
 
     if (event.type === 'queued' || event.type === 'message_complete') {
@@ -555,6 +669,34 @@
       timeline = finalizeReasoningItems(timeline);
     }
 
+    // Escalation push events
+    if (event.type === 'escalation') {
+      const existing = escalations.find((e) => e.call_id === event.call_id);
+      if (!existing) {
+        escalations = [...escalations, {
+          call_id: event.call_id,
+          session_id: event.session_id ?? null,
+          tool_name: event.tool_name,
+          decision: 'escalate',
+          resolved: false,
+          reasoning: event.reasoning,
+          risk: event.risk,
+          timeout_seconds: event.timeout_seconds,
+          received_at: Date.now(),
+        }];
+        startEscalationCountdown();
+        scrollToBottom();
+      }
+      return;
+    }
+
+    if (event.type === 'escalation_resolved') {
+      escalations = escalations.filter((e) => e.call_id !== event.call_id);
+      escalationBusyCallId = null;
+      if (escalations.length === 0) stopEscalationCountdown();
+      return;
+    }
+
     // Handle conversation_updated for title changes
     if (event.type === 'conversation_updated') {
       if (currentConversation && event.conversation_id === currentConversation.conversation_id) {
@@ -575,15 +717,12 @@
       syncVisibleWindow();
     }
 
-    if (
-      event.type === 'workflow_completed' ||
-      event.type === 'workflow_failed' ||
-      event.type === 'workflow_cancelled' ||
-      event.type === 'workflow_gate' ||
-      event.type === 'workflow_step_question'
-    ) {
-      void refreshEscalations();
+    // Auto-scroll on new content
+    if (event.type === 'chunk' || event.type === 'message_complete' || event.type === 'delegation_started' || event.type === 'delegation_completed' || event.type === 'system_message') {
+      scrollToBottom();
     }
+
+    // No longer polling for escalations — they arrive via push events
   }
 
   function handleAgentFilterChange(): void {
@@ -597,6 +736,8 @@
     subSessionLoading = true;
     subSessionError = '';
     subSessionTimeline = [];
+    subSessionInfo = null;
+    subSessionInfoOpen = false;
     try {
       const result = await api.conversations.sessionEvents(currentConversation.conversation_id, sessionId, 0, 200);
       subSessionTimeline = normalizeHistory(result.items ?? []);
@@ -608,9 +749,15 @@
   }
 
   function closeSubSessionPanel(): void {
-    subSessionPanelOpen = false;
-    subSessionId = '';
-    subSessionTimeline = [];
+    subSessionClosing = true;
+    setTimeout(() => {
+      subSessionPanelOpen = false;
+      subSessionClosing = false;
+      subSessionId = '';
+      subSessionTimeline = [];
+      subSessionInfo = null;
+      subSessionInfoOpen = false;
+    }, 250);
   }
 
   $: if ($page.params.conversationId && $page.params.conversationId !== activeConversationId) {
@@ -621,6 +768,8 @@
 
   onMount(() => {
     restoreEnterToSendPreference();
+    restoreSelectedChannel();
+    restoreChatSidebarState();
     mobileListOpen = !conversationIdFromRoute();
     unsubscribeWs = wsClient.subscribe(handleSocketEvent);
     unsubscribeComposerFocus = onChatComposerFocusRequest(() => {
@@ -632,24 +781,19 @@
       }
     });
     visibilityHandler = () => {
-      if (document.hidden) {
-        stopEscalationPolling();
-      } else {
+      if (!document.hidden) {
         void refreshEscalations();
-        startEscalationPolling();
       }
     };
     document.addEventListener('visibilitychange', visibilityHandler);
 
-    void initialize().then(() => {
-      startEscalationPolling();
-    });
+    void initialize();
 
     return () => {
       unsubscribeWs?.();
       unsubscribeComposerFocus?.();
       unsubscribeCancelTurn?.();
-      stopEscalationPolling();
+      stopEscalationCountdown();
       if (visibilityHandler) {
         document.removeEventListener('visibilitychange', visibilityHandler);
       }
@@ -667,50 +811,54 @@
 {#if loading}
   <LoadingState label="Loading conversation" description="Fetching history, restoring workflow prompts, and preparing the live stream." />
 {:else}
-  <div class={`grid min-h-[calc(100vh-12rem)] gap-4 ${subSessionPanelOpen ? 'xl:grid-cols-[320px_minmax(0,1fr)_420px]' : 'xl:grid-cols-[320px_minmax(0,1fr)]'}`}>
+  <div class={`grid h-full gap-4 overflow-hidden ${chatSidebarCollapsed ? '' : 'xl:grid-cols-[320px_minmax(0,1fr)]'}`}>
     <!-- Sidebar -->
-    <aside class={`${mobileListOpen || !currentConversation ? 'block' : 'hidden'} space-y-4 rounded-3xl border border-slate-800/80 bg-slate-900/70 p-4 shadow-card backdrop-blur xl:block`}>
-      {#if agents.length === 0}
-        <Card class="p-4">
-          <div class="space-y-4">
+    <aside class={`${chatSidebarCollapsed ? 'hidden' : `${mobileListOpen || !currentConversation ? 'flex' : 'hidden'} xl:flex`} min-h-0 flex-col rounded-3xl border border-slate-800/80 bg-slate-900/70 shadow-card backdrop-blur`}>
+      <!-- Static top: filters -->
+      <div class="shrink-0 space-y-3 p-4 pb-2">
+        {#if agents.length === 0}
+          <div class="space-y-3">
             <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Setup incomplete</p>
-            <h2 class="text-lg font-semibold text-white">Create an agent to start chatting</h2>
-            <p class="text-sm leading-6 text-slate-400">You need at least one active agent before conversations can start.</p>
-            <Button class="w-full justify-center" onclick={() => goto('/agents/new')}>Create agent</Button>
+            <p class="text-sm leading-6 text-slate-400">Create an agent to start chatting.</p>
+            <Button class="w-full justify-center" size="sm" onclick={() => goto('/agents/new')}>Create agent</Button>
           </div>
-        </Card>
-      {:else if isLlmUnavailableForSetup()}
-        <Card class="p-4">
-          <div class="space-y-4">
+        {:else if isLlmUnavailableForSetup()}
+          <div class="space-y-3">
             <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Setup incomplete</p>
-            <h2 class="text-lg font-semibold text-white">Configure an LLM provider to start chatting</h2>
-            <p class="text-sm leading-6 text-slate-400">Chat and task execution need a configured provider before they can run.</p>
-            <Button class="w-full justify-center" onclick={() => goto('/settings?tab=providers')}>Open provider settings</Button>
+            <p class="text-sm leading-6 text-slate-400">Configure an LLM provider first.</p>
+            <Button class="w-full justify-center" size="sm" onclick={() => goto('/settings?tab=providers')}>Open provider settings</Button>
           </div>
-        </Card>
-      {:else}
-        <!-- Agent filter -->
-        <label class="block space-y-2">
-          <span class="text-xs font-medium uppercase tracking-widest text-slate-500">Agent</span>
-          <select
-            bind:value={selectedAgentId}
-            onchange={handleAgentFilterChange}
-            class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
-          >
-            {#each agents.filter((a) => a.status === 'active') as agent}
-              <option value={agent.agent_id}>{agent.display_name ?? agent.name}</option>
-            {/each}
-          </select>
-        </label>
-      {/if}
+        {:else}
+          <label class="block space-y-1">
+            <span class="text-xs font-medium uppercase tracking-widest text-slate-500">Agent</span>
+            <select
+              bind:value={selectedAgentId}
+              onchange={handleAgentFilterChange}
+              class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+            >
+              {#each agents.filter((a) => a.status === 'active') as agent}
+                <option value={agent.agent_id}>{agent.display_name ?? agent.name}</option>
+              {/each}
+            </select>
+          </label>
 
-      <!-- Conversation list -->
-      <Card class="p-4">
-        <div class="flex items-center justify-between gap-3">
-          <div>
-            <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Conversations</p>
-            <h2 class="mt-1 text-lg font-semibold text-white">History</h2>
-          </div>
+          <label class="block space-y-1">
+            <span class="text-xs font-medium uppercase tracking-widest text-slate-500">Channel</span>
+            <select
+              bind:value={selectedChannel}
+              onchange={persistSelectedChannel}
+              class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+            >
+              <option value="all">All channels</option>
+              {#each channelTypes() as ch}
+                <option value={ch}>{ch.charAt(0).toUpperCase() + ch.slice(1)}</option>
+              {/each}
+            </select>
+          </label>
+        {/if}
+
+        <div class="flex items-center justify-between gap-3 border-t border-slate-800/60 pt-3">
+          <h2 class="text-sm font-semibold text-white">History</h2>
           <button
             class="text-xs font-medium text-sky-400 transition hover:text-sky-300"
             onclick={createNewConversation}
@@ -718,40 +866,41 @@
           >+ New</button>
         </div>
 
-        <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
-          <span>Search</span>
-          <div class="relative">
-            <Search class="pointer-events-none absolute left-3 top-2.5 h-4 w-4 text-slate-500" />
-            <Input bind:value={conversationSearch} class="pl-9" placeholder="Filter by title" />
-          </div>
-        </label>
+        <div class="relative">
+          <Search class="pointer-events-none absolute left-3 top-2.5 h-4 w-4 text-slate-500" />
+          <Input bind:value={conversationSearch} class="pl-9" placeholder="Filter by title" />
+        </div>
+      </div>
 
-        <div class="mt-4 space-y-1">
+      <!-- Scrollable middle: conversation list -->
+      <div class="min-h-0 flex-1 overflow-y-auto px-4 py-2">
+        <div class="space-y-1">
           {#if filteredConversations().length === 0}
-            <p class="rounded-2xl border border-dashed border-slate-700 px-4 py-6 text-sm text-slate-400">
-              No conversations loaded yet.
+            <p class="rounded-2xl border border-dashed border-slate-700 px-4 py-6 text-center text-sm text-slate-400">
+              No conversations found.
             </p>
           {:else}
-            {@const grouped = groupedConversations()}
-
-            <!-- Web conversations -->
-            {#if grouped.web.length > 0}
-              <p class="px-1 pb-1 pt-2 text-[10px] font-semibold uppercase tracking-widest text-slate-500">Web</p>
-              {#each grouped.web as conversation}
-                {@const agent = conversationAgent(conversation)}
-                <a
-                  class={`flex items-start gap-3 rounded-2xl border px-3 py-2.5 transition ${conversation.conversation_id === currentConversation?.conversation_id ? 'border-sky-400/40 bg-sky-500/10' : 'border-transparent bg-slate-950/60 hover:border-slate-700 hover:bg-slate-900'}`}
-                  href={`/chat/${conversation.conversation_id}`}
-                  onclick={() => { mobileListOpen = false; }}
-                >
-                  <AgentAvatar name={agent?.display_name ?? agent?.name ?? conversation.agent_id} avatarUrl={agent?.avatar_url ?? null} class="h-8 w-8" />
-                  <div class="min-w-0 flex-1">
-                    <p class="truncate text-sm font-medium text-white">{conversationTitle(conversation)}</p>
-                    <p class="mt-0.5 truncate text-xs text-slate-400">{agent?.display_name ?? agent?.name ?? conversation.agent_id}</p>
+            {#each filteredConversations() as conversation}
+              {@const agent = conversationAgent(conversation)}
+              <a
+                class={`flex items-start gap-3 rounded-2xl border px-3 py-2.5 transition ${conversation.conversation_id === currentConversation?.conversation_id ? 'border-sky-400/40 bg-sky-500/10' : 'border-transparent bg-slate-950/60 hover:border-slate-700 hover:bg-slate-900'}`}
+                href={`/chat/${conversation.conversation_id}`}
+                onclick={() => { mobileListOpen = false; }}
+              >
+                <AgentAvatar name={agent?.display_name ?? agent?.name ?? conversation.agent_id} avatarUrl={agent?.avatar_url ?? null} class="h-8 w-8" />
+                <div class="min-w-0 flex-1">
+                  <p class="truncate text-sm font-medium text-white">{conversationTitle(conversation)}</p>
+                  <div class="mt-0.5 flex items-center gap-2">
+                    <span class="truncate text-xs text-slate-400">{agent?.display_name ?? agent?.name ?? conversation.agent_id}</span>
+                    {#if (conversation.context?.type ?? 'web').toLowerCase() !== 'web'}
+                      <span class="shrink-0 rounded-full border border-slate-700 bg-slate-800/60 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-widest text-slate-500">
+                        {contextTypeBadge(conversation)}
+                      </span>
+                    {/if}
                   </div>
-                </a>
+                </div>
+              </a>
             {/each}
-            {/if}
           {/if}
 
           {#if conversationsHasMore}
@@ -760,20 +909,45 @@
             </div>
           {/if}
         </div>
-      </Card>
+      </div>
+
+      <!-- Static bottom: collapse button -->
+      <div class="hidden shrink-0 border-t border-slate-800/60 p-3 xl:block">
+        <button
+          class="flex w-full items-center justify-center gap-2 rounded-xl py-1.5 text-xs text-slate-400 transition hover:bg-slate-800 hover:text-white"
+          onclick={toggleChatSidebar}
+          type="button"
+          title="Hide conversations"
+        >
+          <ChevronsLeft class="h-3.5 w-3.5" />
+          <span>Collapse</span>
+        </button>
+      </div>
     </aside>
 
     <!-- Main chat area -->
-    <section class={`${mobileListOpen && currentConversation ? 'hidden' : 'flex'} min-h-0 flex-col rounded-3xl border border-slate-800/80 bg-slate-900/70 shadow-card backdrop-blur xl:flex`}>
+    <section class={`${mobileListOpen && currentConversation ? 'hidden' : 'flex'} relative min-h-0 flex-col rounded-3xl border border-slate-800/80 bg-slate-900/70 shadow-card backdrop-blur xl:flex`}>
       <!-- Header -->
       <div class="border-b border-slate-800/80 px-5 py-4">
         <div class="flex flex-wrap items-start justify-between gap-3">
           <div class="min-w-0 flex-1">
-            <div class="mb-2 xl:hidden">
-              <Button size="sm" variant="secondary" onclick={() => (mobileListOpen = true)}>
-                <ArrowLeft class="mr-2 h-4 w-4" />
-                Conversations
-              </Button>
+            <div class="mb-2 flex items-center gap-2">
+              {#if chatSidebarCollapsed}
+                <button
+                  class="hidden rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-800 hover:text-white xl:inline-flex"
+                  onclick={toggleChatSidebar}
+                  type="button"
+                  title="Show conversations"
+                >
+                  <ChevronsRight class="h-4 w-4" />
+                </button>
+              {/if}
+              <div class="xl:hidden">
+                <Button size="sm" variant="secondary" onclick={() => (mobileListOpen = true)}>
+                  <ArrowLeft class="mr-2 h-4 w-4" />
+                  Conversations
+                </Button>
+              </div>
             </div>
 
             <!-- Editable title -->
@@ -833,10 +1007,45 @@
                     {sessions.length} sessions
                   </span>
                 {/if}
+
+                <!-- Session info button -->
+                <button
+                  class="flex items-center gap-1 text-xs text-slate-500 transition hover:text-sky-300"
+                  onclick={() => { sessionInfoOpen = !sessionInfoOpen; if (sessionInfoOpen && !sessionInfo) void loadSessionInfo(); }}
+                  type="button"
+                  title="Session details"
+                >
+                  <Info class="h-3.5 w-3.5" />
+                </button>
               {:else}
                 <span>No active conversation selected</span>
               {/if}
             </div>
+
+            <!-- Session info popover -->
+            {#if sessionInfoOpen}
+              <div class="mt-2 rounded-xl border border-slate-700 bg-slate-900/95 px-4 py-3 text-sm">
+                {#if sessionInfoLoading}
+                  <p class="text-xs text-slate-500">Loading session details...</p>
+                {:else if sessionInfo}
+                  {#if sessionInfo.intention}
+                    <div class="mb-2">
+                      <p class="text-[10px] font-semibold uppercase tracking-widest text-slate-500">Intention</p>
+                      <p class="mt-0.5 text-sm text-slate-200">{sessionInfo.intention}</p>
+                    </div>
+                  {/if}
+                  <div class="flex flex-wrap gap-3 text-xs text-slate-400">
+                    <span>Status: <span class="text-slate-200">{sessionInfo.status}</span></span>
+                    <span>Calls: <span class="text-slate-200">{sessionInfo.total_calls}</span></span>
+                    <span class="text-emerald-400">{sessionInfo.approved_count} approved</span>
+                    <span class="text-rose-400">{sessionInfo.denied_count} denied</span>
+                    <span class="text-amber-400">{sessionInfo.escalated_count} escalated</span>
+                  </div>
+                {:else}
+                  <p class="text-xs text-slate-500">Unable to load session details.</p>
+                {/if}
+              </div>
+            {/if}
           </div>
 
           <div class="flex flex-wrap gap-2">
@@ -884,22 +1093,12 @@
           </div>
         {/if}
 
-        {#if escalations.length > 0}
-          <div class="space-y-3">
-            {#each escalations as escalation (escalation.call_id)}
-              <EscalationPrompt
-                item={escalation}
-                secondsRemaining={escalationSecondsRemaining(escalation.call_id)}
-                pending={escalationBusyCallId === escalation.call_id}
-                onApprove={() => handleEscalationDecision(escalation.call_id, 'approve')}
-                onDeny={() => handleEscalationDecision(escalation.call_id, 'deny')}
-              />
-            {/each}
-          </div>
-        {/if}
-
         <!-- Timeline -->
-        <div class="min-h-0 flex-1 space-y-3 overflow-y-auto rounded-3xl border border-slate-800/80 bg-slate-950/60 p-4">
+        <div
+          class="relative min-h-0 flex-1 space-y-3 overflow-y-auto p-4"
+          bind:this={timelineEl}
+          onscroll={handleTimelineScroll}
+        >
           {#if visibleStartIndex > 0}
             <div class="flex justify-center">
               <Button size="sm" variant="secondary" onclick={loadOlder}>Load older messages</Button>
@@ -922,6 +1121,8 @@
                 <ReasoningBlock {item} />
               {:else if item.kind === 'delegation'}
                 <DelegationCard {item} onViewSession={handleViewSession} />
+              {:else if item.kind === 'system_message'}
+                <p class="py-1 text-center text-xs italic text-slate-500">{item.text}</p>
               {:else}
                 <article class={`rounded-3xl border px-4 py-4 text-sm shadow-card ${item.tone === 'warning' ? 'border-amber-500/30 bg-amber-500/10 text-amber-100' : item.tone === 'error' ? 'border-rose-500/30 bg-rose-500/10 text-rose-100' : 'border-slate-700 bg-slate-900 text-slate-200'}`}>
                   <h3 class="font-semibold">{item.title}</h3>
@@ -929,6 +1130,21 @@
                 </article>
               {/if}
             {/each}
+          {/if}
+
+          <!-- Escalation prompts (sequential: show one at a time) -->
+          {#if escalations.length > 0}
+            {@const current = escalations[0]}
+            <div class="space-y-3">
+              <EscalationPrompt
+                item={current}
+                secondsRemaining={escalationSecondsRemaining(current)}
+                pending={escalationBusyCallId === current.call_id}
+                queuedCount={escalations.length - 1}
+                onApprove={() => handleEscalationDecision(current.call_id, 'approve')}
+                onDeny={() => handleEscalationDecision(current.call_id, 'deny')}
+              />
+            </div>
           {/if}
 
           {#if turnInProgress && awaitingAssistantStart}
@@ -939,6 +1155,18 @@
                 <span class="h-2 w-2 animate-bounce rounded-full bg-sky-400 [animation-delay:300ms]"></span>
               </div>
             </div>
+          {/if}
+
+          <!-- Scroll to bottom button -->
+          {#if userScrolledUp}
+            <button
+              class="sticky bottom-2 left-1/2 z-10 -translate-x-1/2 rounded-full border border-slate-700 bg-slate-900/90 p-2 shadow-lg transition hover:bg-slate-800"
+              onclick={jumpToBottom}
+              type="button"
+              title="Scroll to bottom"
+            >
+              <ArrowDown class="h-4 w-4 text-slate-300" />
+            </button>
           {/if}
         </div>
 
@@ -952,25 +1180,20 @@
             This conversation is archived.
           </div>
         {:else}
-          <form class="space-y-3 rounded-3xl border border-slate-800/80 bg-slate-900/80 p-4" onsubmit={(event) => { event.preventDefault(); void handleSend(); }}>
+          <form class="shrink-0 space-y-3 rounded-3xl border border-slate-800/80 bg-slate-900/80 p-4" onsubmit={(event) => { event.preventDefault(); void handleSend(); }}>
             <textarea
               bind:this={composerElement}
               bind:value={composer}
-              class="min-h-[110px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500"
+              class="min-h-[80px] w-full resize-none rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500"
               disabled={!currentConversation || isReadOnly(currentConversation) || isLlmUnavailableForSetup()}
               onkeydown={handleComposerKeydown}
               placeholder={isLlmUnavailableForSetup() ? 'Configure an LLM provider to start chatting.' : 'Send a message to Cognis...'}
             ></textarea>
             <div class="flex flex-wrap items-center justify-between gap-3">
-              <div class="space-y-1">
-                <p class="text-xs uppercase tracking-[0.2em] text-slate-500">
-                  Reconnect-safe streaming via first-message-auth WebSocket
-                </p>
-                <label class="flex items-center gap-2 text-xs text-slate-400">
-                  <input bind:checked={enterToSend} class="h-4 w-4 rounded border-slate-700 bg-slate-950" onchange={persistEnterToSendPreference} type="checkbox" />
-                  <span>Press Enter to send</span>
-                </label>
-              </div>
+              <label class="flex items-center gap-2 text-xs text-slate-400">
+                <input bind:checked={enterToSend} class="h-4 w-4 rounded border-slate-700 bg-slate-950" onchange={persistEnterToSendPreference} type="checkbox" />
+                <span>Press Enter to send</span>
+              </label>
               <div class="flex gap-2">
                 <Button size="sm" variant="secondary" type="button" onclick={() => currentConversation && wsClient.cancelTurn(currentConversation.conversation_id)}>
                   Cancel turn
@@ -983,45 +1206,114 @@
           </form>
         {/if}
       </div>
-    </section>
 
-    <!-- Sub-session panel (slide-out) -->
-    {#if subSessionPanelOpen}
-      <aside class="flex min-h-0 w-full flex-col rounded-3xl border border-slate-800/80 bg-slate-900/70 shadow-card backdrop-blur xl:w-[420px]">
-        <div class="flex items-center justify-between border-b border-slate-800/80 px-4 py-3">
-          <div class="min-w-0">
-            <p class="text-xs font-medium uppercase tracking-[0.2em] text-slate-400">Sub-session</p>
-            <p class="mt-0.5 truncate font-mono text-xs text-slate-500">{subSessionId.slice(0, 16)}</p>
+      <!-- Sub-session drawer overlay -->
+      {#if subSessionPanelOpen}
+        <!-- Backdrop -->
+        <button
+          class={`absolute inset-0 z-20 bg-slate-950/50 backdrop-blur-sm transition-opacity duration-250 ${subSessionClosing ? 'opacity-0' : 'opacity-100'}`}
+          onclick={closeSubSessionPanel}
+          type="button"
+          aria-label="Close sub-session"
+        ></button>
+
+        <!-- Drawer -->
+        <aside class={`absolute inset-0 z-30 flex h-full w-full flex-col border-l border-slate-800/80 bg-slate-900/95 shadow-2xl backdrop-blur ${subSessionClosing ? 'animate-slide-out-right' : 'animate-slide-in-right'}`}>
+          <div class="flex items-center gap-3 border-b border-slate-800/80 px-4 py-3">
+            <button
+              class="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-800 hover:text-white"
+              onclick={closeSubSessionPanel}
+              type="button"
+              title="Back to conversation"
+            >
+              <ArrowLeft class="h-4 w-4" />
+            </button>
+            <div class="min-w-0 flex-1">
+              <p class="text-xs font-medium uppercase tracking-[0.2em] text-slate-400">Sub-session</p>
+              <p class="mt-0.5 truncate font-mono text-xs text-slate-500">{subSessionId.slice(0, 16)}</p>
+            </div>
+            <button
+              class="flex items-center gap-1 text-xs text-slate-500 transition hover:text-sky-300"
+              onclick={() => { subSessionInfoOpen = !subSessionInfoOpen; if (subSessionInfoOpen && !subSessionInfo) void loadSubSessionInfo(); }}
+              type="button"
+              title="Session details"
+            >
+              <Info class="h-3.5 w-3.5" />
+            </button>
           </div>
-          <Button size="sm" variant="ghost" onclick={closeSubSessionPanel}>Close</Button>
-        </div>
-        <div class="flex-1 overflow-y-auto px-4 py-4 space-y-4">
-          {#if subSessionLoading}
-            <LoadingState />
-          {:else if subSessionError}
-            <p class="text-sm text-rose-400">{subSessionError}</p>
-          {:else if subSessionTimeline.length === 0}
-            <p class="text-sm text-slate-500">No events recorded yet.</p>
-          {:else}
-            {#each subSessionTimeline as item (item.id)}
-              {#if item.kind === 'message'}
-                <ChatMessage {item} />
-              {:else if item.kind === 'tool_call'}
-                <ToolCallBlock {item} />
-              {:else if item.kind === 'reasoning'}
-                <ReasoningBlock {item} />
-              {:else if item.kind === 'delegation'}
-                <DelegationCard {item} />
-              {:else if item.kind === 'notice'}
-                <div class="rounded-xl border border-slate-800/60 bg-slate-900/50 px-3 py-2 text-xs text-slate-400">
-                  <p class="font-medium">{item.title}</p>
-                  {#if item.description}<p class="mt-1 opacity-75">{item.description}</p>{/if}
+
+          <!-- Sub-session info popover -->
+          {#if subSessionInfoOpen}
+            <div class="border-b border-slate-800/60 px-4 py-3 text-sm">
+              {#if subSessionInfoLoading}
+                <p class="text-xs text-slate-500">Loading session details...</p>
+              {:else if subSessionInfo}
+                {#if subSessionInfo.intention}
+                  <div class="mb-2">
+                    <p class="text-[10px] font-semibold uppercase tracking-widest text-slate-500">Intention</p>
+                    <p class="mt-0.5 text-sm text-slate-200">{subSessionInfo.intention}</p>
+                  </div>
+                {/if}
+                <div class="flex flex-wrap gap-3 text-xs text-slate-400">
+                  <span>Status: <span class="text-slate-200">{subSessionInfo.status}</span></span>
+                  <span>Calls: <span class="text-slate-200">{subSessionInfo.total_calls}</span></span>
+                  <span class="text-emerald-400">{subSessionInfo.approved_count} approved</span>
+                  <span class="text-rose-400">{subSessionInfo.denied_count} denied</span>
+                  <span class="text-amber-400">{subSessionInfo.escalated_count} escalated</span>
                 </div>
+              {:else}
+                <p class="text-xs text-slate-500">Unable to load session details.</p>
               {/if}
-            {/each}
+            </div>
           {/if}
-        </div>
-      </aside>
-    {/if}
+
+          <div class="flex-1 overflow-y-auto px-4 py-4 space-y-4">
+            {#if subSessionLoading}
+              <LoadingState />
+            {:else if subSessionError}
+              <p class="text-sm text-rose-400">{subSessionError}</p>
+            {:else if subSessionTimeline.length === 0}
+              <p class="text-sm text-slate-500">No events recorded yet.</p>
+            {:else}
+              {#each subSessionTimeline as item (item.id)}
+                {#if item.kind === 'message'}
+                  <div class={`flex ${item.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                    <ChatMessage {item} />
+                  </div>
+                {:else if item.kind === 'tool_call'}
+                  <ToolCallBlock {item} />
+                {:else if item.kind === 'reasoning'}
+                  <ReasoningBlock {item} />
+                {:else if item.kind === 'delegation'}
+                  <DelegationCard {item} />
+                {:else if item.kind === 'notice'}
+                  <div class="rounded-xl border border-slate-800/60 bg-slate-900/50 px-3 py-2 text-xs text-slate-400">
+                    <p class="font-medium">{item.title}</p>
+                    {#if item.description}<p class="mt-1 opacity-75">{item.description}</p>{/if}
+                  </div>
+                {/if}
+              {/each}
+            {/if}
+          </div>
+        </aside>
+      {/if}
+    </section>
   </div>
 {/if}
+
+<style>
+  @keyframes slide-in-right {
+    from { transform: translateX(100%); }
+    to { transform: translateX(0); }
+  }
+  @keyframes slide-out-right {
+    from { transform: translateX(0); }
+    to { transform: translateX(100%); }
+  }
+  .animate-slide-in-right {
+    animation: slide-in-right 0.25s ease-out forwards;
+  }
+  .animate-slide-out-right {
+    animation: slide-out-right 0.25s ease-in forwards;
+  }
+</style>
