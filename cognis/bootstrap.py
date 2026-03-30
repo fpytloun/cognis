@@ -122,6 +122,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await conn.run_sync(_ensure_session_lifecycle_columns)
+        await conn.run_sync(_ensure_session_compaction_columns)
         await conn.run_sync(_ensure_api_key_columns)
         await conn.run_sync(_ensure_agent_sync_metadata_column)
         await conn.run_sync(_ensure_provider_is_default_column)
@@ -141,6 +142,17 @@ def _ensure_session_lifecycle_columns(sync_conn: object) -> None:
             )
         )
         execute(text("UPDATE sessions SET updated_at = COALESCE(updated_at, started_at)"))
+
+
+def _ensure_session_compaction_columns(sync_conn: object) -> None:
+    inspector = cast(Any, inspect(sync_conn))
+    session_columns = {column["name"] for column in inspector.get_columns("sessions")}
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+
+    if "previous_session_id" not in session_columns:
+        execute(text("ALTER TABLE sessions ADD COLUMN previous_session_id VARCHAR"))
+    if "completion_reason" not in session_columns:
+        execute(text("ALTER TABLE sessions ADD COLUMN completion_reason VARCHAR"))
 
 
 def _ensure_api_key_columns(sync_conn: object) -> None:
