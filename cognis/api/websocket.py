@@ -1983,6 +1983,25 @@ async def _handle_slash_lsp(
             f"{totals['total_errors']} errors, {totals['total_warnings']} warnings"
         )
 
+        # Available servers (detected on system)
+        try:
+            available = await lsp_mgr.available_servers()
+            if available:
+                lines.append("\nAvailable servers:")
+                for srv in available:
+                    status_str = ""
+                    if srv["active"]:
+                        status_str = "active"
+                    elif srv["available"]:
+                        status_str = srv["path"]
+                    elif srv["has_auto_install"]:
+                        status_str = "not found (auto-install available)"
+                    else:
+                        status_str = "not found"
+                    lines.append(f"  {srv['server_id']} ({srv['extensions']}) — {status_str}")
+        except Exception:
+            pass  # Best-effort
+
     await manager.send_to_conversation(
         conversation_id,
         {

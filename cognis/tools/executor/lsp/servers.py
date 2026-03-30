@@ -205,6 +205,195 @@ BASH_LS = LSPServerDefinition(
     npm_run=True,
 )
 
+# ---------------------------------------------------------------------------
+# Additional servers
+# ---------------------------------------------------------------------------
+
+YAML_LS = LSPServerDefinition(
+    server_id="yaml",
+    extensions=frozenset({".yaml", ".yml"}),
+    command="yaml-language-server",
+    args=("--stdio",),
+    root_markers=(),
+    language_id_map={".yaml": "yaml", ".yml": "yaml"},
+    install_strategy=NpmInstall(
+        package="yaml-language-server",
+        version="1.15.0",
+        entry_point="node_modules/yaml-language-server/out/server/src/server.js",
+    ),
+    npm_run=True,
+)
+
+JSON_LS = LSPServerDefinition(
+    server_id="json",
+    extensions=frozenset({".json", ".jsonc"}),
+    command="vscode-json-language-server",
+    args=("--stdio",),
+    root_markers=(),
+    language_id_map={".json": "json", ".jsonc": "jsonc"},
+    install_strategy=NpmInstall(
+        package="vscode-langservers-extracted",
+        version="4.10.0",
+        entry_point="node_modules/vscode-langservers-extracted/bin/vscode-json-language-server",
+    ),
+    npm_run=True,
+)
+
+CSS_LS = LSPServerDefinition(
+    server_id="css",
+    extensions=frozenset({".css", ".scss", ".less"}),
+    command="vscode-css-language-server",
+    args=("--stdio",),
+    root_markers=("package.json",),
+    language_id_map={".css": "css", ".scss": "scss", ".less": "less"},
+    install_strategy=NpmInstall(
+        package="vscode-langservers-extracted",
+        version="4.10.0",
+        entry_point="node_modules/vscode-langservers-extracted/bin/vscode-css-language-server",
+    ),
+    npm_run=True,
+)
+
+HTML_LS = LSPServerDefinition(
+    server_id="html",
+    extensions=frozenset({".html", ".htm"}),
+    command="vscode-html-language-server",
+    args=("--stdio",),
+    root_markers=("package.json",),
+    language_id_map={".html": "html", ".htm": "html"},
+    install_strategy=NpmInstall(
+        package="vscode-langservers-extracted",
+        version="4.10.0",
+        entry_point="node_modules/vscode-langservers-extracted/bin/vscode-html-language-server",
+    ),
+    npm_run=True,
+)
+
+SVELTE = LSPServerDefinition(
+    server_id="svelte",
+    extensions=frozenset({".svelte"}),
+    command="svelteserver",
+    args=("--stdio",),
+    root_markers=("svelte.config.js", "svelte.config.ts", "package.json"),
+    language_id_map={".svelte": "svelte"},
+    install_strategy=NpmInstall(
+        package="svelte-language-server",
+        version="0.17.8",
+        entry_point="node_modules/svelte-language-server/bin/server.js",
+    ),
+    npm_run=True,
+)
+
+VUE = LSPServerDefinition(
+    server_id="vue",
+    extensions=frozenset({".vue"}),
+    command="vue-language-server",
+    args=("--stdio",),
+    root_markers=("vue.config.js", "nuxt.config.ts", "package.json"),
+    language_id_map={".vue": "vue"},
+    install_strategy=NpmInstall(
+        package="@vue/language-server",
+        version="2.2.8",
+        entry_point="node_modules/@vue/language-server/bin/vue-language-server.js",
+    ),
+    npm_run=True,
+)
+
+DOCKERFILE = LSPServerDefinition(
+    server_id="dockerfile",
+    extensions=frozenset({".dockerfile"}),
+    command="docker-langserver",
+    args=("--stdio",),
+    root_markers=("Dockerfile", "docker-compose.yml", "docker-compose.yaml"),
+    language_id_map={".dockerfile": "dockerfile"},
+    install_strategy=NpmInstall(
+        package="dockerfile-language-server-nodejs",
+        version="0.13.0",
+        entry_point="node_modules/dockerfile-language-server-nodejs/lib/server.js",
+    ),
+    npm_run=True,
+)
+
+TERRAFORM = LSPServerDefinition(
+    server_id="terraform",
+    extensions=frozenset({".tf", ".tfvars"}),
+    command="terraform-ls",
+    args=("serve",),
+    root_markers=(".terraform", "main.tf", "terraform.tfvars"),
+    language_id_map={".tf": "terraform", ".tfvars": "terraform-vars"},
+    install_strategy=None,  # Install via system package manager
+)
+
+TOML_LS = LSPServerDefinition(
+    server_id="toml",
+    extensions=frozenset({".toml"}),
+    command="taplo",
+    args=("lsp", "stdio"),
+    root_markers=(),
+    language_id_map={".toml": "toml"},
+    install_strategy=None,  # Install via cargo or system package manager
+)
+
+LUA_LS = LSPServerDefinition(
+    server_id="lua",
+    extensions=frozenset({".lua"}),
+    command="lua-language-server",
+    args=(),
+    root_markers=(".luarc.json", ".luarc.jsonc", ".luacheckrc"),
+    language_id_map={".lua": "lua"},
+    install_strategy=None,  # Install via system package manager
+)
+
+NIXD = LSPServerDefinition(
+    server_id="nixd",
+    extensions=frozenset({".nix"}),
+    command="nixd",
+    args=(),
+    root_markers=("flake.nix", "default.nix", "shell.nix"),
+    language_id_map={".nix": "nix"},
+    install_strategy=None,  # Install via nix
+)
+
+ZLS = LSPServerDefinition(
+    server_id="zls",
+    extensions=frozenset({".zig", ".zon"}),
+    command="zls",
+    args=(),
+    root_markers=("build.zig", "build.zig.zon"),
+    language_id_map={".zig": "zig", ".zon": "zig"},
+    install_strategy=None,  # Install via system package manager
+)
+
+DART = LSPServerDefinition(
+    server_id="dart",
+    extensions=frozenset({".dart"}),
+    command="dart",
+    args=("language-server", "--protocol=lsp"),
+    root_markers=("pubspec.yaml", "pubspec.lock"),
+    language_id_map={".dart": "dart"},
+    install_strategy=None,  # Comes with Dart/Flutter SDK
+)
+
+GLEAM = LSPServerDefinition(
+    server_id="gleam",
+    extensions=frozenset({".gleam"}),
+    command="gleam",
+    args=("lsp",),
+    root_markers=("gleam.toml",),
+    language_id_map={".gleam": "gleam"},
+    install_strategy=None,  # Comes with gleam toolchain
+)
+
+SOURCEKIT_LSP = LSPServerDefinition(
+    server_id="sourcekit-lsp",
+    extensions=frozenset({".swift"}),
+    command="sourcekit-lsp",
+    args=(),
+    root_markers=("Package.swift", ".swift-version"),
+    language_id_map={".swift": "swift"},
+    install_strategy=None,  # Comes with Xcode / Swift toolchain
+)
+
 
 # ---------------------------------------------------------------------------
 # Registry
@@ -219,6 +408,21 @@ BUILTIN_SERVERS: list[LSPServerDefinition] = [
     RUST_ANALYZER,
     CLANGD,
     BASH_LS,
+    YAML_LS,
+    JSON_LS,
+    CSS_LS,
+    HTML_LS,
+    SVELTE,
+    VUE,
+    DOCKERFILE,
+    TERRAFORM,
+    TOML_LS,
+    LUA_LS,
+    NIXD,
+    ZLS,
+    DART,
+    GLEAM,
+    SOURCEKIT_LSP,
 ]
 
 #: Mapping of file extension to server definitions (multiple servers per

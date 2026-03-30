@@ -226,3 +226,57 @@ class TestLSPManagerStatus:
         assert status["totals"]["files_tracked"] == 3
         assert status["totals"]["total_errors"] == 2
         assert status["totals"]["total_warnings"] == 1
+
+
+class TestAvailableServers:
+    """Test the available_servers() method."""
+
+    @pytest.mark.asyncio()
+    async def test_available_servers_returns_all_definitions(self) -> None:
+        """Should return an entry for every built-in server."""
+        manager = LSPManager(enabled=True)
+        with patch("cognis.tools.executor.lsp.manager.shutil.which", return_value=None):
+            results = await manager.available_servers()
+        # Should have entries for all builtin servers
+        from cognis.tools.executor.lsp.servers import BUILTIN_SERVERS
+
+        assert len(results) == len(BUILTIN_SERVERS)
+        ids = {r["server_id"] for r in results}
+        assert "pyright" in ids
+        assert "yaml" in ids
+        assert "typescript" in ids
+
+    @pytest.mark.asyncio()
+    async def test_available_servers_detects_path(self) -> None:
+        """Should mark servers found on PATH as available."""
+        manager = LSPManager(enabled=True)
+
+        def mock_which(cmd: str) -> str | None:
+            if cmd == "gopls":
+                return "/usr/local/bin/gopls"
+            return None
+
+        with patch("cognis.tools.executor.lsp.manager.shutil.which", side_effect=mock_which):
+            results = await manager.available_servers()
+
+        gopls = next(r for r in results if r["server_id"] == "gopls")
+        assert gopls["available"] is True
+        assert gopls["path"] == "/usr/local/bin/gopls"
+
+        pyright = next(r for r in results if r["server_id"] == "pyright")
+        assert pyright["available"] is False
+
+    @pytest.mark.asyncio()
+    async def test_available_servers_shows_active(self) -> None:
+        """Should mark active servers."""
+        manager = LSPManager(enabled=True)
+        manager._clients["pyright:/tmp/project"] = MagicMock()
+
+        with patch("cognis.tools.executor.lsp.manager.shutil.which", return_value=None):
+            results = await manager.available_servers()
+
+        pyright = next(r for r in results if r["server_id"] == "pyright")
+        assert pyright["active"] is True
+
+        gopls = next(r for r in results if r["server_id"] == "gopls")
+        assert gopls["active"] is False

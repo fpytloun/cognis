@@ -1154,6 +1154,88 @@
                 ? 'All tools enabled'
                 : `${(exec.enabled_tools || []).length} individual + ${(exec.enabled_tool_groups || []).length} group(s) enabled`}
             </div>
+
+            <!-- LSP Diagnostics settings -->
+            {@const lspConfig = exec.config || {}}
+            {@const lspEnabled = lspConfig.lsp_enabled !== false}
+            {@const lspAutoInstall = lspConfig.lsp_auto_install !== false}
+            <details class="group">
+              <summary class="cursor-pointer text-xs uppercase tracking-wider text-slate-400 hover:text-slate-300 select-none">
+                LSP Diagnostics
+                <span class="ml-1 text-slate-500">{lspEnabled ? '(enabled)' : '(disabled)'}</span>
+              </summary>
+              <div class="mt-3 space-y-3 pl-1">
+                <div class="flex flex-wrap gap-4">
+                  <label class="flex items-center gap-2 text-sm text-slate-300">
+                    <input type="checkbox" checked={lspEnabled}
+                      class="rounded border-slate-600 bg-slate-800 text-emerald-500 focus:ring-emerald-500/30"
+                      onchange={async (e) => {
+                        const checked = /** @type {HTMLInputElement} */ (e.target).checked;
+                        const cfg = { ...(exec.config || {}), lsp_enabled: checked };
+                        await api.executor.update(exec.executor_id, { config: cfg });
+                        await refreshPageState();
+                        addToast(`LSP ${checked ? 'enabled' : 'disabled'}.`, 'success');
+                      }}
+                    />
+                    Enabled
+                  </label>
+                  <label class="flex items-center gap-2 text-sm text-slate-300">
+                    <input type="checkbox" checked={lspAutoInstall} disabled={!lspEnabled}
+                      class="rounded border-slate-600 bg-slate-800 text-emerald-500 focus:ring-emerald-500/30 disabled:opacity-40"
+                      onchange={async (e) => {
+                        const checked = /** @type {HTMLInputElement} */ (e.target).checked;
+                        const cfg = { ...(exec.config || {}), lsp_auto_install: checked };
+                        await api.executor.update(exec.executor_id, { config: cfg });
+                        await refreshPageState();
+                        addToast(`Auto-install ${checked ? 'enabled' : 'disabled'}.`, 'success');
+                      }}
+                    />
+                    Auto-install servers
+                  </label>
+                </div>
+                <div class="grid gap-3 md:grid-cols-3">
+                  <label class="space-y-1 text-sm text-slate-300">
+                    <span class="text-xs text-slate-400">Diagnostics timeout (ms)</span>
+                    <Input value={lspConfig.lsp_diagnostics_timeout_ms ?? 10000} disabled={!lspEnabled}
+                      type="number" min="1000" max="60000" step="1000"
+                      onchange={async (e) => {
+                        const val = parseInt(/** @type {HTMLInputElement} */ (e.target).value, 10);
+                        if (isNaN(val)) return;
+                        const cfg = { ...(exec.config || {}), lsp_diagnostics_timeout_ms: val };
+                        await api.executor.update(exec.executor_id, { config: cfg });
+                        await refreshPageState();
+                      }}
+                    />
+                  </label>
+                  <label class="space-y-1 text-sm text-slate-300">
+                    <span class="text-xs text-slate-400">Idle timeout (seconds)</span>
+                    <Input value={lspConfig.lsp_idle_timeout_seconds ?? 600} disabled={!lspEnabled}
+                      type="number" min="60" max="3600" step="60"
+                      onchange={async (e) => {
+                        const val = parseInt(/** @type {HTMLInputElement} */ (e.target).value, 10);
+                        if (isNaN(val)) return;
+                        const cfg = { ...(exec.config || {}), lsp_idle_timeout_seconds: val };
+                        await api.executor.update(exec.executor_id, { config: cfg });
+                        await refreshPageState();
+                      }}
+                    />
+                  </label>
+                  <label class="space-y-1 text-sm text-slate-300">
+                    <span class="text-xs text-slate-400">Max concurrent servers</span>
+                    <Input value={lspConfig.lsp_max_concurrent_servers ?? 8} disabled={!lspEnabled}
+                      type="number" min="1" max="32" step="1"
+                      onchange={async (e) => {
+                        const val = parseInt(/** @type {HTMLInputElement} */ (e.target).value, 10);
+                        if (isNaN(val)) return;
+                        const cfg = { ...(exec.config || {}), lsp_max_concurrent_servers: val };
+                        await api.executor.update(exec.executor_id, { config: cfg });
+                        await refreshPageState();
+                      }}
+                    />
+                  </label>
+                </div>
+              </div>
+            </details>
           </Card>
         {/each}
 

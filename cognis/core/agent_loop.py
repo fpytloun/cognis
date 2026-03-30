@@ -397,6 +397,8 @@ class StepContext:
     step_inputs: dict[str, StepOutput] = field(default_factory=dict)
     todos: list[dict[str, Any]] = field(default_factory=list)
     task_id: str | None = None
+    task_title: str = ""
+    task_description: str = ""
     step_run_id: str | None = None
     is_direct: bool = False  # True for main chat (Direct workflow)
     is_retry: bool = False  # True for re-attempt within the same step
@@ -2508,13 +2510,23 @@ class AgentLoop:
 
         For first-attempt workflow steps the ``StepContextAssembler``
         handles prior-step input injection, so this method only includes
-        the step objective and any in-progress todos.
+        the task context, step objective, and any in-progress todos.
 
         For retries the regular ``ContextAssembler`` reads session history
         directly, so there is no step_inputs section here either.
         """
+        parts: list[str] = []
+
+        # Inject task context so the LLM knows what the workflow is about
+        if ctx.task_title or ctx.task_description:
+            parts.append("## Task\n\n")
+            if ctx.task_title:
+                parts.append(f"**{ctx.task_title}**\n\n")
+            if ctx.task_description:
+                parts.append(f"{ctx.task_description}\n\n")
+
         prompt_text = ctx.user_message or ctx.step_definition.prompt
-        parts = [f"## Step: {ctx.step_definition.name}\n\n{prompt_text}"]
+        parts.append(f"## Step: {ctx.step_definition.name}\n\n{prompt_text}")
 
         if ctx.todos:
             parts.append("\n\n## Your step todos:\n")

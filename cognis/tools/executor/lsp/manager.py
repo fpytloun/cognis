@@ -409,6 +409,49 @@ class LSPManager:
             },
         }
 
+    async def available_servers(self) -> list[dict[str, Any]]:
+        """Detect which language servers are available on the system.
+
+        Checks PATH and cache for each built-in server definition.
+        Returns a list of dicts with server info and detection status.
+        """
+        from cognis.tools.executor.lsp.servers import BUILTIN_SERVERS
+
+        results: list[dict[str, Any]] = []
+        for server_def in BUILTIN_SERVERS:
+            path = await asyncio.to_thread(shutil.which, server_def.command)
+            if path is None and server_def.install_strategy is not None:
+                cached = await server_def.install_strategy.detect(
+                    server_def.server_id, self.cache_dir
+                )
+                if cached is not None:
+                    path = str(cached)
+
+            # Summarise extensions
+            exts = sorted(server_def.extensions)
+            ext_str = ", ".join(exts[:4])
+            if len(exts) > 4:
+                ext_str += f" +{len(exts) - 4}"
+
+            # Check if currently active
+            active_key = None
+            for key in self._clients:
+                if key.startswith(f"{server_def.server_id}:"):
+                    active_key = key
+                    break
+
+            results.append(
+                {
+                    "server_id": server_def.server_id,
+                    "extensions": ext_str,
+                    "path": path,
+                    "available": path is not None,
+                    "has_auto_install": server_def.install_strategy is not None,
+                    "active": active_key is not None,
+                }
+            )
+        return results
+
     async def cleanup(self) -> None:
         """Shutdown all LSP clients and cancel background tasks."""
         if self._cleanup_done:

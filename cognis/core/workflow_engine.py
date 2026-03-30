@@ -434,6 +434,8 @@ class WorkflowEngine:
             conversation=conversation,
             agent=agent,
             task_id=task.task_id,
+            task_title=task.title,
+            task_description=task.description,
             step_run_id=step_run_id,
             is_direct=False,
             is_retry=is_retry,
@@ -970,7 +972,7 @@ class WorkflowEngine:
             agent_id=agent.agent_id,
             context=context,
             title=f"Task: {task.title} / Step: {step_def.name}",
-            intention=f"Workflow step: {step_def.name} — {step_def.description or step_def.prompt[:100]}",
+            intention=f"Task: {task.title} — Step: {step_def.name} — {step_def.description or step_def.prompt[:100]}",
         )
         return conversation, session
 

@@ -342,7 +342,7 @@ uv run alembic -c cognis/store/migrations/alembic.ini downgrade -1
 | `COGNIS_LOG_FORMAT` | `json` | Log format (json or text) |
 | `COGNIS_CORS_ORIGINS` | `http://localhost:5173` | CORS allowlist |
 | `COGNIS_LSP_ENABLED` | `true` | Enable LSP diagnostics after file edits |
-| `COGNIS_LSP_AUTO_INSTALL` | `false` | Auto-install missing language servers |
+| `COGNIS_LSP_AUTO_INSTALL` | `true` | Auto-install missing language servers |
 | `COGNIS_LSP_DIAGNOSTICS_TIMEOUT_MS` | `10000` | Max wait for diagnostics (ms) |
 | `COGNIS_LSP_IDLE_TIMEOUT_SECONDS` | `600` | Kill idle LSP servers after (s) |
 | `COGNIS_LSP_MAX_CONCURRENT_SERVERS` | `8` | Max concurrent LSP server processes |

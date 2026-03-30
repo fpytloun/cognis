@@ -77,7 +77,7 @@ def load_config() -> CognisConfig:
     serve_ui = serve_ui_raw not in {"0", "false", "no", "off"}
 
     lsp_enabled_raw = os.environ.get("COGNIS_LSP_ENABLED", "true").strip().lower()
-    lsp_auto_install_raw = os.environ.get("COGNIS_LSP_AUTO_INSTALL", "false").strip().lower()
+    lsp_auto_install_raw = os.environ.get("COGNIS_LSP_AUTO_INSTALL", "true").strip().lower()
 
     return CognisConfig(
         data_dir=data_dir,
@@ -155,7 +155,7 @@ ENV_TEMPLATE = """\
 
 # LSP diagnostics (auto-detect language servers for edit feedback)
 # COGNIS_LSP_ENABLED=true
-# COGNIS_LSP_AUTO_INSTALL=false
+# COGNIS_LSP_AUTO_INSTALL=true
 # COGNIS_LSP_DIAGNOSTICS_TIMEOUT_MS=10000
 # COGNIS_LSP_IDLE_TIMEOUT_SECONDS=600
 # COGNIS_LSP_MAX_CONCURRENT_SERVERS=8

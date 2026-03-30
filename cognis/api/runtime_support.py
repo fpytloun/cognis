@@ -159,6 +159,10 @@ def build_step_runtime_factory(
         enabled_tools = executor_config.get("enabled_tools") if executor_config else None
         enabled_groups = executor_config.get("enabled_tool_groups") if executor_config else None
 
+        # Build runtime metadata: user context + executor DB config (LSP settings, etc.)
+        db_config = executor_config.get("config", {}) if executor_config else {}
+        runtime_metadata = {"user_email": user_email, **db_config}
+
         # Filter tools by agent config AND executor enablement
         agent_tools = select_static_tools(agent)
         if executor_config is not None:
@@ -187,7 +191,7 @@ def build_step_runtime_factory(
                     tools=agent_tools,
                     mcp_servers=mcp_servers,
                     secrets=secrets,
-                    metadata={"user_email": user_email},
+                    metadata=runtime_metadata,
                 )
             )
             connection = await providers.executor.get_executor(handle)
@@ -209,7 +213,7 @@ def build_step_runtime_factory(
                 shared_connection.handle,
                 registry,
                 shared_connection.breaker,
-                {"user_email": user_email},
+                runtime_metadata,
             )
             return registry, connection, noop_cleanup
 
@@ -248,6 +252,7 @@ async def _resolve_executor_config(
                 "enabled_tools": selected.enabled_tools or [],
                 "enabled_tool_groups": selected.enabled_tool_groups or [],
                 "labels": selected.labels or {},
+                "config": selected.config or {},
             }
     except Exception:
         logger.warning("Failed to resolve executor config from DB", exc_info=True)
