@@ -1119,6 +1119,11 @@ async def handle_websocket(websocket: WebSocket) -> None:
                     )
                     continue
 
+                # /lsp — show LSP diagnostics status
+                if stripped == "/lsp":
+                    await _handle_slash_lsp(websocket.app, manager, connection, conversation)
+                    continue
+
                 # /help — show available commands
                 if stripped == "/help":
                     await _handle_slash_help(manager, connection, conversation)
@@ -1900,9 +1905,98 @@ async def _handle_slash_thinking(
     )
 
 
+async def _handle_slash_lsp(
+    app: Any,
+    manager: Any,
+    connection: Any,
+    conversation: Any,
+) -> None:
+    """Handle /lsp — display LSP diagnostics subsystem status."""
+    conversation_id = conversation.conversation_id
+    lines: list[str] = []
+
+    # Collect LSP managers from all active executor runtimes
+    executor = app.state.providers.executor
+    lsp_managers = executor.get_lsp_managers() if hasattr(executor, "get_lsp_managers") else []
+
+    if not lsp_managers:
+        lines.append("LSP Diagnostics")
+        lines.append("  Status: no active LSP managers")
+        await manager.send_to_conversation(
+            conversation_id,
+            {
+                "type": "system_message",
+                "conversation_id": conversation_id,
+                "text": "\n".join(lines),
+            },
+        )
+        return
+
+    # Aggregate status from all managers (typically just one)
+    for lsp_mgr in lsp_managers:
+        status = lsp_mgr.status()
+        cfg = status["config"]
+        totals = status["totals"]
+
+        lines.append("LSP Diagnostics")
+        lines.append(f"  Status: {'enabled' if cfg['enabled'] else 'disabled'}")
+        lines.append(f"  Auto-install: {'enabled' if cfg['auto_install'] else 'disabled'}")
+        lines.append(f"  Timeout: {cfg['diagnostics_timeout_ms']}ms")
+        lines.append(f"  Max servers: {cfg['max_concurrent_servers']}")
+
+        active = status["active_servers"]
+        if active:
+            lines.append(
+                f"\nActive servers ({totals['active_server_count']}/{cfg['max_concurrent_servers']}):"
+            )
+            for srv in active:
+                pid_str = f"PID {srv['pid']}" if srv["pid"] else "no PID"
+                alive_str = "" if srv["alive"] else " [dead]"
+                lines.append(f"  {srv['server_name']} ({pid_str}{alive_str})")
+                lines.append(f"    Root: {srv['root_path']}")
+                lines.append(
+                    f"    Files: {srv['file_count']}, "
+                    f"diagnostics: {srv['error_count']} errors, "
+                    f"{srv['warning_count']} warnings"
+                )
+                idle = srv["idle_seconds"]
+                if idle >= 60:
+                    lines.append(f"    Idle: {idle // 60}m {idle % 60}s")
+                else:
+                    lines.append(f"    Idle: {idle}s")
+        else:
+            lines.append("\nNo active servers")
+
+        broken = status["broken_servers"]
+        if broken:
+            lines.append(f"\nBroken servers ({len(broken)}):")
+            for brk in broken:
+                retry = brk["retry_in_seconds"]
+                retry_str = f"{retry // 60}m {retry % 60}s" if retry >= 60 else f"{retry}s"
+                lines.append(f"  {brk['client_key']} (retry in {retry_str})")
+
+        if status["spawning_count"] > 0:
+            lines.append(f"\nSpawning: {status['spawning_count']} server(s)")
+
+        lines.append(
+            f"\nTotals: {totals['files_tracked']} files tracked, "
+            f"{totals['total_errors']} errors, {totals['total_warnings']} warnings"
+        )
+
+    await manager.send_to_conversation(
+        conversation_id,
+        {
+            "type": "system_message",
+            "conversation_id": conversation_id,
+            "text": "\n".join(lines),
+        },
+    )
+
+
 _HELP_TEXT = """\
 Available commands:
   /help              Show this help message
+  /lsp               Show LSP diagnostics status
   /model [name]      List available models or switch model
   /thinking [level]  Show or set reasoning effort (low/medium/high)
   /context           Show context window usage

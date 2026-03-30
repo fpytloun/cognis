@@ -21,6 +21,7 @@ import os
 import shutil
 from pathlib import Path
 from time import monotonic, perf_counter
+from typing import Any
 
 from prometheus_client import Counter, Gauge, Histogram
 
@@ -315,6 +316,98 @@ class LSPManager:
                         result[path] = diags
 
         return result
+
+    def status(self) -> dict[str, Any]:
+        """Return structured status information for the ``/lsp`` command.
+
+        Returns a dict with configuration, active servers, broken servers,
+        and aggregate totals.
+        """
+        now = monotonic()
+
+        # Configuration
+        config = {
+            "enabled": self.enabled,
+            "auto_install": self.auto_install,
+            "diagnostics_timeout_ms": self.diagnostics_timeout_ms,
+            "idle_timeout_seconds": self.idle_timeout_seconds,
+            "max_concurrent_servers": self.max_concurrent_servers,
+        }
+
+        # Active servers
+        active_servers: list[dict[str, Any]] = []
+        total_files = 0
+        total_errors = 0
+        total_warnings = 0
+
+        for client_key, client in self._clients.items():
+            # Parse server_id and root from key
+            parts = client_key.split(":", 1)
+            server_id = parts[0] if parts else client_key
+            root_path = parts[1] if len(parts) > 1 else ""
+
+            # Count files opened on this client
+            opened = self._opened_files.get(client_key, set())
+            file_count = len(opened)
+            total_files += file_count
+
+            # Count diagnostics by severity
+            error_count = 0
+            warning_count = 0
+            all_diags = client.get_diagnostics()
+            for diag_list in all_diags.values():
+                for d in diag_list:
+                    if d.severity is not None:
+                        if d.severity.value == 1:
+                            error_count += 1
+                        elif d.severity.value == 2:
+                            warning_count += 1
+            total_errors += error_count
+            total_warnings += warning_count
+
+            # Idle time
+            last_access = self._last_access.get(client_key, now)
+            idle_seconds = int(now - last_access)
+
+            pid = client.process.pid if client.process else None
+
+            active_servers.append(
+                {
+                    "server_id": server_id,
+                    "server_name": client.server_name or server_id,
+                    "root_path": root_path,
+                    "pid": pid,
+                    "alive": client.is_alive,
+                    "file_count": file_count,
+                    "error_count": error_count,
+                    "warning_count": warning_count,
+                    "idle_seconds": idle_seconds,
+                }
+            )
+
+        # Broken servers
+        broken_servers: list[dict[str, Any]] = []
+        for client_key, broken_until in self._broken.items():
+            retry_in = max(0, int(broken_until - now))
+            broken_servers.append(
+                {
+                    "client_key": client_key,
+                    "retry_in_seconds": retry_in,
+                }
+            )
+
+        return {
+            "config": config,
+            "active_servers": active_servers,
+            "broken_servers": broken_servers,
+            "spawning_count": len(self._spawning),
+            "totals": {
+                "active_server_count": len(active_servers),
+                "files_tracked": total_files,
+                "total_errors": total_errors,
+                "total_warnings": total_warnings,
+            },
+        }
 
     async def cleanup(self) -> None:
         """Shutdown all LSP clients and cancel background tasks."""

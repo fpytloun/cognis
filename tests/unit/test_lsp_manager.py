@@ -149,3 +149,80 @@ class TestBrokenRetry:
 
         # The broken entry should have been cleared or no longer present
         # (since no server matches, nothing re-breaks it)
+
+
+class TestLSPManagerStatus:
+    """Test the status() method for /lsp command."""
+
+    def test_status_disabled(self) -> None:
+        manager = LSPManager(enabled=False)
+        status = manager.status()
+        assert status["config"]["enabled"] is False
+        assert status["totals"]["active_server_count"] == 0
+
+    def test_status_empty(self) -> None:
+        manager = LSPManager(enabled=True)
+        status = manager.status()
+        assert status["config"]["enabled"] is True
+        assert status["active_servers"] == []
+        assert status["broken_servers"] == []
+        assert status["totals"]["files_tracked"] == 0
+        assert status["totals"]["total_errors"] == 0
+        assert status["totals"]["total_warnings"] == 0
+
+    def test_status_with_broken_server(self) -> None:
+        manager = LSPManager(enabled=True)
+        manager._broken["pyright:/tmp/project"] = monotonic() + 300
+        status = manager.status()
+        assert len(status["broken_servers"]) == 1
+        assert status["broken_servers"][0]["client_key"] == "pyright:/tmp/project"
+        assert status["broken_servers"][0]["retry_in_seconds"] > 0
+
+    def test_status_with_mock_client(self) -> None:
+        """Test status with a mock LSP client."""
+        manager = LSPManager(enabled=True, max_concurrent_servers=4)
+
+        mock_client = MagicMock()
+        mock_client.server_id = "pyright"
+        mock_client.server_name = "Pyright"
+        mock_client.is_alive = True
+        mock_client.process = MagicMock()
+        mock_client.process.pid = 12345
+        mock_client.get_diagnostics.return_value = {
+            "file:///src/foo.py": [
+                MagicMock(severity=MagicMock(value=1)),  # error
+                MagicMock(severity=MagicMock(value=2)),  # warning
+            ],
+            "file:///src/bar.py": [
+                MagicMock(severity=MagicMock(value=1)),  # error
+            ],
+        }
+
+        client_key = "pyright:/tmp/project"
+        manager._clients[client_key] = mock_client
+        manager._opened_files[client_key] = {
+            "file:///src/foo.py",
+            "file:///src/bar.py",
+            "file:///src/baz.py",
+        }
+        manager._last_access[client_key] = monotonic() - 45
+
+        status = manager.status()
+        assert status["config"]["max_concurrent_servers"] == 4
+        assert len(status["active_servers"]) == 1
+
+        srv = status["active_servers"][0]
+        assert srv["server_id"] == "pyright"
+        assert srv["server_name"] == "Pyright"
+        assert srv["root_path"] == "/tmp/project"
+        assert srv["pid"] == 12345
+        assert srv["alive"] is True
+        assert srv["file_count"] == 3
+        assert srv["error_count"] == 2
+        assert srv["warning_count"] == 1
+        assert srv["idle_seconds"] >= 44
+
+        assert status["totals"]["active_server_count"] == 1
+        assert status["totals"]["files_tracked"] == 3
+        assert status["totals"]["total_errors"] == 2
+        assert status["totals"]["total_warnings"] == 1

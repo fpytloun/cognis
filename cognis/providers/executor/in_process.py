@@ -281,6 +281,10 @@ class InProcessExecutorProvider:
 
         return [runtime.handle for runtime in self._active.values()]
 
+    def get_lsp_managers(self) -> list[LSPManager]:
+        """Return all active LSP managers across executor runtimes."""
+        return [rt.lsp_manager for rt in self._active.values() if rt.lsp_manager is not None]
+
     async def cleanup(self) -> None:
         """Close all active executor runtimes."""
 

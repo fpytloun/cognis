@@ -590,7 +590,7 @@
   }
 
   /** Slash commands that are handled as system actions, not chat messages. */
-  const SYSTEM_SLASH_COMMANDS = ['/approve', '/deny', '/compact', '/summarize', '/new', '/reset', '/clear', '/context', '/info', '/model', '/thinking', '/help'];
+  const SYSTEM_SLASH_COMMANDS = ['/approve', '/deny', '/compact', '/summarize', '/new', '/reset', '/clear', '/context', '/info', '/lsp', '/model', '/thinking', '/help'];
 
   /** Slash command suggestions shown when user types /. */
   const SLASH_SUGGESTIONS = [
