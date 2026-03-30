@@ -590,7 +590,7 @@
   }
 
   /** Slash commands that are handled as system actions, not chat messages. */
-  const SYSTEM_SLASH_COMMANDS = ['/approve', '/deny'];
+  const SYSTEM_SLASH_COMMANDS = ['/approve', '/deny', '/compact', '/summarize', '/new', '/reset', '/clear', '/context', '/info'];
 
   async function handleSend(): Promise<void> {
     const content = composer.trim();
@@ -1182,7 +1182,7 @@
               {:else if item.kind === 'compaction'}
                 <CompactionCard {item} onViewPreviousSession={handleViewSession} />
               {:else if item.kind === 'system_message'}
-                <p class="py-1 text-center text-xs italic text-slate-500">{item.text}</p>
+                <p class="py-1 text-center text-xs italic text-slate-500 whitespace-pre-line">{item.text}</p>
               {:else}
                 <article class={`rounded-3xl border px-4 py-4 text-sm shadow-card ${item.tone === 'warning' ? 'border-amber-500/30 bg-amber-500/10 text-amber-100' : item.tone === 'error' ? 'border-rose-500/30 bg-rose-500/10 text-rose-100' : 'border-slate-700 bg-slate-900 text-slate-200'}`}>
                   <h3 class="font-semibold">{item.title}</h3>
