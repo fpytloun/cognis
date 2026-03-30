@@ -82,6 +82,7 @@ class IntarisSession(BaseModel):
     session_id: str
     user_id: str
     agent_id: str
+    title: str | None = None
     intention: str | None = None
     details: dict[str, Any] | None = None
     policy: dict[str, Any] | None = None

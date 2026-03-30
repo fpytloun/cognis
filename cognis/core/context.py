@@ -14,7 +14,7 @@ from cognis.models.agent import AgentDefinition
 from cognis.models.session import ConversationModel, SessionModel
 from cognis.models.tool import ToolDefinition
 from cognis.runtime_context import scoped_runtime_context
-from cognis.store.queries import get_setting_value
+from cognis.store.queries import get_setting_value, update_conversation
 
 logger = get_logger(__name__)
 
@@ -55,6 +55,7 @@ class ContextAssembler:
         session_manager: Any,
         max_context_tokens: int,
         compaction_threshold: float,
+        session_factory: async_sessionmaker[AsyncSession] | None = None,
     ) -> None:
         self.memory = memory
         self.guardrails = guardrails
@@ -63,6 +64,7 @@ class ContextAssembler:
         self.session_manager = session_manager
         self.max_context_tokens = max_context_tokens
         self.compaction_threshold = compaction_threshold
+        self.session_factory = session_factory
 
     @classmethod
     async def from_session_factory(
@@ -96,6 +98,7 @@ class ContextAssembler:
             compaction_threshold=float(compaction_threshold)
             if isinstance(compaction_threshold, (int, float))
             else 0.85,
+            session_factory=session_factory,
         )
 
     async def assemble(
@@ -168,6 +171,34 @@ class ContextAssembler:
                 session.session_id, intention_result.intention
             )
             cache_entry.intention = intention_result.intention
+
+            # Sync Intaris-generated title to conversation. Only writes
+            # to DB when the title has actually changed to avoid churn.
+            if (
+                intention_result.title
+                and conversation.title != intention_result.title
+                and self.session_factory is not None
+            ):
+                try:
+                    async with self.session_factory() as db_session:
+                        ok = await update_conversation(
+                            db_session,
+                            conversation.conversation_id,
+                            title=intention_result.title,
+                        )
+                        if ok:
+                            await db_session.commit()
+                            conversation.title = intention_result.title
+                except Exception:
+                    logger.debug(
+                        "context: failed to sync title from Intaris",
+                        extra={
+                            "extra_data": {
+                                "conversation_id": conversation.conversation_id,
+                            }
+                        },
+                        exc_info=True,
+                    )
 
         memory_block = None
         if isinstance(recall_result, Exception):

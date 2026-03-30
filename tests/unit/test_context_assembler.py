@@ -75,7 +75,7 @@ class _Guardrails:
     async def get_session(self, session_id: str) -> object:
         del session_id
         await asyncio.sleep(0.1)
-        return type("IntarisSession", (), {"intention": "fresh intention"})()
+        return type("IntarisSession", (), {"intention": "fresh intention", "title": None})()
 
 
 class _LLM:

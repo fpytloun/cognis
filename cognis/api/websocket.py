@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
@@ -36,7 +37,6 @@ from cognis.store.queries import (
     get_conversation,
     get_session_row,
     get_task,
-    update_conversation,
 )
 
 logger = get_logger(__name__)
@@ -169,17 +169,6 @@ WS_CHUNK_GAP_FRAMES_TOTAL = Counter(
     "cognis_ws_chunk_gap_frames_total",
     "Chunk gap frames emitted due to dropped streaming chunks",
 )
-AUTO_TITLE_TOTAL = Counter(
-    "cognis_auto_title_total",
-    "Auto-title generation attempts",
-    labelnames=("status",),
-)
-
-_AUTO_TITLE_SYSTEM_PROMPT = (
-    "Generate a concise 3-6 word title for a conversation that starts with "
-    "the following user message. Return ONLY the title text, nothing else."
-)
-
 MAX_QUEUED_MESSAGES = 5
 DEFAULT_TURN_LIMIT = 3
 DEFAULT_INBOUND_RATE_LIMIT = 10
@@ -441,6 +430,7 @@ class WebSocketConnectionManager:
     ) -> None:
         conversation_id = conversation.conversation_id
         message_id = f"msg_{uuid.uuid4().hex[:12]}"
+        _pre_turn_title = conversation.title
         try:
             current_user_email.set(session.user_email)
             current_agent_id.set(agent.agent_id)
@@ -539,7 +529,7 @@ class WebSocketConnectionManager:
                     "tool_name": tool_name,
                     "status": "started",
                 }
-                if arguments:
+                if arguments is not None:
                     payload["arguments"] = arguments
                 await self.send_to_conversation(conversation_id, payload)
 
@@ -549,20 +539,21 @@ class WebSocketConnectionManager:
                 result: str,
                 is_error: bool,
                 duration_ms: int | None,
+                evaluation: dict[str, Any] | None = None,
             ) -> None:
-                await self.send_to_conversation(
-                    conversation_id,
-                    {
-                        "type": "tool_result",
-                        "conversation_id": conversation_id,
-                        "session_id": session.session_id,
-                        "call_id": call_id,
-                        "tool_name": tool_name,
-                        "result": result,
-                        "is_error": is_error,
-                        "duration_ms": duration_ms,
-                    },
-                )
+                payload: dict[str, Any] = {
+                    "type": "tool_result",
+                    "conversation_id": conversation_id,
+                    "session_id": session.session_id,
+                    "call_id": call_id,
+                    "tool_name": tool_name,
+                    "result": result,
+                    "is_error": is_error,
+                    "duration_ms": duration_ms,
+                }
+                if evaluation:
+                    payload["evaluation"] = evaluation
+                await self.send_to_conversation(conversation_id, payload)
                 # Also send a tool_call status update for completion
                 await self.send_to_conversation(
                     conversation_id,
@@ -624,9 +615,17 @@ class WebSocketConnectionManager:
                     "queued_count": len(self._queued_messages.get(conversation_id, [])),
                 },
             )
-            # Fire-and-forget auto-title generation for untitled conversations
-            if not system_initiated and conversation.title is None:
-                asyncio.create_task(self._generate_auto_title(conversation_id, content))
+            # Notify clients if the conversation title changed during
+            # this turn (Intaris generates titles alongside intentions).
+            if conversation.title and conversation.title != _pre_turn_title:
+                await self.send_to_conversation(
+                    conversation_id,
+                    {
+                        "type": "conversation_updated",
+                        "conversation_id": conversation_id,
+                        "title": conversation.title,
+                    },
+                )
 
             logger.info(
                 "turn: completed",
@@ -681,49 +680,10 @@ class WebSocketConnectionManager:
                         system_initiated=queued.system_initiated,
                     )
 
-    async def _generate_auto_title(self, conversation_id: str, user_message: str) -> None:
-        """Generate a conversation title from the first user message.
-
-        Runs as a fire-and-forget task so it never blocks the turn lifecycle.
-        """
-        try:
-            messages = [
-                {"role": "system", "content": _AUTO_TITLE_SYSTEM_PROMPT},
-                {"role": "user", "content": user_message[:500]},
-            ]
-            accumulated = ""
-            async for chunk in self.app.state.providers.llm.stream_generate(
-                messages, task_type="classifier", tools=[]
-            ):
-                choices = chunk.get("choices")
-                if choices:
-                    delta_text = choices[0].get("delta", {}).get("content")
-                    if delta_text:
-                        accumulated += delta_text
-            title = accumulated.strip().strip('"').strip("'")[:120]
-            if not title:
-                AUTO_TITLE_TOTAL.labels(status="empty").inc()
-                return
-            async with self.app.state.session_factory() as db_session:
-                ok = await update_conversation(db_session, conversation_id, title=title)
-                if ok:
-                    await db_session.commit()
-            if ok:
-                await self.send_to_conversation(
-                    conversation_id,
-                    {
-                        "type": "conversation_updated",
-                        "conversation_id": conversation_id,
-                        "title": title,
-                    },
-                )
-            AUTO_TITLE_TOTAL.labels(status="ok").inc()
-        except Exception:
-            AUTO_TITLE_TOTAL.labels(status="error").inc()
-            logger.warning(
-                "Auto-title generation failed",
-                extra={"extra_data": {"conversation_id": conversation_id}},
-            )
+    # Title generation has been moved to Intaris. The IntentionBarrier
+    # generates a session title alongside the intention on every user
+    # message. Cognis reads it in context assembly and syncs it to the
+    # conversation. The _generate_auto_title method has been removed.
 
     async def _select_workflow(self, agent: Any, task_description: str) -> str:
         execution = agent.execution or {}
@@ -1052,6 +1012,85 @@ async def handle_websocket(websocket: WebSocket) -> None:
                         recoverable=False,
                     )
                     continue
+
+                # -------------------------------------------------------
+                # Slash commands: /approve and /deny resolve escalations
+                # -------------------------------------------------------
+                stripped = content.strip()
+                if stripped.startswith("/approve") or stripped.startswith("/deny"):
+                    is_approve = stripped.startswith("/approve")
+                    cmd_word = "/approve" if is_approve else "/deny"
+                    note = stripped[len(cmd_word) :].strip() or None
+                    esc_decision = "approve" if is_approve else "deny"
+
+                    pending = websocket.app.state.pause_waiter.find_pending(
+                        pause_type="escalation",
+                        conversation_id=conversation_id,
+                    )
+                    if pending is None:
+                        await manager.send_to_conversation(
+                            conversation_id,
+                            {
+                                "type": "system_message",
+                                "conversation_id": conversation_id,
+                                "text": "No pending escalation to resolve.",
+                            },
+                        )
+                        continue
+
+                    tool_name = (pending.context or {}).get("tool_name", "tool call")
+                    intaris_call_id = (pending.context or {}).get("call_id", pending.pause_id)
+                    websocket.app.state.pause_waiter.resolve(
+                        pending.pause_id,
+                        PauseResolution(
+                            decision=esc_decision,
+                            data={"note": note or ""},
+                        ),
+                    )
+                    # Submit to Intaris for audit trail
+                    current_user_email.set(connection.user_email)
+                    with contextlib.suppress(Exception):
+                        await websocket.app.state.providers.guardrails.submit_decision(
+                            intaris_call_id, esc_decision, note
+                        )
+                    # Emit system message for the action
+                    verb = "approved" if is_approve else "denied"
+                    note_suffix = f": {note}" if note else ""
+                    await manager.send_to_conversation(
+                        conversation_id,
+                        {
+                            "type": "system_message",
+                            "conversation_id": conversation_id,
+                            "text": f"User {verb} {tool_name}{note_suffix}",
+                        },
+                    )
+                    continue
+
+                # -------------------------------------------------------
+                # Queue messages while an escalation is pending
+                # -------------------------------------------------------
+                pending_esc = websocket.app.state.pause_waiter.find_pending(
+                    pause_type="escalation",
+                    conversation_id=conversation_id,
+                )
+                if pending_esc is not None:
+                    manager._queued_messages[conversation_id].append(  # noqa: SLF001
+                        QueuedMessage(content=content)
+                    )
+                    await manager.send_to_conversation(
+                        conversation_id,
+                        {
+                            "type": "queued",
+                            "conversation_id": conversation_id,
+                            "queued_count": len(
+                                manager._queued_messages.get(conversation_id, [])  # noqa: SLF001
+                            ),
+                            "reason": "Waiting for escalation resolution. "
+                            "Use /approve or /deny, or use the buttons above.",
+                        },
+                    )
+                    continue
+
                 await manager.enqueue_or_start_turn(
                     connection,
                     conversation=conversation,
@@ -1090,12 +1129,23 @@ async def handle_websocket(websocket: WebSocket) -> None:
                     )
                     continue
                 cancelled = await manager.cancel_turn(conversation_id)
-                if not cancelled:
-                    await manager.send_error(
-                        connection,
-                        code="not_found",
-                        message="No active turn to cancel",
-                        recoverable=True,
+                if cancelled:
+                    await manager.send_to_conversation(
+                        conversation_id,
+                        {
+                            "type": "system_message",
+                            "conversation_id": conversation_id,
+                            "text": "User stopped the current turn.",
+                        },
+                    )
+                else:
+                    await manager.send_to_conversation(
+                        conversation_id,
+                        {
+                            "type": "system_message",
+                            "conversation_id": conversation_id,
+                            "text": "No active turn to cancel.",
+                        },
                     )
                 continue
 
@@ -1111,22 +1161,65 @@ async def handle_websocket(websocket: WebSocket) -> None:
                         recoverable=True,
                     )
                     continue
-                current_user_email.set(connection.user_email)
-                pending_escalations = (
-                    await websocket.app.state.providers.guardrails.list_pending_escalations()
-                )
-                if not any(item.call_id == call_id for item in pending_escalations):
+                if decision not in ("approve", "deny"):
                     await manager.send_error(
                         connection,
-                        code="not_found",
-                        message="Escalation not found",
+                        code="validation_error",
+                        message="decision must be 'approve' or 'deny'",
                         recoverable=True,
                     )
                     continue
                 current_user_email.set(connection.user_email)
-                await websocket.app.state.providers.guardrails.submit_decision(
-                    call_id, decision, note if isinstance(note, str) else None
+                # Look up the pending pause to get tool_name for the system message
+                pause_id = f"escalation:{call_id}"
+                pending_pause = websocket.app.state.pause_waiter.get(pause_id)
+                tool_name = (
+                    (pending_pause.context or {}).get("tool_name", "tool call")
+                    if pending_pause
+                    else "tool call"
                 )
+                # Resolve the PauseWaiter (unblocks the agent loop)
+                resolved = websocket.app.state.pause_waiter.resolve(
+                    pause_id,
+                    PauseResolution(
+                        decision=decision,
+                        data={"note": note if isinstance(note, str) else ""},
+                    ),
+                )
+                if not resolved:
+                    # No pending pause — check Intaris as fallback (may be
+                    # an ex-post resolution or the pause already timed out)
+                    pending_escalations = (
+                        await websocket.app.state.providers.guardrails.list_pending_escalations()
+                    )
+                    if not any(item.call_id == call_id for item in pending_escalations):
+                        await manager.send_error(
+                            connection,
+                            code="not_found",
+                            message="Escalation not found or already resolved",
+                            recoverable=True,
+                        )
+                        continue
+                # Submit to Intaris for audit trail
+                with contextlib.suppress(Exception):
+                    await websocket.app.state.providers.guardrails.submit_decision(
+                        call_id, decision, note if isinstance(note, str) else None
+                    )
+                # Emit system message for the action
+                verb = "approved" if decision == "approve" else "denied"
+                note_str = note if isinstance(note, str) and note else ""
+                note_suffix = f": {note_str}" if note_str else ""
+                # Find conversation_id from the pending pause
+                conv_id = pending_pause.conversation_id if pending_pause else None
+                if conv_id:
+                    await manager.send_to_conversation(
+                        conv_id,
+                        {
+                            "type": "system_message",
+                            "conversation_id": conv_id,
+                            "text": f"User {verb} {tool_name}{note_suffix}",
+                        },
+                    )
                 continue
 
             if message_type == "gate_response":
@@ -1474,6 +1567,25 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
             "conversation_id": conversation_id,
             "session_id": event.data.get("session_id"),
             "reason": event.data.get("reason") or "controller_restart",
+        }
+    if event.type == EventType.ESCALATION_CREATED:
+        return {
+            "type": "escalation",
+            "conversation_id": conversation_id,
+            "session_id": event.data.get("session_id"),
+            "call_id": event.data.get("call_id"),
+            "tool_name": event.data.get("tool_name"),
+            "risk": event.data.get("risk"),
+            "reasoning": event.data.get("reasoning"),
+            "timeout_seconds": event.data.get("timeout_seconds"),
+        }
+    if event.type == EventType.ESCALATION_RESOLVED:
+        return {
+            "type": "escalation_resolved",
+            "conversation_id": conversation_id,
+            "call_id": event.data.get("call_id"),
+            "decision": event.data.get("decision"),
+            "reason": event.data.get("reason"),
         }
     return None
 
