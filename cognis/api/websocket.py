@@ -70,6 +70,14 @@ def _follow_up_turn_prompt(status: str | None) -> str:
     )
 
 
+# Per-conversation lock to prevent duplicate deferred session creation
+# when multiple WebSocket tabs send a message simultaneously after /compact.
+# Locks are lightweight (~200 bytes each) and are cleaned up when not held
+# once the dict exceeds _MAX_DEFERRED_LOCKS entries.
+_deferred_creation_locks: dict[str, asyncio.Lock] = {}
+_MAX_DEFERRED_LOCKS = 500
+
+
 class SessionCreationFailedError(RuntimeError):
     """Raised when the controller cannot create or recover a root session."""
 
@@ -1635,48 +1643,77 @@ async def _load_conversation_runtime(
     # --- Deferred session creation after /compact ---
     if (
         session_model.status == SessionStatus.COMPLETED
-        and getattr(session_model, "completion_reason", None) == "compacted"
+        and session_model.completion_reason == "compacted"
     ):
-        compaction_summary = await _read_compaction_summary_from_session(app, session_model)
-        intention = user_message[:200] if user_message else "Continued conversation"
-        if compaction_summary:
-            intention = f"Continuation: {intention}"
-        try:
-            new_session = await app.state.session_manager.rotate_session(
-                conversation_id=conversation_model.conversation_id,
-                current_session=session_model,
-                intention=intention,
-                completion_reason="compacted",
-                compaction_summary=compaction_summary,
-            )
-            ROTATION_TOTAL.labels(trigger="deferred").inc()
-        except Exception as exc:
-            raise SessionCreationFailedError("Could not create session after compaction") from exc
-        conversation_model.root_session_id = new_session.session_id
+        # Acquire per-conversation lock to prevent duplicate creation
+        # from multiple WebSocket tabs sending messages simultaneously.
+        lock = _deferred_creation_locks.setdefault(conversation_id, asyncio.Lock())
+        async with lock:
+            # Double-check: re-read root session after acquiring lock —
+            # another tab may have already created the new session.
+            async with app.state.session_factory() as db_session_check:
+                conv_row_check = await get_conversation(db_session_check, conversation_id)
+            if (
+                conv_row_check is not None
+                and conv_row_check.root_session_id != session_model.session_id
+            ):
+                # Another tab already rotated — reload with new root
+                async with app.state.session_factory() as db_session_reload:
+                    new_row = await get_session_row(
+                        db_session_reload, conv_row_check.root_session_id
+                    )
+                if new_row is not None:
+                    conversation_model.root_session_id = conv_row_check.root_session_id
+                    return conversation_model, _to_session_model(new_row), agent_model
 
-        # Pre-populate session cache with compaction summary.
-        # compaction_seq=0 because the new session's Intaris event stream
-        # starts fresh — there are no events to prune. The summary is
-        # injected purely as context for the LLM, not as an Intaris event.
-        if compaction_summary:
-            await app.state.session_cache.refresh(new_session)
-            await app.state.session_cache.apply_compaction(
-                new_session,
-                summary=compaction_summary,
-                compaction_seq=0,
-            )
+            compaction_summary = await _read_compaction_summary_from_session(app, session_model)
+            intention = user_message[:200] if user_message else "Continued conversation"
+            if compaction_summary:
+                intention = f"Continuation: {intention}"
+            try:
+                new_session = await app.state.session_manager.rotate_session(
+                    conversation_id=conversation_model.conversation_id,
+                    current_session=session_model,
+                    intention=intention,
+                    completion_reason="compacted",
+                    compaction_summary=compaction_summary,
+                )
+                ROTATION_TOTAL.labels(trigger="deferred").inc()
+            except Exception as exc:
+                raise SessionCreationFailedError(
+                    "Could not create session after compaction"
+                ) from exc
+            conversation_model.root_session_id = new_session.session_id
 
-        logger.info(
-            "ws: deferred session created after compaction",
-            extra={
-                "extra_data": {
-                    "conversation_id": conversation_id,
-                    "old_session_id": session_model.session_id,
-                    "new_session_id": new_session.session_id,
-                }
-            },
-        )
-        return conversation_model, new_session, agent_model
+            # Pre-populate session cache with compaction summary.
+            # compaction_seq=0 because the new session's Intaris event stream
+            # starts fresh — there are no events to prune. The summary is
+            # injected purely as context for the LLM, not as an Intaris event.
+            if compaction_summary:
+                await app.state.session_cache.refresh(new_session)
+                await app.state.session_cache.apply_compaction(
+                    new_session,
+                    summary=compaction_summary,
+                    compaction_seq=0,
+                )
+
+            logger.info(
+                "ws: deferred session created after compaction",
+                extra={
+                    "extra_data": {
+                        "conversation_id": conversation_id,
+                        "old_session_id": session_model.session_id,
+                        "new_session_id": new_session.session_id,
+                    }
+                },
+            )
+            return conversation_model, new_session, agent_model
+
+        # Periodic cleanup: remove unheld locks when the dict grows too large
+        if len(_deferred_creation_locks) > _MAX_DEFERRED_LOCKS:
+            to_remove = [cid for cid, lk in _deferred_creation_locks.items() if not lk.locked()]
+            for cid in to_remove:
+                _deferred_creation_locks.pop(cid, None)
 
     logger.debug(
         "ws: conversation runtime loaded",
@@ -1889,6 +1926,16 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
             "call_id": event.data.get("call_id"),
             "decision": event.data.get("decision"),
             "reason": event.data.get("reason"),
+        }
+    if event.type == EventType.SESSION_COMPACTED:
+        return {
+            "type": "session_compacted",
+            "conversation_id": conversation_id,
+            "session_id": event.data.get("session_id"),
+            "previous_session_id": event.data.get("previous_session_id"),
+            "summary_preview": event.data.get("summary_preview"),
+            "method": event.data.get("method"),
+            "turns_compacted": event.data.get("turns_compacted"),
         }
     return None
 

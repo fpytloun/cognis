@@ -707,6 +707,29 @@ export interface WebSocketEscalationResolvedEvent {
   reason?: string | null;
 }
 
+export interface WebSocketSessionCompactedEvent {
+  type: 'session_compacted';
+  conversation_id: string;
+  session_id: string;
+  previous_session_id: string;
+  summary_preview: string;
+  method: string;
+  turns_compacted: number;
+}
+
+export interface WebSocketSessionResetEvent {
+  type: 'session_reset';
+  conversation_id: string;
+  session_id: string;
+  previous_session_id: string;
+}
+
+export interface WebSocketConversationCreatedEvent {
+  type: 'conversation_created';
+  conversation_id: string;
+  old_conversation_id: string;
+}
+
 export type CognisWebSocketEvent =
   | WebSocketAuthenticatedEvent
   | WebSocketChunkEvent
@@ -730,6 +753,9 @@ export type CognisWebSocketEvent =
   | WebSocketSystemMessageEvent
   | WebSocketEscalationEvent
   | WebSocketEscalationResolvedEvent
+  | WebSocketSessionCompactedEvent
+  | WebSocketSessionResetEvent
+  | WebSocketConversationCreatedEvent
   | WebSocketQueuedEvent
   | WebSocketReconnectedEvent
   | WebSocketSessionRecoveredEvent

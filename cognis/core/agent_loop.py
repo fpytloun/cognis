@@ -21,6 +21,7 @@ from typing import Any
 
 from prometheus_client import Counter, Histogram
 
+from cognis.core.compaction import ROTATION_TOTAL
 from cognis.core.events import Event, EventBus, EventType
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
@@ -64,6 +65,11 @@ DELEGATIONS_TOTAL = Counter(
     "Sub-session delegations spawned",
     labelnames=("status",),
 )
+AUTO_COMPACTION_DURATION = Histogram(
+    "cognis_auto_compaction_duration_seconds",
+    "Duration of automatic post-turn compaction (compact + rotate + cache)",
+)
+AUTO_COMPACTION_TIMEOUT_SECONDS = 15
 
 # Controller-injected tool names
 STEP_COMPLETE = "step_complete"
@@ -1408,7 +1414,18 @@ class AgentLoop:
                 )
 
         # Finalize step
-        await self._finalize_step(ctx, events_to_record)
+        events_recorded = await self._finalize_step(ctx, events_to_record)
+
+        # Automatic compaction: if context assembly recommended compaction
+        # and events were successfully recorded, compact + rotate session
+        # so the next turn starts with a clean context window.  Only for
+        # direct chat — workflow steps have their own lifecycle management.
+        if (
+            events_recorded
+            and ctx.is_direct
+            and getattr(context_result, "recommend_compaction", False)
+        ):
+            await self._auto_compact(ctx)
 
         if step_output:
             STEPS_TOTAL.labels(step_type=ctx.step_definition.type, status="completed").inc()
@@ -2153,14 +2170,21 @@ class AgentLoop:
         self,
         ctx: StepContext,
         events: list[SessionEvent],
-    ) -> None:
-        """Record events to Intaris, update cache, dispatch remember."""
+    ) -> bool:
+        """Record events to Intaris, update cache, dispatch remember.
+
+        Returns ``True`` if events were successfully recorded to Intaris,
+        ``False`` otherwise.  Callers use this to gate post-turn operations
+        like automatic compaction — running compaction after a failed write
+        would lose the current turn's events.
+        """
         if not events:
-            return
+            return True
 
         intaris_id = ctx.session.intaris_session_id or ctx.session.session_id
         idempotency_key = f"{intaris_id}:step_{uuid.uuid4().hex[:8]}"
 
+        events_recorded = False
         try:
             append_result = await self.providers.guardrails.record_events(
                 session_id=ctx.session.intaris_session_id or ctx.session.session_id,
@@ -2170,6 +2194,7 @@ class AgentLoop:
             )
             # Update session cache with recorded events
             await self.session_cache.append_recorded_events(ctx.session, events, append_result)
+            events_recorded = True
             logger.info(
                 "agent: events recorded",
                 extra={
@@ -2202,10 +2227,132 @@ class AgentLoop:
                 }
             )
 
-        # Compaction is now triggered by token-based recommend_compaction
-        # during context assembly, not by event count. The old heuristic
-        # (len(events) > 50) has been removed in favour of the unified
-        # token-threshold trigger in _execute_step().
+        return events_recorded
+
+    async def _auto_compact(self, ctx: StepContext) -> None:
+        """Automatically compact and rotate the session post-turn.
+
+        Called when ``context_result.recommend_compaction`` was ``True``
+        and events were successfully recorded.  Runs LLM compaction →
+        session rotation → cache pre-population.  On failure, the turn
+        has already completed successfully so we log and continue —
+        the next turn will re-trigger compaction.
+
+        Bounded to ``AUTO_COMPACTION_TIMEOUT_SECONDS`` to avoid holding
+        the session lock indefinitely under provider degradation.
+        """
+
+        # Early exit: skip if session cache has very few events
+        # (e.g. manual /compact just ran and deferred creation already
+        # created a near-empty session).
+        cache_entry = self.session_cache.get_entry(ctx.session.session_id)
+        if cache_entry is not None:
+            preserve_turns = getattr(self.compaction_strategy, "preserve_turns", 10)
+            user_event_count = sum(1 for e in cache_entry.events if e.type == "user_message")
+            if user_event_count <= preserve_turns:
+                logger.debug(
+                    "agent: auto-compact skipped — too few events",
+                    extra={
+                        "extra_data": {
+                            "session_id": ctx.session.session_id,
+                            "user_events": user_event_count,
+                            "preserve_turns": preserve_turns,
+                        }
+                    },
+                )
+                return
+
+        logger.info(
+            "agent: auto-compaction triggered",
+            extra={"extra_data": {"session_id": ctx.session.session_id}},
+        )
+
+        with AUTO_COMPACTION_DURATION.time():
+            try:
+                compaction_result = await asyncio.wait_for(
+                    self.compaction_strategy.compact(ctx.session, trigger="automatic"),
+                    timeout=AUTO_COMPACTION_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                logger.warning(
+                    "agent: auto-compaction timed out, skipping — will retry next turn",
+                    extra={"extra_data": {"session_id": ctx.session.session_id}},
+                )
+                return
+            except Exception:
+                logger.warning(
+                    "agent: auto-compaction failed, skipping — will retry next turn",
+                    extra={"extra_data": {"session_id": ctx.session.session_id}},
+                    exc_info=True,
+                )
+                return
+
+            if not compaction_result.compacted:
+                return
+
+            # Rotate session: create new root session with clean Intaris stream
+            try:
+                intention = "Continued conversation"
+                new_session = await self.session_manager.rotate_session(
+                    conversation_id=ctx.conversation.conversation_id,
+                    current_session=ctx.session,
+                    intention=intention,
+                    completion_reason="compacted",
+                    compaction_summary=compaction_result.summary,
+                )
+                ROTATION_TOTAL.labels(trigger="automatic").inc()
+            except Exception:
+                logger.warning(
+                    "agent: session rotation after auto-compaction failed",
+                    extra={"extra_data": {"session_id": ctx.session.session_id}},
+                    exc_info=True,
+                )
+                return
+
+            # Pre-populate new session cache with compaction summary
+            if compaction_result.summary:
+                try:
+                    await self.session_cache.refresh(new_session)
+                    await self.session_cache.apply_compaction(
+                        new_session,
+                        summary=compaction_result.summary,
+                        compaction_seq=0,
+                    )
+                except Exception:
+                    logger.warning(
+                        "agent: failed to pre-populate cache after auto-compaction",
+                        extra={"extra_data": {"new_session_id": new_session.session_id}},
+                        exc_info=True,
+                    )
+
+        # Notify clients via event bus
+        summary_preview = (compaction_result.summary or "")[:500]
+        await self.event_bus.publish(
+            Event(
+                type=EventType.SESSION_COMPACTED,
+                data={
+                    "conversation_id": ctx.conversation.conversation_id,
+                    "session_id": new_session.session_id,
+                    "previous_session_id": ctx.session.session_id,
+                    "summary_preview": summary_preview,
+                    "method": compaction_result.method,
+                    "turns_compacted": compaction_result.turns_compacted,
+                },
+            )
+        )
+
+        logger.info(
+            "agent: auto-compaction completed",
+            extra={
+                "extra_data": {
+                    "conversation_id": ctx.conversation.conversation_id,
+                    "old_session_id": ctx.session.session_id,
+                    "new_session_id": new_session.session_id,
+                    "method": compaction_result.method,
+                    "turns_compacted": compaction_result.turns_compacted,
+                }
+            },
+        )
 
     def _raise_if_cancelled(self, ctx: StepContext) -> None:
         """Abort the current step when external control requested interruption."""

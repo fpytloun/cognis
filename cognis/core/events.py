@@ -36,6 +36,7 @@ class EventType(StrEnum):
     SESSION_COMPLETED = "session_completed"
     SESSION_FAILED = "session_failed"
     SESSION_RECOVERED = "session_recovered"
+    SESSION_COMPACTED = "session_compacted"
 
     # Step lifecycle
     STEP_STARTED = "step_started"

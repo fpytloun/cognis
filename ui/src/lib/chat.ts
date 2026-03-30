@@ -7,7 +7,8 @@ export type TimelineItem =
   | DelegationTimelineItem
   | ReasoningTimelineItem
   | NoticeTimelineItem
-  | SystemMessageTimelineItem;
+  | SystemMessageTimelineItem
+  | CompactionTimelineItem;
 
 export interface MessageTimelineItem {
   id: string;
@@ -75,6 +76,16 @@ export interface SystemMessageTimelineItem {
   id: string;
   kind: 'system_message';
   text: string;
+  timestamp: string | null;
+}
+
+export interface CompactionTimelineItem {
+  id: string;
+  kind: 'compaction';
+  previousSessionId: string;
+  summaryPreview: string;
+  method: string;
+  turnsCompacted: number;
   timestamp: string | null;
 }
 
@@ -254,6 +265,22 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
       } else {
         items.push(delegation);
       }
+      continue;
+    }
+
+    if (event.type === 'compaction_summary') {
+      const summary = typeof event.data.summary === 'string' ? event.data.summary : '';
+      const method = typeof event.data.method === 'string' ? event.data.method : 'unknown';
+      const turnsCompacted = typeof event.data.turns_compacted === 'number' ? event.data.turns_compacted : 0;
+      items.push({
+        id: `compaction:${event.seq}`,
+        kind: 'compaction',
+        previousSessionId: '',  // Not available from Intaris event data
+        summaryPreview: summary.slice(0, 500),
+        method,
+        turnsCompacted,
+        timestamp: event.timestamp
+      });
       continue;
     }
 
@@ -502,6 +529,19 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
       return next;
     }
     next.push(delegation);
+    return next;
+  }
+
+  if (event.type === 'session_compacted') {
+    next.push({
+      id: `compaction:${Date.now()}`,
+      kind: 'compaction',
+      previousSessionId: event.previous_session_id,
+      summaryPreview: event.summary_preview?.slice(0, 500) ?? '',
+      method: event.method ?? 'unknown',
+      turnsCompacted: event.turns_compacted ?? 0,
+      timestamp: new Date().toISOString()
+    });
     return next;
   }
 

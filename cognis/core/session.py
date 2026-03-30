@@ -380,12 +380,14 @@ class SessionManager:
         async with self.session_factory() as db_session:
             try:
                 # 1. Mark current session completed
+                # NOTE: result_summary is metadata only — no LLM-generated content
+                # in the Cognis DB. The actual compaction summary lives in Intaris.
                 await queries.set_session_status(
                     db_session,
                     current_session.session_id,
                     SessionStatus.COMPLETED,
                     completed_at=datetime.now(UTC),
-                    result_summary=compaction_summary[:200] if compaction_summary else None,
+                    result_summary=f"Rotated ({completion_reason})",
                     completion_reason=completion_reason,
                 )
 

@@ -187,3 +187,97 @@ async def test_session_manager_recovery_uses_updated_at_not_started_at(tmp_path)
         assert stale_grandchild is not None and stale_grandchild.status == "failed"
 
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_rotate_session_creates_new_root_and_marks_old_completed(tmp_path) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    providers = _Providers()
+    cache = _Cache()
+    manager = SessionManager(session_factory, providers, cache)
+
+    # Create an initial conversation + root session
+    conversation, root_session = await manager.create_conversation_with_root_session(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context=ConversationContext(type="web"),
+        title="Rotation test",
+    )
+
+    # Rotate
+    new_session = await manager.rotate_session(
+        conversation_id=conversation.conversation_id,
+        current_session=root_session,
+        intention="Continued after compaction",
+        completion_reason="compacted",
+        compaction_summary="Summary of older turns.",
+    )
+
+    # Verify new session
+    assert new_session.session_id != root_session.session_id
+    assert new_session.conversation_id == conversation.conversation_id
+
+    # Verify old session is completed
+    async with session_factory() as db:
+        old_row = await db.get(Session, root_session.session_id)
+        assert old_row is not None
+        assert old_row.status == "completed"
+        assert old_row.completion_reason == "compacted"
+        assert old_row.completed_at is not None
+
+    # Verify new session is linked via previous_session_id
+    async with session_factory() as db:
+        new_row = await db.get(Session, new_session.session_id)
+        assert new_row is not None
+        assert new_row.previous_session_id == root_session.session_id
+
+    # Verify conversation root updated
+    async with session_factory() as db:
+        conv = await db.get(Conversation, conversation.conversation_id)
+        assert conv is not None
+        assert conv.root_session_id == new_session.session_id
+
+    # Verify old session cache was evicted
+    assert root_session.session_id in cache.evicted
+
+    # Verify Intaris session was created for new root
+    assert len(providers.guardrails.calls) == 2  # original + rotation
+    assert providers.guardrails.calls[1][0] == new_session.session_id
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_rotate_session_carries_forward_mnemory_session_id(tmp_path) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    manager = SessionManager(session_factory, _Providers(), _Cache())
+
+    conversation, root_session = await manager.create_conversation_with_root_session(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context=ConversationContext(type="web"),
+        title="Mnemory carry test",
+    )
+
+    # Set a mnemory_session_id on the root session
+    async with session_factory() as db:
+        row = await db.get(Session, root_session.session_id)
+        assert row is not None
+        row.mnemory_session_id = "mnemory-abc-123"
+        await db.commit()
+
+    root_session.mnemory_session_id = "mnemory-abc-123"
+
+    new_session = await manager.rotate_session(
+        conversation_id=conversation.conversation_id,
+        current_session=root_session,
+        intention="Test",
+    )
+
+    # The new session should carry forward mnemory_session_id
+    async with session_factory() as db:
+        new_row = await db.get(Session, new_session.session_id)
+        assert new_row is not None
+        assert new_row.mnemory_session_id == "mnemory-abc-123"
+
+    await engine.dispose()

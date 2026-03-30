@@ -122,6 +122,7 @@ class Session(BaseModel):
     session_id: str
     conversation_id: str
     parent_session_id: str | None     # NULL for root session
+    previous_session_id: str | None   # Links to predecessor after rotation/compaction
 
     user_email: str
     agent_id: str                     # May differ for agent delegation
@@ -137,6 +138,7 @@ class Session(BaseModel):
     started_at: datetime
     completed_at: datetime | None
     idle_since: datetime | None
+    completion_reason: str | None     # Why session ended: "compacted", "user_reset", etc.
     result: SessionResult | None
 
     # NOTE: intention, last_event_seq, last_compaction_summary, and
@@ -148,10 +150,11 @@ class Session(BaseModel):
 class SessionStatus(str, Enum):
     ACTIVE = "active"
     IDLE = "idle"
+    SUSPENDED = "suspended"
+    TERMINATED = "terminated"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
-    PARTIAL = "partial"
 
 
 class DelegationInfo(BaseModel):
@@ -270,11 +273,34 @@ token budget overrun identified in the review.
 
 ### Compaction Strategy
 
-When context approaches limit (>85% of total budget):
+When context approaches limit (>85% of total budget), compaction triggers
+and creates a new Intaris session within the same conversation. The old
+session is marked completed with ``completion_reason="compacted"``. The
+compaction summary is stored as a ``compaction_summary`` event in the
+old session's Intaris stream and injected as system context in the new
+session.
+
+Two compaction paths:
+
+- **Manual** (``/compact`` slash command): Compaction runs immediately.
+  Session creation is *deferred* until the next user message. The
+  ``_load_conversation_runtime()`` function detects the completed/compacted
+  root session and calls ``rotate_session()`` on the next turn.
+
+- **Automatic** (post-turn in ``_execute_step()``): When
+  ``context_result.recommend_compaction`` is ``True`` after context assembly,
+  ``_auto_compact()`` runs after ``_finalize_step()`` records the turn's
+  events. It compacts, rotates the session immediately, and emits a
+  ``SESSION_COMPACTED`` event for client notification. Bounded to 15 seconds
+  timeout. Only fires for direct chat (``ctx.is_direct``), not workflow steps.
+
+Guard: automatic compaction only fires when ``_finalize_step()`` succeeded
+(events recorded). This prevents data loss where the turn's events would be
+lost if compaction rotated away from the session before events were saved.
 
 ```python
 class CompactionStrategy:
-    async def compact(self, session: Session) -> CompactionResult:
+    async def compact(self, session: Session, *, trigger: str = "manual") -> CompactionResult:
         """
         1. Preserve last N turns uncompacted (default 10)
         2. Summarize older turns via _system/compaction agent (LLM call)
@@ -284,7 +310,7 @@ class CompactionStrategy:
         """
         ...
 
-    async def compact_with_fallback(self, session: Session) -> CompactionResult:
+    async def compact_with_fallback(self, session: Session, *, trigger: str = "manual") -> CompactionResult:
         """
         Tiered fallback for compaction:
         1. Try LLM compaction (primary)
@@ -294,6 +320,21 @@ class CompactionStrategy:
         """
         ...
 ```
+
+### Session Rotation
+
+When compaction (or user reset) triggers session rotation:
+
+1. Old session marked ``COMPLETED`` with ``completion_reason``
+2. New root session created with ``previous_session_id`` pointing to old session
+3. New Intaris session created for the new root
+4. Conversation ``root_session_id`` updated to new session
+5. ``mnemory_session_id`` carried forward across the rotation boundary
+6. Old session cache evicted; new session cache pre-populated with compaction summary
+
+The ``previous_session_id`` chain enables "View previous session" navigation
+in the web UI. The ``mnemory_session_id`` carry-forward ensures memory
+deduplication continues across rotation boundaries.
 
 ### Context Assembly
 
@@ -483,13 +524,27 @@ class SessionTimeoutPolicy:
     max_session_age: timedelta = timedelta(hours=24)
 ```
 
-When root session reaches `max_session_age`:
-1. Complete current session with final compaction
-2. Create new root session inheriting compaction summary
+Session rotation happens for three reasons:
+
+1. **Compaction** (automatic or manual ``/compact``): context exceeds 85%
+   of model capacity. Uses ``rotate_session()`` with
+   ``completion_reason="compacted"``.
+2. **User reset** (``/new`` or ``/reset`` in channel-bound context): user
+   explicitly starts fresh. Uses ``rotate_session()`` with
+   ``completion_reason="user_reset"``.
+3. **Max session age**: root session reaches ``max_session_age``.
+
+In all cases ``rotate_session()`` is called:
+1. Complete current session (``status=completed``, set ``completion_reason``)
+2. Create new root session with ``previous_session_id`` pointing to old session
 3. Create new Intaris session with inherited intention
-4. Create new Mnemory session (fresh recall)
-5. Update `conversation.root_session_id`
-6. Emit `SESSION_ROTATED` event, push notification to client
+4. Carry forward ``mnemory_session_id`` (memory deduplication continues)
+5. Update ``conversation.root_session_id``
+6. Emit ``SESSION_COMPACTED`` event (for compaction) or push notification to client
+
+A per-conversation ``asyncio.Lock`` in the WebSocket handler prevents
+duplicate deferred session creation when multiple tabs send messages
+simultaneously after ``/compact``.
 
 ### Conversation Archival
 

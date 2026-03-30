@@ -6,6 +6,7 @@
 
   import AgentAvatar from '$lib/components/AgentAvatar.svelte';
   import ChatMessage from '$lib/components/ChatMessage.svelte';
+  import CompactionCard from '$lib/components/CompactionCard.svelte';
   import DelegationCard from '$lib/components/DelegationCard.svelte';
   import EscalationPrompt from '$lib/components/EscalationPrompt.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
@@ -112,6 +113,20 @@
     if (conversation.status !== 'active') return true;
     if (!isWebConversation(conversation)) return true;
     return false;
+  }
+
+  const TERMINAL_SESSION_STATES = new Set(['terminated', 'failed', 'cancelled']);
+  const BLOCKED_SESSION_STATES = new Set(['terminated', 'failed', 'cancelled', 'suspended']);
+
+  function rootSessionStatus(): string | null {
+    if (!currentConversation?.root_session_id) return null;
+    const root = sessions.find((s) => s.session_id === currentConversation?.root_session_id);
+    return root?.status ?? null;
+  }
+
+  function isSessionBlocked(): boolean {
+    const status = rootSessionStatus();
+    return status !== null && BLOCKED_SESSION_STATES.has(status);
   }
 
   function contextTypeBadge(conversation: Conversation): string {
@@ -712,6 +727,35 @@
       return;
     }
 
+    // Handle session_compacted: add to timeline and refresh sessions
+    if (event.type === 'session_compacted') {
+      timeline = applyWebSocketEvent(timeline, event);
+      syncVisibleWindow();
+      scrollToBottom();
+      // Refresh session list to show the new session
+      if (currentConversation) {
+        api.conversations.sessions(currentConversation.conversation_id).then((s) => { sessions = s; }).catch(() => {});
+      }
+      return;
+    }
+
+    // Handle session_reset: clear timeline for new session
+    if (event.type === 'session_reset') {
+      timeline = [];
+      syncVisibleWindow();
+      // Refresh session list
+      if (currentConversation) {
+        api.conversations.sessions(currentConversation.conversation_id).then((s) => { sessions = s; }).catch(() => {});
+      }
+      return;
+    }
+
+    // Handle conversation_created: navigate to new conversation
+    if (event.type === 'conversation_created') {
+      void goto(`/chat/${event.conversation_id}`);
+      return;
+    }
+
     timeline = applyWebSocketEvent(timeline, event);
     if (event.type !== 'tool_call' && event.type !== 'tool_result' && event.type !== 'reasoning') {
       syncVisibleWindow();
@@ -1121,6 +1165,8 @@
                 <ReasoningBlock {item} />
               {:else if item.kind === 'delegation'}
                 <DelegationCard {item} onViewSession={handleViewSession} />
+              {:else if item.kind === 'compaction'}
+                <CompactionCard {item} onViewPreviousSession={handleViewSession} />
               {:else if item.kind === 'system_message'}
                 <p class="py-1 text-center text-xs italic text-slate-500">{item.text}</p>
               {:else}
@@ -1178,6 +1224,16 @@
         {:else if currentConversation && currentConversation.status !== 'active'}
           <div class="rounded-2xl border border-slate-700/60 bg-slate-900/60 px-4 py-3 text-center text-sm text-slate-400">
             This conversation is archived.
+          </div>
+        {:else if isSessionBlocked()}
+          <div class="rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-center text-sm text-amber-100">
+            {#if rootSessionStatus() === 'suspended'}
+              This session is suspended.
+            {:else if rootSessionStatus() === 'terminated'}
+              This session has been terminated.
+            {:else}
+              This session has ended ({rootSessionStatus()}).
+            {/if}
           </div>
         {:else}
           <form class="shrink-0 space-y-3 rounded-3xl border border-slate-800/80 bg-slate-900/80 p-4" onsubmit={(event) => { event.preventDefault(); void handleSend(); }}>

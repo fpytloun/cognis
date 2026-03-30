@@ -353,11 +353,33 @@ socket authenticates so stalled connections are detected proactively.
 {type: "workflow_completed", task_id, result}
 {type: "workflow_failed", task_id, reason}
 
+// Session lifecycle
+{type: "session_compacted", conversation_id, session_id, previous_session_id,
+ summary_preview, method, turns_compacted}
+{type: "session_reset", conversation_id, session_id, previous_session_id}
+{type: "conversation_created", conversation_id, old_conversation_id}
+{type: "session_recovered", conversation_id, session_id, reason}
+
+// System messages (slash command feedback, cancel notifications, etc.)
+{type: "system_message", conversation_id, text}
+
+// Queue status
+{type: "queued", conversation_id, queued_count}
+
 // Reconnection
 {type: "reconnected", conversation_id, missed_events_count}
 
-// Recovery (sent after controller restart if session was affected)
-{type: "session_recovered", conversation_id, session_id, reason}
+// Auth
+{type: "authenticated", user_email, role}
+
+// Escalation resolution
+{type: "escalation_resolved", conversation_id, call_id, decision, reason}
+
+// Streaming gap notification
+{type: "chunk_gap", conversation_id, dropped_count}
+
+// Workflow cancellation
+{type: "workflow_cancelled", conversation_id, task_id, reason}
 
 // Errors
 {type: "error", conversation_id?, code, message, recoverable, error_detail?, detail?}

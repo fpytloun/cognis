@@ -82,6 +82,33 @@ When the user types while a turn processes:
 [Processing...] Your message is queued (1 pending)
 ```
 
+### Session Compaction Cards
+When a session is compacted (automatic or manual `/compact`), an inline
+card appears in the timeline:
+```
+[SESSION COMPACTED]
+5 turns summarized (llm)
+"Summary of older conversation..."
+                          [View previous session]
+```
+Violet-toned card. The "View previous session" button opens the existing
+sub-session drawer to browse the old session's events.
+
+### Session State Banners
+When the root session is in a blocked state (terminated, suspended, failed,
+cancelled), the composer area shows a contextual banner:
+- **Suspended**: "This session is suspended."
+- **Terminated**: "This session has been terminated."
+- **Other terminal**: "This session has ended ({status})."
+
+### Slash Commands
+The chat composer accepts slash commands:
+- `/compact` or `/summarize` — Trigger manual compaction of conversation history
+- `/new`, `/reset`, or `/clear` — Start fresh: new conversation (web) or new session (channel-bound)
+- `/approve` or `/deny` — Resolve pending escalation prompts
+
+Slash commands are rejected with an error if a turn is currently in progress.
+
 ## Agent Creation Wizard
 
 5-step wizard:
@@ -165,15 +192,26 @@ Client → Server:
 
 Server → Client:
 ```typescript
+{type: "authenticated", user_email, role}
 {type: "chunk", conversation_id, session_id, message_id, content, index}
+{type: "chunk_gap", conversation_id, dropped_count}
 {type: "tool_call", conversation_id, session_id, call_id, tool_name, status}
+{type: "tool_result", conversation_id, call_id, tool_name, result, is_error, duration_ms, evaluation}
+{type: "reasoning", conversation_id, message_id, content}
+{type: "conversation_updated", conversation_id, title}
 {type: "delegation_started", conversation_id, child_session_id, mode, task}
 {type: "delegation_progress", conversation_id, child_session_id, step, progress}
 {type: "delegation_completed", conversation_id, child_session_id, result}
+{type: "delegation_failed", conversation_id, child_session_id, reason}
 {type: "escalation", conversation_id, call_id, tool_name, risk, reasoning, timeout}
-{type: "escalation_expired", call_id}
+{type: "escalation_resolved", conversation_id, call_id, decision, reason}
 {type: "message_complete", conversation_id, message_id, token_usage, queued_count}
+{type: "queued", conversation_id, queued_count}
+{type: "session_compacted", conversation_id, session_id, previous_session_id, summary_preview, method, turns_compacted}
+{type: "session_reset", conversation_id, session_id, previous_session_id}
+{type: "conversation_created", conversation_id, old_conversation_id}
 {type: "session_recovered", conversation_id, session_id, reason}
+{type: "system_message", conversation_id, text}
 {type: "reconnected", conversation_id, missed_events_count}
 {type: "error", conversation_id, code, message, recoverable}
 {type: "pong"}
