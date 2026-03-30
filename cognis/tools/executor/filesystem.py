@@ -20,6 +20,12 @@ logger = get_logger(__name__)
 _MAX_READ_LINES = 2000
 _MAX_LINE_LENGTH = 2000
 
+
+def _resolve_path(raw: str) -> Path:
+    """Resolve a user-provided path, expanding ``~`` and environment variables."""
+    return Path(raw).expanduser()
+
+
 # Canonical key for LSPManager in ToolExecutionContext.runtime_metadata
 _LSP_MANAGER_KEY = "lsp_manager"  # Must match LSP_MANAGER_KEY from lsp package
 
@@ -134,7 +140,7 @@ async def handle_read(arguments: dict[str, Any], context: ToolExecutionContext) 
     offset = max(1, int(arguments.get("offset", 1)))
     limit = int(arguments.get("limit", _MAX_READ_LINES))
 
-    path = Path(file_path)
+    path = _resolve_path(file_path)
     if not path.exists():
         return ToolResult(output=f"Path does not exist: {file_path}", is_error=True)
 
@@ -189,7 +195,7 @@ async def handle_write(arguments: dict[str, Any], context: ToolExecutionContext)
     file_path = arguments.get("file_path", "")
     content = arguments.get("content", "")
 
-    path = Path(file_path)
+    path = _resolve_path(file_path)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
@@ -216,7 +222,7 @@ async def handle_edit(arguments: dict[str, Any], context: ToolExecutionContext) 
     if old_string == new_string:
         return ToolResult(output="old_string and new_string are identical.", is_error=True)
 
-    path = Path(file_path)
+    path = _resolve_path(file_path)
     if not path.is_file():
         return ToolResult(output=f"File not found: {file_path}", is_error=True)
 
@@ -265,7 +271,7 @@ async def handle_patch(arguments: dict[str, Any], context: ToolExecutionContext)
     errors: list[str] = []
 
     for file_path, hunks in _parse_unified_diff(patch_text):
-        path = Path(file_path)
+        path = _resolve_path(file_path)
         if not path.is_file():
             errors.append(f"File not found: {file_path}")
             continue
@@ -303,7 +309,7 @@ async def handle_multiedit(arguments: dict[str, Any], context: ToolExecutionCont
     if not isinstance(edits, list) or not edits:
         return ToolResult(output="No edits provided.", is_error=True)
 
-    path = Path(file_path)
+    path = _resolve_path(file_path)
     if not path.is_file():
         return ToolResult(output=f"File not found: {file_path}", is_error=True)
 
@@ -359,7 +365,7 @@ async def handle_list_directory(
     dir_path = arguments.get("path", ".")
     ignore_patterns = arguments.get("ignore") or []
 
-    path = Path(dir_path)
+    path = _resolve_path(dir_path)
     if not path.is_dir():
         return ToolResult(output=f"Not a directory: {dir_path}", is_error=True)
 

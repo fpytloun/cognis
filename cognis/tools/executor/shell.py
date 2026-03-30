@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
 
 from cognis.models.tool import ToolResult
@@ -24,11 +25,12 @@ async def handle_bash(arguments: dict[str, Any], context: ToolExecutionContext) 
     timeout_seconds = max(1, timeout_ms // 1000)
 
     try:
+        resolved_cwd = str(Path(workdir).expanduser()) if workdir else None
         process = await asyncio.create_subprocess_shell(
             command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            cwd=workdir,
+            cwd=resolved_cwd,
         )
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
     except TimeoutError:
