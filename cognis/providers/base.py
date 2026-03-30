@@ -88,7 +88,12 @@ class GuardrailsProvider(Protocol):
     ) -> EvaluationResult: ...
 
     async def report_reasoning(
-        self, session_id: str, content: str, context: str | None = None
+        self,
+        session_id: str,
+        content: str = "",
+        context: str | None = None,
+        *,
+        from_events: bool = False,
     ) -> None: ...
     async def checkpoint(self, session_id: str, content: str) -> None: ...
     async def get_session(self, session_id: str) -> IntarisSession: ...

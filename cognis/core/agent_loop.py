@@ -28,6 +28,7 @@ from cognis.models.session import ConversationModel, SessionEvent, SessionModel
 from cognis.models.tool import ToolCall, ToolResult
 from cognis.models.workflow import StepDefinition, StepOutput, WorkflowState
 from cognis.runtime_context import scoped_runtime_context  # noqa: F401 — used in delegation
+from cognis.store.queries import get_setting_value
 from cognis.tools.builtin.orchestration import (
     OrchestrationMode,
     handle_delegate_tool_call,
@@ -74,7 +75,10 @@ CONTROLLER_TOOLS = {STEP_COMPLETE, STEP_REQUEST_INPUT, STEP_TODO_WRITE, STEP_TOD
 # Callback types
 TokenCallback = Callable[[str], Coroutine[Any, Any, None]]
 ToolCallCallback = Callable[[str, str, dict[str, Any]], Coroutine[Any, Any, None]]
-ToolResultCallback = Callable[[str, str, str, bool, int | None], Coroutine[Any, Any, None]]
+ToolResultCallback = Callable[
+    [str, str, str, bool, int | None, dict[str, Any] | None],
+    Coroutine[Any, Any, None],
+]
 
 # Default limits
 DEFAULT_MAX_TOOL_CALLS = 50
@@ -236,6 +240,7 @@ class PendingPause:
     step_name: str | None = None
     step_run_id: str | None = None
     session_id: str | None = None
+    conversation_id: str | None = None
     question: str | None = None
     options: list[dict[str, Any]] | None = None
     context: dict[str, Any] | None = None
@@ -302,6 +307,7 @@ class PauseWaiter:
         *,
         task_id: str | None = None,
         session_id: str | None = None,
+        conversation_id: str | None = None,
         step_name: str | None = None,
         pause_type: str | None = None,
         include_resolved: bool = False,
@@ -313,6 +319,8 @@ class PauseWaiter:
             if task_id is not None and pause.task_id != task_id:
                 continue
             if session_id is not None and pause.session_id != session_id:
+                continue
+            if conversation_id is not None and pause.conversation_id != conversation_id:
                 continue
             if step_name is not None and pause.step_name != step_name:
                 continue
@@ -326,8 +334,10 @@ class PauseWaiter:
         *,
         task_id: str | None = None,
         session_id: str | None = None,
+        conversation_id: str | None = None,
+        pause_type: str | None = None,
     ) -> list[PendingPause]:
-        """List unresolved pauses, optionally filtered by task or session."""
+        """List unresolved pauses, optionally filtered by task, session, or conversation."""
         result: list[PendingPause] = []
         for pause in self._pending.values():
             if pause.resolved:
@@ -335,6 +345,10 @@ class PauseWaiter:
             if task_id is not None and pause.task_id != task_id:
                 continue
             if session_id is not None and pause.session_id != session_id:
+                continue
+            if conversation_id is not None and pause.conversation_id != conversation_id:
+                continue
+            if pause_type is not None and pause.pause_type != pause_type:
                 continue
             result.append(pause)
         return result
@@ -805,6 +819,47 @@ class AgentLoop:
         # Build tool definitions for LLM (controller-injected tools)
         controller_tool_schemas = self._build_controller_tool_schemas(ctx)
 
+        # Record user message to Intaris event store BEFORE context
+        # assembly so the IntentionBarrier can start updating the session
+        # intention while we assemble context and call the LLM.
+        _user_msg_recorded_early = False
+        if ctx.is_direct and ctx.user_message and not ctx.system_initiated:
+            intaris_id = ctx.session.intaris_session_id or ctx.session.session_id
+            user_msg_event = SessionEvent(type="user_message", data={"content": ctx.user_message})
+            try:
+                await self.providers.guardrails.record_events(
+                    session_id=intaris_id,
+                    events=[user_msg_event],
+                    source="cognis",
+                )
+                _user_msg_recorded_early = True
+            except Exception:
+                logger.warning(
+                    "agent: failed to record early user_message event",
+                    extra={"extra_data": {"session_id": ctx.session.session_id}},
+                )
+
+            # Trigger intention update. When the event was recorded
+            # successfully, use from_events to avoid re-sending content.
+            # Fall back to sending content directly if recording failed.
+            try:
+                if _user_msg_recorded_early:
+                    await self.providers.guardrails.report_reasoning(
+                        session_id=intaris_id,
+                        from_events=True,
+                    )
+                else:
+                    await self.providers.guardrails.report_reasoning(
+                        session_id=intaris_id,
+                        content=f"User message: {ctx.user_message}",
+                    )
+            except Exception:
+                logger.warning(
+                    "agent: failed to trigger intention update",
+                    extra={"extra_data": {"session_id": ctx.session.session_id}},
+                    exc_info=True,
+                )
+
         # Assemble initial context
         if not ctx.is_direct and not ctx.is_retry and self.step_context_assembler is not None:
             # First-attempt workflow step → use StepContextAssembler
@@ -864,8 +919,14 @@ class AgentLoop:
             )
             messages = context_result.messages
 
-        # Record user message event for direct workflow
-        if ctx.is_direct and ctx.user_message and not ctx.system_initiated:
+        # Record user message event for direct workflow (skip if already
+        # recorded early for intention tracking above).
+        if (
+            ctx.is_direct
+            and ctx.user_message
+            and not ctx.system_initiated
+            and not _user_msg_recorded_early
+        ):
             events_to_record.append(
                 SessionEvent(type="user_message", data={"content": ctx.user_message})
             )
@@ -1009,7 +1070,7 @@ class AgentLoop:
                             {"role": "tool", "tool_call_id": tc.call_id, "content": err_content}
                         )
                         if on_tool_result:
-                            await on_tool_result(tc.call_id, tc.name, err_content, True, None)
+                            await on_tool_result(tc.call_id, tc.name, err_content, True, None, None)
                         continue
 
                     # Enforce todo completion for non-direct steps
@@ -1031,7 +1092,7 @@ class AgentLoop:
                             {"role": "tool", "tool_call_id": tc.call_id, "content": err_content}
                         )
                         if on_tool_result:
-                            await on_tool_result(tc.call_id, tc.name, err_content, True, None)
+                            await on_tool_result(tc.call_id, tc.name, err_content, True, None, None)
                         continue
 
                     step_output = StepOutput(
@@ -1055,7 +1116,7 @@ class AgentLoop:
                         {"role": "tool", "tool_call_id": tc.call_id, "content": result_content}
                     )
                     if on_tool_result:
-                        await on_tool_result(tc.call_id, tc.name, result_content, False, None)
+                        await on_tool_result(tc.call_id, tc.name, result_content, False, None, None)
                     break
 
                 elif tc.name == STEP_TODO_WRITE:
@@ -1065,7 +1126,7 @@ class AgentLoop:
                         {"role": "tool", "tool_call_id": tc.call_id, "content": result_content}
                     )
                     if on_tool_result:
-                        await on_tool_result(tc.call_id, tc.name, result_content, False, None)
+                        await on_tool_result(tc.call_id, tc.name, result_content, False, None, None)
                     continue
 
                 elif tc.name == STEP_TODO_LIST:
@@ -1074,7 +1135,7 @@ class AgentLoop:
                         {"role": "tool", "tool_call_id": tc.call_id, "content": result_content}
                     )
                     if on_tool_result:
-                        await on_tool_result(tc.call_id, tc.name, result_content, False, None)
+                        await on_tool_result(tc.call_id, tc.name, result_content, False, None, None)
                     continue
 
                 elif tc.name == STEP_REQUEST_INPUT:
@@ -1089,7 +1150,7 @@ class AgentLoop:
                             {"role": "tool", "tool_call_id": tc.call_id, "content": err_content}
                         )
                         if on_tool_result:
-                            await on_tool_result(tc.call_id, tc.name, err_content, True, None)
+                            await on_tool_result(tc.call_id, tc.name, err_content, True, None, None)
                         continue
 
                     recovered_response = self._get_recovered_step_response(ctx)
@@ -1100,7 +1161,9 @@ class AgentLoop:
                             {"role": "tool", "tool_call_id": tc.call_id, "content": rec_content}
                         )
                         if on_tool_result:
-                            await on_tool_result(tc.call_id, tc.name, rec_content, False, None)
+                            await on_tool_result(
+                                tc.call_id, tc.name, rec_content, False, None, None
+                            )
                         continue
 
                     # Pause and wait for input
@@ -1169,7 +1232,9 @@ class AgentLoop:
                             {"role": "tool", "tool_call_id": tc.call_id, "content": resp_content}
                         )
                         if on_tool_result:
-                            await on_tool_result(tc.call_id, tc.name, resp_content, False, None)
+                            await on_tool_result(
+                                tc.call_id, tc.name, resp_content, False, None, None
+                            )
                     except TimeoutError:
                         await self._clear_interactive_pause_state(ctx)
                         timeout_content = json.dumps({"error": "Input request timed out."})
@@ -1177,7 +1242,9 @@ class AgentLoop:
                             {"role": "tool", "tool_call_id": tc.call_id, "content": timeout_content}
                         )
                         if on_tool_result:
-                            await on_tool_result(tc.call_id, tc.name, timeout_content, True, None)
+                            await on_tool_result(
+                                tc.call_id, tc.name, timeout_content, True, None, None
+                            )
                     continue
 
                 elif is_orchestration_tool(tc.name):
@@ -1203,6 +1270,7 @@ class AgentLoop:
                             tc.name,
                             orch_result.output,
                             orch_result.is_error,
+                            None,
                             None,
                         )
                     # Check if an async delegation was spawned
@@ -1247,6 +1315,13 @@ class AgentLoop:
                         self._get_executor(ctx),
                     )
 
+                    # -------------------------------------------------------
+                    # Escalation blocking: pause and wait for user approval
+                    # -------------------------------------------------------
+                    result = await self._handle_escalation(
+                        result, tc, ctx, events_to_record, on_tool_result
+                    )
+
                     truncated_output = _truncate_tool_data(result.output)
                     events_to_record.append(
                         SessionEvent(
@@ -1260,6 +1335,7 @@ class AgentLoop:
                             },
                         )
                     )
+                    eval_meta = result.metadata.get("evaluation") if result.metadata else None
                     if on_tool_result:
                         await on_tool_result(
                             tc.call_id,
@@ -1267,6 +1343,7 @@ class AgentLoop:
                             truncated_output,
                             result.is_error,
                             result.duration_ms,
+                            eval_meta,
                         )
                     messages.append(
                         {
@@ -1335,6 +1412,184 @@ class AgentLoop:
             STEPS_TOTAL.labels(step_type=ctx.step_definition.type, status="failed").inc()
 
         return step_output
+
+    # ------------------------------------------------------------------
+    # Escalation blocking
+    # ------------------------------------------------------------------
+
+    async def _handle_escalation(
+        self,
+        result: ToolResult,
+        tc: ToolCall,
+        ctx: StepContext,
+        events_to_record: list[SessionEvent],
+        on_tool_result: ToolResultCallback | None,
+    ) -> ToolResult:
+        """If the tool was escalated, block and wait for user approval.
+
+        On approval the tool is re-executed (Intaris auto-approves via its
+        escalation retry cache).  On denial or timeout the escalation error
+        is returned to the LLM.  Timeout does NOT submit a deny to Intaris
+        so future similar calls are not prejudiced.
+        """
+        eval_meta = result.metadata.get("evaluation") if result.metadata else None
+        if not eval_meta or eval_meta.get("decision") != "escalate":
+            return result
+
+        intaris_call_id = eval_meta.get("call_id")
+        if not intaris_call_id:
+            # No call_id from Intaris — cannot track, treat as denied
+            return result
+
+        pause_id = f"escalation:{intaris_call_id}"
+        conversation_id = ctx.conversation.conversation_id
+
+        # Read escalation timeout from settings
+        async with self.session_manager.session_factory() as db:
+            timeout_raw: int = await get_setting_value(  # type: ignore[assignment]
+                db, "session.escalation_timeout_seconds", 300
+            )
+        timeout_f = float(timeout_raw)
+
+        # Register the pause so WebSocket/REST handlers can find it
+        self.pause_waiter.register(
+            PendingPause(
+                pause_id=pause_id,
+                pause_type="escalation",
+                session_id=ctx.session.session_id,
+                conversation_id=conversation_id,
+                context={
+                    "call_id": intaris_call_id,
+                    "tool_name": tc.name,
+                    "arguments": tc.arguments,
+                    "risk": eval_meta.get("risk"),
+                    "reasoning": eval_meta.get("reasoning"),
+                },
+            )
+        )
+
+        # Notify all channel subscribers (web, signal, slack, etc.)
+        await self.event_bus.publish(
+            Event(
+                type=EventType.ESCALATION_CREATED,
+                data={
+                    "conversation_id": conversation_id,
+                    "session_id": ctx.session.session_id,
+                    "call_id": intaris_call_id,
+                    "tool_name": tc.name,
+                    "risk": eval_meta.get("risk"),
+                    "reasoning": eval_meta.get("reasoning"),
+                    "timeout_seconds": timeout_raw,
+                },
+            )
+        )
+
+        # Send an interim tool_result to the WebSocket so the UI shows
+        # the escalation status on the tool call block immediately.
+        if on_tool_result:
+            await on_tool_result(
+                tc.call_id,
+                tc.name,
+                "Waiting for user approval...",
+                True,
+                None,
+                {**eval_meta, "pending": True},
+            )
+
+        logger.info(
+            "Escalation: waiting for user decision",
+            extra={
+                "extra_data": {
+                    "session_id": ctx.session.session_id,
+                    "call_id": intaris_call_id,
+                    "tool_name": tc.name,
+                    "timeout_seconds": timeout_raw,
+                }
+            },
+        )
+
+        # Block until resolved or timeout
+        try:
+            resolution = await self.pause_waiter.wait(pause_id, timeout=timeout_f)
+        except TimeoutError:
+            resolution = PauseResolution(decision="deny", data={"reason": "timeout"})
+
+        # Publish resolution event to all channel subscribers
+        await self.event_bus.publish(
+            Event(
+                type=EventType.ESCALATION_RESOLVED,
+                data={
+                    "conversation_id": conversation_id,
+                    "session_id": ctx.session.session_id,
+                    "call_id": intaris_call_id,
+                    "decision": resolution.decision,
+                    "reason": resolution.data.get("reason"),
+                },
+            )
+        )
+
+        if resolution.decision == "approve":
+            logger.info(
+                "Escalation approved — re-executing tool",
+                extra={
+                    "extra_data": {
+                        "session_id": ctx.session.session_id,
+                        "call_id": intaris_call_id,
+                        "tool_name": tc.name,
+                    }
+                },
+            )
+            # Re-execute: Intaris auto-approves via escalation retry (10 min)
+            result = await self.tool_router.execute(
+                tc,
+                ctx.session,
+                ctx.agent,
+                self._get_tool_registry(ctx),
+                self._get_executor(ctx),
+            )
+            # If Intaris still escalates on retry (shouldn't happen), treat
+            # as denied to avoid infinite loops.
+            retry_eval = result.metadata.get("evaluation") if result.metadata else None
+            if retry_eval and retry_eval.get("decision") == "escalate":
+                logger.warning(
+                    "Escalation retry still escalated — treating as denied",
+                    extra={
+                        "extra_data": {
+                            "session_id": ctx.session.session_id,
+                            "tool_name": tc.name,
+                        }
+                    },
+                )
+                return ToolResult(
+                    output="Tool denied: approval could not be verified.",
+                    is_error=True,
+                    metadata=result.metadata,
+                )
+            return result
+
+        # Denied by user or timed out
+        if resolution.data.get("reason") == "timeout":
+            reason = "Escalation timed out — no response received."
+        else:
+            note = resolution.data.get("note", "")
+            reason = f"User denied the tool call. {note}".strip()
+
+        logger.info(
+            "Escalation denied",
+            extra={
+                "extra_data": {
+                    "session_id": ctx.session.session_id,
+                    "call_id": intaris_call_id,
+                    "decision": resolution.decision,
+                    "reason": resolution.data.get("reason"),
+                }
+            },
+        )
+        return ToolResult(
+            output=reason,
+            is_error=True,
+            metadata=result.metadata,
+        )
 
     # ------------------------------------------------------------------
     # Orchestration tool dispatch
@@ -1477,7 +1732,10 @@ class AgentLoop:
         )
 
         if wait:
-            # Synchronous delegation — await inline, return output as tool result
+            # Synchronous delegation — await inline, return output as tool result.
+            # Do NOT pass parent streaming callbacks to child sessions — child
+            # tool calls should only be visible in the sub-session view, not
+            # leak into the parent conversation timeline.
             DELEGATIONS_TOTAL.labels(status="sync_started").inc()
             output = await self._run_child_session(
                 child_session=child_session,
@@ -1487,9 +1745,6 @@ class AgentLoop:
                 parent_intaris_session_id=parent_intaris_id,
                 tool_registry=ctx.tool_registry,
                 executor_connection=ctx.executor_connection,
-                on_token=on_token,
-                on_tool_call=on_tool_call,
-                on_tool_result=on_tool_result,
             )
             if output:
                 # Prefer full content over summary for delegation results

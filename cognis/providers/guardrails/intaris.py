@@ -108,11 +108,21 @@ class IntarisProvider:
         return EvaluationResult.model_validate(response.json())
 
     async def report_reasoning(
-        self, session_id: str, content: str, context: str | None = None
+        self,
+        session_id: str,
+        content: str = "",
+        context: str | None = None,
+        *,
+        from_events: bool = False,
     ) -> None:
+        body: dict[str, Any] = {"session_id": session_id, "content": content}
+        if context is not None:
+            body["context"] = context
+        if from_events:
+            body["from_events"] = True
         response = await self.client.post(
             "/api/v1/reasoning",
-            json={"session_id": session_id, "content": content, "context": context},
+            json=body,
             headers=self._headers(user_email=current_user_email.get()),
         )
         response.raise_for_status()
