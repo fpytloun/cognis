@@ -541,6 +541,7 @@ async def create_session(
     agent_id: str,
     *,
     parent_session_id: str | None = None,
+    previous_session_id: str | None = None,
     delegation_mode: str | None = None,
     delegation_task: str | None = None,
     status: str = "active",
@@ -554,6 +555,7 @@ async def create_session(
         session_id=session_id or f"sess_{uuid.uuid4().hex}",
         conversation_id=conversation_id,
         parent_session_id=parent_session_id,
+        previous_session_id=previous_session_id,
         user_email=user_email,
         agent_id=agent_id,
         delegation_mode=delegation_mode,
@@ -610,6 +612,7 @@ async def set_session_status(
     idle_since: datetime | None = None,
     completed_at: datetime | None = None,
     result_summary: str | None = None,
+    completion_reason: str | None = None,
 ) -> bool:
     """Update session lifecycle state and timestamps."""
 
@@ -621,6 +624,8 @@ async def set_session_status(
     session_row.completed_at = completed_at
     if result_summary is not None:
         session_row.result_summary = result_summary
+    if completion_reason is not None:
+        session_row.completion_reason = completion_reason
     session_row.updated_at = datetime.now(UTC)
     await session.flush()
     return True

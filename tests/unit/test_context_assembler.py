@@ -26,6 +26,8 @@ class _SessionCache:
         self.cold = cold
         self.entry = None if cold else _CacheEntry()
         self.refresh_calls = 0
+        self._cached_instructions: str | None = None
+        self._cached_core: str | None = None
 
     async def refresh(self, session: SessionModel) -> object:
         del session
@@ -52,6 +54,21 @@ class _SessionCache:
     def get_events_since_compaction(self, session_id: str, types: list[str] | None = None) -> list:
         del session_id, types
         return []
+
+    def get_cached_memory(
+        self, session_id: str, ttl_seconds: float = 1800.0
+    ) -> tuple[str | None, str | None, bool]:
+        del session_id, ttl_seconds
+        if self._cached_instructions is not None:
+            return self._cached_instructions, self._cached_core, True
+        return None, None, False
+
+    async def cache_memory(
+        self, session_id: str, instructions: str | None, core_memories: str | None
+    ) -> None:
+        del session_id
+        self._cached_instructions = instructions
+        self._cached_core = core_memories
 
 
 class _Memory:
@@ -266,4 +283,11 @@ async def test_context_assembler_accounts_for_tool_schema_budget() -> None:
         tool_definitions=[large_tool],
     )
 
-    assert not any('trust="untrusted"' in str(message["content"]) for message in result.messages)
+    # With the new context structure, core memories are in the immutable prefix
+    # and are never pruned. Only mutable recalled memories (search results)
+    # should be pruned when the token budget is tight.
+    assert not any(
+        'trust="untrusted"' in str(message["content"])
+        and "Recalled memories:" in str(message["content"])
+        for message in result.messages
+    )

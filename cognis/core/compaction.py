@@ -5,12 +5,27 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+from prometheus_client import Counter
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from cognis.logging import get_logger
 from cognis.models.session import SessionEvent, SessionModel
 from cognis.runtime_context import scoped_runtime_context
 from cognis.store.queries import get_setting_value
+
+logger = get_logger(__name__)
+
+COMPACTION_TOTAL = Counter(
+    "cognis_session_compactions_total",
+    "Total compaction attempts",
+    ["trigger", "method"],
+)
+ROTATION_TOTAL = Counter(
+    "cognis_session_rotations_total",
+    "Total session rotations after compaction",
+    ["trigger"],
+)
 
 
 class CompactionResult(BaseModel):
@@ -76,8 +91,13 @@ class CompactionStrategy:
             return False
         return (prompt_tokens / max_context_tokens) >= self.compaction_threshold
 
-    async def compact(self, session: SessionModel) -> CompactionResult:
-        """Attempt LLM-driven compaction of buffered session history."""
+    async def compact(self, session: SessionModel, *, trigger: str = "manual") -> CompactionResult:
+        """Attempt LLM-driven compaction of buffered session history.
+
+        *trigger* is used for observability labels: ``"manual"`` for
+        ``/compact`` slash command, ``"automatic"`` for token-threshold
+        compaction during context assembly.
+        """
 
         entry = self.session_cache.get_entry(session.session_id)
         if entry is None:
@@ -105,7 +125,13 @@ class CompactionStrategy:
             if not summary:
                 raise ValueError("LLM compaction returned empty summary")
         except Exception:
-            return await self.compact_with_fallback(session)
+            logger.warning(
+                "LLM compaction failed, falling back to mechanical",
+                extra={"extra_data": {"session_id": session.session_id}},
+            )
+            return await self.compact_with_fallback(session, trigger=trigger)
+
+        COMPACTION_TOTAL.labels(trigger=trigger, method="llm").inc()
         return await self._record_compaction(
             session=session,
             summary=summary,
@@ -113,7 +139,9 @@ class CompactionStrategy:
             method="llm",
         )
 
-    async def compact_with_fallback(self, session: SessionModel) -> CompactionResult:
+    async def compact_with_fallback(
+        self, session: SessionModel, *, trigger: str = "manual"
+    ) -> CompactionResult:
         """Use metadata-only compaction if LLM compaction fails."""
 
         entry = self.session_cache.get_entry(session.session_id)
@@ -124,6 +152,7 @@ class CompactionStrategy:
         if not older_events:
             return CompactionResult(compacted=False, method="noop")
         summary = _mechanical_summary(older_events)
+        COMPACTION_TOTAL.labels(trigger=trigger, method="mechanical").inc()
         return await self._record_compaction(
             session=session,
             summary=summary,

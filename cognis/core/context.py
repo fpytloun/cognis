@@ -40,6 +40,7 @@ class ContextAssemblyResult(BaseModel):
     dynamic_tokens: int = 0
     prompt_tokens: int = 0
     recommend_compaction: bool = False
+    cache_breakpoint_index: int | None = None
 
 
 class ContextAssembler:
@@ -121,6 +122,12 @@ class ContextAssembler:
         )
         cached_intention = self.session_cache.get_intention(session.session_id)
         is_first_recall = session.mnemory_session_id is None
+
+        # Check if cached instructions are stale (TTL 30 min)
+        _cached_instr, _cached_core, memory_cache_valid = self.session_cache.get_cached_memory(
+            session.session_id
+        )
+        need_instructions = is_first_recall or not memory_cache_valid
         search_mode = "find" if is_first_recall else "search"
 
         with scoped_runtime_context(user_email=session.user_email, agent_id=session.agent_id):
@@ -130,9 +137,9 @@ class ContextAssembler:
                 labels=conversation.context.memory_labels,
                 context=cached_intention,
                 search_mode=search_mode,
-                include_instructions=is_first_recall,
+                include_instructions=need_instructions,
                 managed=True,
-                instruction_mode="personality" if is_first_recall else None,
+                instruction_mode="personality" if need_instructions else None,
             )
             refresh_task = self.session_cache.refresh(session)
             intention_task = self.guardrails.get_session(
@@ -200,17 +207,27 @@ class ContextAssembler:
                         exc_info=True,
                     )
 
-        memory_block = None
+        # ----- Memory handling: split into immutable and mutable parts -----
+        immutable_instructions: str | None = None
+        immutable_core_memories: str | None = None
+        mutable_search_results: str | None = None
+
         if isinstance(recall_result, Exception):
             logger.warning(
                 "context: degraded source=memory",
                 extra={"extra_data": {"session_id": session.session_id}},
             )
             degraded_sources.append("memory")
-            recall_payload: dict[str, Any] | None = None
+
+            # Fall back to cached immutable memory if available
+            cached_instr, cached_core, cache_valid = self.session_cache.get_cached_memory(
+                session.session_id
+            )
+            if cached_instr or cached_core:
+                immutable_instructions = cached_instr
+                immutable_core_memories = cached_core
         else:
-            recall_payload = recall_result
-            memory_block = _format_memory_context(recall_payload)
+            recall_payload: dict[str, Any] = recall_result
             recall_session_id = str(recall_payload.get("session_id") or "").strip()
             if session.mnemory_session_id is None and recall_session_id:
                 updated = await self.session_manager.attach_mnemory_session(
@@ -218,6 +235,34 @@ class ContextAssembler:
                 )
                 if updated:
                     session.mnemory_session_id = recall_session_id
+
+            # Extract the three memory parts from the recall response
+            raw_instructions = recall_payload.get("instructions")
+            raw_core = recall_payload.get("core_memories")
+            raw_search = recall_payload.get("search_results")
+
+            if isinstance(raw_instructions, str) and raw_instructions.strip():
+                immutable_instructions = raw_instructions.strip()
+            if isinstance(raw_core, str) and raw_core.strip():
+                immutable_core_memories = raw_core.strip()
+
+            # Cache immutable parts on first recall (or refresh on stale)
+            if immutable_instructions or immutable_core_memories:
+                await self.session_cache.cache_memory(
+                    session.session_id, immutable_instructions, immutable_core_memories
+                )
+            else:
+                # Use cached values if recall didn't return new ones
+                # (subsequent calls don't include instructions/core)
+                cached_instr, cached_core, cache_valid = self.session_cache.get_cached_memory(
+                    session.session_id
+                )
+                if cache_valid:
+                    immutable_instructions = cached_instr
+                    immutable_core_memories = cached_core
+
+            # Format mutable search results
+            mutable_search_results = _format_search_results(raw_search)
 
         resolved_model = await self.llm.resolve_model(
             explicit_model=agent.llm_config.model if agent.llm_config else None,
@@ -242,26 +287,71 @@ class ContextAssembler:
         dynamic_tokens = max(0, max_context_tokens - static_tokens - reserve_output_tokens)
         max_prompt_tokens = max(0, max_context_tokens - reserve_output_tokens)
 
+        # ----- Build messages: immutable prefix first, then mutable suffix -----
         messages: list[dict[str, Any]] = []
+
+        # Immutable prefix block 1: system prompt
         if agent.system_prompt:
             messages.append({"role": "system", "content": agent.system_prompt})
+
+        # Immutable prefix block 2: memory instructions (behavioral guidance)
+        if immutable_instructions:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": f"<memory_instructions>\n{immutable_instructions}\n</memory_instructions>",
+                }
+            )
+
+        # Immutable prefix block 3: core memories (pinned facts, identity)
+        if immutable_core_memories:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        '<memory_context trust="untrusted">\n'
+                        + immutable_core_memories
+                        + "\n</memory_context>"
+                    ),
+                }
+            )
+
+        # Immutable prefix block 4: compaction summary (stable within session)
         compaction_summary = cache_entry.last_compaction_summary
         if compaction_summary:
             messages.append(
                 {
                     "role": "system",
-                    "content": f"Compaction summary:\n{compaction_summary}",
+                    "content": (
+                        "This is a continuation from a previous session. "
+                        "Here is a summary of what was discussed:\n\n"
+                        f"{compaction_summary}\n\n"
+                        "The conversation continues below."
+                    ),
                 }
             )
-        if memory_block is not None:
-            messages.append({"role": "system", "content": memory_block})
 
+        # ----- Mutable suffix -----
+
+        # History messages (append-only)
         history_messages = self._events_to_messages(
             self.session_cache.get_events_since_compaction(
                 session.session_id, EVENT_TYPES_FOR_CONTEXT
             )
         )
         messages.extend(history_messages)
+
+        # Per-turn recalled memories (mutable, appended each turn)
+        if mutable_search_results:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        '<memory_context trust="untrusted">\n'
+                        "Recalled memories:\n" + mutable_search_results + "\n</memory_context>"
+                    ),
+                }
+            )
 
         if active_delegations:
             messages.append(
@@ -277,6 +367,10 @@ class ContextAssembler:
             system_prompt=agent.system_prompt,
             tool_schema_tokens=tool_schema_tokens,
         )
+
+        # Recompute cache breakpoint after pruning (immutable messages may have shifted)
+        cache_breakpoint_index = _find_cache_breakpoint(messages)
+
         prompt_tokens = (
             self.llm.count_messages_tokens(messages, resolved_model) + tool_schema_tokens
         )
@@ -293,6 +387,7 @@ class ContextAssembler:
                     "degraded_sources": sorted(set(degraded_sources)),
                     "prompt_tokens": prompt_tokens,
                     "recommend_compaction": recommend_compaction,
+                    "cache_breakpoint_index": cache_breakpoint_index,
                 }
             },
         )
@@ -305,6 +400,7 @@ class ContextAssembler:
             dynamic_tokens=dynamic_tokens,
             prompt_tokens=prompt_tokens,
             recommend_compaction=recommend_compaction,
+            cache_breakpoint_index=cache_breakpoint_index,
         )
 
     def _count_static_tokens(
@@ -346,35 +442,29 @@ class ContextAssembler:
             self.llm.count_messages_tokens(pruned_messages, resolved_model) + tool_schema_tokens
             > max_prompt_tokens
         ):
-            memory_index = next(
+            # Priority 1: Drop mutable recalled memories (search results)
+            recalled_index = next(
                 (
                     index
                     for index, message in enumerate(pruned_messages)
                     if message.get("role") == "system"
                     and isinstance(message.get("content"), str)
+                    and "Recalled memories:" in str(message.get("content"))
                     and '<memory_context trust="untrusted">' in str(message.get("content"))
                 ),
                 None,
             )
-            if memory_index is not None:
-                pruned_messages.pop(memory_index)
+            if recalled_index is not None:
+                pruned_messages.pop(recalled_index)
                 continue
 
+            # Priority 2: Drop oldest non-protected messages (history)
             removable_history_index = next(
                 (
                     index
                     for index, message in enumerate(pruned_messages)
                     if index != len(pruned_messages) - 1
-                    and not (
-                        system_prompt is not None
-                        and message.get("role") == "system"
-                        and message.get("content") == system_prompt
-                    )
-                    and not (
-                        message.get("role") == "system"
-                        and isinstance(message.get("content"), str)
-                        and str(message.get("content")).startswith("Compaction summary:\n")
-                    )
+                    and not _is_immutable_prefix_message(message, system_prompt)
                 ),
                 None,
             )
@@ -497,36 +587,77 @@ def events_to_messages(events: list[Any]) -> list[dict[str, Any]]:
     return messages
 
 
-def _format_memory_context(recall_payload: dict[str, Any]) -> str | None:
-    parts: list[str] = []
+def _find_cache_breakpoint(messages: list[dict[str, Any]]) -> int | None:
+    """Find the index of the last immutable prefix message.
 
-    # Mnemory-managed instructions (memory system prompt, behavioral guidance)
-    instructions = recall_payload.get("instructions")
-    if isinstance(instructions, str) and instructions.strip():
-        parts.append(instructions.strip())
+    The cache breakpoint is the last system message that belongs to the
+    immutable prefix (system prompt, memory instructions, core memories,
+    or compaction summary). Everything after this index is mutable and
+    changes every turn.
 
-    core_memories = recall_payload.get("core_memories")
-    if isinstance(core_memories, str) and core_memories.strip():
-        parts.append("Core memories:\n" + core_memories.strip())
+    The system prompt (first message) is always immutable. We detect
+    the other immutable messages by their content markers.
+    """
 
-    search_results = recall_payload.get("search_results")
-    if isinstance(search_results, list) and search_results:
-        lines = []
-        for result in search_results:
-            if not isinstance(result, dict):
-                continue
-            memory = result.get("memory")
-            if not isinstance(memory, str) or not memory.strip():
-                continue
-            score = result.get("score")
-            prefix = f"- ({score:.2f}) " if isinstance(score, (int, float)) else "- "
-            lines.append(prefix + memory.strip())
-        if lines:
-            parts.append("Relevant memories:\n" + "\n".join(lines))
-
-    if not parts:
+    if not messages:
         return None
-    return '<memory_context trust="untrusted">\n' + "\n\n".join(parts) + "\n</memory_context>"
+
+    # The first message is always the system prompt (immutable)
+    system_prompt = messages[0].get("content") if messages[0].get("role") == "system" else None
+
+    last_immutable = None
+    for index, message in enumerate(messages):
+        if _is_immutable_prefix_message(message, system_prompt):
+            last_immutable = index
+        elif message.get("role") != "system":
+            # First non-system message means we've left the prefix
+            break
+    return last_immutable
+
+
+def _format_search_results(search_results: Any) -> str | None:
+    """Format per-turn recalled memories (mutable part of memory context)."""
+
+    if not isinstance(search_results, list) or not search_results:
+        return None
+    lines: list[str] = []
+    for result in search_results:
+        if not isinstance(result, dict):
+            continue
+        memory = result.get("memory")
+        if not isinstance(memory, str) or not memory.strip():
+            continue
+        score = result.get("score")
+        prefix = f"- ({score:.2f}) " if isinstance(score, (int, float)) else "- "
+        lines.append(prefix + memory.strip())
+    return "\n".join(lines) if lines else None
+
+
+def _is_immutable_prefix_message(message: dict[str, Any], system_prompt: str | None) -> bool:
+    """Check if a message belongs to the immutable prompt prefix.
+
+    Protected messages that should never be pruned:
+    - System prompt
+    - Memory instructions (server-generated behavioral guidance)
+    - Core memories (untrusted wrapper with pinned facts)
+    - Compaction summary (continuation context)
+    """
+    if message.get("role") != "system":
+        return False
+    content = message.get("content")
+    if not isinstance(content, str):
+        return False
+    # System prompt
+    if system_prompt is not None and content == system_prompt:
+        return True
+    # Memory instructions (server-generated behavioral guidance)
+    if content.startswith("<memory_instructions>"):
+        return True
+    # Compaction summary
+    if content.startswith("This is a continuation from a previous session."):
+        return True
+    # Core memories (untrusted wrapper without "Recalled memories" marker)
+    return '<memory_context trust="untrusted">' in content and "Recalled memories:" not in content
 
 
 def _format_delegation_status(data: dict[str, Any]) -> str:

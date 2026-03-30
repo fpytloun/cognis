@@ -24,6 +24,59 @@ logger = get_logger(__name__)
 MODEL_CACHE_TTL_SECONDS = 60.0
 SAFE_PROVIDER_KWARGS = {"api_base", "api_version", "base_url", "max_retries", "timeout"}
 
+# Anthropic model name patterns for prompt caching support
+_ANTHROPIC_MODEL_PATTERNS = re.compile(r"(claude|anthropic)", re.IGNORECASE)
+
+
+def _apply_cache_hints(
+    messages: list[dict[str, Any]],
+    model: str,
+    cache_breakpoint_index: int | None,
+) -> list[dict[str, Any]]:
+    """Apply provider-specific prompt cache hints to the immutable prefix.
+
+    For Anthropic models, adds ``cache_control`` breakpoint to the last
+    message in the immutable prefix so that everything up to (and including)
+    that message is cached across requests.
+
+    For other providers (OpenAI uses automatic prefix caching), the messages
+    are returned unchanged.
+    """
+
+    if cache_breakpoint_index is None or cache_breakpoint_index < 0:
+        return messages
+    if not _ANTHROPIC_MODEL_PATTERNS.search(model):
+        return messages
+    if cache_breakpoint_index >= len(messages):
+        return messages
+
+    # Deep-copy only the breakpoint message to avoid mutating the original
+    result = list(messages)
+    breakpoint_msg = dict(result[cache_breakpoint_index])
+
+    # LiteLLM passes cache_control through to the Anthropic API
+    content = breakpoint_msg.get("content")
+    if isinstance(content, str):
+        breakpoint_msg["content"] = [
+            {
+                "type": "text",
+                "text": content,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
+    elif isinstance(content, list):
+        # Content is already a list of blocks — add cache_control to the last one
+        content = [dict(block) if isinstance(block, dict) else block for block in content]
+        if content:
+            last_block = dict(content[-1]) if isinstance(content[-1], dict) else content[-1]
+            if isinstance(last_block, dict):
+                last_block["cache_control"] = {"type": "ephemeral"}
+                content[-1] = last_block
+        breakpoint_msg["content"] = content
+
+    result[cache_breakpoint_index] = breakpoint_msg
+    return result
+
 
 class LiteLLMProvider:
     """Load provider/model config from DB and route through LiteLLM."""
@@ -118,12 +171,14 @@ class LiteLLMProvider:
         messages: list[dict[str, Any]],
         model: str | None = None,
         task_type: str = "default",
+        cache_breakpoint_index: int | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
         resolved_model, provider = await self._resolve_model_target(model, task_type=task_type)
         request_kwargs = {**await self._resolve_provider_kwargs(provider), **kwargs}
+        prepared_messages = _apply_cache_hints(messages, resolved_model, cache_breakpoint_index)
         response = await litellm.acompletion(
-            model=resolved_model, messages=messages, stream=False, **request_kwargs
+            model=resolved_model, messages=prepared_messages, stream=False, **request_kwargs
         )
         return dict(response)
 
@@ -132,12 +187,14 @@ class LiteLLMProvider:
         messages: list[dict[str, Any]],
         model: str | None = None,
         task_type: str = "default",
+        cache_breakpoint_index: int | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[dict[str, Any]]:
         resolved_model, provider = await self._resolve_model_target(model, task_type=task_type)
         request_kwargs = {**await self._resolve_provider_kwargs(provider), **kwargs}
+        prepared_messages = _apply_cache_hints(messages, resolved_model, cache_breakpoint_index)
         stream = await litellm.acompletion(
-            model=resolved_model, messages=messages, stream=True, **request_kwargs
+            model=resolved_model, messages=prepared_messages, stream=True, **request_kwargs
         )
         async for chunk in stream:
             yield dict(chunk)

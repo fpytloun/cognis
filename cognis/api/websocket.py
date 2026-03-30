@@ -24,11 +24,12 @@ from cognis.api.models import (
 )
 from cognis.api.serializers import agent_to_response
 from cognis.core.agent_loop import PauseResolution
+from cognis.core.compaction import ROTATION_TOTAL
 from cognis.core.events import Event, EventType
 from cognis.core.session import _to_conversation_model, _to_session_model
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
-from cognis.models.session import ConversationModel, SessionModel
+from cognis.models.session import BLOCKED_STATES, ConversationModel, SessionModel, SessionStatus
 from cognis.models.task import TaskDelivery
 from cognis.runtime_context import current_agent_id, current_user_email
 from cognis.store.models import Task
@@ -669,7 +670,9 @@ class WebSocketConnectionManager:
             queue = self._queued_messages.get(conversation_id)
             if queue:
                 queued = queue.popleft()
-                runtime = await _load_conversation_runtime(self.app, conversation_id)
+                runtime = await _load_conversation_runtime(
+                    self.app, conversation_id, user_message=queued.content
+                )
                 if runtime is not None:
                     next_conversation, next_session, next_agent = runtime
                     self._launch_turn(
@@ -986,7 +989,9 @@ async def handle_websocket(websocket: WebSocket) -> None:
                         recoverable=True,
                     )
                     continue
-                runtime = await _load_conversation_runtime(websocket.app, conversation_id)
+                runtime = await _load_conversation_runtime(
+                    websocket.app, conversation_id, user_message=content
+                )
                 if runtime is None:
                     await manager.send_error(
                         connection,
@@ -1014,9 +1019,65 @@ async def handle_websocket(websocket: WebSocket) -> None:
                     continue
 
                 # -------------------------------------------------------
-                # Slash commands: /approve and /deny resolve escalations
+                # Session state enforcement
+                # -------------------------------------------------------
+                if session.status in BLOCKED_STATES:
+                    if session.status == SessionStatus.SUSPENDED:
+                        await manager.send_error(
+                            connection,
+                            code="session_suspended",
+                            message="Session is suspended. Resolve the pending escalation to continue.",
+                            recoverable=True,
+                        )
+                    else:
+                        await manager.send_error(
+                            connection,
+                            code="session_ended",
+                            message="This session has ended. Use /new to start a fresh conversation.",
+                            recoverable=False,
+                        )
+                    continue
+
+                # -------------------------------------------------------
+                # Slash commands
                 # -------------------------------------------------------
                 stripped = content.strip()
+
+                # /compact or /summarize — trigger manual compaction
+                if stripped in ("/compact", "/summarize"):
+                    if (
+                        conversation_id in manager._active_turns
+                        and not manager._active_turns[conversation_id].done()
+                    ):  # noqa: SLF001
+                        await manager.send_error(
+                            connection,
+                            code="turn_active",
+                            message="Cannot compact while a turn is active. Wait for it to finish or cancel it.",
+                            recoverable=True,
+                        )
+                    else:
+                        await _handle_slash_compact(
+                            websocket.app, manager, connection, conversation, session
+                        )
+                    continue
+
+                # /new, /reset, /clear — start fresh
+                if stripped in ("/new", "/reset", "/clear"):
+                    if (
+                        conversation_id in manager._active_turns
+                        and not manager._active_turns[conversation_id].done()
+                    ):  # noqa: SLF001
+                        await manager.send_error(
+                            connection,
+                            code="turn_active",
+                            message="Cannot reset while a turn is active. Wait for it to finish or cancel it.",
+                            recoverable=True,
+                        )
+                    else:
+                        await _handle_slash_new(
+                            websocket.app, manager, connection, conversation, session, agent
+                        )
+                    continue
                 if stripped.startswith("/approve") or stripped.startswith("/deny"):
                     is_approve = stripped.startswith("/approve")
                     cmd_word = "/approve" if is_approve else "/deny"
@@ -1362,10 +1423,179 @@ async def handle_websocket(websocket: WebSocket) -> None:
         manager.disconnect(connection)
 
 
+async def _handle_slash_compact(
+    app: Any,
+    manager: WebSocketConnectionManager,
+    connection: AuthenticatedWebSocket,
+    conversation: ConversationModel,
+    session: SessionModel,
+) -> None:
+    """Handle /compact or /summarize slash command.
+
+    Triggers LLM compaction on the current session, marks it completed
+    with ``completion_reason="compacted"``, and notifies the client.
+    Session creation is deferred until the next user message.
+    """
+    conversation_id = conversation.conversation_id
+
+    # Notify start
+    await manager.send_to_conversation(
+        conversation_id,
+        {
+            "type": "system_message",
+            "conversation_id": conversation_id,
+            "text": "Compacting conversation history...",
+        },
+    )
+
+    try:
+        compaction_result = await app.state.compaction_strategy.compact(session, trigger="manual")
+    except Exception:
+        logger.exception(
+            "Slash compact failed",
+            extra={"extra_data": {"session_id": session.session_id}},
+        )
+        await manager.send_error(
+            connection,
+            code="compaction_failed",
+            message="Compaction failed. Try again or continue chatting.",
+            recoverable=True,
+        )
+        return
+
+    if not compaction_result.compacted:
+        await manager.send_to_conversation(
+            conversation_id,
+            {
+                "type": "system_message",
+                "conversation_id": conversation_id,
+                "text": "Not enough conversation history to compact.",
+            },
+        )
+        return
+
+    # Mark current session as completed (deferred creation)
+    await app.state.session_manager.mark_completed(
+        session.session_id,
+        result_summary=f"Compacted ({compaction_result.method})",
+        completion_reason="compacted",
+    )
+
+    # Send compaction event to clients
+    summary_preview = (compaction_result.summary or "")[:500]
+    await manager.send_to_conversation(
+        conversation_id,
+        {
+            "type": "session_compacted",
+            "conversation_id": conversation_id,
+            "session_id": session.session_id,
+            "previous_session_id": session.session_id,
+            "summary_preview": summary_preview,
+            "method": compaction_result.method,
+            "turns_compacted": compaction_result.turns_compacted,
+        },
+    )
+
+
+async def _handle_slash_new(
+    app: Any,
+    manager: WebSocketConnectionManager,
+    connection: AuthenticatedWebSocket,
+    conversation: ConversationModel,
+    session: SessionModel,
+    agent: Any,
+) -> None:
+    """Handle /new, /reset, or /clear slash command.
+
+    For web context: creates a new conversation + session.
+    For channel-bound context: creates a new root session within the same conversation.
+    """
+    conversation_id = conversation.conversation_id
+
+    if conversation.context.type == "web":
+        # Web context: create a new conversation entirely
+        try:
+            (
+                new_conversation,
+                new_session,
+            ) = await app.state.session_manager.create_conversation_with_root_session(
+                user_email=connection.user_email,
+                agent_id=agent.agent_id,
+                context=conversation.context,
+                intention=f"New conversation with {agent.name}",
+            )
+        except Exception:
+            logger.exception("Slash /new failed to create conversation")
+            await manager.send_error(
+                connection,
+                code="creation_failed",
+                message="Could not create a new conversation.",
+                recoverable=True,
+            )
+            return
+
+        # Mark old session completed
+        await app.state.session_manager.mark_completed(
+            session.session_id,
+            result_summary="User started new conversation",
+            completion_reason="user_reset",
+        )
+
+        await manager.send_to_conversation(
+            conversation_id,
+            {
+                "type": "conversation_created",
+                "conversation_id": new_conversation.conversation_id,
+                "old_conversation_id": conversation_id,
+            },
+        )
+    else:
+        # Channel-bound: create new root session within same conversation
+        try:
+            new_session = await app.state.session_manager.rotate_session(
+                conversation_id=conversation_id,
+                current_session=session,
+                intention=f"Conversation with {agent.name}",
+                completion_reason="user_reset",
+            )
+        except Exception:
+            logger.exception("Slash /new failed to rotate session")
+            await manager.send_error(
+                connection,
+                code="creation_failed",
+                message="Could not create a new session.",
+                recoverable=True,
+            )
+            return
+
+        await manager.send_to_conversation(
+            conversation_id,
+            {
+                "type": "session_reset",
+                "conversation_id": conversation_id,
+                "session_id": new_session.session_id,
+                "previous_session_id": session.session_id,
+            },
+        )
+
+
 async def _load_conversation_runtime(
     app: Any,
     conversation_id: str,
+    *,
+    user_message: str | None = None,
 ) -> tuple[ConversationModel, SessionModel, Any] | None:
+    """Load conversation, session, and agent for a WebSocket turn.
+
+    When the root session is completed with ``completion_reason="compacted"``
+    (deferred session creation after ``/compact``), this function creates a
+    new root session carrying the compaction summary as initial context.
+
+    When *user_message* is provided and the root session needs creation
+    (either brand-new or deferred after compaction), the message is used
+    to derive the initial intention via Intaris.
+    """
+
     async with app.state.session_factory() as session:
         conversation_row = await get_conversation(session, conversation_id)
         if conversation_row is None:
@@ -1375,7 +1605,9 @@ async def _load_conversation_runtime(
             return None
         agent_model = AgentDefinition.model_validate(agent_to_response(agent_row).model_dump())
         conversation_model = _to_conversation_model(conversation_row)
+
         if conversation_row.root_session_id is None:
+            # No root session at all — create one
             intention = (
                 conversation_row.title
                 or agent_row.description
@@ -1392,10 +1624,60 @@ async def _load_conversation_runtime(
                 raise SessionCreationFailedError("Could not create a session") from exc
             conversation_model.root_session_id = root_session.session_id
             return conversation_model, root_session, agent_model
+
         session_row = await get_session_row(session, conversation_row.root_session_id)
+
     if session_row is None:
         return None
+
     session_model = _to_session_model(session_row)
+
+    # --- Deferred session creation after /compact ---
+    if (
+        session_model.status == SessionStatus.COMPLETED
+        and getattr(session_model, "completion_reason", None) == "compacted"
+    ):
+        compaction_summary = await _read_compaction_summary_from_session(app, session_model)
+        intention = user_message[:200] if user_message else "Continued conversation"
+        if compaction_summary:
+            intention = f"Continuation: {intention}"
+        try:
+            new_session = await app.state.session_manager.rotate_session(
+                conversation_id=conversation_model.conversation_id,
+                current_session=session_model,
+                intention=intention,
+                completion_reason="compacted",
+                compaction_summary=compaction_summary,
+            )
+            ROTATION_TOTAL.labels(trigger="deferred").inc()
+        except Exception as exc:
+            raise SessionCreationFailedError("Could not create session after compaction") from exc
+        conversation_model.root_session_id = new_session.session_id
+
+        # Pre-populate session cache with compaction summary.
+        # compaction_seq=0 because the new session's Intaris event stream
+        # starts fresh — there are no events to prune. The summary is
+        # injected purely as context for the LLM, not as an Intaris event.
+        if compaction_summary:
+            await app.state.session_cache.refresh(new_session)
+            await app.state.session_cache.apply_compaction(
+                new_session,
+                summary=compaction_summary,
+                compaction_seq=0,
+            )
+
+        logger.info(
+            "ws: deferred session created after compaction",
+            extra={
+                "extra_data": {
+                    "conversation_id": conversation_id,
+                    "old_session_id": session_model.session_id,
+                    "new_session_id": new_session.session_id,
+                }
+            },
+        )
+        return conversation_model, new_session, agent_model
+
     logger.debug(
         "ws: conversation runtime loaded",
         extra={
@@ -1409,6 +1691,27 @@ async def _load_conversation_runtime(
         },
     )
     return conversation_model, session_model, agent_model
+
+
+async def _read_compaction_summary_from_session(app: Any, session: SessionModel) -> str | None:
+    """Read the last compaction_summary event from a completed session's Intaris stream."""
+
+    try:
+        result = await app.state.providers.guardrails.read_events(
+            session_id=session.intaris_session_id or session.session_id,
+            after_seq=0,
+            allow_missing_stream=True,
+        )
+        # Find the last compaction_summary event
+        for event in reversed(result.events):
+            if event.get("type") == "compaction_summary":
+                return event.get("data", {}).get("summary")
+    except Exception:
+        logger.warning(
+            "Failed to read compaction summary from previous session",
+            extra={"extra_data": {"session_id": session.session_id}},
+        )
+    return None
 
 
 async def _load_pending_task_prompts(app: Any, conversation_id: str) -> list[dict[str, Any]]:

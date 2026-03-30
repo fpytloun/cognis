@@ -130,11 +130,13 @@ class Session(Base):
     parent_session_id: Mapped[str | None] = mapped_column(
         String, ForeignKey("sessions.session_id"), nullable=True
     )
+    previous_session_id: Mapped[str | None] = mapped_column(String, nullable=True)
     user_email: Mapped[str] = mapped_column(String, nullable=False)
     agent_id: Mapped[str] = mapped_column(String, nullable=False)
     delegation_mode: Mapped[str | None] = mapped_column(String, nullable=True)
     delegation_task: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String, nullable=False, default="active")
+    completion_reason: Mapped[str | None] = mapped_column(String, nullable=True)
     intaris_session_id: Mapped[str | None] = mapped_column(String, nullable=True)
     mnemory_session_id: Mapped[str | None] = mapped_column(String, nullable=True)
     started_at: Mapped[datetime] = mapped_column(

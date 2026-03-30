@@ -3,9 +3,34 @@
 from __future__ import annotations
 
 from datetime import datetime
+from enum import StrEnum
 from typing import Any
 
 from pydantic import BaseModel, Field
+
+
+class SessionStatus(StrEnum):
+    """Session lifecycle states."""
+
+    ACTIVE = "active"
+    IDLE = "idle"
+    SUSPENDED = "suspended"
+    TERMINATED = "terminated"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+TERMINAL_STATES = frozenset(
+    {
+        SessionStatus.COMPLETED,
+        SessionStatus.FAILED,
+        SessionStatus.CANCELLED,
+        SessionStatus.TERMINATED,
+    }
+)
+
+BLOCKED_STATES = TERMINAL_STATES | frozenset({SessionStatus.SUSPENDED})
 
 
 class ConversationContext(BaseModel):
@@ -38,11 +63,13 @@ class SessionModel(BaseModel):
     session_id: str
     conversation_id: str
     parent_session_id: str | None = None
+    previous_session_id: str | None = None
     user_email: str
     agent_id: str
     delegation_mode: str | None = None
     delegation_task: str | None = None
-    status: str = "active"
+    status: str = SessionStatus.ACTIVE
+    completion_reason: str | None = None
     intaris_session_id: str | None = None
     mnemory_session_id: str | None = None
     started_at: datetime | None = None

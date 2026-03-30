@@ -155,6 +155,10 @@ cognis/
 
 11. **Follows mnemory/intaris conventions**: Same build tooling (hatchling/uv), config pattern (env vars, no config files), error handling, and code style. Compatible ecosystem.
 
+12. **Compaction creates new sessions**: When context exceeds 85% capacity, compaction creates a new Intaris session within the same conversation. The compacted summary is injected as system context. Manual compaction (`/compact`) defers session creation until the next user message; automatic compaction creates it immediately since the user message is available. The old session is marked completed with `completion_reason="compacted"`.
+
+13. **Prompt caching via immutable prefix**: Context is structured with an immutable prefix (system prompt → tool schemas → memory instructions + core memories → compaction summary) followed by a mutable suffix (history → recalled memories → delegations → user message). The immutable prefix benefits from LLM prompt caching (Anthropic `cache_control`, OpenAI automatic prefix caching). Memory instructions and core memories are cached in the session cache for the duration of the session with a 30-minute TTL refresh.
+
 ## Build / Run / Test
 
 This project uses **uv** for dependency management. All tools (pytest, ruff,
@@ -369,6 +373,8 @@ class SessionCache:
     last_compaction_seq: int         # Updated on compaction
     last_compaction_summary: str     # Updated on compaction
     intention: str | None            # Read-through at turn start
+    memory_instructions: str | None  # Cached from first Mnemory recall (30 min TTL)
+    core_memories: str | None        # Cached from first Mnemory recall (30 min TTL)
 ```
 
 - **Events are immutable in Intaris object store** — safe to cache without invalidation

@@ -54,6 +54,10 @@ class CachedSessionState:
     touched_at: float = field(default_factory=monotonic)
     initialized: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # Cached memory content from first Mnemory recall (immutable prefix)
+    memory_instructions: str | None = None
+    core_memories: str | None = None
+    memory_instructions_cached_at: float | None = None
 
 
 class SessionCache:
@@ -197,6 +201,38 @@ class SessionCache:
             allowed = set(types)
             events = [event for event in events if event.type in allowed]
         return list(events)
+
+    def get_cached_memory(
+        self, session_id: str, ttl_seconds: float = 1800.0
+    ) -> tuple[str | None, str | None, bool]:
+        """Return cached (instructions, core_memories, is_valid).
+
+        Returns ``is_valid=False`` when the cache is stale (older than
+        *ttl_seconds*, default 30 minutes) or when no cached values exist.
+        """
+
+        entry = self.get_entry(session_id)
+        if entry is None or entry.memory_instructions is None:
+            return None, None, False
+        if entry.memory_instructions_cached_at is None:
+            return entry.memory_instructions, entry.core_memories, False
+        age = monotonic() - entry.memory_instructions_cached_at
+        is_valid = age < ttl_seconds
+        return entry.memory_instructions, entry.core_memories, is_valid
+
+    async def cache_memory(
+        self, session_id: str, instructions: str | None, core_memories: str | None
+    ) -> None:
+        """Cache memory instructions and core memories from first recall."""
+
+        entry = self.get_entry(session_id)
+        if entry is None:
+            return
+        async with entry.lock:
+            entry.memory_instructions = instructions
+            entry.core_memories = core_memories
+            entry.memory_instructions_cached_at = monotonic()
+            entry.touched_at = monotonic()
 
     async def _ensure_entry(self, session: SessionModel) -> CachedSessionState:
         async with self._entries_lock:

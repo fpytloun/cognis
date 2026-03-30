@@ -931,6 +931,9 @@ class AgentLoop:
                 SessionEvent(type="user_message", data={"content": ctx.user_message})
             )
 
+        # Capture cache breakpoint for prompt caching (Anthropic cache_control)
+        cache_breakpoint = getattr(context_result, "cache_breakpoint_index", None)
+
         # Main agentic loop
         reprompted = False
         while True:
@@ -942,6 +945,7 @@ class AgentLoop:
                 messages,
                 task_type="default",
                 tools=controller_tool_schemas + self._get_executor_tool_schemas(ctx),
+                cache_breakpoint_index=cache_breakpoint,
             ):
                 text_delta = accumulator.feed(chunk)
                 if text_delta and on_token:
@@ -2198,17 +2202,10 @@ class AgentLoop:
                 }
             )
 
-        # Check compaction
-        if ctx.session.intaris_session_id:
-            entry = self.session_cache.get_entry(ctx.session.session_id)
-            if entry and len(entry.events) > 50:
-                try:
-                    await self.compaction_strategy.compact(ctx.session)
-                except Exception:
-                    logger.warning(
-                        "Compaction failed during step finalization",
-                        extra={"extra_data": {"session_id": ctx.session.session_id}},
-                    )
+        # Compaction is now triggered by token-based recommend_compaction
+        # during context assembly, not by event count. The old heuristic
+        # (len(events) > 50) has been removed in favour of the unified
+        # token-threshold trigger in _execute_step().
 
     def _raise_if_cancelled(self, ctx: StepContext) -> None:
         """Abort the current step when external control requested interruption."""

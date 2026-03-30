@@ -10,7 +10,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from cognis.core.events import Event, EventBus, EventType
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
-from cognis.models.session import ConversationContext, ConversationModel, SessionModel
+from cognis.models.session import (
+    ConversationContext,
+    ConversationModel,
+    SessionModel,
+    SessionStatus,
+)
 from cognis.runtime_context import scoped_runtime_context
 from cognis.store import queries
 
@@ -264,7 +269,12 @@ class SessionManager:
         await self.session_cache.evict(session_id)
         return updated
 
-    async def mark_completed(self, session_id: str, result_summary: str | None = None) -> bool:
+    async def mark_completed(
+        self,
+        session_id: str,
+        result_summary: str | None = None,
+        completion_reason: str | None = None,
+    ) -> bool:
         """Mark a session completed and evict cache state."""
 
         async with self.session_factory() as db_session:
@@ -272,9 +282,10 @@ class SessionManager:
                 updated = await queries.set_session_status(
                     db_session,
                     session_id,
-                    "completed",
+                    SessionStatus.COMPLETED,
                     completed_at=datetime.now(UTC),
                     result_summary=result_summary,
+                    completion_reason=completion_reason,
                 )
                 await db_session.commit()
             except Exception:
@@ -291,7 +302,7 @@ class SessionManager:
                 updated = await queries.set_session_status(
                     db_session,
                     session_id,
-                    "failed",
+                    SessionStatus.FAILED,
                     completed_at=datetime.now(UTC),
                     result_summary=result_summary,
                 )
@@ -301,6 +312,136 @@ class SessionManager:
                 raise
         await self.session_cache.evict(session_id)
         return updated
+
+    async def mark_suspended(self, session_id: str, reason: str | None = None) -> bool:
+        """Mark a session suspended (e.g., safety concern from Intaris)."""
+
+        async with self.session_factory() as db_session:
+            try:
+                updated = await queries.set_session_status(
+                    db_session,
+                    session_id,
+                    SessionStatus.SUSPENDED,
+                    result_summary=reason,
+                )
+                await db_session.commit()
+            except Exception:
+                await db_session.rollback()
+                raise
+        return updated
+
+    async def mark_terminated(self, session_id: str, reason: str | None = None) -> bool:
+        """Mark a session terminated (hard-kill by user or system)."""
+
+        async with self.session_factory() as db_session:
+            try:
+                updated = await queries.set_session_status(
+                    db_session,
+                    session_id,
+                    SessionStatus.TERMINATED,
+                    completed_at=datetime.now(UTC),
+                    result_summary=reason,
+                )
+                await db_session.commit()
+            except Exception:
+                await db_session.rollback()
+                raise
+        await self.session_cache.evict(session_id)
+        return updated
+
+    async def rotate_session(
+        self,
+        *,
+        conversation_id: str,
+        current_session: SessionModel,
+        intention: str,
+        completion_reason: str = "compacted",
+        compaction_summary: str | None = None,
+    ) -> SessionModel:
+        """Create a new root session, completing the current one.
+
+        This is used for compaction (new clean context window) and for
+        explicit session reset. The new session carries forward the
+        ``mnemory_session_id`` so memory deduplication continues across
+        the rotation boundary.
+        """
+
+        logger.info(
+            "session: rotating root session",
+            extra={
+                "extra_data": {
+                    "conversation_id": conversation_id,
+                    "old_session_id": current_session.session_id,
+                    "completion_reason": completion_reason,
+                }
+            },
+        )
+
+        async with self.session_factory() as db_session:
+            try:
+                # 1. Mark current session completed
+                await queries.set_session_status(
+                    db_session,
+                    current_session.session_id,
+                    SessionStatus.COMPLETED,
+                    completed_at=datetime.now(UTC),
+                    result_summary=compaction_summary[:200] if compaction_summary else None,
+                    completion_reason=completion_reason,
+                )
+
+                # 2. Create new root session (carry mnemory_session_id forward)
+                new_session_row = await queries.create_session(
+                    db_session,
+                    conversation_id=conversation_id,
+                    user_email=current_session.user_email,
+                    agent_id=current_session.agent_id,
+                    previous_session_id=current_session.session_id,
+                    mnemory_session_id=current_session.mnemory_session_id,
+                )
+
+                # 3. Create Intaris session for the new root
+                with scoped_runtime_context(
+                    user_email=current_session.user_email,
+                    agent_id=current_session.agent_id,
+                ):
+                    await self.providers.guardrails.create_session(
+                        session_id=new_session_row.session_id,
+                        intention=intention,
+                        agent_id=current_session.agent_id,
+                        user_id=current_session.user_email,
+                    )
+
+                await queries.set_session_intaris_session_id(
+                    db_session, new_session_row.session_id, new_session_row.session_id
+                )
+
+                # 4. Update conversation root
+                await queries.update_conversation_root_session(
+                    db_session, conversation_id, new_session_row.session_id
+                )
+
+                await db_session.commit()
+            except Exception:
+                await db_session.rollback()
+                raise
+
+        # Evict old session cache
+        await self.session_cache.evict(current_session.session_id)
+
+        new_session_row.intaris_session_id = new_session_row.session_id
+        new_session = _to_session_model(new_session_row)
+
+        logger.info(
+            "session: rotation completed",
+            extra={
+                "extra_data": {
+                    "conversation_id": conversation_id,
+                    "old_session_id": current_session.session_id,
+                    "new_session_id": new_session.session_id,
+                }
+            },
+        )
+        return new_session
 
     async def recover_stale_sessions(self, stale_after_seconds: int = 300) -> list[str]:
         """Mark stale active sessions idle on controller startup."""
@@ -398,12 +539,17 @@ class SessionManager:
                     db_session, conversation_id, conversation_status
                 )
                 for session_row in sessions:
-                    if session_row.status in {"completed", "failed", "cancelled"}:
+                    if session_row.status in {
+                        SessionStatus.COMPLETED,
+                        SessionStatus.FAILED,
+                        SessionStatus.CANCELLED,
+                        SessionStatus.TERMINATED,
+                    }:
                         continue
                     await queries.set_session_status(
                         db_session,
                         session_row.session_id,
-                        "completed",
+                        SessionStatus.COMPLETED,
                         completed_at=datetime.now(UTC),
                         result_summary=f"conversation {conversation_status}",
                     )
@@ -504,11 +650,13 @@ def _to_session_model(row: Any) -> SessionModel:
         session_id=row.session_id,
         conversation_id=row.conversation_id,
         parent_session_id=row.parent_session_id,
+        previous_session_id=getattr(row, "previous_session_id", None),
         user_email=row.user_email,
         agent_id=row.agent_id,
         delegation_mode=row.delegation_mode,
         delegation_task=row.delegation_task,
         status=row.status,
+        completion_reason=getattr(row, "completion_reason", None),
         intaris_session_id=row.intaris_session_id,
         mnemory_session_id=row.mnemory_session_id,
         started_at=row.started_at,

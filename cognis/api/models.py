@@ -173,11 +173,13 @@ class SessionResponse(BaseModel):
     session_id: str
     conversation_id: str
     parent_session_id: str | None = None
+    previous_session_id: str | None = None
     user_email: str
     agent_id: str
     delegation_mode: str | None = None
     delegation_task: str | None = None
     status: str
+    completion_reason: str | None = None
     intaris_session_id: str | None = None
     mnemory_session_id: str | None = None
     started_at: datetime | None = None
