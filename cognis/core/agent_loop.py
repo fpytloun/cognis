@@ -978,13 +978,29 @@ class AgentLoop:
                 ),
             )
 
+            # Resolve model and reasoning effort for this turn.
+            # Chain: session override → agent config → system default.
+            model_for_llm = self.session_cache.get_model_override(ctx.session.session_id) or (
+                ctx.agent.llm_config.model if ctx.agent.llm_config else None
+            )
+
+            reasoning_effort = self.session_cache.get_reasoning_effort_override(
+                ctx.session.session_id
+            ) or (ctx.agent.llm_config.reasoning_effort if ctx.agent.llm_config else None)
+
+            llm_kwargs: dict[str, Any] = {}
+            if reasoning_effort:
+                llm_kwargs["reasoning_effort"] = reasoning_effort
+
             # Stream LLM response
             accumulator = StreamAccumulator()
             async for chunk in self.providers.llm.stream_generate(
                 messages,
+                model=model_for_llm,
                 task_type="default",
                 tools=controller_tool_schemas + self._get_executor_tool_schemas(ctx),
                 cache_breakpoint_index=cache_breakpoint,
+                **llm_kwargs,
             ):
                 text_delta = accumulator.feed(chunk)
                 if text_delta and on_token:

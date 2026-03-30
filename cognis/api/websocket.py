@@ -1103,6 +1103,27 @@ async def handle_websocket(websocket: WebSocket) -> None:
                     )
                     continue
 
+                # /model [name] — list or switch LLM model
+                if stripped == "/model" or stripped.startswith("/model "):
+                    arg = stripped[6:].strip() if len(stripped) > 6 else ""
+                    await _handle_slash_model(
+                        websocket.app, manager, connection, conversation, session, arg
+                    )
+                    continue
+
+                # /thinking [level] — list or switch reasoning effort
+                if stripped == "/thinking" or stripped.startswith("/thinking "):
+                    arg = stripped[9:].strip() if len(stripped) > 9 else ""
+                    await _handle_slash_thinking(
+                        websocket.app, manager, connection, conversation, session, arg
+                    )
+                    continue
+
+                # /help — show available commands
+                if stripped == "/help":
+                    await _handle_slash_help(manager, connection, conversation)
+                    continue
+
                 if stripped.startswith("/approve") or stripped.startswith("/deny"):
                     is_approve = stripped.startswith("/approve")
                     cmd_word = "/approve" if is_approve else "/deny"
@@ -1658,18 +1679,20 @@ async def _handle_slash_info(
     lines.append(f"Agent: {session.agent_id}")
     lines.append(f"Status: {session.status}")
 
-    # Context usage
+    # Context usage + model + reasoning effort
     usage = app.state.session_cache.get_context_usage(session.session_id)
     if usage:
         lines.append(f"Model: {usage['model']}")
         lines.append(
             f"Context: {usage['prompt_tokens']:,} / {usage['max_context_tokens']:,} tokens ({usage['percentage']}%)"
         )
+    reasoning = app.state.session_cache.get_reasoning_effort_override(session.session_id)
+    if reasoning:
+        lines.append(f"Reasoning effort: {reasoning}")
 
     # Intaris session stats
     intaris_sid = session.intaris_session_id or session.session_id
     try:
-
         intaris_session = await app.state.providers.guardrails.get_session(intaris_sid)
         if intaris_session.intention:
             lines.append(f"Intention: {intaris_session.intention}")
@@ -1693,6 +1716,215 @@ async def _handle_slash_info(
             "type": "system_message",
             "conversation_id": conversation_id,
             "text": "\n".join(lines),
+        },
+    )
+
+
+_DEFAULT_REASONING_EFFORTS: dict[str, list[str]] = {
+    "anthropic": ["low", "medium", "high"],
+    "openai": ["low", "medium", "high"],
+}
+
+
+def _infer_reasoning_efforts(model: str) -> list[str]:
+    """Best-effort reasoning effort levels for a model."""
+    m = model.lower()
+    if "opus" in m:
+        return ["low", "medium", "high", "max"]
+    if any(p in m for p in ("claude", "anthropic")):
+        return ["low", "medium", "high"]
+    if any(p in m for p in ("o1", "o3", "o4")):
+        return ["low", "medium", "high"]
+    if "gpt-5" in m:
+        return ["none", "low", "medium", "high"]
+    return ["low", "medium", "high"]
+
+
+async def _handle_slash_model(
+    app: Any,
+    manager: Any,
+    connection: Any,
+    conversation: Any,
+    session: Any,
+    arg: str,
+) -> None:
+    """Handle /model [name] — list or switch LLM model."""
+    conversation_id = conversation.conversation_id
+    session_id = session.session_id
+
+    if not arg:
+        # List available models with current highlighted
+        try:
+            model_ids = await app.state.providers.llm.list_model_ids()
+        except Exception:
+            model_ids = []
+
+        current = app.state.session_cache.get_model_override(session_id)
+        if not current:
+            usage = app.state.session_cache.get_context_usage(session_id)
+            current = usage["model"] if usage else None
+
+        if not model_ids:
+            text = "No models configured. Add LLM providers in Settings → Providers."
+        else:
+            lines = ["Available models:"]
+            for mid in model_ids:
+                marker = " *" if mid == current else ""
+                lines.append(f"  {mid}{marker}")
+            lines.append(f"\nCurrent: {current or 'system default'}")
+            lines.append("Usage: /model <model_name>")
+            text = "\n".join(lines)
+
+        await manager.send_to_conversation(
+            conversation_id,
+            {"type": "system_message", "conversation_id": conversation_id, "text": text},
+        )
+        return
+
+    # Switch model
+    try:
+        model_ids = await app.state.providers.llm.list_model_ids()
+    except Exception:
+        model_ids = []
+
+    if model_ids and arg not in model_ids:
+        await manager.send_to_conversation(
+            conversation_id,
+            {
+                "type": "system_message",
+                "conversation_id": conversation_id,
+                "text": f"Unknown model: {arg}\nAvailable: {', '.join(model_ids)}",
+            },
+        )
+        return
+
+    app.state.session_cache.set_model_override(session_id, arg)
+    await manager.send_to_conversation(
+        conversation_id,
+        {
+            "type": "system_message",
+            "conversation_id": conversation_id,
+            "text": f"Model switched to: {arg}\nTakes effect on next message.",
+        },
+    )
+
+
+async def _handle_slash_thinking(
+    app: Any,
+    manager: Any,
+    connection: Any,
+    conversation: Any,
+    session: Any,
+    arg: str,
+) -> None:
+    """Handle /thinking [level] — list or switch reasoning effort."""
+    conversation_id = conversation.conversation_id
+    session_id = session.session_id
+
+    # Determine current model for effort level inference
+    current_model = app.state.session_cache.get_model_override(session_id)
+    if not current_model:
+        usage = app.state.session_cache.get_context_usage(session_id)
+        current_model = usage["model"] if usage else ""
+
+    # Get supported effort levels
+    try:
+        if current_model:
+            model_info = await app.state.providers.llm.get_model_info(current_model)
+            available = model_info.reasoning_efforts if model_info.reasoning_efforts else []
+        else:
+            available = []
+    except Exception:
+        available = []
+
+    if not available and current_model:
+        available = _infer_reasoning_efforts(current_model)
+
+    current_effort = app.state.session_cache.get_reasoning_effort_override(session_id)
+
+    if not arg:
+        # Show current effort and available levels
+        lines = []
+        if current_effort:
+            lines.append(f"Current reasoning effort: {current_effort}")
+        else:
+            lines.append("Reasoning effort: default (not set)")
+        if available:
+            lines.append(f"Available levels: {', '.join(available)}")
+        else:
+            lines.append("No reasoning effort levels available for current model.")
+        lines.append("Usage: /thinking <level>  (use 'off' to reset to default)")
+        await manager.send_to_conversation(
+            conversation_id,
+            {
+                "type": "system_message",
+                "conversation_id": conversation_id,
+                "text": "\n".join(lines),
+            },
+        )
+        return
+
+    # Reset
+    if arg in ("off", "default", "reset", "none"):
+        app.state.session_cache.set_reasoning_effort_override(session_id, None)
+        await manager.send_to_conversation(
+            conversation_id,
+            {
+                "type": "system_message",
+                "conversation_id": conversation_id,
+                "text": "Reasoning effort reset to default.",
+            },
+        )
+        return
+
+    # Validate
+    if available and arg not in available:
+        await manager.send_to_conversation(
+            conversation_id,
+            {
+                "type": "system_message",
+                "conversation_id": conversation_id,
+                "text": f"Unsupported level: {arg}\nAvailable: {', '.join(available)}",
+            },
+        )
+        return
+
+    app.state.session_cache.set_reasoning_effort_override(session_id, arg)
+    await manager.send_to_conversation(
+        conversation_id,
+        {
+            "type": "system_message",
+            "conversation_id": conversation_id,
+            "text": f"Reasoning effort set to: {arg}\nTakes effect on next message.",
+        },
+    )
+
+
+_HELP_TEXT = """\
+Available commands:
+  /help              Show this help message
+  /model [name]      List available models or switch model
+  /thinking [level]  Show or set reasoning effort (low/medium/high)
+  /context           Show context window usage
+  /info              Show session details and statistics
+  /compact           Compact conversation history
+  /new               Start a new conversation
+  /approve [note]    Approve pending tool escalation
+  /deny [note]       Deny pending tool escalation"""
+
+
+async def _handle_slash_help(
+    manager: Any,
+    connection: Any,
+    conversation: Any,
+) -> None:
+    """Handle /help — show available slash commands."""
+    await manager.send_to_conversation(
+        conversation.conversation_id,
+        {
+            "type": "system_message",
+            "conversation_id": conversation.conversation_id,
+            "text": _HELP_TEXT,
         },
     )
 

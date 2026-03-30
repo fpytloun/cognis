@@ -590,7 +590,46 @@
   }
 
   /** Slash commands that are handled as system actions, not chat messages. */
-  const SYSTEM_SLASH_COMMANDS = ['/approve', '/deny', '/compact', '/summarize', '/new', '/reset', '/clear', '/context', '/info'];
+  const SYSTEM_SLASH_COMMANDS = ['/approve', '/deny', '/compact', '/summarize', '/new', '/reset', '/clear', '/context', '/info', '/model', '/thinking', '/help'];
+
+  /** Slash command suggestions shown when user types /. */
+  const SLASH_SUGGESTIONS = [
+    { command: '/help', description: 'Show available commands' },
+    { command: '/model', description: 'List or switch LLM model' },
+    { command: '/thinking', description: 'Set reasoning effort' },
+    { command: '/context', description: 'Show context usage' },
+    { command: '/info', description: 'Show session details' },
+    { command: '/compact', description: 'Compact conversation' },
+    { command: '/new', description: 'Start new conversation' },
+    { command: '/approve', description: 'Approve tool escalation' },
+    { command: '/deny', description: 'Deny tool escalation' },
+  ];
+
+  let slashSuggestionsVisible = false;
+  let slashFilteredSuggestions: typeof SLASH_SUGGESTIONS = [];
+  let slashSelectedIndex = 0;
+
+  function updateSlashSuggestions(): void {
+    const val = composer.trimStart();
+    if (val.startsWith('/') && !val.includes(' ') && val.length < 20) {
+      const filter = val.toLowerCase();
+      slashFilteredSuggestions = SLASH_SUGGESTIONS.filter((s) => s.command.startsWith(filter));
+      slashSuggestionsVisible = slashFilteredSuggestions.length > 0;
+      slashSelectedIndex = 0;
+    } else {
+      slashSuggestionsVisible = false;
+    }
+  }
+
+  function acceptSlashSuggestion(index: number): void {
+    const suggestion = slashFilteredSuggestions[index];
+    if (!suggestion) return;
+    // Commands that take arguments get a trailing space
+    const needsArg = ['/model', '/thinking', '/approve', '/deny'].includes(suggestion.command);
+    composer = needsArg ? suggestion.command + ' ' : suggestion.command;
+    slashSuggestionsVisible = false;
+    composerElement?.focus();
+  }
 
   async function handleSend(): Promise<void> {
     const content = composer.trim();
@@ -620,6 +659,28 @@
   }
 
   function handleComposerKeydown(event: KeyboardEvent): void {
+    // Slash suggestion navigation
+    if (slashSuggestionsVisible) {
+      if (event.key === 'ArrowDown') {
+        event.preventDefault();
+        slashSelectedIndex = (slashSelectedIndex + 1) % slashFilteredSuggestions.length;
+        return;
+      }
+      if (event.key === 'ArrowUp') {
+        event.preventDefault();
+        slashSelectedIndex = (slashSelectedIndex - 1 + slashFilteredSuggestions.length) % slashFilteredSuggestions.length;
+        return;
+      }
+      if (event.key === 'Tab' || (event.key === 'Enter' && !event.shiftKey)) {
+        event.preventDefault();
+        acceptSlashSuggestion(slashSelectedIndex);
+        return;
+      }
+      if (event.key === 'Escape') {
+        slashSuggestionsVisible = false;
+        return;
+      }
+    }
     if (!enterToSend || event.key !== 'Enter' || event.shiftKey) return;
     event.preventDefault();
     void handleSend();
@@ -1070,9 +1131,12 @@
 
                 <!-- Context usage badge (right-aligned) -->
                 {#if contextUsage}
-                  <span class="ml-auto flex items-center gap-1.5 text-[10px] font-medium {contextUsage.percentage > 85 ? 'text-rose-400' : contextUsage.percentage > 60 ? 'text-amber-400' : 'text-slate-400'}" title="Context: {contextUsage.prompt_tokens.toLocaleString()} / {contextUsage.max_context_tokens.toLocaleString()} tokens ({contextUsage.model})">
+                  <span class="ml-auto flex items-center gap-1.5 text-[10px] font-medium {contextUsage.percentage > 85 ? 'text-rose-400' : contextUsage.percentage > 60 ? 'text-amber-400' : 'text-slate-400'}" title="Context: {contextUsage.prompt_tokens.toLocaleString()} / {contextUsage.max_context_tokens.toLocaleString()} tokens ({contextUsage.model}){contextUsage.reasoning_effort ? ` | reasoning: ${contextUsage.reasoning_effort}` : ''}">
                     <span class="font-mono">{contextUsage.prompt_tokens.toLocaleString()}</span>
                     <span class="opacity-50">({contextUsage.percentage}%)</span>
+                    {#if contextUsage.reasoning_effort}
+                      <span class="rounded border border-violet-500/30 px-1 text-violet-400">{contextUsage.reasoning_effort}</span>
+                    {/if}
                   </span>
                 {/if}
               {:else}
@@ -1251,12 +1315,28 @@
           </div>
         {:else}
           <form class="shrink-0 space-y-3 rounded-3xl border border-slate-800/80 bg-slate-900/80 p-4" onsubmit={(event) => { event.preventDefault(); void handleSend(); }}>
+            <!-- Slash command suggestions dropdown -->
+            {#if slashSuggestionsVisible}
+              <div class="mb-1 rounded-xl border border-slate-700 bg-slate-900/95 py-1 text-sm shadow-lg">
+                {#each slashFilteredSuggestions as suggestion, i}
+                  <button
+                    class="flex w-full items-center gap-3 px-3 py-1.5 text-left text-xs transition {i === slashSelectedIndex ? 'bg-slate-700/60 text-slate-100' : 'text-slate-400 hover:bg-slate-800/60 hover:text-slate-200'}"
+                    onmousedown={(e: MouseEvent) => { e.preventDefault(); acceptSlashSuggestion(i); }}
+                    type="button"
+                  >
+                    <span class="font-mono font-medium text-sky-400">{suggestion.command}</span>
+                    <span class="opacity-70">{suggestion.description}</span>
+                  </button>
+                {/each}
+              </div>
+            {/if}
             <textarea
               bind:this={composerElement}
               bind:value={composer}
               class="min-h-[80px] w-full resize-none rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500"
               disabled={!currentConversation || isReadOnly(currentConversation) || isLlmUnavailableForSetup()}
               onkeydown={handleComposerKeydown}
+              oninput={updateSlashSuggestions}
               placeholder={isLlmUnavailableForSetup() ? 'Configure an LLM provider to start chatting.' : 'Send a message to Cognis...'}
             ></textarea>
             <div class="flex flex-wrap items-center justify-between gap-3">

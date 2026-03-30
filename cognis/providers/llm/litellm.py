@@ -237,6 +237,11 @@ class LiteLLMProvider:
                             )
             return models
 
+    async def list_model_ids(self) -> list[str]:
+        """Return all configured model IDs across all providers."""
+        models = await self.list_models()
+        return sorted({m["model_id"] for m in models if "model_id" in m})
+
     async def discover_models(self, provider_id: str) -> list[dict[str, Any]]:
         """Query the remote provider for available models.
 

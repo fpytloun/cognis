@@ -70,6 +70,15 @@ class _SessionCache:
         self._cached_instructions = instructions
         self._cached_core = core_memories
 
+    def get_model_override(self, session_id: str) -> str | None:
+        del session_id
+        return None
+
+    def update_context_usage(
+        self, session: object, *, prompt_tokens: int, max_context_tokens: int, model: str
+    ) -> None:
+        pass
+
 
 class _Memory:
     def __init__(self, fail: bool = False) -> None:

@@ -53,6 +53,9 @@ class CachedSessionState:
     last_prompt_tokens: int = 0
     max_context_tokens: int = 0
     context_model: str = ""
+    # Per-session overrides (ephemeral, set via /model and /thinking commands)
+    model_override: str | None = None
+    reasoning_effort_override: str | None = None
 
 
 class SessionCache:
@@ -208,7 +211,30 @@ class SessionCache:
             "max_context_tokens": entry.max_context_tokens,
             "percentage": round(entry.last_prompt_tokens / entry.max_context_tokens * 100, 1),
             "model": entry.context_model,
+            "reasoning_effort": entry.reasoning_effort_override,
         }
+
+    def set_model_override(self, session_id: str, model: str | None) -> None:
+        """Set per-session model override (from /model command)."""
+        entry = self._entries.get(session_id)
+        if entry is not None:
+            entry.model_override = model
+
+    def get_model_override(self, session_id: str) -> str | None:
+        """Get per-session model override, or ``None`` for default."""
+        entry = self._entries.get(session_id)
+        return entry.model_override if entry is not None else None
+
+    def set_reasoning_effort_override(self, session_id: str, effort: str | None) -> None:
+        """Set per-session reasoning effort override (from /thinking command)."""
+        entry = self._entries.get(session_id)
+        if entry is not None:
+            entry.reasoning_effort_override = effort
+
+    def get_reasoning_effort_override(self, session_id: str) -> str | None:
+        """Get per-session reasoning effort override, or ``None`` for default."""
+        entry = self._entries.get(session_id)
+        return entry.reasoning_effort_override if entry is not None else None
 
     def get_compaction_summary(self, session_id: str) -> str | None:
         """Get the cached compaction summary for a session."""

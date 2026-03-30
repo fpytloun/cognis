@@ -514,6 +514,7 @@ export interface ContextUsage {
   max_context_tokens: number;
   percentage: number;
   model: string;
+  reasoning_effort: string | null;
 }
 
 export interface WebSocketMessageCompleteEvent {

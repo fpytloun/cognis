@@ -265,8 +265,11 @@ class ContextAssembler:
             # Format mutable search results
             mutable_search_results = _format_search_results(raw_search)
 
+        # Model resolution chain: session override → agent config → system default
+        model_override = self.session_cache.get_model_override(session.session_id)
+        explicit_model = model_override or (agent.llm_config.model if agent.llm_config else None)
         resolved_model = await self.llm.resolve_model(
-            explicit_model=agent.llm_config.model if agent.llm_config else None,
+            explicit_model=explicit_model,
             task_type="default",
         )
         model_info = await self.llm.get_model_info(resolved_model)
