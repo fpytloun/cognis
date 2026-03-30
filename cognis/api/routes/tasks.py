@@ -39,7 +39,7 @@ from cognis.api.serializers import (
     task_to_response,
     workflow_run_to_response,
 )
-from cognis.core.agent_loop import PauseResolution
+from cognis.core.agent_loop import PauseResolution, PendingPause
 from cognis.models.task import TaskDelivery, TaskModel
 from cognis.models.workflow import WorkflowState
 from cognis.store.models import Task
@@ -471,21 +471,17 @@ def _task_pending_pause(request: Request, task: TaskModel) -> Any:
         return None
 
     payload = task.workflow_state.pending_pause_payload or {}
-    recovered_pause = type(
-        "RecoveredPause",
-        (),
-        {
-            "pause_id": str(payload.get("pause_id", "recovered")),
-            "pause_type": task.workflow_state.pending_pause_type,
-            "task_id": task.task_id,
-            "step_name": payload.get("step_name"),
-            "step_run_id": payload.get("step_run_id"),
-            "session_id": payload.get("session_id"),
-            "question": payload.get("question") or payload.get("message"),
-            "options": payload.get("options"),
-            "context": payload.get("context"),
-        },
-    )()
+    recovered_pause = PendingPause(
+        pause_id=str(payload.get("pause_id", "recovered")),
+        pause_type=task.workflow_state.pending_pause_type or "unknown",
+        task_id=task.task_id,
+        step_name=payload.get("step_name"),
+        step_run_id=payload.get("step_run_id"),
+        session_id=payload.get("session_id"),
+        question=payload.get("question") or payload.get("message"),
+        options=payload.get("options"),
+        context=payload.get("context"),
+    )
     return pending_pause_to_response(recovered_pause)
 
 

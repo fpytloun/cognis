@@ -32,7 +32,6 @@ class EventType(StrEnum):
     """Controller-internal event types."""
 
     # Session lifecycle
-    SESSION_CREATED = "session_created"
     SESSION_COMPLETED = "session_completed"
     SESSION_FAILED = "session_failed"
     SESSION_RECOVERED = "session_recovered"

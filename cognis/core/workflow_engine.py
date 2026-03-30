@@ -97,6 +97,9 @@ class WorkflowEngine:
         session_manager: Any,
         event_bus: EventBus,
         pause_waiter: PauseWaiter,
+        step_runtime_factory: Any = None,
+        shared_tool_registry: Any = None,
+        shared_executor_connection: Any = None,
     ) -> None:
         self._session_factory = session_factory
         self._providers = providers
@@ -106,6 +109,9 @@ class WorkflowEngine:
         self._session_manager = session_manager
         self._event_bus = event_bus
         self._pause_waiter = pause_waiter
+        self._step_runtime_factory = step_runtime_factory
+        self._shared_tool_registry = shared_tool_registry
+        self._shared_executor_connection = shared_executor_connection
 
     async def run_direct_turn(
         self,
@@ -916,16 +922,15 @@ class WorkflowEngine:
         user_email: str,
     ) -> tuple[Any, Any, Any]:
         """Resolve the tool registry and executor connection for one step/turn."""
-        runtime_factory = getattr(self._providers, "_step_runtime_factory", None)
-        if callable(runtime_factory):
+        if callable(self._step_runtime_factory):
             return cast(
                 tuple[Any, Any, Any],
-                await runtime_factory(agent=agent, user_email=user_email),
+                await self._step_runtime_factory(agent=agent, user_email=user_email),
             )
 
         return (
-            getattr(self._providers, "_tool_registry", None),
-            getattr(self._providers, "_executor_connection", None),
+            self._shared_tool_registry,
+            self._shared_executor_connection,
             _noop_cleanup,
         )
 

@@ -689,10 +689,13 @@ class TaskQueue:
         pause_waiter = self._workflow_engine._pause_waiter  # noqa: SLF001
         return pause_waiter.find_pending(task_id=task_id)
 
-    def _build_cancel_resolution(self, pause_type: str) -> PauseResolution:
-        """Build a cancellation resolution for a pending pause."""
-        decision = "cancel" if pause_type == "gate" else "cancel"
-        return PauseResolution(decision=decision, data={"response": ""})
+    def _build_cancel_resolution(self, pause_type: str) -> PauseResolution:  # noqa: ARG002
+        """Build a cancellation resolution for a pending pause.
+
+        ``pause_type`` is accepted for future differentiation (e.g. gates
+        vs step-input requests may warrant different resolution payloads).
+        """
+        return PauseResolution(decision="cancel", data={"response": ""})
 
     @property
     def active_run_count(self) -> int:

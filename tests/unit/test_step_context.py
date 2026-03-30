@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -301,10 +302,74 @@ def test_events_to_messages_handles_evaluation_feedback() -> None:
 
 def test_events_to_messages_handles_tool_call_with_name_field() -> None:
     """Tool calls recorded by agent_loop use 'name' not 'tool_name'."""
-    events = [{"type": "tool_call", "data": {"name": "filesystem/read_file"}}]
+    events = [{"type": "tool_call", "data": {"name": "filesystem/read_file", "call_id": "c1"}}]
     messages = events_to_messages(events)
     assert len(messages) == 1
-    assert "filesystem/read_file" in messages[0]["content"]
+    assert messages[0]["role"] == "assistant"
+    assert messages[0]["content"] is None
+    assert len(messages[0]["tool_calls"]) == 1
+    assert messages[0]["tool_calls"][0]["function"]["name"] == "filesystem/read_file"
+    assert messages[0]["tool_calls"][0]["id"] == "c1"
+
+
+def test_events_to_messages_groups_parallel_tool_calls() -> None:
+    """Consecutive tool_call events are grouped into a single assistant message."""
+    events = [
+        {
+            "type": "tool_call",
+            "data": {"name": "read", "call_id": "c1", "arguments": {"path": "/a"}},
+        },
+        {
+            "type": "tool_call",
+            "data": {"name": "write", "call_id": "c2", "arguments": {"path": "/b"}},
+        },
+        {"type": "tool_result", "data": {"call_id": "c1", "result": "content_a"}},
+        {"type": "tool_result", "data": {"call_id": "c2", "result": "content_b"}},
+    ]
+    messages = events_to_messages(events)
+    # assistant message with 2 tool_calls + 2 tool results = 3 messages
+    assert len(messages) == 3
+    assert messages[0]["role"] == "assistant"
+    assert len(messages[0]["tool_calls"]) == 2
+    assert messages[0]["tool_calls"][0]["function"]["name"] == "read"
+    assert messages[0]["tool_calls"][1]["function"]["name"] == "write"
+    assert messages[1]["role"] == "tool"
+    assert messages[1]["tool_call_id"] == "c1"
+    assert messages[2]["role"] == "tool"
+    assert messages[2]["tool_call_id"] == "c2"
+
+
+def test_events_to_messages_merges_tool_calls_with_assistant_text() -> None:
+    """Tool calls after an assistant message merge onto that message."""
+    events = [
+        {"type": "assistant_message", "data": {"content": "Let me check that."}},
+        {"type": "tool_call", "data": {"name": "search", "call_id": "c1"}},
+        {"type": "tool_result", "data": {"call_id": "c1", "result": "found it"}},
+    ]
+    messages = events_to_messages(events)
+    assert len(messages) == 2
+    # The assistant message should have both content and tool_calls
+    assert messages[0]["role"] == "assistant"
+    assert messages[0]["content"] == "Let me check that."
+    assert len(messages[0]["tool_calls"]) == 1
+    assert messages[0]["tool_calls"][0]["function"]["name"] == "search"
+    assert messages[1]["role"] == "tool"
+
+
+def test_events_to_messages_tool_call_arguments_serialized() -> None:
+    """Tool call arguments are serialized to JSON string."""
+    events = [
+        {
+            "type": "tool_call",
+            "data": {"name": "edit", "call_id": "c1", "arguments": {"file": "a.py", "line": 42}},
+        },
+    ]
+    messages = events_to_messages(events)
+    assert len(messages) == 1
+    args = messages[0]["tool_calls"][0]["function"]["arguments"]
+    assert isinstance(args, str)
+    parsed = json.loads(args)
+    assert parsed == {"file": "a.py", "line": 42}
 
 
 # ---------------------------------------------------------------------------

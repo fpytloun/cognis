@@ -91,7 +91,7 @@ DELEGATE_TOOL = ToolDefinition(
     },
     source=ToolSource(type="builtin"),
     category="orchestration",
-    read_only=True,
+    read_only=False,
 )
 
 LIST_SUBSESSIONS_TOOL = ToolDefinition(
