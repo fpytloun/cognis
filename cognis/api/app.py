@@ -208,13 +208,11 @@ def create_app() -> FastAPI:
             shared_executor_connection,
             shared_runtime_cleanup,
         ) = await build_shared_runtime(providers)
-        providers._session_factory = session_factory  # type: ignore[attr-defined]
-        providers._tool_registry = shared_tool_registry  # type: ignore[attr-defined]
-        providers._executor_connection = shared_executor_connection  # type: ignore[attr-defined]
-        providers._step_runtime_factory = build_step_runtime_factory(  # type: ignore[attr-defined]
+        step_runtime_factory = build_step_runtime_factory(
             providers=providers,
             shared_registry=shared_tool_registry,
             shared_connection=shared_executor_connection,
+            session_factory=session_factory,
         )
         step_context_assembler = StepContextAssembler(
             context_assembler=context_assembler,
@@ -245,6 +243,9 @@ def create_app() -> FastAPI:
             session_manager=session_manager,
             event_bus=event_bus,
             pause_waiter=pause_waiter,
+            step_runtime_factory=step_runtime_factory,
+            shared_tool_registry=shared_tool_registry,
+            shared_executor_connection=shared_executor_connection,
         )
         task_queue = await TaskQueue.from_session_factory(
             session_factory=session_factory,
@@ -252,6 +253,7 @@ def create_app() -> FastAPI:
             workflow_registry=workflow_registry,
             event_bus=event_bus,
         )
+        agent_loop.set_task_queue(task_queue)
         recovered_sessions = await session_manager.recover_stale_sessions()
         recovered_tasks = await task_queue.recover_stale_tasks()
         recovered_paused_tasks = await task_queue.recover_paused_tasks()
@@ -292,9 +294,11 @@ def create_app() -> FastAPI:
         app.state.task_queue = task_queue
         app.state.tool_registry = shared_tool_registry
         app.state.executor_connection = shared_executor_connection
-        app.state.recovered_session_ids = recovered_sessions
-        app.state.recovered_task_ids = recovered_tasks
-        app.state.recovered_paused_task_ids = recovered_paused_tasks
+        # Store as frozensets for O(1) lookup; these are written once at
+        # startup and never grow.
+        app.state.recovered_session_ids = frozenset(recovered_sessions)
+        app.state.recovered_task_ids = frozenset(recovered_tasks)
+        app.state.recovered_paused_task_ids = frozenset(recovered_paused_tasks)
 
         yield
 

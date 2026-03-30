@@ -27,7 +27,7 @@
     normalizeHistory,
     type TimelineItem
   } from '$lib/chat';
-  import type { Agent, Conversation, Escalation, MessageEvent, Session } from '$lib/types/api';
+  import type { Agent, ContextUsage, Conversation, Escalation, MessageEvent, Session } from '$lib/types/api';
   import { wsClient } from '$lib/ws/client';
 
   let loading = true;
@@ -83,6 +83,7 @@
   let sessionInfoOpen = false;
   let sessionInfo: SessionInfoData | null = null;
   let sessionInfoLoading = false;
+  let contextUsage: ContextUsage | null = null;
   let subSessionInfoOpen = false;
   let subSessionInfo: SessionInfoData | null = null;
   let subSessionInfoLoading = false;
@@ -433,6 +434,7 @@
       awaitingAssistantStart = false;
       lastRecoverableMessage = '';
       editingTitle = false;
+      contextUsage = null;
 
       wsClient.subscribeConversation(conversationId, latestSeq(events));
       await refreshEscalations();
@@ -682,6 +684,10 @@
       awaitingAssistantStart = false;
       turnInProgress = false;
       timeline = finalizeReasoningItems(timeline);
+      // Update context usage from message_complete
+      if (event.type === 'message_complete' && event.context_usage) {
+        contextUsage = event.context_usage;
+      }
     }
 
     // Escalation push events
@@ -1061,6 +1067,14 @@
                 >
                   <Info class="h-3.5 w-3.5" />
                 </button>
+
+                <!-- Context usage badge (right-aligned) -->
+                {#if contextUsage}
+                  <span class="ml-auto flex items-center gap-1.5 text-[10px] font-medium {contextUsage.percentage > 85 ? 'text-rose-400' : contextUsage.percentage > 60 ? 'text-amber-400' : 'text-slate-400'}" title="Context: {contextUsage.prompt_tokens.toLocaleString()} / {contextUsage.max_context_tokens.toLocaleString()} tokens ({contextUsage.model})">
+                    <span class="font-mono">{contextUsage.prompt_tokens.toLocaleString()}</span>
+                    <span class="opacity-50">({contextUsage.percentage}%)</span>
+                  </span>
+                {/if}
               {:else}
                 <span>No active conversation selected</span>
               {/if}

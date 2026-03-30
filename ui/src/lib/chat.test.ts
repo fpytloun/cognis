@@ -29,6 +29,7 @@ describe('chat timeline helpers', () => {
       message_id: 'msg_1',
       seq: 2,
       token_usage: null,
+      context_usage: null,
       queued_count: 0
     });
 

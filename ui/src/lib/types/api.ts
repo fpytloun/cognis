@@ -509,6 +509,13 @@ export interface WebSocketChunkGapEvent {
   recoverable: boolean;
 }
 
+export interface ContextUsage {
+  prompt_tokens: number;
+  max_context_tokens: number;
+  percentage: number;
+  model: string;
+}
+
 export interface WebSocketMessageCompleteEvent {
   type: 'message_complete';
   conversation_id?: string;
@@ -516,6 +523,7 @@ export interface WebSocketMessageCompleteEvent {
   message_id: string;
   seq: number;
   token_usage: Record<string, unknown> | null;
+  context_usage: ContextUsage | null;
   queued_count: number;
 }
 

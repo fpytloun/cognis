@@ -39,6 +39,7 @@ class ContextAssemblyResult(BaseModel):
     static_tokens: int = 0
     dynamic_tokens: int = 0
     prompt_tokens: int = 0
+    max_context_tokens: int = 0
     recommend_compaction: bool = False
     cache_breakpoint_index: int | None = None
 
@@ -399,6 +400,7 @@ class ContextAssembler:
             static_tokens=static_tokens,
             dynamic_tokens=dynamic_tokens,
             prompt_tokens=prompt_tokens,
+            max_context_tokens=max_context_tokens,
             recommend_compaction=recommend_compaction,
             cache_breakpoint_index=cache_breakpoint_index,
         )
@@ -481,8 +483,37 @@ def events_to_messages(events: list[Any]) -> list[dict[str, Any]]:
     ``ContextAssembler`` and the ``StepContextAssembler``.  It supports
     both ``CachedEvent`` objects (with ``.type`` / ``.data`` attributes)
     and raw ``dict`` events from Intaris reads.
+
+    Tool calls are reconstructed in the proper OpenAI function-calling
+    format: consecutive ``tool_call`` events are grouped into a single
+    assistant message with a ``tool_calls`` array, and ``tool_result``
+    events become ``role: "tool"`` messages with matching ``tool_call_id``.
+    When an ``assistant_message`` immediately precedes tool calls (same
+    LLM response), the tool_calls array is merged onto that message.
     """
     messages: list[dict[str, Any]] = []
+    # Buffer for consecutive tool_call events (flushed on non-tool_call)
+    pending_tool_calls: list[dict[str, Any]] = []
+
+    def _flush_tool_calls() -> None:
+        """Flush buffered tool_call events into an assistant message."""
+        if not pending_tool_calls:
+            return
+        tc_array = list(pending_tool_calls)
+        pending_tool_calls.clear()
+        # Merge onto preceding assistant message if it has no tool_calls yet
+        if (
+            messages
+            and messages[-1].get("role") == "assistant"
+            and "tool_calls" not in messages[-1]
+        ):
+            messages[-1]["tool_calls"] = tc_array
+            # OpenAI requires content to be null (not absent) when tool_calls present
+            if not messages[-1].get("content"):
+                messages[-1]["content"] = None
+        else:
+            messages.append({"role": "assistant", "content": None, "tool_calls": tc_array})
+
     for event in events:
         if isinstance(event, dict):
             event_type = str(event.get("type", ""))
@@ -490,6 +521,30 @@ def events_to_messages(events: list[Any]) -> list[dict[str, Any]]:
         else:
             event_type = event.type
             event_data = event.data
+
+        if event_type == "tool_call":
+            tool_name = event_data.get("tool_name") or event_data.get("name")
+            call_id = event_data.get("call_id", "")
+            arguments = event_data.get("arguments")
+            if isinstance(tool_name, str):
+                # Serialize arguments to JSON string as required by the format
+                if isinstance(arguments, dict):
+                    args_str = json.dumps(arguments, default=str)
+                elif isinstance(arguments, str):
+                    args_str = arguments
+                else:
+                    args_str = "{}"
+                pending_tool_calls.append(
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": tool_name, "arguments": args_str},
+                    }
+                )
+            continue
+
+        # Any non-tool_call event flushes the pending buffer
+        _flush_tool_calls()
 
         if event_type == "user_message":
             content = event_data.get("content")
@@ -512,10 +567,6 @@ def events_to_messages(events: list[Any]) -> list[dict[str, Any]]:
                         "content": output,
                     }
                 )
-        elif event_type == "tool_call":
-            tool_name = event_data.get("tool_name") or event_data.get("name")
-            if isinstance(tool_name, str):
-                messages.append({"role": "assistant", "content": f"[Tool call: {tool_name}]"})
         elif event_type == "delegation":
             status = event_data.get("status")
             if status == "completed":
@@ -593,6 +644,8 @@ def events_to_messages(events: list[Any]) -> list[dict[str, Any]]:
                         ),
                     }
                 )
+    # Flush any remaining buffered tool calls at the end of the event list
+    _flush_tool_calls()
     return messages
 
 

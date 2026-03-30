@@ -49,6 +49,10 @@ class CachedSessionState:
     memory_instructions: str | None = None
     core_memories: str | None = None
     memory_instructions_cached_at: float | None = None
+    # Context usage from last context assembly
+    last_prompt_tokens: int = 0
+    max_context_tokens: int = 0
+    context_model: str = ""
 
 
 class SessionCache:
@@ -172,6 +176,39 @@ class SessionCache:
 
         entry = self.get_entry(session_id)
         return None if entry is None else entry.intention
+
+    def update_context_usage(
+        self,
+        session: SessionModel,
+        *,
+        prompt_tokens: int,
+        max_context_tokens: int,
+        model: str,
+    ) -> None:
+        """Store latest context usage from context assembly."""
+
+        entry = self._entries.get(session.session_id)
+        if entry is not None:
+            entry.last_prompt_tokens = prompt_tokens
+            entry.max_context_tokens = max_context_tokens
+            entry.context_model = model
+
+    def get_context_usage(self, session_id: str) -> dict[str, Any] | None:
+        """Get the cached context usage for a session.
+
+        Returns a dict with ``prompt_tokens``, ``max_context_tokens``,
+        ``percentage``, and ``model``, or ``None`` if no data is cached.
+        """
+
+        entry = self.get_entry(session_id)
+        if entry is None or entry.max_context_tokens <= 0:
+            return None
+        return {
+            "prompt_tokens": entry.last_prompt_tokens,
+            "max_context_tokens": entry.max_context_tokens,
+            "percentage": round(entry.last_prompt_tokens / entry.max_context_tokens * 100, 1),
+            "model": entry.context_model,
+        }
 
     def get_compaction_summary(self, session_id: str) -> str | None:
         """Get the cached compaction summary for a session."""

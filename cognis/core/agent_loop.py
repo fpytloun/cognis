@@ -448,9 +448,18 @@ class AgentLoop:
         self.pause_waiter = pause_waiter
         self.step_context_assembler = step_context_assembler
         self.tool_output_store = tool_output_store
+        self._task_queue: Any = None
         # Track active child sessions per parent session for /stop cancellation
         self._active_children: dict[str, dict[str, asyncio.Task[Any]]] = {}
         self._children_lock = asyncio.Lock()
+
+    def set_task_queue(self, task_queue: Any) -> None:
+        """Wire the task queue after construction (breaks circular dependency).
+
+        Must be called before the first agent turn so that controller tools
+        ``create_task`` and ``cancel_task`` can submit/cancel via the queue.
+        """
+        self._task_queue = task_queue
 
     async def run_step(
         self,
@@ -944,6 +953,14 @@ class AgentLoop:
 
         # Capture cache breakpoint for prompt caching (Anthropic cache_control)
         cache_breakpoint = getattr(context_result, "cache_breakpoint_index", None)
+
+        # Store context usage in session cache for UI display and /context command
+        self.session_cache.update_context_usage(
+            ctx.session,
+            prompt_tokens=context_result.prompt_tokens,
+            max_context_tokens=context_result.max_context_tokens,
+            model=context_result.resolved_model,
+        )
 
         # Main agentic loop
         reprompted = False
@@ -1975,10 +1992,7 @@ class AgentLoop:
         )
 
         if tc.name == "create_task":
-            task_queue = getattr(self.session_manager, "_task_queue", None)
-            if task_queue is None:
-                # Try to get from app state via providers
-                task_queue = getattr(self.providers, "_task_queue", None)
+            task_queue = self._task_queue
             if task_queue is None:
                 return ToolResult(
                     output=json.dumps(
@@ -2171,9 +2185,7 @@ class AgentLoop:
                     is_error=True,
                 )
             # Use task queue cancel if available, otherwise direct DB update
-            task_queue = getattr(self.session_manager, "_task_queue", None)
-            if task_queue is None:
-                task_queue = getattr(self.providers, "_task_queue", None)
+            task_queue = self._task_queue
             if task_queue is not None:
                 with contextlib.suppress(Exception):
                     await task_queue.cancel_task(task_id)

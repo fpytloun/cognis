@@ -139,11 +139,15 @@ def build_step_runtime_factory(
     providers: Any,
     shared_registry: ToolRegistry,
     shared_connection: Any,
+    session_factory: Any,
 ) -> RuntimeFactory:
     """Create a per-step runtime factory.
 
     Resolves the executor from DB config, filters tools by executor's
     enabled set, and builds registries WITH handlers for execution.
+
+    ``session_factory`` is passed explicitly to avoid monkey-patching it
+    onto the providers container.
     """
 
     async def factory(
@@ -197,7 +201,7 @@ def build_step_runtime_factory(
         if isinstance(shared_connection, InProcessExecutorConnection):
             # Build registry WITH handlers so tool_execute() can dispatch
             handler_map = _build_handler_map(
-                providers._session_factory,
+                session_factory,
                 getattr(providers.executor, "status_provider", None),
             )
             registry = build_registry_with_handlers(agent_tools, handler_map)

@@ -418,7 +418,7 @@ class WebSocketConnectionManager:
         # Also cancel child sub-sessions via the agent loop
         session_id = self._turn_sessions.get(conversation_id)
         if session_id:
-            agent_loop = self.app.state.workflow_engine._agent_loop  # noqa: SLF001
+            agent_loop = self.app.state.agent_loop
             cancelled = await agent_loop.cancel_children(session_id)
             if cancelled:
                 logger.info(
@@ -612,6 +612,7 @@ class WebSocketConnectionManager:
                 cached = self.app.state.session_cache.get_entry(session.session_id)
                 if cached is not None:
                     last_seq = cached.last_event_seq
+            context_usage = self.app.state.session_cache.get_context_usage(session.session_id)
             await self.send_to_conversation(
                 conversation_id,
                 {
@@ -621,6 +622,7 @@ class WebSocketConnectionManager:
                     "message_id": message_id,
                     "seq": last_seq,
                     "token_usage": None,
+                    "context_usage": context_usage,
                     "queued_count": len(self._queued_messages.get(conversation_id, [])),
                 },
             )
@@ -1086,6 +1088,21 @@ async def handle_websocket(websocket: WebSocket) -> None:
                             websocket.app, manager, connection, conversation, session, agent
                         )
                     continue
+
+                # /context — show context window usage
+                if stripped == "/context":
+                    await _handle_slash_context(
+                        websocket.app, manager, connection, conversation, session
+                    )
+                    continue
+
+                # /info — show session info, context, Intaris stats
+                if stripped == "/info":
+                    await _handle_slash_info(
+                        websocket.app, manager, connection, conversation, session
+                    )
+                    continue
+
                 if stripped.startswith("/approve") or stripped.startswith("/deny"):
                     is_approve = stripped.startswith("/approve")
                     cmd_word = "/approve" if is_approve else "/deny"
@@ -1585,6 +1602,99 @@ async def _handle_slash_new(
                 "previous_session_id": session.session_id,
             },
         )
+
+
+async def _handle_slash_context(
+    app: Any,
+    manager: Any,
+    connection: Any,
+    conversation: Any,
+    session: Any,
+) -> None:
+    """Handle /context — display context window usage."""
+    conversation_id = conversation.conversation_id
+    usage = app.state.session_cache.get_context_usage(session.session_id)
+
+    if usage is None:
+        await manager.send_to_conversation(
+            conversation_id,
+            {
+                "type": "system_message",
+                "conversation_id": conversation_id,
+                "text": "Context usage: no data yet (send a message first).",
+            },
+        )
+        return
+
+    lines = [
+        f"Context: {usage['prompt_tokens']:,} / {usage['max_context_tokens']:,} tokens ({usage['percentage']}%)",
+        f"Model: {usage['model']}",
+        f"Compaction threshold: {int(app.state.compaction_strategy.compaction_threshold * 100)}%",
+    ]
+
+    await manager.send_to_conversation(
+        conversation_id,
+        {
+            "type": "system_message",
+            "conversation_id": conversation_id,
+            "text": "\n".join(lines),
+        },
+    )
+
+
+async def _handle_slash_info(
+    app: Any,
+    manager: Any,
+    connection: Any,
+    conversation: Any,
+    session: Any,
+) -> None:
+    """Handle /info — display session details, context, and Intaris stats."""
+    conversation_id = conversation.conversation_id
+    lines: list[str] = []
+
+    # Session metadata
+    lines.append(f"Session: {session.session_id}")
+    lines.append(f"Agent: {session.agent_id}")
+    lines.append(f"Status: {session.status}")
+
+    # Context usage
+    usage = app.state.session_cache.get_context_usage(session.session_id)
+    if usage:
+        lines.append(f"Model: {usage['model']}")
+        lines.append(
+            f"Context: {usage['prompt_tokens']:,} / {usage['max_context_tokens']:,} tokens ({usage['percentage']}%)"
+        )
+
+    # Intaris session stats
+    intaris_sid = session.intaris_session_id or session.session_id
+    try:
+
+        intaris_session = await app.state.providers.guardrails.get_session(intaris_sid)
+        if intaris_session.intention:
+            lines.append(f"Intention: {intaris_session.intention}")
+        stats_parts = [f"{intaris_session.total_calls} total"]
+        if intaris_session.approved_count:
+            stats_parts.append(f"{intaris_session.approved_count} approved")
+        if intaris_session.denied_count:
+            stats_parts.append(f"{intaris_session.denied_count} denied")
+        if intaris_session.escalated_count:
+            stats_parts.append(f"{intaris_session.escalated_count} escalated")
+        lines.append(f"Tool calls: {', '.join(stats_parts)}")
+    except Exception:
+        lines.append("Intaris stats: unavailable")
+
+    if session.started_at:
+        lines.append(f"Started: {session.started_at}")
+
+    await manager.send_to_conversation(
+        conversation_id,
+        {
+            "type": "system_message",
+            "conversation_id": conversation_id,
+            "text": "\n".join(lines),
+        },
+    )
 
 
 async def _load_conversation_runtime(
