@@ -90,6 +90,18 @@ cognis/
 │   │   ├── builtin/
 │   │   │   ├── orchestration.py   # delegate, spawn_worker, fork
 │   │   │   └── system.py          # list_agents, get_status
+│   │   ├── executor/
+│   │   │   ├── lsp/               # LSP diagnostics integration
+│   │   │   │   ├── client.py      # Async LSP client (JSON-RPC/stdio)
+│   │   │   │   ├── diagnostics.py # Diagnostic formatting for LLM context
+│   │   │   │   ├── install.py     # Auto-install strategies
+│   │   │   │   ├── manager.py     # LSPManager (lazy spawn, routing)
+│   │   │   │   ├── servers.py     # Language server definitions
+│   │   │   │   └── types.py       # LSP type definitions
+│   │   │   ├── filesystem.py      # read, write, edit, patch, multiedit
+│   │   │   ├── search.py          # glob, grep
+│   │   │   ├── shell.py           # bash
+│   │   │   └── definitions.py     # Tool definitions + handler registry
 │   │   ├── mcp.py                  # MCP client
 │   │   ├── skills.py
 │   │   └── registry.py
@@ -329,6 +341,11 @@ uv run alembic -c cognis/store/migrations/alembic.ini downgrade -1
 | `COGNIS_LOG_LEVEL` | `info` | Log level |
 | `COGNIS_LOG_FORMAT` | `json` | Log format (json or text) |
 | `COGNIS_CORS_ORIGINS` | `http://localhost:5173` | CORS allowlist |
+| `COGNIS_LSP_ENABLED` | `true` | Enable LSP diagnostics after file edits |
+| `COGNIS_LSP_AUTO_INSTALL` | `false` | Auto-install missing language servers |
+| `COGNIS_LSP_DIAGNOSTICS_TIMEOUT_MS` | `10000` | Max wait for diagnostics (ms) |
+| `COGNIS_LSP_IDLE_TIMEOUT_SECONDS` | `600` | Kill idle LSP servers after (s) |
+| `COGNIS_LSP_MAX_CONCURRENT_SERVERS` | `8` | Max concurrent LSP server processes |
 | `COGNIS_INITIAL_ADMIN_EMAIL` | — | Container/CI: auto-create admin on first start |
 | `COGNIS_INITIAL_ADMIN_PASSWORD` | — | Container/CI: admin password (cleared after use) |
 

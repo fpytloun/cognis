@@ -2,15 +2,113 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import re
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+from cognis.logging import get_logger
 from cognis.models.tool import ToolResult
 from cognis.tools.registry import ToolExecutionContext
 
+if TYPE_CHECKING:
+    from cognis.tools.executor.lsp.manager import LSPManager
+
+logger = get_logger(__name__)
+
 _MAX_READ_LINES = 2000
 _MAX_LINE_LENGTH = 2000
+
+# Canonical key for LSPManager in ToolExecutionContext.runtime_metadata
+_LSP_MANAGER_KEY = "lsp_manager"  # Must match LSP_MANAGER_KEY from lsp package
+
+
+async def _collect_lsp_diagnostics(
+    context: ToolExecutionContext,
+    file_path: str,
+) -> str:
+    """Touch LSP and return formatted diagnostics, or empty string.
+
+    This is best-effort: any LSP failure returns an empty string so
+    that the file operation result is never affected.
+    """
+    import os
+
+    lsp: LSPManager | None = context.runtime_metadata.get(_LSP_MANAGER_KEY)
+    if lsp is None:
+        return ""
+    try:
+        abs_path = os.path.abspath(file_path)
+        await lsp.touch_file(abs_path, wait=True)
+        diagnostics = lsp.get_diagnostics(abs_path)
+        if not diagnostics:
+            return ""
+        from cognis.tools.executor.lsp.diagnostics import format_diagnostics_for_llm
+
+        return format_diagnostics_for_llm(diagnostics, abs_path)
+    except Exception:
+        logger.debug(
+            "lsp: diagnostics collection failed",
+            extra={"extra_data": {"file_path": file_path}},
+        )
+        return ""
+
+
+async def _collect_lsp_diagnostics_batch(
+    context: ToolExecutionContext,
+    file_paths: list[str],
+) -> str:
+    """Collect LSP diagnostics for multiple files concurrently."""
+    lsp: LSPManager | None = context.runtime_metadata.get(_LSP_MANAGER_KEY)
+    if lsp is None or not file_paths:
+        return ""
+    try:
+        # Touch all files concurrently
+        await asyncio.gather(
+            *(lsp.touch_file(fp, wait=True) for fp in file_paths),
+            return_exceptions=True,
+        )
+        # Collect all diagnostics
+        all_diagnostics: dict[str, list[Any]] = {}
+        for fp in file_paths:
+            diags = lsp.get_diagnostics(fp)
+            for path, path_diags in diags.items():
+                existing = all_diagnostics.get(path, [])
+                existing.extend(path_diags)
+                all_diagnostics[path] = existing
+
+        if not all_diagnostics:
+            return ""
+
+        from cognis.tools.executor.lsp.diagnostics import format_diagnostics_for_llm
+
+        # Use the first file as the "edited file" for formatting
+        return format_diagnostics_for_llm(all_diagnostics, file_paths[0])
+    except Exception:
+        logger.debug(
+            "lsp: batch diagnostics collection failed",
+            extra={"extra_data": {"file_count": len(file_paths)}},
+        )
+        return ""
+
+
+def _warm_lsp(context: ToolExecutionContext, file_path: str) -> None:
+    """Warm LSP for a file (non-blocking, no wait for diagnostics).
+
+    Used by the read tool so that subsequent edits get faster diagnostics.
+    """
+    lsp: LSPManager | None = context.runtime_metadata.get(_LSP_MANAGER_KEY)
+    if lsp is None:
+        return
+
+    async def _warm() -> None:
+        with contextlib.suppress(Exception):
+            await lsp.touch_file(file_path, wait=False)
+
+    asyncio.create_task(_warm())
+
+
 _DEFAULT_IGNORE = {
     "node_modules",
     "__pycache__",
@@ -63,6 +161,10 @@ async def handle_read(arguments: dict[str, Any], context: ToolExecutionContext) 
     if offset + limit - 1 < total:
         result += f"\n\n(Showing lines {offset}-{offset + len(selected) - 1} of {total}. Use offset={offset + limit} to continue.)"
 
+    # Warm LSP for subsequent edits (non-blocking)
+    if path.is_file():
+        _warm_lsp(context, str(path))
+
     return ToolResult(output=result)
 
 
@@ -94,7 +196,14 @@ async def handle_write(arguments: dict[str, Any], context: ToolExecutionContext)
     except (OSError, PermissionError) as exc:
         return ToolResult(output=f"Cannot write file: {exc}", is_error=True)
 
-    return ToolResult(output=f"Wrote {len(content)} bytes to {file_path}")
+    output = f"Wrote {len(content)} bytes to {file_path}"
+
+    # LSP diagnostics (best-effort)
+    diagnostics_text = await _collect_lsp_diagnostics(context, file_path)
+    if diagnostics_text:
+        output += f"\n\n{diagnostics_text}"
+
+    return ToolResult(output=output)
 
 
 async def handle_edit(arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
@@ -136,7 +245,14 @@ async def handle_edit(arguments: dict[str, Any], context: ToolExecutionContext) 
         return ToolResult(output=f"Cannot write file: {exc}", is_error=True)
 
     replacements = count if replace_all else 1
-    return ToolResult(output=f"Replaced {replacements} occurrence(s) in {file_path}")
+    output = f"Replaced {replacements} occurrence(s) in {file_path}"
+
+    # LSP diagnostics (best-effort)
+    diagnostics_text = await _collect_lsp_diagnostics(context, file_path)
+    if diagnostics_text:
+        output += f"\n\n{diagnostics_text}"
+
+    return ToolResult(output=output)
 
 
 async def handle_patch(arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
@@ -169,6 +285,13 @@ async def handle_patch(arguments: dict[str, Any], context: ToolExecutionContext)
         parts.append("Errors:\n" + "\n".join(errors))
     if not parts:
         return ToolResult(output="No files were patched.", is_error=True)
+
+    # LSP diagnostics for all patched files concurrently (best-effort)
+    if files_patched:
+        diagnostics_text = await _collect_lsp_diagnostics_batch(context, files_patched)
+        if diagnostics_text:
+            parts.append(diagnostics_text)
+
     return ToolResult(output="\n".join(parts), is_error=bool(errors))
 
 
@@ -219,7 +342,14 @@ async def handle_multiedit(arguments: dict[str, Any], context: ToolExecutionCont
     except (OSError, PermissionError) as exc:
         return ToolResult(output=f"Cannot write file: {exc}", is_error=True)
 
-    return ToolResult(output=f"Applied {applied} edit(s) to {file_path}")
+    output = f"Applied {applied} edit(s) to {file_path}"
+
+    # LSP diagnostics (best-effort)
+    diagnostics_text = await _collect_lsp_diagnostics(context, file_path)
+    if diagnostics_text:
+        output += f"\n\n{diagnostics_text}"
+
+    return ToolResult(output=output)
 
 
 async def handle_list_directory(

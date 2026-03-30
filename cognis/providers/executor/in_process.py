@@ -13,6 +13,7 @@ from typing import Any, cast
 from prometheus_client import Counter, Histogram
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from cognis.logging import get_logger
 from cognis.models.config import ProviderHealth
 from cognis.models.tool import (
     ExecutorCapabilities,
@@ -24,8 +25,11 @@ from cognis.models.tool import (
 from cognis.providers.circuit_breaker import CircuitBreaker
 from cognis.tools.builtin.system import StatusProvider, build_system_tool_handlers
 from cognis.tools.executor.definitions import executor_tool_handlers
+from cognis.tools.executor.lsp import LSP_MANAGER_KEY, LSPManager
 from cognis.tools.mcp import StdioMCPClient, mcp_tools_to_definitions
 from cognis.tools.registry import RegisteredTool, ToolExecutionContext, ToolRegistry
+
+_logger = get_logger(__name__)
 
 EXECUTOR_SPAWN_TOTAL = Counter(
     "cognis_executor_spawns_total",
@@ -44,6 +48,7 @@ class _ExecutorRuntime:
     handle: ExecutorHandle
     connection: InProcessExecutorConnection
     mcp_clients: dict[str, StdioMCPClient] = field(default_factory=dict)
+    lsp_manager: LSPManager | None = None
 
 
 class InProcessExecutorConnection:
@@ -173,11 +178,57 @@ class InProcessExecutorProvider:
                     tool, system_handlers, mcp_clients, native_handlers
                 )
                 registry.register(RegisteredTool(definition=tool, handler=cast(Any, handler)))
+            # LSP manager (best-effort, non-fatal)
+            # Read config from env vars via CognisConfig. The metadata dict
+            # may override these (e.g. in tests), but env vars are the
+            # primary source — this avoids requiring callers to thread
+            # config through ExecutorConfig.metadata.
+            lsp_manager: LSPManager | None = None
+            runtime_metadata = dict(config.metadata)
+            from cognis.config import load_config as _load_config
+
+            _cfg = _load_config()
+            lsp_enabled = config.metadata.get("lsp_enabled", _cfg.lsp_enabled)
+            if lsp_enabled:
+                try:
+                    lsp_manager = LSPManager(
+                        enabled=True,
+                        auto_install=bool(
+                            config.metadata.get("lsp_auto_install", _cfg.lsp_auto_install)
+                        ),
+                        diagnostics_timeout_ms=int(
+                            config.metadata.get(
+                                "lsp_diagnostics_timeout_ms", _cfg.lsp_diagnostics_timeout_ms
+                            )
+                        ),
+                        idle_timeout_seconds=int(
+                            config.metadata.get(
+                                "lsp_idle_timeout_seconds", _cfg.lsp_idle_timeout_seconds
+                            )
+                        ),
+                        max_concurrent_servers=int(
+                            config.metadata.get(
+                                "lsp_max_concurrent_servers", _cfg.lsp_max_concurrent_servers
+                            )
+                        ),
+                    )
+                    runtime_metadata[LSP_MANAGER_KEY] = lsp_manager
+                    _logger.info(
+                        "lsp: manager created for executor",
+                        extra={"extra_data": {"executor_id": config.executor_id}},
+                    )
+                except Exception:
+                    _logger.warning(
+                        "lsp: failed to create manager, continuing without LSP",
+                        extra={"extra_data": {"executor_id": config.executor_id}},
+                        exc_info=True,
+                    )
+
             connection = InProcessExecutorConnection(
                 handle,
                 registry,
                 CircuitBreaker(failure_threshold=5, recovery_timeout=30.0),
-                config.metadata,
+                runtime_metadata,
             )
         except TimeoutError:
             outcome = "timeout"
@@ -195,6 +246,7 @@ class InProcessExecutorProvider:
             handle=handle,
             connection=connection,
             mcp_clients=mcp_clients,
+            lsp_manager=lsp_manager,
         )
         EXECUTOR_SPAWN_TOTAL.labels(outcome="success").inc()
         EXECUTOR_SPAWN_DURATION.labels(outcome="success").observe(perf_counter() - start)
@@ -215,6 +267,14 @@ class InProcessExecutorProvider:
         if runtime is None:
             return
         await _close_clients(runtime.mcp_clients)
+        if runtime.lsp_manager is not None:
+            try:
+                await runtime.lsp_manager.cleanup()
+            except Exception:
+                _logger.debug(
+                    "lsp: cleanup error during executor cancel",
+                    extra={"extra_data": {"executor_id": handle.executor_id}},
+                )
 
     async def list_active(self) -> list[ExecutorHandle]:
         """List active executor handles."""

@@ -47,6 +47,13 @@ class CognisConfig:
     # CORS
     cors_origins: list[str]
 
+    # LSP diagnostics
+    lsp_enabled: bool
+    lsp_auto_install: bool
+    lsp_diagnostics_timeout_ms: int
+    lsp_idle_timeout_seconds: int
+    lsp_max_concurrent_servers: int
+
     # Initial admin (container/CI bootstrap)
     initial_admin_email: str | None
     initial_admin_password: str | None
@@ -68,6 +75,9 @@ def load_config() -> CognisConfig:
 
     serve_ui_raw = os.environ.get("COGNIS_SERVE_UI", "true").strip().lower()
     serve_ui = serve_ui_raw not in {"0", "false", "no", "off"}
+
+    lsp_enabled_raw = os.environ.get("COGNIS_LSP_ENABLED", "true").strip().lower()
+    lsp_auto_install_raw = os.environ.get("COGNIS_LSP_AUTO_INSTALL", "false").strip().lower()
 
     return CognisConfig(
         data_dir=data_dir,
@@ -98,6 +108,13 @@ def load_config() -> CognisConfig:
         log_format=os.environ.get("COGNIS_LOG_FORMAT", "json"),
         serve_ui=serve_ui,
         cors_origins=cors_origins,
+        lsp_enabled=lsp_enabled_raw not in {"0", "false", "no", "off"},
+        lsp_auto_install=lsp_auto_install_raw not in {"0", "false", "no", "off"},
+        lsp_diagnostics_timeout_ms=int(
+            os.environ.get("COGNIS_LSP_DIAGNOSTICS_TIMEOUT_MS", "10000")
+        ),
+        lsp_idle_timeout_seconds=int(os.environ.get("COGNIS_LSP_IDLE_TIMEOUT_SECONDS", "600")),
+        lsp_max_concurrent_servers=int(os.environ.get("COGNIS_LSP_MAX_CONCURRENT_SERVERS", "8")),
         initial_admin_email=os.environ.get("COGNIS_INITIAL_ADMIN_EMAIL"),
         initial_admin_password=os.environ.get("COGNIS_INITIAL_ADMIN_PASSWORD"),
     )
@@ -135,6 +152,13 @@ ENV_TEMPLATE = """\
 
 # CORS
 # COGNIS_CORS_ORIGINS=http://localhost:5173
+
+# LSP diagnostics (auto-detect language servers for edit feedback)
+# COGNIS_LSP_ENABLED=true
+# COGNIS_LSP_AUTO_INSTALL=false
+# COGNIS_LSP_DIAGNOSTICS_TIMEOUT_MS=10000
+# COGNIS_LSP_IDLE_TIMEOUT_SECONDS=600
+# COGNIS_LSP_MAX_CONCURRENT_SERVERS=8
 
 # Container/CI: auto-create admin on first start
 # COGNIS_INITIAL_ADMIN_EMAIL=admin@example.com
