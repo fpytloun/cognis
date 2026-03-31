@@ -115,11 +115,31 @@ class StepContextAssembler:
 
         # --- 2. Step input context ---
         effective_input = resolve_effective_input(step_definition, step_index, workflow_steps)
+        logger.info(
+            "step context: resolved input config",
+            extra={
+                "extra_data": {
+                    "step": step_definition.name,
+                    "input_type": effective_input.type,
+                    "input_source": effective_input.source,
+                    "step_outputs_keys": list(workflow_state.step_outputs.keys()),
+                }
+            },
+        )
         input_messages = await self._assemble_step_input(
             effective_input=effective_input,
             workflow_state=workflow_state,
             base_result=base_result,
             resolved_model=base_result.resolved_model,
+        )
+        logger.info(
+            "step context: step input assembled",
+            extra={
+                "extra_data": {
+                    "step": step_definition.name,
+                    "input_message_count": len(input_messages),
+                }
+            },
         )
         messages.extend(input_messages)
 

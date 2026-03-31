@@ -214,8 +214,19 @@ class LiteLLMProvider:
         stream = await litellm.acompletion(
             model=prefixed_model, messages=prepared_messages, stream=True, **request_kwargs
         )
-        async for chunk in stream:
-            yield dict(chunk)
+        try:
+            async for chunk in stream:
+                yield dict(chunk)
+        except Exception as exc:
+            # Mid-stream failures (e.g. LiteLLM MidStreamFallbackError,
+            # Anthropic tool_use_failed) should not crash the caller.
+            # Yield an error marker so the agent loop can handle it.
+            logger.warning(
+                "LLM stream failed mid-generation",
+                extra={"extra_data": {"model": prefixed_model}},
+                exc_info=True,
+            )
+            yield {"error": str(exc), "mid_stream_failure": True}
 
     def count_tokens(self, text: str, model: str) -> int:
         try:

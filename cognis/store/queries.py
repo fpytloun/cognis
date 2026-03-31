@@ -412,13 +412,21 @@ async def get_conversation(session: AsyncSession, conversation_id: str) -> Conve
     return result.scalar_one_or_none()
 
 
-async def list_conversations(session: AsyncSession, user_email: str) -> list[Conversation]:
-    """List conversations for a user."""
-    result = await session.execute(
+async def list_conversations(
+    session: AsyncSession,
+    user_email: str,
+    *,
+    context_type: str | None = None,
+) -> list[Conversation]:
+    """List conversations for a user, optionally filtered by context type."""
+    query = (
         select(Conversation)
         .where(Conversation.user_email == user_email)
         .order_by(Conversation.updated_at.desc(), Conversation.conversation_id.asc())
     )
+    if context_type is not None:
+        query = query.where(Conversation.context_type == context_type)
+    result = await session.execute(query)
     return list(result.scalars().all())
 
 

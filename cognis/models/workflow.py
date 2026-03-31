@@ -221,6 +221,21 @@ class WorkflowState(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+def _find_previous_run_step(
+    step_index: int,
+    workflow_steps: list[StepDefinition],
+) -> str | None:
+    """Walk backwards from *step_index* to find the nearest ``type="run"`` step.
+
+    Gate steps never produce output, so they are skipped when resolving
+    the default source for step input.
+    """
+    for i in range(step_index - 1, -1, -1):
+        if workflow_steps[i].type == "run":
+            return workflow_steps[i].name
+    return None
+
+
 def resolve_effective_input(
     step_def: StepDefinition,
     step_index: int,
@@ -241,7 +256,9 @@ def resolve_effective_input(
     if step_def.input is None:
         if step_index == 0:
             return StepInputConfig(type="null")
-        prev_name = workflow_steps[step_index - 1].name
+        prev_name = _find_previous_run_step(step_index, workflow_steps)
+        if prev_name is None:
+            return StepInputConfig(type="null")
         return StepInputConfig(type="last", source=prev_name)
 
     config = step_def.input
@@ -252,7 +269,9 @@ def resolve_effective_input(
             # First step with an input type that needs a source but has none —
             # treat as null.
             return StepInputConfig(type="null")
-        prev_name = workflow_steps[step_index - 1].name
+        prev_name = _find_previous_run_step(step_index, workflow_steps)
+        if prev_name is None:
+            return StepInputConfig(type="null")
         return StepInputConfig(type=config.type, source=prev_name)
 
     return config

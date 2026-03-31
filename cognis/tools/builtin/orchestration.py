@@ -34,7 +34,16 @@ class OrchestrationMode(StrEnum):
 
 # All orchestration tool names (for interception in agent loop)
 SUBSESSION_TOOL_NAMES = {"delegate", "list_subsessions", "get_subsession", "cancel_subsession"}
-TASK_TOOL_NAMES = {"create_task", "list_tasks", "get_task", "update_task", "cancel_task"}
+TASK_TOOL_NAMES = {
+    "create_task",
+    "list_tasks",
+    "get_task",
+    "get_task_output",
+    "get_task_step_output",
+    "update_task",
+    "cancel_task",
+    "retry_task",
+}
 ORCHESTRATION_TOOL_NAMES = SUBSESSION_TOOL_NAMES | TASK_TOOL_NAMES
 
 # ---------------------------------------------------------------------------

@@ -355,6 +355,43 @@ class TaskQueue:
         self._launch_task_run(task)
         return task
 
+    async def retry_failed_task(self, task_id: str) -> TaskModel:
+        """Reset a failed task's workflow state and re-launch it.
+
+        Unlike ``resume_task`` (which only works for paused tasks), this
+        method handles tasks in ``failed`` status by resetting the attempt
+        counter for the current step and transitioning back to ``running``.
+        """
+        async with self._session_factory() as db_session:
+            task_row = await get_task(db_session, task_id)
+            if task_row is None:
+                raise ValueError("Task not found")
+            if task_row.status != "failed":
+                raise ValueError("Only failed tasks can be retried via retry_failed_task")
+
+            # Reset workflow state — clear attempt counters so the step
+            # gets fresh attempts, and set status back to running.
+            ws = (
+                WorkflowState.model_validate(task_row.workflow_state)
+                if task_row.workflow_state
+                else WorkflowState()
+            )
+            ws.loop_iterations = {}  # Reset all attempt counters
+            ws.status = "running"
+            ws.current_step_status = None
+            ws.pending_pause_type = None
+            ws.pending_pause_payload = None
+
+            task_row.workflow_state = ws.model_dump(mode="json")
+            await update_task_status(db_session, task_id, "running")
+            await db_session.commit()
+
+            task = _row_to_task_model(task_row)
+
+        task.workflow_state = ws
+        self._launch_task_run(task)
+        return task
+
     async def cancel_task(self, task_id: str) -> TaskModel:
         """Cancel a task in any mutable state."""
         pending_pause = self._get_pending_interaction(task_id)

@@ -251,7 +251,7 @@ async def select_workflow(
     available_workflows: list[dict[str, str]],
     default_workflow_id: str | None = None,
     selection_mode: str = "automatic",
-    classifier_timeout_seconds: float = 2.0,
+    classifier_timeout_seconds: float = 10.0,
 ) -> WorkflowSelectionResult:
     """Select a workflow for a task based on agent config and classifier.
 
@@ -319,10 +319,22 @@ async def select_workflow(
             source="classifier",
         )
 
-    except (TimeoutError, Exception):
+    except TimeoutError:
+        logger.warning(
+            "Workflow selector timed out, using default",
+            extra={"extra_data": {"default": default_workflow_id}},
+        )
+        return WorkflowSelectionResult(
+            workflow_id=default_workflow_id or "system:direct",
+            confidence=0.3,
+            reason="Classifier timeout fallback",
+            source="default",
+        )
+    except Exception:
         logger.warning(
             "Workflow selector failed, using default",
             extra={"extra_data": {"default": default_workflow_id}},
+            exc_info=True,
         )
         return WorkflowSelectionResult(
             workflow_id=default_workflow_id or "system:direct",

@@ -137,9 +137,7 @@
 
   function filteredConversations(): Conversation[] {
     let list = conversations;
-    if (selectedChannel !== 'all') {
-      list = list.filter((c) => (c.context?.type?.toLowerCase() ?? 'unknown') === selectedChannel);
-    }
+    // Channel filtering is now server-side (passed to API in loadConversationPage)
     const query = conversationSearch.trim().toLowerCase();
     if (query) {
       list = list.filter((c) => conversationTitle(c).toLowerCase().includes(query));
@@ -171,7 +169,8 @@
   }
 
   async function loadConversationPage(reset = false): Promise<void> {
-    const response = await api.conversations.list(reset ? null : conversationCursor);
+    const channelFilter = selectedChannel !== 'all' ? selectedChannel : null;
+    const response = await api.conversations.list(reset ? null : conversationCursor, channelFilter);
     conversations = reset ? response.items : [...conversations, ...response.items];
     conversationCursor = response.cursor;
     conversationsHasMore = response.has_more;

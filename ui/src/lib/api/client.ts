@@ -232,12 +232,12 @@ export const api = {
   },
 
   conversations: {
-    list(cursor: string | null = null): Promise<CursorPage<Conversation>> {
-      return request<CursorPage<Conversation>>(`/api/v1/conversations${encodeQuery({ cursor, limit: 50 })}`);
+    list(cursor: string | null = null, contextType: string | null = null): Promise<CursorPage<Conversation>> {
+      return request<CursorPage<Conversation>>(`/api/v1/conversations${encodeQuery({ cursor, limit: 50, context_type: contextType })}`);
     },
 
-    async listAll(): Promise<Conversation[]> {
-      return collectCursorPages((cursor) => this.list(cursor));
+    async listAll(contextType: string | null = null): Promise<Conversation[]> {
+      return collectCursorPages((cursor) => this.list(cursor, contextType));
     },
 
     create(payload: { agent_id: string; title?: string | null; context?: Record<string, unknown> }): Promise<Conversation> {

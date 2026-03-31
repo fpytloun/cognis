@@ -884,8 +884,9 @@ class WebSocketConnectionManager:
         conversation_id = event.data.get("conversation_id")
         if not isinstance(conversation_id, str):
             return
-        if not self._by_conversation.get(conversation_id):
-            return
+        # Run the follow-up turn even without active WebSocket clients.
+        # The turn results persist to Intaris and are visible when the
+        # user reconnects.  Streaming callbacks are simply skipped.
         prompt = _follow_up_turn_prompt(
             event.data.get("status") if isinstance(event.data.get("status"), str) else None
         )

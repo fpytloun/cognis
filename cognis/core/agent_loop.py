@@ -941,6 +941,19 @@ class AgentLoop:
         # Assemble initial context
         if not ctx.is_direct and not ctx.is_retry and self.step_context_assembler is not None:
             # First-attempt workflow step → use StepContextAssembler
+            logger.info(
+                "agent: using StepContextAssembler for workflow step",
+                extra={
+                    "extra_data": {
+                        "session_id": ctx.session.session_id,
+                        "step": ctx.step_definition.name,
+                        "step_index": ctx.step_index,
+                        "step_outputs_keys": list((ctx.workflow_state.step_outputs or {}).keys())
+                        if ctx.workflow_state
+                        else [],
+                    }
+                },
+            )
             step_prompt = self._build_step_prompt(ctx)
             context_result = await self.step_context_assembler.assemble(
                 session=ctx.session,
@@ -1052,6 +1065,7 @@ class AgentLoop:
 
             # Stream LLM response
             accumulator = StreamAccumulator()
+            mid_stream_error: str | None = None
             async for chunk in self.providers.llm.stream_generate(
                 messages,
                 model=model_for_llm,
@@ -1060,9 +1074,15 @@ class AgentLoop:
                 cache_breakpoint_index=cache_breakpoint,
                 **llm_kwargs,
             ):
+                if chunk.get("mid_stream_failure"):
+                    mid_stream_error = chunk.get("error", "LLM stream failed mid-generation")
+                    break
                 text_delta = accumulator.feed(chunk)
                 if text_delta and on_token:
                     await on_token(text_delta)
+
+            if mid_stream_error:
+                raise RuntimeError(mid_stream_error)
 
             content = accumulator.get_content()
             tool_calls = accumulator.get_tool_calls()
@@ -2338,14 +2358,14 @@ class AgentLoop:
                             }
                         ),
                     )
-                # No active pause — resume from failed state
-                await task_queue.resume_task(task_id)
+                # No active pause — retry from failed state directly
+                await task_queue.retry_failed_task(task_id)
                 return ToolResult(
                     output=json.dumps(
                         {
                             "status": "retrying",
                             "task_id": task_id,
-                            "message": "Task requeued for retry.",
+                            "message": "Task reset and relaunched for retry.",
                         }
                     ),
                 )
