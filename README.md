@@ -10,7 +10,7 @@ Decoupled control plane for AI agents. Cognis is the controller and orchestratio
 
 **Self-hosted.** Python async controller, SQLite or PostgreSQL, no external dependencies beyond an LLM API key and the companion services. Your agents, conversations, and data stay under your control.
 
-Part of the [Openclaw](https://github.com/openclaw) ecosystem: Cognis controller, [Intaris](https://github.com/openclaw/intaris) guardrails, [Mnemory](https://github.com/openclaw/mnemory) memory.
+Part of the Openclaw ecosystem: Cognis controller, [Intaris](https://github.com/fpytloun/intaris) guardrails, [Mnemory](https://github.com/fpytloun/mnemory) memory.
 
 ## Features
 
@@ -19,8 +19,8 @@ Part of the [Openclaw](https://github.com/openclaw) ecosystem: Cognis controller
 - **Sub-session delegation** -- Three modes: Agent (delegate to different agent), Worker (same agent, focused task), Fork (parallel exploration). Main chat stays responsive.
 - **Task queue + workflows** -- Durable kanban-style tasks with priorities, dependencies, portable workflow templates, step evaluation, and human-in-the-loop gates.
 - **Controller-executor separation** -- The controller decides; executors do. The MVP ships with an in-process executor and the same JSON-RPC contract that future executor backends will follow.
-- **Memory integration** -- Persistent recall and remember through [Mnemory](https://github.com/openclaw/mnemory). Agent identity, user facts, episodic memory, and artifacts.
-- **Guardrails integration** -- Every tool call evaluated by [Intaris](https://github.com/openclaw/intaris). Escalation prompts with approve/deny. Session recording and behavioral analysis.
+- **Memory integration** -- Persistent recall and remember through [Mnemory](https://github.com/fpytloun/mnemory). Agent identity, user facts, episodic memory, and artifacts.
+- **Guardrails integration** -- Every tool call evaluated by [Intaris](https://github.com/fpytloun/intaris). Escalation prompts with approve/deny. Session recording and behavioral analysis.
 - **LLM provider abstraction** -- Multi-provider support via LiteLLM. Configure providers and model routing through the UI. Cost tracking per agent and task.
 - **MCP tool support** -- Connect any MCP server. Tools discovered automatically, evaluated through guardrails, executed on the executor.
 - **Decision Engine** -- Deterministic rules + lightweight LLM classifier decide whether a request runs inline or gets delegated to a background sub-session.
@@ -40,7 +40,7 @@ Part of the [Openclaw](https://github.com/openclaw) ecosystem: Cognis controller
 - Python 3.12+
 - One LLM option: OpenAI, Anthropic, or a local Ollama instance
 
-Cognis needs [Mnemory](https://github.com/openclaw/mnemory) and [Intaris](https://github.com/openclaw/intaris) running. Each is a single command:
+Cognis needs [Mnemory](https://github.com/fpytloun/mnemory) and [Intaris](https://github.com/fpytloun/intaris) running. Each is a single command:
 
 ```bash
 uvx mnemory                     # Memory layer on :8050

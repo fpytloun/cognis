@@ -9,7 +9,7 @@
 - **Core dependencies**: fastapi, uvicorn, httpx, pydantic v2, sqlalchemy 2.x, litellm, typer
 - **Frontend**: SvelteKit (separate app in `ui/`)
 - **License**: TBD
-- **Repository**: https://github.com/openclaw/cognis
+- **Repository**: https://github.com/fpytloun/cognis
 - **Part of**: Openclaw ecosystem (Cognis controller, Intaris guardrails, Mnemory memory)
 
 ## Architecture

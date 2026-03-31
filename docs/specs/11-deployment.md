@@ -153,11 +153,11 @@ services:
 
   # Internal services - NOT exposed to host
   mnemory:
-    image: ghcr.io/openclaw/mnemory:latest
+    image: ghcr.io/fpytloun/mnemory:latest
     # No host ports - only accessible within Docker network
 
   intaris:
-    image: ghcr.io/openclaw/intaris:latest
+    image: ghcr.io/fpytloun/intaris:latest
     # No host ports - only accessible within Docker network
 
 volumes:
@@ -212,7 +212,7 @@ Namespace: cognis
 Namespace: cognis-executors
   Job: cognis-exec-{id} (on-demand, created by controller)
 
-Namespace: openclaw
+Namespace: cognis-services
   Deployment: mnemory
   Deployment: intaris
 ```

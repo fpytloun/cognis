@@ -9,12 +9,12 @@
   import type { SystemDiagnostics } from '$lib/types/api';
 
   const guideLinks = [
-    ['Getting started', 'https://github.com/openclaw/cognis/blob/main/docs/guide/getting-started.md'],
-    ['Configuring providers', 'https://github.com/openclaw/cognis/blob/main/docs/guide/configuring-providers.md'],
-    ['Creating agents', 'https://github.com/openclaw/cognis/blob/main/docs/guide/creating-agents.md'],
-    ['Using chat', 'https://github.com/openclaw/cognis/blob/main/docs/guide/using-chat.md'],
-    ['Managing tasks', 'https://github.com/openclaw/cognis/blob/main/docs/guide/managing-tasks.md'],
-    ['Troubleshooting', 'https://github.com/openclaw/cognis/blob/main/docs/guide/troubleshooting.md']
+    ['Getting started', 'https://github.com/fpytloun/cognis/blob/main/docs/guide/getting-started.md'],
+    ['Configuring providers', 'https://github.com/fpytloun/cognis/blob/main/docs/guide/configuring-providers.md'],
+    ['Creating agents', 'https://github.com/fpytloun/cognis/blob/main/docs/guide/creating-agents.md'],
+    ['Using chat', 'https://github.com/fpytloun/cognis/blob/main/docs/guide/using-chat.md'],
+    ['Managing tasks', 'https://github.com/fpytloun/cognis/blob/main/docs/guide/managing-tasks.md'],
+    ['Troubleshooting', 'https://github.com/fpytloun/cognis/blob/main/docs/guide/troubleshooting.md']
   ] as const;
 
   let loading = true;
