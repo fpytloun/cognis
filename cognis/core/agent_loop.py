@@ -103,6 +103,55 @@ def _truncate_tool_data(text: str) -> str:
     return text[:_MAX_TOOL_DATA_BYTES] + f"\n... (truncated, {len(text)} bytes total)"
 
 
+def _append_tool_call_event(
+    events: list[SessionEvent],
+    tc: ToolCall,
+) -> None:
+    """Record a tool_call event to the Intaris event batch."""
+    events.append(
+        SessionEvent(
+            type="tool_call",
+            data={
+                "name": tc.name,
+                "call_id": tc.call_id,
+                "arguments": _truncate_tool_data(json.dumps(tc.arguments, default=str)),
+            },
+        )
+    )
+
+
+def _append_tool_result_event(
+    events: list[SessionEvent],
+    tc: ToolCall,
+    output: str,
+    is_error: bool,
+    duration_ms: int | None = None,
+) -> None:
+    """Record a tool_result event to the Intaris event batch.
+
+    Uses the same truncation limit as the regular tools path
+    (``_MAX_INTARIS_TOOL_RESULT``) for consistency with Intaris
+    compaction and audit consumers.
+    """
+    truncated = (
+        output[:_MAX_INTARIS_TOOL_RESULT] if len(output) > _MAX_INTARIS_TOOL_RESULT else output
+    )
+    events.append(
+        SessionEvent(
+            type="tool_result",
+            data={
+                "call_id": tc.call_id,
+                "name": tc.name,
+                "is_error": is_error,
+                "duration_ms": duration_ms,
+                "result": truncated,
+                "output_size": len(output),
+                "has_full_output": False,
+            },
+        )
+    )
+
+
 # ---------------------------------------------------------------------------
 # Stream accumulator
 # ---------------------------------------------------------------------------
@@ -1116,6 +1165,7 @@ class AgentLoop:
 
                 # Controller tool interception
                 if tc.name == STEP_COMPLETE:
+                    _append_tool_call_event(events_to_record, tc)
                     # Reject step_complete in direct mode (main chat)
                     if ctx.is_direct:
                         err_content = json.dumps(
@@ -1130,6 +1180,7 @@ class AgentLoop:
                         messages.append(
                             {"role": "tool", "tool_call_id": tc.call_id, "content": err_content}
                         )
+                        _append_tool_result_event(events_to_record, tc, err_content, True)
                         if on_tool_result:
                             await on_tool_result(tc.call_id, tc.name, err_content, True, None, None)
                         continue
@@ -1152,6 +1203,7 @@ class AgentLoop:
                         messages.append(
                             {"role": "tool", "tool_call_id": tc.call_id, "content": err_content}
                         )
+                        _append_tool_result_event(events_to_record, tc, err_content, True)
                         if on_tool_result:
                             await on_tool_result(tc.call_id, tc.name, err_content, True, None, None)
                         continue
@@ -1176,30 +1228,36 @@ class AgentLoop:
                     messages.append(
                         {"role": "tool", "tool_call_id": tc.call_id, "content": result_content}
                     )
+                    _append_tool_result_event(events_to_record, tc, result_content, False)
                     if on_tool_result:
                         await on_tool_result(tc.call_id, tc.name, result_content, False, None, None)
                     break
 
                 elif tc.name == STEP_TODO_WRITE:
+                    _append_tool_call_event(events_to_record, tc)
                     ctx.todos = tc.arguments.get("todos", [])
                     result_content = json.dumps({"status": "updated", "count": len(ctx.todos)})
                     messages.append(
                         {"role": "tool", "tool_call_id": tc.call_id, "content": result_content}
                     )
+                    _append_tool_result_event(events_to_record, tc, result_content, False)
                     if on_tool_result:
                         await on_tool_result(tc.call_id, tc.name, result_content, False, None, None)
                     continue
 
                 elif tc.name == STEP_TODO_LIST:
+                    _append_tool_call_event(events_to_record, tc)
                     result_content = json.dumps({"todos": ctx.todos})
                     messages.append(
                         {"role": "tool", "tool_call_id": tc.call_id, "content": result_content}
                     )
+                    _append_tool_result_event(events_to_record, tc, result_content, False)
                     if on_tool_result:
                         await on_tool_result(tc.call_id, tc.name, result_content, False, None, None)
                     continue
 
                 elif tc.name == STEP_REQUEST_INPUT:
+                    _append_tool_call_event(events_to_record, tc)
                     if (
                         ctx.interaction_mode != "step_requests"
                         or not ctx.step_definition.allow_questions
@@ -1210,6 +1268,7 @@ class AgentLoop:
                         messages.append(
                             {"role": "tool", "tool_call_id": tc.call_id, "content": err_content}
                         )
+                        _append_tool_result_event(events_to_record, tc, err_content, True)
                         if on_tool_result:
                             await on_tool_result(tc.call_id, tc.name, err_content, True, None, None)
                         continue
@@ -1221,6 +1280,7 @@ class AgentLoop:
                         messages.append(
                             {"role": "tool", "tool_call_id": tc.call_id, "content": rec_content}
                         )
+                        _append_tool_result_event(events_to_record, tc, rec_content, False)
                         if on_tool_result:
                             await on_tool_result(
                                 tc.call_id, tc.name, rec_content, False, None, None
@@ -1287,11 +1347,14 @@ class AgentLoop:
                         resolution = await self.pause_waiter.wait(pause_id, timeout=300.0)
                         await self._clear_interactive_pause_state(ctx)
                         if resolution.decision == "cancel":
+                            # No tool_result event needed: StepInterrupted propagates
+                            # without calling _finalize_step, so events_to_record is discarded.
                             raise StepInterrupted("Step input request cancelled")
                         resp_content = json.dumps({"response": resolution.data.get("response", "")})
                         messages.append(
                             {"role": "tool", "tool_call_id": tc.call_id, "content": resp_content}
                         )
+                        _append_tool_result_event(events_to_record, tc, resp_content, False)
                         if on_tool_result:
                             await on_tool_result(
                                 tc.call_id, tc.name, resp_content, False, None, None
@@ -1302,6 +1365,7 @@ class AgentLoop:
                         messages.append(
                             {"role": "tool", "tool_call_id": tc.call_id, "content": timeout_content}
                         )
+                        _append_tool_result_event(events_to_record, tc, timeout_content, True)
                         if on_tool_result:
                             await on_tool_result(
                                 tc.call_id, tc.name, timeout_content, True, None, None
@@ -1310,6 +1374,7 @@ class AgentLoop:
 
                 elif is_orchestration_tool(tc.name):
                     # Orchestration tool — intercept as controller directive
+                    _append_tool_call_event(events_to_record, tc)
                     orch_result = await self._handle_orchestration_tool(
                         tc,
                         ctx=ctx,
@@ -1324,6 +1389,9 @@ class AgentLoop:
                             "tool_call_id": tc.call_id,
                             "content": orch_result.output,
                         }
+                    )
+                    _append_tool_result_event(
+                        events_to_record, tc, orch_result.output, orch_result.is_error
                     )
                     if on_tool_result:
                         await on_tool_result(
