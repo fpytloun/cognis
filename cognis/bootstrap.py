@@ -127,6 +127,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_api_key_columns)
         await conn.run_sync(_ensure_agent_sync_metadata_column)
         await conn.run_sync(_ensure_provider_is_default_column)
+        await conn.run_sync(_ensure_active_session_id_column)
         await conn.run_sync(_ensure_task_expected_output_column)
 
 
@@ -185,6 +186,23 @@ def _ensure_provider_is_default_column(sync_conn: object) -> None:
 
     if "is_default" not in provider_columns:
         execute(text("ALTER TABLE llm_providers ADD COLUMN is_default BOOLEAN NOT NULL DEFAULT 0"))
+
+
+def _ensure_active_session_id_column(sync_conn: object) -> None:
+    """Rename root_session_id → active_session_id on conversations table."""
+    inspector = cast(Any, inspect(sync_conn))
+    try:
+        conv_columns = {column["name"] for column in inspector.get_columns("conversations")}
+    except Exception:
+        return
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+
+    if "root_session_id" in conv_columns and "active_session_id" not in conv_columns:
+        execute(
+            text("ALTER TABLE conversations RENAME COLUMN root_session_id TO active_session_id")
+        )
+    elif "active_session_id" not in conv_columns:
+        execute(text("ALTER TABLE conversations ADD COLUMN active_session_id VARCHAR"))
 
 
 def _ensure_task_expected_output_column(sync_conn: object) -> None:

@@ -79,14 +79,14 @@ async def test_session_manager_creates_conversation_and_root_session_atomically(
         title="Test conversation",
     )
 
-    assert conversation.root_session_id == root_session.session_id
+    assert conversation.active_session_id == root_session.session_id
     assert root_session.intaris_session_id == root_session.session_id
 
     async with session_factory() as session:
         stored_conversation = await session.get(Conversation, conversation.conversation_id)
         stored_session = await session.get(Session, root_session.session_id)
         assert stored_conversation is not None
-        assert stored_conversation.root_session_id == root_session.session_id
+        assert stored_conversation.active_session_id == root_session.session_id
         assert stored_session is not None
         assert stored_session.intaris_session_id == root_session.session_id
 
@@ -235,7 +235,7 @@ async def test_rotate_session_creates_new_root_and_marks_old_completed(tmp_path)
     async with session_factory() as db:
         conv = await db.get(Conversation, conversation.conversation_id)
         assert conv is not None
-        assert conv.root_session_id == new_session.session_id
+        assert conv.active_session_id == new_session.session_id
 
     # Verify old session cache was evicted
     assert root_session.session_id in cache.evicted

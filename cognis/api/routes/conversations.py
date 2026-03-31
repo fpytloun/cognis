@@ -220,9 +220,9 @@ async def conversation_messages(
         if row is None:
             raise api_exception(404, "not_found", "Conversation not found")
         require_owner_or_admin(request, row.user_email)
-        if row.root_session_id is None:
+        if row.active_session_id is None:
             return MessageHistoryResponse(items=[], last_seq=0, has_more=False)
-        session_row = await get_session_row(session, row.root_session_id)
+        session_row = await get_session_row(session, row.active_session_id)
     if session_row is None:
         return MessageHistoryResponse(items=[], last_seq=0, has_more=False)
     event_result = await request.app.state.providers.guardrails.read_events(

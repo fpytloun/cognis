@@ -244,6 +244,58 @@ class StreamAccumulator:
 
 
 # ---------------------------------------------------------------------------
+# Execution policy — replaces the is_direct boolean flag
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ExecutionPolicy:
+    """Controls behavioral differences between execution paths.
+
+    Replaces the former ``is_direct`` boolean with explicit, named flags.
+    Three presets cover the standard execution paths:
+
+    - ``CHAT_POLICY``:  direct chat turns (WebSocket)
+    - ``WORKFLOW_POLICY``:  background workflow steps
+    - ``DELEGATION_POLICY``:  synchronous/async sub-sessions
+    """
+
+    require_step_complete: bool = False
+    """Whether the LLM must call ``step_complete`` to signal completion."""
+
+    step_complete_available: bool = False
+    """Whether the ``step_complete`` tool is exposed to the LLM."""
+
+    enable_auto_compaction: bool = False
+    """Whether automatic context compaction runs after the turn."""
+
+    event_flush_strategy: str = "batch"
+    """``"batch"`` = single write at turn end; ``"incremental"`` = after each tool batch."""
+
+
+CHAT_POLICY = ExecutionPolicy(
+    require_step_complete=False,
+    step_complete_available=False,
+    enable_auto_compaction=True,
+    event_flush_strategy="batch",
+)
+
+WORKFLOW_POLICY = ExecutionPolicy(
+    require_step_complete=True,
+    step_complete_available=True,
+    enable_auto_compaction=False,
+    event_flush_strategy="incremental",
+)
+
+DELEGATION_POLICY = ExecutionPolicy(
+    require_step_complete=True,
+    step_complete_available=True,
+    enable_auto_compaction=False,
+    event_flush_strategy="incremental",
+)
+
+
+# ---------------------------------------------------------------------------
 # Session lock
 # ---------------------------------------------------------------------------
 
@@ -450,9 +502,13 @@ class StepContext:
     task_description: str = ""
     task_expected_output: str | None = None
     step_run_id: str | None = None
-    is_direct: bool = False  # True for main chat (Direct workflow)
+    policy: ExecutionPolicy = field(default_factory=lambda: CHAT_POLICY)
+    is_direct: bool = (
+        False  # DEPRECATED — use policy fields instead. Kept temporarily for migration.
+    )
     is_retry: bool = False  # True for re-attempt within the same step
     user_message: str = ""
+    prior_context: list[dict[str, Any]] | None = None  # Prior step output messages
     interaction_mode: str = "explicit_gates"
     tool_registry: Any = None  # ToolRegistry instance for this step
     executor_connection: Any = None  # ExecutorConnection for this step
@@ -485,8 +541,8 @@ class AgentLoop:
         event_bus: EventBus,
         session_lock: SessionLock,
         pause_waiter: PauseWaiter,
-        step_context_assembler: Any = None,
         tool_output_store: Any = None,
+        step_context_assembler: Any = None,  # DEPRECATED — kept for backward compat
     ) -> None:
         self.providers = providers
         self.session_manager = session_manager
@@ -498,7 +554,6 @@ class AgentLoop:
         self.event_bus = event_bus
         self.session_lock = session_lock
         self.pause_waiter = pause_waiter
-        self.step_context_assembler = step_context_assembler
         self.tool_output_store = tool_output_store
         self._task_queue: Any = None
         # Track active child sessions per parent session for /stop cancellation
@@ -535,7 +590,7 @@ class AgentLoop:
                 "extra_data": {
                     "session_id": ctx.session.session_id,
                     "step": ctx.step_definition.name,
-                    "is_direct": ctx.is_direct,
+                    "policy": ctx.policy.event_flush_strategy,
                 }
             },
         )
@@ -663,7 +718,8 @@ class AgentLoop:
             session=child_session,
             conversation=conversation,
             agent=resolved_agent,
-            is_direct=False,  # Require step_complete for sub-sessions
+            policy=DELEGATION_POLICY,
+            is_direct=False,
             user_message=task_description,
             system_initiated=True,
             interaction_mode="explicit_gates",
@@ -901,7 +957,11 @@ class AgentLoop:
         # assembly so the IntentionBarrier can start updating the session
         # intention while we assemble context and call the LLM.
         _user_msg_recorded_early = False
-        if ctx.is_direct and ctx.user_message and not ctx.system_initiated:
+        if (
+            ctx.policy.event_flush_strategy == "batch"
+            and ctx.user_message
+            and not ctx.system_initiated
+        ):
             intaris_id = ctx.session.intaris_session_id or ctx.session.session_id
             user_msg_event = SessionEvent(type="user_message", data={"content": ctx.user_message})
             try:
@@ -938,88 +998,39 @@ class AgentLoop:
                     exc_info=True,
                 )
 
-        # Assemble initial context
-        if not ctx.is_direct and not ctx.is_retry and self.step_context_assembler is not None:
-            # First-attempt workflow step → use StepContextAssembler
-            logger.info(
-                "agent: using StepContextAssembler for workflow step",
-                extra={
-                    "extra_data": {
-                        "session_id": ctx.session.session_id,
-                        "step": ctx.step_definition.name,
-                        "step_index": ctx.step_index,
-                        "step_outputs_keys": list((ctx.workflow_state.step_outputs or {}).keys())
-                        if ctx.workflow_state
-                        else [],
-                    }
-                },
+        # Assemble initial context — unified path for all execution modes.
+        # The caller provides prior_context (for workflow step input) and
+        # user_message. Retries include evaluation feedback in the message.
+        effective_user_message = ctx.user_message or ctx.step_definition.prompt
+        if ctx.is_retry and ctx.workflow_state and ctx.workflow_state.last_evaluation_feedback:
+            feedback_text = (
+                f"\n\n<evaluation_feedback>\n"
+                f"{ctx.workflow_state.last_evaluation_feedback}\n"
+                f"</evaluation_feedback>\n\n"
             )
-            step_prompt = self._build_step_prompt(ctx)
-            context_result = await self.step_context_assembler.assemble(
-                session=ctx.session,
-                conversation=ctx.conversation,
-                agent=ctx.agent,
-                step_definition=ctx.step_definition,
-                step_index=ctx.step_index,
-                workflow_steps=ctx.workflow_steps or [],
-                workflow_state=ctx.workflow_state or WorkflowState(),
-                step_prompt=step_prompt,
-            )
-            messages = context_result.messages
-            events_to_record.append(
-                SessionEvent(type="user_message", data={"content": step_prompt})
-            )
-        elif not ctx.is_direct and ctx.is_retry:
-            # Retry → use regular assembler on existing session (which has
-            # original prompt, prior work, and evaluation feedback already).
-            # If state has fallback feedback (Intaris write failed), include it.
-            feedback_text = ""
-            if ctx.workflow_state is not None and ctx.workflow_state.last_evaluation_feedback:
-                feedback_text = (
-                    f"\n\n<evaluation_feedback>\n"
-                    f"{ctx.workflow_state.last_evaluation_feedback}\n"
-                    f"</evaluation_feedback>\n\n"
-                )
-                ctx.workflow_state.last_evaluation_feedback = None
-            retry_message = (
+            ctx.workflow_state.last_evaluation_feedback = None
+            effective_user_message = (
                 f"{feedback_text}Address the evaluation feedback above and complete this step."
             )
-            context_result = await self.context_assembler.assemble(
-                session=ctx.session,
-                conversation=ctx.conversation,
-                agent=ctx.agent,
-                user_message=retry_message,
-                user_message_role="user",
-                tool_definitions=None,
-                active_delegations=None,
-            )
-            messages = context_result.messages
-            events_to_record.append(
-                SessionEvent(type="user_message", data={"content": retry_message})
-            )
-        else:
-            # Direct chat or fallback
-            context_result = await self.context_assembler.assemble(
-                session=ctx.session,
-                conversation=ctx.conversation,
-                agent=ctx.agent,
-                user_message=ctx.user_message or ctx.step_definition.prompt,
-                user_message_role="system" if ctx.system_initiated else "user",
-                tool_definitions=None,
-                active_delegations=None,
-            )
-            messages = context_result.messages
+        elif ctx.policy.require_step_complete and not ctx.is_retry:
+            # First-attempt workflow step — use the built step prompt
+            effective_user_message = self._build_step_prompt(ctx)
 
-        # Record user message event for direct workflow (skip if already
-        # recorded early for intention tracking above).
-        if (
-            ctx.is_direct
-            and ctx.user_message
-            and not ctx.system_initiated
-            and not _user_msg_recorded_early
-        ):
+        context_result = await self.context_assembler.assemble(
+            session=ctx.session,
+            conversation=ctx.conversation,
+            agent=ctx.agent,
+            user_message=effective_user_message,
+            user_message_role="system" if ctx.system_initiated else "user",
+            prior_context=ctx.prior_context,
+        )
+        messages = context_result.messages
+
+        # Record user message event (unless already recorded early for
+        # intention tracking above).
+        if effective_user_message and not ctx.system_initiated and not _user_msg_recorded_early:
             events_to_record.append(
-                SessionEvent(type="user_message", data={"content": ctx.user_message})
+                SessionEvent(type="user_message", data={"content": effective_user_message})
             )
 
         # Capture cache breakpoint for prompt caching (Anthropic cache_control)
@@ -1097,7 +1108,7 @@ class AgentLoop:
 
             # No tool calls — check if step is complete
             if not tool_calls:
-                if ctx.is_direct:
+                if not ctx.policy.require_step_complete:
                     # Direct workflow (main chat): check for incomplete todos
                     incomplete_todos = self._get_incomplete_todos(ctx)
                     if incomplete_todos and todo_reprompt_count < _MAX_TODO_REPROMPTS:
@@ -1193,8 +1204,8 @@ class AgentLoop:
                 # Controller tool interception
                 if tc.name == STEP_COMPLETE:
                     _append_tool_call_event(events_to_record, tc)
-                    # Reject step_complete in direct mode (main chat)
-                    if ctx.is_direct:
+                    # Reject step_complete when it's not available (e.g. direct chat)
+                    if not ctx.policy.step_complete_available:
                         err_content = json.dumps(
                             {
                                 "status": "error",
@@ -1212,9 +1223,9 @@ class AgentLoop:
                             await on_tool_result(tc.call_id, tc.name, err_content, True, None, None)
                         continue
 
-                    # Enforce todo completion for non-direct steps
+                    # Enforce todo completion for workflow steps
                     incomplete_todos = self._get_incomplete_todos(ctx)
-                    if incomplete_todos and not ctx.is_direct:
+                    if incomplete_todos and ctx.policy.require_step_complete:
                         todo_list = ", ".join(t.get("content", "?") for t in incomplete_todos[:5])
                         err_content = json.dumps(
                             {
@@ -1542,10 +1553,9 @@ class AgentLoop:
                         )
                     )
 
-            # Flush events incrementally for workflow steps so they are
-            # visible in session logs during execution (direct chat uses
-            # WebSocket streaming instead).
-            if not ctx.is_direct and events_to_record:
+            # Flush events incrementally when the policy says so (workflow
+            # steps). Direct chat uses batch recording at turn end.
+            if ctx.policy.event_flush_strategy == "incremental" and events_to_record:
                 await self._flush_events_incremental(ctx, events_to_record)
 
             # Check if step_complete was called in this batch
@@ -1595,7 +1605,7 @@ class AgentLoop:
         # direct chat — workflow steps have their own lifecycle management.
         if (
             events_recorded
-            and ctx.is_direct
+            and ctx.policy.enable_auto_compaction
             and getattr(context_result, "recommend_compaction", False)
         ):
             await self._auto_compact(ctx)
@@ -2869,8 +2879,8 @@ class AgentLoop:
 
         tools: list[dict[str, Any]] = []
 
-        # step_complete — available for non-direct steps (sub-sessions, workflow steps)
-        if not ctx.is_direct:
+        # step_complete — available when policy allows it (workflow steps, sub-sessions)
+        if ctx.policy.step_complete_available:
             tools.append(
                 {
                     "type": "function",

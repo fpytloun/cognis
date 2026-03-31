@@ -158,7 +158,7 @@ class ConversationResponse(BaseModel):
     agent_id: str
     title: str | None = None
     context: ConversationContextModel
-    root_session_id: str | None = None
+    active_session_id: str | None = None
     status: str
     last_message_at: datetime | None = None
     created_at: datetime | None = None

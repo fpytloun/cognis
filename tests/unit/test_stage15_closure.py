@@ -19,7 +19,7 @@ from cognis.store.queries import (
     create_user,
     get_latest_active_conversation_for_agent,
     set_session_intaris_session_id,
-    update_conversation_root_session,
+    update_conversation_active_session,
 )
 
 
@@ -340,7 +340,7 @@ async def _seed_conversation(app: object, email: str, agent_id: str) -> str:
         await set_session_intaris_session_id(
             session, session_row.session_id, f"intaris-{session_row.session_id}"
         )
-        await update_conversation_root_session(
+        await update_conversation_active_session(
             session, conversation.conversation_id, session_row.session_id
         )
         await session.commit()

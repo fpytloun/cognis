@@ -113,9 +113,15 @@ class ContextAssembler:
         user_message_role: str = "user",
         tool_definitions: list[ToolDefinition] | None = None,
         active_delegations: list[dict[str, Any]] | None = None,
+        prior_context: list[dict[str, Any]] | None = None,
         skip_user_message: bool = False,
     ) -> ContextAssemblyResult:
-        """Build the LLM message list for a single turn."""
+        """Build the LLM message list for a single turn.
+
+        ``prior_context`` is an optional list of messages to inject after
+        session history and before the user message.  Used by the workflow
+        engine to inject prior step output.  Chat turns pass ``None``.
+        """
 
         logger.debug(
             "context: assembly started",
@@ -361,6 +367,11 @@ class ContextAssembler:
             messages.append(
                 {"role": "system", "content": _format_active_delegations(active_delegations)}
             )
+
+        # Prior context from caller (e.g. prior workflow step output)
+        if prior_context:
+            messages.extend(prior_context)
+
         if not skip_user_message:
             messages.append({"role": user_message_role, "content": user_message})
 

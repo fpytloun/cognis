@@ -477,15 +477,15 @@ async def update_conversation(
     return True
 
 
-async def update_conversation_root_session(
-    session: AsyncSession, conversation_id: str, root_session_id: str
+async def update_conversation_active_session(
+    session: AsyncSession, conversation_id: str, active_session_id: str
 ) -> bool:
-    """Set the root session ID for a conversation."""
+    """Set the active session ID for a conversation."""
 
     conversation = await get_conversation(session, conversation_id)
     if conversation is None:
         return False
-    conversation.root_session_id = root_session_id
+    conversation.active_session_id = active_session_id
     conversation.updated_at = datetime.now(UTC)
     await session.flush()
     return True
@@ -590,8 +590,8 @@ async def get_latest_active_session_for_conversation(
 ) -> Session | None:
     """Get the most recent active/idle session for a conversation.
 
-    Used for task result delivery — prefers the current active session
-    over the root_session_id which may be stale after compaction.
+    Used for task result delivery as a fallback when the conversation's
+    ``active_session_id`` field is not yet populated.
     """
     result = await session.execute(
         select(Session)

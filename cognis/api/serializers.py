@@ -47,7 +47,7 @@ def conversation_to_response(row: Any) -> ConversationResponse:
             if hasattr(row, "memory_labels")
             else row.context.memory_labels,
         ),
-        root_session_id=getattr(row, "root_session_id", None),
+        active_session_id=getattr(row, "active_session_id", None),
         status=row.status,
         last_message_at=getattr(row, "last_message_at", None),
         created_at=getattr(row, "created_at", None),

@@ -16,7 +16,7 @@ from cognis.store.queries import (
     create_session,
     create_user,
     set_session_intaris_session_id,
-    update_conversation_root_session,
+    update_conversation_active_session,
 )
 
 
@@ -78,7 +78,7 @@ async def test_deliver_task_result_uses_latest_active_conversation_and_publishes
             agent_id="agent-1",
         )
         await set_session_intaris_session_id(session, root_session.session_id, "intaris-root")
-        await update_conversation_root_session(
+        await update_conversation_active_session(
             session, conversation.conversation_id, root_session.session_id
         )
         await session.commit()
@@ -190,7 +190,7 @@ async def test_deliver_task_result_uses_source_ref_for_specific_conversation(
             agent_id="agent-1",
         )
         await set_session_intaris_session_id(session, root_session.session_id, "intaris-specific")
-        await update_conversation_root_session(
+        await update_conversation_active_session(
             session, conversation.conversation_id, root_session.session_id
         )
         await session.commit()

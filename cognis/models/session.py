@@ -50,7 +50,7 @@ class ConversationModel(BaseModel):
     agent_id: str
     title: str | None = None
     context: ConversationContext
-    root_session_id: str | None = None
+    active_session_id: str | None = None
     status: str = "active"
     last_message_at: datetime | None = None
     created_at: datetime | None = None

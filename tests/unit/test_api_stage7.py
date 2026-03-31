@@ -18,7 +18,7 @@ from cognis.store.queries import (
     create_task,
     create_user,
     set_session_intaris_session_id,
-    update_conversation_root_session,
+    update_conversation_active_session,
 )
 
 
@@ -545,7 +545,7 @@ def test_session_events_are_proxied(monkeypatch: object, tmp_path: Path) -> None
                 await set_session_intaris_session_id(
                     session, session_row.session_id, session_row.session_id
                 )
-                await update_conversation_root_session(
+                await update_conversation_active_session(
                     session, conversation.conversation_id, session_row.session_id
                 )
                 await session.commit()
@@ -621,7 +621,7 @@ def test_websocket_queues_second_message_while_turn_active(
                 await set_session_intaris_session_id(
                     session, session_row.session_id, session_row.session_id
                 )
-                await update_conversation_root_session(
+                await update_conversation_active_session(
                     session, conversation.conversation_id, session_row.session_id
                 )
                 await session.commit()

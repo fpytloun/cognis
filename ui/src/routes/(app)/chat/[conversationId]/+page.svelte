@@ -119,14 +119,14 @@
   const TERMINAL_SESSION_STATES = new Set(['terminated', 'failed', 'cancelled']);
   const BLOCKED_SESSION_STATES = new Set(['terminated', 'failed', 'cancelled', 'suspended']);
 
-  function rootSessionStatus(): string | null {
-    if (!currentConversation?.root_session_id) return null;
-    const root = sessions.find((s) => s.session_id === currentConversation?.root_session_id);
+  function activeSessionStatus(): string | null {
+    if (!currentConversation?.active_session_id) return null;
+    const root = sessions.find((s) => s.session_id === currentConversation?.active_session_id);
     return root?.status ?? null;
   }
 
   function isSessionBlocked(): boolean {
-    const status = rootSessionStatus();
+    const status = activeSessionStatus();
     return status !== null && BLOCKED_SESSION_STATES.has(status);
   }
 
@@ -364,7 +364,7 @@
   }
 
   async function loadSessionInfo(): Promise<void> {
-    const sid = currentConversation?.root_session_id;
+    const sid = currentConversation?.active_session_id;
     if (!sid) return;
     sessionInfoLoading = true;
     try {
@@ -579,7 +579,7 @@
   }
 
   async function copySessionId(): Promise<void> {
-    const sid = currentConversation?.root_session_id;
+    const sid = currentConversation?.active_session_id;
     if (!sid) return;
     try {
       await navigator.clipboard.writeText(sid);
@@ -718,7 +718,7 @@
     }
 
     // Filter sub-session tool/chunk events from the main timeline (defense-in-depth)
-    const rootSid = currentConversation?.root_session_id;
+    const rootSid = currentConversation?.active_session_id;
     if (rootSid && 'session_id' in event && event.session_id && event.session_id !== rootSid) {
       if (event.type === 'tool_call' || event.type === 'tool_result' || event.type === 'chunk' || event.type === 'reasoning') {
         return;
@@ -1118,14 +1118,14 @@
                   </div>
                 {/if}
 
-                {#if currentConversation.root_session_id}
+                {#if currentConversation.active_session_id}
                   <button
                     class="flex items-center gap-1 font-mono text-xs text-slate-500 transition hover:text-slate-300"
                     onclick={copySessionId}
                     type="button"
                     title="Copy full session ID"
                   >
-                    {currentConversation.root_session_id.slice(0, 12)}
+                    {currentConversation.active_session_id.slice(0, 12)}
                     {#if sessionIdCopied}
                       <Check class="h-3 w-3 text-emerald-400" />
                     {:else}
@@ -1330,12 +1330,12 @@
           </div>
         {:else if isSessionBlocked()}
           <div class="rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-center text-sm text-amber-100">
-            {#if rootSessionStatus() === 'suspended'}
+            {#if activeSessionStatus() === 'suspended'}
               This session is suspended.
-            {:else if rootSessionStatus() === 'terminated'}
+            {:else if activeSessionStatus() === 'terminated'}
               This session has been terminated.
             {:else}
-              This session has ended ({rootSessionStatus()}).
+              This session has ended ({activeSessionStatus()}).
             {/if}
           </div>
         {:else}

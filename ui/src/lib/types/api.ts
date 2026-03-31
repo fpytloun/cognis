@@ -78,7 +78,7 @@ export interface Conversation {
   agent_id: string;
   title: string | null;
   context: ConversationContext;
-  root_session_id: string | null;
+  active_session_id: string | null;
   status: string;
   last_message_at: string | null;
   created_at: string | null;

@@ -107,7 +107,7 @@ class SessionManager:
                 await queries.set_session_intaris_session_id(
                     db_session, session_row.session_id, session_row.session_id
                 )
-                await queries.update_conversation_root_session(
+                await queries.update_conversation_active_session(
                     db_session, conversation_id, session_row.session_id
                 )
                 await db_session.commit()
@@ -168,7 +168,7 @@ class SessionManager:
                 await queries.set_session_intaris_session_id(
                     db_session, session_row.session_id, session_row.session_id
                 )
-                await queries.update_conversation_root_session(
+                await queries.update_conversation_active_session(
                     db_session, conversation.conversation_id, session_row.session_id
                 )
                 await db_session.commit()
@@ -176,7 +176,7 @@ class SessionManager:
                 await db_session.rollback()
                 raise
 
-        conversation.root_session_id = session_row.session_id
+        conversation.active_session_id = session_row.session_id
         session_row.intaris_session_id = session_row.session_id
         return _to_conversation_model(conversation), _to_session_model(session_row)
 
@@ -418,7 +418,7 @@ class SessionManager:
                 )
 
                 # 4. Update conversation root
-                await queries.update_conversation_root_session(
+                await queries.update_conversation_active_session(
                     db_session, conversation_id, new_session_row.session_id
                 )
 
@@ -639,7 +639,7 @@ def _to_conversation_model(row: Any) -> ConversationModel:
             platform_data=row.context_data or {},
             memory_labels=row.memory_labels or {},
         ),
-        root_session_id=row.root_session_id,
+        active_session_id=row.active_session_id,
         status=row.status,
         last_message_at=row.last_message_at,
         created_at=row.created_at,

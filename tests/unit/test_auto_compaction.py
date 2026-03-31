@@ -142,7 +142,7 @@ def _conversation() -> ConversationModel:
         user_email="user@example.com",
         agent_id="agent-1",
         context=ConversationContext(type="web"),
-        root_session_id="session-1",
+        active_session_id="session-1",
     )
 
 

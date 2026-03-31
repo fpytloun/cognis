@@ -16,6 +16,8 @@ from prometheus_client import Counter, Histogram
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cognis.core.agent_loop import (
+    CHAT_POLICY,
+    WORKFLOW_POLICY,
     AgentLoop,
     PauseWaiter,
     PendingPause,
@@ -39,6 +41,7 @@ from cognis.models.workflow import (
     StepOutput,
     Workflow,
     WorkflowState,
+    resolve_effective_input,
     resolve_source_names,
 )
 from cognis.store.queries import (
@@ -100,6 +103,7 @@ class WorkflowEngine:
         step_runtime_factory: Any = None,
         shared_tool_registry: Any = None,
         shared_executor_connection: Any = None,
+        session_cache: Any = None,
     ) -> None:
         self._session_factory = session_factory
         self._providers = providers
@@ -111,6 +115,7 @@ class WorkflowEngine:
         self._pause_waiter = pause_waiter
         self._step_runtime_factory = step_runtime_factory
         self._shared_tool_registry = shared_tool_registry
+        self._session_cache = session_cache
         self._shared_executor_connection = shared_executor_connection
 
     async def run_direct_turn(
@@ -144,6 +149,7 @@ class WorkflowEngine:
             session=session,
             conversation=conversation,
             agent=agent,
+            policy=CHAT_POLICY,
             is_direct=True,
             user_message=user_message,
             system_initiated=system_initiated,
@@ -444,6 +450,13 @@ class WorkflowEngine:
 
         from cognis.tools.builtin.orchestration import OrchestrationMode
 
+        # Load prior step context for injection into the LLM prompt.
+        # This replaces the former StepContextAssembler — the caller now
+        # resolves prior context and passes it to the unified assembler.
+        prior_context = await self._load_prior_step_context(
+            step_def, step_index, workflow.steps, state
+        )
+
         # Build step context — task steps can delegate (sync only)
         ctx = StepContext(
             step_definition=step_def,
@@ -455,9 +468,11 @@ class WorkflowEngine:
             task_description=task.description,
             task_expected_output=task.expected_output,
             step_run_id=step_run_id,
+            policy=WORKFLOW_POLICY,
             is_direct=False,
             is_retry=is_retry,
             user_message=step_def.prompt.replace("{user_message}", task.description or task.title),
+            prior_context=prior_context,
             interaction_mode=workflow.interaction.mode,
             tool_registry=tool_registry,
             executor_connection=executor_connection,
@@ -842,9 +857,7 @@ class WorkflowEngine:
             },
         )
 
-        # Record to target conversation's Intaris session.
-        # Prefer the latest active session (survives compaction) over the
-        # root_session_id which may point to a completed session.
+        # Record to target conversation's active Intaris session.
         try:
             async with self._session_factory() as db_session:
                 from cognis.store.queries import (
@@ -857,10 +870,9 @@ class WorkflowEngine:
                     db_session, target_conversation_id
                 )
                 if sess is None:
-                    # Fall back to root session
                     conv = await get_conversation(db_session, target_conversation_id)
-                    if conv and conv.root_session_id:
-                        sess = await get_session_row(db_session, conv.root_session_id)
+                    if conv and conv.active_session_id:
+                        sess = await get_session_row(db_session, conv.active_session_id)
 
                 if sess and sess.intaris_session_id:
                     await self._providers.guardrails.record_events(
@@ -947,6 +959,162 @@ class WorkflowEngine:
         if row is None:
             return TaskStatus.FAILED
         return TaskStatus(str(row.status))
+
+    async def _load_prior_step_context(
+        self,
+        step_def: StepDefinition,
+        step_index: int,
+        workflow_steps: list[StepDefinition],
+        state: WorkflowState,
+    ) -> list[dict[str, Any]] | None:
+        """Load prior step context for injection into the LLM prompt.
+
+        Resolves the step's input configuration and loads context from
+        the appropriate source.  Returns ``None`` for null input (first
+        step or explicit ``type="null"``).
+
+        Priority for ``type="full"``:
+          1. Session cache (warm — prior step just ran)
+          2. Intaris read (cold — mandatory, retry on failure)
+          3. step_outputs content (defensive — indicates recording failure)
+
+        ``type="last"`` reads directly from ``step_outputs`` (Cognis DB).
+        """
+        effective_input = resolve_effective_input(step_def, step_index, workflow_steps)
+        if effective_input.type == "null":
+            return None
+
+        if effective_input.type == "last":
+            messages: list[dict[str, Any]] = []
+            for source_name in effective_input.source_names():
+                raw = state.step_outputs.get(source_name)
+                if raw is None:
+                    continue
+                output = StepOutput.model_validate(raw)
+                claims_str = (
+                    "\n".join(f"  - {c}" for c in output.claims) if output.claims else "(none)"
+                )
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            f'<step_output source="{source_name}">\n'
+                            f"Summary: {output.summary}\n"
+                            f"Claims:\n{claims_str}\n"
+                            f"</step_output>"
+                        ),
+                    }
+                )
+            return messages or None
+
+        if effective_input.type == "full":
+            source_name = effective_input.single_source()
+            if source_name is None:
+                return None
+            return await self._load_full_step_context(source_name, state)
+
+        if effective_input.type == "summary":
+            # For summary mode, use step_outputs directly (summary + content
+            # are already there). LLM-based summarization can be added later.
+            messages = []
+            for source_name in effective_input.source_names():
+                raw = state.step_outputs.get(source_name)
+                if raw is None:
+                    continue
+                output = StepOutput.model_validate(raw)
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            f'<step_output source="{source_name}">\n'
+                            f"Summary: {output.summary}\n"
+                            f"</step_output>"
+                        ),
+                    }
+                )
+            return messages or None
+
+        return None
+
+    async def _load_full_step_context(
+        self,
+        source_name: str,
+        state: WorkflowState,
+    ) -> list[dict[str, Any]]:
+        """Load full event history from a source step.
+
+        Priority:
+          1. Session cache (warm — prior step just ran)
+          2. Intaris read (mandatory, retry on failure)
+          3. step_outputs content (defensive fallback)
+        """
+        from cognis.core.context import events_to_messages
+
+        raw_output = state.step_outputs.get(source_name, {})
+
+        # 1. Try session cache
+        cognis_session_id = raw_output.get("session_id")
+        if cognis_session_id:
+            cache_entry = self._session_cache.get_entry(cognis_session_id)
+            if cache_entry is not None and cache_entry.initialized and cache_entry.events:
+                logger.info(
+                    "workflow: loaded prior step from session cache",
+                    extra={
+                        "extra_data": {
+                            "source_step": source_name,
+                            "event_count": len(cache_entry.events),
+                        }
+                    },
+                )
+                return events_to_messages(cache_entry.events)
+
+        # 2. Intaris read (mandatory — retry on failure)
+        intaris_session_id = raw_output.get("intaris_session_id")
+        if intaris_session_id:
+            for attempt in range(3):
+                try:
+                    event_read = await self._providers.guardrails.read_events(
+                        session_id=intaris_session_id,
+                        after_seq=0,
+                    )
+                    if event_read.events:
+                        logger.info(
+                            "workflow: loaded prior step from Intaris",
+                            extra={
+                                "extra_data": {
+                                    "source_step": source_name,
+                                    "event_count": len(event_read.events),
+                                }
+                            },
+                        )
+                        return events_to_messages(event_read.events)
+                    break  # Empty but no error — fall through to step_outputs
+                except Exception:
+                    if attempt == 2:
+                        logger.error(
+                            "workflow: Intaris read failed for prior step after retries",
+                            extra={"extra_data": {"source_step": source_name}},
+                            exc_info=True,
+                        )
+                    else:
+                        await asyncio.sleep(0.5 * (attempt + 1))
+
+        # 3. step_outputs content (defensive fallback)
+        content = raw_output.get("content", "") or raw_output.get("summary", "")
+        if content:
+            logger.warning(
+                "workflow: falling back to step_outputs for prior step context",
+                extra={"extra_data": {"source_step": source_name}},
+            )
+            return [
+                {"role": "system", "content": f"Output from step '{source_name}':\n\n{content}"}
+            ]
+
+        logger.warning(
+            "workflow: no prior step context available",
+            extra={"extra_data": {"source_step": source_name}},
+        )
+        return []
 
     async def _resolve_step_runtime(
         self,

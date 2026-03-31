@@ -2063,8 +2063,8 @@ async def _load_conversation_runtime(
         agent_model = AgentDefinition.model_validate(agent_to_response(agent_row).model_dump())
         conversation_model = _to_conversation_model(conversation_row)
 
-        if conversation_row.root_session_id is None:
-            # No root session at all — create one
+        if conversation_row.active_session_id is None:
+            # No session at all — create one
             intention = (
                 conversation_row.title
                 or agent_row.description
@@ -2079,10 +2079,10 @@ async def _load_conversation_runtime(
                 )
             except Exception as exc:
                 raise SessionCreationFailedError("Could not create a session") from exc
-            conversation_model.root_session_id = root_session.session_id
+            conversation_model.active_session_id = root_session.session_id
             return conversation_model, root_session, agent_model
 
-        session_row = await get_session_row(session, conversation_row.root_session_id)
+        session_row = await get_session_row(session, conversation_row.active_session_id)
 
     if session_row is None:
         return None
@@ -2104,15 +2104,15 @@ async def _load_conversation_runtime(
                 conv_row_check = await get_conversation(db_session_check, conversation_id)
             if (
                 conv_row_check is not None
-                and conv_row_check.root_session_id != session_model.session_id
+                and conv_row_check.active_session_id != session_model.session_id
             ):
-                # Another tab already rotated — reload with new root
+                # Another tab already rotated — reload with new session
                 async with app.state.session_factory() as db_session_reload:
                     new_row = await get_session_row(
-                        db_session_reload, conv_row_check.root_session_id
+                        db_session_reload, conv_row_check.active_session_id
                     )
                 if new_row is not None:
-                    conversation_model.root_session_id = conv_row_check.root_session_id
+                    conversation_model.active_session_id = conv_row_check.active_session_id
                     return conversation_model, _to_session_model(new_row), agent_model
 
             compaction_summary = await _read_compaction_summary_from_session(app, session_model)
@@ -2132,7 +2132,7 @@ async def _load_conversation_runtime(
                 raise SessionCreationFailedError(
                     "Could not create session after compaction"
                 ) from exc
-            conversation_model.root_session_id = new_session.session_id
+            conversation_model.active_session_id = new_session.session_id
 
             # Pre-populate session cache with compaction summary.
             # compaction_seq=0 because the new session's Intaris event stream
