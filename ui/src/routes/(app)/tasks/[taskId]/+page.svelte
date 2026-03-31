@@ -5,28 +5,35 @@
 
   import { api, asApiError } from '$lib/api/client';
   import LoadingState from '$lib/components/LoadingState.svelte';
+  import SessionLogsDrawer from '$lib/components/tasks/SessionLogsDrawer.svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import Card from '$lib/components/ui/Card.svelte';
   import Input from '$lib/components/ui/Input.svelte';
   import { confirmAction } from '$lib/stores/confirm';
   import { addToast } from '$lib/stores/toasts';
-  import type { Agent, Conversation, Task, TaskDetail, Workflow } from '$lib/types/api';
+  import { renderMarkdown } from '$lib/markdown';
+  import { formatAbsoluteTime, formatRelativeTime } from '$lib/time';
+  import type { Agent, Conversation, StepRun, Task, TaskDetail, Workflow } from '$lib/types/api';
 
-  let loading = true;
-  let saving = false;
-  let error = '';
-  let task: TaskDetail | null = null;
-  let agents: Agent[] = [];
-  let workflows: Workflow[] = [];
-  let conversations: Conversation[] = [];
-  let allTasks: Task[] = [];
-  let dependencyTaskId = '';
-  let gateFeedback = '';
-  let stepResponse = '';
+  let loading = $state(true);
+  let saving = $state(false);
+  let error = $state('');
+  let task = $state<TaskDetail | null>(null);
+  let agents = $state<Agent[]>([]);
+  let workflows = $state<Workflow[]>([]);
+  let conversations = $state<Conversation[]>([]);
+  let allTasks = $state<Task[]>([]);
+  let dependencyTaskId = $state('');
+  let gateFeedback = $state('');
+  let stepResponse = $state('');
+  let expandedSteps = $state<Set<string>>(new Set());
   let pollTimer: number | null = null;
   let visibilityHandler: (() => void) | null = null;
 
-  let editForm = {
+  // Session logs drawer
+  let sessionDrawer = $state<{ conversationId: string; sessionId: string; stepName: string } | null>(null);
+
+  let editForm = $state({
     title: '',
     description: '',
     priority: 0,
@@ -34,6 +41,16 @@
     workflow_id: '',
     delivery_mode: 'same_conversation',
     delivery_target: ''
+  });
+
+  const statusColors: Record<string, string> = {
+    pending: 'border-slate-600 text-slate-400',
+    running: 'border-amber-700 text-amber-300',
+    approved: 'border-emerald-700 text-emerald-300',
+    completed: 'border-emerald-700 text-emerald-300',
+    failed: 'border-rose-700 text-rose-300',
+    cancelled: 'border-slate-600 text-slate-500',
+    paused: 'border-yellow-700 text-yellow-300',
   };
 
   function taskIdFromRoute(): string {
@@ -41,11 +58,53 @@
   }
 
   function workflowName(workflowId: string | null): string {
-    if (!workflowId) {
-      return 'auto';
-    }
-    return workflows.find((workflow) => workflow.workflow_id === workflowId)?.name ?? workflowId;
+    if (!workflowId) return 'auto';
+    return workflows.find((w) => w.workflow_id === workflowId)?.name ?? workflowId;
   }
+
+  function toggleStepExpand(stepRunId: string): void {
+    const next = new Set(expandedSteps);
+    if (next.has(stepRunId)) next.delete(stepRunId);
+    else next.add(stepRunId);
+    expandedSteps = next;
+  }
+
+  function stepOutputSummary(stepRun: StepRun): string {
+    const val = stepRun.output?.summary;
+    return typeof val === 'string' ? val : '';
+  }
+
+  function stepOutputContent(stepRun: StepRun): string {
+    const val = stepRun.output?.content;
+    return typeof val === 'string' ? val : '';
+  }
+
+  function stepOutputClaims(stepRun: StepRun): string[] {
+    const claims = stepRun.output?.claims;
+    return Array.isArray(claims) ? claims.filter((c): c is string => typeof c === 'string') : [];
+  }
+
+  function openSessionLogs(stepRun: StepRun): void {
+    const sessionId = String(stepRun.output?.session_id ?? stepRun.session_id ?? '');
+    if (!sessionId || !task) return;
+    // Step sessions each get their own conversation (title: "Task: X / Step: Y").
+    // Find it by matching the session_id in the conversation's sessions.
+    // Fall back to searching by task context ref, then to the session ID itself
+    // (the API will return 404 if invalid — the drawer handles this gracefully).
+    const conv = conversations.find((c) =>
+      c.context?.ref === task!.task_id && c.title?.includes(stepRun.step_name)
+    ) ?? conversations.find((c) => c.context?.ref === task!.task_id);
+    const conversationId = conv?.conversation_id ?? sessionId;
+    sessionDrawer = {
+      conversationId,
+      sessionId,
+      stepName: `${stepRun.step_name} (attempt ${stepRun.attempt})`
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Data loading
+  // ---------------------------------------------------------------------------
 
   async function loadTask(): Promise<void> {
     loading = true;
@@ -75,9 +134,7 @@
   }
 
   async function refreshTaskOnly(): Promise<void> {
-    if (document.hidden) {
-      return;
-    }
+    if (document.hidden) return;
     try {
       task = await api.tasks.detail(taskIdFromRoute());
     } catch (caughtError) {
@@ -86,26 +143,21 @@
   }
 
   function stopPolling(): void {
-    if (pollTimer !== null) {
-      window.clearInterval(pollTimer);
-      pollTimer = null;
-    }
+    if (pollTimer !== null) { window.clearInterval(pollTimer); pollTimer = null; }
   }
 
   function startPolling(): void {
     stopPolling();
-    if (document.hidden) {
-      return;
-    }
-    pollTimer = window.setInterval(() => {
-      void refreshTaskOnly();
-    }, 5000);
+    if (document.hidden) return;
+    pollTimer = window.setInterval(() => { void refreshTaskOnly(); }, 5000);
   }
 
+  // ---------------------------------------------------------------------------
+  // Task actions
+  // ---------------------------------------------------------------------------
+
   async function saveTask(): Promise<void> {
-    if (!task) {
-      return;
-    }
+    if (!task) return;
     saving = true;
     try {
       const updatedTask = await api.tasks.update(task.task_id, {
@@ -128,9 +180,7 @@
   }
 
   async function addDependency(): Promise<void> {
-    if (!task || !dependencyTaskId) {
-      return;
-    }
+    if (!task || !dependencyTaskId) return;
     try {
       await api.tasks.addDependency(task.task_id, dependencyTaskId, true);
       dependencyTaskId = '';
@@ -143,17 +193,13 @@
   }
 
   async function removeDependency(dependsOn: string): Promise<void> {
-    if (!task) {
-      return;
-    }
+    if (!task) return;
     const confirmed = await confirmAction({
       title: 'Remove dependency?',
       message: 'The task will no longer wait for this dependency before running.',
       confirmLabel: 'Remove dependency'
     });
-    if (!confirmed) {
-      return;
-    }
+    if (!confirmed) return;
     try {
       await api.tasks.removeDependency(task.task_id, dependsOn);
       task = await api.tasks.detail(task.task_id);
@@ -165,9 +211,7 @@
   }
 
   async function respondToGate(action: string): Promise<void> {
-    if (!task) {
-      return;
-    }
+    if (!task) return;
     try {
       await api.tasks.gateResponse(task.task_id, {
         step_name: task.pending_pause?.step_name,
@@ -182,9 +226,7 @@
   }
 
   async function respondToStepQuestion(response: string): Promise<void> {
-    if (!task) {
-      return;
-    }
+    if (!task) return;
     try {
       await api.tasks.stepResponse(task.task_id, {
         step_name: task.pending_pause?.step_name,
@@ -197,26 +239,20 @@
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Lifecycle
+  // ---------------------------------------------------------------------------
+
   onMount(() => {
     visibilityHandler = () => {
-      if (document.hidden) {
-        stopPolling();
-      } else {
-        void refreshTaskOnly();
-        startPolling();
-      }
+      if (document.hidden) stopPolling();
+      else { void refreshTaskOnly(); startPolling(); }
     };
     document.addEventListener('visibilitychange', visibilityHandler);
-
-    void loadTask().then(() => {
-      startPolling();
-    });
-
+    void loadTask().then(() => startPolling());
     return () => {
       stopPolling();
-      if (visibilityHandler) {
-        document.removeEventListener('visibilitychange', visibilityHandler);
-      }
+      if (visibilityHandler) document.removeEventListener('visibilitychange', visibilityHandler);
     };
   });
 </script>
@@ -246,6 +282,7 @@
 
     <div class="grid gap-5 xl:grid-cols-[minmax(0,1fr)_380px]">
       <div class="space-y-5">
+        <!-- Edit form -->
         <Card class="p-5">
           <div class="grid gap-4 md:grid-cols-2">
             <label class="space-y-2 text-sm font-medium text-slate-200">
@@ -284,11 +321,11 @@
             <label class="space-y-2 text-sm font-medium text-slate-200">
               <span>Delivery mode</span>
               <select bind:value={editForm.delivery_mode} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
-                <option value="same_conversation">same_conversation</option>
-                <option value="specific_conversation">specific_conversation</option>
-                <option value="latest_active_for_agent">latest_active_for_agent</option>
-                <option value="preferred_channel">preferred_channel</option>
-                <option value="silent">silent</option>
+                <option value="same_conversation">Same conversation</option>
+                <option value="specific_conversation">Specific conversation</option>
+                <option value="latest_active_for_agent">Latest active</option>
+                <option value="preferred_channel">Preferred channel</option>
+                <option value="silent">Silent</option>
               </select>
             </label>
             {#if editForm.delivery_mode === 'specific_conversation'}
@@ -305,10 +342,11 @@
           </div>
 
           <div class="mt-5 flex justify-end">
-            <Button disabled={saving} onclick={saveTask}>{saving ? 'Saving…' : 'Save task'}</Button>
+            <Button disabled={saving} onclick={saveTask}>{saving ? 'Saving...' : 'Save task'}</Button>
           </div>
         </Card>
 
+        <!-- Pending pause -->
         {#if task.pending_pause}
           <Card class="p-5">
             <div class="space-y-4">
@@ -342,6 +380,7 @@
           </Card>
         {/if}
 
+        <!-- Workflow progress -->
         <Card class="p-5">
           <div class="space-y-4">
             <div>
@@ -350,28 +389,104 @@
             </div>
 
             <div class="space-y-3">
-              {#each task.step_runs as stepRun}
+              {#each task.step_runs as stepRun (stepRun.step_run_id)}
+                {@const summary = stepOutputSummary(stepRun)}
+                {@const content = stepOutputContent(stepRun)}
+                {@const claims = stepOutputClaims(stepRun)}
+                {@const isExpanded = expandedSteps.has(stepRun.step_run_id)}
+
                 <article class="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
+                  <!-- Header -->
                   <div class="flex flex-wrap items-center justify-between gap-3">
                     <div>
                       <h3 class="font-semibold text-white">{stepRun.step_name}</h3>
-                      <p class="text-xs uppercase tracking-[0.2em] text-slate-500">{stepRun.step_type} · attempt {stepRun.attempt}</p>
+                      <p class="text-xs text-slate-500">
+                        {stepRun.step_type} · attempt {stepRun.attempt}
+                        {#if stepRun.completed_at}
+                          <span title={formatAbsoluteTime(stepRun.completed_at)}> · {formatRelativeTime(stepRun.completed_at)}</span>
+                        {/if}
+                      </p>
                     </div>
-                    <span class="rounded-full border border-slate-700 bg-slate-900 px-3 py-1 text-xs font-semibold uppercase tracking-[0.2em] text-slate-200">{stepRun.status}</span>
+                    <div class="flex items-center gap-2">
+                      {#if stepRun.output?.session_id || stepRun.session_id}
+                        <Button size="sm" variant="ghost" onclick={() => openSessionLogs(stepRun)}>Logs</Button>
+                      {/if}
+                      <span class="rounded-full border px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wider {statusColors[stepRun.status] ?? 'border-slate-600 text-slate-400'}">
+                        {stepRun.status}
+                      </span>
+                    </div>
                   </div>
-                  {#if stepRun.output}
-                    <pre class="mt-3 overflow-x-auto rounded-2xl border border-slate-800 bg-slate-950 p-4 text-xs text-slate-300">{JSON.stringify(stepRun.output, null, 2)}</pre>
+
+                  <!-- Summary -->
+                  {#if summary}
+                    <div class="prose prose-sm prose-invert mt-3 max-w-none text-slate-300">
+                      {@html renderMarkdown(summary)}
+                    </div>
                   {/if}
+
+                  <!-- Claims -->
+                  {#if claims.length > 0}
+                    <ul class="mt-3 space-y-1 text-sm text-slate-400">
+                      {#each claims as claim}
+                        <li class="flex items-start gap-2">
+                          <span class="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-slate-600"></span>
+                          <span>{claim}</span>
+                        </li>
+                      {/each}
+                    </ul>
+                  {/if}
+
+                  <!-- Content (collapsible) -->
+                  {#if content}
+                    {#if content.length > 300 && !isExpanded}
+                      <div class="prose prose-sm prose-invert mt-3 max-w-none text-slate-400">
+                        {@html renderMarkdown(content.slice(0, 300) + '...')}
+                      </div>
+                      <button class="mt-2 text-xs text-blue-400 hover:text-blue-300" onclick={() => toggleStepExpand(stepRun.step_run_id)}>
+                        Show full output
+                      </button>
+                    {:else if content.length > 300}
+                      <div class="prose prose-sm prose-invert mt-3 max-w-none text-slate-400">
+                        {@html renderMarkdown(content)}
+                      </div>
+                      <button class="mt-2 text-xs text-blue-400 hover:text-blue-300" onclick={() => toggleStepExpand(stepRun.step_run_id)}>
+                        Collapse
+                      </button>
+                    {:else}
+                      <div class="prose prose-sm prose-invert mt-3 max-w-none text-slate-400">
+                        {@html renderMarkdown(content)}
+                      </div>
+                    {/if}
+                  {/if}
+
+                  <!-- Evaluation -->
                   {#if stepRun.evaluation}
-                    <pre class="mt-3 overflow-x-auto rounded-2xl border border-slate-800 bg-slate-950 p-4 text-xs text-slate-300">{JSON.stringify(stepRun.evaluation, null, 2)}</pre>
+                    {@const evalDecision = String(stepRun.evaluation.decision ?? '')}
+                    {@const evalReasoning = String(stepRun.evaluation.reasoning ?? '')}
+                    <div class="mt-3 rounded-xl border border-slate-800 bg-slate-950/80 px-3 py-2">
+                      <p class="text-xs font-medium uppercase tracking-widest text-slate-500">Evaluation</p>
+                      <p class="mt-1 text-sm text-slate-300">
+                        <span class="font-medium {evalDecision === 'approve' ? 'text-emerald-400' : 'text-amber-400'}">
+                          {evalDecision}
+                        </span>
+                        {#if evalReasoning}
+                          — {evalReasoning}
+                        {/if}
+                      </p>
+                    </div>
                   {/if}
                 </article>
               {/each}
+
+              {#if task.step_runs.length === 0}
+                <p class="text-sm text-slate-400">No steps have been executed yet.</p>
+              {/if}
             </div>
           </div>
         </Card>
       </div>
 
+      <!-- Sidebar -->
       <div class="space-y-5">
         <Card class="p-5">
           <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Result</p>
@@ -387,7 +502,7 @@
             <div class="space-y-3">
               {#each task.dependencies as dependency}
                 <div class="flex items-center justify-between gap-3 rounded-2xl border border-slate-800 bg-slate-950/60 px-4 py-3">
-                  <span class="text-sm text-slate-200">{allTasks.find((candidate) => candidate.task_id === dependency.depends_on)?.title ?? dependency.depends_on}</span>
+                  <span class="text-sm text-slate-200">{allTasks.find((c) => c.task_id === dependency.depends_on)?.title ?? dependency.depends_on}</span>
                   <Button size="sm" variant="danger" onclick={() => removeDependency(dependency.depends_on)}>Remove</Button>
                 </div>
               {/each}
@@ -398,8 +513,8 @@
 
             <div class="space-y-3 border-t border-slate-800 pt-4">
               <select bind:value={dependencyTaskId} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
-                <option value="">Add dependency…</option>
-                {#each allTasks.filter((candidate) => candidate.task_id !== taskIdFromRoute()) as candidate}
+                <option value="">Add dependency...</option>
+                {#each allTasks.filter((c) => c.task_id !== taskIdFromRoute()) as candidate}
                   <option value={candidate.task_id}>{candidate.title}</option>
                 {/each}
               </select>
@@ -410,6 +525,16 @@
       </div>
     </div>
   </section>
+
+  <!-- Session logs drawer -->
+  {#if sessionDrawer}
+    <SessionLogsDrawer
+      conversationId={sessionDrawer.conversationId}
+      sessionId={sessionDrawer.sessionId}
+      stepName={sessionDrawer.stepName}
+      onclose={() => (sessionDrawer = null)}
+    />
+  {/if}
 {:else}
   <p class="rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-100">Task not found.</p>
 {/if}

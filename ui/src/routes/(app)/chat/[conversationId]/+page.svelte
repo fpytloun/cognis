@@ -342,6 +342,8 @@
   function persistSelectedChannel(): void {
     if (typeof window === 'undefined') return;
     window.localStorage.setItem('cognis-chat-selected-channel', selectedChannel);
+    // Re-fetch conversations so the filter applies to the full dataset
+    void loadConversationPage(true);
   }
 
   function restoreSelectedChannel(): void {

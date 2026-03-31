@@ -126,6 +126,10 @@ class StepContextAssembler:
         # --- 3. Step prompt ---
         messages.append({"role": "user", "content": step_prompt})
 
+        # Recount tokens to include step input messages and step prompt
+        # (base_result.prompt_tokens only covers the base context).
+        total_prompt_tokens = self.llm.count_messages_tokens(messages, base_result.resolved_model)
+
         return ContextAssemblyResult(
             messages=messages,
             degraded=base_result.degraded,
@@ -133,7 +137,7 @@ class StepContextAssembler:
             resolved_model=base_result.resolved_model,
             static_tokens=base_result.static_tokens,
             dynamic_tokens=base_result.dynamic_tokens,
-            prompt_tokens=base_result.prompt_tokens,
+            prompt_tokens=total_prompt_tokens,
             recommend_compaction=base_result.recommend_compaction,
         )
 

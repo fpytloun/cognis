@@ -5,6 +5,7 @@
   import { api, asApiError } from '$lib/api/client';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import TaskCard from '$lib/components/tasks/TaskCard.svelte';
+  import CreateTaskModal from '$lib/components/tasks/CreateTaskModal.svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import Card from '$lib/components/ui/Card.svelte';
   import Input from '$lib/components/ui/Input.svelte';
@@ -15,7 +16,7 @@
   import type { Agent, Conversation, Task, Workflow } from '$lib/types/api';
 
   // ---------------------------------------------------------------------------
-  // Reactive state (Svelte 5 runes)
+  // Reactive state
   // ---------------------------------------------------------------------------
 
   let loading = $state(true);
@@ -25,9 +26,16 @@
   let agents = $state<Agent[]>([]);
   let workflows = $state<Workflow[]>([]);
   let conversations = $state<Conversation[]>([]);
-  let selectedDraftIds = $state<string[]>([]);
+  let showCreateModal = $state(false);
+
+  // Multi-select
+  let selectedIds = $state<Set<string>>(new Set());
+  let lastClickedId = $state<string | null>(null);
+
+  // Drag state
   let dragState = $state<{ taskId: string; column: TaskBoardColumnId } | null>(null);
   let dropTargetColumn = $state<TaskBoardColumnId | null>(null);
+
   let pollTimer: number | null = null;
   let visibilityHandler: (() => void) | null = null;
 
@@ -38,41 +46,37 @@
     status: ''
   });
 
-  let draftForm = $state({
-    title: '',
-    description: '',
-    agent_id: '',
-    workflow_id: '',
-    priority: 0,
-    delivery_mode: 'same_conversation',
-    delivery_target: ''
-  });
-
   // ---------------------------------------------------------------------------
   // Derived state
   // ---------------------------------------------------------------------------
 
   let filtersActive = $derived(Boolean(filters.search || filters.agentId || filters.workflowId || filters.status));
-
   let filteredTasks = $derived(sortTasks(tasks.filter((task) => matchesTaskFilters(task, filters))));
+  let selectedCount = $derived(selectedIds.size);
+
+  // Bulk action counts
+  let submitCount = $derived([...selectedIds].filter((id) => tasks.find((t) => t.task_id === id)?.status === 'draft').length);
+  let cancelCount = $derived([...selectedIds].filter((id) => {
+    const s = tasks.find((t) => t.task_id === id)?.status;
+    return s && ['queued', 'ready', 'running', 'paused', 'draft'].includes(s);
+  }).length);
+  let deleteCount = $derived([...selectedIds].filter((id) => {
+    const s = tasks.find((t) => t.task_id === id)?.status;
+    return s && ['draft', 'completed', 'failed', 'cancelled'].includes(s);
+  }).length);
 
   // ---------------------------------------------------------------------------
-  // Valid cross-column drag transitions
+  // Drag transitions
   // ---------------------------------------------------------------------------
 
-  /**
-   * Maps `sourceColumn->targetColumn` to the API action to execute.
-   * Missing entries mean the transition is not allowed.
-   */
   const DRAG_TRANSITIONS: Record<string, 'submit' | 'pause' | 'resume' | 'cancel'> = {
     'draft->queued': 'submit',
     'running->paused': 'pause',
     'paused->queued': 'resume',
-    // Any column -> done is cancel (handled separately below)
   };
 
   function isDragTransitionValid(source: TaskBoardColumnId, target: TaskBoardColumnId): boolean {
-    if (source === target) return true; // reorder within column
+    if (source === target) return true;
     if (target === 'done') return source !== 'done';
     return `${source}->${target}` in DRAG_TRANSITIONS;
   }
@@ -87,18 +91,12 @@
   }
 
   function workflowName(workflowId: string | null): string {
-    if (!workflowId) {
-      return 'auto';
-    }
-    return workflows.find((workflow) => workflow.workflow_id === workflowId)?.name ?? workflowId;
+    if (!workflowId) return 'auto';
+    return workflows.find((w) => w.workflow_id === workflowId)?.name ?? workflowId;
   }
 
   function tasksForColumn(columnId: TaskBoardColumnId): Task[] {
     return filteredTasks.filter((task) => boardColumnForStatus(task.status) === columnId);
-  }
-
-  function defaultAgentId(): string {
-    return agents.find((agent) => agent.status === 'active')?.agent_id ?? agents[0]?.agent_id ?? '';
   }
 
   // ---------------------------------------------------------------------------
@@ -115,8 +113,6 @@
         api.workflows.listAll(),
         api.conversations.listAll()
       ]);
-      draftForm.agent_id = draftForm.agent_id || defaultAgentId();
-      draftForm.workflow_id = draftForm.workflow_id || workflows[0]?.workflow_id || '';
     } catch (caughtError) {
       error = asApiError(caughtError).message;
     } finally {
@@ -125,9 +121,7 @@
   }
 
   async function refreshTasksOnly(): Promise<void> {
-    if (document.hidden) {
-      return;
-    }
+    if (document.hidden) return;
     try {
       tasks = await api.tasks.listAll();
     } catch (caughtError) {
@@ -136,51 +130,25 @@
   }
 
   function stopPolling(): void {
-    if (pollTimer !== null) {
-      window.clearInterval(pollTimer);
-      pollTimer = null;
-    }
+    if (pollTimer !== null) { window.clearInterval(pollTimer); pollTimer = null; }
   }
 
   function startPolling(): void {
     stopPolling();
-    if (document.hidden) {
-      return;
-    }
-    pollTimer = window.setInterval(() => {
-      void refreshTasksOnly();
-    }, 15000);
+    if (document.hidden) return;
+    pollTimer = window.setInterval(() => { void refreshTasksOnly(); }, 15000);
   }
 
   // ---------------------------------------------------------------------------
   // Task actions
   // ---------------------------------------------------------------------------
 
-  async function createDraftTask(): Promise<void> {
-    if (!draftForm.title.trim()) {
-      error = 'Task title is required.';
-      return;
-    }
-    if (!draftForm.agent_id) {
-      error = 'Select an agent for the task.';
-      return;
-    }
+  async function handleCreateTask(form: Parameters<typeof api.tasks.create>[0]): Promise<void> {
     creating = true;
     error = '';
     try {
-      await api.tasks.create({
-        agent_id: draftForm.agent_id,
-        title: draftForm.title,
-        description: draftForm.description,
-        workflow_id: draftForm.workflow_id || null,
-        priority: Number(draftForm.priority),
-        delivery_mode: draftForm.delivery_mode,
-        delivery_target: draftForm.delivery_mode === 'specific_conversation' ? draftForm.delivery_target : null,
-        status: 'draft'
-      });
-      draftForm.title = '';
-      draftForm.description = '';
-      draftForm.delivery_target = '';
+      await api.tasks.create(form);
+      showCreateModal = false;
       await refreshTasksOnly();
       addToast('Draft task created.', 'success');
     } catch (caughtError) {
@@ -191,29 +159,6 @@
     }
   }
 
-  function toggleDraftSelection(taskId: string): void {
-    if (selectedDraftIds.includes(taskId)) {
-      selectedDraftIds = selectedDraftIds.filter((value) => value !== taskId);
-    } else {
-      selectedDraftIds = [...selectedDraftIds, taskId];
-    }
-  }
-
-  async function batchSubmit(): Promise<void> {
-    if (selectedDraftIds.length === 0) {
-      return;
-    }
-    try {
-      await api.tasks.batchSubmit(selectedDraftIds);
-      selectedDraftIds = [];
-      await refreshTasksOnly();
-      addToast('Selected drafts submitted.', 'success');
-    } catch (caughtError) {
-      error = asApiError(caughtError).message;
-      addToast(error, 'error', 4_000, 'Unable to submit drafts');
-    }
-  }
-
   async function changeTaskState(taskId: string, action: 'submit' | 'pause' | 'resume' | 'cancel'): Promise<void> {
     if (action === 'cancel') {
       const confirmed = await confirmAction({
@@ -221,20 +166,13 @@
         message: 'This stops the task and marks it as cancelled.',
         confirmLabel: 'Cancel task'
       });
-      if (!confirmed) {
-        return;
-      }
+      if (!confirmed) return;
     }
     try {
-      if (action === 'submit') {
-        await api.tasks.submit(taskId);
-      } else if (action === 'pause') {
-        await api.tasks.pause(taskId);
-      } else if (action === 'resume') {
-        await api.tasks.resume(taskId);
-      } else {
-        await api.tasks.cancel(taskId);
-      }
+      if (action === 'submit') await api.tasks.submit(taskId);
+      else if (action === 'pause') await api.tasks.pause(taskId);
+      else if (action === 'resume') await api.tasks.resume(taskId);
+      else await api.tasks.cancel(taskId);
       await refreshTasksOnly();
       addToast(`Task ${action} completed.`, 'success');
     } catch (caughtError) {
@@ -244,30 +182,123 @@
   }
 
   // ---------------------------------------------------------------------------
+  // Bulk actions
+  // ---------------------------------------------------------------------------
+
+  async function bulkSubmit(): Promise<void> {
+    const ids = [...selectedIds].filter((id) => tasks.find((t) => t.task_id === id)?.status === 'draft');
+    if (ids.length === 0) return;
+    try {
+      await api.tasks.batchSubmit(ids);
+      selectedIds = new Set();
+      await refreshTasksOnly();
+      addToast(`${ids.length} task(s) submitted.`, 'success');
+    } catch (caughtError) {
+      error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to submit tasks');
+    }
+  }
+
+  async function bulkCancel(): Promise<void> {
+    const ids = [...selectedIds].filter((id) => {
+      const s = tasks.find((t) => t.task_id === id)?.status;
+      return s && ['queued', 'ready', 'running', 'paused', 'draft'].includes(s);
+    });
+    if (ids.length === 0) return;
+    const confirmed = await confirmAction({
+      title: `Cancel ${ids.length} task(s)?`,
+      message: 'This stops the selected tasks and marks them as cancelled.',
+      confirmLabel: 'Cancel tasks'
+    });
+    if (!confirmed) return;
+    try {
+      await Promise.all(ids.map((id) => api.tasks.cancel(id)));
+      selectedIds = new Set();
+      await refreshTasksOnly();
+      addToast(`${ids.length} task(s) cancelled.`, 'success');
+    } catch (caughtError) {
+      error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to cancel tasks');
+    }
+  }
+
+  async function bulkDelete(): Promise<void> {
+    const ids = [...selectedIds].filter((id) => {
+      const s = tasks.find((t) => t.task_id === id)?.status;
+      return s && ['draft', 'completed', 'failed', 'cancelled'].includes(s);
+    });
+    if (ids.length === 0) return;
+    const confirmed = await confirmAction({
+      title: `Delete ${ids.length} task(s)?`,
+      message: 'This permanently removes the selected tasks.',
+      confirmLabel: 'Delete tasks'
+    });
+    if (!confirmed) return;
+    try {
+      await Promise.all(ids.map((id) => api.tasks.remove(id)));
+      selectedIds = new Set();
+      await refreshTasksOnly();
+      addToast(`${ids.length} task(s) deleted.`, 'success');
+    } catch (caughtError) {
+      error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to delete tasks');
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Multi-select
+  // ---------------------------------------------------------------------------
+
+  function handleCardClick(event: MouseEvent, taskId: string, columnId: TaskBoardColumnId): void {
+    if (event.metaKey || event.ctrlKey) {
+      if (event.shiftKey && lastClickedId) {
+        // Range select within column
+        const columnTasks = tasksForColumn(columnId);
+        const lastIdx = columnTasks.findIndex((t) => t.task_id === lastClickedId);
+        const curIdx = columnTasks.findIndex((t) => t.task_id === taskId);
+        if (lastIdx >= 0 && curIdx >= 0) {
+          const start = Math.min(lastIdx, curIdx);
+          const end = Math.max(lastIdx, curIdx);
+          const next = new Set(selectedIds);
+          for (let i = start; i <= end; i++) {
+            next.add(columnTasks[i].task_id);
+          }
+          selectedIds = next;
+        }
+      } else {
+        // Toggle single
+        const next = new Set(selectedIds);
+        if (next.has(taskId)) next.delete(taskId);
+        else next.add(taskId);
+        selectedIds = next;
+      }
+    } else {
+      // Plain click — select only this one
+      selectedIds = new Set([taskId]);
+    }
+    lastClickedId = taskId;
+  }
+
+  // ---------------------------------------------------------------------------
   // Drag-and-drop
   // ---------------------------------------------------------------------------
 
   async function handleColumnDrop(targetColumnId: TaskBoardColumnId, targetTaskId?: string): Promise<void> {
     dropTargetColumn = null;
     if (!dragState) return;
-
     const { taskId: sourceTaskId, column: sourceColumnId } = dragState;
     dragState = null;
 
     if (sourceColumnId === targetColumnId && targetTaskId) {
-      // Reorder within same column
       await reorderWithinColumn(targetTaskId, targetColumnId, sourceTaskId);
       return;
     }
+    if (sourceColumnId === targetColumnId) return;
 
-    if (sourceColumnId === targetColumnId) return; // dropped on same column container — noop
-
-    // Cross-column transition
     if (targetColumnId === 'done') {
       await changeTaskState(sourceTaskId, 'cancel');
       return;
     }
-
     const key = `${sourceColumnId}->${targetColumnId}`;
     const action = DRAG_TRANSITIONS[key];
     if (action) {
@@ -278,52 +309,26 @@
   }
 
   async function reorderWithinColumn(targetTaskId: string, columnId: TaskBoardColumnId, sourceTaskId: string): Promise<void> {
-    if (filtersActive) {
-      error = 'Clear active filters before reordering priorities.';
-      return;
-    }
-    if (!sourceTaskId || sourceTaskId === targetTaskId) {
-      return;
-    }
-
+    if (filtersActive || !sourceTaskId || sourceTaskId === targetTaskId) return;
     const previousTasks = [...tasks];
     const columnTasks = tasksForColumn(columnId);
-    const sourceIndex = columnTasks.findIndex((task) => task.task_id === sourceTaskId);
-    const targetIndex = columnTasks.findIndex((task) => task.task_id === targetTaskId);
-    if (sourceIndex < 0 || targetIndex < 0) {
-      return;
-    }
+    const sourceIndex = columnTasks.findIndex((t) => t.task_id === sourceTaskId);
+    const targetIndex = columnTasks.findIndex((t) => t.task_id === targetTaskId);
+    if (sourceIndex < 0 || targetIndex < 0) return;
 
     const reordered = [...columnTasks];
     const [moved] = reordered.splice(sourceIndex, 1);
     reordered.splice(targetIndex, 0, moved);
-
-    const updated = reordered.map((task, index) => ({
-      ...task,
-      priority: reordered.length - index
-    }));
-
-    tasks = tasks.map((task) => updated.find((candidate) => candidate.task_id === task.task_id) ?? task);
+    const updated = reordered.map((task, i) => ({ ...task, priority: reordered.length - i }));
+    tasks = tasks.map((task) => updated.find((c) => c.task_id === task.task_id) ?? task);
 
     try {
-      await Promise.all(
-        updated.map((task) => api.tasks.update(task.task_id, { priority: task.priority }))
-      );
+      await Promise.all(updated.map((t) => api.tasks.update(t.task_id, { priority: t.priority })));
       await refreshTasksOnly();
     } catch (caughtError) {
       tasks = previousTasks;
       error = asApiError(caughtError).message;
     }
-  }
-
-  async function moveTaskByOffset(taskId: string, columnId: TaskBoardColumnId, offset: -1 | 1): Promise<void> {
-    const columnTasks = tasksForColumn(columnId);
-    const currentIndex = columnTasks.findIndex((task) => task.task_id === taskId);
-    const target = columnTasks[currentIndex + offset];
-    if (currentIndex < 0 || !target) {
-      return;
-    }
-    await reorderWithinColumn(target.task_id, columnId, taskId);
   }
 
   // ---------------------------------------------------------------------------
@@ -332,24 +337,14 @@
 
   onMount(() => {
     visibilityHandler = () => {
-      if (document.hidden) {
-        stopPolling();
-      } else {
-        void refreshTasksOnly();
-        startPolling();
-      }
+      if (document.hidden) stopPolling();
+      else { void refreshTasksOnly(); startPolling(); }
     };
     document.addEventListener('visibilitychange', visibilityHandler);
-
-    void loadBoardData().then(() => {
-      startPolling();
-    });
-
+    void loadBoardData().then(() => startPolling());
     return () => {
       stopPolling();
-      if (visibilityHandler) {
-        document.removeEventListener('visibilitychange', visibilityHandler);
-      }
+      if (visibilityHandler) document.removeEventListener('visibilitychange', visibilityHandler);
     };
   });
 </script>
@@ -385,7 +380,7 @@
         <p class="text-sm uppercase tracking-[0.25em] text-slate-400">Workflow queue</p>
         <h1 class="mt-1 text-2xl font-semibold text-white">Task board</h1>
       </div>
-      <Button disabled={selectedDraftIds.length === 0} onclick={batchSubmit}>Submit selected drafts</Button>
+      <Button onclick={() => (showCreateModal = true)}>Create task</Button>
     </div>
 
     {#if error}
@@ -440,7 +435,7 @@
       <div class="grid min-w-[1200px] gap-4 xl:grid-cols-5">
       {#each TASK_BOARD_COLUMNS as column}
         <section
-          class="flex min-h-[720px] flex-col rounded-3xl border p-4 shadow-card transition-colors {dropTargetColumn === column.id && dragState && dragState.column !== column.id ? 'border-blue-500/50 bg-blue-950/20' : 'border-slate-800/80 bg-slate-900/70'}"
+          class="flex min-h-[600px] flex-col rounded-3xl border p-4 shadow-card transition-colors {dropTargetColumn === column.id && dragState && dragState.column !== column.id ? 'border-blue-500/50 bg-blue-950/20' : 'border-slate-800/80 bg-slate-900/70'}"
           ondragover={(event: DragEvent) => {
             if (dragState && isDragTransitionValid(dragState.column, column.id)) {
               event.preventDefault();
@@ -456,77 +451,27 @@
           ondrop={() => handleColumnDrop(column.id)}
           aria-label={column.label}
         >
-          <div class="mb-4 flex items-center justify-between gap-2">
+          <div class="mb-3 flex items-center justify-between gap-2">
             <div>
               <p class="text-sm font-semibold text-white">{column.label}</p>
               <p class="text-xs uppercase tracking-[0.2em] text-slate-500">{tasksForColumn(column.id).length} items</p>
             </div>
           </div>
 
-          {#if column.id === 'draft'}
-            <Card class="mb-4 p-4">
-              <div class="space-y-3">
-                <Input bind:value={draftForm.title} placeholder="New task title" />
-                <textarea bind:value={draftForm.description} class="min-h-[110px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500" placeholder="Describe the work item"></textarea>
-                <div class="grid gap-3">
-                  <select bind:value={draftForm.agent_id} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
-                    {#each agents as agent}
-                      <option value={agent.agent_id}>{agent.display_name ?? agent.name}</option>
-                    {/each}
-                  </select>
-                  <select bind:value={draftForm.workflow_id} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
-                    <option value="">Auto workflow</option>
-                    {#each workflows as workflow}
-                      <option value={workflow.workflow_id}>{workflow.name}</option>
-                    {/each}
-                  </select>
-                  <Input bind:value={draftForm.priority} type="number" />
-                  <select bind:value={draftForm.delivery_mode} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
-                    <option value="same_conversation">same_conversation</option>
-                    <option value="specific_conversation">specific_conversation</option>
-                    <option value="latest_active_for_agent">latest_active_for_agent</option>
-                    <option value="preferred_channel">preferred_channel</option>
-                    <option value="silent">silent</option>
-                  </select>
-                  {#if draftForm.delivery_mode === 'specific_conversation'}
-                    <select bind:value={draftForm.delivery_target} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
-                      <option value="">Select conversation</option>
-                      {#each conversations as conversation}
-                        <option value={conversation.conversation_id}>{conversation.title ?? conversation.conversation_id}</option>
-                      {/each}
-                    </select>
-                  {/if}
-                </div>
-                <Button class="w-full justify-center" disabled={!draftForm.title.trim() || creating} onclick={createDraftTask}>
-                  {creating ? 'Creating…' : 'Create draft'}
-                </Button>
-              </div>
-            </Card>
-          {/if}
-
-          <div class="flex-1 space-y-4 overflow-y-auto">
+          <div class="flex-1 space-y-2 overflow-y-auto">
             {#each tasksForColumn(column.id) as task (task.task_id)}
               <div
-                aria-label={`Reorder task ${task.title}`}
                 draggable={!filtersActive}
                 ondragstart={() => (dragState = { taskId: task.task_id, column: column.id })}
                 ondragend={() => { dragState = null; dropTargetColumn = null; }}
                 ondragover={(event: DragEvent) => event.preventDefault()}
                 ondrop={(event: DragEvent) => { event.stopPropagation(); handleColumnDrop(column.id, task.task_id); }}
-                role="listitem"
               >
                 <TaskCard
-                  task={task}
+                  {task}
                   workflowName={workflowName(task.workflow_id)}
-                  selected={selectedDraftIds.includes(task.task_id)}
-                  onOpen={() => goto(`/tasks/${task.task_id}`)}
-                  onSelect={column.id === 'draft' ? () => toggleDraftSelection(task.task_id) : null}
-                  onSubmit={task.status === 'draft' ? () => changeTaskState(task.task_id, 'submit') : null}
-                  onPause={task.status === 'running' ? () => changeTaskState(task.task_id, 'pause') : null}
-                  onResume={task.status === 'paused' ? () => changeTaskState(task.task_id, 'resume') : null}
-                  onCancel={['queued', 'ready', 'running', 'paused', 'draft'].includes(task.status) ? () => changeTaskState(task.task_id, 'cancel') : null}
-                  onMoveUp={!filtersActive ? () => moveTaskByOffset(task.task_id, column.id, -1) : null}
-                  onMoveDown={!filtersActive ? () => moveTaskByOffset(task.task_id, column.id, 1) : null}
+                  selected={selectedIds.has(task.task_id)}
+                  onclick={(event) => handleCardClick(event, task.task_id, column.id)}
                 />
               </div>
             {/each}
@@ -536,4 +481,36 @@
       </div>
     </div>
   </section>
+
+  <!-- Bulk action bar -->
+  {#if selectedCount > 0}
+    <div class="fixed inset-x-0 bottom-6 z-40 flex justify-center">
+      <div class="flex items-center gap-3 rounded-2xl border border-slate-700 bg-slate-900/95 px-5 py-3 shadow-2xl backdrop-blur-sm">
+        <span class="text-sm font-medium text-slate-200">{selectedCount} selected</span>
+        <div class="h-5 w-px bg-slate-700"></div>
+        {#if submitCount > 0}
+          <Button size="sm" onclick={bulkSubmit}>Submit ({submitCount})</Button>
+        {/if}
+        {#if cancelCount > 0}
+          <Button size="sm" variant="danger" onclick={bulkCancel}>Cancel ({cancelCount})</Button>
+        {/if}
+        {#if deleteCount > 0}
+          <Button size="sm" variant="danger" onclick={bulkDelete}>Delete ({deleteCount})</Button>
+        {/if}
+        <Button size="sm" variant="secondary" onclick={() => (selectedIds = new Set())}>Clear</Button>
+      </div>
+    </div>
+  {/if}
+
+  <!-- Create task modal -->
+  {#if showCreateModal}
+    <CreateTaskModal
+      {agents}
+      {workflows}
+      {conversations}
+      {creating}
+      onclose={() => (showCreateModal = false)}
+      oncreate={handleCreateTask}
+    />
+  {/if}
 {/if}

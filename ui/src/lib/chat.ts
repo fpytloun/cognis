@@ -452,13 +452,17 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
     const taskId = event.child_session_id;
     const itemId = `delegation:${taskId}`;
     const index = next.findIndex((item) => item.id === itemId && item.kind === 'delegation');
+    const progressText =
+      event.type === 'delegation_progress' && 'progress' in event && typeof event.progress === 'string'
+        ? event.progress
+        : null;
     const delegation: DelegationTimelineItem = {
       id: itemId,
       kind: 'delegation',
       taskId,
       taskLabel: 'task' in event && typeof event.task === 'string' ? event.task : 'Background task',
       status: event.type === 'delegation_started' ? 'started' : 'running',
-      result: null,
+      result: progressText,
       timestamp: new Date().toISOString()
     };
     if (index >= 0) {
@@ -529,6 +533,29 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
       return next;
     }
     next.push(delegation);
+    return next;
+  }
+
+  if (event.type === 'workflow_step_started' || event.type === 'workflow_step_completed') {
+    const taskId = event.task_id;
+    const stepName = 'step_name' in event && typeof event.step_name === 'string' ? event.step_name : '';
+    // Delegation cards may be keyed by child_session_id or task_id — search both
+    let index = next.findIndex((item) => item.id === `delegation:${taskId}` && item.kind === 'delegation');
+    if (index < 0) {
+      index = next.findIndex((item) => item.kind === 'delegation' && (item as DelegationTimelineItem).taskId === taskId);
+    }
+    if (index >= 0) {
+      const existing = next[index] as DelegationTimelineItem;
+      next[index] = {
+        ...existing,
+        status: 'running',
+        result:
+          event.type === 'workflow_step_started'
+            ? `Running step: ${stepName}`
+            : `Completed step: ${stepName}`,
+      };
+      return next;
+    }
     return next;
   }
 

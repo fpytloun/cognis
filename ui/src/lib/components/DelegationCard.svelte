@@ -33,7 +33,12 @@
     </div>
   </div>
 
-  {#if item.result}
+  {#if item.status === 'started' || item.status === 'running'}
+    <div class="mt-3 flex items-center gap-2 text-xs opacity-75">
+      <span class="h-2 w-2 animate-pulse rounded-full bg-current"></span>
+      <span>{item.result ?? 'Working...'}</span>
+    </div>
+  {:else if item.result}
     <p class="mt-3 text-sm leading-6 opacity-90">{item.result}</p>
   {/if}
 

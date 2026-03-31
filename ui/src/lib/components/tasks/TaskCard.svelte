@@ -1,93 +1,55 @@
 <script lang="ts">
-  import Button from '$lib/components/ui/Button.svelte';
   import type { Task } from '$lib/types/api';
 
   let {
     task,
     workflowName,
     selected = false,
-    draggable = false,
-    onOpen,
-    onSubmit,
-    onPause,
-    onResume,
-    onCancel,
-    onSelect,
-    onMoveUp,
-    onMoveDown
+    onclick
   } = $props<{
     task: Task;
     workflowName: string;
     selected?: boolean;
-    draggable?: boolean;
-    onOpen: () => void;
-    onSubmit?: (() => void) | null;
-    onPause?: (() => void) | null;
-    onResume?: (() => void) | null;
-    onCancel?: (() => void) | null;
-    onSelect?: (() => void) | null;
-    onMoveUp?: (() => void) | null;
-    onMoveDown?: (() => void) | null;
+    onclick?: ((event: MouseEvent) => void) | null;
   }>();
+
+  const statusColors: Record<string, string> = {
+    draft: 'border-slate-600 text-slate-400',
+    queued: 'border-sky-700 text-sky-300',
+    ready: 'border-sky-700 text-sky-300',
+    running: 'border-amber-700 text-amber-300',
+    paused: 'border-yellow-700 text-yellow-300',
+    completed: 'border-emerald-700 text-emerald-300',
+    failed: 'border-rose-700 text-rose-300',
+    cancelled: 'border-slate-600 text-slate-500'
+  };
 </script>
 
-<article class="rounded-3xl border border-slate-800 bg-slate-950/70 p-4 shadow-card" {draggable}>
-  <div class="flex items-start justify-between gap-3">
-    <div>
-      <h3 class="text-sm font-semibold text-white">{task.title}</h3>
-      <p class="mt-1 text-xs uppercase tracking-[0.2em] text-slate-500">{task.agent_id}</p>
-    </div>
-    <span class="rounded-full border border-slate-700 bg-slate-900 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.2em] text-slate-200">
+<div
+  class="cursor-pointer rounded-2xl border p-3 transition-colors hover:bg-slate-800/40 {selected ? 'border-blue-500/60 bg-blue-950/20' : 'border-slate-800 bg-slate-950/70'}"
+  onclick={onclick}
+  role="button"
+  tabindex="0"
+  onkeydown={(e) => { if (e.key === 'Enter' && onclick) onclick(e as unknown as MouseEvent); }}
+>
+  <div class="flex items-start justify-between gap-2">
+    <a
+      href="/tasks/{task.task_id}"
+      class="text-sm font-medium text-white hover:text-blue-300 hover:underline"
+      onclick={(e) => e.stopPropagation()}
+    >
+      {task.title}
+    </a>
+    <span class="shrink-0 rounded-full border border-slate-700 bg-slate-900 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-slate-300">
       P{task.priority}
     </span>
   </div>
 
-  {#if task.description}
-    <p class="mt-3 text-sm leading-6 text-slate-300">{task.description}</p>
-  {/if}
-
-  {#if task.result_summary}
-    <p class="mt-3 rounded-2xl border border-slate-800 bg-slate-950 px-3 py-2 text-xs leading-6 text-slate-300">
-      {task.result_summary}
-    </p>
-  {/if}
-
-  <dl class="mt-4 grid gap-3 text-xs text-slate-400">
-    <div>
-      <dt class="uppercase tracking-[0.2em] text-slate-500">Workflow</dt>
-      <dd class="mt-1 text-slate-200">{workflowName}</dd>
-    </div>
-    <div>
-      <dt class="uppercase tracking-[0.2em] text-slate-500">Delivery</dt>
-      <dd class="mt-1 text-slate-200">{task.delivery.mode}</dd>
-    </div>
-  </dl>
-
-  <div class="mt-4 flex flex-wrap gap-2">
-    {#if onSelect}
-      <label class="flex items-center gap-2 rounded-xl border border-slate-700 px-3 py-2 text-xs text-slate-300">
-        <input checked={selected} type="checkbox" onchange={onSelect} />
-        Batch
-      </label>
-    {/if}
-    <Button size="sm" variant="secondary" onclick={onOpen}>Open</Button>
-    {#if onSubmit}
-      <Button size="sm" onclick={onSubmit}>Submit</Button>
-    {/if}
-    {#if onPause}
-      <Button size="sm" variant="secondary" onclick={onPause}>Pause</Button>
-    {/if}
-    {#if onResume}
-      <Button size="sm" onclick={onResume}>Resume</Button>
-    {/if}
-    {#if onCancel}
-      <Button size="sm" variant="danger" onclick={onCancel}>Cancel</Button>
-    {/if}
-    {#if onMoveUp}
-      <Button size="sm" variant="secondary" onclick={onMoveUp}>Move up</Button>
-    {/if}
-    {#if onMoveDown}
-      <Button size="sm" variant="secondary" onclick={onMoveDown}>Move down</Button>
-    {/if}
+  <div class="mt-2 flex flex-wrap items-center gap-2 text-[11px]">
+    <span class="rounded-full border px-2 py-0.5 {statusColors[task.status] ?? 'border-slate-600 text-slate-400'}">
+      {task.status}
+    </span>
+    <span class="text-slate-500">{task.agent_id}</span>
+    <span class="text-slate-600">{workflowName}</span>
   </div>
-</article>
+</div>
