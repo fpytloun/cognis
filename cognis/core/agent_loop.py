@@ -545,13 +545,19 @@ class AgentLoop:
             )
         except StepInterrupted:
             raise
-        except Exception:
+        except Exception as exc:
             logger.exception(
                 "Agent loop step failed",
                 extra={"extra_data": {"session_id": ctx.session.session_id}},
             )
             STEPS_TOTAL.labels(step_type=ctx.step_definition.type, status="error").inc()
-            return None
+            # Return a StepOutput with the error so it can be stored and
+            # displayed in the UI instead of silently returning None.
+            error_msg = f"{type(exc).__name__}: {exc}"
+            return StepOutput(
+                summary=f"Step failed: {type(exc).__name__}",
+                error=error_msg[:2000],
+            )
         finally:
             self.session_lock.release(ctx.session.session_id)
             duration = (datetime.now(UTC) - start_time).total_seconds()

@@ -473,18 +473,21 @@ class WorkflowEngine:
             output.session_id = session.session_id
             output.intaris_session_id = session.intaris_session_id
 
-        # Update StepRun record
+        # Update StepRun record — a StepOutput with error set is a failure
+        step_failed = output is None or output.error is not None
         async with self._session_factory() as db_session:
             await update_step_run(
                 db_session,
                 step_run_id,
-                status="approved" if output else "failed",
+                status="failed" if step_failed else "approved",
                 output=output.model_dump(mode="json") if output else None,
                 completed_at=datetime.now(UTC),
             )
             await db_session.commit()
 
-        return output
+        # Return None for failed steps so the workflow engine treats them
+        # as failures (retry logic, on_exhausted handling, etc.)
+        return None if step_failed else output
 
     async def _evaluate_step(
         self,

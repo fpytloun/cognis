@@ -168,12 +168,13 @@ class Workflow(BaseModel):
 
 
 class StepOutput(BaseModel):
-    """What a step produces when the agent calls step_complete."""
+    """What a step produces on completion (via step_complete) or failure (error is set)."""
 
     summary: str
     content: str = ""  # Full assistant output (for delegation result delivery)
     outputs: dict[str, Any] = {}
     claims: list[str] = []
+    error: str | None = None  # Set when the step failed with an exception
     completed_at: datetime | None = None
     session_id: str | None = None
     intaris_session_id: str | None = None

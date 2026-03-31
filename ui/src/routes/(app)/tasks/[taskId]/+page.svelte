@@ -87,6 +87,11 @@
     return Array.isArray(claims) ? claims.filter((c): c is string => typeof c === 'string') : [];
   }
 
+  function stepOutputError(stepRun: StepRun): string {
+    const val = stepRun.output?.error;
+    return typeof val === 'string' ? val : '';
+  }
+
   function openSessionLogs(stepRun: StepRun): void {
     const sessionId = String(stepRun.output?.session_id ?? stepRun.session_id ?? '');
     if (!sessionId || !task) return;
@@ -396,6 +401,7 @@
                 {@const summary = stepOutputSummary(stepRun)}
                 {@const content = stepOutputContent(stepRun)}
                 {@const claims = stepOutputClaims(stepRun)}
+                {@const stepError = stepOutputError(stepRun)}
                 {@const isExpanded = expandedSteps.has(stepRun.step_run_id)}
 
                 <article class="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
@@ -420,8 +426,16 @@
                     </div>
                   </div>
 
+                  <!-- Error -->
+                  {#if stepError}
+                    <div class="mt-3 rounded-xl border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-sm text-rose-200">
+                      <p class="font-medium">Error</p>
+                      <pre class="mt-1 whitespace-pre-wrap text-xs text-rose-300">{stepError}</pre>
+                    </div>
+                  {/if}
+
                   <!-- Summary -->
-                  {#if summary}
+                  {#if summary && !stepError}
                     <div class="prose prose-sm prose-invert mt-3 max-w-none text-slate-300">
                       {@html renderMarkdown(summary)}
                     </div>

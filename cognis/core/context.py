@@ -463,19 +463,15 @@ class ContextAssembler:
                 pruned_messages.pop(recalled_index)
                 continue
 
-            # Priority 2: Drop oldest non-protected messages (history)
-            removable_history_index = next(
-                (
-                    index
-                    for index, message in enumerate(pruned_messages)
-                    if index != len(pruned_messages) - 1
-                    and not _is_immutable_prefix_message(message, system_prompt)
-                ),
-                None,
-            )
-            if removable_history_index is None:
+            # Priority 2: Drop oldest non-protected messages (history).
+            # Tool call groups (assistant message with tool_calls + matching
+            # tool role responses) must be dropped atomically to avoid
+            # orphaned tool_calls that LLM providers reject.
+            indices_to_drop = _find_oldest_droppable_group(pruned_messages, system_prompt)
+            if not indices_to_drop:
                 break
-            pruned_messages.pop(removable_history_index)
+            for idx in sorted(indices_to_drop, reverse=True):
+                pruned_messages.pop(idx)
         return pruned_messages
 
 
@@ -647,8 +643,33 @@ def events_to_messages(events: list[Any]) -> list[dict[str, Any]]:
                         ),
                     }
                 )
-    # Flush any remaining buffered tool calls at the end of the event list
-    _flush_tool_calls()
+    # Flush any remaining buffered tool calls at the end of the event list.
+    # If these are orphaned (no matching tool_result events follow), they
+    # would create an invalid message sequence that LLM providers reject.
+    # We still flush them but add synthetic placeholder tool results so
+    # the message sequence is valid.
+    if pending_tool_calls:
+        _flush_tool_calls()
+        # The flushed assistant message is now the last (or near-last) in
+        # messages.  Check if any of its tool_call IDs lack a subsequent
+        # tool response and add placeholders.
+        for tc in (
+            messages[-1].get("tool_calls", [])
+            if messages and messages[-1].get("tool_calls")
+            else []
+        ):
+            tc_id = tc.get("id", "")
+            has_response = any(
+                m.get("role") == "tool" and m.get("tool_call_id") == tc_id for m in messages
+            )
+            if not has_response:
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc_id,
+                        "content": "[No result recorded — step may have been interrupted]",
+                    }
+                )
     return messages
 
 
@@ -696,6 +717,90 @@ def _format_search_results(search_results: Any) -> str | None:
         prefix = f"- ({score:.2f}) " if isinstance(score, (int, float)) else "- "
         lines.append(prefix + memory.strip())
     return "\n".join(lines) if lines else None
+
+
+def _find_oldest_droppable_group(
+    messages: list[dict[str, Any]],
+    system_prompt: str | None,
+) -> list[int]:
+    """Find the indices of the oldest droppable message group.
+
+    Tool call groups (an assistant message with ``tool_calls`` followed by
+    matching ``tool`` role responses) are treated atomically — all indices
+    in the group are returned so they can be dropped together.  Standalone
+    messages return a single-element list.
+
+    Returns an empty list when no droppable messages remain.
+    """
+    last_idx = len(messages) - 1
+    for i, msg in enumerate(messages):
+        if i == last_idx:
+            continue  # Never drop the last message (current user turn)
+        if _is_immutable_prefix_message(msg, system_prompt):
+            continue
+
+        # If this is an assistant message with tool_calls, collect the
+        # entire group (assistant + all matching tool responses).
+        # Never include the last message (current user turn) in a group.
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            call_ids = {tc.get("id") or tc.get("call_id", "") for tc in msg["tool_calls"]} - {""}
+            group = [i]
+            for j in range(i + 1, last_idx):
+                if (
+                    messages[j].get("role") == "tool"
+                    and messages[j].get("tool_call_id") in call_ids
+                ):
+                    group.append(j)
+            return group
+
+        # If this is a tool response, find its parent assistant message
+        # and drop the entire group from the parent.
+        if msg.get("role") == "tool":
+            target_id = msg.get("tool_call_id", "")
+            if not target_id:
+                return [i]  # Malformed — safe to drop individually
+            for k in range(i - 1, -1, -1):
+                parent = messages[k]
+                if parent.get("role") == "assistant" and parent.get("tool_calls"):
+                    parent_ids = {
+                        tc.get("id") or tc.get("call_id", "") for tc in parent["tool_calls"]
+                    } - {""}
+                    if target_id in parent_ids:
+                        group = [k]
+                        for j in range(k + 1, last_idx):
+                            if (
+                                messages[j].get("role") == "tool"
+                                and messages[j].get("tool_call_id") in parent_ids
+                            ):
+                                group.append(j)
+                        return group
+
+        # If this is a tool response, find its parent assistant message
+        # and drop the entire group from the parent.
+        if msg.get("role") == "tool":
+            target_id = msg.get("tool_call_id", "")
+            for k in range(i - 1, -1, -1):
+                parent = messages[k]
+                if parent.get("role") == "assistant" and parent.get("tool_calls"):
+                    parent_ids = {
+                        tc.get("id") or tc.get("call_id", "") for tc in parent["tool_calls"]
+                    }
+                    if target_id in parent_ids:
+                        group = [k]
+                        for j in range(k + 1, len(messages)):
+                            if (
+                                messages[j].get("role") == "tool"
+                                and messages[j].get("tool_call_id") in parent_ids
+                            ):
+                                group.append(j)
+                        return group
+            # Orphaned tool response — safe to drop individually
+            return [i]
+
+        # Standalone message (user, assistant without tool_calls, system)
+        return [i]
+
+    return []
 
 
 def _is_immutable_prefix_message(message: dict[str, Any], system_prompt: str | None) -> bool:

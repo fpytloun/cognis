@@ -302,14 +302,19 @@ def test_events_to_messages_handles_evaluation_feedback() -> None:
 
 def test_events_to_messages_handles_tool_call_with_name_field() -> None:
     """Tool calls recorded by agent_loop use 'name' not 'tool_name'."""
-    events = [{"type": "tool_call", "data": {"name": "filesystem/read_file", "call_id": "c1"}}]
+    events = [
+        {"type": "tool_call", "data": {"name": "filesystem/read_file", "call_id": "c1"}},
+        {"type": "tool_result", "data": {"call_id": "c1", "result": "file content"}},
+    ]
     messages = events_to_messages(events)
-    assert len(messages) == 1
+    assert len(messages) == 2
     assert messages[0]["role"] == "assistant"
     assert messages[0]["content"] is None
     assert len(messages[0]["tool_calls"]) == 1
     assert messages[0]["tool_calls"][0]["function"]["name"] == "filesystem/read_file"
     assert messages[0]["tool_calls"][0]["id"] == "c1"
+    assert messages[1]["role"] == "tool"
+    assert messages[1]["tool_call_id"] == "c1"
 
 
 def test_events_to_messages_groups_parallel_tool_calls() -> None:
@@ -363,13 +368,29 @@ def test_events_to_messages_tool_call_arguments_serialized() -> None:
             "type": "tool_call",
             "data": {"name": "edit", "call_id": "c1", "arguments": {"file": "a.py", "line": 42}},
         },
+        {"type": "tool_result", "data": {"call_id": "c1", "result": "ok"}},
     ]
     messages = events_to_messages(events)
-    assert len(messages) == 1
+    assert len(messages) == 2
     args = messages[0]["tool_calls"][0]["function"]["arguments"]
     assert isinstance(args, str)
     parsed = json.loads(args)
     assert parsed == {"file": "a.py", "line": 42}
+
+
+def test_events_to_messages_orphaned_tool_calls_get_placeholder() -> None:
+    """Orphaned tool_calls at end of event stream get synthetic tool results."""
+    events = [
+        {"type": "tool_call", "data": {"name": "search", "call_id": "c1"}},
+        # No matching tool_result — simulates interrupted step
+    ]
+    messages = events_to_messages(events)
+    assert len(messages) == 2
+    assert messages[0]["role"] == "assistant"
+    assert len(messages[0]["tool_calls"]) == 1
+    assert messages[1]["role"] == "tool"
+    assert messages[1]["tool_call_id"] == "c1"
+    assert "interrupted" in messages[1]["content"].lower()
 
 
 # ---------------------------------------------------------------------------
