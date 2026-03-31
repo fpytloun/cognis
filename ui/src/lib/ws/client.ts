@@ -156,7 +156,11 @@ class CognisWebSocketClient {
   }
 
   sendMessage(conversationId: string, content: string): void {
-    this.subscribeConversation(conversationId, this.subscriptions.get(conversationId) ?? 0);
+    // Only subscribe if not already subscribed — avoids sending a redundant
+    // reconnect frame before every message which triggers session_recovered.
+    if (!this.subscriptions.has(conversationId)) {
+      this.subscribeConversation(conversationId, 0);
+    }
     this.sendRaw({ type: 'message', conversation_id: conversationId, content });
   }
 

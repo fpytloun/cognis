@@ -377,10 +377,12 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
       next[index] = {
         ...existing,
         ...toolItem,
-        // Preserve result fields if already set
+        // Preserve fields from the original event when not provided by the update
+        arguments: toolItem.arguments ?? existing.arguments,
         result: existing.result,
         isError: existing.isError,
-        durationMs: existing.durationMs
+        durationMs: existing.durationMs,
+        evaluation: existing.evaluation
       };
       return next;
     }

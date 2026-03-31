@@ -39,7 +39,11 @@
     if (name.includes('grep') || name.includes('glob')) {
       if (typeof args.pattern === 'string') return truncate(args.pattern);
     }
-    // Web
+    // Web search
+    if (name.includes('websearch') || name === 'search') {
+      if (typeof args.query === 'string') return truncate(args.query);
+    }
+    // Web fetch / navigate
     if (name.includes('webfetch') || name.includes('navigate') || name.includes('fetch')) {
       if (typeof args.url === 'string') return truncate(args.url);
     }

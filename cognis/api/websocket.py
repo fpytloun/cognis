@@ -197,6 +197,7 @@ class AuthenticatedWebSocket:
     pending_sends: int = 0
     recent_message_times: deque[float] = field(default_factory=deque)
     dropped_chunks: dict[str, int] = field(default_factory=dict)
+    recovery_notified: set[str] = field(default_factory=set)
 
     async def send_json(self, payload: dict[str, Any]) -> None:
         """Send a WebSocket message with chunk backpressure handling."""
@@ -563,18 +564,6 @@ class WebSocketConnectionManager:
                 if evaluation:
                     payload["evaluation"] = evaluation
                 await self.send_to_conversation(conversation_id, payload)
-                # Also send a tool_call status update for completion
-                await self.send_to_conversation(
-                    conversation_id,
-                    {
-                        "type": "tool_call",
-                        "conversation_id": conversation_id,
-                        "session_id": session.session_id,
-                        "call_id": call_id,
-                        "tool_name": tool_name,
-                        "status": "completed",
-                    },
-                )
 
             await self.app.state.workflow_engine.run_direct_turn(
                 conversation=conversation,
@@ -856,7 +845,11 @@ class WebSocketConnectionManager:
         pending_pauses = await _load_pending_task_prompts(self.app, conversation_id)
         for payload in pending_pauses:
             await connection.send_json(payload)
-        if session.session_id in set(getattr(self.app.state, "recovered_session_ids", [])):
+        if (
+            session.session_id in set(getattr(self.app.state, "recovered_session_ids", []))
+            and session.session_id not in connection.recovery_notified
+        ):
+            connection.recovery_notified.add(session.session_id)
             await connection.send_json(
                 {
                     "type": "session_recovered",
