@@ -843,6 +843,8 @@
     persistSelectedAgent();
   }
 
+  let subSessionPollTimer: number | null = null;
+
   async function handleViewSession(sessionId: string): Promise<void> {
     if (!currentConversation) return;
     subSessionId = sessionId;
@@ -860,9 +862,29 @@
     } finally {
       subSessionLoading = false;
     }
+    startSubSessionPolling();
+  }
+
+  function startSubSessionPolling(): void {
+    stopSubSessionPolling();
+    subSessionPollTimer = window.setInterval(async () => {
+      if (document.hidden || !subSessionPanelOpen || !subSessionId || !currentConversation) return;
+      try {
+        const result = await api.conversations.sessionEvents(currentConversation.conversation_id, subSessionId, 0, 200);
+        subSessionTimeline = normalizeHistory(result.items ?? []);
+      } catch { /* silently ignore polling errors */ }
+    }, 3000);
+  }
+
+  function stopSubSessionPolling(): void {
+    if (subSessionPollTimer !== null) {
+      window.clearInterval(subSessionPollTimer);
+      subSessionPollTimer = null;
+    }
   }
 
   function closeSubSessionPanel(): void {
+    stopSubSessionPolling();
     subSessionClosing = true;
     setTimeout(() => {
       subSessionPanelOpen = false;
@@ -914,6 +936,7 @@
       if (activeConversationId) {
         wsClient.unsubscribeConversation(activeConversationId);
       }
+      stopSubSessionPolling();
     };
   });
 </script>

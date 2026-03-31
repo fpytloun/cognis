@@ -249,6 +249,20 @@ class WorkflowEngine:
                         step_def, step_result, state, task, workflow
                     )
 
+                    # Persist evaluation in the step_run record so the UI
+                    # can display it regardless of the decision outcome.
+                    async with self._session_factory() as db_session:
+                        step_run = await get_latest_step_run_for_task_step(
+                            db_session, task.task_id, step_def.name
+                        )
+                        if step_run:
+                            await update_step_run(
+                                db_session,
+                                step_run.step_run_id,
+                                evaluation=evaluation.model_dump(mode="json"),
+                            )
+                            await db_session.commit()
+
                     if evaluation.decision == "revise":
                         # Store feedback for retry
                         state.last_evaluation_feedback = evaluation.feedback or evaluation.reasoning
@@ -829,23 +843,31 @@ class WorkflowEngine:
         )
 
         # Record to target conversation's Intaris session.
-        # TODO: After adding active_session_id to the Conversation model,
-        # prefer it over root_session_id to handle compacted sessions.
+        # Prefer the latest active session (survives compaction) over the
+        # root_session_id which may point to a completed session.
         try:
             async with self._session_factory() as db_session:
-                from cognis.store.queries import get_conversation, get_session_row
+                from cognis.store.queries import (
+                    get_conversation,
+                    get_latest_active_session_for_conversation,
+                    get_session_row,
+                )
 
-                conv = await get_conversation(db_session, target_conversation_id)
-                if conv and conv.root_session_id:
-                    session_id = conv.root_session_id
-                    if session_id:
-                        sess = await get_session_row(db_session, session_id)
-                        if sess and sess.intaris_session_id:
-                            await self._providers.guardrails.record_events(
-                                session_id=sess.intaris_session_id,
-                                events=[event],
-                                source="cognis",
-                            )
+                sess = await get_latest_active_session_for_conversation(
+                    db_session, target_conversation_id
+                )
+                if sess is None:
+                    # Fall back to root session
+                    conv = await get_conversation(db_session, target_conversation_id)
+                    if conv and conv.root_session_id:
+                        sess = await get_session_row(db_session, conv.root_session_id)
+
+                if sess and sess.intaris_session_id:
+                    await self._providers.guardrails.record_events(
+                        session_id=sess.intaris_session_id,
+                        events=[event],
+                        source="cognis",
+                    )
         except Exception:
             logger.warning(
                 "Failed to deliver task result to conversation",

@@ -303,6 +303,39 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
       } else {
         items.push(delegation);
       }
+      continue;
+    }
+
+    // Intaris lifecycle events wrap task result/failed/cancelled events
+    // with type="lifecycle" and data.event="task_result" etc.
+    if (event.type === 'lifecycle') {
+      const lifecycleEvent = String(event.data?.event ?? '');
+      if (['task_result', 'task_failed', 'task_cancelled'].includes(lifecycleEvent)) {
+        const taskId = String(event.data.task_id ?? event.seq);
+        const itemId = `delegation:${taskId}`;
+        const existingIdx = items.findIndex((i) => i.id === itemId && i.kind === 'delegation');
+        const statusMap: Record<string, string> = {
+          task_result: 'completed',
+          task_failed: 'failed',
+          task_cancelled: 'cancelled'
+        };
+        const delegation: DelegationTimelineItem = {
+          id: itemId,
+          kind: 'delegation',
+          taskId,
+          taskLabel: String(event.data.title ?? event.data.task_id ?? 'Background task'),
+          status: statusMap[lifecycleEvent] ?? 'completed',
+          result: typeof event.data.result_summary === 'string' ? event.data.result_summary : null,
+          timestamp: event.timestamp
+        };
+        if (existingIdx >= 0) {
+          const existing = items[existingIdx] as DelegationTimelineItem;
+          items[existingIdx] = { ...existing, ...delegation, taskLabel: existing.taskLabel || delegation.taskLabel };
+        } else {
+          items.push(delegation);
+        }
+      }
+      continue;
     }
   }
 

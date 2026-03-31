@@ -250,22 +250,10 @@ class StepContextAssembler:
         except (ValueError, KeyError):
             logger.warning(
                 "step context: source step missing intaris_session_id, "
-                "falling back to summary from step_outputs",
+                "falling back to step_outputs content",
                 extra={"extra_data": {"source_step": source_name}},
             )
-            # Fall back to injecting the step's summary as a system message
-            raw = state.step_outputs.get(source_name, {})
-            summary = raw.get("summary", "")
-            content = raw.get("content", "")
-            fallback_text = content or summary
-            if fallback_text:
-                return [
-                    {
-                        "role": "system",
-                        "content": f"Output from step '{source_name}':\n\n{fallback_text}",
-                    }
-                ]
-            return []
+            return self._step_output_as_messages(source_name, state)
 
         # Try session cache first
         raw_output = state.step_outputs.get(source_name, {})
@@ -286,25 +274,52 @@ class StepContextAssembler:
                 after_seq=0,
                 allow_missing_stream=True,
             )
-            if not event_read.events:
-                logger.warning(
-                    "step context: source step has no events in Intaris",
-                    extra={
-                        "extra_data": {"source_step": source_name, "session_id": intaris_session_id}
-                    },
-                )
-            return events_to_messages(event_read.events)
+            if event_read.events:
+                return events_to_messages(event_read.events)
+            logger.warning(
+                "step context: source step has no events in Intaris, "
+                "falling back to step_outputs content",
+                extra={
+                    "extra_data": {"source_step": source_name, "session_id": intaris_session_id}
+                },
+            )
         except Exception:
             logger.warning(
-                "step context: failed to load source step events",
+                "step context: failed to load source step events, "
+                "falling back to step_outputs content",
                 extra={
                     "extra_data": {"source_step": source_name, "session_id": intaris_session_id}
                 },
                 exc_info=True,
             )
-            return []
+        # Fall back to step_outputs summary/content when Intaris returned
+        # empty events or the read failed entirely.
+        return self._step_output_as_messages(source_name, state)
 
     # ------------------------------------------------------------------
+    @staticmethod
+    def _step_output_as_messages(
+        source_name: str,
+        state: WorkflowState,
+    ) -> list[dict[str, Any]]:
+        """Convert a step's stored output into context messages.
+
+        Used as a fallback when the full event history cannot be loaded
+        from Intaris (empty stream, read failure, or missing session ID).
+        """
+        raw = state.step_outputs.get(source_name, {})
+        content = raw.get("content", "")
+        summary = raw.get("summary", "")
+        fallback_text = content or summary
+        if fallback_text:
+            return [
+                {
+                    "role": "system",
+                    "content": f"Output from step '{source_name}':\n\n{fallback_text}",
+                }
+            ]
+        return []
+
     # summary
     # ------------------------------------------------------------------
 

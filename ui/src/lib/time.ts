@@ -4,7 +4,15 @@ function normalizeDate(value: string | null): Date | null {
   if (!value) {
     return null;
   }
-  const parsed = new Date(value);
+  // Backend stores UTC timestamps.  SQLite returns them without a
+  // timezone suffix, which JavaScript interprets as local time.
+  // Append 'Z' when no timezone indicator is present so the Date
+  // constructor treats the value as UTC.
+  let normalized = value;
+  if (!/[Zz]|[+-]\d{2}:?\d{2}$/.test(normalized)) {
+    normalized += 'Z';
+  }
+  const parsed = new Date(normalized);
   return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 

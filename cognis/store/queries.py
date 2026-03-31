@@ -576,6 +576,27 @@ async def get_session_row(session: AsyncSession, session_id: str) -> Session | N
     return result.scalar_one_or_none()
 
 
+async def get_latest_active_session_for_conversation(
+    session: AsyncSession,
+    conversation_id: str,
+) -> Session | None:
+    """Get the most recent active/idle session for a conversation.
+
+    Used for task result delivery — prefers the current active session
+    over the root_session_id which may be stale after compaction.
+    """
+    result = await session.execute(
+        select(Session)
+        .where(
+            Session.conversation_id == conversation_id,
+            Session.status.in_(["active", "idle"]),
+        )
+        .order_by(Session.started_at.desc(), Session.session_id.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
 async def set_session_intaris_session_id(
     session: AsyncSession, session_id: str, intaris_session_id: str
 ) -> bool:
