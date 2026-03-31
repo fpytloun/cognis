@@ -198,3 +198,72 @@ async def test_litellm_provider_cached_resolution_expires(
 
     assert await provider.resolve_model(task_type="default") == "gpt-5.4-mini"
     await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# _apply_model_prefix tests
+# ---------------------------------------------------------------------------
+
+
+def _make_provider_row(preset: str) -> LLMProvider:
+    """Create a minimal LLMProvider ORM instance with a given preset."""
+    return LLMProvider(
+        provider_id="test",
+        display_name="Test",
+        location="controller",
+        backend="litellm",
+        config={"preset": preset, "default_model": "some-model"},
+        status="active",
+    )
+
+
+def test_apply_model_prefix_returns_unchanged_when_provider_is_none() -> None:
+    assert LiteLLMProvider._apply_model_prefix("gpt-4o", None) == "gpt-4o"
+
+
+def test_apply_model_prefix_returns_unchanged_when_model_contains_slash() -> None:
+    provider = _make_provider_row("openai_compatible")
+    assert LiteLLMProvider._apply_model_prefix("ollama/llama3", provider) == "ollama/llama3"
+
+
+def test_apply_model_prefix_adds_openai_prefix_for_openai_compatible() -> None:
+    provider = _make_provider_row("openai_compatible")
+    assert LiteLLMProvider._apply_model_prefix("gpt-oss-120b", provider) == "openai/gpt-oss-120b"
+
+
+def test_apply_model_prefix_adds_litellm_proxy_prefix() -> None:
+    provider = _make_provider_row("litellm_proxy")
+    assert (
+        LiteLLMProvider._apply_model_prefix("gpt-oss-120b", provider)
+        == "litellm_proxy/gpt-oss-120b"
+    )
+
+
+def test_apply_model_prefix_no_prefix_for_standard_openai() -> None:
+    provider = _make_provider_row("openai")
+    assert LiteLLMProvider._apply_model_prefix("gpt-4o", provider) == "gpt-4o"
+
+
+def test_apply_model_prefix_no_prefix_for_anthropic() -> None:
+    provider = _make_provider_row("anthropic")
+    assert (
+        LiteLLMProvider._apply_model_prefix("claude-sonnet-4-20250514", provider)
+        == "claude-sonnet-4-20250514"
+    )
+
+
+def test_apply_model_prefix_no_prefix_for_unknown_preset() -> None:
+    provider = _make_provider_row("some_future_preset")
+    assert LiteLLMProvider._apply_model_prefix("my-model", provider) == "my-model"
+
+
+def test_apply_model_prefix_no_prefix_when_preset_missing() -> None:
+    provider = LLMProvider(
+        provider_id="test",
+        display_name="Test",
+        location="controller",
+        backend="litellm",
+        config={"default_model": "my-model"},
+        status="active",
+    )
+    assert LiteLLMProvider._apply_model_prefix("my-model", provider) == "my-model"

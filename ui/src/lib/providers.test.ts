@@ -46,6 +46,52 @@ describe('provider presets', () => {
     expect(config.auth_config).toEqual({ mode: 'secret', secret_name: 'my_openai_key' });
   });
 
+  it('handles litellm_proxy preset with base_url', () => {
+    const proxyProvider: LLMProvider = {
+      provider_id: 'my-proxy',
+      display_name: 'LiteLLM Proxy',
+      location: 'controller',
+      backend: 'litellm',
+      config: {
+        preset: 'litellm_proxy',
+        default_model: 'gpt-oss-120b',
+        models: [{ model_id: 'gpt-oss-120b' }],
+        base_url: 'http://localhost:4000',
+        api_base: 'http://localhost:4000',
+        auth_config: { mode: 'env', env_var: 'LITELLM_PROXY_API_KEY' }
+      },
+      is_default: false,
+      status: 'active',
+      created_at: null,
+      updated_at: null,
+      models: [{ model_id: 'gpt-oss-120b' }],
+      last_test: null
+    };
+    expect(detectProviderPreset(proxyProvider)).toBe('litellm_proxy');
+    const form = createProviderForm(proxyProvider);
+    expect(form.preset).toBe('litellm_proxy');
+    expect(form.base_url).toBe('http://localhost:4000');
+    expect(form.auth_env_var).toBe('LITELLM_PROXY_API_KEY');
+  });
+
+  it('defaults base_url for new litellm_proxy preset', () => {
+    const newProxy: LLMProvider = {
+      provider_id: 'proxy-new',
+      display_name: 'Proxy',
+      location: 'controller',
+      backend: 'litellm',
+      config: { preset: 'litellm_proxy' },
+      is_default: false,
+      status: 'active',
+      created_at: null,
+      updated_at: null,
+      models: [],
+      last_test: null
+    };
+    const form = createProviderForm(newProxy);
+    expect(form.base_url).toBe('http://localhost:4000');
+  });
+
   it('collects model options with provider metadata', () => {
     expect(collectModelOptions([provider])).toEqual([
       {

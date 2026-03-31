@@ -24,6 +24,14 @@ logger = get_logger(__name__)
 MODEL_CACHE_TTL_SECONDS = 60.0
 SAFE_PROVIDER_KWARGS = {"api_base", "api_version", "base_url", "max_retries", "timeout"}
 
+# Preset-to-litellm model prefix mapping.  LiteLLM uses the prefix to
+# determine which provider API to use.  Standard presets (openai, anthropic)
+# are recognised by litellm natively and need no prefix.
+PRESET_TO_MODEL_PREFIX: dict[str, str] = {
+    "litellm_proxy": "litellm_proxy",
+    "openai_compatible": "openai",
+}
+
 # Anthropic model name patterns for prompt caching support
 _ANTHROPIC_MODEL_PATTERNS = re.compile(r"(claude|anthropic)", re.IGNORECASE)
 
@@ -175,10 +183,15 @@ class LiteLLMProvider:
         **kwargs: Any,
     ) -> dict[str, Any]:
         resolved_model, provider = await self._resolve_model_target(model, task_type=task_type)
+        prefixed_model = self._apply_model_prefix(resolved_model, provider)
         request_kwargs = {**await self._resolve_provider_kwargs(provider), **kwargs}
         prepared_messages = _apply_cache_hints(messages, resolved_model, cache_breakpoint_index)
+        logger.debug(
+            "LLM generate",
+            extra={"extra_data": {"model": prefixed_model, "task_type": task_type}},
+        )
         response = await litellm.acompletion(
-            model=resolved_model, messages=prepared_messages, stream=False, **request_kwargs
+            model=prefixed_model, messages=prepared_messages, stream=False, **request_kwargs
         )
         return dict(response)
 
@@ -191,10 +204,15 @@ class LiteLLMProvider:
         **kwargs: Any,
     ) -> AsyncIterator[dict[str, Any]]:
         resolved_model, provider = await self._resolve_model_target(model, task_type=task_type)
+        prefixed_model = self._apply_model_prefix(resolved_model, provider)
         request_kwargs = {**await self._resolve_provider_kwargs(provider), **kwargs}
         prepared_messages = _apply_cache_hints(messages, resolved_model, cache_breakpoint_index)
+        logger.debug(
+            "LLM stream_generate",
+            extra={"extra_data": {"model": prefixed_model, "task_type": task_type}},
+        )
         stream = await litellm.acompletion(
-            model=resolved_model, messages=prepared_messages, stream=True, **request_kwargs
+            model=prefixed_model, messages=prepared_messages, stream=True, **request_kwargs
         )
         async for chunk in stream:
             yield dict(chunk)
@@ -317,7 +335,7 @@ class LiteLLMProvider:
                     {"model_id": "claude-opus-4-20250514", "name": "Claude Opus 4"},
                 ]
 
-            # OpenAI-compatible: GET /v1/models
+            # OpenAI-compatible (incl. litellm_proxy): GET /v1/models
             openai_url = base_url.rstrip("/") if base_url else "https://api.openai.com"
             response = await client.get(f"{openai_url}/v1/models", headers=headers)
             response.raise_for_status()
@@ -358,6 +376,7 @@ class LiteLLMProvider:
         if not isinstance(default_model, str) or not default_model:
             raise ValueError("Provider default_model is not configured")
 
+        prefixed_model = self._apply_model_prefix(default_model, provider)
         request_kwargs = await self._resolve_provider_kwargs(provider)
         configured_timeout = request_kwargs.get("timeout")
         request_kwargs["timeout"] = (
@@ -369,7 +388,7 @@ class LiteLLMProvider:
         tested_at = datetime.now(UTC)
         try:
             await litellm.acompletion(
-                model=default_model,
+                model=prefixed_model,
                 messages=[{"role": "user", "content": "Say hello."}],
                 max_tokens=5,
                 stream=False,
@@ -379,6 +398,7 @@ class LiteLLMProvider:
             return {
                 "ok": False,
                 "model_resolved": default_model,
+                "model_sent": prefixed_model,
                 "latency_ms": int((monotonic() - started_at) * 1000),
                 "error_type": "timeout",
                 "error_detail": self._sanitize_error_detail(exc),
@@ -388,6 +408,7 @@ class LiteLLMProvider:
             return {
                 "ok": False,
                 "model_resolved": default_model,
+                "model_sent": prefixed_model,
                 "latency_ms": int((monotonic() - started_at) * 1000),
                 "error_type": self._classify_provider_error(exc),
                 "error_detail": self._sanitize_error_detail(exc),
@@ -396,6 +417,7 @@ class LiteLLMProvider:
         return {
             "ok": True,
             "model_resolved": default_model,
+            "model_sent": prefixed_model,
             "latency_ms": int((monotonic() - started_at) * 1000),
             "error_type": None,
             "error_detail": None,
@@ -415,6 +437,27 @@ class LiteLLMProvider:
                 if isinstance(model, dict) and model.get("model_id") == model_id:
                     return cast(LLMProviderRow, row)
         return None
+
+    @staticmethod
+    def _apply_model_prefix(model: str, provider: LLMProviderRow | None) -> str:
+        """Prefix model name based on provider preset for correct litellm routing.
+
+        LiteLLM uses model name prefixes to determine which provider API to
+        use.  For standard providers (``openai``, ``anthropic``), litellm
+        recognises model names natively.  For OpenAI-compatible endpoints and
+        LiteLLM proxies, a prefix is required so litellm routes correctly:
+        ``openai/model`` or ``litellm_proxy/model``.
+
+        Models that already contain a ``/`` (e.g. ``ollama/llama3``) are
+        returned unchanged to avoid double-prefixing.
+        """
+        if provider is None or "/" in model:
+            return model
+        preset = dict(provider.config).get("preset", "")
+        prefix = PRESET_TO_MODEL_PREFIX.get(preset)
+        if prefix:
+            return f"{prefix}/{model}"
+        return model
 
     def _provider_request_kwargs(self, provider: LLMProviderRow | None) -> dict[str, Any]:
         if provider is None:

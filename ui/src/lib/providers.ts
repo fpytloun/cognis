@@ -1,6 +1,6 @@
 import type { LLMProvider } from '$lib/types/api';
 
-export type ProviderPreset = 'openai' | 'openai_compatible' | 'anthropic' | 'ollama' | 'custom';
+export type ProviderPreset = 'openai' | 'openai_compatible' | 'anthropic' | 'ollama' | 'litellm_proxy' | 'custom';
 export type AuthMode = 'env' | 'secret' | 'none';
 
 export interface ProviderFormState {
@@ -31,7 +31,8 @@ export interface ProviderModelOption {
 const PRESET_ENV_VARS: Record<string, string> = {
   openai: 'OPENAI_API_KEY',
   openai_compatible: 'OPENAI_API_KEY',
-  anthropic: 'ANTHROPIC_API_KEY'
+  anthropic: 'ANTHROPIC_API_KEY',
+  litellm_proxy: 'LITELLM_PROXY_API_KEY'
 };
 
 /** Display names for presets. */
@@ -40,6 +41,7 @@ export const PRESET_LABELS: Record<ProviderPreset, string> = {
   openai_compatible: 'OpenAI Compatible',
   anthropic: 'Anthropic',
   ollama: 'Ollama (local)',
+  litellm_proxy: 'LiteLLM Proxy',
   custom: 'Custom (raw JSON)'
 };
 
@@ -55,7 +57,7 @@ export function detectProviderPreset(provider: LLMProvider | null): ProviderPres
   const config = provider.config ?? {};
   if (typeof config.preset === 'string') {
     const raw = config.preset as string;
-    if (['openai', 'openai_compatible', 'anthropic', 'ollama', 'custom'].includes(raw)) {
+    if (['openai', 'openai_compatible', 'anthropic', 'ollama', 'litellm_proxy', 'custom'].includes(raw)) {
       return raw as ProviderPreset;
     }
   }
@@ -63,6 +65,9 @@ export function detectProviderPreset(provider: LLMProvider | null): ProviderPres
   const defaultModel = typeof config.default_model === 'string' ? config.default_model : '';
   if (defaultModel.startsWith('ollama/')) {
     return 'ollama';
+  }
+  if (defaultModel.startsWith('litellm_proxy/')) {
+    return 'litellm_proxy';
   }
   if (defaultModel.startsWith('claude') || defaultModel.startsWith('anthropic/')) {
     return 'anthropic';
@@ -121,7 +126,9 @@ export function createProviderForm(provider: LLMProvider | null = null): Provide
           ? (config.api_base as string)
           : preset === 'ollama'
             ? 'http://localhost:11434'
-            : '',
+            : preset === 'litellm_proxy'
+              ? 'http://localhost:4000'
+              : '',
     default_model: typeof config.default_model === 'string' ? config.default_model : '',
     additional_models: models.join('\n'),
     custom_json: JSON.stringify(config, null, 2),
@@ -213,5 +220,5 @@ export function presetNeedsAuth(preset: ProviderPreset): boolean {
 
 /** Whether the preset allows configuring base URL. */
 export function presetHasBaseUrl(preset: ProviderPreset): boolean {
-  return preset === 'openai_compatible' || preset === 'ollama';
+  return preset === 'openai_compatible' || preset === 'ollama' || preset === 'litellm_proxy';
 }

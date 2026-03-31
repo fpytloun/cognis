@@ -310,7 +310,7 @@
     }
   }
 
-  const presetOptions: ProviderPreset[] = ['openai', 'openai_compatible', 'anthropic', 'ollama', 'custom'];
+  const presetOptions: ProviderPreset[] = ['openai', 'openai_compatible', 'anthropic', 'ollama', 'litellm_proxy', 'custom'];
 
   async function refreshPageState(): Promise<void> {
     isAdmin = auth.getSnapshot().user?.role === 'admin';

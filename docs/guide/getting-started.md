@@ -57,8 +57,10 @@ cognis admin create-user admin@example.com --name "Admin"
 Open **Settings → Providers** and choose a preset:
 
 - OpenAI
+- OpenAI Compatible
 - Anthropic
 - Ollama
+- LiteLLM Proxy
 - Custom
 
 Use **Test provider** to verify model resolution and connectivity.
