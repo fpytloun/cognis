@@ -321,6 +321,75 @@ CANCEL_TASK_TOOL = ToolDefinition(
 )
 
 
+GET_TASK_OUTPUT_TOOL = ToolDefinition(
+    name="get_task_output",
+    description=(
+        "Get the full output of a completed task. Returns the content "
+        "produced by the final workflow step including full text, claims, "
+        "and structured outputs. Use get_task first to check task status."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": "ID of the task.",
+            },
+        },
+        "required": ["task_id"],
+    },
+    source=ToolSource(type="builtin"),
+    category="orchestration",
+    read_only=True,
+)
+
+GET_TASK_STEP_OUTPUT_TOOL = ToolDefinition(
+    name="get_task_step_output",
+    description=(
+        "Get the full output of a specific workflow step. Use get_task "
+        "first to see available step names and their statuses."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": "ID of the task.",
+            },
+            "step_name": {
+                "type": "string",
+                "description": "Name of the step (e.g., 'plan', 'research', 'synthesize').",
+            },
+        },
+        "required": ["task_id", "step_name"],
+    },
+    source=ToolSource(type="builtin"),
+    category="orchestration",
+    read_only=True,
+)
+
+RETRY_TASK_TOOL = ToolDefinition(
+    name="retry_task",
+    description=(
+        "Retry a failed or paused task. Re-runs the current workflow step "
+        "that failed or is waiting for input. The attempt counter is reset."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": "ID of the task to retry.",
+            },
+        },
+        "required": ["task_id"],
+    },
+    source=ToolSource(type="builtin"),
+    category="orchestration",
+    read_only=False,
+)
+
+
 # ---------------------------------------------------------------------------
 # Tool collections by orchestration mode
 # ---------------------------------------------------------------------------
@@ -336,8 +405,11 @@ _ALL_TASK_TOOLS = [
     CREATE_TASK_TOOL,
     LIST_TASKS_TOOL,
     GET_TASK_TOOL,
+    GET_TASK_OUTPUT_TOOL,
+    GET_TASK_STEP_OUTPUT_TOOL,
     UPDATE_TASK_TOOL,
     CANCEL_TASK_TOOL,
+    RETRY_TASK_TOOL,
 ]
 
 # Sync-only delegate for task steps (no wait parameter exposed — always sync)

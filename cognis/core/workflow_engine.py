@@ -209,6 +209,9 @@ class WorkflowEngine:
                         target_idx = self._find_step_index(workflow, revise_target)
                         if target_idx is not None:
                             state.current_step_index = target_idx
+                            # Reset attempt counter so the step gets fresh attempts
+                            state.loop_iterations.pop(f"attempts:{revise_target}", None)
+                            await self._persist_workflow_state(task)
                             continue
                     # "continue" → advance
                     state.current_step_index += 1
@@ -436,6 +439,7 @@ class WorkflowEngine:
             task_id=task.task_id,
             task_title=task.title,
             task_description=task.description,
+            task_expected_output=task.expected_output,
             step_run_id=step_run_id,
             is_direct=False,
             is_retry=is_retry,
@@ -775,6 +779,8 @@ class WorkflowEngine:
                 target_idx = self._find_step_index(workflow, revise_target)
                 if target_idx is not None:
                     state.current_step_index = target_idx
+                    # Reset attempt counter so the step gets fresh attempts
+                    state.loop_iterations.pop(f"attempts:{revise_target}", None)
                     await self._persist_workflow_state(task)
                     return True
             return False
@@ -822,25 +828,24 @@ class WorkflowEngine:
             },
         )
 
-        # Record to target conversation's Intaris session
-        recorded_to_intaris = False
+        # Record to target conversation's Intaris session.
+        # TODO: After adding active_session_id to the Conversation model,
+        # prefer it over root_session_id to handle compacted sessions.
         try:
-            # Resolve the conversation's root session Intaris ID
             async with self._session_factory() as db_session:
-                from cognis.store.queries import get_conversation
+                from cognis.store.queries import get_conversation, get_session_row
 
                 conv = await get_conversation(db_session, target_conversation_id)
                 if conv and conv.root_session_id:
-                    from cognis.store.queries import get_session_row
-
-                    sess = await get_session_row(db_session, conv.root_session_id)
-                    if sess and sess.intaris_session_id:
-                        await self._providers.guardrails.record_events(
-                            session_id=sess.intaris_session_id,
-                            events=[event],
-                            source="cognis",
-                        )
-                        recorded_to_intaris = True
+                    session_id = conv.root_session_id
+                    if session_id:
+                        sess = await get_session_row(db_session, session_id)
+                        if sess and sess.intaris_session_id:
+                            await self._providers.guardrails.record_events(
+                                session_id=sess.intaris_session_id,
+                                events=[event],
+                                source="cognis",
+                            )
         except Exception:
             logger.warning(
                 "Failed to deliver task result to conversation",
@@ -865,19 +870,20 @@ class WorkflowEngine:
                 },
             )
         )
-        if recorded_to_intaris:
-            await self._event_bus.publish(
-                Event(
-                    type=EventType.FOLLOW_UP_TURN_REQUESTED,
-                    data={
-                        "conversation_id": target_conversation_id,
-                        "task_id": task.task_id,
-                        "agent_id": task.agent_id,
-                        "user_email": task.created_by,
-                        "status": str(task.status),
-                    },
-                )
+        # Always request a follow-up turn so the agent can process the
+        # result even if Intaris recording failed (degraded mode).
+        await self._event_bus.publish(
+            Event(
+                type=EventType.FOLLOW_UP_TURN_REQUESTED,
+                data={
+                    "conversation_id": target_conversation_id,
+                    "task_id": task.task_id,
+                    "agent_id": task.agent_id,
+                    "user_email": task.created_by,
+                    "status": str(task.status),
+                },
             )
+        )
 
     async def _persist_workflow_state(self, task: TaskModel) -> None:
         """Persist workflow state to DB after a step transition."""
@@ -1072,14 +1078,17 @@ class WorkflowEngine:
 
 
 def _build_exhaustion_gate(step_def: StepDefinition) -> Any:
-    """Build a gate config for exhausted step attempts."""
+    """Build a gate config for exhausted step attempts.
+
+    Only offers "Retry step" — the user can cancel the task from the
+    task board if they don't want to retry.
+    """
     from cognis.models.workflow import GateConfig, GateOption
 
     return GateConfig(
-        message=f"Step '{step_def.name}' has exhausted its retry limit. How would you like to proceed?",
+        message=f"Step '{step_def.name}' has exhausted its retry limit ({step_def.completion.max_attempts if step_def.completion else '?'} attempts). You can retry or cancel the task from the task board.",
         options=[
-            GateOption(label="Continue anyway", action="continue"),
-            GateOption(label="Cancel workflow", action="cancel"),
+            GateOption(label="Retry step", action=f"revise({step_def.name})"),
         ],
     )
 

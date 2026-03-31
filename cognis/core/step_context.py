@@ -245,7 +245,27 @@ class StepContextAssembler:
         state: WorkflowState,
     ) -> list[dict[str, Any]]:
         """Load full event history for a source step and format as messages."""
-        intaris_session_id = state.get_source_intaris_session_id(source_name)
+        try:
+            intaris_session_id = state.get_source_intaris_session_id(source_name)
+        except (ValueError, KeyError):
+            logger.warning(
+                "step context: source step missing intaris_session_id, "
+                "falling back to summary from step_outputs",
+                extra={"extra_data": {"source_step": source_name}},
+            )
+            # Fall back to injecting the step's summary as a system message
+            raw = state.step_outputs.get(source_name, {})
+            summary = raw.get("summary", "")
+            content = raw.get("content", "")
+            fallback_text = content or summary
+            if fallback_text:
+                return [
+                    {
+                        "role": "system",
+                        "content": f"Output from step '{source_name}':\n\n{fallback_text}",
+                    }
+                ]
+            return []
 
         # Try session cache first
         raw_output = state.step_outputs.get(source_name, {})

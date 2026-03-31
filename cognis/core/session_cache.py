@@ -123,6 +123,7 @@ class SessionCache:
                 )
                 next_seq += 1
             entry.last_event_seq = max(entry.last_event_seq, append_result.last_seq)
+            entry.initialized = True
             entry.touched_at = monotonic()
         return entry
 

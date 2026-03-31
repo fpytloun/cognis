@@ -143,6 +143,7 @@ def task_to_response(task: TaskModel) -> TaskResponse:
         task_id=task.task_id,
         title=task.title,
         description=task.description,
+        expected_output=task.expected_output,
         status=str(task.status),
         priority=task.priority,
         created_by=task.created_by,

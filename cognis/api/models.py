@@ -357,6 +357,7 @@ class TaskCreateRequest(BaseModel):
     agent_id: str
     title: str
     description: str = ""
+    expected_output: str | None = None
     priority: int = 0
     workflow_id: str | None = None
     delivery_mode: str = "same_conversation"
@@ -369,6 +370,7 @@ class TaskCreateRequest(BaseModel):
 class TaskUpdateRequest(BaseModel):
     title: str | None = None
     description: str | None = None
+    expected_output: str | None = None
     priority: int | None = None
     agent_id: str | None = None
     workflow_id: str | None = None
@@ -413,6 +415,7 @@ class TaskResponse(BaseModel):
     task_id: str
     title: str
     description: str = ""
+    expected_output: str | None = None
     status: str
     priority: int = 0
     created_by: str

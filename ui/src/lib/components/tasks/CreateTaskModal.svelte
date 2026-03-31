@@ -35,6 +35,7 @@
     description: '',
     agent_id: defaultAgentId,
     workflow_id: '',
+    expected_output: '',
     priority: 0,
     delivery_mode: 'same_conversation',
     delivery_target: ''
@@ -46,6 +47,7 @@
       agent_id: form.agent_id,
       title: form.title,
       description: form.description,
+      expected_output: form.expected_output || null,
       workflow_id: form.workflow_id || null,
       priority: Number(form.priority),
       delivery_mode: form.delivery_mode,
@@ -89,6 +91,16 @@
           bind:value={form.description}
           class="min-h-[100px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500"
           placeholder="Describe the work item"
+        ></textarea>
+      </div>
+
+      <div class="space-y-1">
+        <label for="task-expected" class="text-xs font-medium uppercase tracking-widest text-slate-400">Expected output</label>
+        <textarea
+          id="task-expected"
+          bind:value={form.expected_output}
+          class="min-h-[60px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500"
+          placeholder="Describe the expected format or content of the result (optional)"
         ></textarea>
       </div>
 

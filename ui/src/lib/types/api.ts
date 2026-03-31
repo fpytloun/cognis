@@ -352,6 +352,7 @@ export interface Task {
   task_id: string;
   title: string;
   description: string;
+  expected_output: string | null;
   status: string;
   priority: number;
   created_by: string;

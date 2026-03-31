@@ -448,6 +448,7 @@ class StepContext:
     task_id: str | None = None
     task_title: str = ""
     task_description: str = ""
+    task_expected_output: str | None = None
     step_run_id: str | None = None
     is_direct: bool = False  # True for main chat (Direct workflow)
     is_retry: bool = False  # True for re-attempt within the same step
@@ -2087,6 +2088,7 @@ class AgentLoop:
         """Handle create_task, list_tasks, get_task, update_task, cancel_task."""
         from cognis.store.queries import (
             get_task,
+            list_step_runs_for_task,
             list_tasks_for_agent,
             update_task_fields,
             update_task_status,
@@ -2112,6 +2114,7 @@ class AgentLoop:
                     agent_id=tc.arguments.get("agent_id") or ctx.agent.agent_id,
                     title=tc.arguments.get("title", "Untitled task"),
                     description=tc.arguments.get("description", ""),
+                    expected_output=tc.arguments.get("expected_output"),
                     priority=tc.arguments.get("priority", 0),
                     source_type="agent",
                     source_ref=ctx.conversation.conversation_id,
@@ -2165,28 +2168,35 @@ class AgentLoop:
             task_id = tc.arguments.get("task_id", "")
             async with self.session_manager.session_factory() as db:
                 task_row = await get_task(db, task_id)
-            if task_row is None:
-                return ToolResult(
-                    output=json.dumps({"status": "error", "message": "Task not found."}),
-                    is_error=True,
-                )
-            # Verify agent access
-            if task_row.agent_id != ctx.agent.agent_id:
-                return ToolResult(
-                    output=json.dumps(
-                        {
-                            "status": "error",
-                            "message": "Task belongs to a different agent.",
-                        }
-                    ),
-                    is_error=True,
-                )
+                if task_row is None:
+                    return ToolResult(
+                        output=json.dumps({"status": "error", "message": "Task not found."}),
+                        is_error=True,
+                    )
+                if task_row.agent_id != ctx.agent.agent_id:
+                    return ToolResult(
+                        output=json.dumps(
+                            {"status": "error", "message": "Task belongs to a different agent."}
+                        ),
+                        is_error=True,
+                    )
+                step_rows = await list_step_runs_for_task(db, task_id)
+            step_run_summaries = [
+                {
+                    "step_name": sr.step_name,
+                    "status": sr.status,
+                    "attempt": sr.attempt,
+                    "summary": (sr.output or {}).get("summary", "") if sr.output else "",
+                }
+                for sr in step_rows
+            ]
             return ToolResult(
                 output=json.dumps(
                     {
                         "task_id": task_row.task_id,
                         "title": task_row.title,
                         "description": task_row.description,
+                        "expected_output": task_row.expected_output,
                         "status": task_row.status,
                         "priority": task_row.priority,
                         "workflow_id": task_row.workflow_id,
@@ -2196,10 +2206,153 @@ class AgentLoop:
                         if task_row.completed_at
                         else None,
                         "result_summary": task_row.result_summary,
+                        "step_runs": step_run_summaries,
                     },
                     default=str,
                 ),
             )
+
+        elif tc.name == "get_task_output":
+            task_id = tc.arguments.get("task_id", "")
+            async with self.session_manager.session_factory() as db:
+                task_row = await get_task(db, task_id)
+                if task_row is None:
+                    return ToolResult(
+                        output=json.dumps({"error": "Task not found."}), is_error=True
+                    )
+                if task_row.agent_id != ctx.agent.agent_id:
+                    return ToolResult(
+                        output=json.dumps({"error": "Task belongs to a different agent."}),
+                        is_error=True,
+                    )
+                step_rows = await list_step_runs_for_task(db, task_id)
+            # Find the last completed step with output
+            completed = [sr for sr in reversed(step_rows) if sr.status == "approved" and sr.output]
+            if completed:
+                output = completed[0].output
+                return ToolResult(
+                    output=json.dumps(
+                        {
+                            "step_name": completed[0].step_name,
+                            "summary": output.get("summary", ""),
+                            "content": output.get("content", ""),
+                            "claims": output.get("claims", []),
+                            "outputs": output.get("outputs", {}),
+                        },
+                        default=str,
+                    ),
+                )
+            return ToolResult(
+                output=json.dumps(
+                    {
+                        "summary": task_row.result_summary or "No output available.",
+                        "content": "",
+                        "claims": [],
+                        "outputs": {},
+                    }
+                ),
+            )
+
+        elif tc.name == "get_task_step_output":
+            task_id = tc.arguments.get("task_id", "")
+            step_name = tc.arguments.get("step_name", "")
+            async with self.session_manager.session_factory() as db:
+                task_row = await get_task(db, task_id)
+                if task_row is None:
+                    return ToolResult(
+                        output=json.dumps({"error": "Task not found."}), is_error=True
+                    )
+                if task_row.agent_id != ctx.agent.agent_id:
+                    return ToolResult(
+                        output=json.dumps({"error": "Task belongs to a different agent."}),
+                        is_error=True,
+                    )
+                step_rows = await list_step_runs_for_task(db, task_id)
+            matching = [sr for sr in step_rows if sr.step_name == step_name]
+            if not matching:
+                return ToolResult(
+                    output=json.dumps({"error": f"No step '{step_name}' found for this task."}),
+                    is_error=True,
+                )
+            latest = matching[-1]
+            output = latest.output or {}
+            return ToolResult(
+                output=json.dumps(
+                    {
+                        "step_name": latest.step_name,
+                        "status": latest.status,
+                        "attempt": latest.attempt,
+                        "summary": output.get("summary", ""),
+                        "content": output.get("content", ""),
+                        "claims": output.get("claims", []),
+                        "outputs": output.get("outputs", {}),
+                        "error": output.get("error"),
+                    },
+                    default=str,
+                ),
+            )
+
+        elif tc.name == "retry_task":
+            task_id = tc.arguments.get("task_id", "")
+            task_queue = self._task_queue
+            if task_queue is None:
+                return ToolResult(
+                    output=json.dumps({"error": "Task queue is not available."}), is_error=True
+                )
+            async with self.session_manager.session_factory() as db:
+                task_row = await get_task(db, task_id)
+                if task_row is None:
+                    return ToolResult(
+                        output=json.dumps({"error": "Task not found."}), is_error=True
+                    )
+                if task_row.agent_id != ctx.agent.agent_id:
+                    return ToolResult(
+                        output=json.dumps({"error": "Task belongs to a different agent."}),
+                        is_error=True,
+                    )
+                if task_row.status not in ("failed", "paused"):
+                    return ToolResult(
+                        output=json.dumps(
+                            {
+                                "error": f"Cannot retry task in '{task_row.status}' status. Only failed or paused tasks can be retried."
+                            }
+                        ),
+                        is_error=True,
+                    )
+            try:
+                # If the task has a pending gate pause, resolve it with retry
+                pauses = self.pause_waiter.list_pending(task_id=task_id)
+                if pauses:
+                    pause = pauses[0]
+                    step_name = pause.step_name or ""
+                    self.pause_waiter.resolve(
+                        pause.pause_id,
+                        PauseResolution(decision=f"revise({step_name})", data={}),
+                    )
+                    return ToolResult(
+                        output=json.dumps(
+                            {
+                                "status": "retrying",
+                                "task_id": task_id,
+                                "message": f"Retrying step '{step_name}'.",
+                            }
+                        ),
+                    )
+                # No active pause — resume from failed state
+                await task_queue.resume_task(task_id)
+                return ToolResult(
+                    output=json.dumps(
+                        {
+                            "status": "retrying",
+                            "task_id": task_id,
+                            "message": "Task requeued for retry.",
+                        }
+                    ),
+                )
+            except Exception as exc:
+                return ToolResult(
+                    output=json.dumps({"error": f"Failed to retry task: {exc}"}), is_error=True
+                )
 
         elif tc.name == "update_task":
             task_id = tc.arguments.get("task_id", "")
@@ -2675,6 +2828,8 @@ class AgentLoop:
                 parts.append(f"**{ctx.task_title}**\n\n")
             if ctx.task_description:
                 parts.append(f"{ctx.task_description}\n\n")
+            if ctx.task_expected_output:
+                parts.append(f"**Expected output:** {ctx.task_expected_output}\n\n")
 
         prompt_text = ctx.user_message or ctx.step_definition.prompt
         parts.append(f"## Step: {ctx.step_definition.name}\n\n{prompt_text}")

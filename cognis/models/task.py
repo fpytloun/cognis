@@ -52,6 +52,7 @@ class TaskModel(BaseModel):
     task_id: str
     title: str
     description: str = ""
+    expected_output: str | None = None
     status: TaskStatus = TaskStatus.DRAFT
     priority: int = 0
     created_by: str

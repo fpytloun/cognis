@@ -37,6 +37,7 @@
     title: '',
     description: '',
     priority: 0,
+    expected_output: '',
     agent_id: '',
     workflow_id: '',
     delivery_mode: 'same_conversation',
@@ -128,6 +129,7 @@
       editForm = {
         title: task.title,
         description: task.description,
+        expected_output: task.expected_output ?? '',
         priority: task.priority,
         agent_id: task.agent_id,
         workflow_id: task.workflow_id ?? '',
@@ -171,6 +173,7 @@
       const updatedTask = await api.tasks.update(task.task_id, {
         title: editForm.title,
         description: editForm.description,
+        expected_output: editForm.expected_output || null,
         priority: Number(editForm.priority),
         agent_id: editForm.agent_id,
         workflow_id: editForm.workflow_id || null,
@@ -323,6 +326,11 @@
           <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
             <span>Description</span>
             <textarea bind:value={editForm.description} disabled={!isEditable} class="min-h-[110px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500 disabled:opacity-50"></textarea>
+          </label>
+
+          <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
+            <span>Expected output</span>
+            <textarea bind:value={editForm.expected_output} disabled={!isEditable} class="min-h-[60px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500 disabled:opacity-50" placeholder="Describe the expected format or content of the result (optional)"></textarea>
           </label>
 
           <div class="mt-4 grid gap-4 md:grid-cols-2">

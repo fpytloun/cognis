@@ -721,6 +721,7 @@ async def create_task(
     agent_id: str,
     title: str,
     description: str = "",
+    expected_output: str | None = None,
     status: str = "draft",
     priority: int = 0,
     source_type: str = "api",
@@ -738,6 +739,7 @@ async def create_task(
         task_id=task_id or f"task_{uuid.uuid4().hex}",
         title=title,
         description=description,
+        expected_output=expected_output,
         status=status,
         priority=priority,
         created_by=created_by,
@@ -821,6 +823,7 @@ async def update_task_fields(
     *,
     title: str | None = None,
     description: str | None = None,
+    expected_output: str | None = None,
     priority: int | None = None,
     workflow_id: str | None = None,
 ) -> bool:
@@ -830,6 +833,8 @@ async def update_task_fields(
         values["title"] = title
     if description is not None:
         values["description"] = description
+    if expected_output is not None:
+        values["expected_output"] = expected_output
     if priority is not None:
         values["priority"] = priority
     if workflow_id is not None:

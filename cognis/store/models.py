@@ -236,6 +236,7 @@ class Task(Base):
     task_id: Mapped[str] = mapped_column(String, primary_key=True)
     title: Mapped[str] = mapped_column(String, nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    expected_output: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String, nullable=False, default="draft")
     priority: Mapped[int] = mapped_column(nullable=False, default=0)
     created_by: Mapped[str] = mapped_column(String, ForeignKey("users.email"), nullable=False)
