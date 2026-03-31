@@ -9,7 +9,6 @@ import pytest
 
 from cognis.models.tool import ExecutorHandle, ToolResult
 from cognis.tools.executor.definitions import (
-    ALL_EXECUTOR_TOOLS,
     executor_tool_definitions,
     executor_tool_handlers,
 )
@@ -183,31 +182,110 @@ class TestBackendResolution:
 
 
 class TestDefinitions:
-    """Test that web tool definitions are properly registered."""
-
-    def test_all_web_tools_present(self) -> None:
-        defs = executor_tool_definitions()
-        names = {d.name for d in defs}
-        assert "web_fetch" in names
-        assert "web_search" in names
-        assert "web_crawl" in names
-        assert "web_map" in names
-        assert "web_research" in names
-
-    def test_total_executor_tools_count(self) -> None:
-        defs = executor_tool_definitions()
-        assert len(defs) == 14  # 10 original + 4 new tools (search, crawl, map, research) = 14
-
-    def test_web_tools_are_read_only(self) -> None:
-        for tool in ALL_EXECUTOR_TOOLS:
-            if tool.name.startswith("web_"):
-                assert tool.read_only, f"{tool.name} should be read_only"
-                assert not tool.non_bypassable, f"{tool.name} should not be non_bypassable"
+    """Test that web tool handlers are registered and static tools are correct."""
 
     def test_web_handlers_registered(self) -> None:
         handlers = executor_tool_handlers()
         for name in ("web_fetch", "web_search", "web_crawl", "web_map", "web_research"):
             assert name in handlers, f"Missing handler for {name}"
+
+    def test_static_executor_tools_exclude_web(self) -> None:
+        defs = executor_tool_definitions()
+        names = {d.name for d in defs}
+        assert "web_fetch" not in names
+        assert "web_search" not in names
+        assert len(defs) == 9
+
+
+class TestDynamicWebDefinitions:
+    """Test dynamic web tool definition generation."""
+
+    def test_direct_only_no_backend_param(self) -> None:
+        from cognis.tools.executor.web.definitions import web_tool_definitions
+
+        defs = web_tool_definitions(["direct"])
+        names = {d.name for d in defs}
+        assert names == {"web_fetch", "web_search"}
+
+        for d in defs:
+            props = d.parameters.get("properties", {})
+            assert "backend" not in props, f"{d.name} should not have backend param"
+
+    def test_direct_only_no_tavily_params(self) -> None:
+        from cognis.tools.executor.web.definitions import web_tool_definitions
+
+        defs = web_tool_definitions(["direct"])
+        search = next(d for d in defs if d.name == "web_search")
+        props = search.parameters.get("properties", {})
+        assert "search_depth" not in props
+        assert "include_answer" not in props
+        assert "topic" not in props
+
+    def test_tavily_adds_backend_and_params(self) -> None:
+        from cognis.tools.executor.web.definitions import web_tool_definitions
+
+        defs = web_tool_definitions(["direct", "tavily"])
+        search = next(d for d in defs if d.name == "web_search")
+        props = search.parameters.get("properties", {})
+        assert "backend" in props
+        assert "search_depth" in props
+        assert "include_answer" in props
+        assert "topic" in props
+        backend_enum = props["backend"]["enum"]
+        assert "direct" in backend_enum
+        assert "tavily" in backend_enum
+
+    def test_tavily_only_tools_included(self) -> None:
+        from cognis.tools.executor.web.definitions import web_tool_definitions
+
+        defs_direct = web_tool_definitions(["direct"])
+        defs_tavily = web_tool_definitions(["direct", "tavily"])
+        names_direct = {d.name for d in defs_direct}
+        names_tavily = {d.name for d in defs_tavily}
+        assert "web_crawl" not in names_direct
+        assert "web_map" not in names_direct
+        assert "web_research" not in names_direct
+        assert "web_crawl" in names_tavily
+        assert "web_map" in names_tavily
+        assert "web_research" in names_tavily
+
+    def test_brave_adds_search_params(self) -> None:
+        from cognis.tools.executor.web.definitions import web_tool_definitions
+
+        defs = web_tool_definitions(["direct", "brave"])
+        search = next(d for d in defs if d.name == "web_search")
+        props = search.parameters.get("properties", {})
+        assert "backend" in props
+        assert "freshness" in props
+        assert "extra_snippets" in props
+        assert "safesearch" in props
+        # Tavily params should NOT be present
+        assert "search_depth" not in props
+        assert "include_answer" not in props
+
+    def test_brave_fetch_excludes_brave_from_backend(self) -> None:
+        from cognis.tools.executor.web.definitions import web_tool_definitions
+
+        defs = web_tool_definitions(["direct", "brave"])
+        fetch = next(d for d in defs if d.name == "web_fetch")
+        props = fetch.parameters.get("properties", {})
+        # brave has no fetch — should not appear in fetch backend enum
+        if "backend" in props:
+            assert "brave" not in props["backend"].get("enum", [])
+
+    def test_all_web_tools_are_read_only(self) -> None:
+        from cognis.tools.executor.web.definitions import web_tool_definitions
+
+        defs = web_tool_definitions(["direct", "tavily", "brave"])
+        for d in defs:
+            assert d.read_only, f"{d.name} should be read_only"
+            assert not d.non_bypassable, f"{d.name} should not be non_bypassable"
+
+    def test_maximal_set_has_five_tools(self) -> None:
+        from cognis.tools.executor.web.definitions import web_tool_definitions
+
+        defs = web_tool_definitions(["direct", "tavily", "brave"])
+        assert len(defs) == 5
 
 
 class TestWebFetchHandler:
@@ -468,3 +546,27 @@ class TestRetryLogic:
             assert result.is_error
             assert "Cloudflare" in result.output
             assert "tavily" in result.output.lower()
+
+
+class TestSettingsSchema:
+    """Test web backend settings validation."""
+
+    def test_valid_backends(self) -> None:
+        from cognis.settings_schema import validate_setting_value
+
+        for backend in ("direct", "tavily", "brave"):
+            validate_setting_value("web.backend", backend)
+
+    def test_invalid_backend_rejected(self) -> None:
+        from cognis.settings_schema import validate_setting_value
+
+        with pytest.raises(ValueError, match="must be one of"):
+            validate_setting_value("web.backend", "grok")
+
+    def test_web_backend_in_default_settings(self) -> None:
+        from cognis.bootstrap import DEFAULT_SETTINGS
+
+        assert "web.backend" in DEFAULT_SETTINGS
+        category, default = DEFAULT_SETTINGS["web.backend"]
+        assert category == "web"
+        assert default == "direct"

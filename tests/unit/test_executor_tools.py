@@ -36,7 +36,8 @@ class TestDefinitions:
 
     def test_executor_tool_definitions_returns_all(self) -> None:
         defs = executor_tool_definitions()
-        assert len(defs) == 14
+        # Web tools are dynamic — not in the static list
+        assert len(defs) == 9
         names = {d.name for d in defs}
         assert names == {
             "read",
@@ -48,11 +49,6 @@ class TestDefinitions:
             "glob",
             "grep",
             "bash",
-            "web_fetch",
-            "web_search",
-            "web_crawl",
-            "web_map",
-            "web_research",
         }
 
     def test_all_definitions_have_executor_source(self) -> None:
@@ -70,17 +66,7 @@ class TestDefinitions:
         for tool in ALL_EXECUTOR_TOOLS:
             if tool.name in write_tools:
                 assert tool.non_bypassable, f"{tool.name} should be non_bypassable"
-            if tool.name in {
-                "read",
-                "glob",
-                "grep",
-                "list_directory",
-                "web_fetch",
-                "web_search",
-                "web_crawl",
-                "web_map",
-                "web_research",
-            }:
+            if tool.name in {"read", "glob", "grep", "list_directory"}:
                 assert tool.read_only, f"{tool.name} should be read_only"
 
 

@@ -43,6 +43,7 @@ DEFAULT_SETTINGS: Final[dict[str, tuple[str, object]]] = {
     "security.token_ttl_seconds": ("security", 3600),
     "security.max_connections": ("security", 100),
     "security.ws_auth_timeout_seconds": ("security", 10),
+    "web.backend": ("web", "direct"),
 }
 
 

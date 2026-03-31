@@ -38,6 +38,7 @@ import type {
   TaskDetail,
   ToolDefinitionSummary,
   UserSummary,
+  WebConfigStatus,
   Workflow,
   WorkflowRun
 } from '$lib/types/api';
@@ -624,6 +625,12 @@ export const api = {
         method: 'PUT',
         body: JSON.stringify(payload)
       });
+    }
+  },
+
+  webConfig: {
+    status(): Promise<WebConfigStatus> {
+      return request<WebConfigStatus>('/api/v1/web-config/status');
     }
   },
 

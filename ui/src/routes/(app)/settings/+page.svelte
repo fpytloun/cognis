@@ -27,12 +27,22 @@
     Setting,
     SettingsCategory,
     SystemDiagnostics,
-    ToolDefinitionSummary
+    ToolDefinitionSummary,
+    WebConfigStatus
   } from '$lib/types/api';
 
-  type SettingsTab = 'providers' | 'routing' | 'secrets' | 'executors' | 'system' | 'account';
+  type SettingsTab = 'providers' | 'routing' | 'secrets' | 'web' | 'executors' | 'system' | 'account';
 
-  const tabs: SettingsTab[] = ['providers', 'routing', 'secrets', 'executors', 'system', 'account'];
+  const tabs: SettingsTab[] = ['providers', 'routing', 'secrets', 'web', 'executors', 'system', 'account'];
+  const TAB_LABELS: Record<SettingsTab, string> = {
+    providers: 'providers',
+    routing: 'routing',
+    secrets: 'secrets',
+    web: 'web search',
+    executors: 'executors',
+    system: 'system',
+    account: 'account'
+  };
   let activeTab: SettingsTab = 'providers';
   let loading = true;
   let busy = false;
@@ -47,6 +57,9 @@
   let executorConfigs: ExecutorConfig[] = [];
   let executorTools: ToolDefinitionSummary[] = [];
   let editingExecutor: ExecutorConfig | null = null;
+  let webConfig: WebConfigStatus = { backend: 'direct', tavily_configured: false, brave_configured: false, available_backends: ['direct'] };
+  let webBackendForm = 'direct';
+  let webKeySetup: { backend: string; value: string } | null = null;
   let showExecutorForm = false;
   let executorForm = { name: '', executor_type: 'in_process', labels: '' };
   let isAdmin = false;
@@ -317,6 +330,9 @@
       extraJson: JSON.stringify(modelRouting.items, null, 2)
     };
 
+    webConfig = await api.webConfig.status().catch(() => webConfig);
+    webBackendForm = webConfig.backend;
+
     if (isAdmin) {
       [providers, diagnostics, agents, executorConfigs, executorTools] = await Promise.all([
         api.llmProviders.list().then((page) => page.items),
@@ -530,6 +546,63 @@
     }
   }
 
+  // -- Web config ---------------------------------------------------------------
+
+  const WEB_BACKEND_INFO: Record<string, { label: string; description: string; link?: string }> = {
+    direct: {
+      label: 'Direct (DuckDuckGo)',
+      description: 'Uses DuckDuckGo for search and direct HTTP for page fetching. Free, no API key needed. DuckDuckGo is community-maintained and may occasionally be unavailable.'
+    },
+    tavily: {
+      label: 'Tavily',
+      description: 'AI-optimized search with answer generation, content extraction, website crawling, and deep research. Unlocks web_crawl, web_map, and web_research tools.',
+      link: 'https://tavily.com'
+    },
+    brave: {
+      label: 'Brave Search',
+      description: 'Search from Brave\'s index with freshness filters, extra snippets, and country targeting. Search only \u2014 page fetching uses direct HTTP.',
+      link: 'https://brave.com/search/api/'
+    }
+  };
+
+  async function saveWebBackend(): Promise<void> {
+    busy = true;
+    error = '';
+    try {
+      await api.settings.update('web.backend', webBackendForm);
+      webConfig = await api.webConfig.status();
+      notice = 'Web backend updated.';
+      addToast('Web backend updated.', 'success');
+      initialSnapshot = snapshotState();
+    } catch (caughtError) {
+      error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to save web backend');
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function saveWebApiKey(): Promise<void> {
+    if (!webKeySetup) return;
+    busy = true;
+    error = '';
+    try {
+      const secretName = webKeySetup.backend === 'tavily' ? 'tavily_api_key' : 'brave_api_key';
+      await api.secrets.upsert({ name: secretName, value: webKeySetup.value, scope: 'global', description: `API key for ${WEB_BACKEND_INFO[webKeySetup.backend]?.label ?? webKeySetup.backend}` });
+      secrets = await api.secrets.list();
+      webConfig = await api.webConfig.status();
+      webKeySetup = null;
+      notice = 'API key saved.';
+      addToast('API key saved.', 'success');
+      initialSnapshot = snapshotState();
+    } catch (caughtError) {
+      error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to save API key');
+    } finally {
+      busy = false;
+    }
+  }
+
   function selectSetting(setting: Setting): void {
     selectedSettingKey = setting.key;
     settingValueText = JSON.stringify(setting.value, null, 2);
@@ -664,7 +737,7 @@
   <section class="space-y-5">
     <div class="flex flex-wrap gap-2">
       {#each tabs as tab}
-        <Button variant={activeTab === tab ? 'primary' : 'secondary'} onclick={() => setActiveTab(tab)}>{tab}</Button>
+        <Button variant={activeTab === tab ? 'primary' : 'secondary'} onclick={() => setActiveTab(tab)}>{TAB_LABELS[tab]}</Button>
       {/each}
     </div>
 
@@ -973,6 +1046,103 @@
               </div>
             {/each}
           </div>
+        </Card>
+      </div>
+    {:else if activeTab === 'web'}
+      <div class="grid gap-5 xl:grid-cols-[360px_minmax(0,1fr)]">
+        <!-- Left: backend selector -->
+        <Card class="p-5">
+          <div class="space-y-4">
+            <div>
+              <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Web search</p>
+              <h2 class="mt-1 text-lg font-semibold text-white">Default backend</h2>
+            </div>
+            <p class="text-sm leading-6 text-slate-400">
+              Configure how agents search and fetch web content. The default backend is used unless the agent overrides it per-call.
+            </p>
+            <label class="space-y-2 text-sm font-medium text-slate-200">
+              <span>Backend</span>
+              <select bind:value={webBackendForm} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+                <option value="direct">{WEB_BACKEND_INFO.direct.label}</option>
+                <option value="tavily" disabled={!webConfig.tavily_configured}>{WEB_BACKEND_INFO.tavily.label}{webConfig.tavily_configured ? '' : ' (not configured)'}</option>
+                <option value="brave" disabled={!webConfig.brave_configured}>{WEB_BACKEND_INFO.brave.label}{webConfig.brave_configured ? '' : ' (not configured)'}</option>
+              </select>
+            </label>
+            <p class="text-sm leading-6 text-slate-400">{WEB_BACKEND_INFO[webBackendForm]?.description ?? ''}</p>
+            <Button class="w-full justify-center" onclick={saveWebBackend} disabled={!isAdmin || busy || webBackendForm === webConfig.backend}>Save backend</Button>
+          </div>
+        </Card>
+
+        <!-- Right: backend status + key setup -->
+        <Card class="p-5">
+          <div class="space-y-4">
+            <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Backend status</p>
+
+            <!-- Direct -->
+            <div class="flex items-center justify-between gap-3 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3">
+              <div>
+                <p class="font-medium text-white">{WEB_BACKEND_INFO.direct.label}</p>
+                <p class="text-xs text-slate-400">Always available, free</p>
+              </div>
+              <ProviderStatusBadge status="healthy" />
+            </div>
+
+            <!-- Tavily -->
+            <div class="rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3">
+              <div class="flex items-center justify-between gap-3">
+                <div>
+                  <p class="font-medium text-white">{WEB_BACKEND_INFO.tavily.label}</p>
+                  <p class="text-xs text-slate-400">{webConfig.tavily_configured ? 'API key configured' : 'Not configured'}</p>
+                </div>
+                <div class="flex items-center gap-2">
+                  {#if !webConfig.tavily_configured}
+                    <Button size="sm" variant="secondary" onclick={() => { webKeySetup = { backend: 'tavily', value: '' }; }}>Setup</Button>
+                  {/if}
+                  <ProviderStatusBadge status={webConfig.tavily_configured ? 'healthy' : 'degraded'} />
+                </div>
+              </div>
+            </div>
+
+            <!-- Brave -->
+            <div class="rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3">
+              <div class="flex items-center justify-between gap-3">
+                <div>
+                  <p class="font-medium text-white">{WEB_BACKEND_INFO.brave.label}</p>
+                  <p class="text-xs text-slate-400">{webConfig.brave_configured ? 'API key configured' : 'Not configured'}</p>
+                </div>
+                <div class="flex items-center gap-2">
+                  {#if !webConfig.brave_configured}
+                    <Button size="sm" variant="secondary" onclick={() => { webKeySetup = { backend: 'brave', value: '' }; }}>Setup</Button>
+                  {/if}
+                  <ProviderStatusBadge status={webConfig.brave_configured ? 'healthy' : 'degraded'} />
+                </div>
+              </div>
+            </div>
+
+            <p class="text-xs text-slate-500">
+              Tavily-only tools (web_crawl, web_map, web_research) require a Tavily API key.
+            </p>
+          </div>
+
+          <!-- Inline API key setup -->
+          {#if webKeySetup}
+            <div class="mt-4 space-y-3 border-t border-slate-800 pt-4">
+              <p class="text-sm font-medium text-white">Configure {WEB_BACKEND_INFO[webKeySetup.backend]?.label ?? webKeySetup.backend}</p>
+              <label class="space-y-2 text-sm font-medium text-slate-200">
+                <span>API Key</span>
+                <Input bind:value={webKeySetup.value} type="password" placeholder="Enter API key" />
+              </label>
+              {#if WEB_BACKEND_INFO[webKeySetup.backend]?.link}
+                <p class="text-xs text-slate-400">
+                  Get your key at <a href={WEB_BACKEND_INFO[webKeySetup.backend].link} target="_blank" rel="noopener noreferrer" class="text-blue-400 underline">{WEB_BACKEND_INFO[webKeySetup.backend].link}</a>
+                </p>
+              {/if}
+              <div class="flex gap-2">
+                <Button onclick={saveWebApiKey} disabled={busy || !webKeySetup.value}>Save key</Button>
+                <Button variant="secondary" onclick={() => { webKeySetup = null; }}>Cancel</Button>
+              </div>
+            </div>
+          {/if}
         </Card>
       </div>
     {:else if activeTab === 'executors'}

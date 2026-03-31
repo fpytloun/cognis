@@ -424,6 +424,12 @@ WEB_RESEARCH_TOOL = ToolDefinition(
 
 # -- Public API ----------------------------------------------------------------
 
+# Web tool definitions (WEB_FETCH_TOOL, WEB_SEARCH_TOOL, WEB_CRAWL_TOOL,
+# WEB_MAP_TOOL, WEB_RESEARCH_TOOL) are generated dynamically based on
+# available backends — see cognis.tools.executor.web.definitions.
+# They are NOT included in ALL_EXECUTOR_TOOLS.  The handler map below
+# still registers all web handlers so calls are routed correctly.
+
 ALL_EXECUTOR_TOOLS: list[ToolDefinition] = [
     READ_TOOL,
     WRITE_TOOL,
@@ -434,11 +440,6 @@ ALL_EXECUTOR_TOOLS: list[ToolDefinition] = [
     GLOB_TOOL,
     GREP_TOOL,
     BASH_TOOL,
-    WEB_FETCH_TOOL,
-    WEB_SEARCH_TOOL,
-    WEB_CRAWL_TOOL,
-    WEB_MAP_TOOL,
-    WEB_RESEARCH_TOOL,
 ]
 
 _HANDLER_MAP: dict[

@@ -118,6 +118,15 @@ class SystemDiagnosticsResponse(BaseModel):
     key_fingerprint: str | None = None
 
 
+class WebConfigStatusResponse(BaseModel):
+    """Web backend configuration status."""
+
+    backend: str = "direct"
+    tavily_configured: bool = False
+    brave_configured: bool = False
+    available_backends: list[str] = Field(default_factory=lambda: ["direct"])
+
+
 class ConversationContextModel(BaseModel):
     type: str = "web"
     ref: str | None = None

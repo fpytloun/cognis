@@ -35,8 +35,14 @@ def static_tool_definitions() -> list[ToolDefinition]:
     """Return all static tool definitions available to Cognis.
 
     Includes builtin controller tools, workflow tools, memory tools,
-    and executor-native tools.
+    executor-native tools, and a maximal set of web tools (for
+    discovery/listing — actual web tools sent to the LLM are filtered
+    per-session based on available backends).
     """
+    from cognis.tools.executor.web.definitions import web_tool_definitions
+
+    # Include all web tools for discovery (as if all backends were available)
+    all_web = web_tool_definitions(["direct", "tavily", "brave"])
     return [
         *system_tools(),
         *orchestration_tools(),
@@ -44,6 +50,7 @@ def static_tool_definitions() -> list[ToolDefinition]:
         *memory_tools(),
         *tool_output_tools(),
         *executor_tool_definitions(),
+        *all_web,
     ]
 
 
@@ -164,11 +171,18 @@ def build_step_runtime_factory(
         runtime_metadata = {"user_email": user_email, **db_config}
 
         # Inject web backend config (backend name + API keys)
-        web_config = await _resolve_web_config(providers)
+        web_config = await _resolve_web_config(providers, user_email)
         runtime_metadata.update(web_config)
 
-        # Filter tools by agent config AND executor enablement
-        agent_tools = select_static_tools(agent)
+        # Filter tools by agent config AND executor enablement.
+        # Exclude web-category tools — they are injected dynamically below
+        # based on available backends.
+        agent_tools = [t for t in select_static_tools(agent) if t.category != "web"]
+
+        # Add dynamic web tool definitions based on available backends
+        from cognis.tools.executor.web.definitions import web_tool_definitions
+
+        agent_tools.extend(web_tool_definitions(web_config["web_available_backends"]))
         if executor_config is not None:
             # Only include executor-native tools that are enabled on this executor.
             # Controller-side tools (builtin) are always available regardless.
@@ -263,7 +277,10 @@ async def _resolve_executor_config(
         return None
 
 
-async def _resolve_web_config(providers: Any) -> dict[str, Any]:
+async def _resolve_web_config(
+    providers: Any,
+    user_email: str,
+) -> dict[str, Any]:
     """Resolve web backend configuration from settings and secrets.
 
     Returns a dict with keys suitable for merging into runtime_metadata:
@@ -278,27 +295,26 @@ async def _resolve_web_config(providers: Any) -> dict[str, Any]:
     session_factory = getattr(providers, "_session_factory", None)
     if session_factory is not None:
         try:
-            from cognis.store.queries import get_setting
+            from cognis.store.queries import get_setting_value
 
             async with session_factory() as session:
-                setting = await get_setting(session, "web.backend")
-                if setting:
-                    web_backend = str(setting)
+                value = await get_setting_value(session, "web.backend", "direct")
+                if isinstance(value, str):
+                    web_backend = value
         except Exception:
             logger.debug("web: failed to read web.backend setting", exc_info=True)
 
     # Read API keys from secrets provider
-    try:
-        if hasattr(providers, "secrets") and hasattr(providers.secrets, "get_value"):
-            for secret_name in ("tavily_api_key", "brave_api_key"):
-                try:
-                    value = await providers.secrets.get_value(secret_name)
-                    if value:
-                        web_secrets[secret_name] = value
-                except Exception:
-                    pass
-    except Exception:
-        logger.debug("web: failed to read web secrets", exc_info=True)
+    if hasattr(providers, "secrets") and hasattr(providers.secrets, "get_secret"):
+        for secret_name in ("tavily_api_key", "brave_api_key"):
+            try:
+                value = await providers.secrets.get_secret(secret_name, user_email)
+                if value:
+                    web_secrets[secret_name] = value
+            except KeyError:
+                pass  # Secret not configured — expected
+            except Exception:
+                logger.debug("web: failed to read secret %s", secret_name)
 
     available = ["direct"]
     if web_secrets.get("tavily_api_key"):

@@ -256,7 +256,7 @@ class TestStaticToolDefinitionsComplete:
         from cognis.api.runtime_support import static_tool_definitions
 
         defs = static_tool_definitions()
-        # 2 system + 9 orchestration + 4 workflow + 14 memory + 2 tool_output + 14 executor = 45
+        # 2 system + 9 orchestration + 4 workflow + 14 memory + 2 tool_output + 9 executor + 5 web = 45
         assert len(defs) == 45
 
 

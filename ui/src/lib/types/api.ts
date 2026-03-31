@@ -448,6 +448,13 @@ export interface SecretMetadata {
   description: string | null;
 }
 
+export interface WebConfigStatus {
+  backend: string;
+  tavily_configured: boolean;
+  brave_configured: boolean;
+  available_backends: string[];
+}
+
 export interface ProviderHealth {
   name: string;
   status: string;

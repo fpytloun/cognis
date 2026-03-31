@@ -20,6 +20,7 @@ from cognis.api.models import (
     SettingResponse,
     SettingsCategoryResponse,
     SettingUpdateRequest,
+    WebConfigStatusResponse,
 )
 from cognis.api.serializers import llm_provider_to_response, setting_to_response
 from cognis.settings_schema import setting_category, validate_setting_value
@@ -103,6 +104,48 @@ async def setting_update(
             write_requests_per_minute=int(payload.value)
         )
     return setting_to_response(row)
+
+
+# -- Web config ----------------------------------------------------------------
+
+
+@router.get("/api/v1/web-config/status", response_model=WebConfigStatusResponse)
+async def web_config_status(request: Request) -> WebConfigStatusResponse:
+    """Return web backend configuration status."""
+    user = require_current_user(request)
+    from cognis.store.queries import get_setting_value
+
+    async with request.app.state.session_factory() as session:
+        backend = await get_setting_value(session, "web.backend", "direct")
+
+    tavily_configured = False
+    brave_configured = False
+    secrets_provider = getattr(request.app.state.providers, "secrets", None)
+    if secrets_provider is not None:
+        for secret_name in ("tavily_api_key", "brave_api_key"):
+            try:
+                await secrets_provider.get_secret(secret_name, user.email)
+                if secret_name == "tavily_api_key":
+                    tavily_configured = True
+                else:
+                    brave_configured = True
+            except KeyError:
+                pass  # Secret not configured — expected
+            except Exception:
+                pass  # Provider error — treat as not configured
+
+    available = ["direct"]
+    if tavily_configured:
+        available.append("tavily")
+    if brave_configured:
+        available.append("brave")
+
+    return WebConfigStatusResponse(
+        backend=str(backend) if isinstance(backend, str) else "direct",
+        tavily_configured=tavily_configured,
+        brave_configured=brave_configured,
+        available_backends=available,
+    )
 
 
 @router.get("/api/v1/llm-providers", response_model=CursorPage[LLMProviderResponse])
