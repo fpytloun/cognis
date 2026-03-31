@@ -37,55 +37,38 @@
 </script>
 
 <svelte:head>
-  <title>Log In · Cognis</title>
+  <title>Sign In · Cognis</title>
 </svelte:head>
 
-<div class="mx-auto flex min-h-screen max-w-6xl items-center justify-center px-4 py-10 sm:px-6 sm:py-16">
-  <Card class="grid w-full max-w-5xl overflow-hidden lg:grid-cols-[1.2fr_0.8fr]">
-    <section class="border-b border-slate-800/80 bg-slate-950/80 p-8 lg:block lg:border-b-0 lg:border-r lg:p-10">
-      <p class="text-sm font-medium uppercase tracking-[0.3em] text-sky-300">Cognis</p>
-      <h1 class="mt-6 text-4xl font-semibold leading-tight text-white">
-        Decoupled control plane for safe, streaming agent workflows.
-      </h1>
-      <p class="mt-6 max-w-xl text-sm leading-7 text-slate-300">
-        Log in to manage agents, watch delegated work progress in real time, review workflow gates,
-        and configure Cognis from one browser workspace.
-      </p>
-    </section>
-
-    <section class="p-8 sm:p-10">
-      <div class="mx-auto max-w-md space-y-8">
-        <div class="space-y-3">
-          <p class="text-sm font-medium uppercase tracking-[0.3em] text-sky-300">Sign in</p>
-          <h2 class="text-3xl font-semibold text-white">Welcome back</h2>
-          <p class="text-sm leading-6 text-slate-400">
-            Use your Cognis account to open the UI, fetch your agent workspace, and start a secure
-            WebSocket session.
-          </p>
-        </div>
-
-        <form class="space-y-5" onsubmit={handleSubmit} novalidate>
-          <label class="block space-y-2 text-sm font-medium text-slate-200">
-            <span>Email <span class="text-rose-300">*</span></span>
-            <Input bind:value={email} name="email" type="email" placeholder="admin@example.com" />
-          </label>
-
-          <label class="block space-y-2 text-sm font-medium text-slate-200">
-            <span>Password <span class="text-rose-300">*</span></span>
-            <Input bind:value={password} name="password" type="password" placeholder="••••••••" />
-          </label>
-
-          {#if error}
-            <p class="rounded-2xl border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
-              {error}
-            </p>
-          {/if}
-
-          <Button class="w-full justify-center" type="submit" disabled={submitting}>
-            {submitting ? 'Signing in…' : 'Sign in'}
-          </Button>
-        </form>
+<div class="flex min-h-screen items-center justify-center px-4">
+  <Card class="w-full max-w-sm p-8 sm:p-10">
+    <div class="space-y-6">
+      <div class="space-y-1 text-center">
+        <h1 class="text-2xl font-semibold text-white">Cognis</h1>
+        <p class="text-sm text-slate-400">User sign-in</p>
       </div>
-    </section>
+
+      <form class="space-y-5" onsubmit={handleSubmit} novalidate>
+        <label class="block space-y-2 text-sm font-medium text-slate-200">
+          <span>Email</span>
+          <Input bind:value={email} name="email" type="email" autocomplete="username" placeholder="admin@example.com" />
+        </label>
+
+        <label class="block space-y-2 text-sm font-medium text-slate-200">
+          <span>Password</span>
+          <Input bind:value={password} name="password" type="password" autocomplete="current-password" placeholder="••••••••" />
+        </label>
+
+        {#if error}
+          <p class="rounded-2xl border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
+            {error}
+          </p>
+        {/if}
+
+        <Button class="w-full justify-center" type="submit" disabled={submitting}>
+          {submitting ? 'Signing in…' : 'Sign in'}
+        </Button>
+      </form>
+    </div>
   </Card>
 </div>

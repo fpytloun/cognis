@@ -132,15 +132,35 @@ async function parseTokenResponse(response: Response): Promise<TokenResponse> {
   return (await response.json()) as TokenResponse;
 }
 
+class AuthError extends Error {
+  override readonly name = 'AuthError';
+
+  constructor(
+    message: string,
+    readonly transient: boolean
+  ) {
+    super(message);
+  }
+}
+
 async function fetchMe(accessToken: string): Promise<UserSummary> {
-  const response = await fetch(apiUrl('/api/auth/me'), {
-    headers: {
-      Authorization: `Bearer ${accessToken}`
-    }
-  });
+  let response: Response;
+  try {
+    response = await fetch(apiUrl('/api/auth/me'), {
+      headers: {
+        Authorization: `Bearer ${accessToken}`
+      }
+    });
+  } catch {
+    throw new AuthError('Unable to reach the server', true);
+  }
+
+  if (response.status === 401) {
+    throw new AuthError('Session is no longer valid', false);
+  }
 
   if (!response.ok) {
-    throw new Error('Failed to verify the current session');
+    throw new AuthError('Failed to verify the current session', true);
   }
 
   return (await response.json()) as UserSummary;
@@ -153,27 +173,36 @@ async function refreshAccessToken(): Promise<string | null> {
     return null;
   }
 
+  let response: Response;
   try {
-    const response = await fetch(apiUrl('/api/auth/refresh'), {
+    response = await fetch(apiUrl('/api/auth/refresh'), {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({ refresh_token: state.refreshToken })
     });
-
-    if (!response.ok) {
-      throw new Error('Your session has expired. Please log in again.');
-    }
-
-    const payload = await parseTokenResponse(response);
-    setAuthenticated(payload);
-    return payload.token;
   } catch (error) {
-    reportError('Token refresh failed', error);
-    setAnonymous(toErrorMessage(error, 'Your session has expired. Please log in again.'));
+    // Network error (server unreachable) — keep current tokens, don't clear session
+    reportError('Token refresh failed (network)', error);
     return null;
   }
+
+  if (response.status === 401) {
+    // Definitive auth failure — token is invalid or expired
+    setAnonymous('Your session has expired. Please log in again.');
+    return null;
+  }
+
+  if (!response.ok) {
+    // Non-401 HTTP error (4xx other than 401, 5xx) — treat as transient, keep tokens
+    reportError('Token refresh failed (server)', new Error(`HTTP ${response.status}`));
+    return null;
+  }
+
+  const payload = await parseTokenResponse(response);
+  setAuthenticated(payload);
+  return payload.token;
 }
 
 export const auth = {
@@ -214,6 +243,13 @@ export const auth = {
         store.set(nextState);
       } catch (error) {
         reportError('Auth bootstrap verification failed', error);
+        if (error instanceof AuthError && error.transient) {
+          // Server unreachable — keep hydrated session, don't clear tokens.
+          // Subsequent bootstrap() calls (e.g. on re-mount) will re-attempt
+          // verification. Individual API calls handle 401 independently via
+          // the retry logic in client.ts.
+          return;
+        }
         await this.refreshSession();
       }
     })();

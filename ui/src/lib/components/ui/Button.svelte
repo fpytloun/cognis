@@ -49,6 +49,6 @@
   }: Props = $props();
 </script>
 
-<button class={cn(buttonVariants({ variant, size }), className)} {type} {disabled} {onclick} {...rest}>
+<button class={cn(buttonVariants({ variant, size }), className)} {type} {disabled} onclick={onclick ?? undefined} {...rest}>
   {@render children?.()}
 </button>
