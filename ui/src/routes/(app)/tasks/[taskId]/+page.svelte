@@ -53,6 +53,9 @@
     paused: 'border-yellow-700 text-yellow-300',
   };
 
+  const TERMINAL_STATUSES = ['completed', 'failed', 'cancelled'];
+  let isEditable = $derived(task != null && !TERMINAL_STATUSES.includes(task.status));
+
   function taskIdFromRoute(): string {
     return $page.params.taskId ?? '';
   }
@@ -287,15 +290,15 @@
           <div class="grid gap-4 md:grid-cols-2">
             <label class="space-y-2 text-sm font-medium text-slate-200">
               <span>Title</span>
-              <Input bind:value={editForm.title} />
+              <Input bind:value={editForm.title} disabled={!isEditable} />
             </label>
             <label class="space-y-2 text-sm font-medium text-slate-200">
               <span>Priority</span>
-              <Input bind:value={editForm.priority} type="number" />
+              <Input bind:value={editForm.priority} type="number" disabled={!isEditable} />
             </label>
             <label class="space-y-2 text-sm font-medium text-slate-200">
               <span>Agent</span>
-              <select bind:value={editForm.agent_id} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+              <select bind:value={editForm.agent_id} disabled={!isEditable} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100 disabled:opacity-50">
                 {#each agents as agent}
                   <option value={agent.agent_id}>{agent.display_name ?? agent.name}</option>
                 {/each}
@@ -303,7 +306,7 @@
             </label>
             <label class="space-y-2 text-sm font-medium text-slate-200">
               <span>Workflow</span>
-              <select bind:value={editForm.workflow_id} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+              <select bind:value={editForm.workflow_id} disabled={!isEditable} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100 disabled:opacity-50">
                 <option value="">Auto</option>
                 {#each workflows as workflow}
                   <option value={workflow.workflow_id}>{workflow.name}</option>
@@ -314,13 +317,13 @@
 
           <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
             <span>Description</span>
-            <textarea bind:value={editForm.description} class="min-h-[110px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500"></textarea>
+            <textarea bind:value={editForm.description} disabled={!isEditable} class="min-h-[110px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500 disabled:opacity-50"></textarea>
           </label>
 
           <div class="mt-4 grid gap-4 md:grid-cols-2">
             <label class="space-y-2 text-sm font-medium text-slate-200">
               <span>Delivery mode</span>
-              <select bind:value={editForm.delivery_mode} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+              <select bind:value={editForm.delivery_mode} disabled={!isEditable} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100 disabled:opacity-50">
                 <option value="same_conversation">Same conversation</option>
                 <option value="specific_conversation">Specific conversation</option>
                 <option value="latest_active_for_agent">Latest active</option>
@@ -331,7 +334,7 @@
             {#if editForm.delivery_mode === 'specific_conversation'}
               <label class="space-y-2 text-sm font-medium text-slate-200">
                 <span>Delivery target</span>
-                <select bind:value={editForm.delivery_target} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+                <select bind:value={editForm.delivery_target} disabled={!isEditable} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100 disabled:opacity-50">
                   <option value="">Select conversation</option>
                   {#each conversations as conversation}
                     <option value={conversation.conversation_id}>{conversation.title ?? conversation.conversation_id}</option>
@@ -342,7 +345,7 @@
           </div>
 
           <div class="mt-5 flex justify-end">
-            <Button disabled={saving} onclick={saveTask}>{saving ? 'Saving...' : 'Save task'}</Button>
+            <Button disabled={saving || !isEditable} onclick={saveTask}>{saving ? 'Saving...' : 'Save task'}</Button>
           </div>
         </Card>
 
@@ -511,15 +514,17 @@
               {/if}
             </div>
 
-            <div class="space-y-3 border-t border-slate-800 pt-4">
-              <select bind:value={dependencyTaskId} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
-                <option value="">Add dependency...</option>
-                {#each allTasks.filter((c) => c.task_id !== taskIdFromRoute()) as candidate}
-                  <option value={candidate.task_id}>{candidate.title}</option>
-                {/each}
-              </select>
-              <Button class="w-full justify-center" disabled={!dependencyTaskId} onclick={addDependency}>Add dependency</Button>
-            </div>
+            {#if isEditable}
+              <div class="space-y-3 border-t border-slate-800 pt-4">
+                <select bind:value={dependencyTaskId} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+                  <option value="">Add dependency...</option>
+                  {#each allTasks.filter((c) => c.task_id !== taskIdFromRoute()) as candidate}
+                    <option value={candidate.task_id}>{candidate.title}</option>
+                  {/each}
+                </select>
+                <Button class="w-full justify-center" disabled={!dependencyTaskId} onclick={addDependency}>Add dependency</Button>
+              </div>
+            {/if}
           </div>
         </Card>
       </div>

@@ -252,6 +252,7 @@ def create_app() -> FastAPI:
             workflow_engine=workflow_engine,
             workflow_registry=workflow_registry,
             event_bus=event_bus,
+            llm_provider=providers.llm,
         )
         agent_loop.set_task_queue(task_queue)
         recovered_sessions = await session_manager.recover_stale_sessions()

@@ -55,6 +55,8 @@ from cognis.store.queries import (
     update_task_workflow_state,
 )
 
+_TERMINAL_STATUSES: frozenset[str] = frozenset({"completed", "failed", "cancelled"})
+
 router = APIRouter(tags=["tasks"])
 
 
@@ -189,6 +191,12 @@ async def task_update(request: Request, task_id: str, payload: TaskUpdateRequest
         row = await get_task(session, task_id)
         if row is None:
             raise api_exception(404, "not_found", "Task not found")
+        if row.status in _TERMINAL_STATUSES:
+            raise api_exception(
+                409,
+                "conflict",
+                f"Cannot update task in '{row.status}' status.",
+            )
         updates = payload.model_dump(exclude_none=True)
         if "delivery_mode" in updates:
             row.delivery_mode = updates.pop("delivery_mode")

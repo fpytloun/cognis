@@ -1515,6 +1515,12 @@ class AgentLoop:
                         )
                     )
 
+            # Flush events incrementally for workflow steps so they are
+            # visible in session logs during execution (direct chat uses
+            # WebSocket streaming instead).
+            if not ctx.is_direct and events_to_record:
+                await self._flush_events_incremental(ctx, events_to_record)
+
             # Check if step_complete was called in this batch
             if step_output is not None:
                 break
@@ -1550,8 +1556,11 @@ class AgentLoop:
                     }
                 )
 
-        # Finalize step
-        events_recorded = await self._finalize_step(ctx, events_to_record)
+        # Finalize step — pass assistant_content_parts so Mnemory remember
+        # works even when events were already flushed incrementally.
+        events_recorded = await self._finalize_step(
+            ctx, events_to_record, assistant_content_parts=assistant_content_parts
+        )
 
         # Automatic compaction: if context assembly recommended compaction
         # and events were successfully recorded, compact + rotate session
@@ -2298,10 +2307,51 @@ class AgentLoop:
         """Return todos that are not done or cancelled."""
         return [t for t in ctx.todos if t.get("status") not in ("done", "cancelled")]
 
+    async def _flush_events_incremental(
+        self,
+        ctx: StepContext,
+        events: list[SessionEvent],
+    ) -> None:
+        """Flush accumulated events to Intaris without finalizing the step.
+
+        Used for workflow steps to make events visible in session logs
+        during execution instead of waiting for the entire step to complete.
+        Events are moved out of the list (cleared) on success so they are
+        not recorded again by ``_finalize_step``.
+        """
+        if not events:
+            return
+        batch = list(events)
+        intaris_id = ctx.session.intaris_session_id or ctx.session.session_id
+        try:
+            append_result = await self.providers.guardrails.record_events(
+                session_id=intaris_id,
+                events=batch,
+                source="cognis",
+            )
+            if append_result.ok:
+                await self.session_cache.append_recorded_events(ctx.session, batch, append_result)
+                events.clear()
+            else:
+                logger.debug(
+                    "agent: incremental flush returned ok=False, will retry at finalize",
+                    extra={"extra_data": {"session_id": ctx.session.session_id}},
+                )
+        except Exception:
+            # Non-fatal — events stay in the list and will be retried
+            # by _finalize_step at the end of the step.
+            logger.debug(
+                "agent: incremental flush failed, will retry at finalize",
+                extra={"extra_data": {"session_id": ctx.session.session_id}},
+                exc_info=True,
+            )
+
     async def _finalize_step(
         self,
         ctx: StepContext,
         events: list[SessionEvent],
+        *,
+        assistant_content_parts: list[str] | None = None,
     ) -> bool:
         """Record events to Intaris, update cache, dispatch remember.
 
@@ -2311,6 +2361,9 @@ class AgentLoop:
         would lose the current turn's events.
         """
         if not events:
+            # Events may have been flushed incrementally — still dispatch
+            # Mnemory remember using the accumulated assistant content.
+            await self._dispatch_remember(ctx, assistant_content_parts)
             return True
 
         intaris_id = ctx.session.intaris_session_id or ctx.session.session_id
@@ -2356,21 +2409,37 @@ class AgentLoop:
                 },
             )
 
-        # Dispatch remember to retry queue
-        assistant_content = " ".join(
-            e.data.get("content", "")
-            for e in events
-            if e.type == "assistant_message" and e.data.get("content")
-        )
-        if assistant_content and ctx.session.mnemory_session_id:
+        # Dispatch remember — use assistant_content_parts if provided
+        # (covers incrementally-flushed events), fall back to extracting
+        # from the events list (covers the non-incremental path).
+        if assistant_content_parts is None:
+            extracted = [
+                e.data.get("content", "")
+                for e in events
+                if e.type == "assistant_message" and e.data.get("content")
+            ]
+            await self._dispatch_remember(ctx, extracted or None)
+        else:
+            await self._dispatch_remember(ctx, assistant_content_parts)
+
+        return events_recorded
+
+    async def _dispatch_remember(
+        self,
+        ctx: StepContext,
+        content_parts: list[str] | None,
+    ) -> None:
+        """Enqueue assistant content to Mnemory remember queue."""
+        if not content_parts or not ctx.session.mnemory_session_id:
+            return
+        assistant_content = " ".join(content_parts)
+        if assistant_content.strip():
             await self.remember_queue.enqueue(
                 {
                     "session_id": ctx.session.mnemory_session_id,
                     "messages": [{"role": "assistant", "content": assistant_content[:5000]}],
                 }
             )
-
-        return events_recorded
 
     async def _auto_compact(self, ctx: StepContext) -> None:
         """Automatically compact and rotate the session post-turn.

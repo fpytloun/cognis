@@ -73,6 +73,7 @@ class TaskQueue:
         workflow_engine: WorkflowEngine,
         workflow_registry: WorkflowRegistry,
         event_bus: EventBus,
+        llm_provider: Any = None,
         max_active_steps_global: int = DEFAULT_MAX_ACTIVE_STEPS_GLOBAL,
         max_active_steps_per_agent: int = DEFAULT_MAX_ACTIVE_STEPS_PER_AGENT,
         poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
@@ -81,6 +82,7 @@ class TaskQueue:
         self._workflow_engine = workflow_engine
         self._workflow_registry = workflow_registry
         self._event_bus = event_bus
+        self._llm_provider = llm_provider
         self._max_active_global = max_active_steps_global
         self._max_active_per_agent = max_active_steps_per_agent
         self._poll_interval = poll_interval_seconds
@@ -100,6 +102,7 @@ class TaskQueue:
         workflow_engine: WorkflowEngine,
         workflow_registry: WorkflowRegistry,
         event_bus: EventBus,
+        llm_provider: Any = None,
     ) -> TaskQueue:
         """Create a TaskQueue with DB-backed settings."""
         async with session_factory() as db_session:
@@ -118,6 +121,7 @@ class TaskQueue:
             workflow_engine=workflow_engine,
             workflow_registry=workflow_registry,
             event_bus=event_bus,
+            llm_provider=llm_provider,
             max_active_steps_global=int(max_global)
             if isinstance(max_global, int)
             else DEFAULT_MAX_ACTIVE_STEPS_GLOBAL,
@@ -563,6 +567,66 @@ class TaskQueue:
         # Start workflow execution in background
         self._launch_task_run(task)
 
+    async def _select_workflow_for_task(self, task: TaskModel) -> str:
+        """Auto-select a workflow using the LLM classifier.
+
+        Falls back to ``system:direct`` if the classifier is unavailable
+        or no workflows match.  Persists the selection to the DB so the
+        user can see which workflow was chosen.
+        """
+        if self._llm_provider is None:
+            return "system:direct"
+
+        from cognis.core.decision import select_workflow
+
+        try:
+            available = await self._workflow_registry.list_all()
+            if not available:
+                return "system:direct"
+
+            selection = await select_workflow(
+                llm=self._llm_provider,
+                task_description=task.description or task.title,
+                available_workflows=[
+                    {
+                        "workflow_id": w.workflow_id,
+                        "name": w.name,
+                        "criteria": w.criteria,
+                    }
+                    for w in available
+                ],
+                default_workflow_id="system:research",
+            )
+            workflow_id = selection.workflow_id
+            logger.info(
+                "Auto-selected workflow for task",
+                extra={
+                    "extra_data": {
+                        "task_id": task.task_id,
+                        "workflow_id": workflow_id,
+                        "confidence": selection.confidence,
+                        "reason": selection.reason,
+                    }
+                },
+            )
+        except Exception:
+            logger.warning(
+                "Workflow auto-selection failed, falling back to system:direct",
+                extra={"extra_data": {"task_id": task.task_id}},
+                exc_info=True,
+            )
+            workflow_id = "system:direct"
+
+        # Persist the selected workflow on the task for visibility
+        task.workflow_id = workflow_id
+        async with self._session_factory() as db_session:
+            row = await get_task(db_session, task.task_id)
+            if row is not None:
+                row.workflow_id = workflow_id
+                await db_session.commit()
+
+        return workflow_id
+
     async def _run_task(self, task: TaskModel) -> None:
         """Execute a task's workflow.
 
@@ -576,8 +640,11 @@ class TaskQueue:
             agent_id=task.agent_id,
         ):
             try:
-                # Resolve workflow
-                workflow_id = task.workflow_id or "system:direct"
+                # Resolve workflow — auto-select via LLM classifier if not set
+                if task.workflow_id:
+                    workflow_id = task.workflow_id
+                else:
+                    workflow_id = await self._select_workflow_for_task(task)
                 workflow = await self._workflow_registry.get(workflow_id)
                 if workflow is None:
                     logger.warning(

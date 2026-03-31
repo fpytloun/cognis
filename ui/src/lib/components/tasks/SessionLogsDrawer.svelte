@@ -26,8 +26,12 @@
   let error = $state('');
   let timeline = $state<TimelineItem[]>([]);
 
+  let initialLoadDone = $state(false);
+
   async function loadEvents(): Promise<void> {
-    loading = true;
+    // Only show loading spinner on the first load — background refreshes
+    // update the timeline in-place without blanking the UI.
+    if (!initialLoadDone) loading = true;
     error = '';
     try {
       const result = await api.conversations.sessionEvents(conversationId, sessionId, 0, 200);
@@ -36,6 +40,7 @@
       error = asApiError(caughtError).message;
     } finally {
       loading = false;
+      initialLoadDone = true;
     }
   }
 
@@ -47,8 +52,15 @@
     if (event.target === event.currentTarget) onclose();
   }
 
+  let pollTimer: number | null = null;
+
   onMount(() => {
     void loadEvents();
+    // Auto-refresh every 3 seconds so events appear during execution
+    pollTimer = window.setInterval(() => { void loadEvents(); }, 3000);
+    return () => {
+      if (pollTimer !== null) window.clearInterval(pollTimer);
+    };
   });
 </script>
 

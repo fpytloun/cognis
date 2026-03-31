@@ -439,7 +439,7 @@ class WorkflowEngine:
             step_run_id=step_run_id,
             is_direct=False,
             is_retry=is_retry,
-            user_message=step_def.prompt,
+            user_message=step_def.prompt.replace("{user_message}", task.description or task.title),
             interaction_mode=workflow.interaction.mode,
             tool_registry=tool_registry,
             executor_connection=executor_connection,
