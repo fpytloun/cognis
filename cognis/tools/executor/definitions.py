@@ -15,7 +15,13 @@ from cognis.tools.executor.filesystem import (
 )
 from cognis.tools.executor.search import handle_glob, handle_grep
 from cognis.tools.executor.shell import handle_bash
-from cognis.tools.executor.web import handle_web_fetch
+from cognis.tools.executor.web import (
+    handle_web_crawl,
+    handle_web_fetch,
+    handle_web_map,
+    handle_web_research,
+    handle_web_search,
+)
 
 _EXECUTOR_SOURCE = ToolSource(type="executor")
 
@@ -222,7 +228,12 @@ BASH_TOOL = ToolDefinition(
 
 WEB_FETCH_TOOL = ToolDefinition(
     name="web_fetch",
-    description="Fetch content from a URL and return it as text or markdown.",
+    description=(
+        "Fetch content from a URL and return it as text or markdown. "
+        "Supports configurable backends. Use 'direct' for simple page fetching "
+        "(default, free), 'tavily' for higher-quality extraction with content "
+        "reranking. The 'backend' parameter overrides the system default."
+    ),
     parameters={
         "type": "object",
         "properties": {
@@ -233,6 +244,13 @@ WEB_FETCH_TOOL = ToolDefinition(
                 "description": "Output format (default: markdown)",
             },
             "timeout": {"type": "integer", "description": "Timeout in seconds (max 120)"},
+            "backend": {
+                "type": "string",
+                "description": (
+                    "Backend to use: 'direct' (default, free), 'tavily' "
+                    "(higher quality extraction). Overrides system default."
+                ),
+            },
         },
         "required": ["url"],
     },
@@ -240,6 +258,168 @@ WEB_FETCH_TOOL = ToolDefinition(
     category="web",
     read_only=True,
     timeout_seconds=60,
+)
+
+WEB_SEARCH_TOOL = ToolDefinition(
+    name="web_search",
+    description=(
+        "Search the web for information. Returns relevant results with titles, "
+        "URLs, and content snippets. Backends: 'direct' (DuckDuckGo, free), "
+        "'tavily' (AI-optimized, supports answer generation), "
+        "'brave' (large index, freshness filters). "
+        "The 'backend' parameter overrides the system default."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Search query"},
+            "num_results": {
+                "type": "integer",
+                "description": "Number of results (default: 8, max varies by backend)",
+            },
+            "backend": {
+                "type": "string",
+                "description": (
+                    "Backend: 'direct' (DuckDuckGo, free), 'tavily', 'brave'. "
+                    "Overrides system default."
+                ),
+            },
+            "search_depth": {
+                "type": "string",
+                "enum": ["basic", "advanced", "fast", "ultra-fast"],
+                "description": "Tavily: search depth (default: basic)",
+            },
+            "topic": {
+                "type": "string",
+                "enum": ["general", "news", "finance"],
+                "description": "Tavily: topic category (default: general)",
+            },
+            "include_answer": {
+                "type": "boolean",
+                "description": "Tavily: generate LLM answer from results",
+            },
+            "time_range": {
+                "type": "string",
+                "description": (
+                    "Recency filter. Tavily: 'day','week','month','year'. "
+                    "Brave: 'pd','pw','pm','py' or 'YYYY-MM-DDtoYYYY-MM-DD'."
+                ),
+            },
+            "country": {
+                "type": "string",
+                "description": "Country filter (Tavily: full name, Brave: 2-letter code)",
+            },
+        },
+        "required": ["query"],
+    },
+    source=_EXECUTOR_SOURCE,
+    category="web",
+    read_only=True,
+    timeout_seconds=60,
+)
+
+WEB_CRAWL_TOOL = ToolDefinition(
+    name="web_crawl",
+    description=(
+        "Crawl a website starting from a URL. Extracts content from pages "
+        "with configurable depth and breadth. Requires Tavily backend."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "url": {"type": "string", "description": "Root URL to begin crawl"},
+            "max_depth": {
+                "type": "integer",
+                "description": "How deep to crawl (1-5, default: 1)",
+            },
+            "max_breadth": {
+                "type": "integer",
+                "description": "Max links per level (1-500, default: 20)",
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Total pages to process (default: 50)",
+            },
+            "instructions": {
+                "type": "string",
+                "description": "Natural language instructions for the crawler",
+            },
+            "extract_depth": {
+                "type": "string",
+                "enum": ["basic", "advanced"],
+                "description": "Extraction depth (default: basic)",
+            },
+        },
+        "required": ["url"],
+    },
+    source=_EXECUTOR_SOURCE,
+    category="web",
+    read_only=True,
+    timeout_seconds=120,
+)
+
+WEB_MAP_TOOL = ToolDefinition(
+    name="web_map",
+    description=(
+        "Map a website's structure. Returns a list of URLs found starting "
+        "from the base URL. Useful for discovering site structure before "
+        "crawling. Requires Tavily backend."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "url": {"type": "string", "description": "Root URL to map"},
+            "max_depth": {
+                "type": "integer",
+                "description": "Mapping depth (1-5, default: 1)",
+            },
+            "max_breadth": {
+                "type": "integer",
+                "description": "Links per level (1-500, default: 20)",
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Total pages to map (default: 50)",
+            },
+            "instructions": {
+                "type": "string",
+                "description": "Natural language instructions for the mapper",
+            },
+        },
+        "required": ["url"],
+    },
+    source=_EXECUTOR_SOURCE,
+    category="web",
+    read_only=True,
+    timeout_seconds=150,
+)
+
+WEB_RESEARCH_TOOL = ToolDefinition(
+    name="web_research",
+    description=(
+        "Perform comprehensive research on a topic. Uses multiple searches "
+        "and source analysis to produce a detailed report. "
+        "Requires Tavily backend."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "input": {"type": "string", "description": "Research task description"},
+            "model": {
+                "type": "string",
+                "enum": ["mini", "pro", "auto"],
+                "description": (
+                    "Research depth: 'mini' for narrow tasks, 'pro' for broad, "
+                    "'auto' selects automatically (default: auto)"
+                ),
+            },
+        },
+        "required": ["input"],
+    },
+    source=_EXECUTOR_SOURCE,
+    category="web",
+    read_only=True,
+    timeout_seconds=300,
 )
 
 # -- Public API ----------------------------------------------------------------
@@ -255,6 +435,10 @@ ALL_EXECUTOR_TOOLS: list[ToolDefinition] = [
     GREP_TOOL,
     BASH_TOOL,
     WEB_FETCH_TOOL,
+    WEB_SEARCH_TOOL,
+    WEB_CRAWL_TOOL,
+    WEB_MAP_TOOL,
+    WEB_RESEARCH_TOOL,
 ]
 
 _HANDLER_MAP: dict[
@@ -271,6 +455,10 @@ _HANDLER_MAP: dict[
     "grep": handle_grep,
     "bash": handle_bash,
     "web_fetch": handle_web_fetch,
+    "web_search": handle_web_search,
+    "web_crawl": handle_web_crawl,
+    "web_map": handle_web_map,
+    "web_research": handle_web_research,
 }
 
 

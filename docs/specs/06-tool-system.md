@@ -277,26 +277,31 @@ bash_tool = ToolDefinition(
 
 ### Web Tools
 
+Web tools support configurable backends. The default backend is set via the
+`web.backend` setting (`"direct"`, `"tavily"`, or `"brave"`). Each tool call
+can override the default with a `backend` parameter.
+
+**Backends:**
+
+| Backend | Fetch | Search | Crawl/Map/Research | API Key Required |
+|---------|-------|--------|--------------------|------------------|
+| `direct` | httpx + browser headers | DuckDuckGo | no | no |
+| `tavily` | Tavily Extract | Tavily Search | yes | yes (`tavily_api_key`) |
+| `brave` | falls back to direct | Brave Web Search | no | yes (`brave_api_key`) |
+
 ```python
-# web_fetch — Fetch URL content
-web_fetch_tool = ToolDefinition(
-    name="web_fetch",
-    description="Fetch content from a URL and return it as text or markdown.",
-    parameters={
-        "type": "object",
-        "properties": {
-            "url": {"type": "string", "description": "URL to fetch"},
-            "format": {"type": "string", "enum": ["text", "markdown", "html"]},
-            "timeout": {"type": "integer", "description": "Timeout in seconds (max 120)"},
-        },
-        "required": ["url"],
-    },
-    source=ToolSource(type="executor"),
-    category="web",
-    read_only=True,
-    timeout_seconds=60,
-)
+# web_fetch — Fetch URL content (supports direct + tavily backends)
+# web_search — Search the web (supports direct + tavily + brave backends)
+# web_crawl — Crawl a website (requires tavily)
+# web_map — Map site structure (requires tavily)
+# web_research — Deep research (requires tavily)
 ```
+
+The direct backend uses browser-like headers (Chrome User-Agent, Accept,
+Sec-Fetch-* headers) to avoid bot detection. It retries on HTTP 429 with
+exponential backoff and Retry-After header support. Cloudflare-protected
+sites that require browser access return an actionable error suggesting
+the Tavily backend.
 
 ### Safety Classification
 
@@ -312,6 +317,10 @@ web_fetch_tool = ToolDefinition(
 | `grep` | yes | no | Read-only content search |
 | `bash` | no | **yes** | Arbitrary command execution |
 | `web_fetch` | yes | no | Read-only URL fetching |
+| `web_search` | yes | no | Read-only web search |
+| `web_crawl` | yes | no | Read-only website crawling |
+| `web_map` | yes | no | Read-only site structure mapping |
+| `web_research` | yes | no | Read-only research |
 
 Write operations always go through Intaris evaluation regardless of agent
 permissions. Read-only tools can be auto-approved by agent permission matrix.

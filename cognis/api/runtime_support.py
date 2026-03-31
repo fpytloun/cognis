@@ -163,6 +163,10 @@ def build_step_runtime_factory(
         db_config = executor_config.get("config", {}) if executor_config else {}
         runtime_metadata = {"user_email": user_email, **db_config}
 
+        # Inject web backend config (backend name + API keys)
+        web_config = await _resolve_web_config(providers)
+        runtime_metadata.update(web_config)
+
         # Filter tools by agent config AND executor enablement
         agent_tools = select_static_tools(agent)
         if executor_config is not None:
@@ -257,6 +261,56 @@ async def _resolve_executor_config(
     except Exception:
         logger.warning("Failed to resolve executor config from DB", exc_info=True)
         return None
+
+
+async def _resolve_web_config(providers: Any) -> dict[str, Any]:
+    """Resolve web backend configuration from settings and secrets.
+
+    Returns a dict with keys suitable for merging into runtime_metadata:
+    - web_backend: str — default backend name ("direct", "tavily", "brave")
+    - web_secrets: dict — API keys for configured backends
+    - web_available_backends: list[str] — backends that have API keys configured
+    """
+    web_backend = "direct"
+    web_secrets: dict[str, str] = {}
+
+    # Read web.backend setting from DB
+    session_factory = getattr(providers, "_session_factory", None)
+    if session_factory is not None:
+        try:
+            from cognis.store.queries import get_setting
+
+            async with session_factory() as session:
+                setting = await get_setting(session, "web.backend")
+                if setting:
+                    web_backend = str(setting)
+        except Exception:
+            logger.debug("web: failed to read web.backend setting", exc_info=True)
+
+    # Read API keys from secrets provider
+    try:
+        if hasattr(providers, "secrets") and hasattr(providers.secrets, "get_value"):
+            for secret_name in ("tavily_api_key", "brave_api_key"):
+                try:
+                    value = await providers.secrets.get_value(secret_name)
+                    if value:
+                        web_secrets[secret_name] = value
+                except Exception:
+                    pass
+    except Exception:
+        logger.debug("web: failed to read web secrets", exc_info=True)
+
+    available = ["direct"]
+    if web_secrets.get("tavily_api_key"):
+        available.append("tavily")
+    if web_secrets.get("brave_api_key"):
+        available.append("brave")
+
+    return {
+        "web_backend": web_backend,
+        "web_secrets": web_secrets,
+        "web_available_backends": available,
+    }
 
 
 def _parse_local_mcp_servers(agent: AgentDefinition) -> list[MCPServerConfig]:
