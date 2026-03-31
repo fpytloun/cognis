@@ -38,6 +38,8 @@ class MemoryProvider(Protocol):
         role: str | None = None,
         labels: dict[str, Any] | None = None,
         context: str | None = None,
+        user_email: str | None = None,
+        agent_id: str | None = None,
     ) -> None: ...
 
     async def add_memory(

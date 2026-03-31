@@ -124,6 +124,7 @@ class MnemoryProvider:
         labels: dict[str, Any] | None = None,
         context: str | None = None,
         user_email: str | None = None,
+        agent_id: str | None = None,
     ) -> None:
         logger.info(
             "mnemory: remember",
@@ -137,8 +138,12 @@ class MnemoryProvider:
             "context": context,
         }
         try:
-            response = await self.client.post(
-                "/api/remember", json=payload, headers=self._headers(user_email=user_email)
+            response = await self.breaker.call(
+                lambda: self.client.post(
+                    "/api/remember",
+                    json=payload,
+                    headers=self._headers(agent_id=agent_id, user_email=user_email),
+                )
             )
             response.raise_for_status()
         except Exception:
@@ -236,7 +241,7 @@ class MnemoryProvider:
     async def health(self) -> ProviderHealth:
         start = perf_counter()
         try:
-            response = await self.client.get("/health", headers=self._headers())
+            response = await self.client.get("/health")
             latency_ms = (perf_counter() - start) * 1000
             if response.is_success:
                 return ProviderHealth(

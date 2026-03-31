@@ -2436,7 +2436,13 @@ class AgentLoop:
         content_parts: list[str] | None,
     ) -> None:
         """Enqueue assistant content to Mnemory remember queue."""
-        if not content_parts or not ctx.session.mnemory_session_id:
+        if not content_parts:
+            return
+        if not ctx.session.mnemory_session_id:
+            logger.warning(
+                "agent: skipping remember — no mnemory_session_id",
+                extra={"extra_data": {"session_id": ctx.session.session_id}},
+            )
             return
         assistant_content = " ".join(content_parts)
         if assistant_content.strip():
@@ -2444,6 +2450,8 @@ class AgentLoop:
                 {
                     "session_id": ctx.session.mnemory_session_id,
                     "messages": [{"role": "assistant", "content": assistant_content[:5000]}],
+                    "user_email": ctx.session.user_email,
+                    "agent_id": ctx.session.agent_id,
                 }
             )
 
