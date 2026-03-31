@@ -432,7 +432,7 @@ dependencies = [
     { name = "alembic" },
     { name = "argon2-cffi" },
     { name = "cryptography" },
-    { name = "duckduckgo-search" },
+    { name = "ddgs" },
     { name = "email-validator" },
     { name = "fastapi" },
     { name = "httpx" },
@@ -469,7 +469,7 @@ requires-dist = [
     { name = "argon2-cffi", specifier = ">=23.1.0" },
     { name = "asyncpg", marker = "extra == 'postgres'", specifier = ">=0.29.0" },
     { name = "cryptography", specifier = ">=42.0.0" },
-    { name = "duckduckgo-search", specifier = ">=7.0.0" },
+    { name = "ddgs", specifier = ">=9.0.0" },
     { name = "email-validator", specifier = ">=2.0.0" },
     { name = "fastapi", specifier = ">=0.115.0" },
     { name = "httpx", specifier = ">=0.27.0" },
@@ -640,6 +640,20 @@ wheels = [
 ]
 
 [[package]]
+name = "ddgs"
+version = "9.12.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "click" },
+    { name = "lxml" },
+    { name = "primp" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/bf/0e/8059c8e804cb9f7d24606536c6c3449375a8a04abdb845a33d740eb8f2e4/ddgs-9.12.0.tar.gz", hash = "sha256:29e8285cb0492602d979ea5b0842baa9960e9168f82ccf8c21841a8341128835", size = 36930, upload-time = "2026-03-27T16:16:04.869Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/62/8f/c5229d519af06a1405ad83bf4d0429d5d3c29b7c9dc51a96d2afba26bdeb/ddgs-9.12.0-py3-none-any.whl", hash = "sha256:54f24abdff538e8f9b83f99af99455776021419b704b11d796b17825f8baff1a", size = 45452, upload-time = "2026-03-27T16:16:03.677Z" },
+]
+
+[[package]]
 name = "distro"
 version = "1.9.0"
 source = { registry = "https://pypi.org/simple" }
@@ -655,20 +669,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/8c/8b/57666417c0f90f08bcafa776861060426765fdb422eb10212086fb811d26/dnspython-2.8.0.tar.gz", hash = "sha256:181d3c6996452cb1189c4046c61599b84a5a86e099562ffde77d26984ff26d0f", size = 368251, upload-time = "2025-09-07T18:58:00.022Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/ba/5a/18ad964b0086c6e62e2e7500f7edc89e3faa45033c71c1893d34eed2b2de/dnspython-2.8.0-py3-none-any.whl", hash = "sha256:01d9bbc4a2d76bf0db7c1f729812ded6d912bd318d3b1cf81d30c0f845dbf3af", size = 331094, upload-time = "2025-09-07T18:57:58.071Z" },
-]
-
-[[package]]
-name = "duckduckgo-search"
-version = "8.1.1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "click" },
-    { name = "lxml" },
-    { name = "primp" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/10/ef/07791a05751e6cc9de1dd49fb12730259ee109b18e6d097e25e6c32d5617/duckduckgo_search-8.1.1.tar.gz", hash = "sha256:9da91c9eb26a17e016ea1da26235d40404b46b0565ea86d75a9f78cc9441f935", size = 22868, upload-time = "2025-07-06T15:30:59.73Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/db/72/c027b3b488b1010cf71670032fcf7e681d44b81829d484bb04e31a949a8d/duckduckgo_search-8.1.1-py3-none-any.whl", hash = "sha256:f48adbb06626ee05918f7e0cef3a45639e9939805c4fc179e68c48a12f1b5062", size = 18932, upload-time = "2025-07-06T15:30:58.339Z" },
 ]
 
 [[package]]

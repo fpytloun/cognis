@@ -35,7 +35,7 @@ dependencies = [
     "python-jose[cryptography]>=3.3.0",
     "prometheus-client>=0.20.0",
     "markdownify>=0.14.0",
-    "duckduckgo-search>=7.0.0",
+    "ddgs>=9.0.0",
 ]
 
 [project.optional-dependencies]
@@ -116,6 +116,6 @@ module = [
     "alembic.*",
     "jose.*",
     "markdownify.*",
-    "duckduckgo_search.*",
+    "ddgs.*",
 ]
 ignore_missing_imports = true

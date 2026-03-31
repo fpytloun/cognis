@@ -120,19 +120,17 @@ async def _ddg_search(
     import asyncio
 
     def _sync_search() -> list[dict[str, str]]:
-        from duckduckgo_search import DDGS  # type: ignore[import-untyped]
+        from ddgs import DDGS  # type: ignore[import-untyped]
 
-        with DDGS() as ddgs:
-            results = list(
-                ddgs.text(
-                    query,
-                    max_results=max_results,
-                    region=region,
-                    safesearch=safesearch,
-                    timelimit=timelimit,
-                )
+        return list(
+            DDGS().text(
+                query,
+                max_results=max_results,
+                region=region,
+                safesearch=safesearch,
+                timelimit=timelimit,
             )
-        return results
+        )
 
     results = await asyncio.to_thread(_sync_search)
 
