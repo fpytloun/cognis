@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from cognis.core.agent_loop import AgentLoop, PauseWaiter, SessionLock, StepContext
+from cognis.core.agent_loop import CHAT_POLICY, AgentLoop, PauseWaiter, SessionLock, StepContext
 from cognis.core.compaction import CompactionResult
 from cognis.core.events import Event, EventBus
 from cognis.core.session_cache import CachedEvent, CachedSessionState
@@ -206,7 +206,7 @@ def _step_context(session: SessionModel | None = None) -> StepContext:
             name="Test Agent",
             owner_email="user@example.com",
         ),
-        is_direct=True,
+        policy=CHAT_POLICY,
     )
 
 

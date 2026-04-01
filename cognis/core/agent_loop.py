@@ -503,9 +503,6 @@ class StepContext:
     task_expected_output: str | None = None
     step_run_id: str | None = None
     policy: ExecutionPolicy = field(default_factory=lambda: CHAT_POLICY)
-    is_direct: bool = (
-        False  # DEPRECATED — use policy fields instead. Kept temporarily for migration.
-    )
     is_retry: bool = False  # True for re-attempt within the same step
     user_message: str = ""
     prior_context: list[dict[str, Any]] | None = None  # Prior step output messages
@@ -719,7 +716,6 @@ class AgentLoop:
             conversation=conversation,
             agent=resolved_agent,
             policy=DELEGATION_POLICY,
-            is_direct=False,
             user_message=task_description,
             system_initiated=True,
             interaction_mode="explicit_gates",

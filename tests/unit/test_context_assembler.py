@@ -218,27 +218,26 @@ async def test_context_assembler_uses_search_mode_for_follow_up_turns() -> None:
 
 
 @pytest.mark.asyncio
-async def test_context_assembler_uses_warm_cache_when_event_refresh_fails() -> None:
+async def test_context_assembler_raises_on_mnemory_failure() -> None:
+    """Mnemory is a mandatory provider — failure must raise, not degrade."""
     assembler = ContextAssembler(
         memory=_Memory(fail=True),
         guardrails=_Guardrails(),
         llm=_LLM(),
-        session_cache=_SessionCache(fail_refresh=True),
+        session_cache=_SessionCache(),
         session_manager=_SessionManager(),
         max_context_tokens=4096,
         compaction_threshold=0.85,
     )
 
-    result = await assembler.assemble(
-        session=_session(),
-        conversation=_conversation(),
-        agent=_agent(),
-        user_message="still works",
-        tool_definitions=[],
-    )
-
-    assert result.degraded is True
-    assert set(result.degraded_sources) == {"events", "memory"}
+    with pytest.raises(RuntimeError, match="mnemory unavailable"):
+        await assembler.assemble(
+            session=_session(),
+            conversation=_conversation(),
+            agent=_agent(),
+            user_message="should fail",
+            tool_definitions=[],
+        )
 
 
 @pytest.mark.asyncio

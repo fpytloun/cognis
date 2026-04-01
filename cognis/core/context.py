@@ -152,31 +152,50 @@ class ContextAssembler:
             intention_task = self.guardrails.get_session(
                 session.intaris_session_id or session.session_id
             )
+            # Providers are mandatory — any failure propagates immediately.
+            # Intention is best-effort (non-critical for turn execution).
             gathered_results: tuple[Any, Any, Any] = await asyncio.gather(
                 recall_task,
                 refresh_task,
                 intention_task,
-                return_exceptions=True,
+                return_exceptions=True,  # Intention may fail independently
             )
         recall_result, cache_result, intention_result = gathered_results
 
         degraded_sources: list[str] = []
 
+        # Mnemory is mandatory — raise if recall failed
+        if isinstance(recall_result, Exception):
+            logger.error(
+                "context: Mnemory recall failed (mandatory provider)",
+                extra={"extra_data": {"session_id": session.session_id}},
+                exc_info=recall_result,
+            )
+            raise recall_result
+
+        # Intaris event refresh is mandatory — raise if failed
         if isinstance(cache_result, Exception):
+            # Allow if we have a warm cache from a previous refresh
             cache_entry = self.session_cache.get_entry(session.session_id)
             if cache_entry is None or not cache_entry.initialized:
+                logger.error(
+                    "context: Intaris event refresh failed (mandatory provider, no cache)",
+                    extra={"extra_data": {"session_id": session.session_id}},
+                    exc_info=cache_result,
+                )
                 raise cache_result
             logger.warning(
-                "context: degraded source=events",
+                "context: Intaris refresh failed but cache is warm, continuing",
                 extra={"extra_data": {"session_id": session.session_id}},
             )
             degraded_sources.append("events")
         else:
             cache_entry = cache_result
 
+        # Intention is best-effort (non-critical)
         if isinstance(intention_result, Exception):
             logger.warning(
-                "context: degraded source=intention",
+                "context: intention fetch failed (non-critical)",
                 extra={"extra_data": {"session_id": session.session_id}},
             )
             degraded_sources.append("intention")
@@ -219,57 +238,43 @@ class ContextAssembler:
         immutable_core_memories: str | None = None
         mutable_search_results: str | None = None
 
-        if isinstance(recall_result, Exception):
-            logger.warning(
-                "context: degraded source=memory",
-                extra={"extra_data": {"session_id": session.session_id}},
+        # recall_result is guaranteed to be a dict here (we raise on Exception above).
+        recall_payload: dict[str, Any] = recall_result
+        recall_session_id = str(recall_payload.get("session_id") or "").strip()
+        if session.mnemory_session_id is None and recall_session_id:
+            updated = await self.session_manager.attach_mnemory_session(
+                session.session_id, recall_session_id
             )
-            degraded_sources.append("memory")
+            if updated:
+                session.mnemory_session_id = recall_session_id
 
-            # Fall back to cached immutable memory if available
+        # Extract the three memory parts from the recall response
+        raw_instructions = recall_payload.get("instructions")
+        raw_core = recall_payload.get("core_memories")
+        raw_search = recall_payload.get("search_results")
+
+        if isinstance(raw_instructions, str) and raw_instructions.strip():
+            immutable_instructions = raw_instructions.strip()
+        if isinstance(raw_core, str) and raw_core.strip():
+            immutable_core_memories = raw_core.strip()
+
+        # Cache immutable parts on first recall (or refresh on stale)
+        if immutable_instructions or immutable_core_memories:
+            await self.session_cache.cache_memory(
+                session.session_id, immutable_instructions, immutable_core_memories
+            )
+        else:
+            # Use cached values if recall didn't return new ones
+            # (subsequent calls don't include instructions/core)
             cached_instr, cached_core, cache_valid = self.session_cache.get_cached_memory(
                 session.session_id
             )
-            if cached_instr or cached_core:
+            if cache_valid:
                 immutable_instructions = cached_instr
                 immutable_core_memories = cached_core
-        else:
-            recall_payload: dict[str, Any] = recall_result
-            recall_session_id = str(recall_payload.get("session_id") or "").strip()
-            if session.mnemory_session_id is None and recall_session_id:
-                updated = await self.session_manager.attach_mnemory_session(
-                    session.session_id, recall_session_id
-                )
-                if updated:
-                    session.mnemory_session_id = recall_session_id
 
-            # Extract the three memory parts from the recall response
-            raw_instructions = recall_payload.get("instructions")
-            raw_core = recall_payload.get("core_memories")
-            raw_search = recall_payload.get("search_results")
-
-            if isinstance(raw_instructions, str) and raw_instructions.strip():
-                immutable_instructions = raw_instructions.strip()
-            if isinstance(raw_core, str) and raw_core.strip():
-                immutable_core_memories = raw_core.strip()
-
-            # Cache immutable parts on first recall (or refresh on stale)
-            if immutable_instructions or immutable_core_memories:
-                await self.session_cache.cache_memory(
-                    session.session_id, immutable_instructions, immutable_core_memories
-                )
-            else:
-                # Use cached values if recall didn't return new ones
-                # (subsequent calls don't include instructions/core)
-                cached_instr, cached_core, cache_valid = self.session_cache.get_cached_memory(
-                    session.session_id
-                )
-                if cache_valid:
-                    immutable_instructions = cached_instr
-                    immutable_core_memories = cached_core
-
-            # Format mutable search results
-            mutable_search_results = _format_search_results(raw_search)
+        # Format mutable search results
+        mutable_search_results = _format_search_results(raw_search)
 
         # Model resolution chain: session override → agent config → system default
         model_override = self.session_cache.get_model_override(session.session_id)
