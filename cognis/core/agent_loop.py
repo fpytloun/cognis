@@ -553,6 +553,10 @@ class AgentLoop:
         self.pause_waiter = pause_waiter
         self.tool_output_store = tool_output_store
         self._task_queue: Any = None
+        # Emergency event flush support — tracks pending events across
+        # _execute_step and run_step for exception-path persistence.
+        self._pending_events: list[SessionEvent] | None = None
+        self._pending_events_ctx: StepContext | None = None
         # Track active child sessions per parent session for /stop cancellation
         self._active_children: dict[str, dict[str, asyncio.Task[Any]]] = {}
         self._children_lock = asyncio.Lock()
@@ -597,12 +601,18 @@ class AgentLoop:
                 ctx, on_token=on_token, on_tool_call=on_tool_call, on_tool_result=on_tool_result
             )
         except StepInterrupted:
+            # Emergency flush: persist any accumulated events before
+            # the cancellation propagates — events represent real work.
+            await self._emergency_flush_events(ctx, self._pending_events)
             raise
         except Exception as exc:
             logger.exception(
                 "Agent loop step failed",
                 extra={"extra_data": {"session_id": ctx.session.session_id}},
             )
+            # Emergency flush: persist any accumulated events before
+            # reporting failure — preserves tool call history for the UI.
+            await self._emergency_flush_events(ctx, self._pending_events)
             STEPS_TOTAL.labels(step_type=ctx.step_definition.type, status="error").inc()
             # Return a StepOutput with the error so it can be stored and
             # displayed in the UI instead of silently returning None.
@@ -943,6 +953,9 @@ class AgentLoop:
         todo_reprompt_count = 0
         step_output: StepOutput | None = None
         events_to_record: list[SessionEvent] = []
+        # Store on instance for emergency flush access from run_step
+        self._pending_events = events_to_record
+        self._pending_events_ctx = ctx
         messages: list[dict[str, Any]] = []
         assistant_content_parts: list[str] = []  # Accumulate full assistant output
 
@@ -1089,6 +1102,15 @@ class AgentLoop:
                     await on_token(text_delta)
 
             if mid_stream_error:
+                # Capture partial content accumulated before stream failure
+                partial_content = accumulator.get_content()
+                if partial_content:
+                    events_to_record.append(
+                        SessionEvent(type="assistant_message", data={"content": partial_content})
+                    )
+                    assistant_content_parts.append(partial_content)
+                # Flush events before raising so tool call history is preserved
+                await self._emergency_flush_events(ctx, events_to_record)
                 raise RuntimeError(mid_stream_error)
 
             content = accumulator.get_content()
@@ -1611,6 +1633,8 @@ class AgentLoop:
         else:
             STEPS_TOTAL.labels(step_type=ctx.step_definition.type, status="failed").inc()
 
+        self._pending_events = None
+        self._pending_events_ctx = None
         return step_output
 
     # ------------------------------------------------------------------
@@ -2486,6 +2510,67 @@ class AgentLoop:
             output=json.dumps({"status": "error", "message": f"Unknown tool: {tc.name}"}),
             is_error=True,
         )
+
+    async def _emergency_flush_events(
+        self,
+        ctx: StepContext,
+        events: list[SessionEvent] | None,
+    ) -> None:
+        """Best-effort flush of accumulated events on exception paths.
+
+        Called from ``run_step``'s exception handlers to ensure tool call
+        history is persisted to Intaris even when the step fails mid-
+        execution.  Errors are caught and logged — this method NEVER
+        raises, so it cannot mask the original exception.
+        """
+        if not events:
+            return
+        try:
+            intaris_id = ctx.session.intaris_session_id or ctx.session.session_id
+            append_result = await self.providers.guardrails.record_events(
+                session_id=intaris_id,
+                events=list(events),
+                source="cognis",
+            )
+            if append_result.ok:
+                await self.session_cache.append_recorded_events(
+                    ctx.session, list(events), append_result
+                )
+                events.clear()
+                logger.info(
+                    "agent: emergency flush persisted events",
+                    extra={
+                        "extra_data": {
+                            "session_id": ctx.session.session_id,
+                            "event_count": append_result.last_seq,
+                        }
+                    },
+                )
+            else:
+                logger.warning(
+                    "agent: emergency flush returned ok=False — events may be lost",
+                    extra={
+                        "extra_data": {
+                            "session_id": ctx.session.session_id,
+                            "event_count": len(events),
+                        }
+                    },
+                )
+        except Exception:
+            logger.warning(
+                "agent: emergency flush failed — %d events lost",
+                len(events),
+                extra={
+                    "extra_data": {
+                        "session_id": ctx.session.session_id,
+                        "lost_event_types": [e.type for e in events[:10]],
+                    }
+                },
+                exc_info=True,
+            )
+        finally:
+            self._pending_events = None
+            self._pending_events_ctx = None
 
     @staticmethod
     def _get_incomplete_todos(ctx: StepContext) -> list[dict[str, Any]]:
