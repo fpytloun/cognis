@@ -588,6 +588,7 @@ class SessionManager:
             llm_config=agent_row.llm_config,
             execution=agent_row.execution,
             avatar_url=agent_row.avatar_url,
+            avatar_image_id=getattr(agent_row, "avatar_image_id", None),
             status=agent_row.status,
             created_at=agent_row.created_at,
             updated_at=agent_row.updated_at,

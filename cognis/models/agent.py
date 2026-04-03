@@ -29,7 +29,8 @@ class AgentDefinition(BaseModel):
     permissions: AgentPermissions | None = None
     llm_config: AgentLLMConfig | None = None
     execution: dict[str, Any] | None = None
-    avatar_url: str | None = None
+    avatar_url: str | None = None  # deprecated — computed from avatar_image_id
+    avatar_image_id: str | None = None
     # Type system
     agent_type: str = "primary"  # "primary" | "secondary"
     is_system: bool = False

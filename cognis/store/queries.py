@@ -476,6 +476,7 @@ async def create_agent(
     llm_config: dict[str, Any] | None = None,
     execution: dict[str, Any] | None = None,
     avatar_url: str | None = None,
+    avatar_image_id: str | None = None,
     agent_type: str = "primary",
     status: str = "draft",
 ) -> Agent:
@@ -494,6 +495,7 @@ async def create_agent(
         llm_config=llm_config,
         execution=execution,
         avatar_url=avatar_url,
+        avatar_image_id=avatar_image_id,
         agent_type=agent_type,
         status=status,
     )

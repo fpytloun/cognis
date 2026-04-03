@@ -617,6 +617,7 @@ def _row_to_definition(row: Any) -> AgentDefinition:
         llm_config=llm_config,
         execution=row.execution,
         avatar_url=row.avatar_url,
+        avatar_image_id=getattr(row, "avatar_image_id", None),
         agent_type=getattr(row, "agent_type", "primary"),
         is_system=getattr(row, "is_system", False),
         hidden=getattr(row, "hidden", False),

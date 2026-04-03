@@ -48,6 +48,7 @@ class ModelInfo(BaseModel):
     reasoning_efforts: list[str] = Field(default_factory=list)
     supports_prompt_caching: bool = False
     supports_extended_thinking: bool = False
+    supports_image_generation: bool = False
     input_cost_per_mtok: float | None = None
     output_cost_per_mtok: float | None = None
     tier: str = "standard"
@@ -97,3 +98,20 @@ class Cost(BaseModel):
     total_cost: float = 0.0
     model: str = ""
     provider: str = ""
+
+
+class GeneratedImage(BaseModel):
+    """A single generated image."""
+
+    b64_json: str | None = None
+    url: str | None = None
+    content_type: str = "image/png"
+    revised_prompt: str | None = None
+
+
+class ImageGenerationResult(BaseModel):
+    """Result of an image generation call."""
+
+    images: list[GeneratedImage]
+    model: str
+    usage: TokenUsage | None = None

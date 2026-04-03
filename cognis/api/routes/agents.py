@@ -119,6 +119,7 @@ def _system_agent_to_response(agent: AgentDefinition) -> AgentResponse:
         llm_config=None,
         execution=agent.execution,
         avatar_url=agent.avatar_url,
+        avatar_image_id=getattr(agent, "avatar_image_id", None),
         agent_type=agent.agent_type,
         is_system=agent.is_system,
         hidden=agent.hidden,
@@ -168,7 +169,7 @@ async def create_agent_route(request: Request, payload: AgentCreateRequest) -> A
             permissions=payload.permissions,
             llm_config=payload.llm_config,
             execution=payload.execution,
-            avatar_url=payload.avatar_url,
+            avatar_image_id=payload.avatar_image_id,
             agent_type=payload.agent_type,
             status=payload.status,
         )
@@ -314,6 +315,29 @@ async def sync_personality(request: Request, agent_id: str) -> dict[str, bool]:
         ) from exc
     await _persist_sync_metadata(request, agent_id, True)
     return {"ok": True}
+
+
+@router.delete("/{agent_id}/avatar", response_model=dict)
+async def delete_agent_avatar(request: Request, agent_id: str) -> dict[str, bool]:
+    """Remove an agent's avatar image."""
+    forbid_mutation_for_viewer(request)
+    if agent_id in SYSTEM_AGENTS:
+        raise api_exception(403, "forbidden", "System agents are read-only")
+    async with request.app.state.session_factory() as session:
+        row = await get_agent(session, agent_id)
+        if row is None:
+            raise api_exception(404, "not_found", "Agent not found")
+        require_owner_or_admin(request, row.owner_email)
+        old_image_id = row.avatar_image_id
+        ok = await update_agent(session, agent_id, updates={"avatar_image_id": None})
+        await session.commit()
+    # Clean up old artifact
+    if old_image_id and hasattr(request.app.state, "artifact_store"):
+        try:
+            await request.app.state.artifact_store.async_delete_object("avatars", old_image_id)
+        except Exception:
+            logger.warning("Failed to delete avatar artifact", exc_info=True)
+    return {"ok": ok}
 
 
 @router.get("/{agent_id}/bindings", response_model=list[str])

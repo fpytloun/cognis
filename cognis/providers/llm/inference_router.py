@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from cognis.core.executor_resolution import labels_match
+from cognis.models.config import ImageGenerationResult
 from cognis.providers.executor.websocket import ExecutorDisconnectedError, WebSocketExecutorProvider
 
 
@@ -104,6 +105,45 @@ class InferenceRouter:
             ],
             "usage": usage,
         }
+
+    async def route_image_generate(
+        self,
+        *,
+        prompt: str,
+        model: str,
+        strategy: str = "aimage_generation",
+        executor_labels: dict[str, str] | None = None,
+        n: int = 1,
+        size: str | None = None,
+        quality: str | None = None,
+        response_format: str = "b64_json",
+        image: str | None = None,
+        request_kwargs: dict[str, Any] | None = None,
+    ) -> ImageGenerationResult:
+        """Route image generation through a matching executor."""
+        conn = await self._find_executor(executor_labels)
+        if conn is None:
+            raise RuntimeError("No executor matches the provider selector for image generation")
+
+        try:
+            result = await conn.rpc_call(
+                method="llm.image_generate",
+                params={
+                    "request_id": uuid.uuid4().hex,
+                    "prompt": prompt,
+                    "model": model,
+                    "strategy": strategy,
+                    "n": n,
+                    "size": size,
+                    "quality": quality,
+                    "response_format": response_format,
+                    "image": image,
+                    "request_kwargs": request_kwargs or {},
+                },
+            )
+            return ImageGenerationResult.model_validate(result)
+        except ExecutorDisconnectedError:
+            raise RuntimeError("Executor disconnected during image generation") from None
 
     async def _find_executor(self, executor_labels: dict[str, str] | None) -> Any | None:
         active = await self._ws_provider.list_active()

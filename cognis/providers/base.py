@@ -6,7 +6,13 @@ from collections.abc import AsyncIterator
 from typing import Any, Protocol
 
 from cognis.models.agent import AgentDefinition
-from cognis.models.config import Cost, ModelInfo, ProviderHealth, TokenUsage
+from cognis.models.config import (
+    Cost,
+    ImageGenerationResult,
+    ModelInfo,
+    ProviderHealth,
+    TokenUsage,
+)
 from cognis.models.session import EventAppendResult, EventReadResult, IntarisSession, SessionEvent
 from cognis.models.tool import (
     EscalationRecord,
@@ -197,6 +203,27 @@ class LLMProvider(Protocol):
     async def list_models(self) -> list[dict[str, Any]]: ...
     async def get_cost(self, usage: TokenUsage, model: str) -> Cost: ...
     async def health(self) -> ProviderHealth: ...
+
+
+class ImageGenerationProvider(Protocol):
+    """Protocol for image generation capabilities.
+
+    Separate from LLMProvider to avoid breaking existing implementations.
+    LiteLLMProvider implements both protocols.
+    """
+
+    async def image_generate(
+        self,
+        prompt: str,
+        model: str | None = None,
+        task_type: str = "image_generation",
+        n: int = 1,
+        size: str | None = None,
+        quality: str | None = None,
+        response_format: str = "b64_json",
+        image: str | None = None,
+        **kwargs: Any,
+    ) -> ImageGenerationResult: ...
 
 
 class AuthProvider(Protocol):

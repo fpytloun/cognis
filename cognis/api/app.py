@@ -23,6 +23,7 @@ from cognis.api.routes.channels import router as channels_router
 from cognis.api.routes.conversations import router as conversations_router
 from cognis.api.routes.escalations import router as escalations_router
 from cognis.api.routes.executors import router as executors_router
+from cognis.api.routes.images import router as images_router
 from cognis.api.routes.notifications import router as notifications_router
 from cognis.api.routes.secrets import router as secrets_router
 from cognis.api.routes.sessions import router as sessions_router
@@ -194,11 +195,30 @@ def create_app() -> FastAPI:
         session_lock = SessionLock()
         tool_output_store = ToolOutputStore(Path(config_runtime.data_dir))
         await tool_output_store.cleanup_expired()
+
+        # Artifact store for images and other binary content
+        from cognis.artifacts.store import ArtifactStore, ArtifactStoreConfig
+
+        artifact_store = ArtifactStore(
+            ArtifactStoreConfig(
+                backend=config_runtime.artifact_backend,
+                path=str(config_runtime.artifact_path),
+                s3_endpoint=config_runtime.artifact_s3_endpoint,
+                s3_access_key=config_runtime.artifact_s3_access_key,
+                s3_secret_key=config_runtime.artifact_s3_secret_key,
+                s3_bucket=config_runtime.artifact_s3_bucket,
+                s3_region=config_runtime.artifact_s3_region,
+                max_size_bytes=config_runtime.artifact_max_size_bytes,
+            )
+        )
+
         tool_router = await ToolRouter.from_session_factory(
             providers.guardrails,
             session_factory,
             memory=providers.memory,
             tool_output_store=tool_output_store,
+            image_generation_provider=providers.image_generation,
+            artifact_store=artifact_store,
         )
         workflow_registry = WorkflowRegistry(session_factory)
         step_evaluator = await StepEvaluator.from_session_factory(
@@ -322,6 +342,7 @@ def create_app() -> FastAPI:
         app.state.provider_test_results = {}
         app.state.provider_test_cooldowns = {}
         app.state.remember_queue = remember_queue
+        app.state.artifact_store = artifact_store
         app.state.serve_ui = config_runtime.serve_ui
         app.state.ui_build_dir = str(ui_build_dir) if ui_build_dir is not None else None
         app.state.user_facing_url = _build_user_facing_url(config_runtime)
@@ -434,6 +455,7 @@ def create_app() -> FastAPI:
     app.include_router(channels_router)
     app.include_router(conversations_router)
     app.include_router(agents_router)
+    app.include_router(images_router)
     app.include_router(sessions_router)
     app.include_router(settings_router)
     app.include_router(tasks_router)

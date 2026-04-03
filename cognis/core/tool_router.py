@@ -16,6 +16,7 @@ from cognis.models.agent import AgentDefinition
 from cognis.models.session import SessionModel
 from cognis.models.tool import Permission, ToolCall, ToolResult
 from cognis.store.queries import get_setting_value
+from cognis.tools.builtin.image import handle_image_tool, is_image_tool
 from cognis.tools.builtin.memory import handle_memory_tool, is_memory_tool
 from cognis.tools.builtin.orchestration import handle_delegate_tool_call, is_orchestration_tool
 from cognis.tools.builtin.tool_output import handle_tool_output_tool, is_tool_output_tool
@@ -31,6 +32,11 @@ TOOL_ROUTE_OUTCOMES = Counter(
     "Tool route outcomes",
     labelnames=("route", "outcome"),
 )
+IMAGE_GENERATION_TOTAL = Counter(
+    "cognis_image_generation_total",
+    "Image generation operations",
+    labelnames=("model", "status"),
+)
 
 
 class ToolRoute(StrEnum):
@@ -39,6 +45,7 @@ class ToolRoute(StrEnum):
     ORCHESTRATION = "orchestration"
     MEMORY = "memory"
     TOOL_OUTPUT = "tool_output"
+    IMAGE = "image"
     INTARIS_MCP = "intaris_mcp"
     LOCAL = "local"
     UNKNOWN = "unknown"
@@ -66,10 +73,14 @@ class ToolRouter:
         non_bypassable_patterns: list[str] | None = None,
         memory: Any | None = None,
         tool_output_store: Any | None = None,
+        image_generation_provider: Any | None = None,
+        artifact_store: Any | None = None,
     ) -> None:
         self.guardrails = guardrails
         self.memory = memory
         self.tool_output_store = tool_output_store
+        self.image_generation_provider = image_generation_provider
+        self.artifact_store = artifact_store
         self.non_bypassable_patterns = non_bypassable_patterns or []
 
     @classmethod
@@ -79,6 +90,8 @@ class ToolRouter:
         session_factory: async_sessionmaker[AsyncSession],
         memory: Any | None = None,
         tool_output_store: Any | None = None,
+        image_generation_provider: Any | None = None,
+        artifact_store: Any | None = None,
     ) -> ToolRouter:
         """Create a router with cached non-bypassable patterns from settings."""
 
@@ -89,6 +102,8 @@ class ToolRouter:
             non_bypassable_patterns=_coerce_patterns(patterns),
             memory=memory,
             tool_output_store=tool_output_store,
+            image_generation_provider=image_generation_provider,
+            artifact_store=artifact_store,
         )
 
     def classify(self, tool_name: str, registry: ToolRegistry) -> ToolRoute:
@@ -100,6 +115,8 @@ class ToolRouter:
             return ToolRoute.MEMORY
         if is_tool_output_tool(tool_name):
             return ToolRoute.TOOL_OUTPUT
+        if is_image_tool(tool_name):
+            return ToolRoute.IMAGE
         registered_tool = registry.get(tool_name)
         if registered_tool is None:
             return ToolRoute.UNKNOWN
@@ -217,6 +234,26 @@ class ToolRouter:
             outcome = "success" if not result.is_error else "failure"
             TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome=outcome).inc()
             return self._sanitize_result(tool_call.name, result, 50_000, call_id=cid)
+        if route is ToolRoute.IMAGE:
+            if self.image_generation_provider is None:
+                result = ToolResult(
+                    output="Image generation not available. No image generation model configured.",
+                    is_error=True,
+                )
+            else:
+                result = await handle_image_tool(
+                    tool_name=tool_call.name,
+                    arguments=dict(tool_call.arguments),
+                    image_generation_provider=self.image_generation_provider,
+                    artifact_store=self.artifact_store,
+                )
+            outcome = "success" if not result.is_error else "failure"
+            IMAGE_GENERATION_TOTAL.labels(
+                model=tool_call.arguments.get("model", "default"),
+                status=outcome,
+            ).inc()
+            TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome=outcome).inc()
+            return self._sanitize_result(tool_call.name, result, 100_000, call_id=cid)
         if route is ToolRoute.INTARIS_MCP:
             result = await self._call_intaris_mcp(tool_call, session, registry)
             TOOL_ROUTE_OUTCOMES.labels(

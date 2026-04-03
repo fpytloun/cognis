@@ -35,6 +35,7 @@ cognis/
 │   │   │   ├── workflows.py        # Workflow CRUD, duplication, import/export
 │   │   │   ├── schedules.py        # Schedule CRUD (task factory)
 │   │   │   ├── escalations.py
+│   │   │   ├── images.py            # Image serving, upload, generation
 │   │   │   └── system.py           # Health, metrics, JWKS
 │   │   ├── websocket.py            # WebSocket transport layer (thin adapter)
 │   │   ├── executor_ws.py          # Executor WebSocket endpoint (auth + configure)
@@ -66,7 +67,11 @@ cognis/
 │   │   ├── session.py
 │   │   ├── tool.py
 │   │   ├── delegation.py
-│   │   └── config.py              # LLMProviderConfig, ModelRoutingPolicy, etc.
+│   │   └── config.py              # LLMProviderConfig, ModelRoutingPolicy, ImageGenerationResult, etc.
+│   │
+│   ├── artifacts/                  # Binary artifact storage (images, etc.)
+│   │   ├── __init__.py
+│   │   └── store.py               # ArtifactBackend Protocol, FS/S3 backends, ArtifactStore
 │   │
 │   ├── channels/                   # External messaging adapters + pairing
 │   │   ├── protocol.py            # ChannelAdapter protocol + base adapter
@@ -388,6 +393,14 @@ uv run alembic -c cognis/store/migrations/alembic.ini downgrade -1
 | `COGNIS_LSP_DIAGNOSTICS_TIMEOUT_MS` | `10000` | Max wait for diagnostics (ms) |
 | `COGNIS_LSP_IDLE_TIMEOUT_SECONDS` | `600` | Kill idle LSP servers after (s) |
 | `COGNIS_LSP_MAX_CONCURRENT_SERVERS` | `8` | Max concurrent LSP server processes |
+| `COGNIS_ARTIFACT_BACKEND` | `filesystem` | Artifact store backend (`filesystem` or `s3`) |
+| `COGNIS_ARTIFACT_PATH` | `~/.cognis/artifacts` | Filesystem artifact base path |
+| `COGNIS_ARTIFACT_S3_ENDPOINT` | `http://localhost:9000` | S3/MinIO endpoint |
+| `COGNIS_ARTIFACT_S3_ACCESS_KEY` | — | S3 access key (required for s3) |
+| `COGNIS_ARTIFACT_S3_SECRET_KEY` | — | S3 secret key (required for s3) |
+| `COGNIS_ARTIFACT_S3_BUCKET` | `cognis-artifacts` | S3 bucket name |
+| `COGNIS_ARTIFACT_S3_REGION` | — | S3 region (optional) |
+| `COGNIS_ARTIFACT_MAX_SIZE_MB` | `50` | Max artifact size in MB |
 | `COGNIS_INITIAL_ADMIN_EMAIL` | — | Container/CI: auto-create admin on first start |
 | `COGNIS_INITIAL_ADMIN_PASSWORD` | — | Container/CI: admin password (cleared after use) |
 

@@ -54,6 +54,16 @@ class CognisConfig:
     lsp_idle_timeout_seconds: int
     lsp_max_concurrent_servers: int
 
+    # Artifact store
+    artifact_backend: str
+    artifact_path: Path
+    artifact_s3_endpoint: str
+    artifact_s3_access_key: str
+    artifact_s3_secret_key: str
+    artifact_s3_bucket: str
+    artifact_s3_region: str
+    artifact_max_size_bytes: int
+
     # Initial admin (container/CI bootstrap)
     initial_admin_email: str | None
     initial_admin_password: str | None
@@ -115,6 +125,18 @@ def load_config() -> CognisConfig:
         ),
         lsp_idle_timeout_seconds=int(os.environ.get("COGNIS_LSP_IDLE_TIMEOUT_SECONDS", "600")),
         lsp_max_concurrent_servers=int(os.environ.get("COGNIS_LSP_MAX_CONCURRENT_SERVERS", "8")),
+        artifact_backend=os.environ.get("COGNIS_ARTIFACT_BACKEND", "filesystem"),
+        artifact_path=_expand_path(
+            os.environ.get("COGNIS_ARTIFACT_PATH", str(data_dir / "artifacts"))
+        ),
+        artifact_s3_endpoint=os.environ.get("COGNIS_ARTIFACT_S3_ENDPOINT", "http://localhost:9000"),
+        artifact_s3_access_key=os.environ.get("COGNIS_ARTIFACT_S3_ACCESS_KEY", ""),
+        artifact_s3_secret_key=os.environ.get("COGNIS_ARTIFACT_S3_SECRET_KEY", ""),
+        artifact_s3_bucket=os.environ.get("COGNIS_ARTIFACT_S3_BUCKET", "cognis-artifacts"),
+        artifact_s3_region=os.environ.get("COGNIS_ARTIFACT_S3_REGION", ""),
+        artifact_max_size_bytes=int(os.environ.get("COGNIS_ARTIFACT_MAX_SIZE_MB", "50"))
+        * 1024
+        * 1024,
         initial_admin_email=os.environ.get("COGNIS_INITIAL_ADMIN_EMAIL"),
         initial_admin_password=os.environ.get("COGNIS_INITIAL_ADMIN_PASSWORD"),
     )
@@ -159,6 +181,16 @@ ENV_TEMPLATE = """\
 # COGNIS_LSP_DIAGNOSTICS_TIMEOUT_MS=10000
 # COGNIS_LSP_IDLE_TIMEOUT_SECONDS=600
 # COGNIS_LSP_MAX_CONCURRENT_SERVERS=8
+
+# Artifact store (images, generated content)
+# COGNIS_ARTIFACT_BACKEND=filesystem
+# COGNIS_ARTIFACT_PATH=~/.cognis/artifacts
+# COGNIS_ARTIFACT_S3_ENDPOINT=http://localhost:9000
+# COGNIS_ARTIFACT_S3_ACCESS_KEY=
+# COGNIS_ARTIFACT_S3_SECRET_KEY=
+# COGNIS_ARTIFACT_S3_BUCKET=cognis-artifacts
+# COGNIS_ARTIFACT_S3_REGION=
+# COGNIS_ARTIFACT_MAX_SIZE_MB=50
 
 # Container/CI: auto-create admin on first start
 # COGNIS_INITIAL_ADMIN_EMAIL=admin@example.com

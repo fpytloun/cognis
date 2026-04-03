@@ -29,6 +29,9 @@ class ProviderRegistry:
     secrets: EncryptedDBSecretsProvider
     llm: LiteLLMProvider
     auth: JWTAuthProvider
+    # LiteLLMProvider implements both LLMProvider and ImageGenerationProvider.
+    # This alias provides explicit access via the ImageGenerationProvider protocol.
+    image_generation: LiteLLMProvider | None = None
 
     async def health(self) -> dict[str, ProviderHealth]:
         return {
@@ -65,15 +68,19 @@ def build_provider_registry(
     # Build inference router (decouples LLM from executor)
     inference_router = InferenceRouter(ws_provider)
 
+    llm_provider = LiteLLMProvider(
+        session_factory,
+        secrets_provider=secrets_provider,
+        inference_router=inference_router,
+    )
+
     return ProviderRegistry(
         memory=MnemoryProvider(config.mnemory_url, auth_provider),
         guardrails=IntarisProvider(config.intaris_url, auth_provider),
         executor=composite_executor,
         secrets=secrets_provider,
-        llm=LiteLLMProvider(
-            session_factory,
-            secrets_provider=secrets_provider,
-            inference_router=inference_router,
-        ),
+        llm=llm_provider,
         auth=auth_provider,
+        # LiteLLMProvider implements ImageGenerationProvider
+        image_generation=llm_provider,
     )

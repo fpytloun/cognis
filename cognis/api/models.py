@@ -252,7 +252,7 @@ class AgentRequestBase(BaseModel):
     permissions: dict[str, Any] | None = None
     llm_config: dict[str, Any] | None = None
     execution: dict[str, Any] | None = None
-    avatar_url: str | None = None
+    avatar_image_id: str | None = None
     status: str | None = None
 
 
@@ -273,7 +273,7 @@ class AgentUpdateRequest(BaseModel):
     permissions: dict[str, Any] | None = None
     llm_config: dict[str, Any] | None = None
     execution: dict[str, Any] | None = None
-    avatar_url: str | None = None
+    avatar_image_id: str | None = None
     status: str | None = None
 
 
@@ -293,7 +293,8 @@ class AgentResponse(BaseModel):
     personality_synced: bool = True
     personality_sync_error: str | None = None
     personality_sync_checked_at: datetime | None = None
-    avatar_url: str | None = None
+    avatar_url: str | None = None  # computed from avatar_image_id (or legacy fallback)
+    avatar_image_id: str | None = None
     # Type system
     agent_type: str = "primary"
     is_system: bool = False

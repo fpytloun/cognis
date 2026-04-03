@@ -2,6 +2,9 @@
   import Button from '$lib/components/ui/Button.svelte';
   import Card from '$lib/components/ui/Card.svelte';
   import Input from '$lib/components/ui/Input.svelte';
+  import AgentAvatar from '$lib/components/AgentAvatar.svelte';
+  import AvatarGenerateModal from '$lib/components/agents/AvatarGenerateModal.svelte';
+  import { api } from '$lib/api/client';
   import {
     buildBootstrapPreview,
     defaultSystemPrompt,
@@ -52,6 +55,38 @@
   }>();
 
   let localBindings = $state<string[]>([...secondaryBindings]);
+  let showAvatarModal = $state(false);
+  let uploadingAvatar = $state(false);
+  let fileInput: HTMLInputElement | undefined = $state();
+
+  function handleAvatarAccept(imageId: string, avatarUrl: string) {
+    form.avatarImageId = imageId;
+    form.avatarUrl = avatarUrl;
+    showAvatarModal = false;
+  }
+
+  async function handleAvatarUpload(event: Event) {
+    const target = event.target as HTMLInputElement;
+    const file = target.files?.[0];
+    if (!file) return;
+    uploadingAvatar = true;
+    try {
+      const result = await api.images.upload(file);
+      form.avatarImageId = result.image_id;
+      form.avatarUrl = result.url;
+    } catch (e) {
+      // Show error via the form error field
+      error = e instanceof Error ? e.message : 'Failed to upload avatar';
+    } finally {
+      uploadingAvatar = false;
+      if (target) target.value = '';
+    }
+  }
+
+  function removeAvatar() {
+    form.avatarImageId = '';
+    form.avatarUrl = '';
+  }
 
   function toggleBinding(agentId: string): void {
     if (localBindings.includes(agentId)) {
@@ -242,10 +277,49 @@
               {form.agentType === 'primary' ? 'Interactive agent with personality and memory.' : 'Lightweight task executor for focused sub-tasks.'}
             </span>
           </label>
-          <label class="space-y-2 text-sm font-medium text-slate-200">
-            <span>Avatar URL</span>
-            <Input bind:value={form.avatarUrl} placeholder="https://…" disabled={readonly} />
-          </label>
+          <div class="space-y-2 text-sm font-medium text-slate-200">
+            <span>Avatar</span>
+            <div class="flex items-center gap-3">
+              <AgentAvatar name={form.name || 'A'} avatarUrl={form.avatarUrl || null} class="h-14 w-14" />
+              <div class="flex flex-col gap-1.5">
+                {#if !readonly}
+                  <div class="flex gap-2">
+                    <input
+                      bind:this={fileInput}
+                      type="file"
+                      accept="image/png,image/jpeg,image/webp"
+                      class="hidden"
+                      onchange={handleAvatarUpload}
+                    />
+                    <button
+                      type="button"
+                      class="rounded-lg border border-slate-700 bg-slate-800/60 px-2.5 py-1 text-xs text-slate-300 hover:bg-slate-700 hover:text-slate-100 disabled:opacity-50"
+                      onclick={() => fileInput?.click()}
+                      disabled={uploadingAvatar}
+                    >
+                      {uploadingAvatar ? 'Uploading...' : 'Upload'}
+                    </button>
+                    <button
+                      type="button"
+                      class="rounded-lg border border-slate-700 bg-slate-800/60 px-2.5 py-1 text-xs text-sky-400 hover:bg-slate-700 hover:text-sky-300"
+                      onclick={() => { showAvatarModal = true; }}
+                    >
+                      Generate
+                    </button>
+                    {#if form.avatarImageId || form.avatarUrl}
+                      <button
+                        type="button"
+                        class="rounded-lg border border-slate-700 bg-slate-800/60 px-2.5 py-1 text-xs text-rose-400 hover:bg-slate-700 hover:text-rose-300"
+                        onclick={removeAvatar}
+                      >
+                        Remove
+                      </button>
+                    {/if}
+                  </div>
+                {/if}
+              </div>
+            </div>
+          </div>
         </div>
         <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
           <span>Description</span>
@@ -611,3 +685,13 @@
     </div>
   </div>
 </form>
+
+{#if showAvatarModal}
+  <AvatarGenerateModal
+    name={form.name}
+    description={form.description}
+    personality={{ tone: form.tone, temperament: form.temperament, purpose: form.purpose }}
+    onAccept={handleAvatarAccept}
+    onClose={() => { showAvatarModal = false; }}
+  />
+{/if}

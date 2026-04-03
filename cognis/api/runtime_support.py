@@ -11,6 +11,7 @@ from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.tool import ExecutorConfig, MCPServerConfig, ToolDefinition
 from cognis.providers.executor.in_process import InProcessExecutorConnection
+from cognis.tools.builtin.image import image_tools
 from cognis.tools.builtin.memory import memory_tools
 from cognis.tools.builtin.orchestration import orchestration_tools
 from cognis.tools.builtin.system import build_system_tool_handlers, system_tools
@@ -49,6 +50,7 @@ def static_tool_definitions() -> list[ToolDefinition]:
         *workflow_tools(),
         *memory_tools(),
         *tool_output_tools(),
+        *image_tools(),
         *executor_tool_definitions(),
         *all_web,
     ]

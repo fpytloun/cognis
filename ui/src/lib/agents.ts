@@ -20,7 +20,8 @@ export interface AgentFormState {
   agentType: 'primary' | 'secondary';
   name: string;
   description: string;
-  avatarUrl: string;
+  avatarImageId: string;
+  avatarUrl: string;  // read-only display URL (computed from avatarImageId)
   systemPrompt: string;
   tone: string;
   temperament: string;
@@ -75,6 +76,7 @@ export function createEmptyAgentForm(workflows: Workflow[] = []): AgentFormState
     agentType: 'primary',
     name: '',
     description: '',
+    avatarImageId: '',
     avatarUrl: '',
     systemPrompt: '',
     tone: '',
@@ -115,6 +117,7 @@ export function agentToFormState(agent: Agent): AgentFormState {
     agentType: (agent.agent_type === 'secondary' ? 'secondary' : 'primary') as 'primary' | 'secondary',
     name: agent.display_name || agent.name,
     description: agent.description ?? '',
+    avatarImageId: agent.avatar_image_id ?? '',
     avatarUrl: agent.avatar_url ?? '',
     systemPrompt: agent.system_prompt ?? '',
     tone: typeof personality.tone === 'string' ? personality.tone : '',
@@ -195,7 +198,7 @@ export function formStateToPayload(form: AgentFormState): Record<string, unknown
     agent_type: form.agentType,
     name: form.name,
     description: form.description || null,
-    avatar_url: form.avatarUrl || null,
+    avatar_image_id: form.avatarImageId || null,
     system_prompt: form.systemPrompt || null,
     personality: {
       tone: form.tone || undefined,

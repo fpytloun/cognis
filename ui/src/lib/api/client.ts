@@ -427,6 +427,31 @@ export const api = {
     }
   },
 
+  images: {
+    upload(file: File): Promise<{ image_id: string; url: string }> {
+      const formData = new FormData();
+      formData.append('file', file);
+      return request<{ image_id: string; url: string }>('/api/v1/images/upload', {
+        method: 'POST',
+        body: formData
+      });
+    },
+
+    generate(prompt: string, options?: { size?: string; quality?: string }): Promise<{ image_id: string; url: string; prompt_used: string }> {
+      return request<{ image_id: string; url: string; prompt_used: string }>('/api/v1/images/generate', {
+        method: 'POST',
+        body: JSON.stringify({ prompt, ...options })
+      });
+    },
+
+    generatePrompt(details: { name: string; description?: string; personality?: Record<string, unknown> }): Promise<{ prompt: string }> {
+      return request<{ prompt: string }>('/api/v1/images/generate-prompt', {
+        method: 'POST',
+        body: JSON.stringify(details)
+      });
+    }
+  },
+
   tools: {
     list(): Promise<ToolDefinitionSummary[]> {
       return request<ToolDefinitionSummary[]>('/api/v1/tools');

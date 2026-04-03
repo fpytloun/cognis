@@ -110,7 +110,12 @@ def agent_to_response(row: Any) -> AgentResponse:
             else None
         ),
         personality_sync_checked_at=checked_at if isinstance(checked_at, datetime) else None,
-        avatar_url=row.avatar_url,
+        avatar_url=(
+            f"/api/v1/images/{row.avatar_image_id}"
+            if getattr(row, "avatar_image_id", None)
+            else getattr(row, "avatar_url", None)
+        ),
+        avatar_image_id=getattr(row, "avatar_image_id", None),
         agent_type=getattr(row, "agent_type", "primary"),
         is_system=getattr(row, "is_system", False),
         hidden=getattr(row, "hidden", False),

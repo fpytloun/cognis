@@ -15,7 +15,15 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from cognis.logging import get_logger
-from cognis.models.config import DEFAULT_MODEL_INFO, Cost, ModelInfo, ProviderHealth, TokenUsage
+from cognis.models.config import (
+    DEFAULT_MODEL_INFO,
+    Cost,
+    GeneratedImage,
+    ImageGenerationResult,
+    ModelInfo,
+    ProviderHealth,
+    TokenUsage,
+)
 from cognis.store.models import LLMProvider as LLMProviderRow
 from cognis.store.models import ModelRouting
 
@@ -30,6 +38,17 @@ SAFE_PROVIDER_KWARGS = {"api_base", "api_version", "base_url", "max_retries", "t
 PRESET_TO_MODEL_PREFIX: dict[str, str] = {
     "litellm_proxy": "litellm_proxy",
     "openai_compatible": "openai",
+}
+
+# Preset-to-image-generation strategy mapping.
+# "aimage_generation" uses litellm.aimage_generation() (OpenAI, DALL-E).
+# "acompletion_modalities" uses litellm.acompletion() with modalities=["image", "text"] (Gemini).
+_IMAGE_GEN_STRATEGY: dict[str, str] = {
+    "openai": "aimage_generation",
+    "openai_compatible": "aimage_generation",
+    "litellm_proxy": "aimage_generation",
+    "gemini": "acompletion_modalities",
+    "vertex_ai": "acompletion_modalities",
 }
 
 # Anthropic model name patterns for prompt caching support
@@ -739,3 +758,317 @@ class LiteLLMProvider:
             request_kwargs=request_kwargs,
         ):
             yield chunk
+
+    # ------------------------------------------------------------------
+    # Image generation (ImageGenerationProvider)
+    # ------------------------------------------------------------------
+
+    async def image_generate(
+        self,
+        prompt: str,
+        model: str | None = None,
+        task_type: str = "image_generation",
+        n: int = 1,
+        size: str | None = None,
+        quality: str | None = None,
+        response_format: str = "b64_json",
+        image: str | None = None,
+        **kwargs: Any,
+    ) -> ImageGenerationResult:
+        """Generate or edit an image using the configured LLM provider.
+
+        Uses preset-based strategy dispatch:
+        - OpenAI/DALL-E: litellm.aimage_generation()
+        - Gemini: litellm.acompletion() with modalities=["image", "text"]
+        """
+
+        resolved_model, provider = await self._resolve_model_target(model, task_type=task_type)
+        prefixed_model = self._apply_model_prefix(resolved_model, provider)
+        request_kwargs = await self._resolve_provider_kwargs(provider)
+
+        # Determine strategy from provider preset
+        preset = ""
+        if provider is not None:
+            config = dict(provider.config) if hasattr(provider, "config") else {}
+            preset = config.get("preset", "") if isinstance(config, dict) else ""
+        strategy = _IMAGE_GEN_STRATEGY.get(preset, "aimage_generation")
+
+        # Route to executor if configured
+        if self._should_route_to_executor(provider):
+            return await self._executor_image_generate(
+                prefixed_model,
+                prompt,
+                provider,
+                strategy=strategy,
+                n=n,
+                size=size,
+                quality=quality,
+                response_format=response_format,
+                image=image,
+                request_kwargs=request_kwargs,
+                **kwargs,
+            )
+
+        logger.debug(
+            "LLM image_generate",
+            extra={
+                "extra_data": {
+                    "model": prefixed_model,
+                    "strategy": strategy,
+                    "task_type": task_type,
+                }
+            },
+        )
+
+        if strategy == "acompletion_modalities":
+            return await self._image_generate_via_completion(
+                prefixed_model,
+                prompt,
+                request_kwargs,
+                n=n,
+                size=size,
+                image=image,
+                **kwargs,
+            )
+        return await self._image_generate_via_api(
+            prefixed_model,
+            prompt,
+            request_kwargs,
+            n=n,
+            size=size,
+            quality=quality,
+            response_format=response_format,
+            image=image,
+            **kwargs,
+        )
+
+    async def _image_generate_via_api(
+        self,
+        model: str,
+        prompt: str,
+        request_kwargs: dict[str, Any],
+        *,
+        n: int = 1,
+        size: str | None = None,
+        quality: str | None = None,
+        response_format: str = "b64_json",
+        image: str | None = None,
+        **kwargs: Any,
+    ) -> ImageGenerationResult:
+        """Generate image using litellm.aimage_generation (OpenAI path)."""
+        from cognis.providers.llm.retry import with_llm_retry
+
+        gen_kwargs: dict[str, Any] = {}
+        if request_kwargs.get("api_key"):
+            gen_kwargs["api_key"] = request_kwargs["api_key"]
+        if request_kwargs.get("api_base"):
+            gen_kwargs["api_base"] = request_kwargs["api_base"]
+
+        if image is not None:
+            # Edit mode — pass the source image when the backend supports it.
+            try:
+                response = await with_llm_retry(
+                    litellm.aimage_generation,
+                    prompt=prompt,
+                    model=model,
+                    n=n,
+                    size=size,
+                    quality=quality,
+                    response_format=response_format,
+                    image=image,
+                    operation=f"image_edit({model})",
+                    **gen_kwargs,
+                    **kwargs,
+                )
+            except Exception:
+                # Fall back to regular generation if edit not supported
+                response = await with_llm_retry(
+                    litellm.aimage_generation,
+                    prompt=prompt,
+                    model=model,
+                    n=n,
+                    size=size,
+                    quality=quality,
+                    response_format=response_format,
+                    operation=f"image_generate({model})",
+                    **gen_kwargs,
+                    **kwargs,
+                )
+        else:
+            response = await with_llm_retry(
+                litellm.aimage_generation,
+                prompt=prompt,
+                model=model,
+                n=n,
+                size=size,
+                quality=quality,
+                response_format=response_format,
+                operation=f"image_generate({model})",
+                **gen_kwargs,
+                **kwargs,
+            )
+
+        return self._normalize_image_response(response, model)
+
+    async def _image_generate_via_completion(
+        self,
+        model: str,
+        prompt: str,
+        request_kwargs: dict[str, Any],
+        *,
+        n: int = 1,
+        size: str | None = None,
+        image: str | None = None,
+        **kwargs: Any,
+    ) -> ImageGenerationResult:
+        """Generate image using litellm.acompletion with modalities (Gemini path)."""
+        from cognis.providers.llm.retry import with_llm_retry
+
+        # Build messages
+        content: list[dict[str, Any]] | str
+        if image is not None:
+            # Edit mode — include image in messages
+            content = [
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image}"}},
+                {"type": "text", "text": prompt},
+            ]
+        else:
+            content = prompt
+
+        messages = [{"role": "user", "content": content}]
+
+        # Filter kwargs — don't pass image-specific params to acompletion
+        completion_kwargs = {k: v for k, v in request_kwargs.items() if k not in ("size",)}
+        if size:
+            completion_kwargs.setdefault("extra_body", {})
+            if isinstance(completion_kwargs["extra_body"], dict):
+                completion_kwargs["extra_body"]["image_size"] = size
+
+        response = await with_llm_retry(
+            litellm.acompletion,
+            model=model,
+            messages=messages,
+            modalities=["image", "text"],
+            stream=False,
+            n=n,
+            operation=f"image_generate_completion({model})",
+            **completion_kwargs,
+            **kwargs,
+        )
+
+        return self._normalize_gemini_image_response(response, model)
+
+    @staticmethod
+    def _normalize_image_response(response: Any, model: str) -> ImageGenerationResult:
+        """Normalize litellm ImageResponse to ImageGenerationResult."""
+        images: list[GeneratedImage] = []
+        data = getattr(response, "data", []) or []
+        for item in data:
+            b64 = getattr(item, "b64_json", None) or None
+            url = getattr(item, "url", None) or None
+            revised = getattr(item, "revised_prompt", None)
+            if b64 or url:
+                images.append(
+                    GeneratedImage(
+                        b64_json=b64,
+                        url=url,
+                        content_type="image/png",
+                        revised_prompt=revised,
+                    )
+                )
+
+        usage = None
+        raw_usage = getattr(response, "usage", None)
+        if raw_usage is not None:
+            usage = TokenUsage(
+                prompt_tokens=getattr(raw_usage, "input_tokens", 0) or 0,
+                completion_tokens=getattr(raw_usage, "output_tokens", 0) or 0,
+                total_tokens=getattr(raw_usage, "total_tokens", 0) or 0,
+            )
+
+        return ImageGenerationResult(images=images, model=model, usage=usage)
+
+    @staticmethod
+    def _normalize_gemini_image_response(response: Any, model: str) -> ImageGenerationResult:
+        """Normalize Gemini completion response with images to ImageGenerationResult."""
+        images: list[GeneratedImage] = []
+        response_dict = response.model_dump() if hasattr(response, "model_dump") else dict(response)
+
+        choices = response_dict.get("choices", [])
+        for choice in choices:
+            message = choice.get("message", {})
+            # Gemini returns images in message.images (list of dicts with image_url.url)
+            msg_images = message.get("images", [])
+            for img in msg_images:
+                url = ""
+                if isinstance(img, dict):
+                    image_url = img.get("image_url", {})
+                    if isinstance(image_url, dict):
+                        url = image_url.get("url", "")
+                    elif isinstance(img.get("url"), str):
+                        url = img["url"]
+
+                # Extract base64 from data URL
+                b64 = ""
+                content_type = "image/png"
+                if url.startswith("data:"):
+                    # data:image/png;base64,<data>
+                    parts = url.split(",", 1)
+                    if len(parts) == 2:
+                        b64 = parts[1]
+                        header = parts[0]  # data:image/png;base64
+                        if ":" in header and ";" in header:
+                            content_type = header.split(":")[1].split(";")[0]
+                elif url:
+                    b64 = url
+
+                if b64 or url:
+                    images.append(
+                        GeneratedImage(
+                            b64_json=b64 or None,
+                            url=None if b64 else (url or None),
+                            content_type=content_type,
+                        )
+                    )
+
+        usage_dict = response_dict.get("usage", {})
+        usage = None
+        if usage_dict:
+            usage = TokenUsage(
+                prompt_tokens=usage_dict.get("prompt_tokens", 0),
+                completion_tokens=usage_dict.get("completion_tokens", 0),
+                total_tokens=usage_dict.get("total_tokens", 0),
+            )
+
+        return ImageGenerationResult(images=images, model=model, usage=usage)
+
+    async def _executor_image_generate(
+        self,
+        model: str,
+        prompt: str,
+        provider: Any,
+        *,
+        strategy: str,
+        n: int = 1,
+        size: str | None = None,
+        quality: str | None = None,
+        response_format: str = "b64_json",
+        image: str | None = None,
+        request_kwargs: dict[str, Any],
+        **kwargs: Any,
+    ) -> ImageGenerationResult:
+        """Route image generation to executor-side inference."""
+        config = provider.config if hasattr(provider, "config") else {}
+        executor_labels = config.get("executor_labels") if isinstance(config, dict) else None
+        return await self._inference_router.route_image_generate(
+            prompt=prompt,
+            model=model,
+            strategy=strategy,
+            executor_labels=executor_labels,
+            n=n,
+            size=size,
+            quality=quality,
+            response_format=response_format,
+            image=image,
+            request_kwargs=request_kwargs,
+        )

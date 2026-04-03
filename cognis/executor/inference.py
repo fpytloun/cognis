@@ -90,3 +90,56 @@ class InferenceHandler:
             **request_kwargs,
         )
         return response.model_dump()
+
+    async def image_generate(
+        self,
+        *,
+        prompt: str,
+        model: str,
+        strategy: str = "aimage_generation",
+        n: int = 1,
+        size: str | None = None,
+        quality: str | None = None,
+        response_format: str = "b64_json",
+        image: str | None = None,
+        request_kwargs: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Generate an image through LiteLLM on the executor side."""
+        gen_kwargs: dict[str, Any] = {}
+        if request_kwargs.get("api_key"):
+            gen_kwargs["api_key"] = request_kwargs["api_key"]
+        if request_kwargs.get("api_base"):
+            gen_kwargs["api_base"] = request_kwargs["api_base"]
+
+        if strategy == "acompletion_modalities":
+            # Gemini path
+            content: list[dict[str, Any]] | str
+            if image is not None:
+                content = [
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image}"}},
+                    {"type": "text", "text": prompt},
+                ]
+            else:
+                content = prompt
+            messages = [{"role": "user", "content": content}]
+            response = await litellm.acompletion(
+                model=model,
+                messages=messages,
+                modalities=["image", "text"],
+                stream=False,
+                n=n,
+                **gen_kwargs,
+            )
+            return response.model_dump()
+        else:
+            # OpenAI path
+            response = await litellm.aimage_generation(
+                prompt=prompt,
+                model=model,
+                n=n,
+                size=size,
+                quality=quality,
+                response_format=response_format,
+                **gen_kwargs,
+            )
+            return response.model_dump()
