@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import secrets
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -18,6 +19,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from cognis.api.common import error_response
 from cognis.api.middleware import AuthenticationMiddleware
 from cognis.api.routes.agents import router as agents_router
+from cognis.api.routes.artifacts import router as artifacts_router
 from cognis.api.routes.auth import router as auth_router
 from cognis.api.routes.channels import router as channels_router
 from cognis.api.routes.conversations import router as conversations_router
@@ -69,6 +71,14 @@ def _as_user_facing_host(host: str) -> str:
 
 def _build_user_facing_url(config: object) -> str:
     return f"http://{_as_user_facing_host(config.host)}:{config.port}"  # type: ignore[attr-defined]
+
+
+def _ensure_artifact_signing_secret(config: object) -> str:
+    key_path = Path(config.data_dir) / "artifact-signing.key"  # type: ignore[attr-defined]
+    key_path.parent.mkdir(parents=True, exist_ok=True)
+    if not key_path.exists():
+        key_path.write_text(secrets.token_urlsafe(32), encoding="utf-8")
+    return key_path.read_text(encoding="utf-8").strip()
 
 
 def _key_fingerprint(path: Path) -> str | None:
@@ -209,8 +219,22 @@ def create_app() -> FastAPI:
                 s3_bucket=config_runtime.artifact_s3_bucket,
                 s3_region=config_runtime.artifact_s3_region,
                 max_size_bytes=config_runtime.artifact_max_size_bytes,
+                base_url=_build_user_facing_url(config_runtime),
+                signing_secret=(
+                    config_runtime.artifact_signing_secret
+                    or _ensure_artifact_signing_secret(config_runtime)
+                ),
+                signed_url_ttl_seconds=config_runtime.artifact_signed_url_ttl_seconds,
             )
         )
+
+        from cognis.core.artifact_maintenance import ArtifactMaintenanceService
+
+        artifact_maintenance = ArtifactMaintenanceService(
+            session_factory=session_factory,
+            artifact_store=artifact_store,
+        )
+        await artifact_maintenance.start()
 
         tool_router = await ToolRouter.from_session_factory(
             providers.guardrails,
@@ -305,6 +329,7 @@ def create_app() -> FastAPI:
             pause_waiter=pause_waiter,
             notification_service=notification_service,
             providers=providers,
+            artifact_store=artifact_store,
             workflow_registry=workflow_registry,
             event_bus=event_bus,
         )
@@ -343,6 +368,7 @@ def create_app() -> FastAPI:
         app.state.provider_test_cooldowns = {}
         app.state.remember_queue = remember_queue
         app.state.artifact_store = artifact_store
+        app.state.artifact_maintenance = artifact_maintenance
         app.state.serve_ui = config_runtime.serve_ui
         app.state.ui_build_dir = str(ui_build_dir) if ui_build_dir is not None else None
         app.state.user_facing_url = _build_user_facing_url(config_runtime)
@@ -425,6 +451,7 @@ def create_app() -> FastAPI:
 
         yield
 
+        await artifact_maintenance.stop()
         await channel_manager.stop_all()
         await task_queue.stop()
         await shared_runtime_cleanup()
@@ -452,6 +479,7 @@ def create_app() -> FastAPI:
     app.add_middleware(AuthenticationMiddleware)
     app.include_router(auth_router)
     app.include_router(system_router)
+    app.include_router(artifacts_router)
     app.include_router(channels_router)
     app.include_router(conversations_router)
     app.include_router(agents_router)

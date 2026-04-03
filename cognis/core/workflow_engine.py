@@ -33,6 +33,7 @@ from cognis.core.step_evaluator import StepEvaluator
 from cognis.core.workflow_registry import WorkflowRegistry
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
+from cognis.models.artifact import AttachmentRef
 from cognis.models.session import SessionEvent
 from cognis.models.task import TaskModel, TaskStatus
 from cognis.models.workflow import (
@@ -128,6 +129,8 @@ class WorkflowEngine:
         session: Any,
         agent: AgentDefinition,
         user_message: str,
+        user_attachments: list[AttachmentRef] | None = None,
+        attachment_notice: str | None = None,
         system_initiated: bool = False,
         on_progress: ProgressCallback | None = None,
         on_tool_call: ToolCallCallback | None = None,
@@ -153,6 +156,8 @@ class WorkflowEngine:
             agent=agent,
             policy=CHAT_POLICY,
             user_message=user_message,
+            user_attachments=user_attachments or [],
+            attachment_notice=attachment_notice,
             system_initiated=system_initiated,
             interaction_mode="explicit_gates",
             tool_registry=tool_registry,

@@ -589,3 +589,34 @@ class ChannelPairingRequest(Base):
         Index("ix_channel_pairing_owner_status", "owner_email", "status"),
         Index("ix_channel_pairing_sender_status", "channel_type", "sender_id", "status"),
     )
+
+
+class ArtifactRecordRow(Base):
+    """Metadata and lifecycle state for stored artifacts."""
+
+    __tablename__ = "artifacts"
+
+    artifact_id: Mapped[str] = mapped_column(String, primary_key=True)
+    namespace: Mapped[str] = mapped_column(String, nullable=False)
+    object_id: Mapped[str] = mapped_column(String, nullable=False)
+    filename: Mapped[str] = mapped_column(String, nullable=False)
+    owner_email: Mapped[str | None] = mapped_column(String, nullable=True)
+    conversation_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    session_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    message_role: Mapped[str | None] = mapped_column(String, nullable=True)
+    purpose: Mapped[str] = mapped_column(String, nullable=False, default="chat_input")
+    kind: Mapped[str] = mapped_column(String, nullable=False, default="file")
+    mime_type: Mapped[str] = mapped_column(String, nullable=False)
+    size_bytes: Mapped[int] = mapped_column(nullable=False, default=0)
+    status: Mapped[str] = mapped_column(String, nullable=False, default="temporary")
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    expires_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+
+    __table_args__ = (
+        Index("ix_artifacts_owner_status", "owner_email", "status"),
+        Index("ix_artifacts_conversation", "conversation_id"),
+        Index("ix_artifacts_expiry", "expires_at"),
+    )

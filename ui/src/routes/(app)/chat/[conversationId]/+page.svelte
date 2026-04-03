@@ -2,7 +2,7 @@
   import { goto } from '$app/navigation';
   import { page } from '$app/stores';
   import { onMount } from 'svelte';
-  import { ArrowDown, ArrowLeft, ChevronsLeft, ChevronsRight, Search, Copy, Check, Info } from 'lucide-svelte';
+  import { ArrowDown, ArrowLeft, ChevronsLeft, ChevronsRight, Search, Copy, Check, Info, Paperclip, X } from 'lucide-svelte';
 
   import AgentAvatar from '$lib/components/AgentAvatar.svelte';
   import ChatMessage from '$lib/components/ChatMessage.svelte';
@@ -28,7 +28,7 @@
     normalizeHistory,
     type TimelineItem
   } from '$lib/chat';
-  import type { Agent, ContextUsage, Conversation, Escalation, MessageEvent, Session } from '$lib/types/api';
+  import type { Agent, AttachmentRef, ContextUsage, Conversation, Escalation, MessageEvent, Session } from '$lib/types/api';
   import { wsClient } from '$lib/ws/client';
 
   let loading = true;
@@ -42,6 +42,8 @@
   let sessions: Session[] = [];
   let composer = '';
   let composerElement: HTMLTextAreaElement | null = null;
+  let attachmentInput: HTMLInputElement | null = null;
+  let composerAttachments: AttachmentRef[] = [];
   let selectedAgentId = '';
   let archivingConversation = false;
   let deletingConversation = false;
@@ -665,12 +667,12 @@
 
   async function handleSend(): Promise<void> {
     const content = composer.trim();
-    if (!content || !currentConversation || isReadOnly(currentConversation)) return;
+    if ((!content && composerAttachments.length === 0) || !currentConversation || isReadOnly(currentConversation)) return;
 
     const isSlashCommand = SYSTEM_SLASH_COMMANDS.some((cmd) => content.startsWith(cmd));
 
     if (!isSlashCommand) {
-      timeline = appendOptimisticUserMessage(timeline, content);
+      timeline = appendOptimisticUserMessage(timeline, content, composerAttachments);
       lastSubmittedMessage = content;
       lastRecoverableMessage = '';
       turnInProgress = true;
@@ -678,10 +680,30 @@
     }
     error = '';
     composer = '';
+    const attachments = [...composerAttachments];
+    composerAttachments = [];
     syncVisibleWindow();
     userScrolledUp = false;
     scrollToBottom();
-    wsClient.sendMessage(currentConversation.conversation_id, content);
+    wsClient.sendMessage(currentConversation.conversation_id, content, attachments);
+  }
+
+  async function handleAttachmentSelect(event: Event): Promise<void> {
+    const files = (event.currentTarget as HTMLInputElement).files;
+    if (!files || files.length === 0) return;
+    try {
+      const uploaded = await Promise.all(Array.from(files).map((file) => api.artifacts.upload(file)));
+      composerAttachments = [...composerAttachments, ...uploaded];
+      addToast('Attachment uploaded.', 'success');
+    } catch (caughtError) {
+      addToast(asApiError(caughtError).message, 'error', 4000, 'Unable to upload attachment');
+    } finally {
+      if (attachmentInput) attachmentInput.value = '';
+    }
+  }
+
+  function removeAttachment(artifactId: string): void {
+    composerAttachments = composerAttachments.filter((item) => item.artifact_id !== artifactId);
   }
 
   async function retryLastTurn(): Promise<void> {
@@ -1420,6 +1442,18 @@
                 {/each}
               </div>
             {/if}
+            {#if composerAttachments.length > 0}
+              <div class="flex flex-wrap gap-2">
+                {#each composerAttachments as attachment}
+                  <div class="flex items-center gap-2 rounded-full border border-slate-700 bg-slate-950/70 px-3 py-2 text-xs text-slate-200">
+                    <span class="truncate max-w-[220px]">{attachment.filename}</span>
+                    <button type="button" class="text-slate-400 hover:text-white" onclick={() => removeAttachment(attachment.artifact_id)} aria-label="Remove attachment">
+                      <X class="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                {/each}
+              </div>
+            {/if}
             <textarea
               bind:this={composerElement}
               bind:value={composer}
@@ -1435,10 +1469,14 @@
                 <span>Press Enter to send</span>
               </label>
               <div class="flex gap-2">
+                <input bind:this={attachmentInput} class="hidden" type="file" multiple onchange={(event) => void handleAttachmentSelect(event)} />
+                <Button size="sm" variant="secondary" type="button" onclick={() => attachmentInput?.click()}>
+                  <Paperclip class="mr-2 h-4 w-4" /> Attach
+                </Button>
                 <Button size="sm" variant="secondary" type="button" onclick={() => currentConversation && wsClient.cancelTurn(currentConversation.conversation_id)}>
                   Cancel turn
                 </Button>
-                <Button size="sm" type="submit" disabled={!composer.trim() || !currentConversation || isReadOnly(currentConversation) || isLlmUnavailableForSetup()}>
+                <Button size="sm" type="submit" disabled={(!composer.trim() && composerAttachments.length === 0) || !currentConversation || isReadOnly(currentConversation) || isLlmUnavailableForSetup()}>
                   Send
                 </Button>
               </div>

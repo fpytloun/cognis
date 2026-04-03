@@ -14,6 +14,7 @@ from cognis.store.models import (
     Agent,
     AgentSecondaryBinding,
     ApiKey,
+    ArtifactRecordRow,
     ChannelAccountRow,
     ChannelContact,
     ChannelPairingRequest,
@@ -2140,6 +2141,154 @@ async def list_pairing_requests(
     stmt = stmt.order_by(ChannelPairingRequest.created_at.desc())
     result = await session.execute(stmt)
     return list(result.scalars().all())
+
+
+# --- Artifacts ---
+
+
+async def create_artifact_record(
+    session: AsyncSession,
+    *,
+    artifact_id: str,
+    namespace: str,
+    object_id: str,
+    filename: str,
+    owner_email: str | None,
+    purpose: str,
+    kind: str,
+    mime_type: str,
+    size_bytes: int,
+    status: str = "temporary",
+    expires_at: datetime | None = None,
+    conversation_id: str | None = None,
+    session_id: str | None = None,
+    message_role: str | None = None,
+) -> ArtifactRecordRow:
+    row = ArtifactRecordRow(
+        artifact_id=artifact_id,
+        namespace=namespace,
+        object_id=object_id,
+        filename=filename,
+        owner_email=owner_email,
+        conversation_id=conversation_id,
+        session_id=session_id,
+        message_role=message_role,
+        purpose=purpose,
+        kind=kind,
+        mime_type=mime_type,
+        size_bytes=size_bytes,
+        status=status,
+        expires_at=expires_at,
+    )
+    session.add(row)
+    await session.flush()
+    return row
+
+
+async def get_artifact_record(session: AsyncSession, artifact_id: str) -> ArtifactRecordRow | None:
+    result = await session.execute(
+        select(ArtifactRecordRow).where(ArtifactRecordRow.artifact_id == artifact_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def mark_artifacts_attached(
+    session: AsyncSession,
+    artifact_ids: list[str],
+    *,
+    owner_email: str | None = None,
+    conversation_id: str,
+    session_id: str | None = None,
+    message_role: str = "user",
+) -> int:
+    if not artifact_ids:
+        return 0
+    stmt = update(ArtifactRecordRow).where(ArtifactRecordRow.artifact_id.in_(artifact_ids))
+    if owner_email is not None:
+        stmt = stmt.where(ArtifactRecordRow.owner_email == owner_email)
+    result = await session.execute(
+        stmt.values(
+            status="attached",
+            conversation_id=conversation_id,
+            session_id=session_id,
+            message_role=message_role,
+            expires_at=None,
+        )
+    )
+    return int(result.rowcount or 0)
+
+
+async def list_expired_temporary_artifacts(
+    session: AsyncSession,
+    *,
+    now: datetime,
+    limit: int = 200,
+) -> list[ArtifactRecordRow]:
+    result = await session.execute(
+        select(ArtifactRecordRow)
+        .where(
+            ArtifactRecordRow.status == "temporary",
+            ArtifactRecordRow.expires_at.is_not(None),
+            ArtifactRecordRow.expires_at <= now,
+        )
+        .order_by(ArtifactRecordRow.expires_at.asc())
+        .limit(limit)
+    )
+    return list(result.scalars().all())
+
+
+async def list_orphaned_attached_artifacts(
+    session: AsyncSession,
+    *,
+    limit: int = 200,
+) -> list[ArtifactRecordRow]:
+    result = await session.execute(
+        select(ArtifactRecordRow)
+        .where(
+            ArtifactRecordRow.status == "attached",
+            sa.or_(
+                sa.and_(
+                    ArtifactRecordRow.owner_email.is_not(None),
+                    sa.not_(
+                        sa.exists(
+                            select(User.email).where(User.email == ArtifactRecordRow.owner_email)
+                        )
+                    ),
+                ),
+                sa.and_(
+                    ArtifactRecordRow.conversation_id.is_not(None),
+                    sa.not_(
+                        sa.exists(
+                            select(Conversation.conversation_id).where(
+                                Conversation.conversation_id == ArtifactRecordRow.conversation_id
+                            )
+                        )
+                    ),
+                ),
+            ),
+        )
+        .order_by(ArtifactRecordRow.created_at.asc())
+        .limit(limit)
+    )
+    return list(result.scalars().all())
+
+
+async def mark_artifact_deleted(session: AsyncSession, artifact_id: str) -> bool:
+    row = await get_artifact_record(session, artifact_id)
+    if row is None:
+        return False
+    row.status = "deleted"
+    row.deleted_at = _utcnow()
+    await session.flush()
+    return True
+
+
+async def delete_artifact_record(session: AsyncSession, artifact_id: str) -> bool:
+    row = await get_artifact_record(session, artifact_id)
+    if row is None:
+        return False
+    await session.delete(row)
+    return True
 
 
 async def get_pairing_request_by_code(

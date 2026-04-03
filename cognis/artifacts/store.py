@@ -8,13 +8,17 @@ Storage layout: {namespace}/{object_id}/{filename}
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import re
 import shutil
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
+from urllib.parse import quote
 
 from cognis.logging import get_logger
 
@@ -37,6 +41,9 @@ class ArtifactStoreConfig:
     s3_bucket: str = "cognis-artifacts"
     s3_region: str = ""
     max_size_bytes: int = _MAX_ARTIFACT_SIZE_DEFAULT
+    base_url: str = ""
+    signing_secret: str = ""
+    signed_url_ttl_seconds: int = 3600
 
 
 @dataclass(frozen=True)
@@ -107,6 +114,15 @@ class ArtifactBackend(Protocol):
         ...
 
     def exists(self, namespace: str, object_id: str, filename: str) -> bool: ...
+
+    def get_signed_url(
+        self,
+        namespace: str,
+        object_id: str,
+        filename: str,
+        *,
+        ttl_seconds: int,
+    ) -> str | None: ...
 
 
 class FilesystemArtifactBackend:
@@ -196,6 +212,16 @@ class FilesystemArtifactBackend:
             return path.exists()
         except ValueError:
             return False
+
+    def get_signed_url(
+        self,
+        namespace: str,
+        object_id: str,
+        filename: str,
+        *,
+        ttl_seconds: int,
+    ) -> str | None:
+        return None
 
 
 class S3ArtifactBackend:
@@ -321,6 +347,21 @@ class S3ArtifactBackend:
         except Exception:
             return False
 
+    def get_signed_url(
+        self,
+        namespace: str,
+        object_id: str,
+        filename: str,
+        *,
+        ttl_seconds: int,
+    ) -> str | None:
+        key = self._key(namespace, object_id, filename)
+        return self._client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": self._bucket, "Key": key},
+            ExpiresIn=ttl_seconds,
+        )
+
 
 class ArtifactStore:
     """High-level artifact store with backend selection and size limits.
@@ -381,6 +422,50 @@ class ArtifactStore:
         """Check if an artifact exists (sync)."""
         return self._backend.exists(namespace, object_id, filename)
 
+    def _filesystem_signature(self, namespace: str, object_id: str, filename: str, exp: int) -> str:
+        payload = f"{namespace}:{object_id}:{filename}:{exp}".encode()
+        secret = self._config.signing_secret.encode("utf-8")
+        return hmac.new(secret, payload, hashlib.sha256).hexdigest()
+
+    def get_signed_url(
+        self,
+        namespace: str,
+        object_id: str,
+        filename: str,
+        *,
+        ttl_seconds: int | None = None,
+    ) -> str:
+        """Generate a signed URL for an artifact.
+
+        S3 backends use native presigned URLs. Filesystem backends return an
+        application URL signed with HMAC.
+        """
+        ttl = ttl_seconds or self._config.signed_url_ttl_seconds
+        backend_url = self._backend.get_signed_url(
+            namespace,
+            object_id,
+            filename,
+            ttl_seconds=ttl,
+        )
+        if backend_url is not None:
+            return backend_url
+        if not self._config.base_url or not self._config.signing_secret:
+            raise ValueError("Artifact signing requires base_url and signing_secret")
+        exp = int(time.time()) + ttl
+        sig = self._filesystem_signature(namespace, object_id, filename, exp)
+        path = f"/api/v1/artifacts/content/{quote(namespace)}/{quote(object_id)}/{quote(filename)}"
+        return f"{self._config.base_url}{path}?exp={exp}&sig={sig}"
+
+    def verify_signed_request(
+        self, namespace: str, object_id: str, filename: str, *, exp: int, sig: str
+    ) -> bool:
+        if exp < int(time.time()):
+            return False
+        if not self._config.signing_secret:
+            return False
+        expected = self._filesystem_signature(namespace, object_id, filename, exp)
+        return hmac.compare_digest(expected, sig)
+
     # ------------------------------------------------------------------
     # Async wrappers — use these from async route handlers and tools
     # ------------------------------------------------------------------
@@ -432,3 +517,17 @@ class ArtifactStore:
         import asyncio
 
         return await asyncio.to_thread(self.exists, namespace, object_id, filename)
+
+    async def async_get_signed_url(
+        self,
+        namespace: str,
+        object_id: str,
+        filename: str,
+        *,
+        ttl_seconds: int | None = None,
+    ) -> str:
+        import asyncio
+
+        return await asyncio.to_thread(
+            self.get_signed_url, namespace, object_id, filename, ttl_seconds=ttl_seconds
+        )

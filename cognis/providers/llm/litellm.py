@@ -184,9 +184,15 @@ class LiteLLMProvider:
                         continue
                     if model.get("model_id") != model_id:
                         continue
-                    model_info = ModelInfo.model_validate(model)
+                    model_info = await self._merge_litellm_model_info(model_id, row, model)
                     await self._set_cached_model_info(model_id, model_info)
                     return model_info
+
+            provider = await self._find_provider_for_model(session, model_id)
+            if provider is not None:
+                model_info = await self._merge_litellm_model_info(model_id, provider, {})
+                await self._set_cached_model_info(model_id, model_info)
+                return model_info
 
         logger.warning(
             "LLM model metadata missing; using conservative defaults",
@@ -194,6 +200,56 @@ class LiteLLMProvider:
         )
         await self._set_cached_model_info(model_id, DEFAULT_MODEL_INFO)
         return DEFAULT_MODEL_INFO
+
+    async def _merge_litellm_model_info(
+        self,
+        model_id: str,
+        provider: LLMProviderRow | None,
+        configured: dict[str, Any],
+    ) -> ModelInfo:
+        merged: dict[str, Any] = dict(DEFAULT_MODEL_INFO.model_dump())
+        try:
+            provider_kwargs = await self._resolve_provider_kwargs(provider)
+            live = litellm.get_model_info(
+                model=self._apply_model_prefix(model_id, provider),
+                custom_llm_provider=(
+                    dict(provider.config).get("preset") if provider is not None else None
+                ),
+                api_base=provider_kwargs.get("api_base"),
+            )
+            if isinstance(live, dict):
+                merged.update(
+                    {
+                        "context_window": live.get("max_input_tokens")
+                        or live.get("context_window")
+                        or merged.get("context_window"),
+                        "max_output_tokens": live.get("max_output_tokens")
+                        or merged.get("max_output_tokens"),
+                        "supports_tools": bool(
+                            live.get("supports_function_calling")
+                            or "tools" in (live.get("supported_openai_params") or [])
+                        ),
+                        "supports_streaming": "stream"
+                        in (live.get("supported_openai_params") or [])
+                        or merged.get("supports_streaming"),
+                        "supports_vision": bool(live.get("supports_vision")),
+                        "supports_audio_input": bool(live.get("supports_audio_input")),
+                        "supports_pdf_input": bool(live.get("supports_pdf_input")),
+                        "supports_file_input": bool(live.get("supports_file_input", False)),
+                        "supports_reasoning": bool(live.get("supports_reasoning")),
+                        "supports_prompt_caching": bool(live.get("supports_prompt_caching")),
+                        "supported_openai_params": list(live.get("supported_openai_params") or []),
+                    }
+                )
+        except Exception:
+            logger.debug(
+                "LLM model metadata lookup via LiteLLM failed",
+                extra={"extra_data": {"model_id": model_id}},
+                exc_info=True,
+            )
+        merged.update(configured)
+        merged["model_id"] = model_id
+        return ModelInfo.model_validate(merged)
 
     async def generate(
         self,

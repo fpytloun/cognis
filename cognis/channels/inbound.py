@@ -105,6 +105,7 @@ class InboundPipeline:
             channel_type=message.channel_type,
             account_id=message.account_id,
             chat_id=message.chat_id,
+            thread_id=message.thread_id,
             conversation_id=conversation_id,
             turn_scheduler=self._turn_scheduler,
             reply_to_id=message.message_id,
@@ -117,6 +118,7 @@ class InboundPipeline:
             conversation_id,
             message.content,
             user_email=user_email,
+            attachments=[],
         )
 
         if error is not None:
@@ -215,6 +217,8 @@ class InboundPipeline:
         to find an existing conversation, or creates a new one.
         """
         context_ref = f"{message.channel_type}:{message.account_id}:{message.chat_id}"
+        if message.thread_id:
+            context_ref = f"{context_ref}:{message.thread_id}"
 
         # Check for default conversation
         if config.default_conversation_id:
@@ -250,6 +254,7 @@ class InboundPipeline:
                         "chat_id": message.chat_id,
                         "chat_name": message.chat_name,
                         "chat_type": message.chat_type,
+                        "thread_id": message.thread_id,
                     },
                 ),
                 title=message.chat_name or f"{message.channel_type} chat",
@@ -314,6 +319,7 @@ class ChannelTurnObserver:
         channel_type: str,
         account_id: str,
         chat_id: str,
+        thread_id: str | None = None,
         conversation_id: str,
         turn_scheduler: Any,
         reply_to_id: str | None = None,
@@ -322,6 +328,7 @@ class ChannelTurnObserver:
         self._channel_type = channel_type
         self._account_id = account_id
         self._chat_id = chat_id
+        self._thread_id = thread_id
         self._conversation_id = conversation_id
         self._turn_scheduler = turn_scheduler
         self._reply_to_id = reply_to_id
@@ -400,6 +407,7 @@ class ChannelTurnObserver:
                         chat_id=self._chat_id,
                         content=chunk,
                         reply_to_id=self._reply_to_id,
+                        thread_id=self._thread_id,
                     )
                 )
                 CHANNEL_OUTBOUND_TOTAL.labels(
@@ -428,6 +436,7 @@ class ChannelTurnObserver:
                     chat_id=self._chat_id,
                     content=error_text,
                     reply_to_id=self._reply_to_id,
+                    thread_id=self._thread_id,
                 )
             )
 
@@ -443,6 +452,7 @@ class ChannelTurnObserver:
                     account_id=self._account_id,
                     chat_id=self._chat_id,
                     content=text,
+                    thread_id=self._thread_id,
                 )
             )
 

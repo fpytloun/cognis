@@ -28,6 +28,7 @@ from cognis.core.pruning import prune_tool_outputs
 from cognis.core.truncation import middle_truncate
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
+from cognis.models.artifact import AttachmentRef
 from cognis.models.session import ConversationModel, SessionEvent, SessionModel
 from cognis.models.tool import ToolCall, ToolResult
 from cognis.models.workflow import StepDefinition, StepOutput, WorkflowState
@@ -521,6 +522,8 @@ class StepContext:
     policy: ExecutionPolicy = field(default_factory=lambda: CHAT_POLICY)
     is_retry: bool = False  # True for re-attempt within the same step
     user_message: str = ""
+    user_attachments: list[AttachmentRef] = field(default_factory=list)
+    attachment_notice: str | None = None
     prior_context: list[dict[str, Any]] | None = None  # Prior step output messages
     interaction_mode: str = "explicit_gates"
     tool_registry: Any = None  # ToolRegistry instance for this step
@@ -1049,7 +1052,14 @@ class AgentLoop:
         if effective_user_message and not ctx.system_initiated and not ctx.is_retry:
             intaris_id = ctx.session.intaris_session_id or ctx.session.session_id
             user_msg_event = SessionEvent(
-                type="user_message", data={"content": effective_user_message}
+                type="user_message",
+                data={
+                    "content": effective_user_message,
+                    "attachments": [
+                        item.model_dump(mode="json", exclude={"url"})
+                        for item in ctx.user_attachments
+                    ],
+                },
             )
             try:
                 await self.providers.guardrails.record_events(
@@ -1101,6 +1111,8 @@ class AgentLoop:
             conversation=ctx.conversation,
             agent=ctx.agent,
             user_message=effective_user_message,
+            user_attachments=[item.model_dump(mode="json") for item in ctx.user_attachments],
+            attachment_notice=ctx.attachment_notice,
             user_message_role="system" if ctx.system_initiated else "user",
             prior_context=ctx.prior_context,
             skip_memory=ctx.policy.skip_memory,
@@ -1115,7 +1127,16 @@ class AgentLoop:
         # is an internal instruction, not user-visible content.
         if effective_user_message and not _user_msg_recorded_early and not ctx.system_initiated:
             events_to_record.append(
-                SessionEvent(type="user_message", data={"content": effective_user_message})
+                SessionEvent(
+                    type="user_message",
+                    data={
+                        "content": effective_user_message,
+                        "attachments": [
+                            item.model_dump(mode="json", exclude={"url"})
+                            for item in ctx.user_attachments
+                        ],
+                    },
+                )
             )
 
         # Capture cache breakpoint for prompt caching (Anthropic cache_control)

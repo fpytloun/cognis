@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from cognis.core.prompts import PromptContext, build_system_instructions
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
+from cognis.models.artifact import ArtifactKind
 from cognis.models.session import ConversationModel, SessionModel
 from cognis.models.tool import ToolDefinition
 from cognis.runtime_context import scoped_runtime_context
@@ -50,6 +51,57 @@ class ContextAssemblyResult(BaseModel):
     max_context_tokens: int = 0
     recommend_compaction: bool = False
     cache_breakpoint_index: int | None = None
+
+
+def _attachment_note(attachments: list[dict[str, Any]]) -> str:
+    parts: list[str] = []
+    for attachment in attachments:
+        filename = str(attachment.get("filename") or attachment.get("artifact_id") or "attachment")
+        kind = str(attachment.get("kind") or "file")
+        parts.append(f"{filename} ({kind})")
+    return "Attachments: " + ", ".join(parts)
+
+
+def _filter_attachments_by_names(
+    attachments: list[dict[str, Any]],
+    names: list[str],
+) -> list[dict[str, Any]]:
+    wanted = set(names)
+    return [
+        attachment
+        for attachment in attachments
+        if str(attachment.get("filename") or attachment.get("artifact_id") or "attachment")
+        in wanted
+    ]
+
+
+def _native_attachment_blocks(
+    attachments: list[dict[str, Any]],
+    model_info: Any,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    blocks: list[dict[str, Any]] = []
+    unsupported: list[str] = []
+    for attachment in attachments:
+        kind = str(attachment.get("kind") or ArtifactKind.FILE.value)
+        url = attachment.get("url")
+        filename = str(attachment.get("filename") or attachment.get("artifact_id") or "attachment")
+        if not isinstance(url, str) or not url:
+            unsupported.append(filename)
+            continue
+        if kind == ArtifactKind.IMAGE.value and getattr(model_info, "supports_vision", False):
+            blocks.append({"type": "image_url", "image_url": {"url": url}})
+            continue
+        if kind == ArtifactKind.PDF.value and getattr(model_info, "supports_pdf_input", False):
+            blocks.append({"type": "file", "file": {"file_url": url, "filename": filename}})
+            continue
+        if kind == ArtifactKind.AUDIO.value and getattr(model_info, "supports_audio_input", False):
+            blocks.append({"type": "file", "file": {"file_url": url, "filename": filename}})
+            continue
+        if kind == ArtifactKind.FILE.value and getattr(model_info, "supports_file_input", False):
+            blocks.append({"type": "file", "file": {"file_url": url, "filename": filename}})
+            continue
+        unsupported.append(filename)
+    return blocks, unsupported
 
 
 def _build_environment_info() -> str:
@@ -142,6 +194,8 @@ class ContextAssembler:
         conversation: ConversationModel,
         agent: AgentDefinition,
         user_message: str,
+        user_attachments: list[dict[str, Any]] | None = None,
+        attachment_notice: str | None = None,
         user_message_role: str = "user",
         tool_definitions: list[ToolDefinition] | None = None,
         active_delegations: list[dict[str, Any]] | None = None,
@@ -175,6 +229,8 @@ class ContextAssembler:
                 conversation=conversation,
                 agent=agent,
                 user_message=user_message,
+                user_attachments=user_attachments,
+                attachment_notice=attachment_notice,
                 user_message_role=user_message_role,
                 tool_definitions=tool_definitions,
                 active_delegations=active_delegations,
@@ -449,7 +505,34 @@ class ContextAssembler:
             )
 
         if not skip_user_message:
-            messages.append({"role": user_message_role, "content": user_message})
+            if attachment_notice:
+                messages.append({"role": "system", "content": attachment_notice})
+            attachment_blocks, unsupported = _native_attachment_blocks(
+                user_attachments or [], model_info
+            )
+            if attachment_blocks:
+                blocks: list[dict[str, Any]] = []
+                if user_message.strip():
+                    blocks.append({"type": "text", "text": user_message})
+                elif attachment_blocks:
+                    blocks.append({"type": "text", "text": "User attached files."})
+                blocks.extend(attachment_blocks)
+                if unsupported:
+                    blocks.append(
+                        {
+                            "type": "text",
+                            "text": _attachment_note(
+                                _filter_attachments_by_names(user_attachments or [], unsupported)
+                            ),
+                        }
+                    )
+                messages.append({"role": user_message_role, "content": blocks})
+            else:
+                content = user_message
+                if user_attachments:
+                    note = _attachment_note(user_attachments)
+                    content = f"{user_message}\n\n{note}" if user_message.strip() else note
+                messages.append({"role": user_message_role, "content": content})
 
         messages = self._prune_messages(
             messages=messages,
@@ -506,6 +589,8 @@ class ContextAssembler:
         conversation: ConversationModel,
         agent: AgentDefinition,
         user_message: str,
+        user_attachments: list[dict[str, Any]] | None = None,
+        attachment_notice: str | None = None,
         user_message_role: str = "user",
         tool_definitions: list[ToolDefinition] | None = None,
         active_delegations: list[dict[str, Any]] | None = None,
@@ -603,7 +688,34 @@ class ContextAssembler:
             messages.extend(prior_context)
 
         if not skip_user_message:
-            messages.append({"role": user_message_role, "content": user_message})
+            if attachment_notice:
+                messages.append({"role": "system", "content": attachment_notice})
+            attachment_blocks, unsupported = _native_attachment_blocks(
+                user_attachments or [], model_info
+            )
+            if attachment_blocks:
+                blocks: list[dict[str, Any]] = []
+                if user_message.strip():
+                    blocks.append({"type": "text", "text": user_message})
+                else:
+                    blocks.append({"type": "text", "text": "User attached files."})
+                blocks.extend(attachment_blocks)
+                if unsupported:
+                    blocks.append(
+                        {
+                            "type": "text",
+                            "text": _attachment_note(
+                                _filter_attachments_by_names(user_attachments or [], unsupported)
+                            ),
+                        }
+                    )
+                messages.append({"role": user_message_role, "content": blocks})
+            else:
+                content = user_message
+                if user_attachments:
+                    note = _attachment_note(user_attachments)
+                    content = f"{user_message}\n\n{note}" if user_message.strip() else note
+                messages.append({"role": user_message_role, "content": content})
 
         messages = self._prune_messages(
             messages=messages,
@@ -787,10 +899,16 @@ def events_to_messages(events: list[Any]) -> list[dict[str, Any]]:
         if event_type == "user_message":
             content = event_data.get("content")
             if isinstance(content, str):
+                attachments = event_data.get("attachments")
+                if isinstance(attachments, list) and attachments:
+                    content = f"{content}\n\n{_attachment_note([a for a in attachments if isinstance(a, dict)])}"
                 messages.append({"role": "user", "content": content})
         elif event_type == "assistant_message":
             content = event_data.get("content")
             if isinstance(content, str):
+                attachments = event_data.get("attachments")
+                if isinstance(attachments, list) and attachments:
+                    content = f"{content}\n\n{_attachment_note([a for a in attachments if isinstance(a, dict)])}"
                 messages.append({"role": "assistant", "content": content})
         elif event_type == "tool_result":
             # The agent loop stores tool output under key "result";

@@ -36,6 +36,7 @@ from cognis.core.compaction import ROTATION_TOTAL
 from cognis.core.events import Event, EventBus, EventType
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
+from cognis.models.artifact import ArtifactKind, AttachmentRef
 from cognis.models.session import BLOCKED_STATES, ConversationModel, SessionModel, SessionStatus
 from cognis.models.task import TaskDelivery
 from cognis.runtime_context import current_agent_id, current_user_email
@@ -104,6 +105,7 @@ class _QueuedMessage:
 
     content: str
     user_email: str
+    attachments: list[dict[str, Any]] | None = None
     system_initiated: bool = False
 
 
@@ -194,6 +196,7 @@ class TurnScheduler:
         pause_waiter: Any,
         notification_service: Any,
         providers: Any,
+        artifact_store: Any,
         workflow_registry: Any,
         event_bus: EventBus,
     ) -> None:
@@ -208,6 +211,7 @@ class TurnScheduler:
         self._pause_waiter = pause_waiter
         self._notification_service = notification_service
         self._providers = providers
+        self._artifact_store = artifact_store
         self._workflow_registry = workflow_registry
         self._event_bus = event_bus
 
@@ -268,6 +272,7 @@ class TurnScheduler:
         content: str,
         *,
         user_email: str,
+        attachments: list[dict[str, Any]] | None = None,
         system_initiated: bool = False,
     ) -> TurnError | None:
         """Submit a chat turn for execution.
@@ -306,6 +311,19 @@ class TurnScheduler:
                 recoverable=False,
             )
 
+        normalized_attachments, attachment_error = await self._resolve_attachments_for_turn(
+            user_email=user_email,
+            attachments=attachments or [],
+        )
+        if attachment_error is not None:
+            return attachment_error
+
+        attachment_notice = await self._build_attachment_notice(
+            session=session,
+            agent=agent,
+            attachments=normalized_attachments,
+        )
+
         # Conversation state check
         if conversation.status in {"archived", "deleted"}:
             return TurnError(
@@ -337,7 +355,13 @@ class TurnScheduler:
             if pending_esc is not None:
                 # Queue the message behind the escalation
                 self._queued_messages[conversation_id].append(
-                    _QueuedMessage(content=content, user_email=user_email)
+                    _QueuedMessage(
+                        content=content,
+                        user_email=user_email,
+                        attachments=[
+                            item.model_dump(mode="json") for item in normalized_attachments
+                        ],
+                    )
                 )
                 await self._notify_observers_system_message(
                     conversation_id,
@@ -370,6 +394,7 @@ class TurnScheduler:
                 _QueuedMessage(
                     content=content,
                     user_email=user_email,
+                    attachments=[item.model_dump(mode="json") for item in normalized_attachments],
                     system_initiated=system_initiated,
                 )
             )
@@ -386,6 +411,8 @@ class TurnScheduler:
             agent=agent,
             content=content,
             user_email=user_email,
+            attachments=normalized_attachments,
+            attachment_notice=attachment_notice,
             system_initiated=system_initiated,
         )
         return None
@@ -464,6 +491,93 @@ class TurnScheduler:
     # Turn execution
     # ------------------------------------------------------------------
 
+    async def _resolve_attachments_for_turn(
+        self,
+        *,
+        user_email: str,
+        attachments: list[dict[str, Any]],
+    ) -> tuple[list[AttachmentRef], TurnError | None]:
+        if not attachments:
+            return [], None
+        from cognis.store.queries import get_artifact_record
+
+        normalized: list[AttachmentRef] = []
+        async with self._session_factory() as session:
+            for raw in attachments:
+                artifact_id = raw.get("artifact_id") if isinstance(raw, dict) else None
+                if not isinstance(artifact_id, str) or not artifact_id:
+                    return [], TurnError(
+                        code="validation_error",
+                        message="Invalid attachment reference",
+                        recoverable=True,
+                    )
+                row = await get_artifact_record(session, artifact_id)
+                if row is None or row.status == "deleted":
+                    return [], TurnError(
+                        code="not_found",
+                        message="Attachment not found",
+                        recoverable=True,
+                    )
+                if row.owner_email and row.owner_email != user_email:
+                    return [], TurnError(
+                        code="forbidden",
+                        message="Attachment access denied",
+                        recoverable=False,
+                    )
+                url = await self._artifact_store.async_get_signed_url(
+                    row.namespace,
+                    row.object_id,
+                    row.filename,
+                )
+                normalized.append(
+                    AttachmentRef(
+                        artifact_id=row.artifact_id,
+                        kind=ArtifactKind(row.kind),
+                        mime_type=row.mime_type,
+                        filename=row.filename,
+                        size_bytes=row.size_bytes,
+                        url=url,
+                    )
+                )
+        return normalized, None
+
+    async def _build_attachment_notice(
+        self,
+        *,
+        session: SessionModel,
+        agent: AgentDefinition,
+        attachments: list[AttachmentRef],
+    ) -> str | None:
+        if not attachments:
+            return None
+        explicit_model = self._session_cache.get_model_override(session.session_id) or (
+            agent.llm_config.model if agent.llm_config else None
+        )
+        resolved_model = await self._providers.llm.resolve_model(
+            explicit_model=explicit_model,
+            task_type="default",
+        )
+        model_info = await self._providers.llm.get_model_info(resolved_model)
+        unsupported: list[str] = []
+        for attachment in attachments:
+            if attachment.kind == ArtifactKind.IMAGE and model_info.supports_vision:
+                continue
+            if attachment.kind == ArtifactKind.PDF and model_info.supports_pdf_input:
+                continue
+            if attachment.kind == ArtifactKind.AUDIO and model_info.supports_audio_input:
+                continue
+            if attachment.kind == ArtifactKind.FILE and model_info.supports_file_input:
+                continue
+            unsupported.append(f"{attachment.filename} ({attachment.kind.value})")
+
+        if not unsupported:
+            return None
+        joined = ", ".join(unsupported)
+        return (
+            f"The current model ({resolved_model}) cannot read these attachments natively: {joined}. "
+            "You must explicitly refuse to analyze those files and ask the user to switch to a compatible model if needed."
+        )
+
     def _launch_turn(
         self,
         *,
@@ -472,6 +586,8 @@ class TurnScheduler:
         agent: AgentDefinition,
         content: str,
         user_email: str,
+        attachments: list[AttachmentRef] | None = None,
+        attachment_notice: str | None = None,
         system_initiated: bool = False,
     ) -> None:
         """Launch a turn as a background asyncio.Task."""
@@ -488,6 +604,8 @@ class TurnScheduler:
                 agent=agent,
                 content=content,
                 user_email=user_email,
+                attachments=attachments,
+                attachment_notice=attachment_notice,
                 system_initiated=system_initiated,
                 cancel_event=control,
             )
@@ -501,6 +619,8 @@ class TurnScheduler:
         agent: AgentDefinition,
         content: str,
         user_email: str,
+        attachments: list[AttachmentRef] | None,
+        attachment_notice: str | None,
         system_initiated: bool,
         cancel_event: asyncio.Event,
     ) -> None:
@@ -514,6 +634,9 @@ class TurnScheduler:
         try:
             current_user_email.set(user_email)
             current_agent_id.set(agent.agent_id)
+
+            if attachment_notice:
+                await self._notify_observers_system_message(conversation_id, attachment_notice)
 
             logger.info(
                 "turn_scheduler: turn started",
@@ -594,6 +717,8 @@ class TurnScheduler:
                 session=session,
                 agent=agent,
                 user_message=content,
+                user_attachments=attachments,
+                attachment_notice=attachment_notice,
                 system_initiated=system_initiated,
                 on_progress=on_token,
                 on_tool_call=on_tool_call,
@@ -687,24 +812,17 @@ class TurnScheduler:
             if queue:
                 queued = queue.popleft()
                 try:
-                    runtime = await self._load_conversation_runtime(
-                        conversation_id, user_message=queued.content
+                    await self.submit_turn(
+                        conversation_id,
+                        queued.content,
+                        user_email=queued.user_email,
+                        attachments=queued.attachments,
+                        system_initiated=queued.system_initiated,
                     )
                 except Exception:
                     logger.exception(
                         "turn_scheduler: failed to load runtime for queued message",
                         extra={"extra_data": {"conversation_id": conversation_id}},
-                    )
-                    runtime = None
-                if runtime is not None:
-                    next_conversation, next_session, next_agent = runtime
-                    self._launch_turn(
-                        conversation=next_conversation,
-                        session=next_session,
-                        agent=next_agent,
-                        content=queued.content,
-                        user_email=queued.user_email,
-                        system_initiated=queued.system_initiated,
                     )
 
     # ------------------------------------------------------------------

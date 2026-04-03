@@ -115,6 +115,15 @@ export interface MessageEvent {
   timestamp: string | null;
 }
 
+export interface AttachmentRef {
+  artifact_id: string;
+  kind: string;
+  mime_type: string;
+  filename: string;
+  size_bytes: number;
+  url?: string | null;
+}
+
 export interface MessageHistoryResponse {
   items: MessageEvent[];
   last_seq: number;

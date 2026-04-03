@@ -3,7 +3,7 @@ import { writable, get } from 'svelte/store';
 import { getWebSocketUrl } from '$lib/config';
 import { reportError } from '$lib/errors';
 import { auth } from '$lib/stores/auth';
-import type { CognisWebSocketEvent } from '$lib/types/api';
+import type { AttachmentRef, CognisWebSocketEvent } from '$lib/types/api';
 import { clamp } from '$lib/utils';
 
 type ConnectionStatus = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'stalled';
@@ -155,13 +155,13 @@ class CognisWebSocketClient {
     this.subscriptions.set(conversationId, Math.max(previous, lastSeq));
   }
 
-  sendMessage(conversationId: string, content: string): void {
+  sendMessage(conversationId: string, content: string, attachments: AttachmentRef[] = []): void {
     // Only subscribe if not already subscribed — avoids sending a redundant
     // reconnect frame before every message which triggers session_recovered.
     if (!this.subscriptions.has(conversationId)) {
       this.subscribeConversation(conversationId, 0);
     }
-    this.sendRaw({ type: 'message', conversation_id: conversationId, content });
+    this.sendRaw({ type: 'message', conversation_id: conversationId, content, attachments });
   }
 
   cancelTurn(conversationId: string): void {

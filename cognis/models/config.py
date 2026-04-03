@@ -44,11 +44,15 @@ class ModelInfo(BaseModel):
     supports_tools: bool = True
     supports_streaming: bool = True
     supports_vision: bool = False
+    supports_audio_input: bool = False
+    supports_pdf_input: bool = False
+    supports_file_input: bool = False
     supports_reasoning: bool = False
     reasoning_efforts: list[str] = Field(default_factory=list)
     supports_prompt_caching: bool = False
     supports_extended_thinking: bool = False
     supports_image_generation: bool = False
+    supported_openai_params: list[str] = Field(default_factory=list)
     input_cost_per_mtok: float | None = None
     output_cost_per_mtok: float | None = None
     tier: str = "standard"

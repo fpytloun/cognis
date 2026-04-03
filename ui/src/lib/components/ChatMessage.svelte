@@ -43,6 +43,10 @@
       : 'prose-invert prose-code:text-sky-200';
   }
 
+  function isImage(mimeType: string | undefined): boolean {
+    return typeof mimeType === 'string' && mimeType.startsWith('image/');
+  }
+
   async function copyMessage(): Promise<void> {
     try {
       await navigator.clipboard.writeText(item.content);
@@ -133,6 +137,26 @@
     <div use:addCodeCopyButtons={item.html} class={`chat-markdown prose max-w-none overflow-x-auto break-words prose-pre:overflow-x-auto ${proseClass()}`}>{@html item.html}</div>
   {:else}
     <p class="whitespace-pre-wrap break-words text-sm leading-6 [overflow-wrap:anywhere]">{item.content}</p>
+  {/if}
+
+  {#if item.attachments && item.attachments.length > 0}
+    <div class="mt-4 space-y-3">
+      {#each item.attachments as attachment}
+        {#if attachment.url && isImage(attachment.mime_type)}
+          <a href={attachment.url} target="_blank" rel="noreferrer" class="block overflow-hidden rounded-2xl border border-slate-800 bg-slate-950/60">
+            <img src={attachment.url} alt={attachment.filename} class="max-h-80 w-full object-cover" loading="lazy" />
+            <div class="px-3 py-2 text-xs text-slate-400">{attachment.filename}</div>
+          </a>
+        {:else if attachment.url}
+          <a href={attachment.url} target="_blank" rel="noreferrer" class="flex items-center justify-between rounded-2xl border border-slate-800 bg-slate-950/60 px-3 py-3 text-sm text-slate-200 hover:border-slate-600">
+            <span class="truncate">{attachment.filename}</span>
+            <span class="text-xs text-slate-500">{attachment.mime_type}</span>
+          </a>
+        {:else}
+          <div class="rounded-2xl border border-slate-800 bg-slate-950/60 px-3 py-3 text-sm text-slate-300">{attachment.filename}</div>
+        {/if}
+      {/each}
+    </div>
   {/if}
 
   <div class="mt-3 flex items-center justify-between gap-4 text-[11px] uppercase tracking-[0.2em] opacity-70">

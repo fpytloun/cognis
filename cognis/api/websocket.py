@@ -43,7 +43,7 @@ from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.runtime_context import current_user_email
 from cognis.store.models import Task
-from cognis.store.queries import get_task
+from cognis.store.queries import get_task, mark_artifacts_attached
 
 logger = get_logger(__name__)
 
@@ -718,7 +718,22 @@ async def _handle_message(
     """Handle a 'message' type WebSocket frame."""
     conversation_id = message.get("conversation_id")
     content = message.get("content")
-    if not isinstance(conversation_id, str) or not isinstance(content, str) or not content.strip():
+    attachments = message.get("attachments")
+    if not isinstance(attachments, list):
+        attachments = []
+    if len(attachments) > 20:
+        await manager.send_error(
+            connection,
+            code="validation_error",
+            message="Too many attachments",
+            recoverable=True,
+        )
+        return
+    if (
+        not isinstance(conversation_id, str)
+        or not isinstance(content, str)
+        or (not content.strip() and len(attachments) == 0)
+    ):
         await manager.send_error(
             connection,
             code="validation_error",
@@ -793,10 +808,27 @@ async def _handle_message(
 
     # Not a command — submit to TurnScheduler
     if turn_scheduler is not None:
+        async with app.state.session_factory() as db_session:
+            from cognis.store.queries import get_conversation
+
+            conversation_row = await get_conversation(db_session, conversation_id)
+            await mark_artifacts_attached(
+                db_session,
+                [
+                    str(item.get("artifact_id"))
+                    for item in attachments
+                    if isinstance(item, dict) and item.get("artifact_id")
+                ],
+                owner_email=connection.user_email,
+                conversation_id=conversation_id,
+                session_id=conversation_row.active_session_id if conversation_row else None,
+            )
+            await db_session.commit()
         error = await turn_scheduler.submit_turn(
             conversation_id,
             content,
             user_email=connection.user_email,
+            attachments=[item for item in attachments if isinstance(item, dict)],
         )
         if error is not None:
             await manager.send_to_conversation(

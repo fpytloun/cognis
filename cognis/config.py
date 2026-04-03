@@ -63,6 +63,8 @@ class CognisConfig:
     artifact_s3_bucket: str
     artifact_s3_region: str
     artifact_max_size_bytes: int
+    artifact_signed_url_ttl_seconds: int
+    artifact_signing_secret: str
 
     # Initial admin (container/CI bootstrap)
     initial_admin_email: str | None
@@ -137,6 +139,10 @@ def load_config() -> CognisConfig:
         artifact_max_size_bytes=int(os.environ.get("COGNIS_ARTIFACT_MAX_SIZE_MB", "50"))
         * 1024
         * 1024,
+        artifact_signed_url_ttl_seconds=int(
+            os.environ.get("COGNIS_ARTIFACT_SIGNED_URL_TTL_SECONDS", "3600")
+        ),
+        artifact_signing_secret=os.environ.get("COGNIS_ARTIFACT_SIGNING_SECRET", ""),
         initial_admin_email=os.environ.get("COGNIS_INITIAL_ADMIN_EMAIL"),
         initial_admin_password=os.environ.get("COGNIS_INITIAL_ADMIN_PASSWORD"),
     )
@@ -191,6 +197,8 @@ ENV_TEMPLATE = """\
 # COGNIS_ARTIFACT_S3_BUCKET=cognis-artifacts
 # COGNIS_ARTIFACT_S3_REGION=
 # COGNIS_ARTIFACT_MAX_SIZE_MB=50
+# COGNIS_ARTIFACT_SIGNED_URL_TTL_SECONDS=3600
+# COGNIS_ARTIFACT_SIGNING_SECRET=
 
 # Container/CI: auto-create admin on first start
 # COGNIS_INITIAL_ADMIN_EMAIL=admin@example.com

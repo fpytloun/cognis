@@ -32,11 +32,13 @@ from cognis.logging import get_logger
 from cognis.models.session import ConversationContext
 from cognis.store.queries import (
     get_agent,
+    get_artifact_record,
     get_conversation,
     get_latest_active_conversation_for_agent,
     get_session_row,
     list_conversation_sessions,
     list_conversations,
+    mark_artifacts_attached,
     mark_conversation_read,
 )
 
@@ -254,6 +256,38 @@ async def conversation_messages(
         after_seq=after_seq,
         limit=limit,
     )
+
+    artifact_store = request.app.state.artifact_store
+    async with request.app.state.session_factory() as artifact_session:
+        for event in event_result.events:
+            data = event.get("data") if isinstance(event, dict) else None
+            attachments = data.get("attachments") if isinstance(data, dict) else None
+            if not isinstance(attachments, list):
+                continue
+            refreshed: list[dict[str, Any]] = []
+            for attachment in attachments:
+                if not isinstance(attachment, dict):
+                    continue
+                artifact_id = attachment.get("artifact_id")
+                if not isinstance(artifact_id, str):
+                    continue
+                row = await get_artifact_record(artifact_session, artifact_id)
+                if row is None or row.status == "deleted":
+                    continue
+                refreshed.append(
+                    {
+                        **attachment,
+                        "filename": row.filename,
+                        "mime_type": row.mime_type,
+                        "size_bytes": row.size_bytes,
+                        "url": await artifact_store.async_get_signed_url(
+                            row.namespace,
+                            row.object_id,
+                            row.filename,
+                        ),
+                    }
+                )
+            data["attachments"] = refreshed
     return MessageHistoryResponse(
         items=[event_to_response(item) for item in event_result.events],
         last_seq=event_result.last_seq,
@@ -306,8 +340,20 @@ async def send_message(
 
         observer = SSETurnObserver(conversation_id)
         turn_scheduler.add_observer(conversation_id, observer)
+        async with request.app.state.session_factory() as session:
+            await mark_artifacts_attached(
+                session,
+                [item.artifact_id for item in payload.attachments],
+                owner_email=user.email,
+                conversation_id=conversation_id,
+                session_id=row.active_session_id,
+            )
+            await session.commit()
         error = await turn_scheduler.submit_turn(
-            conversation_id, payload.content, user_email=user.email
+            conversation_id,
+            payload.content,
+            user_email=user.email,
+            attachments=[item.model_dump(mode="json") for item in payload.attachments],
         )
         if error is not None:
             turn_scheduler.remove_observer(conversation_id, observer)
@@ -326,8 +372,20 @@ async def send_message(
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
     else:
+        async with request.app.state.session_factory() as session:
+            await mark_artifacts_attached(
+                session,
+                [item.artifact_id for item in payload.attachments],
+                owner_email=user.email,
+                conversation_id=conversation_id,
+                session_id=row.active_session_id,
+            )
+            await session.commit()
         error = await turn_scheduler.submit_turn(
-            conversation_id, payload.content, user_email=user.email
+            conversation_id,
+            payload.content,
+            user_email=user.email,
+            attachments=[item.model_dump(mode="json") for item in payload.attachments],
         )
         if error is not None:
             raise _turn_error_to_http(error)

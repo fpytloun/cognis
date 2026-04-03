@@ -4,6 +4,7 @@ import { auth } from '$lib/stores/auth';
 import type {
   ApiKeyCreateResponse,
   Agent,
+  AttachmentRef,
   ChannelAccount,
   ChannelAccountStatus,
   ChannelContact,
@@ -449,6 +450,22 @@ export const api = {
         method: 'POST',
         body: JSON.stringify(details)
       });
+    }
+  },
+
+  artifacts: {
+    upload(file: File, purpose = 'chat_input'): Promise<AttachmentRef> {
+      const form = new FormData();
+      form.set('file', file);
+      form.set('purpose', purpose);
+      return request<AttachmentRef>('/api/v1/artifacts/upload', {
+        method: 'POST',
+        body: form
+      });
+    },
+
+    signedUrl(artifactId: string, ttlSeconds = 3600): Promise<{ artifact_id: string; url: string; expires_at: string | null }> {
+      return request<{ artifact_id: string; url: string; expires_at: string | null }>(`/api/v1/artifacts/${artifactId}/signed-url${encodeQuery({ ttl_seconds: ttlSeconds })}`);
     }
   },
 

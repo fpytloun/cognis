@@ -5,8 +5,9 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, model_validator
 
+from cognis.models.artifact import AttachmentRef
 from cognis.models.task import TaskDelivery
 from cognis.models.workflow import WorkflowState
 
@@ -695,7 +696,14 @@ class ExecutorTokenResponse(BaseModel):
 class SendMessageRequest(BaseModel):
     """Request body for POST /conversations/{id}/messages."""
 
-    content: str = Field(..., min_length=1, max_length=100_000)
+    content: str = Field(default="", max_length=100_000)
+    attachments: list[AttachmentRef] = Field(default_factory=list, max_length=20)
+
+    @model_validator(mode="after")
+    def _validate_not_empty(self) -> SendMessageRequest:
+        if not self.content.strip() and not self.attachments:
+            raise ValueError("content or attachments are required")
+        return self
 
 
 class SendMessageResponse(BaseModel):

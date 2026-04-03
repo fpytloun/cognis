@@ -1,5 +1,5 @@
 import { renderMarkdown } from '$lib/markdown';
-import type { CognisWebSocketEvent, MessageEvent } from '$lib/types/api';
+import type { AttachmentRef, CognisWebSocketEvent, MessageEvent } from '$lib/types/api';
 
 export type TimelineItem =
   | MessageTimelineItem
@@ -20,6 +20,7 @@ export interface MessageTimelineItem {
   timestamp: string | null;
   messageId?: string;
   streaming?: boolean;
+  attachments?: AttachmentRef[];
 }
 
 export interface ToolCallEvaluation {
@@ -96,7 +97,8 @@ function createMessageItem(
   timestamp: string | null,
   seq: number | null,
   messageId?: string,
-  streaming = false
+  streaming = false,
+  attachments: AttachmentRef[] = []
 ): MessageTimelineItem {
   return {
     id,
@@ -107,7 +109,8 @@ function createMessageItem(
     seq,
     timestamp,
     messageId,
-    streaming
+    streaming,
+    attachments
   };
 }
 
@@ -130,15 +133,18 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
 
   for (const event of events) {
     const content = typeof event.data.content === 'string' ? event.data.content : '';
+    const attachments = Array.isArray(event.data.attachments)
+      ? event.data.attachments.filter((item): item is AttachmentRef => typeof item === 'object' && item !== null && typeof (item as Record<string, unknown>).artifact_id === 'string')
+      : [];
     if (event.type === 'user_message') {
-      items.push(createMessageItem(`event:${event.seq}:user`, 'user', content, event.timestamp, event.seq));
+      items.push(createMessageItem(`event:${event.seq}:user`, 'user', content, event.timestamp, event.seq, undefined, false, attachments));
       continue;
     }
 
     if (event.type === 'assistant_message') {
       if (content.trim()) {
         items.push(
-          createMessageItem(`event:${event.seq}:assistant`, 'assistant', content, event.timestamp, event.seq)
+          createMessageItem(`event:${event.seq}:assistant`, 'assistant', content, event.timestamp, event.seq, undefined, false, attachments)
         );
       }
       continue;
@@ -407,10 +413,10 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
   return items;
 }
 
-export function appendOptimisticUserMessage(items: TimelineItem[], content: string): TimelineItem[] {
+export function appendOptimisticUserMessage(items: TimelineItem[], content: string, attachments: AttachmentRef[] = []): TimelineItem[] {
   return [
     ...items,
-    createMessageItem(`local-user:${Date.now()}`, 'user', content, new Date().toISOString(), null)
+    createMessageItem(`local-user:${Date.now()}`, 'user', content, new Date().toISOString(), null, undefined, false, attachments)
   ];
 }
 
