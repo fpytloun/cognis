@@ -40,6 +40,11 @@ def extract_text_from_response(response: dict[str, Any]) -> str:
 
     Navigates the standard ``choices[0].message.content`` structure
     returned by LiteLLM / OpenAI-compatible APIs.
+
+    For reasoning models (gpt-oss, deepseek, etc.), the litellm client
+    may move the response content to ``reasoning_content`` (standardized)
+    or ``reasoning`` (raw provider field), leaving ``content`` empty.
+    This function checks those fields as fallbacks.
     """
     choices = response.get("choices")
     if not isinstance(choices, list) or not choices:
@@ -47,7 +52,23 @@ def extract_text_from_response(response: dict[str, Any]) -> str:
     message = choices[0].get("message")
     if not isinstance(message, dict):
         return ""
+
+    # Primary: message.content (standard OpenAI format)
     content = message.get("content")
+    if isinstance(content, str) and content.strip():
+        return content
+
+    # Fallback: reasoning models — litellm client-side processing may
+    # move content to reasoning_content, leaving content empty.
+    for field in ("reasoning_content", "reasoning"):
+        fallback = message.get(field)
+        if isinstance(fallback, str) and fallback.strip():
+            logger.info(
+                "Using reasoning field as response content",
+                extra={"extra_data": {"field": field, "content_length": len(fallback)}},
+            )
+            return fallback
+
     return content if isinstance(content, str) else ""
 
 

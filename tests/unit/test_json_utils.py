@@ -38,6 +38,82 @@ class TestExtractTextFromResponse:
     def test_missing_content(self) -> None:
         assert extract_text_from_response({"choices": [{"message": {}}]}) == ""
 
+    def test_reasoning_content_fallback(self) -> None:
+        """When content is empty, fall back to reasoning_content (litellm standardized)."""
+        response = {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "reasoning_content": '{"decision": "revise", "reasoning": "tests missing"}',
+                    }
+                }
+            ]
+        }
+        assert (
+            extract_text_from_response(response)
+            == '{"decision": "revise", "reasoning": "tests missing"}'
+        )
+
+    def test_reasoning_fallback(self) -> None:
+        """When content is empty and no reasoning_content, fall back to reasoning."""
+        response = {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "reasoning": "The step is incomplete because tests are missing",
+                    }
+                }
+            ]
+        }
+        assert (
+            extract_text_from_response(response)
+            == "The step is incomplete because tests are missing"
+        )
+
+    def test_content_preferred_over_reasoning(self) -> None:
+        """When content is present, reasoning fields are ignored."""
+        response = {
+            "choices": [
+                {
+                    "message": {
+                        "content": '{"decision": "approved"}',
+                        "reasoning_content": "some chain of thought",
+                    }
+                }
+            ]
+        }
+        assert extract_text_from_response(response) == '{"decision": "approved"}'
+
+    def test_null_content_with_reasoning(self) -> None:
+        """When content is None, fall back to reasoning_content."""
+        response = {
+            "choices": [
+                {
+                    "message": {
+                        "content": None,
+                        "reasoning_content": '{"decision": "revise"}',
+                    }
+                }
+            ]
+        }
+        assert extract_text_from_response(response) == '{"decision": "revise"}'
+
+    def test_whitespace_content_with_reasoning(self) -> None:
+        """When content is only whitespace, fall back to reasoning_content."""
+        response = {
+            "choices": [
+                {
+                    "message": {
+                        "content": "   \n  ",
+                        "reasoning_content": '{"decision": "approved"}',
+                    }
+                }
+            ]
+        }
+        assert extract_text_from_response(response) == '{"decision": "approved"}'
+
 
 # ---------------------------------------------------------------------------
 # extract_json_object — Layer 1: direct parse

@@ -200,7 +200,33 @@ class LiteLLMProvider:
             operation=f"generate({prefixed_model})",
             **request_kwargs,
         )
-        return dict(response)
+        response_dict = dict(response)
+
+        # Diagnostic: log response structure for debugging reasoning model issues
+        choices = response_dict.get("choices")
+        if isinstance(choices, list) and choices:
+            msg = choices[0].get("message")
+            if isinstance(msg, dict):
+                content = msg.get("content")
+                reasoning_content = msg.get("reasoning_content")
+                logger.debug(
+                    "LLM response structure",
+                    extra={
+                        "extra_data": {
+                            "model": prefixed_model,
+                            "task_type": task_type,
+                            "has_content": isinstance(content, str) and bool(content.strip()),
+                            "content_length": len(content) if isinstance(content, str) else 0,
+                            "has_reasoning_content": isinstance(reasoning_content, str)
+                            and bool(reasoning_content.strip()),
+                            "reasoning_content_length": len(reasoning_content)
+                            if isinstance(reasoning_content, str)
+                            else 0,
+                        }
+                    },
+                )
+
+        return response_dict
 
     async def stream_generate(
         self,

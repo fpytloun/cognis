@@ -234,11 +234,9 @@ class WorkflowEngine:
                 )
 
                 if step_result is None:
-                    # Step failed without producing output
-                    exhausted_action = self._get_on_exhausted(step_def, workflow)
-                    handled = await self._handle_exhausted(
-                        task, step_def, state, workflow, exhausted_action
-                    )
+                    # Step failed without producing output — retry up to
+                    # max_attempts before going to exhaustion handling.
+                    handled = await self._handle_step_retry(task, step_def, state, workflow)
                     if not handled:
                         state.status = "failed"
                         break
@@ -292,7 +290,7 @@ class WorkflowEngine:
                                 continue
 
                         # No review loop or loop exhausted — re-attempt this step
-                        handled = await self._handle_step_revision(
+                        handled = await self._handle_step_retry(
                             task, step_def, state, workflow, evaluation
                         )
                         if not handled:
@@ -742,24 +740,31 @@ class WorkflowEngine:
 
         return False
 
-    async def _handle_step_revision(
+    async def _handle_step_retry(
         self,
         task: TaskModel,
         step_def: StepDefinition,
         state: WorkflowState,
         workflow: Workflow,
-        evaluation: StepEvaluation,
+        evaluation: StepEvaluation | None = None,
     ) -> bool:
-        """Handle step revision (re-attempt with feedback).
+        """Handle step retry — execution failure or evaluation rejection.
 
-        Records evaluation feedback to the existing step Intaris session
-        (so the agent sees it on retry), then increments the attempt
-        counter.
+        Unified retry handler for both failure modes:
+        - ``evaluation=None``: step execution failed (returned None)
+        - ``evaluation`` provided: evaluator rejected the output
 
-        Returns True if revision is possible, False if exhausted.
+        When evaluation is provided, records feedback to the step's
+        Intaris session so the agent sees it on retry.
+
+        Retries up to ``max_attempts`` before delegating to
+        ``_handle_exhausted``.
+
+        Returns True if retry is possible, False if exhausted.
         """
         completion = self._resolve_completion(step_def, workflow)
         max_attempts = completion.max_attempts if completion else 3
+        reason = "evaluation_rejected" if evaluation else "execution_failed"
 
         # Count attempts for this step
         attempt_key = f"attempts:{step_def.name}"
@@ -768,7 +773,7 @@ class WorkflowEngine:
         if current_attempts >= max_attempts:
             exhausted_action = self._get_on_exhausted(step_def, workflow)
             logger.warning(
-                "Step revision attempts exhausted",
+                "Step retry attempts exhausted",
                 extra={
                     "extra_data": {
                         "task_id": task.task_id,
@@ -776,23 +781,26 @@ class WorkflowEngine:
                         "attempts": current_attempts,
                         "max_attempts": max_attempts,
                         "on_exhausted": exhausted_action,
+                        "reason": reason,
                     }
                 },
             )
             return await self._handle_exhausted(task, step_def, state, workflow, exhausted_action)
 
-        # Record evaluation feedback to the existing step session in Intaris
-        await self._record_evaluation_feedback(task, step_def, state, evaluation)
+        # Record evaluation feedback if available (so agent sees it on retry)
+        if evaluation:
+            await self._record_evaluation_feedback(task, step_def, state, evaluation)
 
         state.loop_iterations[attempt_key] = current_attempts + 1
         logger.info(
-            "Step revision attempt",
+            "Step retry",
             extra={
                 "extra_data": {
                     "task_id": task.task_id,
                     "step": step_def.name,
                     "attempt": current_attempts + 1,
                     "max_attempts": max_attempts,
+                    "reason": reason,
                 }
             },
         )
