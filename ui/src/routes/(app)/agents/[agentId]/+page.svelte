@@ -1,10 +1,11 @@
 <script lang="ts">
   import { beforeNavigate, goto } from '$app/navigation';
   import { page } from '$app/stores';
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
 
   import { agentToFormState } from '$lib/agents';
   import { api, asApiError } from '$lib/api/client';
+  import { auth } from '$lib/stores/auth';
   import AgentForm from '$lib/components/agents/AgentForm.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import Button from '$lib/components/ui/Button.svelte';
@@ -78,16 +79,19 @@
         api.agents.listAll({ agent_type: 'secondary' }),
         api.agents.listBindings(agentIdFromRoute()).catch(() => []),
       ]);
-      try {
-        providers = (await api.llmProviders.list()).items;
-      } catch {
-        providers = [];
+      if (auth.getSnapshot().user?.role === 'admin') {
+        try {
+          providers = (await api.llmProviders.list()).items;
+        } catch {
+          providers = [];
+        }
       }
       Object.assign(form, agentToFormState(agent));
+      loading = false;
+      await tick(); // Let AgentForm mount and settle select bindings before capturing snapshot
       initialSnapshot = JSON.stringify($state.snapshot(form));
     } catch (caughtError) {
       error = asApiError(caughtError).message;
-    } finally {
       loading = false;
     }
   }
