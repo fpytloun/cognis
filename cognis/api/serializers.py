@@ -32,6 +32,11 @@ from cognis.models.workflow import Workflow
 
 
 def conversation_to_response(row: Any) -> ConversationResponse:
+    last_message_at = getattr(row, "last_message_at", None)
+    last_read_at = getattr(row, "last_read_at", None)
+    has_unread = last_message_at is not None and (
+        last_read_at is None or last_message_at > last_read_at
+    )
     return ConversationResponse(
         conversation_id=row.conversation_id,
         user_email=row.user_email,
@@ -49,7 +54,9 @@ def conversation_to_response(row: Any) -> ConversationResponse:
         ),
         active_session_id=getattr(row, "active_session_id", None),
         status=row.status,
-        last_message_at=getattr(row, "last_message_at", None),
+        last_message_at=last_message_at,
+        last_read_at=last_read_at,
+        has_unread=has_unread,
         created_at=getattr(row, "created_at", None),
         updated_at=getattr(row, "updated_at", None),
     )

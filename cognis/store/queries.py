@@ -710,6 +710,16 @@ async def update_conversation(
     return True
 
 
+async def mark_conversation_read(session: AsyncSession, conversation_id: str) -> bool:
+    """Set last_read_at to now for unread tracking."""
+    row = await get_conversation(session, conversation_id)
+    if row is None:
+        return False
+    row.last_read_at = datetime.now(UTC)
+    await session.flush()
+    return True
+
+
 async def update_conversation_active_session(
     session: AsyncSession, conversation_id: str, active_session_id: str
 ) -> bool:

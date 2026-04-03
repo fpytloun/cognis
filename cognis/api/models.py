@@ -189,6 +189,8 @@ class ConversationResponse(BaseModel):
     active_session_id: str | None = None
     status: str
     last_message_at: datetime | None = None
+    last_read_at: datetime | None = None
+    has_unread: bool = False
     created_at: datetime | None = None
     updated_at: datetime | None = None
 

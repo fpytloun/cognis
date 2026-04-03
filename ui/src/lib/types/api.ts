@@ -94,16 +94,18 @@ export interface ConversationContext {
 }
 
 export interface Conversation {
-  conversation_id: string;
-  user_email: string;
-  agent_id: string;
-  title: string | null;
-  context: ConversationContext;
-  active_session_id: string | null;
-  status: string;
-  last_message_at: string | null;
-  created_at: string | null;
-  updated_at: string | null;
+    conversation_id: string;
+    user_email: string;
+    agent_id: string;
+    title: string | null;
+    context: ConversationContext;
+    active_session_id: string | null;
+    status: string;
+    last_message_at: string | null;
+    last_read_at: string | null;
+    has_unread: boolean;
+    created_at: string | null;
+    updated_at: string | null;
 }
 
 export interface MessageEvent {

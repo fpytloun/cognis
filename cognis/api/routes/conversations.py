@@ -30,6 +30,7 @@ from cognis.store.queries import (
     get_session_row,
     list_conversation_sessions,
     list_conversations,
+    mark_conversation_read,
 )
 
 router = APIRouter(prefix="/api/v1/conversations", tags=["conversations"])
@@ -159,6 +160,20 @@ async def update_conversation(
         await session.commit()
         await session.refresh(row)
         return conversation_to_response(row)
+
+
+@router.post("/{conversation_id}/read", response_model=dict)
+async def mark_read(request: Request, conversation_id: str) -> dict[str, bool]:
+    """Mark a conversation as read (sets last_read_at to now)."""
+    require_current_user(request)
+    async with request.app.state.session_factory() as session:
+        row = await get_conversation(session, conversation_id)
+        if row is None:
+            raise api_exception(404, "not_found", "Conversation not found")
+        require_owner_or_admin(request, row.user_email)
+        await mark_conversation_read(session, conversation_id)
+        await session.commit()
+    return {"ok": True}
 
 
 @router.delete("/{conversation_id}", response_model=dict)

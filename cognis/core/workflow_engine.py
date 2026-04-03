@@ -1138,10 +1138,36 @@ class WorkflowEngine:
                 latest.conversation_id if latest is not None else task.source_ref
             )
         elif delivery_mode == "silent":
+            logger.info(
+                "task_delivery: silent mode, skipping",
+                extra={"extra_data": {"task_id": task.task_id}},
+            )
             return
 
         if target_conversation_id is None:
+            logger.warning(
+                "task_delivery: no target conversation resolved, skipping",
+                extra={
+                    "extra_data": {
+                        "task_id": task.task_id,
+                        "delivery_mode": delivery_mode,
+                        "source_ref": task.source_ref,
+                    }
+                },
+            )
             return
+
+        logger.info(
+            "task_delivery: delivering result",
+            extra={
+                "extra_data": {
+                    "task_id": task.task_id,
+                    "status": str(task.status),
+                    "target_conversation_id": target_conversation_id,
+                    "delivery_mode": delivery_mode,
+                }
+            },
+        )
 
         task_event = {
             TaskStatus.COMPLETED: "task_result",
@@ -1202,7 +1228,16 @@ class WorkflowEngine:
                         exc_info=True,
                     )
 
-        # Publish event for WebSocket delivery
+        # Publish events for WebSocket delivery and follow-up turn
+        logger.info(
+            "task_delivery: publishing EventBus events",
+            extra={
+                "extra_data": {
+                    "task_id": task.task_id,
+                    "conversation_id": target_conversation_id,
+                }
+            },
+        )
         event_type = EventType.TASK_FAILED
         if task.status == TaskStatus.COMPLETED:
             event_type = EventType.TASK_COMPLETED

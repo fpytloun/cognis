@@ -267,6 +267,18 @@ def create_app() -> FastAPI:
         # PauseWaiters from DB so gates/escalations/step-questions survive).
         await notification_service.reconcile_pending()
 
+        # Follow-up turn handler — core-layer, no WebSocket dependency.
+        # Must be registered BEFORE task_queue.start() so recovered tasks
+        # that complete during startup have a handler for their follow-up.
+        from cognis.core.follow_up import FollowUpTurnHandler
+
+        follow_up_handler = FollowUpTurnHandler(
+            session_factory=session_factory,
+            workflow_engine=workflow_engine,
+            session_manager=session_manager,
+            event_bus=event_bus,
+        )
+
         recovered_sessions = await session_manager.recover_stale_sessions()
         recovered_tasks = await task_queue.recover_stale_tasks()
         recovered_paused_tasks = await task_queue.recover_paused_tasks()
@@ -314,6 +326,7 @@ def create_app() -> FastAPI:
         app.state.recovered_paused_task_ids = frozenset(recovered_paused_tasks)
 
         app.state.notification_service = notification_service
+        app.state.follow_up_handler = follow_up_handler
 
         yield
 

@@ -307,6 +307,11 @@ class WebSocketConnectionManager:
         self._queued_messages: dict[str, deque[QueuedMessage]] = defaultdict(deque)
         self._event_bus_registered = False
         self._register_event_bus_handler()
+        # Wire ourselves as the streaming callback for the core-layer
+        # follow-up handler so tokens are forwarded to connected WS clients.
+        follow_up = getattr(app.state, "follow_up_handler", None)
+        if follow_up is not None:
+            follow_up._on_turn_message = self.send_to_conversation  # noqa: SLF001
 
     def _register_event_bus_handler(self) -> None:
         if self._event_bus_registered:
@@ -919,8 +924,10 @@ class WebSocketConnectionManager:
         WS_MISSED_EVENTS_REPLAYED.inc(replayed)
 
     async def _handle_event(self, event: Event) -> None:
+        # FOLLOW_UP_TURN_REQUESTED is handled by the core-layer
+        # FollowUpTurnHandler (registered at app startup, no WS dependency).
+        # We only handle UI-facing event fanout here.
         if event.type == EventType.FOLLOW_UP_TURN_REQUESTED:
-            await self._handle_follow_up_turn_request(event)
             return
         conversation_id = await self._resolve_conversation_id(event)
         if conversation_id is None:
@@ -929,45 +936,6 @@ class WebSocketConnectionManager:
         if payload is None:
             return
         await self.send_to_conversation(conversation_id, payload)
-
-    async def _handle_follow_up_turn_request(self, event: Event) -> None:
-        conversation_id = event.data.get("conversation_id")
-        if not isinstance(conversation_id, str):
-            return
-        # Run the follow-up turn even without active WebSocket clients.
-        # The turn results persist to Intaris and are visible when the
-        # user reconnects.  Streaming callbacks are simply skipped.
-        prompt = _follow_up_turn_prompt(
-            event.data.get("status") if isinstance(event.data.get("status"), str) else None,
-            task_id=event.data.get("task_id")
-            if isinstance(event.data.get("task_id"), str)
-            else None,
-            task_title=event.data.get("task_title")
-            if isinstance(event.data.get("task_title"), str)
-            else None,
-            result_summary=event.data.get("result_summary")
-            if isinstance(event.data.get("result_summary"), str)
-            else None,
-        )
-        if conversation_id in self._active_turns and not self._active_turns[conversation_id].done():
-            # Turn already active — queue the follow-up instead of dropping it
-            self._queued_messages[conversation_id].append(
-                QueuedMessage(content=prompt, system_initiated=True)
-            )
-            return
-        runtime = await _load_conversation_runtime(self.app, conversation_id)
-        if runtime is None:
-            return
-        conversation, session, agent = runtime
-        if conversation.status != "active":
-            return
-        self._launch_turn(
-            conversation=conversation,
-            session=session,
-            agent=agent,
-            content=prompt,
-            system_initiated=True,
-        )
 
     async def _resolve_conversation_id(self, event: Event) -> str | None:
         if isinstance(event.data.get("conversation_id"), str):

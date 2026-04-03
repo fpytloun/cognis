@@ -19,6 +19,7 @@
   import { confirmAction } from '$lib/stores/confirm';
   import { addToast } from '$lib/stores/toasts';
   import { onCancelActiveTurnRequest, onChatComposerFocusRequest } from '$lib/shortcuts';
+  import { isSupported as notificationsSupported, isGranted as notificationsGranted, requestPermission, notifyIfHidden, hasAskedPermission } from '$lib/notifications';
   import { workspaceHealth } from '$lib/system';
   import {
     appendOptimisticUserMessage,
@@ -439,6 +440,17 @@
 
       wsClient.subscribeConversation(conversationId, latestSeq(events));
       await refreshEscalations();
+
+      // Mark conversation as read and update local state
+      api.conversations.markRead(conversationId).catch(() => {});
+      if (currentConversation) {
+        currentConversation = { ...currentConversation, has_unread: false };
+        const idx = conversations.findIndex((c) => c.conversation_id === conversationId);
+        if (idx >= 0) {
+          conversations[idx] = { ...conversations[idx], has_unread: false };
+          conversations = [...conversations];
+        }
+      }
     } catch (caughtError) {
       error = asApiError(caughtError).message;
     } finally {
@@ -465,6 +477,12 @@
     } catch (caughtError) {
       error = asApiError(caughtError).message;
       loading = false;
+    }
+
+    // Request notification permission once (non-blocking, after page loads)
+    if (notificationsSupported() && !notificationsGranted() && !hasAskedPermission()) {
+      // Delay slightly so it doesn't interfere with initial page load
+      setTimeout(() => { void requestPermission(); }, 5000);
     }
   }
 
@@ -714,6 +732,28 @@
   function handleSocketEvent(event: import('$lib/types/api').CognisWebSocketEvent): void {
     const currentId = conversationIdFromRoute();
     if ('conversation_id' in event && event.conversation_id && event.conversation_id !== currentId) {
+      // Event for a different conversation — mark it as unread locally
+      // and show a browser notification if appropriate.
+      const otherConvId = event.conversation_id;
+      if (event.type === 'message_complete' || event.type === 'workflow_completed' || event.type === 'workflow_failed') {
+        const idx = conversations.findIndex((c) => c.conversation_id === otherConvId);
+        if (idx >= 0 && !conversations[idx].has_unread) {
+          conversations[idx] = { ...conversations[idx], has_unread: true };
+          conversations = [...conversations];
+        }
+        // Browser notification
+        const convTitle = idx >= 0 ? (conversations[idx].title ?? 'Conversation') : 'Conversation';
+        const agentId = idx >= 0 ? conversations[idx].agent_id : '';
+        const agentObj = agents.find((a) => a.agent_id === agentId);
+        const agentLabel = agentObj?.display_name ?? agentObj?.name ?? 'Cognis';
+        if (event.type === 'workflow_completed') {
+          notifyIfHidden(agentLabel, `Task completed in "${convTitle}"`, otherConvId, currentId);
+        } else if (event.type === 'workflow_failed') {
+          notifyIfHidden(agentLabel, `Task failed in "${convTitle}"`, otherConvId, currentId);
+        } else {
+          notifyIfHidden(agentLabel, `New message in "${convTitle}"`, otherConvId, currentId);
+        }
+      }
       return;
     }
 
@@ -750,6 +790,10 @@
       // Update context usage from message_complete
       if (event.type === 'message_complete' && event.context_usage) {
         contextUsage = event.context_usage;
+      }
+      // Mark as read since the user is viewing this conversation
+      if (currentConversation && !document.hidden) {
+        api.conversations.markRead(currentConversation.conversation_id).catch(() => {});
       }
     }
 
@@ -1018,14 +1062,21 @@
           {:else}
             {#each filteredConversations() as conversation}
               {@const agent = conversationAgent(conversation)}
+              {@const isActive = conversation.conversation_id === currentConversation?.conversation_id}
+              {@const unread = conversation.has_unread && !isActive}
               <a
-                class={`flex items-start gap-3 rounded-2xl border px-3 py-2.5 transition ${conversation.conversation_id === currentConversation?.conversation_id ? 'border-sky-400/40 bg-sky-500/10' : 'border-transparent bg-slate-950/60 hover:border-slate-700 hover:bg-slate-900'}`}
+                class={`flex items-start gap-3 rounded-2xl border px-3 py-2.5 transition ${isActive ? 'border-sky-400/40 bg-sky-500/10' : 'border-transparent bg-slate-950/60 hover:border-slate-700 hover:bg-slate-900'}`}
                 href={`/chat/${conversation.conversation_id}`}
                 onclick={() => { mobileListOpen = false; }}
               >
-                <AgentAvatar name={agent?.display_name ?? agent?.name ?? conversation.agent_id} avatarUrl={agent?.avatar_url ?? null} class="h-8 w-8" />
+                <div class="relative shrink-0">
+                  <AgentAvatar name={agent?.display_name ?? agent?.name ?? conversation.agent_id} avatarUrl={agent?.avatar_url ?? null} class="h-8 w-8" />
+                  {#if unread}
+                    <span class="absolute -right-0.5 -top-0.5 h-2.5 w-2.5 rounded-full border-2 border-slate-950 bg-sky-400"></span>
+                  {/if}
+                </div>
                 <div class="min-w-0 flex-1">
-                  <p class="truncate text-sm font-medium text-white">{conversationTitle(conversation)}</p>
+                  <p class="truncate text-sm {unread ? 'font-semibold text-white' : 'font-medium text-white'}">{conversationTitle(conversation)}</p>
                   <div class="mt-0.5 flex items-center gap-2">
                     <span class="truncate text-xs text-slate-400">{agent?.display_name ?? agent?.name ?? conversation.agent_id}</span>
                     {#if (conversation.context?.type ?? 'web').toLowerCase() !== 'web'}

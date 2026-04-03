@@ -346,6 +346,12 @@ export const api = {
       return request<SessionEventsResponse>(
         `/api/v1/conversations/${conversationId}/sessions/${sessionId}/events${encodeQuery({ after_seq: afterSeq, limit })}`
       );
+    },
+
+    markRead(conversationId: string): Promise<{ ok: boolean }> {
+      return request<{ ok: boolean }>(`/api/v1/conversations/${conversationId}/read`, {
+        method: 'POST'
+      });
     }
   },
 
