@@ -6,8 +6,13 @@ from typing import Any
 
 from fastapi import APIRouter, Request
 
-from cognis.api.common import api_exception, require_current_user
-from cognis.api.models import ExecutorConfigResponse, ExecutorCreateRequest, ExecutorUpdateRequest
+from cognis.api.common import api_exception, require_admin, require_current_user
+from cognis.api.models import (
+    ExecutorConfigResponse,
+    ExecutorCreateRequest,
+    ExecutorTokenResponse,
+    ExecutorUpdateRequest,
+)
 from cognis.store.queries import (
     create_executor,
     delete_executor,
@@ -62,6 +67,7 @@ async def create_executor_route(
     async with request.app.state.session_factory() as session:
         row = await create_executor(
             session,
+            executor_id=body.executor_id,
             name=body.name,
             executor_type=body.executor_type,
             labels=body.labels or None,
@@ -73,6 +79,20 @@ async def create_executor_route(
         )
         await session.commit()
     return _executor_to_response(row)
+
+
+@router.post("/api/v1/executors/{executor_id}/token", response_model=ExecutorTokenResponse)
+async def generate_executor_token_route(
+    request: Request,
+    executor_id: str,
+) -> ExecutorTokenResponse:
+    require_admin(request)
+    async with request.app.state.session_factory() as session:
+        row = await get_executor_row(session, executor_id)
+    if row is None:
+        raise api_exception(404, "not_found", "Executor not found")
+    token = request.app.state.providers.auth.sign_executor_token(executor_id)
+    return ExecutorTokenResponse(executor_id=executor_id, token=token, expires_in=30 * 24 * 3600)
 
 
 @router.put("/api/v1/executors/{executor_id}", response_model=ExecutorConfigResponse)

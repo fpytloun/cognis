@@ -165,6 +165,66 @@ async def test_litellm_provider_test_provider_sanitizes_errors(
 
 
 @pytest.mark.asyncio
+async def test_litellm_provider_routes_executor_location_via_inference_router(
+    tmp_path: object,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="remote",
+                display_name="Remote OpenAI",
+                location="executor",
+                backend="litellm",
+                config={
+                    "default_model": "gpt-4o-mini",
+                    "executor_labels": {"location": "local"},
+                },
+                status="active",
+            )
+        )
+        await session.commit()
+
+    class Router:
+        async def route_generate(self, **kwargs: object) -> dict[str, object]:
+            assert kwargs["model"] == "gpt-4o-mini"
+            assert kwargs["executor_labels"] == {"location": "local"}
+            return {"choices": [{"message": {"content": "hello"}}], "usage": {}}
+
+    provider = LiteLLMProvider(session_factory, inference_router=Router())
+    result = await provider.generate(
+        messages=[{"role": "user", "content": "hi"}],
+        model="gpt-4o-mini",
+    )
+    assert result["choices"][0]["message"]["content"] == "hello"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_litellm_provider_discover_models_rejects_executor_location(
+    tmp_path: object,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="remote",
+                display_name="Remote OpenAI",
+                location="executor",
+                backend="litellm",
+                config={"default_model": "gpt-4o-mini"},
+                status="active",
+            )
+        )
+        await session.commit()
+
+    provider = LiteLLMProvider(session_factory)
+    with pytest.raises(ValueError, match="controller-side providers"):
+        await provider.discover_models("remote")
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_litellm_provider_health_reports_degraded_without_model(tmp_path: object) -> None:
     engine, session_factory = await _session_factory(tmp_path)
     provider = LiteLLMProvider(session_factory)

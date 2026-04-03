@@ -4,6 +4,10 @@ import { auth } from '$lib/stores/auth';
 import type {
   ApiKeyCreateResponse,
   Agent,
+  ChannelAccount,
+  ChannelAccountStatus,
+  ChannelContact,
+  ChannelMeta,
   ApiErrorResponse,
   ApiKeyMetadata,
   BootstrapStatusResponse,
@@ -13,6 +17,7 @@ import type {
   ExecutorConfig,
   ExecutorCreateRequest,
   ExecutorStatus,
+  ExecutorTokenResponse,
   ExecutorUpdateRequest,
   ExchangeTokenResponse,
   HealthResponse,
@@ -24,6 +29,7 @@ import type {
   MessageHistoryResponse,
   ModelRouting,
   ProviderTestResult,
+  PairingRequest,
   SecretMetadata,
   Session,
   SessionEventsResponse,
@@ -445,6 +451,88 @@ export const api = {
     }
   },
 
+  channels: {
+    listTypes(): Promise<ChannelMeta[]> {
+      return request<ChannelMeta[]>('/api/v1/channels/types');
+    },
+
+    getType(channelType: string): Promise<ChannelMeta> {
+      return request<ChannelMeta>(`/api/v1/channels/types/${channelType}`);
+    },
+
+    listAccounts(): Promise<ChannelAccount[]> {
+      return request<ChannelAccount[]>('/api/v1/channels/accounts');
+    },
+
+    createAccount(payload: Record<string, unknown>): Promise<{ account_id: string; channel_type: string; display_name: string; webhook_secret: string | null; created_at: string | null }> {
+      return request<{ account_id: string; channel_type: string; display_name: string; webhook_secret: string | null; created_at: string | null }>('/api/v1/channels/accounts', {
+        method: 'POST',
+        body: JSON.stringify(payload)
+      });
+    },
+
+    getAccount(accountId: string): Promise<ChannelAccount> {
+      return request<ChannelAccount>(`/api/v1/channels/accounts/${accountId}`);
+    },
+
+    updateAccount(accountId: string, payload: Record<string, unknown>): Promise<ChannelAccount> {
+      return request<ChannelAccount>(`/api/v1/channels/accounts/${accountId}`, {
+        method: 'PATCH',
+        body: JSON.stringify(payload)
+      });
+    },
+
+    deleteAccount(accountId: string): Promise<{ deleted: boolean }> {
+      return request<{ deleted: boolean }>(`/api/v1/channels/accounts/${accountId}`, {
+        method: 'DELETE'
+      });
+    },
+
+    startAccount(accountId: string): Promise<{ status: ChannelAccountStatus | string }> {
+      return request<{ status: ChannelAccountStatus | string }>(`/api/v1/channels/accounts/${accountId}/start`, {
+        method: 'POST'
+      });
+    },
+
+    stopAccount(accountId: string): Promise<{ status: string }> {
+      return request<{ status: string }>(`/api/v1/channels/accounts/${accountId}/stop`, {
+        method: 'POST'
+      });
+    },
+
+    getAccountStatus(accountId: string): Promise<ChannelAccountStatus> {
+      return request<ChannelAccountStatus>(`/api/v1/channels/accounts/${accountId}/status`);
+    },
+
+    listContacts(): Promise<ChannelContact[]> {
+      return request<ChannelContact[]>('/api/v1/channels/contacts');
+    },
+
+    createContact(payload: Record<string, unknown>): Promise<ChannelContact> {
+      return request<ChannelContact>('/api/v1/channels/contacts', {
+        method: 'POST',
+        body: JSON.stringify(payload)
+      });
+    },
+
+    listPairingRequests(): Promise<PairingRequest[]> {
+      return request<PairingRequest[]>('/api/v1/channels/pairing-requests');
+    },
+
+    redeemPairingCode(code: string): Promise<PairingRequest> {
+      return request<PairingRequest>('/api/v1/channels/pair', {
+        method: 'POST',
+        body: JSON.stringify({ code })
+      });
+    },
+
+    rejectPairingRequest(requestId: string): Promise<{ rejected: boolean }> {
+      return request<{ rejected: boolean }>(`/api/v1/channels/pairing-requests/${requestId}/reject`, {
+        method: 'POST'
+      });
+    }
+  },
+
   executor: {
     status(): Promise<ExecutorStatus> {
       return request<ExecutorStatus>('/api/v1/executor/status');
@@ -468,6 +556,12 @@ export const api = {
 
     delete(executorId: string): Promise<void> {
       return request<void>(`/api/v1/executors/${executorId}`, { method: 'DELETE' });
+    },
+
+    generateToken(executorId: string): Promise<ExecutorTokenResponse> {
+      return request<ExecutorTokenResponse>(`/api/v1/executors/${executorId}/token`, {
+        method: 'POST'
+      });
     }
   },
 

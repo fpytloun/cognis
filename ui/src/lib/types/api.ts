@@ -228,6 +228,105 @@ export interface MCPServerTestResponse {
   items: MCPServerTestItem[];
 }
 
+export interface ChannelCapabilities {
+  chat_types: string[];
+  supports_threads: boolean;
+  supports_reactions: boolean;
+  supports_edits: boolean;
+  supports_media: boolean;
+  supports_typing: boolean;
+  supports_read_receipts: boolean;
+  supports_markdown: boolean;
+  supports_buttons: boolean;
+  max_message_length: number;
+}
+
+export interface ChannelCredentialField {
+  name: string;
+  label: string;
+  description: string;
+  required: boolean;
+  secret: boolean;
+}
+
+export interface ChannelSettingField {
+  name: string;
+  label: string;
+  description: string;
+  field_type: string;
+  default: unknown;
+  options?: string[] | null;
+}
+
+export interface ChannelMeta {
+  channel_type: string;
+  label: string;
+  description: string;
+  icon: string | null;
+  docs_url: string | null;
+  capabilities: ChannelCapabilities;
+  credential_fields: ChannelCredentialField[];
+  setting_fields: ChannelSettingField[];
+  connection_mode: string;
+}
+
+export interface ChannelAccountStatus {
+  account_id: string;
+  channel_type: string;
+  status: string;
+  enabled: boolean;
+  connected_at: string | null;
+  last_message_at: string | null;
+  last_error: string | null;
+  reconnect_attempts: number;
+  active_chats?: number;
+}
+
+export interface ChannelAccount {
+  account_id: string;
+  channel_type: string;
+  display_name: string;
+  enabled: boolean;
+  agent_id: string;
+  config: Record<string, unknown>;
+  credential_refs: Record<string, string>;
+  default_conversation_id?: string | null;
+  allow_new_conversations?: boolean;
+  allowed_senders: string[];
+  dm_policy: string;
+  group_policy: string;
+  created_at: string | null;
+  updated_at: string | null;
+  status?: ChannelAccountStatus | { status: string };
+}
+
+export interface ChannelContact {
+  contact_id: string;
+  channel_type: string;
+  sender_id: string;
+  user_email: string;
+  display_name: string | null;
+  verified: boolean;
+  created_at: string | null;
+}
+
+export interface PairingRequest {
+  request_id: string;
+  owner_email: string;
+  account_id: string;
+  channel_type: string;
+  sender_id: string;
+  sender_name: string | null;
+  chat_id: string;
+  chat_name: string | null;
+  code: string;
+  status: string;
+  attempts: number;
+  expires_at: string;
+  created_at: string;
+  completed_at: string | null;
+}
+
 export interface IntarisMCPServer {
   name: string;
   transport: string | null;
@@ -260,6 +359,7 @@ export interface ExecutorConfig {
 }
 
 export interface ExecutorCreateRequest {
+  executor_id?: string | null;
   name: string;
   executor_type?: string;
   labels?: Record<string, string>;
@@ -277,6 +377,12 @@ export interface ExecutorUpdateRequest {
   config?: Record<string, unknown>;
   status?: string;
   is_default?: boolean;
+}
+
+export interface ExecutorTokenResponse {
+  executor_id: string;
+  token: string;
+  expires_in: number;
 }
 
 export interface Skill {

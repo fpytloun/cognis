@@ -406,14 +406,17 @@ class WebSocketExecutorProvider:
         self,
         executor_id: str,
         ws: WebSocket,
-        capabilities: ExecutorCapabilities,
+        capabilities: ExecutorCapabilities | None = None,
+        *,
+        ready: bool = True,
+        metadata: dict[str, Any] | None = None,
     ) -> WebSocketExecutorConnection:
         """Register a newly connected executor.
 
         Returns the ``WebSocketExecutorConnection`` so the endpoint can
         drive the receiver loop.
         """
-        conn = WebSocketExecutorConnection(ws, executor_id, capabilities)
+        conn = WebSocketExecutorConnection(ws, executor_id, capabilities or ExecutorCapabilities())
         conn.start_receiver()
 
         # If this is a reconnection, close the old connection first
@@ -429,23 +432,54 @@ class WebSocketExecutorProvider:
         EXECUTOR_WS_CONNECTIONS.inc()
 
         # Update or create handle
-        if executor_id in self._handles:
-            self._handles[executor_id].capabilities = capabilities
-            self._handles[executor_id].status = "ready"
-        else:
+        if executor_id not in self._handles:
             self._handles[executor_id] = ExecutorHandle(
+                executor_id=executor_id,
+                executor_type="websocket",
+                capabilities=capabilities or ExecutorCapabilities(),
+                status="pending",
+                metadata=metadata or {},
+            )
+        else:
+            if metadata:
+                self._handles[executor_id].metadata = metadata
+
+        if ready:
+            self.mark_ready(
+                executor_id,
+                capabilities or ExecutorCapabilities(),
+                metadata=metadata,
+            )
+
+        return conn
+
+    def mark_ready(
+        self,
+        executor_id: str,
+        capabilities: ExecutorCapabilities,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Mark a connected executor as fully configured and ready."""
+        handle = self._handles.get(executor_id)
+        if handle is None:
+            handle = ExecutorHandle(
                 executor_id=executor_id,
                 executor_type="websocket",
                 capabilities=capabilities,
                 status="ready",
+                metadata=metadata or {},
             )
+            self._handles[executor_id] = handle
+        else:
+            handle.capabilities = capabilities
+            handle.status = "ready"
+            if metadata is not None:
+                handle.metadata = metadata
 
-        # Signal anyone waiting in spawn()
         event = self._ready_events.get(executor_id)
         if event is not None:
             event.set()
-
-        return conn
 
     def unregister_connection(self, executor_id: str) -> None:
         """Called when an executor WebSocket disconnects."""
@@ -474,7 +508,12 @@ class WebSocketExecutorProvider:
         executor_id = config.executor_id
 
         # Already connected?
-        if executor_id in self._connections and self._connections[executor_id].connected:
+        if (
+            executor_id in self._connections
+            and self._connections[executor_id].connected
+            and self._handles.get(executor_id) is not None
+            and self._handles[executor_id].status == "ready"
+        ):
             return self._handles[executor_id]
 
         # Wait for connection

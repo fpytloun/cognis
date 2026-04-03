@@ -27,7 +27,7 @@ async def test_spawn_generates_short_lived_token() -> None:
 
     # We can't actually spawn a subprocess in unit tests, but we can
     # verify the token generation call
-    config = ExecutorConfig(executor_id="sub-1", secrets={"key": "value"})
+    config = ExecutorConfig(executor_id="sub-1")
 
     # Mock create_subprocess_exec to avoid actually spawning
     mock_process = MagicMock()
@@ -54,23 +54,18 @@ async def test_spawn_generates_short_lived_token() -> None:
     # Verify token was generated with 5-minute TTL
     auth.sign_executor_token.assert_called_once_with("sub-1", ttl_seconds=300)
 
-    # Verify token + secrets were piped via stdin (not CLI args).
-    # Format: first line is JWT token, remaining is secrets JSON.
+    # Verify only the token is piped via stdin (not CLI args).
     mock_process.stdin.write.assert_called_once()
     written_data = mock_process.stdin.write.call_args[0][0].decode()
-    import json
-
-    lines = written_data.split("\n", 1)
-    assert lines[0] == "mock-jwt-token"  # token on first line
-    written_secrets = json.loads(lines[1])
-    assert written_secrets == {"key": "value"}
+    assert written_data == "mock-jwt-token"
 
     # Verify the subprocess command does NOT contain the token or secrets
     call_args = mock_exec.call_args
     cli_args = call_args[0]  # positional args
     cli_str = " ".join(str(a) for a in cli_args)
     assert "mock-jwt-token" not in cli_str
-    assert '"key"' not in cli_str or '"secrets": {}' in cli_str
+    assert "--executor-id" not in cli_str
+    assert "--config-json" not in cli_str
 
 
 @pytest.mark.asyncio

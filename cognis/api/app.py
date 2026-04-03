@@ -484,7 +484,12 @@ def create_app() -> FastAPI:
 
         ws_provider = app.state.providers.executor.websocket
         auth_provider = app.state.providers.auth
-        await handle_executor_websocket(websocket, ws_provider, auth_provider)
+        await handle_executor_websocket(
+            websocket,
+            ws_provider,
+            auth_provider,
+            app.state.session_factory,
+        )
 
     # NOTE: SPA serving moved to SPAMiddleware (added above) which runs
     # before the FastAPI router, avoiding the 404 exception handler

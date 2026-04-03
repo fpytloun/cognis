@@ -665,6 +665,7 @@ class ExecutorConfigResponse(BaseModel):
 
 
 class ExecutorCreateRequest(BaseModel):
+    executor_id: str | None = None
     name: str
     executor_type: str = "in_process"
     labels: dict[str, Any] = Field(default_factory=dict)
@@ -682,6 +683,12 @@ class ExecutorUpdateRequest(BaseModel):
     config: dict[str, Any] | None = None
     status: str | None = None
     is_default: bool | None = None
+
+
+class ExecutorTokenResponse(BaseModel):
+    executor_id: str
+    token: str
+    expires_in: int
 
 
 class SendMessageRequest(BaseModel):

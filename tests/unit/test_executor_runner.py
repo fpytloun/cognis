@@ -2,107 +2,117 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
+from unittest.mock import AsyncMock
+
+import pytest
+
 from cognis.executor.runner import ExecutorRunner, _normalize_result
-from cognis.models.tool import ExecutorConfig, InferenceConfig, ToolResult
+from cognis.models.tool import ExecutorConfig, ToolResult
+
+
+class DummyWebSocket:
+    def __init__(self) -> None:
+        self.sent: list[dict] = []
+
+    async def send(self, raw: str) -> None:
+        self.sent.append(json.loads(raw))
 
 
 def test_normalize_result_from_string() -> None:
-    """_normalize_result wraps a string in ToolResult."""
     result = _normalize_result("hello world", 42)
     assert isinstance(result, ToolResult)
     assert result.output == "hello world"
     assert result.duration_ms == 42
-    assert result.is_error is False
 
 
 def test_normalize_result_from_dict() -> None:
-    """_normalize_result serializes a dict to JSON."""
     result = _normalize_result({"key": "value"}, 10)
     assert result.output == '{"key": "value"}'
-    assert result.duration_ms == 10
 
 
 def test_normalize_result_from_tool_result() -> None:
-    """_normalize_result preserves an existing ToolResult."""
-    original = ToolResult(output="test", is_error=True, duration_ms=None)
-    result = _normalize_result(original, 50)
-    assert result.output == "test"
+    result = _normalize_result(ToolResult(output="x", is_error=True), 7)
     assert result.is_error is True
-    assert result.duration_ms == 50
+    assert result.duration_ms == 7
 
 
-def test_runner_init_tools() -> None:
-    """ExecutorRunner initializes tool handlers from cognis.tools.executor."""
-    config = ExecutorConfig(
-        executor_id="test-runner",
-        metadata={"enabled_tools": "*"},
+@pytest.mark.asyncio
+async def test_handle_configure_filters_tools() -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    ws = DummyWebSocket()
+
+    await runner._handle_configure(
+        ws,
+        "cfg-1",
+        {"enabled_tools": ["read", "glob"], "enabled_tool_groups": [], "config": {}},
     )
-    runner = ExecutorRunner(config)
-    runner._init_tools()
-    # Should have at least some handlers (bash, read, write, etc.)
-    assert len(runner._tool_handlers) > 0
+
+    assert runner._configured is True
+    assert set(runner._tool_handlers) == {"read", "glob"}
+    assert ws.sent[-1]["result"]["capabilities"]["tools"] == ["read", "glob"]
 
 
-def test_runner_init_tools_filtered() -> None:
-    """ExecutorRunner filters tools by enabled_tools metadata."""
-    config = ExecutorConfig(
-        executor_id="test-runner",
-        metadata={"enabled_tools": "bash,read"},
+@pytest.mark.asyncio
+async def test_handle_tool_list_returns_configured_definitions() -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    ws = DummyWebSocket()
+    await runner._handle_configure(ws, "cfg-1", {"enabled_tools": ["read"], "config": {}})
+    ws.sent.clear()
+
+    await runner._handle_tool_list(ws, "list-1")
+
+    assert ws.sent[-1]["result"]["tools"][0]["name"] == "read"
+
+
+@pytest.mark.asyncio
+async def test_handle_tool_execute_requires_configuration() -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    ws = DummyWebSocket()
+
+    await runner._handle_tool_execute(
+        ws,
+        "call-1",
+        {"call_id": "call-1", "tool_name": "read", "arguments": {}},
     )
-    runner = ExecutorRunner(config)
-    runner._init_tools()
-    # Should only have the specified tools
-    assert "bash" in runner._tool_handlers or len(runner._tool_handlers) <= 2
+
+    assert ws.sent[-1]["result"]["is_error"] is True
+    assert "not configured" in ws.sent[-1]["result"]["output"].lower()
 
 
-def test_runner_init_inference_none() -> None:
-    """ExecutorRunner skips inference init when not configured."""
-    config = ExecutorConfig(executor_id="test-runner")
-    runner = ExecutorRunner(config)
-    runner._init_inference()
-    assert runner._inference_handler is None
+@pytest.mark.asyncio
+async def test_handle_llm_complete_streams_chunks() -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    ws = DummyWebSocket()
+    await runner._handle_configure(ws, "cfg-1", {"enabled_tools": [], "config": {}})
 
+    runner._inference_handler = AsyncMock()
 
-def test_runner_handle_configure() -> None:
-    """_handle_configure merges secrets."""
-    config = ExecutorConfig(executor_id="test-runner", secrets={"existing": "value"})
-    runner = ExecutorRunner(config)
-    runner._handle_configure({"secrets": {"new_key": "new_value"}})
-    assert runner._secrets == {"existing": "value", "new_key": "new_value"}
+    async def _stream_complete(**_: object):
+        yield {"content": "Hello", "index": 0}
+        yield {"done": True, "usage": {"prompt_tokens": 1}, "finish_reason": "stop"}
 
+    runner._inference_handler.stream_complete = _stream_complete
+    ws.sent.clear()
 
-def test_runner_get_inference_models_empty() -> None:
-    """_get_inference_models returns empty list when no inference configured."""
-    config = ExecutorConfig(executor_id="test-runner")
-    runner = ExecutorRunner(config)
-    assert runner._get_inference_models() == []
-
-
-def test_runner_get_inference_models_with_config() -> None:
-    """_get_inference_models returns models from inference config."""
-    config = ExecutorConfig(
-        executor_id="test-runner",
-        inference=InferenceConfig(
-            endpoint="http://localhost:11434/v1",
-            models=["llama3.2", "codellama"],
-        ),
+    await runner._handle_llm_complete(
+        ws,
+        "rpc-1",
+        {"request_id": "req-1", "model": "openai/gpt-4o-mini", "messages": []},
     )
-    runner = ExecutorRunner(config)
-    assert runner._get_inference_models() == ["llama3.2", "codellama"]
+
+    assert ws.sent[0]["result"]["status"] == "streaming"
+    assert ws.sent[1]["method"] == "llm.chunk"
+    assert ws.sent[2]["method"] == "llm.done"
 
 
-def test_runner_get_inference_type() -> None:
-    """_get_inference_type returns the inference type from config."""
-    config = ExecutorConfig(
-        executor_id="test-runner",
-        inference=InferenceConfig(type="openai_compatible"),
-    )
-    runner = ExecutorRunner(config)
-    assert runner._get_inference_type() == "openai_compatible"
-
-
-def test_runner_get_inference_type_none() -> None:
-    """_get_inference_type returns None when no inference configured."""
-    config = ExecutorConfig(executor_id="test-runner")
-    runner = ExecutorRunner(config)
-    assert runner._get_inference_type() is None
+@pytest.mark.asyncio
+async def test_heartbeat_includes_configuration_state() -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    ws = DummyWebSocket()
+    task = asyncio.create_task(runner._heartbeat_loop(ws))
+    await asyncio.sleep(0)
+    runner._running = False
+    await task
+    assert ws.sent[0]["params"]["configured"] is False

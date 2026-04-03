@@ -7,6 +7,7 @@ export interface ProviderFormState {
   provider_id: string;
   display_name: string;
   location: string;
+  executor_selector: string;
   backend: string;
   status: string;
   preset: ProviderPreset;
@@ -116,6 +117,12 @@ export function createProviderForm(provider: LLMProvider | null = null): Provide
     provider_id: provider?.provider_id ?? '',
     display_name: provider?.display_name ?? '',
     location: provider?.location ?? 'controller',
+    executor_selector:
+      typeof config.executor_labels === 'object' && config.executor_labels !== null && !Array.isArray(config.executor_labels)
+        ? Object.entries(config.executor_labels as Record<string, unknown>)
+            .map(([key, value]) => `${key}=${String(value)}`)
+            .join(', ')
+        : '',
     backend: provider?.backend ?? 'litellm',
     status: provider?.status ?? 'active',
     preset,
@@ -141,14 +148,30 @@ export function createProviderForm(provider: LLMProvider | null = null): Provide
 }
 
 export function providerFormToPayload(form: ProviderFormState): Record<string, unknown> {
+  const executorLabels = Object.fromEntries(
+    form.executor_selector
+      .split(',')
+      .map((value) => value.trim())
+      .filter(Boolean)
+      .map((entry) => {
+        const [key, ...rest] = entry.split('=');
+        return [key.trim(), rest.join('=').trim()];
+      })
+      .filter(([key, value]) => key && value)
+  );
+
   if (form.preset === 'custom') {
+    const config = JSON.parse(form.custom_json || '{}');
+    if (form.location === 'executor' && Object.keys(executorLabels).length > 0) {
+      config.executor_labels = executorLabels;
+    }
     return {
       provider_id: form.provider_id,
       display_name: form.display_name,
       location: form.location,
       backend: form.backend,
       status: form.status,
-      config: JSON.parse(form.custom_json || '{}')
+      config
     };
   }
 
@@ -169,14 +192,17 @@ export function providerFormToPayload(form: ProviderFormState): Record<string, u
     location: form.location,
     backend: 'litellm',
     status: form.status,
-    config: {
-      preset: form.preset,
-      default_model: form.default_model,
-      models: normalizeModelRows([...new Set(modelIds)]),
-      auth_config: authConfig,
-      ...(form.base_url ? { base_url: form.base_url, api_base: form.base_url } : {})
-    }
-  };
+      config: {
+        preset: form.preset,
+        default_model: form.default_model,
+        models: normalizeModelRows([...new Set(modelIds)]),
+        auth_config: authConfig,
+        ...(form.location === 'executor' && Object.keys(executorLabels).length > 0
+          ? { executor_labels: executorLabels }
+          : {}),
+        ...(form.base_url ? { base_url: form.base_url, api_base: form.base_url } : {})
+      }
+    };
 }
 
 export function collectModelOptions(providers: LLMProvider[]): ProviderModelOption[] {

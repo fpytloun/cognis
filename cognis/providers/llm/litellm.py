@@ -188,13 +188,16 @@ class LiteLLMProvider:
 
         resolved_model, provider = await self._resolve_model_target(model, task_type=task_type)
 
-        # Route to executor-side inference if provider is configured for it
-        if self._should_route_to_executor(provider):
-            return await self._executor_generate(resolved_model, messages, provider, **kwargs)
-
         prefixed_model = self._apply_model_prefix(resolved_model, provider)
         request_kwargs = {**await self._resolve_provider_kwargs(provider), **kwargs}
         prepared_messages = _apply_cache_hints(messages, resolved_model, cache_breakpoint_index)
+        if self._should_route_to_executor(provider):
+            return await self._executor_generate(
+                prefixed_model,
+                prepared_messages,
+                provider,
+                request_kwargs=request_kwargs,
+            )
         logger.debug(
             "LLM generate",
             extra={"extra_data": {"model": prefixed_model, "task_type": task_type}},
@@ -247,17 +250,18 @@ class LiteLLMProvider:
 
         resolved_model, provider = await self._resolve_model_target(model, task_type=task_type)
 
-        # Route to executor-side inference if provider is configured for it
-        if self._should_route_to_executor(provider):
-            async for chunk in self._executor_stream_generate(
-                resolved_model, messages, provider, **kwargs
-            ):
-                yield chunk
-            return
-
         prefixed_model = self._apply_model_prefix(resolved_model, provider)
         request_kwargs = {**await self._resolve_provider_kwargs(provider), **kwargs}
         prepared_messages = _apply_cache_hints(messages, resolved_model, cache_breakpoint_index)
+        if self._should_route_to_executor(provider):
+            async for chunk in self._executor_stream_generate(
+                prefixed_model,
+                prepared_messages,
+                provider,
+                request_kwargs=request_kwargs,
+            ):
+                yield chunk
+            return
         logger.debug(
             "LLM stream_generate",
             extra={"extra_data": {"model": prefixed_model, "task_type": task_type}},
@@ -343,6 +347,8 @@ class LiteLLMProvider:
             raise ValueError("LLM provider not found")
 
         config = dict(provider.config)
+        if provider.location == "executor":
+            raise ValueError("Model discovery is only supported for controller-side providers")
         request_kwargs = await self._resolve_provider_kwargs(provider)
         api_key = request_kwargs.get("api_key", "")
         base_url = request_kwargs.get("api_base") or request_kwargs.get("base_url") or ""
@@ -457,13 +463,24 @@ class LiteLLMProvider:
         started_at = monotonic()
         tested_at = datetime.now(UTC)
         try:
-            await litellm.acompletion(
-                model=prefixed_model,
-                messages=[{"role": "user", "content": "Say hello."}],
-                max_tokens=5,
-                stream=False,
-                **request_kwargs,
-            )
+            test_messages = [{"role": "user", "content": "Say hello."}]
+            if self._should_route_to_executor(provider):
+                await self._inference_router.route_generate(
+                    messages=test_messages,
+                    model=prefixed_model,
+                    executor_labels=config.get("executor_labels")
+                    if isinstance(config, dict)
+                    else None,
+                    request_kwargs={**request_kwargs, "max_tokens": 5},
+                )
+            else:
+                await litellm.acompletion(
+                    model=prefixed_model,
+                    messages=test_messages,
+                    max_tokens=5,
+                    stream=False,
+                    **request_kwargs,
+                )
         except TimeoutError as exc:
             return {
                 "ok": False,
@@ -684,17 +701,15 @@ class LiteLLMProvider:
         """Check if a provider is configured for executor-side inference."""
         if provider is None or self._inference_router is None:
             return False
-        config = provider.config if hasattr(provider, "config") else None
-        if not isinstance(config, dict):
-            return False
-        return config.get("location") == "executor" and config.get("backend") == "executor"
+        return getattr(provider, "location", None) == "executor"
 
     async def _executor_generate(
         self,
         model: str,
         messages: list[dict[str, Any]],
         provider: Any,
-        **kwargs: Any,
+        *,
+        request_kwargs: dict[str, Any],
     ) -> dict[str, Any]:
         """Route a non-streaming request to executor-side inference."""
         config = provider.config if hasattr(provider, "config") else {}
@@ -703,7 +718,7 @@ class LiteLLMProvider:
             messages=messages,
             model=model,
             executor_labels=executor_labels,
-            **kwargs,
+            request_kwargs=request_kwargs,
         )
 
     async def _executor_stream_generate(
@@ -711,7 +726,8 @@ class LiteLLMProvider:
         model: str,
         messages: list[dict[str, Any]],
         provider: Any,
-        **kwargs: Any,
+        *,
+        request_kwargs: dict[str, Any],
     ) -> AsyncIterator[dict[str, Any]]:
         """Route a streaming request to executor-side inference."""
         config = provider.config if hasattr(provider, "config") else {}
@@ -720,6 +736,6 @@ class LiteLLMProvider:
             messages=messages,
             model=model,
             executor_labels=executor_labels,
-            **kwargs,
+            request_kwargs=request_kwargs,
         ):
             yield chunk

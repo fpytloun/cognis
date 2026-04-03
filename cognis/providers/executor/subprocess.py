@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import sys
 from typing import Any
 
@@ -60,15 +59,7 @@ class SubprocessExecutorProvider:
         # Generate short-lived token
         token = self._auth_provider.sign_executor_token(executor_id, ttl_seconds=300)
 
-        # Build config for the subprocess (without secrets or token — those go via stdin)
         controller_url = f"ws://localhost:{self._controller_port}/api/executor/ws"
-        subprocess_config = config.model_copy(
-            update={
-                "controller_url": controller_url,
-                "controller_token": None,  # token delivered via stdin
-                "secrets": {},  # secrets delivered via stdin
-            }
-        )
 
         # Start subprocess
         _logger.info(
@@ -82,22 +73,13 @@ class SubprocessExecutorProvider:
             "cognis.executor",
             "--controller-url",
             controller_url,
-            "--executor-id",
-            executor_id,
-            "--config-json",
-            subprocess_config.model_dump_json(),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )
 
-        # Pipe token + secrets via stdin (never CLI args for sensitive data).
-        # Format: first line is the JWT token, remaining is secrets JSON.
         if process.stdin is not None:
-            stdin_payload = token + "\n" + json.dumps(config.secrets)
-            process.stdin.write(stdin_payload.encode())
-            process.stdin.close()
-        elif process.stdin is not None:
+            process.stdin.write(token.encode())
             process.stdin.close()
 
         self._processes[executor_id] = process

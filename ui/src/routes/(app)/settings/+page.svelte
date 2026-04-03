@@ -19,6 +19,7 @@
     ApiKeyCreateResponse,
     ApiKeyMetadata,
     ExecutorConfig,
+    ExecutorTokenResponse,
     HealthResponse,
     LLMProvider,
     ModelRouting,
@@ -65,7 +66,8 @@
   let webBackendForm = 'direct';
   let webKeySetup: { backend: string; value: string } | null = null;
   let showExecutorForm = false;
-  let executorForm = { name: '', executor_type: 'in_process', labels: '' };
+  let executorForm = { executor_id: '', name: '', executor_type: 'in_process', labels: '' };
+  let executorToken: ExecutorTokenResponse | null = null;
   let isAdmin = false;
   let selectedProviderId = '';
   let selectedSettingKey = '';
@@ -178,6 +180,10 @@
 
   function modelOptions(): Array<{ value: string; label: string; providerId: string }> {
     return collectModelOptions(providers);
+  }
+
+  function executorSelectorFor(labels: Record<string, string> | null | undefined): string {
+    return Object.entries(labels || {}).map(([k, v]) => `${k}=${v}`).join(', ');
   }
 
   function routingWarnings(): string[] {
@@ -958,6 +964,13 @@
               </select>
             </label>
             <label class="space-y-2 text-sm font-medium text-slate-200">
+              <span>Execution location</span>
+              <select bind:value={providerForm.location} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+                <option value="controller">Controller</option>
+                <option value="executor">Via executor</option>
+              </select>
+            </label>
+            <label class="space-y-2 text-sm font-medium text-slate-200">
               <span>Status</span>
               <select bind:value={providerForm.status} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
                 <option value="active">active</option>
@@ -965,6 +978,27 @@
               </select>
             </label>
           </div>
+
+          {#if providerForm.location === 'executor'}
+            <div class="rounded-2xl border border-sky-500/20 bg-sky-500/5 p-4 space-y-3">
+              <div>
+                <p class="text-xs uppercase tracking-[0.25em] text-sky-200/80">Executor routing</p>
+                <p class="mt-2 text-sm text-slate-300">This provider stays configured normally, but requests are executed from a matching remote executor instead of the controller.</p>
+              </div>
+              <label class="space-y-2 text-sm font-medium text-slate-200 block">
+                <span>Executor selector (key=value, comma-separated)</span>
+                <Input bind:value={providerForm.executor_selector} placeholder="location=local, tier=gpu" />
+              </label>
+              {#if executorConfigs.length > 0}
+                <div class="flex flex-wrap gap-2">
+                  <span class="text-xs text-slate-400 self-center">Use labels from:</span>
+                  {#each executorConfigs.filter((executor) => executor.executor_type !== 'in_process') as executor}
+                    <Button size="sm" variant="secondary" onclick={() => (providerForm.executor_selector = executorSelectorFor(executor.labels))}>{executor.name}</Button>
+                  {/each}
+                </div>
+              {/if}
+            </div>
+          {/if}
 
           {#if providerForm.preset === 'custom'}
             <!-- Custom: raw JSON -->
@@ -1027,10 +1061,13 @@
             <div class="rounded-2xl border border-slate-800 bg-slate-900/60 p-4">
               <div class="flex items-center justify-between gap-3">
                 <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Models</p>
-                <Button size="sm" variant="secondary" onclick={discoverModels} disabled={busy}>
+                <Button size="sm" variant="secondary" onclick={discoverModels} disabled={busy || providerForm.location === 'executor'}>
                   Discover models
                 </Button>
               </div>
+              {#if providerForm.location === 'executor'}
+                <p class="mt-3 text-xs text-slate-400">Model discovery runs from the controller. For executor-routed providers, enter models manually.</p>
+              {/if}
 
               {#if providerForm.discovered_models.length > 0}
                 <div class="mt-3 max-h-48 overflow-y-auto rounded-xl border border-slate-800 bg-slate-950/80 p-2">
@@ -1313,7 +1350,7 @@
               Executors handle tool execution. Enable tools on each executor to make them available to agents.
             </p>
           </div>
-          <Button variant="primary" size="sm" onclick={() => { executorForm = { name: '', executor_type: 'in_process', labels: '' }; editingExecutor = null; showExecutorForm = true; }}>New executor</Button>
+          <Button variant="primary" size="sm" onclick={() => { executorForm = { executor_id: '', name: '', executor_type: 'websocket', labels: '' }; editingExecutor = null; executorToken = null; showExecutorForm = true; }}>New executor</Button>
         </div>
 
         {#if showExecutorForm}
@@ -1321,8 +1358,20 @@
             <h3 class="text-lg font-medium text-white">{editingExecutor ? 'Edit Executor' : 'New Executor'}</h3>
             <div class="grid gap-4 md:grid-cols-2">
               <label class="space-y-1 text-sm text-slate-200">
+                <span>Executor ID</span>
+                <Input bind:value={executorForm.executor_id} placeholder="auto-generated if empty" disabled={!!editingExecutor} />
+              </label>
+              <label class="space-y-1 text-sm text-slate-200">
                 <span>Name</span>
                 <Input bind:value={executorForm.name} placeholder="e.g. Local Developer" />
+              </label>
+              <label class="space-y-1 text-sm text-slate-200">
+                <span>Type</span>
+                <select bind:value={executorForm.executor_type} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!editingExecutor}>
+                  <option value="websocket">websocket</option>
+                  <option value="subprocess">subprocess</option>
+                  <option value="in_process">in_process</option>
+                </select>
               </label>
               <label class="space-y-1 text-sm text-slate-200">
                 <span>Labels (key=value, comma-separated)</span>
@@ -1342,7 +1391,7 @@
                   if (editingExecutor) {
                     await api.executor.update(editingExecutor.executor_id, { name: executorForm.name, labels });
                   } else {
-                    await api.executor.create({ name: executorForm.name, executor_type: executorForm.executor_type, labels });
+                    await api.executor.create({ executor_id: executorForm.executor_id || null, name: executorForm.name, executor_type: executorForm.executor_type, labels });
                   }
                   showExecutorForm = false;
                   await refreshPageState();
@@ -1369,12 +1418,23 @@
                 <Button variant="secondary" size="sm" onclick={() => {
                   editingExecutor = exec;
                   executorForm = {
+                    executor_id: exec.executor_id,
                     name: exec.name,
                     executor_type: exec.executor_type,
                     labels: Object.entries(exec.labels || {}).map(([k, v]) => `${k}=${v}`).join(', ')
                   };
                   showExecutorForm = true;
                 }}>Edit</Button>
+                {#if exec.executor_type !== 'in_process'}
+                  <Button variant="secondary" size="sm" onclick={async () => {
+                    try {
+                      executorToken = await api.executor.generateToken(exec.executor_id);
+                      addToast('Executor token generated. Copy it now.', 'success');
+                    } catch (e) {
+                      error = asApiError(e).message;
+                    }
+                  }}>Generate token</Button>
+                {/if}
                 {#if !exec.is_default}
                   <Button variant="danger" size="sm" onclick={async () => {
                     const confirmed = await confirmAction({ title: 'Delete executor', message: `Delete "${exec.name}"? This cannot be undone.` });
@@ -1393,6 +1453,19 @@
                 {#each Object.entries(exec.labels || {}) as [k, v]}
                   <span class="px-2 py-0.5 bg-zinc-800 text-zinc-300 text-xs font-mono rounded border border-zinc-700">{k}={v}</span>
                 {/each}
+              </div>
+            {/if}
+
+            <div class="text-xs text-slate-500 font-mono">ID: {exec.executor_id}</div>
+
+            {#if executorToken && executorToken.executor_id === exec.executor_id}
+              <div class="rounded-2xl border border-emerald-500/30 bg-emerald-500/10 p-4 space-y-3">
+                <p class="text-sm text-emerald-100">Copy this token now. It is not stored in the UI.</p>
+                <textarea readonly class="min-h-[96px] w-full rounded-2xl border border-emerald-500/20 bg-slate-950/80 px-4 py-3 font-mono text-xs text-slate-100">{executorToken.token}</textarea>
+                <div class="flex flex-wrap gap-2">
+                  <Button size="sm" variant="secondary" onclick={() => copyToClipboard(executorToken?.token ?? '')}>Copy token</Button>
+                  <Button size="sm" variant="secondary" onclick={() => copyToClipboard(`cognis executor run --controller-url ${window.location.origin.replace('http', 'ws')}/api/executor/ws --token ${executorToken?.token ?? ''}`)}>Copy command</Button>
+                </div>
               </div>
             {/if}
 
@@ -1495,10 +1568,10 @@
               <div class="mt-3 space-y-3 pl-1">
                 <div class="flex flex-wrap gap-4">
                   <label class="flex items-center gap-2 text-sm text-slate-300">
-                    <input type="checkbox" checked={lspEnabled}
-                      class="rounded border-slate-600 bg-slate-800 text-emerald-500 focus:ring-emerald-500/30"
+                      <input type="checkbox" checked={lspEnabled}
+                        class="rounded border-slate-600 bg-slate-800 text-emerald-500 focus:ring-emerald-500/30"
                       onchange={async (e) => {
-                        const checked = /** @type {HTMLInputElement} */ (e.target).checked;
+                        const checked = e.currentTarget.checked;
                         const cfg = { ...(exec.config || {}), lsp_enabled: checked };
                         await api.executor.update(exec.executor_id, { config: cfg });
                         await refreshPageState();
@@ -1508,10 +1581,10 @@
                     Enabled
                   </label>
                   <label class="flex items-center gap-2 text-sm text-slate-300">
-                    <input type="checkbox" checked={lspAutoInstall} disabled={!lspEnabled}
-                      class="rounded border-slate-600 bg-slate-800 text-emerald-500 focus:ring-emerald-500/30 disabled:opacity-40"
+                      <input type="checkbox" checked={lspAutoInstall} disabled={!lspEnabled}
+                        class="rounded border-slate-600 bg-slate-800 text-emerald-500 focus:ring-emerald-500/30 disabled:opacity-40"
                       onchange={async (e) => {
-                        const checked = /** @type {HTMLInputElement} */ (e.target).checked;
+                        const checked = e.currentTarget.checked;
                         const cfg = { ...(exec.config || {}), lsp_auto_install: checked };
                         await api.executor.update(exec.executor_id, { config: cfg });
                         await refreshPageState();
@@ -1524,10 +1597,10 @@
                 <div class="grid gap-3 md:grid-cols-3">
                   <label class="space-y-1 text-sm text-slate-300">
                     <span class="text-xs text-slate-400">Diagnostics timeout (ms)</span>
-                    <Input value={lspConfig.lsp_diagnostics_timeout_ms ?? 10000} disabled={!lspEnabled}
+                    <Input value={Number(lspConfig.lsp_diagnostics_timeout_ms ?? 10000)} disabled={!lspEnabled}
                       type="number" min="1000" max="60000" step="1000"
                       onchange={async (e) => {
-                        const val = parseInt(/** @type {HTMLInputElement} */ (e.target).value, 10);
+                        const val = parseInt(e.currentTarget.value, 10);
                         if (isNaN(val)) return;
                         const cfg = { ...(exec.config || {}), lsp_diagnostics_timeout_ms: val };
                         await api.executor.update(exec.executor_id, { config: cfg });
@@ -1537,10 +1610,10 @@
                   </label>
                   <label class="space-y-1 text-sm text-slate-300">
                     <span class="text-xs text-slate-400">Idle timeout (seconds)</span>
-                    <Input value={lspConfig.lsp_idle_timeout_seconds ?? 600} disabled={!lspEnabled}
+                    <Input value={Number(lspConfig.lsp_idle_timeout_seconds ?? 600)} disabled={!lspEnabled}
                       type="number" min="60" max="3600" step="60"
                       onchange={async (e) => {
-                        const val = parseInt(/** @type {HTMLInputElement} */ (e.target).value, 10);
+                        const val = parseInt(e.currentTarget.value, 10);
                         if (isNaN(val)) return;
                         const cfg = { ...(exec.config || {}), lsp_idle_timeout_seconds: val };
                         await api.executor.update(exec.executor_id, { config: cfg });
@@ -1550,10 +1623,10 @@
                   </label>
                   <label class="space-y-1 text-sm text-slate-300">
                     <span class="text-xs text-slate-400">Max concurrent servers</span>
-                    <Input value={lspConfig.lsp_max_concurrent_servers ?? 8} disabled={!lspEnabled}
+                    <Input value={Number(lspConfig.lsp_max_concurrent_servers ?? 8)} disabled={!lspEnabled}
                       type="number" min="1" max="32" step="1"
                       onchange={async (e) => {
-                        const val = parseInt(/** @type {HTMLInputElement} */ (e.target).value, 10);
+                        const val = parseInt(e.currentTarget.value, 10);
                         if (isNaN(val)) return;
                         const cfg = { ...(exec.config || {}), lsp_max_concurrent_servers: val };
                         await api.executor.update(exec.executor_id, { config: cfg });
