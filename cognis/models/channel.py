@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -104,13 +104,13 @@ class ChannelAccountConfig(BaseModel):
     allow_new_conversations: bool = True
 
     # Adapter location
-    adapter_location: str = "controller"  # "controller" or "executor"
+    adapter_location: Literal["controller", "executor"] = "controller"
     executor_id: str | None = None  # preferred executor (null = any with channels capability)
 
     # Access control
     allowed_senders: list[str] = Field(default_factory=list)
-    dm_policy: str = "pairing"  # "open", "pairing", "allowlist", "disabled"
-    group_policy: str = "pairing"  # "open", "pairing", "mention", "allowlist", "disabled"
+    dm_policy: Literal["open", "pairing", "allowlist", "disabled"] = "pairing"
+    group_policy: Literal["open", "pairing", "mention", "allowlist", "disabled"] = "pairing"
 
     # Webhook (for platforms that push)
     webhook_secret: str | None = None

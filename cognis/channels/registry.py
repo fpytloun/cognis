@@ -176,7 +176,7 @@ DISCORD_META = ChannelMeta(
             description="Comma-separated Discord server IDs to join (empty = all)",
         ),
     ],
-    connection_mode="long_poll",  # MVP uses REST polling; Gateway WebSocket in Phase 2
+    connection_mode="websocket",
 )
 
 SLACK_META = ChannelMeta(

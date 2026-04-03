@@ -174,6 +174,7 @@ export interface Agent {
   personality_sync_error: string | null;
   personality_sync_checked_at: string | null;
   avatar_url: string | null;
+  avatar_image_id: string | null;
   agent_type: string;
   is_system: boolean;
   hidden: boolean;

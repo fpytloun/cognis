@@ -96,7 +96,8 @@ class Agent(Base):
     llm_config: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     execution: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     sync_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True, default=dict)
-    avatar_url: Mapped[str | None] = mapped_column(String, nullable=True)
+    avatar_url: Mapped[str | None] = mapped_column(String, nullable=True)  # deprecated
+    avatar_image_id: Mapped[str | None] = mapped_column(String, nullable=True)
     # Type system
     agent_type: Mapped[str] = mapped_column(
         String(20), nullable=False, default="primary", server_default="primary"
@@ -507,7 +508,9 @@ class ChannelAccountRow(Base):
     adapter_location: Mapped[str] = mapped_column(
         String, nullable=False, default="controller", server_default="controller"
     )
-    executor_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    executor_id: Mapped[str | None] = mapped_column(
+        String, ForeignKey("executors.executor_id", ondelete="SET NULL"), nullable=True
+    )
     # Access control
     allowed_senders: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
     dm_policy: Mapped[str] = mapped_column(String, nullable=False, default="pairing")

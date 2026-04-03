@@ -136,6 +136,8 @@
   let webhookInfoDismissed = $state(false);
 
   let executors = $state<{ executor_id: string; name: string; status: string }[]>([]);
+  let editingAccountId = $state<string | null>(null);
+  let credentialOverrides = $state<Record<string, string>>({});
 
   let createForm = $state({
     display_name: '',
@@ -203,6 +205,7 @@
   }
 
   function beginCreate(meta: ChannelMeta): void {
+    editingAccountId = null;
     selectedType = meta;
     showCreatePanel = true;
     webhookInfo = null;
@@ -218,6 +221,38 @@
     createForm.settingValues = Object.fromEntries(
       meta.setting_fields.map((field) => [field.name, field.default == null ? '' : String(field.default)])
     );
+    credentialOverrides = {};
+  }
+
+  function beginEdit(account: ChannelAccount): void {
+    const meta = channelTypes.find((item) => item.channel_type === account.channel_type);
+    if (!meta) {
+      return;
+    }
+    editingAccountId = account.account_id;
+    selectedType = meta;
+    showCreatePanel = true;
+    webhookInfo = null;
+    webhookInfoDismissed = true;
+    createForm.display_name = account.display_name;
+    createForm.agent_id = account.agent_id;
+    createForm.adapter_location = account.adapter_location ?? 'controller';
+    createForm.executor_id = account.executor_id ?? '';
+    createForm.dm_policy = account.dm_policy;
+    createForm.group_policy = account.group_policy;
+    createForm.allow_new_conversations = account.allow_new_conversations ?? true;
+    createForm.credentialValues = Object.fromEntries(meta.credential_fields.map((field) => [field.name, '']));
+    createForm.settingValues = Object.fromEntries(
+      meta.setting_fields.map((field) => [field.name, String(account.config?.[field.name] ?? field.default ?? '')])
+    );
+    credentialOverrides = {};
+    activeTab = 'accounts';
+  }
+
+  function cancelEdit(): void {
+    editingAccountId = null;
+    credentialOverrides = {};
+    showCreatePanel = false;
   }
 
   async function loadData(): Promise<void> {
@@ -339,6 +374,84 @@
           // Best effort cleanup of generated secrets on failure.
         }
       }
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function saveAccountChanges(): Promise<void> {
+    if (!selectedType || !editingAccountId) {
+      return;
+    }
+    busy = true;
+    error = '';
+    try {
+      const current = accounts.find((account) => account.account_id === editingAccountId);
+      if (!current) {
+        throw new Error('Channel account no longer exists.');
+      }
+
+      const updates: Record<string, unknown> = {
+        display_name: createForm.display_name,
+        agent_id: createForm.agent_id,
+        adapter_location: createForm.adapter_location,
+        executor_id: createForm.executor_id || null,
+        dm_policy: createForm.dm_policy,
+        group_policy: createForm.group_policy,
+        allow_new_conversations: createForm.allow_new_conversations,
+      };
+
+      const config: Record<string, unknown> = {};
+      const replacedSecretNames: string[] = [];
+      for (const field of selectedType.setting_fields) {
+        const rawValue = createForm.settingValues[field.name] ?? '';
+        if (rawValue === '') {
+          continue;
+        }
+        config[field.name] = normalizeSettingValue(selectedType, field.name, rawValue);
+      }
+      updates.config = config;
+
+      const credential_refs: Record<string, string> = { ...(current.credential_refs ?? {}) };
+      for (const field of selectedType.credential_fields) {
+        const replacement = (credentialOverrides[field.name] ?? '').trim();
+        if (!replacement) {
+          continue;
+        }
+        if (field.secret) {
+          const secretName = `channel.${selectedType.channel_type}.${Date.now()}.${field.name}`;
+          await api.secrets.upsert({
+            name: secretName,
+            value: replacement,
+            scope: 'user',
+            agent_id: null,
+            description: `${selectedType.label} credential: ${field.label}`
+          });
+          const previousSecret = credential_refs[field.name];
+          if (previousSecret && previousSecret !== secretName) {
+            replacedSecretNames.push(previousSecret);
+          }
+          credential_refs[field.name] = secretName;
+        } else {
+          (updates.config as Record<string, unknown>)[field.name] = replacement;
+        }
+      }
+      updates.credential_refs = credential_refs;
+
+      await api.channels.updateAccount(editingAccountId, updates);
+      for (const secretName of replacedSecretNames) {
+        try {
+          await api.secrets.remove(secretName, 'user', null);
+        } catch {
+          // Best effort cleanup for rotated secrets.
+        }
+      }
+      addToast('Channel account updated.', 'success');
+      editingAccountId = null;
+      credentialOverrides = {};
+      await loadData();
+    } catch (caughtError) {
+      addToast(asApiError(caughtError).message, 'error', 4_000, 'Unable to update channel account');
     } finally {
       busy = false;
     }
@@ -583,6 +696,9 @@
                       <CheckCircle2 class="mr-2 h-4 w-4" /> Start
                     {/if}
                   </Button>
+                  <Button variant="secondary" size="sm" onclick={() => beginEdit(account)} disabled={busy}>
+                    Edit
+                  </Button>
                   <Button variant="danger" size="sm" onclick={() => void removeAccount(account)} disabled={busy}>
                     <Trash2 class="mr-2 h-4 w-4" /> Delete
                   </Button>
@@ -596,25 +712,27 @@
           <Card class="p-5">
             <div class="flex items-center justify-between gap-3">
               <div>
-                <h2 class="text-lg font-semibold text-white">Create channel account</h2>
-                <p class="mt-1 text-sm text-slate-400">Choose the adapter first, then follow the platform-specific setup steps.</p>
+                <h2 class="text-lg font-semibold text-white">{editingAccountId ? 'Edit channel account' : 'Create channel account'}</h2>
+                <p class="mt-1 text-sm text-slate-400">{editingAccountId ? 'Update settings, policies, executor placement, or replace stored credentials.' : 'Choose the adapter first, then follow the platform-specific setup steps.'}</p>
               </div>
             </div>
 
-            <div class="mt-5 grid gap-3 sm:grid-cols-2">
-              {#each channelTypes as meta}
-                <button
-                  class={`rounded-2xl border p-4 text-left transition ${selectedType?.channel_type === meta.channel_type ? 'border-sky-400 bg-sky-500/10' : 'border-slate-700 bg-slate-950/60 hover:border-slate-500'}`}
-                  onclick={() => beginCreate(meta)}
-                >
-                  <div class="flex items-center gap-2 text-white">
-                    <MessagesSquare class="h-4 w-4 text-sky-300" />
-                    <span class="font-medium">{meta.label}</span>
-                  </div>
-                  <p class="mt-2 text-sm text-slate-400">{meta.description}</p>
-                </button>
-              {/each}
-            </div>
+            {#if !editingAccountId}
+              <div class="mt-5 grid gap-3 sm:grid-cols-2">
+                {#each channelTypes as meta}
+                  <button
+                    class={`rounded-2xl border p-4 text-left transition ${selectedType?.channel_type === meta.channel_type ? 'border-sky-400 bg-sky-500/10' : 'border-slate-700 bg-slate-950/60 hover:border-slate-500'}`}
+                    onclick={() => beginCreate(meta)}
+                  >
+                    <div class="flex items-center gap-2 text-white">
+                      <MessagesSquare class="h-4 w-4 text-sky-300" />
+                      <span class="font-medium">{meta.label}</span>
+                    </div>
+                    <p class="mt-2 text-sm text-slate-400">{meta.description}</p>
+                  </button>
+                {/each}
+              </div>
+            {/if}
           </Card>
 
           {#if showCreatePanel && selectedType}
@@ -694,7 +812,19 @@
                 {#each selectedType.credential_fields as field}
                   <label class="grid gap-2 text-sm text-slate-300">
                     {field.label}
-                    <Input bind:value={createForm.credentialValues[field.name]} type={field.secret ? 'password' : 'text'} placeholder={field.description || field.label} />
+                    <Input
+                      value={editingAccountId ? (credentialOverrides[field.name] ?? '') : (createForm.credentialValues[field.name] ?? '')}
+                      oninput={(event) => {
+                        const value = (event.currentTarget as HTMLInputElement).value;
+                        if (editingAccountId) {
+                          credentialOverrides[field.name] = value;
+                        } else {
+                          createForm.credentialValues[field.name] = value;
+                        }
+                      }}
+                      type={field.secret ? 'password' : 'text'}
+                      placeholder={editingAccountId ? 'Configured (enter new value to replace)' : (field.description || field.label)}
+                    />
                     {#if field.description}
                       <span class="text-xs text-slate-500">{field.description}</span>
                     {/if}
@@ -749,10 +879,17 @@
                   Allow this adapter to create new conversations automatically when a new chat appears.
                 </label>
 
-                <div class="flex justify-end">
-                  <Button variant="primary" onclick={() => void saveAccount()} disabled={busy}>
-                    <PlugZap class="mr-2 h-4 w-4" /> Save channel account
-                  </Button>
+                <div class="flex justify-end gap-2">
+                  {#if editingAccountId}
+                    <Button variant="secondary" onclick={cancelEdit} disabled={busy}>Cancel</Button>
+                    <Button variant="primary" onclick={() => void saveAccountChanges()} disabled={busy}>
+                      Save changes
+                    </Button>
+                  {:else}
+                    <Button variant="primary" onclick={() => void saveAccount()} disabled={busy}>
+                      <PlugZap class="mr-2 h-4 w-4" /> Save channel account
+                    </Button>
+                  {/if}
                 </div>
               </div>
             </Card>
