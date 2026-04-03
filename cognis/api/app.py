@@ -19,6 +19,7 @@ from cognis.api.common import error_response
 from cognis.api.middleware import AuthenticationMiddleware
 from cognis.api.routes.agents import router as agents_router
 from cognis.api.routes.auth import router as auth_router
+from cognis.api.routes.channels import router as channels_router
 from cognis.api.routes.conversations import router as conversations_router
 from cognis.api.routes.escalations import router as escalations_router
 from cognis.api.routes.executors import router as executors_router
@@ -351,8 +352,48 @@ def create_app() -> FastAPI:
         app.state.turn_scheduler = turn_scheduler
         app.state.command_dispatcher = command_dispatcher
 
+        # Channel manager — lifecycle orchestration for channel adapters.
+        from cognis.channels.delivery import ChannelDeliveryService
+        from cognis.channels.inbound import InboundPipeline
+        from cognis.channels.manager import ChannelManager
+
+        # Use a lazy ref to avoid circular dependency
+        _channel_manager_holder: list[ChannelManager | None] = [None]
+
+        def _get_channel_manager() -> ChannelManager | None:
+            return _channel_manager_holder[0]
+
+        inbound_pipeline = InboundPipeline(
+            session_factory=session_factory,
+            turn_scheduler=turn_scheduler,
+            session_manager=session_manager,
+            channel_manager_ref=_get_channel_manager,
+        )
+        channel_manager = ChannelManager(
+            session_factory=session_factory,
+            inbound_pipeline=inbound_pipeline,
+            secrets_provider=providers.secrets,
+        )
+        _channel_manager_holder[0] = channel_manager
+
+        channel_delivery = ChannelDeliveryService(
+            session_factory=session_factory,
+            event_bus=event_bus,
+            channel_manager_ref=_get_channel_manager,
+        )
+
+        app.state.channel_manager = channel_manager
+        app.state.channel_delivery = channel_delivery
+
+        # Start channel adapters (non-blocking — failures are logged)
+        try:
+            await channel_manager.start_all()
+        except Exception:
+            logger.exception("Failed to start channel adapters")
+
         yield
 
+        await channel_manager.stop_all()
         await task_queue.stop()
         await shared_runtime_cleanup()
         await remember_queue.stop()
@@ -379,6 +420,7 @@ def create_app() -> FastAPI:
     app.add_middleware(AuthenticationMiddleware)
     app.include_router(auth_router)
     app.include_router(system_router)
+    app.include_router(channels_router)
     app.include_router(conversations_router)
     app.include_router(agents_router)
     app.include_router(sessions_router)

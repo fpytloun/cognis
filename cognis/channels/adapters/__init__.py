@@ -1,0 +1,1 @@
+"""Concrete channel adapter implementations."""

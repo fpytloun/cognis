@@ -478,3 +478,75 @@ class AuditLog(Base):
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, default=_utcnow
     )
+
+
+class ChannelAccountRow(Base):
+    """Channel account configurations.
+
+    Each row represents a configured connection to an external messaging
+    platform (Signal, WhatsApp, Telegram, etc.).  Credentials are stored
+    via SecretsProvider and referenced by name in ``credential_refs``.
+    """
+
+    __tablename__ = "channel_accounts"
+
+    account_id: Mapped[str] = mapped_column(String, primary_key=True)
+    channel_type: Mapped[str] = mapped_column(String, nullable=False)
+    display_name: Mapped[str] = mapped_column(String, nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="1")
+    agent_id: Mapped[str] = mapped_column(String, ForeignKey("agents.agent_id"), nullable=False)
+    user_email: Mapped[str] = mapped_column(String, ForeignKey("users.email"), nullable=False)
+    config: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    credential_refs: Mapped[dict[str, str] | None] = mapped_column(JSON, nullable=True)
+    # Routing
+    default_conversation_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    allow_new_conversations: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="1"
+    )
+    # Access control
+    allowed_senders: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    dm_policy: Mapped[str] = mapped_column(String, nullable=False, default="open")
+    group_policy: Mapped[str] = mapped_column(String, nullable=False, default="mention")
+    webhook_secret: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__ = (
+        Index("ix_channel_accounts_type", "channel_type"),
+        Index("ix_channel_accounts_user", "user_email"),
+    )
+
+
+class ChannelContact(Base):
+    """Maps external platform senders to Cognis users.
+
+    Resolves the identity gap between platform-specific sender IDs
+    (phone numbers, Discord IDs, etc.) and Cognis user emails.
+    """
+
+    __tablename__ = "channel_contacts"
+
+    contact_id: Mapped[str] = mapped_column(String, primary_key=True)
+    channel_type: Mapped[str] = mapped_column(String, nullable=False)
+    sender_id: Mapped[str] = mapped_column(String, nullable=False)
+    user_email: Mapped[str] = mapped_column(String, ForeignKey("users.email"), nullable=False)
+    display_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    verified: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="0"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__ = (
+        UniqueConstraint("channel_type", "sender_id", name="uq_channel_contact"),
+        Index("ix_channel_contacts_lookup", "channel_type", "sender_id"),
+    )

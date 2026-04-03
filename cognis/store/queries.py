@@ -14,6 +14,8 @@ from cognis.store.models import (
     Agent,
     AgentSecondaryBinding,
     ApiKey,
+    ChannelAccountRow,
+    ChannelContact,
     Conversation,
     ExecutorRow,
     LLMProvider,
@@ -1865,3 +1867,174 @@ async def ensure_default_executor(session: AsyncSession) -> ExecutorRow:
         enabled_tool_groups=[],
         is_default=True,
     )
+
+
+# --- Channel Accounts ---
+
+
+async def list_channel_accounts(
+    session: AsyncSession,
+    *,
+    enabled_only: bool = False,
+    user_email: str | None = None,
+) -> list[ChannelAccountRow]:
+    """List channel accounts with optional filters."""
+    stmt = select(ChannelAccountRow).order_by(ChannelAccountRow.created_at.desc())
+    if enabled_only:
+        stmt = stmt.where(ChannelAccountRow.enabled.is_(True))
+    if user_email:
+        stmt = stmt.where(ChannelAccountRow.user_email == user_email)
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def get_channel_account(
+    session: AsyncSession,
+    account_id: str,
+) -> ChannelAccountRow | None:
+    """Get a channel account by ID."""
+    result = await session.execute(
+        select(ChannelAccountRow).where(ChannelAccountRow.account_id == account_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def create_channel_account(
+    session: AsyncSession,
+    *,
+    account_id: str | None = None,
+    channel_type: str,
+    display_name: str,
+    agent_id: str,
+    user_email: str,
+    config: dict[str, Any] | None = None,
+    credential_refs: dict[str, str] | None = None,
+    default_conversation_id: str | None = None,
+    allow_new_conversations: bool = True,
+    allowed_senders: list[str] | None = None,
+    dm_policy: str = "open",
+    group_policy: str = "mention",
+    webhook_secret: str | None = None,
+) -> ChannelAccountRow:
+    """Create a new channel account."""
+    row = ChannelAccountRow(
+        account_id=account_id or f"ch_{uuid.uuid4().hex[:12]}",
+        channel_type=channel_type,
+        display_name=display_name,
+        agent_id=agent_id,
+        user_email=user_email,
+        config=config or {},
+        credential_refs=credential_refs or {},
+        default_conversation_id=default_conversation_id,
+        allow_new_conversations=allow_new_conversations,
+        allowed_senders=allowed_senders or [],
+        dm_policy=dm_policy,
+        group_policy=group_policy,
+        webhook_secret=webhook_secret,
+    )
+    session.add(row)
+    await session.flush()
+    return row
+
+
+async def update_channel_account(
+    session: AsyncSession,
+    account_id: str,
+    **kwargs: Any,
+) -> ChannelAccountRow | None:
+    """Update a channel account."""
+    row = await get_channel_account(session, account_id)
+    if row is None:
+        return None
+    for key, value in kwargs.items():
+        if hasattr(row, key):
+            setattr(row, key, value)
+    await session.flush()
+    return row
+
+
+async def delete_channel_account(
+    session: AsyncSession,
+    account_id: str,
+) -> bool:
+    """Delete a channel account."""
+    row = await get_channel_account(session, account_id)
+    if row is None:
+        return False
+    await session.delete(row)
+    return True
+
+
+async def get_latest_active_conversation_for_context(
+    session: AsyncSession,
+    *,
+    user_email: str,
+    agent_id: str,
+    context_ref: str,
+) -> Conversation | None:
+    """Find the latest active conversation matching a context ref."""
+    result = await session.execute(
+        select(Conversation)
+        .where(
+            Conversation.user_email == user_email,
+            Conversation.agent_id == agent_id,
+            Conversation.context_ref == context_ref,
+            Conversation.status == "active",
+        )
+        .order_by(Conversation.updated_at.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+# --- Channel Contacts ---
+
+
+async def get_channel_contact(
+    session: AsyncSession,
+    channel_type: str,
+    sender_id: str,
+) -> ChannelContact | None:
+    """Look up a channel contact by platform identity."""
+    result = await session.execute(
+        select(ChannelContact).where(
+            ChannelContact.channel_type == channel_type,
+            ChannelContact.sender_id == sender_id,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def create_channel_contact(
+    session: AsyncSession,
+    *,
+    channel_type: str,
+    sender_id: str,
+    user_email: str,
+    display_name: str | None = None,
+    verified: bool = False,
+) -> ChannelContact:
+    """Create a new channel contact mapping."""
+    row = ChannelContact(
+        contact_id=f"cc_{uuid.uuid4().hex[:12]}",
+        channel_type=channel_type,
+        sender_id=sender_id,
+        user_email=user_email,
+        display_name=display_name,
+        verified=verified,
+    )
+    session.add(row)
+    await session.flush()
+    return row
+
+
+async def list_channel_contacts(
+    session: AsyncSession,
+    user_email: str | None = None,
+) -> list[ChannelContact]:
+    """List channel contacts."""
+    stmt = select(ChannelContact).order_by(ChannelContact.created_at.desc())
+    if user_email:
+        stmt = stmt.where(ChannelContact.user_email == user_email)
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
