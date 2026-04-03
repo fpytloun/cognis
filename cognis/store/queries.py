@@ -59,8 +59,8 @@ async def create_user(
 
 
 async def count_users(session: AsyncSession) -> int:
-    """Count total users."""
-    result = await session.execute(select(User))
+    """Count total users (excluding system users)."""
+    result = await session.execute(select(User).where(User.role != "system"))
     return len(result.scalars().all())
 
 

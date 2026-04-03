@@ -12,7 +12,7 @@ from typing import Any, Final, cast
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
-from sqlalchemy import inspect, text
+from sqlalchemy import inspect, select, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from cognis.config import CognisConfig
@@ -271,6 +271,60 @@ def _ensure_user_management_columns(sync_conn: object) -> None:
         execute(text("ALTER TABLE users ADD COLUMN disabled_by VARCHAR"))
 
 
+_SYSTEM_USER_EMAIL = "system@cognis.local"
+
+
+async def _ensure_system_user(session: AsyncSession) -> None:
+    """Create the system user if it doesn't exist (for FK integrity)."""
+    from cognis.store.models import User
+
+    existing = await session.execute(select(User).where(User.email == _SYSTEM_USER_EMAIL))
+    if existing.scalar_one_or_none() is not None:
+        return
+    session.add(
+        User(
+            email=_SYSTEM_USER_EMAIL,
+            name="System",
+            role="system",
+        )
+    )
+    await session.flush()
+
+
+async def seed_system_agents(session: AsyncSession) -> None:
+    """Upsert system agent rows into the DB for FK integrity.
+
+    System agents are defined as Python constants in AgentRegistry.
+    The DB rows exist solely so that FK constraints (e.g. conversations.agent_id)
+    work when a workflow step uses a system agent. The AgentRegistry still
+    treats Python constants as authoritative.
+    """
+    from cognis.core.agent_registry import SYSTEM_AGENTS
+    from cognis.store.models import Agent
+
+    await _ensure_system_user(session)
+
+    for agent_def in SYSTEM_AGENTS.values():
+        existing = await session.execute(select(Agent).where(Agent.agent_id == agent_def.agent_id))
+        if existing.scalar_one_or_none() is not None:
+            continue
+        session.add(
+            Agent(
+                agent_id=agent_def.agent_id,
+                owner_email=_SYSTEM_USER_EMAIL,
+                name=agent_def.name,
+                description=agent_def.description,
+                system_prompt=agent_def.system_prompt,
+                tools=agent_def.tools if isinstance(agent_def.tools, dict) else None,
+                agent_type=agent_def.agent_type,
+                is_system=True,
+                hidden=agent_def.hidden,
+                status="active",
+            )
+        )
+    await session.flush()
+
+
 async def seed_default_settings(session: AsyncSession) -> None:
     """Seed application settings into the settings table."""
     for key, (category, value) in DEFAULT_SETTINGS.items():
@@ -315,6 +369,7 @@ async def bootstrap_runtime(
 
     async with session_factory() as session:
         await seed_default_settings(session)
+        await seed_system_agents(session)
         config = await maybe_seed_initial_admin(session, config, password_hasher)
         await session.commit()
 
