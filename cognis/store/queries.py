@@ -80,8 +80,13 @@ async def list_users(
     include_disabled: bool = False,
     limit: int = 100,
 ) -> list[User]:
-    """List all users, optionally including disabled ones."""
-    query = select(User).order_by(User.created_at.desc(), User.email.asc()).limit(limit)
+    """List all users, optionally including disabled ones. Excludes system users."""
+    query = (
+        select(User)
+        .where(User.role != "system")
+        .order_by(User.created_at.desc(), User.email.asc())
+        .limit(limit)
+    )
     if not include_disabled:
         query = query.where(User.is_active.is_(True))
     result = await session.execute(query)

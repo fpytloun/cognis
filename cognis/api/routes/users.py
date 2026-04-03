@@ -20,6 +20,7 @@ from cognis.store.queries import (
 router = APIRouter(prefix="/api/v1/admin", tags=["admin"])
 
 VALID_ROLES = {"admin", "user", "viewer", "service"}
+_SYSTEM_ROLE = "system"
 
 
 def _user_response(user: object) -> UserResponse:
@@ -81,7 +82,7 @@ async def admin_get_user(request: Request, email: str) -> UserResponse:
     require_admin(request)
     async with request.app.state.session_factory() as session:
         user = await get_user(session, email)
-    if user is None:
+    if user is None or user.role == _SYSTEM_ROLE:
         raise api_exception(404, "not_found", f"User {email} not found")
     return _user_response(user)
 
@@ -108,6 +109,8 @@ async def admin_update_user(
         user = await update_user(session, email, name=payload.name, role=payload.role)
         if user is None:
             raise api_exception(404, "not_found", f"User {email} not found")
+        if user.role == _SYSTEM_ROLE:
+            raise api_exception(403, "forbidden", "Cannot modify system user")
         await session.commit()
         await session.refresh(user)
     return _user_response(user)
@@ -121,7 +124,7 @@ async def admin_disable_user(request: Request, email: str) -> UserResponse:
 
     async with request.app.state.session_factory() as session:
         target = await get_user(session, email)
-        if target is None:
+        if target is None or target.role == _SYSTEM_ROLE:
             raise api_exception(404, "not_found", f"User {email} not found")
         if not target.is_active:
             raise api_exception(400, "validation_error", "User is already disabled")
@@ -141,7 +144,7 @@ async def admin_enable_user(request: Request, email: str) -> UserResponse:
     require_admin(request)
     async with request.app.state.session_factory() as session:
         target = await get_user(session, email)
-        if target is None:
+        if target is None or target.role == _SYSTEM_ROLE:
             raise api_exception(404, "not_found", f"User {email} not found")
         if target.is_active:
             raise api_exception(400, "validation_error", "User is already active")
@@ -165,7 +168,7 @@ async def admin_delete_user(request: Request, email: str, confirm: bool = False)
 
     async with request.app.state.session_factory() as session:
         target = await get_user(session, email)
-        if target is None:
+        if target is None or target.role == _SYSTEM_ROLE:
             raise api_exception(404, "not_found", f"User {email} not found")
         # Guard: cannot delete the last admin
         if target.role == "admin":
