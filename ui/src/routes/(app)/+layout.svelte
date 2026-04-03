@@ -11,6 +11,7 @@
     ListTodo,
     Menu,
     MessageSquareText,
+    Radio,
     RefreshCw,
     ServerCrash,
     Settings,
@@ -41,6 +42,7 @@
     { href: '/tasks', label: 'Tasks', icon: ListTodo },
     { href: '/workflows', label: 'Workflows', icon: Workflow },
     { href: '/tools', label: 'Tools', icon: Wrench },
+    { href: '/channels', label: 'Channels', icon: Radio },
     { href: '/settings', label: 'Settings', icon: Settings }
   ];
 

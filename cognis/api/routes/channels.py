@@ -12,7 +12,7 @@ from typing import Any
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse
 
-from cognis.api.common import error_response
+from cognis.api.common import error_response, require_current_user
 from cognis.channels.registry import get_channel_meta, list_channel_types
 from cognis.logging import get_logger
 
@@ -51,7 +51,7 @@ async def get_type(request: Request, channel_type: str) -> Any:
 async def list_accounts(request: Request) -> list[dict[str, Any]]:
     """List all configured channel accounts."""
     session_factory = request.app.state.session_factory
-    user_email = request.state.user_email
+    user_email = require_current_user(request).email
 
     from cognis.store.queries import list_channel_accounts
 
@@ -98,7 +98,7 @@ async def create_account(request: Request) -> Any:
     """Create a new channel account."""
     body = await request.json()
     session_factory = request.app.state.session_factory
-    user_email = request.state.user_email
+    user_email = require_current_user(request).email
 
     channel_type = body.get("channel_type")
     if not channel_type:
@@ -365,7 +365,9 @@ async def list_pairing_requests(request: Request) -> list[dict[str, Any]]:
     if pairing_service is None:
         return []
 
-    rows = await pairing_service.list_pending_requests(owner_email=request.state.user_email)
+    rows = await pairing_service.list_pending_requests(
+        owner_email=require_current_user(request).email
+    )
     return [row.model_dump(mode="json") for row in rows]
 
 
@@ -382,7 +384,9 @@ async def redeem_pairing_code(request: Request) -> Any:
         return error_response(400, "validation_error", "code is required")
 
     try:
-        row = await pairing_service.redeem_code(owner_email=request.state.user_email, code=code)
+        row = await pairing_service.redeem_code(
+            owner_email=require_current_user(request).email, code=code
+        )
     except ValueError as exc:
         return error_response(400, "validation_error", str(exc))
     return row.model_dump(mode="json")
@@ -396,7 +400,7 @@ async def reject_pairing_request(request: Request, request_id: str) -> Any:
         return error_response(503, "unavailable", "Pairing service not initialized")
 
     rejected = await pairing_service.reject_request(
-        owner_email=request.state.user_email,
+        owner_email=require_current_user(request).email,
         request_id=request_id,
     )
     if not rejected:
@@ -413,7 +417,7 @@ async def reject_pairing_request(request: Request, request_id: str) -> Any:
 async def list_contacts(request: Request) -> list[dict[str, Any]]:
     """List channel contact mappings."""
     session_factory = request.app.state.session_factory
-    user_email = request.state.user_email
+    user_email = require_current_user(request).email
 
     from cognis.store.queries import list_channel_contacts
 
@@ -439,7 +443,7 @@ async def create_contact(request: Request) -> Any:
     """Create a channel contact mapping."""
     body = await request.json()
     session_factory = request.app.state.session_factory
-    user_email = request.state.user_email
+    user_email = require_current_user(request).email
 
     channel_type = body.get("channel_type")
     sender_id = body.get("sender_id")

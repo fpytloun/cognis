@@ -47,6 +47,12 @@ def _generate_code() -> str:
     return "".join(secrets.choice(_CODE_ALPHABET) for _ in range(_CODE_LENGTH))
 
 
+def _ensure_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
 class PairingService:
     """Creates, redeems, and rejects external channel pairing requests."""
 
@@ -149,15 +155,16 @@ class PairingService:
             )
             if request is None:
                 raise ValueError("Pairing code not found")
+            expires_at = _ensure_utc(request.expires_at)
+            if request.status == "expired" or expires_at <= datetime.now(UTC):
+                request.status = "expired"
+                await session.commit()
+                raise ValueError("Pairing code has expired")
             request = (
                 await increment_pairing_request_attempts(session, request.request_id) or request
             )
             if request.status != "pending":
                 raise ValueError("Pairing code is no longer active")
-            if request.expires_at <= datetime.now(UTC):
-                request.status = "expired"
-                await session.commit()
-                raise ValueError("Pairing code has expired")
             if request.attempts >= _MAX_REDEEM_ATTEMPTS:
                 request.status = "rejected"
                 await session.commit()
@@ -192,7 +199,7 @@ class PairingService:
                 code=_format_code(request.code),
                 status="completed",
                 attempts=request.attempts,
-                expires_at=request.expires_at,
+                expires_at=expires_at,
                 created_at=request.created_at,
                 completed_at=request.completed_at or datetime.now(UTC),
             )

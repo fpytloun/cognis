@@ -770,6 +770,12 @@ export interface WebSocketWorkflowCancelledEvent {
   reason?: string;
 }
 
+export interface WebSocketTaskPausedEvent {
+  type: 'task_paused';
+  conversation_id?: string;
+  task_id: string;
+}
+
 export interface WebSocketQueuedEvent {
   type: 'queued';
   conversation_id?: string;
@@ -902,6 +908,7 @@ export type CognisWebSocketEvent =
   | WebSocketWorkflowCompletedEvent
   | WebSocketWorkflowFailedEvent
   | WebSocketWorkflowCancelledEvent
+  | WebSocketTaskPausedEvent
   | WebSocketSystemMessageEvent
   | WebSocketEscalationEvent
   | WebSocketEscalationResolvedEvent

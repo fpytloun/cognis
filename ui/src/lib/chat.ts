@@ -253,7 +253,7 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
       const itemId = `delegation:${childSessionId}`;
       const existingIdx = items.findIndex((i) => i.id === itemId && i.kind === 'delegation');
       const dataStatus = String(event.data?.status ?? 'started');
-      const statusMap: Record<string, string> = {
+      const statusMap: Record<string, DelegationTimelineItem['status']> = {
         started: 'started',
         completed: 'completed',
         failed: 'failed',
@@ -344,7 +344,7 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
         const taskId = String(event.data.task_id ?? event.seq);
         const itemId = `delegation:${taskId}`;
         const existingIdx = items.findIndex((i) => i.id === itemId && i.kind === 'delegation');
-        const statusMap: Record<string, string> = {
+        const statusMap: Record<string, DelegationTimelineItem['status']> = {
           task_result: 'completed',
           task_failed: 'failed',
           task_cancelled: 'cancelled'
