@@ -329,6 +329,7 @@ async def model_routing_get(request: Request) -> ModelRoutingResponse:
         classifier=items.get("classifier"),
         compaction=items.get("compaction"),
         simple_inline=items.get("simple_inline"),
+        image_generation=items.get("image_generation"),
         items=items,
     )
 
@@ -344,6 +345,7 @@ async def model_routing_put(
         "classifier": payload.classifier,
         "compaction": payload.compaction,
         "simple_inline": payload.simple_inline,
+        "image_generation": payload.image_generation,
         **payload.items,
     }
     async with request.app.state.session_factory() as session:

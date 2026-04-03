@@ -73,6 +73,7 @@ class ModelRoutingPolicy(BaseModel):
     classifier: str | None = None
     compaction: str | None = None
     simple_inline: str | None = None
+    image_generation: str | None = None
 
 
 class ProviderHealth(BaseModel):

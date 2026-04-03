@@ -586,6 +586,7 @@ export interface ModelRouting {
   classifier: string | null;
   compaction: string | null;
   simple_inline: string | null;
+  image_generation: string | null;
   items: Record<string, string>;
 }
 

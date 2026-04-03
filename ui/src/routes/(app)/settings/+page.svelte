@@ -100,6 +100,7 @@
     classifier: '',
     compaction: '',
     simple_inline: '',
+    image_generation: '',
     extraJson: '{}'
   };
 
@@ -188,7 +189,7 @@
 
   function routingWarnings(): string[] {
     const knownModels = new Set(modelOptions().map((item) => item.value));
-    return [routingForm.default, routingForm.classifier, routingForm.compaction, routingForm.simple_inline]
+    return [routingForm.default, routingForm.classifier, routingForm.compaction, routingForm.simple_inline, routingForm.image_generation]
       .filter(Boolean)
       .filter((model) => !knownModels.has(model))
       .map((model) => `Model '${model}' is not present in configured providers.`);
@@ -348,6 +349,7 @@
       classifier: modelRouting.classifier ?? '',
       compaction: modelRouting.compaction ?? '',
       simple_inline: modelRouting.simple_inline ?? '',
+      image_generation: modelRouting.image_generation ?? '',
       extraJson: JSON.stringify(modelRouting.items, null, 2)
     };
 
@@ -495,6 +497,7 @@
         classifier: routingForm.classifier || null,
         compaction: routingForm.compaction || null,
         simple_inline: routingForm.simple_inline || null,
+        image_generation: routingForm.image_generation || null,
         items: JSON.parse(routingForm.extraJson || '{}')
       });
       notice = 'Model routing updated.';
@@ -1169,6 +1172,16 @@
               {/each}
             </select>
             <span class="block text-xs text-slate-400">Short inline responses / fast model.</span>
+          </label>
+          <label class="space-y-2 text-sm font-medium text-slate-200">
+            <span>image_generation</span>
+            <select bind:value={routingForm.image_generation} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+              <option value="">Not configured</option>
+              {#each modelOptions() as option}
+                <option value={option.value}>{option.label}</option>
+              {/each}
+            </select>
+            <span class="block text-xs text-slate-400">Image generation (avatars, tools). e.g. gpt-image-1, dall-e-3.</span>
           </label>
         </div>
 
