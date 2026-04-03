@@ -131,6 +131,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_task_expected_output_column)
         await conn.run_sync(_ensure_step_run_conversation_id_column)
         await conn.run_sync(_ensure_agent_type_columns)
+        await conn.run_sync(_ensure_user_management_columns)
 
 
 def _ensure_session_lifecycle_columns(sync_conn: object) -> None:
@@ -248,6 +249,26 @@ def _ensure_agent_type_columns(sync_conn: object) -> None:
         execute(text("ALTER TABLE agents ADD COLUMN is_system BOOLEAN NOT NULL DEFAULT 0"))
     if "hidden" not in agent_columns:
         execute(text("ALTER TABLE agents ADD COLUMN hidden BOOLEAN NOT NULL DEFAULT 0"))
+
+
+def _ensure_user_management_columns(sync_conn: object) -> None:
+    inspector = cast(Any, inspect(sync_conn))
+    try:
+        user_columns = {column["name"] for column in inspector.get_columns("users")}
+    except Exception:
+        return  # table doesn't exist yet (create_all will handle it)
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+
+    if "is_active" not in user_columns:
+        execute(text("ALTER TABLE users ADD COLUMN is_active BOOLEAN NOT NULL DEFAULT 1"))
+    if "updated_at" not in user_columns:
+        execute(text("ALTER TABLE users ADD COLUMN updated_at TIMESTAMP WITH TIME ZONE"))
+    if "last_login_at" not in user_columns:
+        execute(text("ALTER TABLE users ADD COLUMN last_login_at TIMESTAMP WITH TIME ZONE"))
+    if "disabled_at" not in user_columns:
+        execute(text("ALTER TABLE users ADD COLUMN disabled_at TIMESTAMP WITH TIME ZONE"))
+    if "disabled_by" not in user_columns:
+        execute(text("ALTER TABLE users ADD COLUMN disabled_by VARCHAR"))
 
 
 async def seed_default_settings(session: AsyncSession) -> None:
