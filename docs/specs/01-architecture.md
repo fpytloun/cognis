@@ -74,6 +74,14 @@ Entry point for all client communication:
 All clients — web UI, Slack bot, Discord bot, API consumers — use the same
 gateway.
 
+### Channel Adapters
+
+External messaging platforms integrate through the channel adapter subsystem.
+Each configured channel account owns one adapter instance and routes inbound
+messages through `TurnScheduler.submit_turn()`. Channel accounts should default
+to the `pairing` policy so an unknown remote sender must first redeem a
+short-lived verification code in the Cognis UI before a turn is submitted.
+
 ### Agent Loop Engine
 
 Runs agent conversation loops. Can run N loops concurrently (main chat +

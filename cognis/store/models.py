@@ -505,8 +505,8 @@ class ChannelAccountRow(Base):
     )
     # Access control
     allowed_senders: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
-    dm_policy: Mapped[str] = mapped_column(String, nullable=False, default="open")
-    group_policy: Mapped[str] = mapped_column(String, nullable=False, default="mention")
+    dm_policy: Mapped[str] = mapped_column(String, nullable=False, default="pairing")
+    group_policy: Mapped[str] = mapped_column(String, nullable=False, default="pairing")
     webhook_secret: Mapped[str | None] = mapped_column(String, nullable=True)
     # Timestamps
     created_at: Mapped[datetime] = mapped_column(
@@ -549,4 +549,35 @@ class ChannelContact(Base):
     __table_args__ = (
         UniqueConstraint("channel_type", "sender_id", name="uq_channel_contact"),
         Index("ix_channel_contacts_lookup", "channel_type", "sender_id"),
+    )
+
+
+class ChannelPairingRequest(Base):
+    """Short-lived pairing challenges for external channel senders."""
+
+    __tablename__ = "channel_pairing_requests"
+
+    request_id: Mapped[str] = mapped_column(String, primary_key=True)
+    owner_email: Mapped[str] = mapped_column(String, ForeignKey("users.email"), nullable=False)
+    account_id: Mapped[str] = mapped_column(
+        String, ForeignKey("channel_accounts.account_id", ondelete="CASCADE"), nullable=False
+    )
+    channel_type: Mapped[str] = mapped_column(String, nullable=False)
+    sender_id: Mapped[str] = mapped_column(String, nullable=False)
+    sender_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    chat_id: Mapped[str] = mapped_column(String, nullable=False)
+    chat_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    code: Mapped[str] = mapped_column(String, nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False, default="pending")
+    attempts: Mapped[int] = mapped_column(nullable=False, default=0)
+    expires_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("code", name="uq_channel_pairing_code"),
+        Index("ix_channel_pairing_owner_status", "owner_email", "status"),
+        Index("ix_channel_pairing_sender_status", "channel_type", "sender_id", "status"),
     )

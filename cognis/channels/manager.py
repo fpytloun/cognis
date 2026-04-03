@@ -380,7 +380,7 @@ def _row_to_config(row: Any) -> ChannelAccountConfig:
         default_conversation_id=row.default_conversation_id,
         allow_new_conversations=row.allow_new_conversations,
         allowed_senders=row.allowed_senders or [],
-        dm_policy=row.dm_policy or "open",
-        group_policy=row.group_policy or "mention",
+        dm_policy=row.dm_policy or "pairing",
+        group_policy=row.group_policy or "pairing",
         webhook_secret=row.webhook_secret,
     )

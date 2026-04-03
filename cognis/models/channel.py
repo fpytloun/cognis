@@ -62,6 +62,15 @@ class ChannelStatus(StrEnum):
     STOPPED = "stopped"
 
 
+class PairingRequestStatus(StrEnum):
+    """Lifecycle states for channel pairing requests."""
+
+    PENDING = "pending"
+    COMPLETED = "completed"
+    EXPIRED = "expired"
+    REJECTED = "rejected"
+
+
 # ---------------------------------------------------------------------------
 # Channel account config (DB-stored)
 # ---------------------------------------------------------------------------
@@ -96,8 +105,8 @@ class ChannelAccountConfig(BaseModel):
 
     # Access control
     allowed_senders: list[str] = Field(default_factory=list)
-    dm_policy: str = "open"  # "open", "allowlist", "disabled"
-    group_policy: str = "mention"  # "open", "mention", "disabled"
+    dm_policy: str = "pairing"  # "open", "pairing", "allowlist", "disabled"
+    group_policy: str = "pairing"  # "open", "pairing", "mention", "allowlist", "disabled"
 
     # Webhook (for platforms that push)
     webhook_secret: str | None = None
@@ -184,6 +193,25 @@ class OutboundMessage(BaseModel):
     thread_id: str | None = None
     media: list[MediaAttachment] = Field(default_factory=list)
     platform_data: dict[str, Any] = Field(default_factory=dict)
+
+
+class PairingRequest(BaseModel):
+    """A pending or completed external-channel pairing challenge."""
+
+    request_id: str
+    owner_email: str
+    account_id: str
+    channel_type: str
+    sender_id: str
+    sender_name: str | None = None
+    chat_id: str
+    chat_name: str | None = None
+    code: str
+    status: PairingRequestStatus
+    attempts: int = 0
+    expires_at: datetime
+    created_at: datetime
+    completed_at: datetime | None = None
 
 
 # ---------------------------------------------------------------------------

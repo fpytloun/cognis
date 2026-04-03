@@ -75,9 +75,11 @@ cognis/
 │   │   │   ├── protocol.py        # GuardrailsProvider Protocol
 │   │   │   └── intaris.py         # Intaris HTTP client (JWT auth)
 │   │   ├── executor/
-│   │   │   ├── protocol.py        # ExecutorProvider Protocol
-│   │   │   ├── in_process.py      # MVP: same-process executor
-│   │   │   ├── subprocess.py      # Local subprocess executor
+│   │   │   ├── protocol.py        # ExecutorProvider Protocol + re-exports
+│   │   │   ├── in_process.py      # In-process executor (same process)
+│   │   │   ├── websocket.py       # WebSocket remote executor connection + provider
+│   │   │   ├── subprocess.py      # Local subprocess executor (spawns process)
+│   │   │   ├── composite.py       # Composite provider (routes by executor_type)
 │   │   │   ├── docker.py          # Phase 2
 │   │   │   └── kubernetes.py      # Phase 2
 │   │   ├── secrets/
@@ -85,7 +87,8 @@ cognis/
 │   │   │   └── encrypted_db.py    # AES-256-GCM encrypted secrets
 │   │   ├── llm/
 │   │   │   ├── protocol.py        # LLMProvider Protocol
-│   │   │   └── litellm.py         # LiteLLM wrapper (loads config from DB)
+│   │   │   ├── litellm.py         # LiteLLM wrapper (loads config from DB)
+│   │   │   └── inference_router.py # Routes LLM inference to executor-side endpoints
 │   │   └── auth/
 │   │       ├── protocol.py
 │   │       └── jwt.py             # ES256 JWT (auto-generated keys)
@@ -118,9 +121,16 @@ cognis/
 │   │       ├── env.py
 │   │       └── versions/
 │   │
+│   ├── executor/                    # Standalone executor runner (remote process)
+│   │   ├── __init__.py
+│   │   ├── __main__.py            # Entry point (python -m cognis.executor)
+│   │   ├── runner.py              # ExecutorRunner (WS client, tool dispatch, heartbeat)
+│   │   └── inference.py           # InferenceHandler (local LLM proxy)
+│   │
 │   └── cli/                        # Typer CLI commands
 │       ├── __init__.py
 │       ├── admin.py               # create-user, reset-password, api-key (direct DB)
+│       ├── executor.py            # executor run (standalone executor process)
 │       └── serve.py               # Server start
 │
 ├── ui/                             # SvelteKit frontend (separate app)
@@ -135,8 +145,8 @@ cognis/
 
 | Layer | Directory | Responsibility |
 |---|---|---|
-| **CLI** | `cli/` | Typer commands: `serve`, `admin create-user`, `admin reset-password`, `admin api-key`, `config init`, `status` |
-| **API Gateway** | `api/` | FastAPI routes, WebSocket transport layer (thin adapter), auth middleware, request/response models |
+| **CLI** | `cli/` | Typer commands: `serve`, `admin create-user`, `admin reset-password`, `admin api-key`, `config init`, `status`, `executor run` |
+| **API Gateway** | `api/` | FastAPI routes, WebSocket transport layer (thin adapter), executor WebSocket endpoint, auth middleware, request/response models |
 | **Turn Scheduler** | `core/turn_scheduler.py` | Transport-agnostic turn orchestration: submission, serialization, decision dispatch, follow-up turns, cancellation, error classification |
 | **Command Dispatcher** | `core/commands.py` | Transport-agnostic slash command handling: /compact, /new, /model, /thinking, /context, /info, /lsp, /help, /approve, /deny |
 | **Orchestration Core** | `core/` | Agent loop, Decision Engine, Session Manager, context assembly, compaction, tool routing, event bus |
@@ -387,6 +397,9 @@ uv run alembic -c cognis/store/migrations/alembic.ini downgrade -1
 | `model_routing` | `task_type` | Model routing policy |
 | `secrets` | `secret_id` | Encrypted secrets (AES-256-GCM) |
 | `notifications` | `notification_id` | Persistent notifications (escalations, gates, step questions) |
+| `channel_accounts` | `account_id` | Configured external messaging connections |
+| `channel_contacts` | `contact_id` | Verified external sender to Cognis user mappings |
+| `channel_pairing_requests` | `request_id` | Short-lived remote verification challenges |
 | `audit_log` | `log_id` | System-level audit events (NOT session content) |
 
 ### Session cache

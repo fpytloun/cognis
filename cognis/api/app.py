@@ -356,6 +356,7 @@ def create_app() -> FastAPI:
         from cognis.channels.delivery import ChannelDeliveryService
         from cognis.channels.inbound import InboundPipeline
         from cognis.channels.manager import ChannelManager
+        from cognis.channels.pairing import PairingService
 
         # Use a lazy ref to avoid circular dependency
         _channel_manager_holder: list[ChannelManager | None] = [None]
@@ -363,10 +364,16 @@ def create_app() -> FastAPI:
         def _get_channel_manager() -> ChannelManager | None:
             return _channel_manager_holder[0]
 
+        pairing_service = PairingService(
+            session_factory=session_factory,
+            channel_manager_ref=_get_channel_manager,
+        )
+
         inbound_pipeline = InboundPipeline(
             session_factory=session_factory,
             turn_scheduler=turn_scheduler,
             session_manager=session_manager,
+            pairing_service=pairing_service,
             channel_manager_ref=_get_channel_manager,
         )
         channel_manager = ChannelManager(
@@ -384,6 +391,7 @@ def create_app() -> FastAPI:
 
         app.state.channel_manager = channel_manager
         app.state.channel_delivery = channel_delivery
+        app.state.pairing_service = pairing_service
 
         # Start channel adapters (non-blocking — failures are logged)
         try:
@@ -469,6 +477,14 @@ def create_app() -> FastAPI:
     @app.websocket("/api/ws")
     async def websocket_endpoint(websocket: WebSocket) -> None:
         await handle_websocket(websocket)
+
+    @app.websocket("/api/executor/ws")
+    async def executor_websocket_endpoint(websocket: WebSocket) -> None:
+        from cognis.api.executor_ws import handle_executor_websocket
+
+        ws_provider = app.state.providers.executor.websocket
+        auth_provider = app.state.providers.auth
+        await handle_executor_websocket(websocket, ws_provider, auth_provider)
 
     # NOTE: SPA serving moved to SPAMiddleware (added above) which runs
     # before the FastAPI router, avoiding the 404 exception handler

@@ -128,6 +128,31 @@ GET /api/v1/conversations/conv_abc/messages?limit=50&after_seq=100
 
 The controller reads from Intaris event store and formats for the client.
 
+### Channels
+
+```
+GET    /api/v1/channels/types                              → Supported channel metadata
+GET    /api/v1/channels/accounts                           → List configured channel accounts
+POST   /api/v1/channels/accounts                           → Create channel account (defaults to pairing)
+GET    /api/v1/channels/accounts/:id                       → Get channel account
+PATCH  /api/v1/channels/accounts/:id                       → Update channel account
+DELETE /api/v1/channels/accounts/:id                       → Delete channel account
+POST   /api/v1/channels/accounts/:id/start                 → Start adapter
+POST   /api/v1/channels/accounts/:id/stop                  → Stop adapter
+GET    /api/v1/channels/accounts/:id/status                → Runtime adapter status
+POST   /api/v1/channels/webhook/:channel_type/:account_id  → Inbound webhook (platform-authenticated)
+GET    /api/v1/channels/webhook/:channel_type/:account_id  → Webhook verification challenge
+GET    /api/v1/channels/contacts                           → Verified external sender mappings
+POST   /api/v1/channels/contacts                           → Manually create verified sender mapping
+GET    /api/v1/channels/pairing-requests                   → List pending pairing requests
+POST   /api/v1/channels/pair                               → Redeem a sender-initiated pairing code
+POST   /api/v1/channels/pairing-requests/:id/reject        → Reject a pending pairing request
+```
+
+Channel accounts should default to `pairing` so unknown remote senders cannot
+talk to an agent until the authenticated Cognis user redeems their short-lived
+pairing code in the web UI.
+
 #### Send Message (REST chat)
 ```http
 POST /api/v1/conversations/conv_abc/messages

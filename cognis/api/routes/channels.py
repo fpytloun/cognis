@@ -133,8 +133,8 @@ async def create_account(request: Request) -> Any:
             default_conversation_id=body.get("default_conversation_id"),
             allow_new_conversations=body.get("allow_new_conversations", True),
             allowed_senders=body.get("allowed_senders", []),
-            dm_policy=body.get("dm_policy", "open"),
-            group_policy=body.get("group_policy", "mention"),
+            dm_policy=body.get("dm_policy", "pairing"),
+            group_policy=body.get("group_policy", "pairing"),
             webhook_secret=webhook_secret,
         )
         await session.commit()
@@ -354,6 +354,57 @@ async def handle_webhook_verification(
 
 
 # ---------------------------------------------------------------------------
+# Channel pairing
+# ---------------------------------------------------------------------------
+
+
+@router.get("/pairing-requests")
+async def list_pairing_requests(request: Request) -> list[dict[str, Any]]:
+    """List pending pairing requests for the authenticated user."""
+    pairing_service = getattr(request.app.state, "pairing_service", None)
+    if pairing_service is None:
+        return []
+
+    rows = await pairing_service.list_pending_requests(owner_email=request.state.user_email)
+    return [row.model_dump(mode="json") for row in rows]
+
+
+@router.post("/pair", response_model=None)
+async def redeem_pairing_code(request: Request) -> Any:
+    """Redeem a sender-initiated pairing code from the web UI."""
+    pairing_service = getattr(request.app.state, "pairing_service", None)
+    if pairing_service is None:
+        return error_response(503, "unavailable", "Pairing service not initialized")
+
+    body = await request.json()
+    code = body.get("code", "")
+    if not isinstance(code, str) or not code.strip():
+        return error_response(400, "validation_error", "code is required")
+
+    try:
+        row = await pairing_service.redeem_code(owner_email=request.state.user_email, code=code)
+    except ValueError as exc:
+        return error_response(400, "validation_error", str(exc))
+    return row.model_dump(mode="json")
+
+
+@router.post("/pairing-requests/{request_id}/reject", response_model=None)
+async def reject_pairing_request(request: Request, request_id: str) -> Any:
+    """Reject a pending pairing request."""
+    pairing_service = getattr(request.app.state, "pairing_service", None)
+    if pairing_service is None:
+        return error_response(503, "unavailable", "Pairing service not initialized")
+
+    rejected = await pairing_service.reject_request(
+        owner_email=request.state.user_email,
+        request_id=request_id,
+    )
+    if not rejected:
+        return error_response(404, "not_found", "Pairing request not found")
+    return {"rejected": True}
+
+
+# ---------------------------------------------------------------------------
 # Channel contacts
 # ---------------------------------------------------------------------------
 
@@ -404,7 +455,7 @@ async def create_contact(request: Request) -> Any:
             sender_id=sender_id,
             user_email=body.get("user_email", user_email),
             display_name=body.get("display_name"),
-            verified=body.get("verified", False),
+            verified=body.get("verified", True),
         )
         await session.commit()
 

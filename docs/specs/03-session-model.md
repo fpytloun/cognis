@@ -76,6 +76,12 @@ Examples:
 This lets Cognis route outbound messages and task results back to the
 correct channel/thread through the appropriate connector.
 
+For external transports, `context.platform_data` also stores routing metadata
+such as `channel_type`, `account_id`, and `chat_id`. When a channel account
+uses the default `pairing` policy, the remote sender must first be linked to a
+verified `channel_contact` via a short-lived pairing code redeemed in the web
+UI. Unpaired senders do not create turns or reach the agent loop.
+
 ### Multi-Context Agent Presence
 
 An agent participates in multiple conversations simultaneously:

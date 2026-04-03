@@ -15,7 +15,6 @@ from __future__ import annotations
 import contextlib
 from typing import Any
 
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from cognis.channels.protocol import CHANNEL_OUTBOUND_TOTAL, BaseChannelAdapter
@@ -43,11 +42,13 @@ class InboundPipeline:
         session_factory: async_sessionmaker[Any],
         turn_scheduler: Any,  # TurnScheduler (avoid circular import)
         session_manager: Any,  # SessionManager
+        pairing_service: Any,
         channel_manager_ref: Any,  # Callable[[], ChannelManager] — lazy ref
     ) -> None:
         self._session_factory = session_factory
         self._turn_scheduler = turn_scheduler
         self._session_manager = session_manager
+        self._pairing_service = pairing_service
         self._channel_manager_ref = channel_manager_ref
 
     async def process(
@@ -71,11 +72,11 @@ class InboundPipeline:
             )
             return
 
-        # 2. Identity mapping (external sender → Cognis user)
+        # 2. Identity mapping / pairing (external sender → Cognis user)
         user_email = await self._resolve_user(message, config)
         if user_email is None:
             logger.info(
-                "channel inbound: no user mapping",
+                "channel inbound: awaiting verified sender mapping",
                 extra={
                     "extra_data": {
                         "channel_type": message.channel_type,
@@ -149,7 +150,7 @@ class InboundPipeline:
                 return False
             if config.dm_policy == "allowlist":
                 return message.sender_id in config.allowed_senders
-            # "open" — allow all
+            # "open" and "pairing" — allow pipeline to continue
             return True
 
         if message.chat_type == "group":
@@ -159,7 +160,7 @@ class InboundPipeline:
                 return message.was_mentioned
             if config.group_policy == "allowlist":
                 return message.sender_id in config.allowed_senders
-            # "open" — allow all
+            # "open" and "pairing" — allow pipeline to continue
             return True
 
         return True
@@ -175,27 +176,27 @@ class InboundPipeline:
     ) -> str | None:
         """Map an external sender to a Cognis user email.
 
-        Resolution order:
-        1. Check channel_contacts table for explicit mapping
-        2. Fall back to channel account owner (single-user MVP)
+        Resolution depends on channel policy:
+        - ``pairing``: require a verified channel contact or issue a challenge
+        - ``open`` / ``mention``: use a verified contact if present, otherwise
+          fall back to the account owner
+        - ``allowlist``: sender must already pass access control; use verified
+          contact if present, otherwise fall back to account owner
         """
-        from cognis.store.models import ChannelContact
+        from cognis.store.queries import get_channel_contact
+
+        policy = config.dm_policy if message.chat_type == "direct" else config.group_policy
 
         async with self._session_factory() as session:
-            # Check for explicit contact mapping
-            stmt = select(ChannelContact).where(
-                ChannelContact.channel_type == message.channel_type,
-                ChannelContact.sender_id == message.sender_id,
-            )
-            result = await session.execute(stmt)
-            contact = result.scalar_one_or_none()
-
-            if contact is not None:
+            contact = await get_channel_contact(session, message.channel_type, message.sender_id)
+            if contact is not None and contact.verified:
                 return contact.user_email
 
-        # Fall back to account owner (single-user MVP)
-        # This means all messages on this channel account are attributed
-        # to the account owner.
+        if policy == "pairing":
+            return await self._pairing_service.ensure_verified_sender(
+                message=message, config=config
+            )
+
         return config.user_email
 
     # ------------------------------------------------------------------

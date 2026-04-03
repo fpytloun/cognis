@@ -16,6 +16,7 @@ from cognis.store.models import (
     ApiKey,
     ChannelAccountRow,
     ChannelContact,
+    ChannelPairingRequest,
     Conversation,
     ExecutorRow,
     LLMProvider,
@@ -1912,8 +1913,8 @@ async def create_channel_account(
     default_conversation_id: str | None = None,
     allow_new_conversations: bool = True,
     allowed_senders: list[str] | None = None,
-    dm_policy: str = "open",
-    group_policy: str = "mention",
+    dm_policy: str = "pairing",
+    group_policy: str = "pairing",
     webhook_secret: str | None = None,
 ) -> ChannelAccountRow:
     """Create a new channel account."""
@@ -2038,3 +2039,186 @@ async def list_channel_contacts(
         stmt = stmt.where(ChannelContact.user_email == user_email)
     result = await session.execute(stmt)
     return list(result.scalars().all())
+
+
+# --- Channel Pairing Requests ---
+
+
+async def get_pending_pairing_request_for_sender(
+    session: AsyncSession,
+    *,
+    account_id: str,
+    channel_type: str,
+    sender_id: str,
+    now: datetime | None = None,
+) -> ChannelPairingRequest | None:
+    """Return the active pending pairing request for a sender, if any."""
+    current_time = now or _utcnow()
+    result = await session.execute(
+        select(ChannelPairingRequest)
+        .where(
+            ChannelPairingRequest.account_id == account_id,
+            ChannelPairingRequest.channel_type == channel_type,
+            ChannelPairingRequest.sender_id == sender_id,
+            ChannelPairingRequest.status == "pending",
+            ChannelPairingRequest.expires_at > current_time,
+        )
+        .order_by(ChannelPairingRequest.created_at.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def count_recent_pairing_requests(
+    session: AsyncSession,
+    *,
+    account_id: str,
+    channel_type: str,
+    sender_id: str,
+    since: datetime,
+) -> int:
+    """Count recent pairing requests for rate limiting."""
+    result = await session.execute(
+        select(sa.func.count(ChannelPairingRequest.request_id)).where(
+            ChannelPairingRequest.account_id == account_id,
+            ChannelPairingRequest.channel_type == channel_type,
+            ChannelPairingRequest.sender_id == sender_id,
+            ChannelPairingRequest.created_at >= since,
+        )
+    )
+    return int(result.scalar() or 0)
+
+
+async def create_pairing_request(
+    session: AsyncSession,
+    *,
+    owner_email: str,
+    account_id: str,
+    channel_type: str,
+    sender_id: str,
+    sender_name: str | None,
+    chat_id: str,
+    chat_name: str | None,
+    code: str,
+    expires_at: datetime,
+) -> ChannelPairingRequest:
+    """Create a new pairing challenge."""
+    row = ChannelPairingRequest(
+        request_id=f"cpr_{uuid.uuid4().hex[:12]}",
+        owner_email=owner_email,
+        account_id=account_id,
+        channel_type=channel_type,
+        sender_id=sender_id,
+        sender_name=sender_name,
+        chat_id=chat_id,
+        chat_name=chat_name,
+        code=code,
+        status="pending",
+        expires_at=expires_at,
+    )
+    session.add(row)
+    await session.flush()
+    return row
+
+
+async def list_pairing_requests(
+    session: AsyncSession,
+    *,
+    owner_email: str,
+    statuses: list[str] | None = None,
+) -> list[ChannelPairingRequest]:
+    """List pairing requests for a Cognis user."""
+    stmt = select(ChannelPairingRequest).where(ChannelPairingRequest.owner_email == owner_email)
+    if statuses:
+        stmt = stmt.where(ChannelPairingRequest.status.in_(statuses))
+    stmt = stmt.order_by(ChannelPairingRequest.created_at.desc())
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def get_pairing_request_by_code(
+    session: AsyncSession,
+    *,
+    owner_email: str | None,
+    code: str,
+) -> ChannelPairingRequest | None:
+    """Look up a pairing request by owner and code."""
+    stmt = select(ChannelPairingRequest).where(ChannelPairingRequest.code == code)
+    if owner_email is not None:
+        stmt = stmt.where(ChannelPairingRequest.owner_email == owner_email)
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
+
+
+async def increment_pairing_request_attempts(
+    session: AsyncSession,
+    request_id: str,
+) -> ChannelPairingRequest | None:
+    """Increment redemption attempts for a pairing request."""
+    result = await session.execute(
+        select(ChannelPairingRequest).where(ChannelPairingRequest.request_id == request_id)
+    )
+    row = result.scalar_one_or_none()
+    if row is None:
+        return None
+    row.attempts += 1
+    await session.flush()
+    return row
+
+
+async def complete_pairing_request(
+    session: AsyncSession,
+    request_id: str,
+) -> ChannelPairingRequest | None:
+    """Mark a pairing request as completed."""
+    result = await session.execute(
+        select(ChannelPairingRequest).where(ChannelPairingRequest.request_id == request_id)
+    )
+    row = result.scalar_one_or_none()
+    if row is None:
+        return None
+    row.status = "completed"
+    row.completed_at = _utcnow()
+    await session.flush()
+    return row
+
+
+async def reject_pairing_request(
+    session: AsyncSession,
+    *,
+    owner_email: str,
+    request_id: str,
+) -> ChannelPairingRequest | None:
+    """Reject a pairing request owned by the user."""
+    result = await session.execute(
+        select(ChannelPairingRequest).where(
+            ChannelPairingRequest.request_id == request_id,
+            ChannelPairingRequest.owner_email == owner_email,
+            ChannelPairingRequest.status == "pending",
+        )
+    )
+    row = result.scalar_one_or_none()
+    if row is None:
+        return None
+    row.status = "rejected"
+    row.completed_at = _utcnow()
+    await session.flush()
+    return row
+
+
+async def expire_stale_pairing_requests(
+    session: AsyncSession,
+    *,
+    now: datetime | None = None,
+) -> int:
+    """Expire all pending pairing requests past their deadline."""
+    current_time = now or _utcnow()
+    result = await session.execute(
+        update(ChannelPairingRequest)
+        .where(
+            ChannelPairingRequest.status == "pending",
+            ChannelPairingRequest.expires_at <= current_time,
+        )
+        .values(status="expired")
+    )
+    return int(result.rowcount or 0)

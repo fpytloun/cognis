@@ -11,6 +11,7 @@ Architecture:
 - ``manager.py`` — Lifecycle orchestration (start/stop/reconnect)
 - ``inbound.py`` — Inbound message processing pipeline
 - ``delivery.py`` — Outbound delivery service (EventBus → channel)
+- ``pairing.py`` — Sender-initiated remote verification flow
 - ``formatting.py`` — Message formatting and splitting
 - ``adapters/`` — Concrete adapter implementations
 """
