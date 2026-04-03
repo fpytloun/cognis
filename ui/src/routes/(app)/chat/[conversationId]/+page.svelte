@@ -49,6 +49,7 @@
   let enterToSend = true;
   let queuedCount = 0;
   let timeline: TimelineItem[] = [];
+  let visibleConversations: Conversation[] = [];
   let visibleStartIndex = 0;
   let activeConversationId = '';
   let escalationTimeoutSeconds = 300;
@@ -138,6 +139,9 @@
 
   function filteredConversations(): Conversation[] {
     let list = conversations;
+    if (selectedAgentId && selectedAgentId !== 'all') {
+      list = list.filter((c) => c.agent_id === selectedAgentId);
+    }
     // Channel filtering is now server-side (passed to API in loadConversationPage)
     const query = conversationSearch.trim().toLowerCase();
     if (query) {
@@ -193,12 +197,16 @@
     if (stored && agents.some((a) => a.agent_id === stored && a.status === 'active')) {
       selectedAgentId = stored;
     } else {
-      selectedAgentId = agents.find((a) => a.status === 'active')?.agent_id ?? agents[0]?.agent_id ?? '';
+      selectedAgentId = 'all';
     }
   }
 
   function persistSelectedAgent(): void {
     if (typeof window === 'undefined' || !selectedAgentId) return;
+    if (selectedAgentId === 'all') {
+      window.localStorage.removeItem('cognis-chat-selected-agent');
+      return;
+    }
     window.localStorage.setItem('cognis-chat-selected-agent', selectedAgentId);
   }
 
@@ -487,7 +495,11 @@
   }
 
   async function createNewConversation(): Promise<void> {
-    if (!selectedAgentId) {
+    const agentId = selectedAgentId !== 'all'
+      ? selectedAgentId
+      : agents.find((agent) => agent.status === 'active' && agent.agent_type === 'primary')?.agent_id ?? '';
+
+    if (!agentId) {
       error = 'Create or activate an agent before starting a conversation.';
       return;
     }
@@ -496,7 +508,7 @@
 
     try {
       const conversation = await api.conversations.create({
-        agent_id: selectedAgentId,
+        agent_id: agentId,
         context: {
           type: 'web',
           ref: null,
@@ -943,6 +955,7 @@
     void openConversation($page.params.conversationId);
   }
 
+  $: visibleConversations = filteredConversations();
   $: displayedTimeline = timeline.slice(visibleStartIndex);
 
   onMount(() => {
@@ -1016,6 +1029,7 @@
               onchange={handleAgentFilterChange}
               class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
             >
+              <option value="all">All agents</option>
               {#each agents.filter((a) => a.status === 'active' && a.agent_type === 'primary') as agent}
                 <option value={agent.agent_id}>{agent.display_name ?? agent.name}</option>
               {/each}
@@ -1055,12 +1069,12 @@
       <!-- Scrollable middle: conversation list -->
       <div class="min-h-0 flex-1 overflow-y-auto px-4 py-2">
         <div class="space-y-1">
-          {#if filteredConversations().length === 0}
+          {#if visibleConversations.length === 0}
             <p class="rounded-2xl border border-dashed border-slate-700 px-4 py-6 text-center text-sm text-slate-400">
               No conversations found.
             </p>
           {:else}
-            {#each filteredConversations() as conversation}
+            {#each visibleConversations as conversation}
               {@const agent = conversationAgent(conversation)}
               {@const isActive = conversation.conversation_id === currentConversation?.conversation_id}
               {@const unread = conversation.has_unread && !isActive}
@@ -1310,7 +1324,7 @@
           {:else}
             {#each displayedTimeline as item (item.id)}
               {#if item.kind === 'message'}
-                <div class={`flex ${item.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                <div class={`flex min-w-0 ${item.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                   <ChatMessage {item} />
                 </div>
               {:else if item.kind === 'tool_call'}
@@ -1503,7 +1517,7 @@
             {:else}
               {#each subSessionTimeline as item (item.id)}
                 {#if item.kind === 'message'}
-                  <div class={`flex ${item.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                  <div class={`flex min-w-0 ${item.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                     <ChatMessage {item} />
                   </div>
                 {:else if item.kind === 'tool_call'}

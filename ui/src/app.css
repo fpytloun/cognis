@@ -48,3 +48,48 @@ textarea:focus-visible,
 ::-webkit-scrollbar-track {
   @apply bg-slate-900/60;
 }
+
+.chat-markdown {
+  overflow-wrap: anywhere;
+}
+
+.chat-markdown table {
+  display: block;
+  width: max-content;
+  min-width: 100%;
+}
+
+.chat-markdown pre {
+  position: relative;
+  padding-top: 3rem;
+}
+
+.chat-code-copy-button {
+  position: absolute;
+  top: 0.75rem;
+  right: 0.75rem;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  border: 1px solid rgb(71 85 105 / 0.85);
+  border-radius: 9999px;
+  background: rgb(15 23 42 / 0.92);
+  color: rgb(148 163 184);
+  padding: 0.3rem 0.55rem;
+  font-size: 0.65rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  transition: color 120ms ease, border-color 120ms ease, background-color 120ms ease;
+}
+
+.chat-code-copy-button:hover {
+  border-color: rgb(56 189 248 / 0.8);
+  background: rgb(15 23 42 / 1);
+  color: rgb(226 232 240);
+}
+
+.chat-code-copy-button svg {
+  width: 0.85rem;
+  height: 0.85rem;
+}
