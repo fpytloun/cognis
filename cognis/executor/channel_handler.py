@@ -8,6 +8,7 @@ controller as ``channel.message`` notifications.
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import json
 import logging
@@ -16,6 +17,7 @@ from typing import Any
 from cognis.models.channel import (
     ChannelAccountConfig,
     InboundMessage,
+    MediaAttachment,
     OutboundMessage,
 )
 
@@ -103,6 +105,28 @@ class ChannelHandler:
         )
         platform_msg_id = await adapter.send_message(outbound)
         return {"status": "sent", "platform_message_id": platform_msg_id}
+
+    async def fetch_media(
+        self,
+        account_id: str,
+        message: dict[str, Any],
+        attachment: dict[str, Any],
+    ) -> dict[str, Any]:
+        adapter = self._adapters.get(account_id)
+        if adapter is None:
+            return {"error": f"No adapter for account {account_id}"}
+        inbound = InboundMessage.model_validate(message)
+        media = MediaAttachment.model_validate(attachment)
+        fetched = await adapter.download_attachment(inbound, media)
+        if fetched is None:
+            return {"status": "unavailable"}
+        content, content_type, filename = fetched
+        return {
+            "status": "ok",
+            "content_b64": base64.b64encode(content).decode("ascii"),
+            "content_type": content_type,
+            "filename": filename,
+        }
 
     async def stop_all(self) -> None:
         """Stop all running adapters (called on executor shutdown)."""

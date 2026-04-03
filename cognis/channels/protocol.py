@@ -23,6 +23,7 @@ from cognis.models.channel import (
     ChannelCapabilities,
     ChannelStatus,
     InboundMessage,
+    MediaAttachment,
     OutboundMessage,
 )
 from cognis.models.config import ProviderHealth
@@ -130,6 +131,14 @@ class ChannelAdapter(Protocol):
 
     async def health(self) -> ProviderHealth:
         """Return health status for monitoring."""
+        ...
+
+    async def download_attachment(
+        self,
+        message: InboundMessage,
+        attachment: MediaAttachment,
+    ) -> tuple[bytes, str, str] | None:
+        """Download inbound media content for normalization into Cognis artifacts."""
         ...
 
     async def verify_webhook(
@@ -254,6 +263,14 @@ class BaseChannelAdapter(ABC):
     ) -> bool:
         """Default: reject all webhooks. Override for webhook-based channels."""
         return False
+
+    async def download_attachment(
+        self,
+        message: InboundMessage,
+        attachment: MediaAttachment,
+    ) -> tuple[bytes, str, str] | None:
+        """Default no-op. Override in adapters that can fetch media."""
+        return None
 
     # ------------------------------------------------------------------
     # Abstract methods for concrete adapters

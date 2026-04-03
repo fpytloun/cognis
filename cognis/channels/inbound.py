@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from cognis.channels.protocol import CHANNEL_OUTBOUND_TOTAL, BaseChannelAdapter
 from cognis.logging import get_logger
+from cognis.models.artifact import ArtifactKind, AttachmentRef
 from cognis.models.channel import (
     ChannelAccountConfig,
     InboundMessage,
@@ -100,6 +101,12 @@ class InboundPipeline:
             )
             return
 
+        attachments = await self._normalize_media_attachments(
+            message=message,
+            conversation_id=conversation_id,
+            user_email=user_email,
+        )
+
         # 4. Register observer for response delivery
         observer = ChannelTurnObserver(
             channel_type=message.channel_type,
@@ -118,7 +125,7 @@ class InboundPipeline:
             conversation_id,
             message.content,
             user_email=user_email,
-            attachments=[],
+            attachments=[item.model_dump(mode="json") for item in attachments],
         )
 
         if error is not None:
@@ -299,6 +306,96 @@ class InboundPipeline:
                     reply_to_id=message.message_id,
                 )
             )
+
+    async def _normalize_media_attachments(
+        self,
+        *,
+        message: InboundMessage,
+        conversation_id: str,
+        user_email: str,
+    ) -> list[AttachmentRef]:
+        if not message.media:
+            return []
+        manager = self._channel_manager_ref()
+        if manager is None:
+            return []
+        adapter = manager.get_adapter(message.account_id)
+        if adapter is None:
+            return []
+
+        refs: list[AttachmentRef] = []
+        async with self._session_factory() as session:
+            from cognis.store.queries import create_artifact_record
+
+            for attachment in message.media:
+                try:
+                    fetched = await adapter.download_attachment(message, attachment)
+                    if fetched is None:
+                        continue
+                    content, content_type, filename = fetched
+                    kind = _kind_for_media(content_type)
+                    artifact_id = manager._artifact_store.generate_id("att")  # noqa: SLF001
+                    await manager._artifact_store.async_save(  # noqa: SLF001
+                        "attachments",
+                        artifact_id,
+                        filename,
+                        content,
+                        content_type,
+                        owner_email=user_email,
+                    )
+                    await create_artifact_record(
+                        session,
+                        artifact_id=artifact_id,
+                        namespace="attachments",
+                        object_id=artifact_id,
+                        filename=filename,
+                        owner_email=user_email,
+                        purpose="channel_input",
+                        kind=kind.value,
+                        mime_type=content_type,
+                        size_bytes=len(content),
+                        status="attached",
+                        conversation_id=conversation_id,
+                        message_role="user",
+                    )
+                    refs.append(
+                        AttachmentRef(
+                            artifact_id=artifact_id,
+                            kind=kind,
+                            mime_type=content_type,
+                            filename=filename,
+                            size_bytes=len(content),
+                            url=await manager._artifact_store.async_get_signed_url(  # noqa: SLF001
+                                "attachments", artifact_id, filename
+                            ),
+                        )
+                    )
+                except Exception:
+                    logger.warning(
+                        "channel inbound: failed to normalize attachment",
+                        extra={
+                            "extra_data": {
+                                "account_id": message.account_id,
+                                "channel_type": message.channel_type,
+                            }
+                        },
+                        exc_info=True,
+                    )
+                    continue
+            await session.commit()
+        return refs
+
+
+def _kind_for_media(content_type: str) -> ArtifactKind:
+    if content_type.startswith("image/"):
+        return ArtifactKind.IMAGE
+    if content_type.startswith("audio/"):
+        return ArtifactKind.AUDIO
+    if content_type.startswith("video/"):
+        return ArtifactKind.VIDEO
+    if content_type == "application/pdf":
+        return ArtifactKind.PDF
+    return ArtifactKind.FILE
 
 
 # ---------------------------------------------------------------------------

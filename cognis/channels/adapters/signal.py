@@ -11,9 +11,11 @@ Required credentials:
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -190,6 +192,7 @@ class SignalAdapter(BaseChannelAdapter):
             media.append(
                 MediaAttachment(
                     path=attachment.get("filename"),
+                    platform_id=attachment.get("id"),
                     mime_type=attachment.get("contentType"),
                     size_bytes=attachment.get("size"),
                 )
@@ -221,3 +224,20 @@ class SignalAdapter(BaseChannelAdapter):
         )
 
         await self._dispatch_inbound(message)
+
+    async def download_attachment(
+        self,
+        message: InboundMessage,
+        attachment: MediaAttachment,
+    ) -> tuple[bytes, str, str] | None:
+        if not attachment.path:
+            return None
+        path = Path(attachment.path)
+        if not path.exists():
+            return None
+        content = await asyncio.to_thread(path.read_bytes)
+        return (
+            content,
+            attachment.mime_type or "application/octet-stream",
+            attachment.filename or path.name,
+        )

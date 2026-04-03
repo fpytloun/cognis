@@ -8,6 +8,7 @@ JSON-RPC call over the executor WebSocket.
 
 from __future__ import annotations
 
+import base64
 from datetime import UTC, datetime
 from typing import Any
 
@@ -21,6 +22,8 @@ from cognis.models.channel import (
     ChannelAccountStatus,
     ChannelCapabilities,
     ChannelStatus,
+    InboundMessage,
+    MediaAttachment,
     OutboundMessage,
 )
 from cognis.models.config import ProviderHealth
@@ -151,6 +154,39 @@ class RemoteChannelAdapterProxy:
 
     async def mark_read(self, chat_id: str, message_id: str) -> None:
         """Read receipts are not proxied."""
+
+    async def download_attachment(
+        self,
+        message: InboundMessage,
+        attachment: MediaAttachment,
+    ) -> tuple[bytes, str, str] | None:
+        try:
+            result = await self._connection.rpc_call(
+                "channel.fetch_media",
+                {
+                    "account_id": self._account_id,
+                    "message": message.model_dump(mode="json"),
+                    "attachment": attachment.model_dump(mode="json"),
+                },
+                timeout=60.0,
+            )
+            payload = result.get("content_b64")
+            if not isinstance(payload, str):
+                return None
+            return (
+                base64.b64decode(payload),
+                str(
+                    result.get("content_type") or attachment.mime_type or "application/octet-stream"
+                ),
+                str(result.get("filename") or attachment.filename or "attachment"),
+            )
+        except Exception:
+            logger.warning(
+                "remote channel proxy: fetch_media failed",
+                extra={"extra_data": {"account_id": self._account_id}},
+                exc_info=True,
+            )
+            return None
 
     async def get_status(self) -> ChannelAccountStatus:
         return ChannelAccountStatus(

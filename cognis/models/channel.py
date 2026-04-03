@@ -145,6 +145,7 @@ class MediaAttachment(BaseModel):
 
     url: str | None = None
     path: str | None = None
+    platform_id: str | None = None
     mime_type: str | None = None
     filename: str | None = None
     size_bytes: int | None = None

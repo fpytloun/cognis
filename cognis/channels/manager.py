@@ -51,11 +51,13 @@ class ChannelManager:
         session_factory: async_sessionmaker[Any],
         inbound_pipeline: InboundPipeline,
         secrets_provider: Any,
+        artifact_store: Any,
         ws_provider: Any | None = None,  # WebSocketExecutorProvider (for executor-hosted channels)
     ) -> None:
         self._session_factory = session_factory
         self._inbound_pipeline = inbound_pipeline
         self._secrets_provider = secrets_provider
+        self._artifact_store = artifact_store
         self._ws_provider = ws_provider
 
         # account_id → adapter instance (local BaseChannelAdapter or RemoteChannelAdapterProxy)

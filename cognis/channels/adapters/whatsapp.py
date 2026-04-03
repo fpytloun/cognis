@@ -199,6 +199,7 @@ class WhatsAppAdapter(BaseChannelAdapter):
             content = media_data.get("caption", "")
             media.append(
                 MediaAttachment(
+                    platform_id=media_data.get("id"),
                     mime_type=media_data.get("mime_type"),
                     filename=media_data.get("filename"),
                 )
@@ -238,3 +239,25 @@ class WhatsAppAdapter(BaseChannelAdapter):
         )
 
         await self._dispatch_inbound(message)
+
+    async def download_attachment(
+        self,
+        message: InboundMessage,
+        attachment: MediaAttachment,
+    ) -> tuple[bytes, str, str] | None:
+        if self._client is None or not attachment.platform_id:
+            return None
+        resp = await self._client.get(f"/{attachment.platform_id}")
+        resp.raise_for_status()
+        media_meta = resp.json()
+        media_url = media_meta.get("url")
+        if not isinstance(media_url, str) or not media_url:
+            return None
+        download = await self._client.get(media_url)
+        download.raise_for_status()
+        return (
+            download.content,
+            attachment.mime_type
+            or download.headers.get("content-type", "application/octet-stream"),
+            attachment.filename or f"{attachment.platform_id}",
+        )

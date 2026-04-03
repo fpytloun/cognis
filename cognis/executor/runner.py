@@ -143,6 +143,8 @@ class ExecutorRunner:
                 asyncio.create_task(self._handle_channel_stop(ws, msg_id, params))
             elif method == "channel.send":
                 asyncio.create_task(self._handle_channel_send(ws, msg_id, params))
+            elif method == "channel.fetch_media":
+                asyncio.create_task(self._handle_channel_fetch_media(ws, msg_id, params))
             elif method == "executor.cancel":
                 self._running = False
                 break
@@ -380,6 +382,22 @@ class ExecutorRunner:
             result = await self._channel_handler.send(
                 account_id=params.get("account_id", ""),
                 message=params.get("message", {}),
+            )
+            await self._send_rpc_result(ws, msg_id, result)
+        except Exception as exc:
+            await self._send_rpc_error(ws, msg_id, -32000, str(exc)[:500])
+
+    async def _handle_channel_fetch_media(
+        self, ws: Any, msg_id: str | None, params: dict[str, Any]
+    ) -> None:
+        if self._channel_handler is None:
+            await self._send_rpc_error(ws, msg_id, -32601, "Channel handler unavailable")
+            return
+        try:
+            result = await self._channel_handler.fetch_media(
+                account_id=params.get("account_id", ""),
+                message=params.get("message", {}),
+                attachment=params.get("attachment", {}),
             )
             await self._send_rpc_result(ws, msg_id, result)
         except Exception as exc:

@@ -211,8 +211,6 @@ class DiscordAdapter(BaseChannelAdapter):
     async def _handle_message(self, msg: dict[str, Any], channel_id: str) -> None:
         author = msg.get("author", {})
         content = msg.get("content", "")
-        if not content:
-            return
         if author.get("id") == self._bot_user_id:
             return
 
@@ -236,12 +234,15 @@ class DiscordAdapter(BaseChannelAdapter):
         media = [
             MediaAttachment(
                 url=attachment.get("url"),
+                platform_id=attachment.get("id"),
                 filename=attachment.get("filename"),
                 mime_type=attachment.get("content_type"),
                 size_bytes=attachment.get("size"),
             )
             for attachment in msg.get("attachments", [])
         ]
+        if not content and not media:
+            return
 
         reply_to_id = (msg.get("message_reference") or {}).get("message_id")
         thread_id = msg.get("thread", {}).get("id") if msg.get("thread") else None
@@ -269,4 +270,20 @@ class DiscordAdapter(BaseChannelAdapter):
                 timestamp=timestamp,
                 platform_data={"raw_message": msg},
             )
+        )
+
+    async def download_attachment(
+        self,
+        message: InboundMessage,
+        attachment: MediaAttachment,
+    ) -> tuple[bytes, str, str] | None:
+        if not attachment.url:
+            return None
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(attachment.url)
+            resp.raise_for_status()
+        return (
+            resp.content,
+            attachment.mime_type or resp.headers.get("content-type", "application/octet-stream"),
+            attachment.filename or "attachment",
         )

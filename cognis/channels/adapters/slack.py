@@ -198,9 +198,6 @@ class SlackAdapter(BaseChannelAdapter):
         channel_id = event.get("channel", "")
         ts = event.get("ts", "")
         thread_ts = event.get("thread_ts")
-        if not text:
-            return
-
         chat_type = "direct" if event.get("channel_type", "") == "im" else "group"
         was_mentioned = False
         if self._bot_user_id and f"<@{self._bot_user_id}>" in text:
@@ -210,12 +207,15 @@ class SlackAdapter(BaseChannelAdapter):
         media = [
             MediaAttachment(
                 url=file_info.get("url_private"),
+                platform_id=file_info.get("id"),
                 filename=file_info.get("name"),
                 mime_type=file_info.get("mimetype"),
                 size_bytes=file_info.get("size"),
             )
             for file_info in event.get("files", [])
         ]
+        if not text and not media:
+            return
         try:
             timestamp = datetime.fromtimestamp(float(ts), tz=UTC)
         except (ValueError, TypeError):
@@ -251,3 +251,18 @@ class SlackAdapter(BaseChannelAdapter):
         except Exception:
             return None
         return None
+
+    async def download_attachment(
+        self,
+        message: InboundMessage,
+        attachment: MediaAttachment,
+    ) -> tuple[bytes, str, str] | None:
+        if self._client is None or not attachment.url:
+            return None
+        resp = await self._client.get(attachment.url)
+        resp.raise_for_status()
+        return (
+            resp.content,
+            attachment.mime_type or resp.headers.get("content-type", "application/octet-stream"),
+            attachment.filename or "attachment",
+        )

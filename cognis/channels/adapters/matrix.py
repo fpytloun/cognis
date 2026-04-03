@@ -214,6 +214,7 @@ class MatrixAdapter(BaseChannelAdapter):
             media.append(
                 MediaAttachment(
                     url=content.get("url"),
+                    platform_id=content.get("url"),
                     mime_type=content.get("info", {}).get("mimetype"),
                     filename=content.get("body"),
                     size_bytes=content.get("info", {}).get("size"),
@@ -252,3 +253,23 @@ class MatrixAdapter(BaseChannelAdapter):
         )
 
         await self._dispatch_inbound(message)
+
+    async def download_attachment(
+        self,
+        message: InboundMessage,
+        attachment: MediaAttachment,
+    ) -> tuple[bytes, str, str] | None:
+        if self._client is None or not attachment.url or not attachment.url.startswith("mxc://"):
+            return None
+        _, rest = attachment.url.split("mxc://", 1)
+        try:
+            server_name, media_id = rest.split("/", 1)
+        except ValueError:
+            return None
+        resp = await self._client.get(f"/_matrix/media/v3/download/{server_name}/{media_id}")
+        resp.raise_for_status()
+        return (
+            resp.content,
+            attachment.mime_type or resp.headers.get("content-type", "application/octet-stream"),
+            attachment.filename or media_id,
+        )

@@ -185,9 +185,6 @@ class TelegramAdapter(BaseChannelAdapter):
         caption = msg.get("caption", "")
         content = text or caption
 
-        if not content:
-            return
-
         # Extract sender info
         sender = msg.get("from", {})
         sender_id = str(sender.get("id", ""))
@@ -235,11 +232,15 @@ class TelegramAdapter(BaseChannelAdapter):
                 if media_data:
                     media.append(
                         MediaAttachment(
+                            platform_id=media_data.get("file_id"),
                             mime_type=media_data.get("mime_type"),
                             filename=media_data.get("file_name"),
                             size_bytes=media_data.get("file_size"),
                         )
                     )
+
+        if not content and not media:
+            return
 
         # Reply context
         reply_to_id = None
@@ -271,3 +272,30 @@ class TelegramAdapter(BaseChannelAdapter):
         )
 
         await self._dispatch_inbound(message)
+
+    async def download_attachment(
+        self,
+        message: InboundMessage,
+        attachment: MediaAttachment,
+    ) -> tuple[bytes, str, str] | None:
+        if self._client is None or not attachment.platform_id:
+            return None
+        resp = await self._client.get("/getFile", params={"file_id": attachment.platform_id})
+        resp.raise_for_status()
+        data = resp.json()
+        if not data.get("ok"):
+            return None
+        file_path = data.get("result", {}).get("file_path")
+        if not isinstance(file_path, str) or not file_path:
+            return None
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            content_resp = await client.get(
+                f"{_TELEGRAM_API_BASE}/file/bot{self._bot_token}/{file_path}"
+            )
+            content_resp.raise_for_status()
+        return (
+            content_resp.content,
+            attachment.mime_type
+            or content_resp.headers.get("content-type", "application/octet-stream"),
+            attachment.filename or file_path.rsplit("/", 1)[-1],
+        )
