@@ -7,15 +7,11 @@ from pathlib import Path
 from typing import Any
 
 from cognis.models.tool import ToolResult
+from cognis.tools.executor.paths import resolve_path
 from cognis.tools.registry import ToolExecutionContext
 
 _MAX_RESULTS = 200
 _MAX_LINE_LENGTH = 2000
-
-
-def _resolve_path(raw: str) -> Path:
-    """Resolve a user-provided path, expanding ``~``."""
-    return Path(raw).expanduser()
 
 
 async def handle_glob(arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
@@ -26,7 +22,7 @@ async def handle_glob(arguments: dict[str, Any], context: ToolExecutionContext) 
     if not pattern:
         return ToolResult(output="No pattern provided.", is_error=True)
 
-    base = _resolve_path(search_path)
+    base = resolve_path(search_path)
     if not base.is_dir():
         return ToolResult(output=f"Not a directory: {search_path}", is_error=True)
 
@@ -72,7 +68,7 @@ async def handle_grep(arguments: dict[str, Any], context: ToolExecutionContext) 
     except re.error as exc:
         return ToolResult(output=f"Invalid regex: {exc}", is_error=True)
 
-    base = _resolve_path(search_path)
+    base = resolve_path(search_path)
     if not base.is_dir():
         return ToolResult(output=f"Not a directory: {search_path}", is_error=True)
 

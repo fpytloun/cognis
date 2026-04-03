@@ -3,8 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
+import getpass
 import json
+import os
+import platform
 import re
+import sys
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -43,6 +49,30 @@ class ContextAssemblyResult(BaseModel):
     max_context_tokens: int = 0
     recommend_compaction: bool = False
     cache_breakpoint_index: int | None = None
+
+
+def _build_environment_info() -> str:
+    """Build environment information for the LLM context.
+
+    Provides the LLM with the actual home directory, working directory,
+    hostname, and platform so it generates correct absolute paths in tool
+    calls instead of guessing (e.g. ``/home/user`` on macOS).
+    """
+    try:
+        user = getpass.getuser()
+    except Exception:
+        user = "unknown"
+
+    return (
+        "Environment:\n"
+        f"- Platform: {sys.platform} ({platform.machine()})\n"
+        f"- Hostname: {platform.node()}\n"
+        f"- System user: {user}\n"
+        f"- Home directory: {Path.home()}\n"
+        f"- Working directory: {os.getcwd()}\n"
+        f"- Date: {datetime.date.today().isoformat()}\n"
+        "When the user references ~ or $HOME, use the home directory above."
+    )
 
 
 class ContextAssembler:
@@ -116,18 +146,37 @@ class ContextAssembler:
         active_delegations: list[dict[str, Any]] | None = None,
         prior_context: list[dict[str, Any]] | None = None,
         skip_user_message: bool = False,
+        skip_memory: bool = False,
     ) -> ContextAssemblyResult:
         """Build the LLM message list for a single turn.
 
         ``prior_context`` is an optional list of messages to inject after
         session history and before the user message.  Used by the workflow
         engine to inject prior step output.  Chat turns pass ``None``.
+
+        ``skip_memory`` skips Mnemory recall and memory instructions.
+        Used for secondary agents that don't have memory integration.
         """
 
         logger.debug(
             "context: assembly started",
             extra={"extra_data": {"session_id": session.session_id, "agent_id": agent.agent_id}},
         )
+
+        # --- Secondary agents: skip memory and intention ---
+        if skip_memory:
+            return await self._assemble_without_memory(
+                session=session,
+                conversation=conversation,
+                agent=agent,
+                user_message=user_message,
+                user_message_role=user_message_role,
+                tool_definitions=tool_definitions,
+                active_delegations=active_delegations,
+                prior_context=prior_context,
+                skip_user_message=skip_user_message,
+            )
+
         cached_intention = self.session_cache.get_intention(session.session_id)
         is_first_recall = session.mnemory_session_id is None
 
@@ -310,7 +359,10 @@ class ContextAssembler:
         if agent.system_prompt:
             messages.append({"role": "system", "content": agent.system_prompt})
 
-        # Immutable prefix block 2: memory instructions (behavioral guidance)
+        # Immutable prefix block 2: environment info (home dir, cwd, platform)
+        messages.append({"role": "system", "content": _build_environment_info()})
+
+        # Immutable prefix block 3: memory instructions (behavioral guidance)
         if immutable_instructions:
             messages.append(
                 {
@@ -319,7 +371,7 @@ class ContextAssembler:
                 }
             )
 
-        # Immutable prefix block 3: core memories (pinned facts, identity)
+        # Immutable prefix block 4: core memories (pinned facts, identity)
         if immutable_core_memories:
             messages.append(
                 {
@@ -332,7 +384,7 @@ class ContextAssembler:
                 }
             )
 
-        # Immutable prefix block 4: compaction summary (stable within session)
+        # Immutable prefix block 5: compaction summary (stable within session)
         compaction_summary = cache_entry.last_compaction_summary
         if compaction_summary:
             messages.append(
@@ -420,6 +472,148 @@ class ContextAssembler:
                     "prompt_tokens": prompt_tokens,
                     "recommend_compaction": recommend_compaction,
                     "cache_breakpoint_index": cache_breakpoint_index,
+                }
+            },
+        )
+        return ContextAssemblyResult(
+            messages=messages,
+            degraded=bool(degraded_sources),
+            degraded_sources=sorted(set(degraded_sources)),
+            resolved_model=resolved_model,
+            static_tokens=static_tokens,
+            dynamic_tokens=dynamic_tokens,
+            prompt_tokens=prompt_tokens,
+            max_context_tokens=max_context_tokens,
+            recommend_compaction=recommend_compaction,
+            cache_breakpoint_index=cache_breakpoint_index,
+        )
+
+    async def _assemble_without_memory(
+        self,
+        *,
+        session: SessionModel,
+        conversation: ConversationModel,
+        agent: AgentDefinition,
+        user_message: str,
+        user_message_role: str = "user",
+        tool_definitions: list[ToolDefinition] | None = None,
+        active_delegations: list[dict[str, Any]] | None = None,
+        prior_context: list[dict[str, Any]] | None = None,
+        skip_user_message: bool = False,
+    ) -> ContextAssemblyResult:
+        """Assemble context without Mnemory calls — for secondary agents.
+
+        Skips: Mnemory recall, memory instructions, core memories,
+        recalled memories, intention fetch. Keeps: system prompt,
+        compaction summary, history, prior step context.
+        """
+        degraded_sources: list[str] = []
+
+        # Still need Intaris event refresh for history
+        cache_result = await self.session_cache.refresh(session)
+        if isinstance(cache_result, Exception):
+            cache_entry = self.session_cache.get_entry(session.session_id)
+            if cache_entry is None or not cache_entry.initialized:
+                raise cache_result
+            degraded_sources.append("events")
+        else:
+            cache_entry = cache_result
+
+        # Model resolution
+        model_override = self.session_cache.get_model_override(session.session_id)
+        explicit_model = model_override or (agent.llm_config.model if agent.llm_config else None)
+        resolved_model = await self.llm.resolve_model(
+            explicit_model=explicit_model,
+            task_type="default",
+        )
+        model_info = await self.llm.get_model_info(resolved_model)
+        if model_info.model_id == "unknown":
+            degraded_sources.append("model_info")
+
+        max_context_tokens = min(self.max_context_tokens, model_info.context_window)
+        reserve_output_tokens = (
+            agent.llm_config.max_tokens
+            if agent.llm_config and agent.llm_config.max_tokens is not None
+            else model_info.max_output_tokens
+        )
+        system_prompt_tokens, tool_schema_tokens = self._count_static_tokens(
+            resolved_model=resolved_model,
+            system_prompt=agent.system_prompt,
+            tool_definitions=tool_definitions or [],
+        )
+        static_tokens = system_prompt_tokens + tool_schema_tokens
+        dynamic_tokens = max(0, max_context_tokens - static_tokens - reserve_output_tokens)
+        max_prompt_tokens = max(0, max_context_tokens - reserve_output_tokens)
+
+        # Build messages: system prompt + compaction + history + prior context
+        messages: list[dict[str, Any]] = []
+
+        if agent.system_prompt:
+            messages.append({"role": "system", "content": agent.system_prompt})
+
+        # Environment info (same as primary assembly)
+        messages.append({"role": "system", "content": _build_environment_info()})
+
+        # No memory instructions, no core memories (skip_memory)
+
+        compaction_summary = cache_entry.last_compaction_summary
+        if compaction_summary:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "This is a continuation from a previous session. "
+                        "Here is a summary of what was discussed:\n\n"
+                        f"{compaction_summary}\n\n"
+                        "The conversation continues below."
+                    ),
+                }
+            )
+
+        history_messages = self._events_to_messages(
+            self.session_cache.get_events_since_compaction(
+                session.session_id, EVENT_TYPES_FOR_CONTEXT
+            )
+        )
+        messages.extend(history_messages)
+
+        # No recalled memories (skip_memory)
+        # No active delegations (secondary agents don't delegate)
+
+        if prior_context:
+            for msg in prior_context:
+                msg["_prior_context"] = True
+            messages.extend(prior_context)
+
+        if not skip_user_message:
+            messages.append({"role": user_message_role, "content": user_message})
+
+        messages = self._prune_messages(
+            messages=messages,
+            resolved_model=resolved_model,
+            max_prompt_tokens=max_prompt_tokens,
+            system_prompt=agent.system_prompt,
+            tool_schema_tokens=tool_schema_tokens,
+        )
+
+        for msg in messages:
+            msg.pop("_prior_context", None)
+
+        cache_breakpoint_index = _find_cache_breakpoint(messages)
+        prompt_tokens = (
+            self.llm.count_messages_tokens(messages, resolved_model) + tool_schema_tokens
+        )
+        recommend_compaction = (
+            max_context_tokens > 0
+            and (prompt_tokens / max_context_tokens) >= self.compaction_threshold
+        )
+        logger.info(
+            "context: assembly completed (skip_memory)",
+            extra={
+                "extra_data": {
+                    "session_id": session.session_id,
+                    "prompt_tokens": prompt_tokens,
+                    "recommend_compaction": recommend_compaction,
                 }
             },
         )

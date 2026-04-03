@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import sys
+from pathlib import Path
 from time import monotonic
 
 import pytest
 
-from cognis.core.context import ContextAssembler
+from cognis.core.context import ContextAssembler, _build_environment_info
 from cognis.models.agent import AgentDefinition, AgentLLMConfig
 from cognis.models.config import ModelInfo
 from cognis.models.session import ConversationContext, ConversationModel, SessionModel
@@ -299,3 +301,50 @@ async def test_context_assembler_accounts_for_tool_schema_budget() -> None:
         and "Recalled memories:" in str(message["content"])
         for message in result.messages
     )
+
+
+def test_build_environment_info_contains_required_fields() -> None:
+    """Environment info must include home dir, cwd, platform, and date."""
+    info = _build_environment_info()
+    assert "Home directory:" in info
+    assert "Working directory:" in info
+    assert "Platform:" in info
+    assert "Date:" in info
+    assert "Hostname:" in info
+    assert "System user:" in info
+    # Must contain the actual home directory, not a generic placeholder
+    assert str(Path.home()) in info
+    # Must instruct the LLM about ~ expansion
+    assert "~" in info
+
+
+@pytest.mark.asyncio
+async def test_context_assembler_includes_environment_info() -> None:
+    """Assembled context must contain an environment info system message."""
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=_SessionCache(),
+        session_manager=_SessionManager(),
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+
+    result = await assembler.assemble(
+        session=_session(),
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="hello",
+        tool_definitions=[],
+    )
+
+    env_messages = [
+        m
+        for m in result.messages
+        if m.get("role") == "system" and "Home directory:" in str(m.get("content", ""))
+    ]
+    assert len(env_messages) == 1, "Expected exactly one environment info message"
+    content = env_messages[0]["content"]
+    assert str(Path.home()) in content
+    assert sys.platform in content

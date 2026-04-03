@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 from cognis.logging import get_logger
 from cognis.models.tool import ToolResult
+from cognis.tools.executor.paths import resolve_path
 from cognis.tools.registry import ToolExecutionContext
 
 if TYPE_CHECKING:
@@ -23,7 +24,7 @@ _MAX_LINE_LENGTH = 2000
 
 def _resolve_path(raw: str) -> Path:
     """Resolve a user-provided path, expanding ``~`` and environment variables."""
-    return Path(raw).expanduser()
+    return resolve_path(raw)
 
 
 # Canonical key for LSPManager in ToolExecutionContext.runtime_metadata

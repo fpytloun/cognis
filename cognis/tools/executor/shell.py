@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
 from typing import Any
 
 from cognis.models.tool import ToolResult
+from cognis.tools.executor.paths import resolve_path
 from cognis.tools.registry import ToolExecutionContext
 
 _DEFAULT_TIMEOUT_MS = 120_000
@@ -25,7 +25,7 @@ async def handle_bash(arguments: dict[str, Any], context: ToolExecutionContext) 
     timeout_seconds = max(1, timeout_ms // 1000)
 
     try:
-        resolved_cwd = str(Path(workdir).expanduser()) if workdir else None
+        resolved_cwd = str(resolve_path(workdir)) if workdir else None
         process = await asyncio.create_subprocess_shell(
             command,
             stdout=asyncio.subprocess.PIPE,

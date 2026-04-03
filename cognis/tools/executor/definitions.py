@@ -33,7 +33,10 @@ READ_TOOL = ToolDefinition(
     parameters={
         "type": "object",
         "properties": {
-            "file_path": {"type": "string", "description": "Absolute path to file or directory"},
+            "file_path": {
+                "type": "string",
+                "description": "Absolute path to file or directory. Use ~ for home directory.",
+            },
             "offset": {
                 "type": "integer",
                 "description": "Line number to start from (1-indexed, default 1)",
@@ -57,7 +60,10 @@ WRITE_TOOL = ToolDefinition(
     parameters={
         "type": "object",
         "properties": {
-            "file_path": {"type": "string", "description": "Absolute path to the file"},
+            "file_path": {
+                "type": "string",
+                "description": "Absolute path to the file. Use ~ for home directory.",
+            },
             "content": {"type": "string", "description": "Content to write"},
         },
         "required": ["file_path", "content"],
@@ -75,7 +81,10 @@ EDIT_TOOL = ToolDefinition(
     parameters={
         "type": "object",
         "properties": {
-            "file_path": {"type": "string", "description": "Absolute path to the file"},
+            "file_path": {
+                "type": "string",
+                "description": "Absolute path to the file. Use ~ for home directory.",
+            },
             "old_string": {"type": "string", "description": "Exact text to find and replace"},
             "new_string": {"type": "string", "description": "Replacement text"},
             "replace_all": {
@@ -115,7 +124,10 @@ MULTIEDIT_TOOL = ToolDefinition(
     parameters={
         "type": "object",
         "properties": {
-            "file_path": {"type": "string", "description": "Absolute path to the file"},
+            "file_path": {
+                "type": "string",
+                "description": "Absolute path to the file. Use ~ for home directory.",
+            },
             "edits": {
                 "type": "array",
                 "items": {
@@ -145,7 +157,10 @@ LIST_DIRECTORY_TOOL = ToolDefinition(
     parameters={
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": "Absolute path to the directory"},
+            "path": {
+                "type": "string",
+                "description": "Absolute path to the directory. Use ~ for home directory.",
+            },
             "ignore": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -168,7 +183,10 @@ GLOB_TOOL = ToolDefinition(
         "type": "object",
         "properties": {
             "pattern": {"type": "string", "description": "Glob pattern (e.g. '**/*.py')"},
-            "path": {"type": "string", "description": "Directory to search in"},
+            "path": {
+                "type": "string",
+                "description": "Directory to search in. Use ~ for home directory.",
+            },
         },
         "required": ["pattern"],
     },
@@ -185,7 +203,10 @@ GREP_TOOL = ToolDefinition(
         "type": "object",
         "properties": {
             "pattern": {"type": "string", "description": "Regex pattern to search for"},
-            "path": {"type": "string", "description": "Directory to search in"},
+            "path": {
+                "type": "string",
+                "description": "Directory to search in. Use ~ for home directory.",
+            },
             "include": {
                 "type": "string",
                 "description": "File pattern filter (e.g. '*.py', '*.{ts,tsx}')",
@@ -213,7 +234,10 @@ BASH_TOOL = ToolDefinition(
                 "description": "Brief description of what this command does",
             },
             "timeout": {"type": "integer", "description": "Timeout in milliseconds"},
-            "workdir": {"type": "string", "description": "Working directory for the command"},
+            "workdir": {
+                "type": "string",
+                "description": "Working directory for the command. Use ~ for home directory.",
+            },
         },
         "required": ["command"],
     },

@@ -294,6 +294,44 @@ class TestListDirectoryTool:
         assert "node_modules" not in result.output
 
 
+class TestResolvePath:
+    """Test the shared resolve_path utility."""
+
+    def test_tilde_expansion(self) -> None:
+        from cognis.tools.executor.paths import resolve_path
+
+        result = resolve_path("~/some/dir")
+        assert "~" not in str(result)
+        assert str(result).startswith("/")
+
+    def test_absolute_path_unchanged(self) -> None:
+        from cognis.tools.executor.paths import resolve_path
+
+        result = resolve_path("/tmp/test")
+        assert str(result) == "/tmp/test"
+
+    def test_env_var_expansion(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from cognis.tools.executor.paths import resolve_path
+
+        monkeypatch.setenv("MY_TEST_DIR", "/opt/data")
+        result = resolve_path("$MY_TEST_DIR/file.txt")
+        assert str(result) == "/opt/data/file.txt"
+
+    def test_tilde_and_env_var_combined(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from cognis.tools.executor.paths import resolve_path
+
+        monkeypatch.setenv("SUBDIR", "projects")
+        result = resolve_path("~/$SUBDIR/repo")
+        assert "~" not in str(result)
+        assert "projects/repo" in str(result)
+
+    def test_relative_path_preserved(self) -> None:
+        from cognis.tools.executor.paths import resolve_path
+
+        result = resolve_path("relative/path")
+        assert str(result) == "relative/path"
+
+
 class TestRegistryIntegration:
     """Test that executor tools integrate with the registry."""
 
