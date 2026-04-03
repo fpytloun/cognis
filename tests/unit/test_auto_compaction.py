@@ -198,7 +198,7 @@ def _minimal_agent_loop(
 
 def _step_context(session: SessionModel | None = None) -> StepContext:
     return StepContext(
-        step_definition=StepDefinition(name="direct", type="direct", prompt=""),
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
         session=session or _session(),
         conversation=_conversation(),
         agent=AgentDefinition(

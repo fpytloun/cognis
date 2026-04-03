@@ -330,29 +330,34 @@ class TaskQueue:
         return task.model_copy(update={"status": TaskStatus.PAUSED})
 
     async def resume_task(self, task_id: str) -> TaskModel:
-        """Resume a paused task when capacity is available."""
+        """Resume a paused task when capacity is available.
+
+        Acquires ``_pick_lock`` to prevent races with the drain loop
+        that could launch duplicate task runs.
+        """
         if self._get_pending_interaction(task_id) is not None:
             raise ValueError("Task is waiting for gate or step input response")
 
-        async with self._session_factory() as db_session:
-            task_row = await get_task(db_session, task_id)
-            if task_row is None:
-                raise ValueError("Task not found")
-            if task_row.status != "paused":
-                raise ValueError("Only paused tasks can be resumed")
-            task = _row_to_task_model(task_row)
+        async with self._pick_lock:
+            async with self._session_factory() as db_session:
+                task_row = await get_task(db_session, task_id)
+                if task_row is None:
+                    raise ValueError("Task not found")
+                if task_row.status != "paused":
+                    raise ValueError("Only paused tasks can be resumed")
+                task = _row_to_task_model(task_row)
 
-        if not await self._has_capacity(agent_id=task.agent_id):
-            raise ValueError("No execution capacity available to resume the task")
+            if not await self._has_capacity(agent_id=task.agent_id):
+                raise ValueError("No execution capacity available to resume the task")
 
-        async with self._session_factory() as db_session:
-            ok = await update_task_status(db_session, task_id, "running")
-            if not ok:
-                raise ValueError("Task could not be resumed")
-            await db_session.commit()
+            async with self._session_factory() as db_session:
+                ok = await update_task_status(db_session, task_id, "running")
+                if not ok:
+                    raise ValueError("Task could not be resumed")
+                await db_session.commit()
 
-        task.status = TaskStatus.RUNNING
-        self._launch_task_run(task)
+            task.status = TaskStatus.RUNNING
+            self._launch_task_run(task)
         return task
 
     async def retry_failed_task(self, task_id: str) -> TaskModel:
@@ -847,6 +852,7 @@ def _row_to_task_model(row: Any) -> TaskModel:
         task_id=row.task_id,
         title=row.title,
         description=row.description or "",
+        expected_output=getattr(row, "expected_output", None),
         status=TaskStatus(row.status),
         priority=row.priority,
         created_by=row.created_by,

@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field, field_validator
 class InteractionMode(BaseModel):
     """Controls whether steps can dynamically request caller input."""
 
-    mode: str = "explicit_gates"  # "none" | "explicit_gates" | "step_requests"
+    mode: Literal["none", "explicit_gates", "step_requests"] = "explicit_gates"
 
 
 class WorkflowDefaults(BaseModel):
@@ -19,14 +19,14 @@ class WorkflowDefaults(BaseModel):
 
     max_attempts: int = 3
     evaluate: bool = True
-    on_exhausted: str = "gate"  # "continue" | "fail" | "gate"
+    on_exhausted: Literal["continue", "fail", "gate"] = "gate"
 
 
 class GateOption(BaseModel):
     """A single option in a gate step."""
 
     label: str
-    action: str  # "continue" | "revise(step_name)" | "cancel"
+    action: str  # "continue" | "revise(step_name)" | "cancel" — free-form for revise()
     prompt: bool = False
 
 
@@ -49,7 +49,7 @@ class CompletionConfig(BaseModel):
     evaluate: bool = True
     evaluator_prompt: str | None = None
     max_attempts: int = 3
-    on_exhausted: str = "gate"  # "continue" | "fail" | "gate"
+    on_exhausted: Literal["continue", "fail", "gate"] = "gate"
 
 
 class OnRejectConfig(BaseModel):
@@ -57,7 +57,7 @@ class OnRejectConfig(BaseModel):
 
     target: str  # step name to re-run
     max_loop_iterations: int = 3
-    on_exhausted: str = "gate"  # "continue" | "fail" | "gate"
+    on_exhausted: Literal["continue", "fail", "gate"] = "gate"
 
 
 # ---------------------------------------------------------------------------
@@ -115,7 +115,7 @@ class StepDefinition(BaseModel):
     """A single step within a workflow."""
 
     name: str
-    type: str  # "run" | "gate"
+    type: Literal["run", "gate"]
     description: str = ""
     prompt: str = ""
     agent_override: str | None = None  # Secondary agent ID for this step
@@ -184,7 +184,7 @@ class StepOutput(BaseModel):
 class StepEvaluation(BaseModel):
     """Result of the controller's semantic evaluation."""
 
-    decision: str  # "approved" | "revise" | "failed"
+    decision: Literal["approved", "revise", "failed"]
     reasoning: str
     feedback: str | None = None
     evaluated_at: datetime | None = None
@@ -196,12 +196,13 @@ class WorkflowState(BaseModel):
     current_step_index: int = 0
     step_outputs: dict[str, dict[str, Any]] = Field(default_factory=dict)
     loop_iterations: dict[str, int] = Field(default_factory=dict)  # "step_a->step_b" -> count
-    status: str = "running"  # "running" | "paused" | "completed" | "failed" | "cancelled"
+    version: int = 0  # Optimistic concurrency — incremented on each persist
+    status: Literal["running", "paused", "completed", "failed", "cancelled"] = "running"
     skipped_steps: list[str] = Field(default_factory=list)  # Steps skipped due to exhaustion
     last_evaluation_feedback: str | None = None  # Feedback from evaluator for retries
-    pending_pause_type: str | None = None
+    pending_pause_type: Literal["gate", "step_input"] | None = None
     pending_pause_payload: dict[str, Any] | None = None
-    current_step_status: str | None = None
+    current_step_status: Literal["running", "paused"] | None = None
 
     def get_source_intaris_session_id(self, step_name: str) -> str:
         """Resolve the Intaris session ID from a completed source step.

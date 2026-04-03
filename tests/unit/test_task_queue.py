@@ -297,6 +297,7 @@ async def test_finalize_active_step_runs_marks_paused_and_running_rows(tmp_path:
                 step_run_id="sr_paused",
             )
             await update_step_run(session, "sr_running", status="running")
+            await update_step_run(session, "sr_paused", status="running")
             await update_step_run(session, "sr_paused", status="paused")
             await session.commit()
 

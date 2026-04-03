@@ -1358,6 +1358,18 @@ async def create_step_run(
     return row
 
 
+_VALID_STEP_RUN_TRANSITIONS: dict[str, set[str]] = {
+    "pending": {"running", "cancelled"},
+    "running": {"evaluating", "approved", "rejected", "failed", "paused", "cancelled"},
+    "evaluating": {"approved", "rejected", "failed"},
+    "approved": set(),  # terminal
+    "rejected": {"running"},  # retry
+    "paused": {"running", "cancelled"},
+    "failed": {"running"},  # retry
+    "cancelled": set(),  # terminal
+}
+
+
 async def update_step_run(
     session: AsyncSession,
     step_run_id: str,
@@ -1368,11 +1380,16 @@ async def update_step_run(
     intaris_session_id: str | None = None,
     output: dict[str, object] | None = None,
     evaluation: dict[str, object] | None = None,
-    todos: dict[str, object] | None = None,
+    todos: list[dict[str, object]] | None = None,
     started_at: datetime | None = None,
     completed_at: datetime | None = None,
 ) -> bool:
-    """Update step run fields."""
+    """Update step run fields.
+
+    When *status* is provided, the update uses a CAS guard to enforce
+    valid state transitions.  Invalid transitions are silently rejected
+    (returns ``False``).
+    """
     values: dict[str, object] = {}
     if status is not None:
         values["status"] = status
@@ -1394,7 +1411,22 @@ async def update_step_run(
         values["completed_at"] = completed_at
     if not values:
         return False
-    stmt = update(StepRun).where(StepRun.step_run_id == step_run_id).values(**values)
+
+    # When updating status, enforce valid transitions via CAS
+    if status is not None:
+        allowed_from = [k for k, v in _VALID_STEP_RUN_TRANSITIONS.items() if status in v]
+        if allowed_from:
+            stmt = (
+                update(StepRun)
+                .where(StepRun.step_run_id == step_run_id, StepRun.status.in_(allowed_from))
+                .values(**values)
+            )
+        else:
+            # No valid source states — this is a terminal state, reject
+            return False
+    else:
+        stmt = update(StepRun).where(StepRun.step_run_id == step_run_id).values(**values)
+
     result = await session.execute(stmt)
     return int(getattr(result, "rowcount", 0) or 0) > 0
 

@@ -8,6 +8,7 @@ execution.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import uuid
 from datetime import UTC, datetime
 from typing import Any, cast
@@ -186,6 +187,7 @@ class WorkflowEngine:
         Returns the updated TaskModel.
         """
         start_time = datetime.now(UTC)
+        max_workflow_seconds = 14400.0  # 4 hours default
         state = task.workflow_state or WorkflowState()
         task.workflow_state = state
 
@@ -202,6 +204,22 @@ class WorkflowEngine:
 
         try:
             while state.current_step_index < len(workflow.steps):
+                # Check overall workflow timeout
+                elapsed = (datetime.now(UTC) - start_time).total_seconds()
+                if elapsed > max_workflow_seconds:
+                    logger.error(
+                        "Workflow execution timed out",
+                        extra={
+                            "extra_data": {
+                                "task_id": task.task_id,
+                                "elapsed_seconds": elapsed,
+                                "max_seconds": max_workflow_seconds,
+                            }
+                        },
+                    )
+                    state.status = "failed"
+                    break
+
                 step_def = workflow.steps[state.current_step_index]
                 state.current_step_status = "running"
 
@@ -213,12 +231,23 @@ class WorkflowEngine:
                     revise_target = _parse_revise_action(gate_result)
                     if revise_target is not None:
                         target_idx = self._find_step_index(workflow, revise_target)
-                        if target_idx is not None:
-                            state.current_step_index = target_idx
-                            # Reset attempt counter so the step gets fresh attempts
-                            state.loop_iterations.pop(f"attempts:{revise_target}", None)
-                            await self._persist_workflow_state(task)
-                            continue
+                        if target_idx is None:
+                            logger.error(
+                                "Gate revise target step not found, failing workflow",
+                                extra={
+                                    "extra_data": {
+                                        "task_id": task.task_id,
+                                        "revise_target": revise_target,
+                                    }
+                                },
+                            )
+                            state.status = "failed"
+                            break
+                        state.current_step_index = target_idx
+                        # Reset attempt counter so the step gets fresh attempts
+                        state.loop_iterations.pop(f"attempts:{revise_target}", None)
+                        await self._persist_workflow_state(task)
+                        continue
                     # "continue" → advance
                     state.current_step_index += 1
                     await self._persist_workflow_state(task)
@@ -279,8 +308,11 @@ class WorkflowEngine:
                         break
                     continue
 
-                # Store step output
-                state.step_outputs[step_def.name] = step_result.model_dump(mode="json")
+                # Store step output temporarily — will be committed to
+                # state.step_outputs only after evaluation approves (or
+                # if no evaluation is configured).  This prevents rejected
+                # output from being visible to downstream steps.
+                pending_output = step_result.model_dump(mode="json")
 
                 # Evaluate if configured
                 completion = self._resolve_completion(step_def, workflow)
@@ -351,7 +383,9 @@ class WorkflowEngine:
                             break
                         continue
 
-                # Step approved or no evaluation — advance.
+                # Step approved or no evaluation — commit the output and advance.
+                state.step_outputs[step_def.name] = pending_output
+
                 # Mark the step session as completed now that it's approved.
                 if step_result and step_result.session_id:
                     try:
@@ -454,6 +488,11 @@ class WorkflowEngine:
             task.completed_at = datetime.now(UTC)
             await self._persist_task_final(task)
             WORKFLOWS_TOTAL.labels(workflow_name=workflow.name, status="failed").inc()
+
+        # Clean up step sessions — mark all as completed/failed based on
+        # final task status.  This prevents session resource leaks where
+        # step sessions stay "idle" or "active" forever.
+        await self._cleanup_step_sessions(task)
 
         duration = (datetime.now(UTC) - start_time).total_seconds()
         WORKFLOW_DURATION.labels(workflow_name=workflow.name).observe(duration)
@@ -561,12 +600,22 @@ class WorkflowEngine:
             user_email=task.created_by,
         )
 
-        # Load prior step context for injection into the LLM prompt.
-        # This replaces the former StepContextAssembler — the caller now
-        # resolves prior context and passes it to the unified assembler.
-        prior_context = await self._load_prior_step_context(
-            step_def, step_index, workflow.steps, state
+        # Log resolved step input for debugging.  Prior step context is
+        # delivered through event forking (type="full") or the step prompt
+        # (type="last"/"summary"), not through a separate prior_context.
+        effective_input = resolve_effective_input(step_def, step_index, workflow.steps)
+        logger.info(
+            "workflow: resolved step input",
+            extra={
+                "extra_data": {
+                    "step": step_def.name,
+                    "input_type": effective_input.type,
+                    "sources": effective_input.source_names(),
+                    "available_outputs": list(state.step_outputs.keys()),
+                }
+            },
         )
+        prior_context = None
 
         # Select execution policy based on agent type.
         # Secondary agents get SECONDARY_POLICY (skip memory, no orchestration).
@@ -708,7 +757,7 @@ class WorkflowEngine:
             if raw:
                 gate_context[input_name] = raw
 
-        # Pause workflow
+        # Pause workflow — write status + workflow_state atomically
         state.status = "paused"
         state.current_step_status = "paused"
         pause_id = f"gate_{uuid.uuid4().hex[:12]}"
@@ -722,11 +771,8 @@ class WorkflowEngine:
             "context": gate_context,
             "options": gate_options,
         }
-        await self._persist_workflow_state(task)
-
-        async with self._session_factory() as db_session:
-            await update_task_status(db_session, task.task_id, "paused")
-            await db_session.commit()
+        task.status = TaskStatus.PAUSED
+        await self._persist_workflow_state(task, sync_status=True)
 
         # Publish TASK_PAUSED so the chat delegation card updates status
         await self._event_bus.publish(
@@ -762,22 +808,28 @@ class WorkflowEngine:
             resolution = await self._pause_waiter.wait(pause_id, timeout=3600.0)
             action = resolution.decision
         except TimeoutError:
-            action = "continue"  # Default on timeout
+            logger.warning(
+                "Gate timed out after 3600s, defaulting to continue",
+                extra={
+                    "extra_data": {
+                        "task_id": task.task_id,
+                        "step": step_def.name,
+                        "pause_id": pause_id,
+                    }
+                },
+            )
+            action = "continue"
 
         GATES_TOTAL.labels(action=action).inc()
 
-        # Resume
+        # Resume — write status + workflow_state atomically
         state.status = "running"
         state.current_step_status = "running"
         state.pending_pause_type = None
         state.pending_pause_payload = None
-        await self._persist_workflow_state(task)
-        async with self._session_factory() as db_session:
-            await update_task_status(db_session, task.task_id, "running")
-            await db_session.commit()
+        task.status = TaskStatus.RUNNING
+        await self._persist_workflow_state(task, sync_status=True)
 
-        if action.startswith("revise"):
-            return action
         return action
 
     async def _handle_review_loop(
@@ -814,7 +866,14 @@ class WorkflowEngine:
                     }
                 },
             )
-            return await self._handle_exhausted(task, step_def, state, workflow, exhausted_action)
+            return await self._handle_exhausted(
+                task,
+                step_def,
+                state,
+                workflow,
+                exhausted_action,
+                last_error=state.last_evaluation_feedback,
+            )
 
         REVIEW_LOOPS.labels(step_name=step_def.name).inc()
         state.loop_iterations[loop_key] = current_iterations + 1
@@ -832,10 +891,12 @@ class WorkflowEngine:
             },
         )
 
-        # Jump back to the target step
+        # Jump back to the target step — reset its attempt counter so it
+        # gets fresh attempts (same as gate-revise does).
         target_idx = self._find_step_index(workflow, on_reject.target)
         if target_idx is not None:
             state.current_step_index = target_idx
+            state.loop_iterations.pop(f"attempts:{on_reject.target}", None)
             await self._persist_workflow_state(task)
             return True
 
@@ -873,6 +934,12 @@ class WorkflowEngine:
 
         if current_attempts >= max_attempts:
             exhausted_action = self._get_on_exhausted(step_def, workflow)
+            # Build a human-readable error summary for the exhaustion gate
+            error_summary: str | None = None
+            if evaluation:
+                error_summary = evaluation.feedback or evaluation.reasoning
+            elif state.last_evaluation_feedback:
+                error_summary = state.last_evaluation_feedback
             logger.warning(
                 "Step retry attempts exhausted",
                 extra={
@@ -886,7 +953,9 @@ class WorkflowEngine:
                     }
                 },
             )
-            return await self._handle_exhausted(task, step_def, state, workflow, exhausted_action)
+            return await self._handle_exhausted(
+                task, step_def, state, workflow, exhausted_action, last_error=error_summary
+            )
 
         # Record evaluation feedback if available (so agent sees it on retry)
         if evaluation:
@@ -971,6 +1040,7 @@ class WorkflowEngine:
         state: WorkflowState,
         workflow: Workflow,
         action: str,
+        last_error: str | None = None,
     ) -> bool:
         """Handle exhausted attempts/loops.
 
@@ -1024,7 +1094,7 @@ class WorkflowEngine:
                 StepDefinition(
                     name=f"{step_def.name}_exhausted",
                     type="gate",
-                    gate=_build_exhaustion_gate(step_def),
+                    gate=_build_exhaustion_gate(step_def, last_error=last_error),
                 ),
                 state,
                 workflow,
@@ -1154,16 +1224,25 @@ class WorkflowEngine:
             )
         )
 
-    async def _persist_workflow_state(self, task: TaskModel) -> None:
-        """Persist workflow state to DB after a step transition."""
+    async def _persist_workflow_state(self, task: TaskModel, *, sync_status: bool = False) -> None:
+        """Persist workflow state to DB after a step transition.
+
+        Increments the workflow state version for optimistic concurrency.
+        When *sync_status* is ``True``, the task status is also written
+        in the same transaction to avoid split-brain between
+        ``task.status`` and ``workflow_state.status``.
+        """
         if task.workflow_state is None:
             return
+        task.workflow_state.version += 1
         async with self._session_factory() as db_session:
             await update_task_workflow_state(
                 db_session,
                 task.task_id,
                 task.workflow_state.model_dump(mode="json"),
             )
+            if sync_status:
+                await update_task_status(db_session, task.task_id, task.status)
             await db_session.commit()
 
     async def _persist_task_final(self, task: TaskModel) -> None:
@@ -1185,6 +1264,35 @@ class WorkflowEngine:
                 )
             await db_session.commit()
 
+    async def _cleanup_step_sessions(self, task: TaskModel) -> None:
+        """Mark all step sessions as completed/failed based on final task status.
+
+        Called at the end of ``execute_workflow`` to prevent session
+        resource leaks.  Sessions that are already completed are skipped.
+        """
+        from cognis.store.queries import list_step_runs_for_task
+
+        completion_reason = (
+            "step_approved" if task.status == TaskStatus.COMPLETED else f"task_{task.status}"
+        )
+        try:
+            async with self._session_factory() as db_session:
+                step_runs = await list_step_runs_for_task(db_session, task.task_id)
+
+            for sr in step_runs:
+                if sr.session_id is None:
+                    continue
+                with contextlib.suppress(Exception):
+                    await self._session_manager.mark_completed(
+                        sr.session_id,
+                        completion_reason=completion_reason,
+                    )
+        except Exception:
+            logger.warning(
+                "workflow: failed to clean up step sessions",
+                extra={"extra_data": {"task_id": task.task_id}},
+            )
+
     async def _read_task_status(self, task_id: str) -> TaskStatus:
         """Read the latest persisted task status."""
         from cognis.store.queries import get_task
@@ -1194,42 +1302,6 @@ class WorkflowEngine:
         if row is None:
             return TaskStatus.FAILED
         return TaskStatus(str(row.status))
-
-    async def _load_prior_step_context(
-        self,
-        step_def: StepDefinition,
-        step_index: int,
-        workflow_steps: list[StepDefinition],
-        state: WorkflowState,
-    ) -> list[dict[str, Any]] | None:
-        """Resolve prior step context for the current step.
-
-        Prior step output is delivered through two mechanisms:
-
-        * **``type="full"``** — source step events are forked into the new
-          session (via ``_fork_source_events``) so they appear as natural
-          history.  No separate ``prior_context`` injection needed.
-        * **``type="last"`` / ``type="summary"``** — structured step output
-          (summary, claims, content) is included directly in the step prompt
-          by ``_build_step_prompt`` → ``_format_prior_step_outputs``.
-
-        In all cases this method returns ``None`` — the prior context is
-        handled elsewhere.  The method is kept for logging and future
-        extensibility.
-        """
-        effective_input = resolve_effective_input(step_def, step_index, workflow_steps)
-        logger.info(
-            "workflow: resolved step input",
-            extra={
-                "extra_data": {
-                    "step": step_def.name,
-                    "input_type": effective_input.type,
-                    "sources": effective_input.source_names(),
-                    "available_outputs": list(state.step_outputs.keys()),
-                }
-            },
-        )
-        return None
 
     async def _fork_source_events(
         self,
@@ -1482,16 +1554,24 @@ class WorkflowEngine:
         return ""
 
 
-def _build_exhaustion_gate(step_def: StepDefinition) -> Any:
+def _build_exhaustion_gate(step_def: StepDefinition, last_error: str | None = None) -> Any:
     """Build a gate config for exhausted step attempts.
 
-    Only offers "Retry step" — the user can cancel the task from the
-    task board if they don't want to retry.
+    Includes the last error/evaluation feedback so the user knows what
+    went wrong.  Offers "Retry step" — the user can cancel the task
+    from the task board if they don't want to retry.
     """
     from cognis.models.workflow import GateConfig, GateOption
 
+    max_attempts = step_def.completion.max_attempts if step_def.completion else 3
+    message = f"Step '{step_def.name}' has exhausted its retry limit ({max_attempts} attempts)."
+    if last_error:
+        message += f"\n\nLast failure: {last_error[:500]}"
+    message += "\n\nYou can retry or cancel the task from the task board."
+
     return GateConfig(
-        message=f"Step '{step_def.name}' has exhausted its retry limit ({step_def.completion.max_attempts if step_def.completion else '?'} attempts). You can retry or cancel the task from the task board.",
+        message=message,
+        input=[],
         options=[
             GateOption(label="Retry step", action=f"revise({step_def.name})"),
         ],
