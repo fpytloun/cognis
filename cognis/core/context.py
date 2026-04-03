@@ -847,6 +847,10 @@ def events_to_messages(events: list[Any]) -> list[dict[str, Any]]:
                             "content": f"Step completed: {summary}",
                         }
                     )
+            elif lifecycle_event == "system_notice":
+                notice_msg = event_data.get("message", "")
+                if notice_msg:
+                    messages.append({"role": "system", "content": notice_msg})
             # Other lifecycle events (task_status, etc.) are informational — skip
         elif event_type == "evaluation":
             eval_event = event_data.get("event", "")

@@ -364,6 +364,16 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
         } else {
           items.push(delegation);
         }
+      } else if (lifecycleEvent === 'system_notice') {
+        const message = String(event.data?.message ?? '');
+        if (message) {
+          items.push({
+            id: `system:${event.seq}`,
+            kind: 'system_message',
+            text: message,
+            timestamp: event.timestamp
+          });
+        }
       }
       continue;
     }

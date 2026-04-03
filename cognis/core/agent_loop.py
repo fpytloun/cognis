@@ -1166,12 +1166,13 @@ class AgentLoop:
                             }
                         },
                     )
-                    if on_token:
-                        await on_token("\n\n[Retrying...]\n\n")
+                    # Retry is transparent to the user — no visible message.
                     await asyncio.sleep(1.0 * mid_stream_retries)
                     continue  # retry — messages is clean, accumulator is fresh next iteration
 
-                # Retries exhausted — capture partial content and inform user
+                # Retries exhausted — capture partial content (if any) and
+                # record a lifecycle event so the failure appears as a system
+                # message in the UI, not as assistant text.
                 partial_content = accumulator.get_content()
                 if partial_content:
                     events_to_record.append(
@@ -1189,13 +1190,15 @@ class AgentLoop:
                     },
                 )
                 error_notice = (
-                    "I encountered a model error while generating my response. "
+                    "A model error occurred while generating the response. "
                     "Your tool results have been saved. Please try sending your message again."
                 )
                 events_to_record.append(
-                    SessionEvent(type="assistant_message", data={"content": error_notice})
+                    SessionEvent(
+                        type="lifecycle",
+                        data={"event": "system_notice", "message": error_notice},
+                    )
                 )
-                assistant_content_parts.append(error_notice)
                 if on_token:
                     await on_token(f"\n\n{error_notice}")
                 break  # Exit while loop → _finalize_step runs normally
