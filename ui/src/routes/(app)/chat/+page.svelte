@@ -9,6 +9,7 @@
 
   let loading = true;
   let error = '';
+  let noAgents = false;
 
   function getSelectedAgentId(agents: Agent[]): string {
     const primary = agents.filter((a) => a.agent_type === 'primary');
@@ -27,7 +28,7 @@
         const agents = await api.agents.listAll();
         const agentId = getSelectedAgentId(agents);
         if (!agentId) {
-          error = 'Create an agent first before starting a conversation.';
+          noAgents = true;
           loading = false;
           return;
         }
@@ -49,6 +50,13 @@
 
 {#if loading}
   <LoadingState label="Opening chat" description="Resolving your default conversation." />
+{:else if noAgents}
+  <section class="rounded-3xl border border-amber-500/30 bg-amber-500/10 px-6 py-10 text-center text-sm text-amber-100">
+    <p>Create an agent first before starting a conversation.</p>
+    <div class="mt-4 flex justify-center gap-3">
+      <Button onclick={() => goto('/agents')}>Open agents</Button>
+    </div>
+  </section>
 {:else if error}
   <section class="rounded-3xl border border-rose-500/30 bg-rose-500/10 px-6 py-10 text-center text-sm text-rose-100">
     <p>{error}</p>
