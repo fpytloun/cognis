@@ -46,7 +46,7 @@
     system: 'system',
     account: 'account'
   };
-  $: tabs = isAdmin ? ALL_TABS : ALL_TABS.filter((t) => t !== 'users');
+  $: tabs = isAdmin ? ALL_TABS : ALL_TABS.filter((t) => t !== 'users' && t !== 'system');
   let activeTab: SettingsTab = 'providers';
   let loading = true;
   let busy = false;
