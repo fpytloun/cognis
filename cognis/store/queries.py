@@ -1072,8 +1072,26 @@ async def update_task_workflow_state(
     session: AsyncSession,
     task_id: str,
     workflow_state: dict[str, object],
+    *,
+    expected_version: int | None = None,
 ) -> bool:
-    """Persist workflow state after a step transition."""
+    """Persist workflow state after a step transition.
+
+    When *expected_version* is provided, the update uses optimistic
+    concurrency: it reads the current row, checks the stored version,
+    and only writes if it matches.  Returns ``False`` if the version
+    has been changed by another writer (stale write detected).
+    """
+    if expected_version is not None:
+        # Read current state to check version (within the same session/tx)
+        row = await session.execute(select(Task.workflow_state).where(Task.task_id == task_id))
+        current_ws = row.scalar_one_or_none()
+        if current_ws is not None and isinstance(current_ws, dict):
+            db_version = current_ws.get("version", 0)
+            if db_version >= expected_version:
+                # Another writer already advanced the version — stale write
+                return False
+
     stmt = update(Task).where(Task.task_id == task_id).values(workflow_state=workflow_state)
     result = await session.execute(stmt)
     return int(getattr(result, "rowcount", 0) or 0) > 0

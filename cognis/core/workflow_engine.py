@@ -1161,33 +1161,46 @@ class WorkflowEngine:
         )
 
         # Record to target conversation's active Intaris session.
-        try:
-            async with self._session_factory() as db_session:
-                from cognis.store.queries import (
-                    get_conversation,
-                    get_latest_active_session_for_conversation,
-                    get_session_row,
-                )
-
-                sess = await get_latest_active_session_for_conversation(
-                    db_session, target_conversation_id
-                )
-                if sess is None:
-                    conv = await get_conversation(db_session, target_conversation_id)
-                    if conv and conv.active_session_id:
-                        sess = await get_session_row(db_session, conv.active_session_id)
-
-                if sess and sess.intaris_session_id:
-                    await self._providers.guardrails.record_events(
-                        session_id=sess.intaris_session_id,
-                        events=[event],
-                        source="cognis",
+        # The Intaris provider already retries internally (exponential
+        # backoff), so a failure here means retries were exhausted.
+        # We do one additional delayed attempt before giving up.
+        for attempt in range(2):
+            try:
+                async with self._session_factory() as db_session:
+                    from cognis.store.queries import (
+                        get_conversation,
+                        get_latest_active_session_for_conversation,
+                        get_session_row,
                     )
-        except Exception:
-            logger.warning(
-                "Failed to deliver task result to conversation",
-                extra={"extra_data": {"task_id": task.task_id}},
-            )
+
+                    sess = await get_latest_active_session_for_conversation(
+                        db_session, target_conversation_id
+                    )
+                    if sess is None:
+                        conv = await get_conversation(db_session, target_conversation_id)
+                        if conv and conv.active_session_id:
+                            sess = await get_session_row(db_session, conv.active_session_id)
+
+                    if sess and sess.intaris_session_id:
+                        await self._providers.guardrails.record_events(
+                            session_id=sess.intaris_session_id,
+                            events=[event],
+                            source="cognis",
+                        )
+                break  # Success
+            except Exception:
+                if attempt == 0:
+                    logger.warning(
+                        "Task result delivery failed, retrying in 2s",
+                        extra={"extra_data": {"task_id": task.task_id}},
+                    )
+                    await asyncio.sleep(2.0)
+                else:
+                    logger.error(
+                        "Task result delivery failed after retry",
+                        extra={"extra_data": {"task_id": task.task_id}},
+                        exc_info=True,
+                    )
 
         # Publish event for WebSocket delivery
         event_type = EventType.TASK_FAILED
@@ -1228,19 +1241,50 @@ class WorkflowEngine:
         """Persist workflow state to DB after a step transition.
 
         Increments the workflow state version for optimistic concurrency.
+        Before writing, checks the current DB status — if the task has
+        been cancelled or failed externally (e.g. via API), the persist
+        is aborted and ``StepInterrupted`` is raised so the workflow
+        engine's exception handler catches it.
+
         When *sync_status* is ``True``, the task status is also written
         in the same transaction to avoid split-brain between
         ``task.status`` and ``workflow_state.status``.
         """
         if task.workflow_state is None:
             return
+
+        # Check for external mutations (cancel, fail) before overwriting
+        db_status = await self._read_task_status(task.task_id)
+        if db_status in {TaskStatus.CANCELLED, TaskStatus.FAILED} and task.status not in {
+            TaskStatus.CANCELLED,
+            TaskStatus.FAILED,
+        }:
+            logger.warning(
+                "Task was externally %s, aborting workflow state persist",
+                db_status,
+                extra={"extra_data": {"task_id": task.task_id}},
+            )
+            task.status = db_status
+            raise StepInterrupted(task.task_id)
+
         task.workflow_state.version += 1
         async with self._session_factory() as db_session:
-            await update_task_workflow_state(
+            ok = await update_task_workflow_state(
                 db_session,
                 task.task_id,
                 task.workflow_state.model_dump(mode="json"),
+                expected_version=task.workflow_state.version,
             )
+            if not ok:
+                logger.warning(
+                    "Stale workflow state write detected (version conflict)",
+                    extra={
+                        "extra_data": {
+                            "task_id": task.task_id,
+                            "version": task.workflow_state.version,
+                        }
+                    },
+                )
             if sync_status:
                 await update_task_status(db_session, task.task_id, task.status)
             await db_session.commit()
