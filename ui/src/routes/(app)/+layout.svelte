@@ -303,7 +303,9 @@
             <Button aria-label="Open navigation" class="md:hidden" size="sm" variant="secondary" onclick={() => (mobileNavOpen = true)}>
               <Menu class="h-4 w-4" />
             </Button>
-            <Button size="sm" variant="secondary" onclick={() => goto('/getting-started')}>Getting started</Button>
+            {#if $auth.user?.role === 'admin'}
+              <Button size="sm" variant="secondary" onclick={() => goto('/getting-started')}>Getting started</Button>
+            {/if}
             <Button aria-label="Open keyboard shortcuts" size="sm" variant="secondary" onclick={openShortcutHelp}>
               <CircleHelp class="h-4 w-4" />
             </Button>

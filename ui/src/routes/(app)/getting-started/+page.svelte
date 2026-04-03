@@ -3,6 +3,7 @@
 
   import { api, asApiError } from '$lib/api/client';
   import { deriveGettingStartedSteps, setGettingStartedDismissed } from '$lib/getting-started';
+  import { auth } from '$lib/stores/auth';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import Card from '$lib/components/ui/Card.svelte';
@@ -24,6 +25,10 @@
   async function loadDiagnostics(): Promise<void> {
     loading = true;
     error = '';
+    if (auth.getSnapshot().user?.role !== 'admin') {
+      loading = false;
+      return;
+    }
     try {
       diagnostics = await api.system.diagnostics();
     } catch (caughtError) {
@@ -65,6 +70,14 @@
 
     {#if error}
       <p class="rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-100">{error}</p>
+    {/if}
+
+    {#if !diagnostics && !error}
+      <Card class="p-6">
+        <p class="text-sm text-slate-400">
+          System diagnostics are only available to administrators. Contact your admin for setup assistance.
+        </p>
+      </Card>
     {/if}
 
     {#if diagnostics}
