@@ -220,6 +220,33 @@ def build_step_runtime_factory(
 
             return registry, connection, cleanup
 
+        # Determine executor type from resolved config
+        resolved_type = (
+            executor_config.get("executor_type", "in_process") if executor_config else "in_process"
+        )
+
+        if resolved_type in ("websocket", "subprocess"):
+            # Remote executor — get tools from the executor itself.
+            # The executor manages its own tool handlers and MCP servers.
+            from cognis.providers.executor.websocket import WebSocketExecutorProvider
+
+            ws_provider: WebSocketExecutorProvider = providers.executor.websocket
+            executor_id = executor_config.get("executor_id", "") if executor_config else ""
+            conn = ws_provider.get_connection(executor_id)
+            if conn is not None:
+                try:
+                    remote_tools = await conn.list_tools()
+                    remote_registry = ToolRegistry()
+                    for tool_data in remote_tools:
+                        tool_def = ToolDefinition.model_validate(tool_data)
+                        remote_registry.register(RegisteredTool(definition=tool_def))
+                    return remote_registry, conn, noop_cleanup
+                except Exception:
+                    logger.warning(
+                        "Failed to get tools from remote executor, falling back to in-process",
+                        extra={"extra_data": {"executor_id": executor_id}},
+                    )
+
         if isinstance(shared_connection, InProcessExecutorConnection):
             # Build registry WITH handlers so tool_execute() can dispatch
             handler_map = _build_handler_map(

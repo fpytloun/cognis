@@ -73,6 +73,19 @@ class JWTAuthProvider:
             self.token_ttl_seconds,
         )
 
+    def sign_executor_token(self, executor_id: str, ttl_seconds: int = 30 * 24 * 3600) -> str:
+        """Sign a long-lived JWT for executor authentication.
+
+        Default TTL is 30 days.  For subprocess executors use a short TTL
+        (e.g. 300 seconds).  The token carries ``typ=executor`` and
+        ``aud=["cognis-executor"]`` so it cannot be confused with user or
+        service tokens.
+        """
+        return self._sign(
+            {"sub": executor_id, "aud": ["cognis-executor"], "typ": "executor"},
+            ttl_seconds,
+        )
+
     def sign_exchange_token(self, subject: str, target: str) -> str:
         return self._sign(
             {"sub": subject, "aud": [target], "typ": "exchange", "target": target},

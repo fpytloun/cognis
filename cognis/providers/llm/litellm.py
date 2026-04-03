@@ -93,9 +93,11 @@ class LiteLLMProvider:
         self,
         session_factory: async_sessionmaker[Any],
         secrets_provider: Any | None = None,
+        inference_router: Any | None = None,
     ) -> None:
         self.session_factory = session_factory
         self._secrets = secrets_provider
+        self._inference_router = inference_router
         self._cache_lock = asyncio.Lock()
         self._resolved_model_cache: dict[str, tuple[str, float]] = {}
         self._model_info_cache: dict[str, tuple[ModelInfo, float]] = {}
@@ -185,6 +187,11 @@ class LiteLLMProvider:
         from cognis.providers.llm.retry import with_llm_retry
 
         resolved_model, provider = await self._resolve_model_target(model, task_type=task_type)
+
+        # Route to executor-side inference if provider is configured for it
+        if self._should_route_to_executor(provider):
+            return await self._executor_generate(resolved_model, messages, provider, **kwargs)
+
         prefixed_model = self._apply_model_prefix(resolved_model, provider)
         request_kwargs = {**await self._resolve_provider_kwargs(provider), **kwargs}
         prepared_messages = _apply_cache_hints(messages, resolved_model, cache_breakpoint_index)
@@ -239,6 +246,15 @@ class LiteLLMProvider:
         from cognis.providers.llm.retry import with_llm_retry
 
         resolved_model, provider = await self._resolve_model_target(model, task_type=task_type)
+
+        # Route to executor-side inference if provider is configured for it
+        if self._should_route_to_executor(provider):
+            async for chunk in self._executor_stream_generate(
+                resolved_model, messages, provider, **kwargs
+            ):
+                yield chunk
+            return
+
         prefixed_model = self._apply_model_prefix(resolved_model, provider)
         request_kwargs = {**await self._resolve_provider_kwargs(provider), **kwargs}
         prepared_messages = _apply_cache_hints(messages, resolved_model, cache_breakpoint_index)
@@ -659,3 +675,51 @@ class LiteLLMProvider:
                 model_info,
                 monotonic() + MODEL_CACHE_TTL_SECONDS,
             )
+
+    # ------------------------------------------------------------------
+    # Executor-side inference routing
+    # ------------------------------------------------------------------
+
+    def _should_route_to_executor(self, provider: Any | None) -> bool:
+        """Check if a provider is configured for executor-side inference."""
+        if provider is None or self._inference_router is None:
+            return False
+        config = provider.config if hasattr(provider, "config") else None
+        if not isinstance(config, dict):
+            return False
+        return config.get("location") == "executor" and config.get("backend") == "executor"
+
+    async def _executor_generate(
+        self,
+        model: str,
+        messages: list[dict[str, Any]],
+        provider: Any,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Route a non-streaming request to executor-side inference."""
+        config = provider.config if hasattr(provider, "config") else {}
+        executor_labels = config.get("executor_labels") if isinstance(config, dict) else None
+        return await self._inference_router.route_generate(
+            messages=messages,
+            model=model,
+            executor_labels=executor_labels,
+            **kwargs,
+        )
+
+    async def _executor_stream_generate(
+        self,
+        model: str,
+        messages: list[dict[str, Any]],
+        provider: Any,
+        **kwargs: Any,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Route a streaming request to executor-side inference."""
+        config = provider.config if hasattr(provider, "config") else {}
+        executor_labels = config.get("executor_labels") if isinstance(config, dict) else None
+        async for chunk in self._inference_router.route_stream(
+            messages=messages,
+            model=model,
+            executor_labels=executor_labels,
+            **kwargs,
+        ):
+            yield chunk

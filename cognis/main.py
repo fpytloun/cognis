@@ -6,6 +6,7 @@ import httpx
 import typer
 
 from cognis.cli.admin import admin_app, print_env_template
+from cognis.cli.executor import executor_app
 from cognis.cli.serve import serve
 from cognis.config import load_config
 
@@ -13,6 +14,7 @@ app = typer.Typer(invoke_without_command=True, help="Cognis controller")
 config_app = typer.Typer(help="Configuration helpers")
 app.add_typer(admin_app, name="admin")
 app.add_typer(config_app, name="config")
+app.add_typer(executor_app, name="executor")
 
 
 @app.callback()
