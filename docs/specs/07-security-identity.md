@@ -209,6 +209,30 @@ class UserRole(str, Enum):
     SERVICE = "service"  # API access, no UI
 ```
 
+### User Management
+
+Admins can manage users via the REST API (`/api/v1/admin/users/*`) or CLI
+(`cognis admin` commands). The Users table includes:
+
+- `is_active` — soft delete flag; disabled users cannot log in or use API
+- `last_login_at` — updated on each successful login
+- `disabled_at` / `disabled_by` — audit trail for soft deletes
+
+**Soft delete (disable):** Sets `is_active=false`. The user's data remains
+intact. The middleware checks `is_active` on every authenticated request
+(JWT, API key, cookie) and returns `403 Account disabled` for inactive users.
+
+**Hard delete:** Cascades to all user-owned resources in Cognis DB
+(conversations, sessions, agents, tasks, workflows, schedules, secrets,
+API keys, executors, skills). Does NOT cascade to Mnemory/Intaris.
+
+**Safety guards:** Cannot delete/disable yourself. Cannot demote, disable,
+or delete the last admin user.
+
+**Self-service:** Users can update their own display name via
+`PATCH /api/auth/me`. Password changes use the existing
+`POST /api/auth/change-password` endpoint.
+
 ### Resource Authorization
 
 In MVP, all data is effectively scoped by the authenticated user's email.

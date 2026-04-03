@@ -37,7 +37,10 @@ import type {
   Task,
   TaskDetail,
   ToolDefinitionSummary,
+  UserCreatePayload,
+  UserDetail,
   UserSummary,
+  UserUpdatePayload,
   WebConfigStatus,
   Workflow,
   WorkflowRun
@@ -209,6 +212,55 @@ export const api = {
     exchangeToken(target: 'intaris' | 'mnemory'): Promise<ExchangeTokenResponse> {
       return request<ExchangeTokenResponse>(`/api/v1/auth/exchange-token${encodeQuery({ target })}`, {
         method: 'POST'
+      });
+    },
+
+    updateProfile(payload: { name?: string | null }): Promise<UserSummary> {
+      return request<UserSummary>('/api/auth/me', {
+        method: 'PATCH',
+        body: JSON.stringify(payload)
+      });
+    }
+  },
+
+  users: {
+    list(includeDisabled = false): Promise<CursorPage<UserDetail>> {
+      return request<CursorPage<UserDetail>>(`/api/v1/admin/users${encodeQuery({ include_disabled: includeDisabled })}`);
+    },
+
+    detail(email: string): Promise<UserDetail> {
+      return request<UserDetail>(`/api/v1/admin/users/${encodeURIComponent(email)}`);
+    },
+
+    create(payload: UserCreatePayload): Promise<UserDetail> {
+      return request<UserDetail>('/api/v1/admin/users', {
+        method: 'POST',
+        body: JSON.stringify(payload)
+      });
+    },
+
+    update(email: string, payload: UserUpdatePayload): Promise<UserDetail> {
+      return request<UserDetail>(`/api/v1/admin/users/${encodeURIComponent(email)}`, {
+        method: 'PATCH',
+        body: JSON.stringify(payload)
+      });
+    },
+
+    disable(email: string): Promise<UserDetail> {
+      return request<UserDetail>(`/api/v1/admin/users/${encodeURIComponent(email)}/disable`, {
+        method: 'POST'
+      });
+    },
+
+    enable(email: string): Promise<UserDetail> {
+      return request<UserDetail>(`/api/v1/admin/users/${encodeURIComponent(email)}/enable`, {
+        method: 'POST'
+      });
+    },
+
+    remove(email: string): Promise<{ ok: boolean }> {
+      return request<{ ok: boolean }>(`/api/v1/admin/users/${encodeURIComponent(email)}${encodeQuery({ confirm: true })}`, {
+        method: 'DELETE'
       });
     }
   },

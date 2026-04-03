@@ -28,21 +28,25 @@
     SettingsCategory,
     SystemDiagnostics,
     ToolDefinitionSummary,
+    UserDetail,
+    UserRole,
     WebConfigStatus
   } from '$lib/types/api';
 
-  type SettingsTab = 'providers' | 'routing' | 'secrets' | 'web' | 'executors' | 'system' | 'account';
+  type SettingsTab = 'providers' | 'routing' | 'secrets' | 'web' | 'executors' | 'users' | 'system' | 'account';
 
-  const tabs: SettingsTab[] = ['providers', 'routing', 'secrets', 'web', 'executors', 'system', 'account'];
+  const ALL_TABS: SettingsTab[] = ['providers', 'routing', 'secrets', 'web', 'executors', 'users', 'system', 'account'];
   const TAB_LABELS: Record<SettingsTab, string> = {
     providers: 'providers',
     routing: 'routing',
     secrets: 'secrets',
     web: 'web search',
     executors: 'executors',
+    users: 'users',
     system: 'system',
     account: 'account'
   };
+  $: tabs = isAdmin ? ALL_TABS : ALL_TABS.filter((t) => t !== 'users');
   let activeTab: SettingsTab = 'providers';
   let loading = true;
   let busy = false;
@@ -77,6 +81,17 @@
   let newApiKeyName = '';
   let newApiKeyExpiresInDays = '';
   let initialSnapshot = '';
+
+  // User management state
+  let userList: UserDetail[] = [];
+  let showUserCreateModal = false;
+  let showUserEditModal = false;
+  let showDisabledUsers = false;
+  let editingUser: UserDetail | null = null;
+  let userCreateForm = { email: '', name: '', password: '', confirm_password: '', role: 'user' as UserRole };
+  let userEditForm = { name: '', role: 'user' as UserRole };
+  let accountNameForm = '';
+  let accountNameDirty = false;
 
   let routingForm = {
     default: '',
@@ -333,6 +348,10 @@
     webConfig = await api.webConfig.status().catch(() => webConfig);
     webBackendForm = webConfig.backend;
 
+    // Initialize account name form
+    accountNameForm = auth.getSnapshot().user?.name ?? '';
+    accountNameDirty = false;
+
     if (isAdmin) {
       [providers, diagnostics, agents, executorConfigs, executorTools] = await Promise.all([
         api.llmProviders.list().then((page) => page.items),
@@ -341,12 +360,14 @@
         api.executor.list().catch(() => []),
         api.tools.executorTools().catch(() => []),
       ]);
+      await loadUsers();
     } else {
       providers = [];
       diagnostics = null;
       agents = [];
       executorConfigs = [];
       executorTools = [];
+      userList = [];
     }
 
     if (selectedProviderId) {
@@ -715,6 +736,143 @@
     } catch (caughtError) {
       error = asApiError(caughtError).message;
       addToast(error, 'error', 4_000, 'Unable to revoke API key');
+    } finally {
+      busy = false;
+    }
+  }
+
+  // --- User management functions ---
+
+  async function loadUsers(): Promise<void> {
+    try {
+      const page = await api.users.list(showDisabledUsers);
+      userList = page.items;
+    } catch {
+      userList = [];
+    }
+  }
+
+  function openCreateUserModal(): void {
+    userCreateForm = { email: '', name: '', password: '', confirm_password: '', role: 'user' };
+    showUserCreateModal = true;
+  }
+
+  function openEditUserModal(user: UserDetail): void {
+    editingUser = user;
+    userEditForm = { name: user.name ?? '', role: user.role };
+    showUserEditModal = true;
+  }
+
+  async function createUserSubmit(): Promise<void> {
+    if (userCreateForm.password !== userCreateForm.confirm_password) {
+      addToast('Passwords do not match.', 'error');
+      return;
+    }
+    busy = true;
+    error = '';
+    try {
+      await api.users.create({
+        email: userCreateForm.email,
+        name: userCreateForm.name || undefined,
+        password: userCreateForm.password,
+        role: userCreateForm.role
+      });
+      showUserCreateModal = false;
+      await loadUsers();
+      addToast('User created.', 'success');
+    } catch (caughtError) {
+      error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to create user');
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function updateUserSubmit(): Promise<void> {
+    if (!editingUser) return;
+    busy = true;
+    error = '';
+    try {
+      await api.users.update(editingUser.email, {
+        name: userEditForm.name || undefined,
+        role: userEditForm.role
+      });
+      showUserEditModal = false;
+      editingUser = null;
+      await loadUsers();
+      addToast('User updated.', 'success');
+    } catch (caughtError) {
+      error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to update user');
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function toggleUserActive(user: UserDetail): Promise<void> {
+    if (user.is_active) {
+      const confirmed = await confirmAction({
+        title: 'Disable user?',
+        message: `${user.email} will no longer be able to log in. Their data will be preserved.`,
+        confirmLabel: 'Disable user',
+        variant: 'danger'
+      });
+      if (!confirmed) return;
+      busy = true;
+      try {
+        await api.users.disable(user.email);
+        await loadUsers();
+        addToast('User disabled.', 'success');
+      } catch (caughtError) {
+        addToast(asApiError(caughtError).message, 'error', 4_000, 'Unable to disable user');
+      } finally {
+        busy = false;
+      }
+    } else {
+      busy = true;
+      try {
+        await api.users.enable(user.email);
+        await loadUsers();
+        addToast('User enabled.', 'success');
+      } catch (caughtError) {
+        addToast(asApiError(caughtError).message, 'error', 4_000, 'Unable to enable user');
+      } finally {
+        busy = false;
+      }
+    }
+  }
+
+  async function deleteUser(user: UserDetail): Promise<void> {
+    const confirmed = await confirmAction({
+      title: 'Delete user permanently?',
+      message: `This will permanently delete ${user.email} and all their data (conversations, agents, tasks). This cannot be undone.`,
+      confirmLabel: 'Delete permanently',
+      variant: 'danger'
+    });
+    if (!confirmed) return;
+    busy = true;
+    try {
+      await api.users.remove(user.email);
+      await loadUsers();
+      addToast('User deleted.', 'success');
+    } catch (caughtError) {
+      addToast(asApiError(caughtError).message, 'error', 4_000, 'Unable to delete user');
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function saveAccountName(): Promise<void> {
+    busy = true;
+    error = '';
+    try {
+      const updated = await api.auth.updateProfile({ name: accountNameForm || null });
+      auth.updateUser(updated);
+      accountNameDirty = false;
+      addToast('Name updated.', 'success');
+    } catch (caughtError) {
+      error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to update name');
     } finally {
       busy = false;
     }
@@ -1495,6 +1653,66 @@
           </div>
         {/if}
       </div>
+    {:else if activeTab === 'users'}
+      <div class="space-y-5">
+        <Card class="p-5">
+          <div class="space-y-4">
+            <div class="flex items-center justify-between gap-3">
+              <div>
+                <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Administration</p>
+                <h2 class="mt-1 text-lg font-semibold text-white">User management</h2>
+              </div>
+              <div class="flex items-center gap-3">
+                <label class="flex items-center gap-2 text-sm text-slate-300">
+                  <input type="checkbox" bind:checked={showDisabledUsers}
+                    class="rounded border-slate-600 bg-slate-800 text-emerald-500 focus:ring-emerald-500/30"
+                    onchange={() => void loadUsers()}
+                  />
+                  Show disabled
+                </label>
+                <Button onclick={openCreateUserModal}>Create user</Button>
+              </div>
+            </div>
+
+            {#each userList as user}
+              {@const isSelf = user.email === auth.getSnapshot().user?.email}
+              <div class="flex items-center justify-between gap-3 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3 {!user.is_active ? 'opacity-60' : ''}">
+                <div class="min-w-0 flex-1">
+                  <div class="flex items-center gap-2">
+                    <p class="font-medium text-white truncate">{user.email}</p>
+                    {#if !user.is_active}
+                      <span class="rounded-full border border-rose-500/40 bg-rose-500/10 px-2 py-0.5 text-xs text-rose-300">disabled</span>
+                    {/if}
+                    {#if isSelf}
+                      <span class="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-2 py-0.5 text-xs text-emerald-300">you</span>
+                    {/if}
+                  </div>
+                  <p class="text-sm text-slate-400">{user.name ?? ''}</p>
+                  <div class="mt-1 flex flex-wrap gap-3 text-xs text-slate-500">
+                    <span>Role: <span class="text-slate-300">{user.role}</span></span>
+                    <span>Last login: {user.last_login_at ? new Date(user.last_login_at).toLocaleDateString() : 'never'}</span>
+                    <span>Created: {user.created_at ? new Date(user.created_at).toLocaleDateString() : ''}</span>
+                    {#if user.disabled_by}
+                      <span>Disabled by: {user.disabled_by}</span>
+                    {/if}
+                  </div>
+                </div>
+                <div class="flex items-center gap-2">
+                  <Button size="sm" variant="secondary" onclick={() => openEditUserModal(user)} disabled={busy}>Edit</Button>
+                  {#if !isSelf}
+                    <Button size="sm" variant={user.is_active ? 'danger' : 'secondary'} onclick={() => toggleUserActive(user)} disabled={busy}>
+                      {user.is_active ? 'Disable' : 'Enable'}
+                    </Button>
+                    <Button size="sm" variant="danger" onclick={() => deleteUser(user)} disabled={busy}>Delete</Button>
+                  {/if}
+                </div>
+              </div>
+            {:else}
+              <p class="text-sm text-slate-400">No users found.</p>
+            {/each}
+          </div>
+        </Card>
+      </div>
     {:else}
       <div class="grid gap-5 xl:grid-cols-[minmax(0,1fr)_420px]">
         <Card class="p-5">
@@ -1504,6 +1722,13 @@
               <h2 class="mt-1 text-lg font-semibold text-white">{auth.getSnapshot().user?.name ?? auth.getSnapshot().user?.email}</h2>
               <p class="text-sm text-slate-400">{auth.getSnapshot().user?.email}</p>
             </div>
+            <label class="space-y-2 text-sm font-medium text-slate-200">
+              <span>Display name</span>
+              <Input bind:value={accountNameForm} oninput={() => (accountNameDirty = true)} placeholder="Your name" />
+            </label>
+            {#if accountNameDirty}
+              <Button onclick={saveAccountName} disabled={busy}>Save name</Button>
+            {/if}
             <div class="grid gap-4 md:grid-cols-2">
               <label class="space-y-2 text-sm font-medium text-slate-200"><span>Current password</span><Input bind:value={passwordForm.current_password} type="password" /></label>
               <label class="space-y-2 text-sm font-medium text-slate-200"><span>New password</span><Input bind:value={passwordForm.new_password} type="password" /></label>
@@ -1574,6 +1799,77 @@
       <div class="mt-5 flex justify-end gap-2">
         <Button variant="secondary" onclick={() => (showSecretModal = false)}>Cancel</Button>
         <Button onclick={saveSecretFromModal} disabled={busy || !secretModalName.trim() || !secretModalValue.trim()}>Save credential</Button>
+      </div>
+    </div>
+  </div>
+{/if}
+
+<!-- User create modal -->
+{#if showUserCreateModal}
+  <div class="fixed inset-0 z-[80] flex items-center justify-center bg-slate-950/80 backdrop-blur" role="dialog" aria-modal="true">
+    <div class="w-full max-w-md rounded-3xl border border-slate-800 bg-slate-950 p-6 shadow-card">
+      <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Administration</p>
+      <h3 class="mt-1 text-lg font-semibold text-white">Create user</h3>
+      <div class="mt-4 space-y-4">
+        <label class="space-y-2 text-sm font-medium text-slate-200">
+          <span>Email</span>
+          <Input bind:value={userCreateForm.email} type="email" placeholder="user@example.com" />
+        </label>
+        <label class="space-y-2 text-sm font-medium text-slate-200">
+          <span>Name (optional)</span>
+          <Input bind:value={userCreateForm.name} placeholder="Display name" />
+        </label>
+        <label class="space-y-2 text-sm font-medium text-slate-200">
+          <span>Role</span>
+          <select bind:value={userCreateForm.role} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+            <option value="user">user</option>
+            <option value="admin">admin</option>
+            <option value="viewer">viewer</option>
+            <option value="service">service</option>
+          </select>
+        </label>
+        <label class="space-y-2 text-sm font-medium text-slate-200">
+          <span>Password</span>
+          <Input bind:value={userCreateForm.password} type="password" />
+        </label>
+        <label class="space-y-2 text-sm font-medium text-slate-200">
+          <span>Confirm password</span>
+          <Input bind:value={userCreateForm.confirm_password} type="password" />
+        </label>
+      </div>
+      <div class="mt-5 flex justify-end gap-2">
+        <Button variant="secondary" onclick={() => (showUserCreateModal = false)}>Cancel</Button>
+        <Button onclick={createUserSubmit} disabled={busy || !userCreateForm.email.trim() || userCreateForm.password.length < 8 || userCreateForm.password !== userCreateForm.confirm_password}>Create user</Button>
+      </div>
+    </div>
+  </div>
+{/if}
+
+<!-- User edit modal -->
+{#if showUserEditModal && editingUser}
+  <div class="fixed inset-0 z-[80] flex items-center justify-center bg-slate-950/80 backdrop-blur" role="dialog" aria-modal="true">
+    <div class="w-full max-w-md rounded-3xl border border-slate-800 bg-slate-950 p-6 shadow-card">
+      <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Administration</p>
+      <h3 class="mt-1 text-lg font-semibold text-white">Edit user</h3>
+      <p class="mt-1 text-sm text-slate-400">{editingUser.email}</p>
+      <div class="mt-4 space-y-4">
+        <label class="space-y-2 text-sm font-medium text-slate-200">
+          <span>Name</span>
+          <Input bind:value={userEditForm.name} placeholder="Display name" />
+        </label>
+        <label class="space-y-2 text-sm font-medium text-slate-200">
+          <span>Role</span>
+          <select bind:value={userEditForm.role} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+            <option value="user">user</option>
+            <option value="admin">admin</option>
+            <option value="viewer">viewer</option>
+            <option value="service">service</option>
+          </select>
+        </label>
+      </div>
+      <div class="mt-5 flex justify-end gap-2">
+        <Button variant="secondary" onclick={() => { showUserEditModal = false; editingUser = null; }}>Cancel</Button>
+        <Button onclick={updateUserSubmit} disabled={busy}>Save changes</Button>
       </div>
     </div>
   </div>

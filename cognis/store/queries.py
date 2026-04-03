@@ -74,6 +74,163 @@ async def update_user_password(session: AsyncSession, email: str, password_hash:
     return True
 
 
+async def list_users(
+    session: AsyncSession,
+    *,
+    include_disabled: bool = False,
+    limit: int = 100,
+) -> list[User]:
+    """List all users, optionally including disabled ones."""
+    query = select(User).order_by(User.created_at.desc(), User.email.asc()).limit(limit)
+    if not include_disabled:
+        query = query.where(User.is_active.is_(True))
+    result = await session.execute(query)
+    return list(result.scalars().all())
+
+
+async def update_user(
+    session: AsyncSession,
+    email: str,
+    *,
+    name: str | None = None,
+    role: str | None = None,
+) -> User | None:
+    """Update mutable user fields. Returns updated user or None if not found."""
+    user = await get_user(session, email)
+    if user is None:
+        return None
+    if name is not None:
+        user.name = name
+    if role is not None:
+        user.role = role
+    user.updated_at = _utcnow()
+    await session.flush()
+    return user
+
+
+async def disable_user(
+    session: AsyncSession,
+    email: str,
+    disabled_by: str,
+) -> User | None:
+    """Disable a user (soft delete). Returns updated user or None."""
+    user = await get_user(session, email)
+    if user is None:
+        return None
+    user.is_active = False
+    user.disabled_at = _utcnow()
+    user.disabled_by = disabled_by
+    user.updated_at = _utcnow()
+    await session.flush()
+    return user
+
+
+async def enable_user(session: AsyncSession, email: str) -> User | None:
+    """Re-enable a disabled user. Returns updated user or None."""
+    user = await get_user(session, email)
+    if user is None:
+        return None
+    user.is_active = True
+    user.disabled_at = None
+    user.disabled_by = None
+    user.updated_at = _utcnow()
+    await session.flush()
+    return user
+
+
+async def update_user_last_login(session: AsyncSession, email: str) -> None:
+    """Update the last_login_at timestamp for a user."""
+    user = await get_user(session, email)
+    if user is not None:
+        user.last_login_at = _utcnow()
+        await session.flush()
+
+
+async def delete_user_cascade(session: AsyncSession, email: str) -> bool:
+    """Hard-delete a user and cascade to all owned resources in Cognis DB.
+
+    Deletes: API keys, conversations (+ sessions), agents (+ bindings),
+    tasks (+ dependencies + step runs), workflows, schedules, secrets,
+    executors, skills, settings updated_by references, audit log entries.
+    Returns True if user existed and was deleted.
+    """
+    user = await get_user(session, email)
+    if user is None:
+        return False
+
+    # Delete in dependency order (children before parents)
+    # Step runs reference tasks
+    await session.execute(
+        delete(StepRun).where(
+            StepRun.task_id.in_(select(Task.task_id).where(Task.created_by == email))
+        )
+    )
+    # Task dependencies reference tasks
+    await session.execute(
+        delete(TaskDependency).where(
+            TaskDependency.task_id.in_(select(Task.task_id).where(Task.created_by == email))
+        )
+    )
+    await session.execute(
+        delete(TaskDependency).where(
+            TaskDependency.depends_on.in_(select(Task.task_id).where(Task.created_by == email))
+        )
+    )
+    # Sessions reference conversations
+    await session.execute(
+        delete(Session).where(
+            Session.conversation_id.in_(
+                select(Conversation.conversation_id).where(Conversation.user_email == email)
+            )
+        )
+    )
+    # Agent secondary bindings reference agents
+    await session.execute(
+        delete(AgentSecondaryBinding).where(
+            AgentSecondaryBinding.primary_agent_id.in_(
+                select(Agent.agent_id).where(Agent.owner_email == email)
+            )
+        )
+    )
+    await session.execute(
+        delete(AgentSecondaryBinding).where(
+            AgentSecondaryBinding.secondary_agent_id.in_(
+                select(Agent.agent_id).where(Agent.owner_email == email)
+            )
+        )
+    )
+    # Schedules reference agents owned by user
+    await session.execute(delete(Schedule).where(Schedule.created_by == email))
+    # Tasks reference agents and users
+    await session.execute(delete(Task).where(Task.created_by == email))
+    # Now delete the main tables
+    await session.execute(delete(Conversation).where(Conversation.user_email == email))
+    await session.execute(delete(Agent).where(Agent.owner_email == email))
+    await session.execute(delete(ApiKey).where(ApiKey.user_email == email))
+    await session.execute(delete(Secret).where(Secret.user_email == email))
+    await session.execute(delete(WorkflowRow).where(WorkflowRow.owner_email == email))
+    await session.execute(delete(ExecutorRow).where(ExecutorRow.owner_email == email))
+    await session.execute(delete(SkillRow).where(SkillRow.owner_email == email))
+    # Nullify settings updated_by references
+    await session.execute(
+        update(Setting).where(Setting.updated_by == email).values(updated_by=None)
+    )
+    # Delete the user
+    await session.execute(delete(User).where(User.email == email))
+    await session.flush()
+    return True
+
+
+async def count_admins(session: AsyncSession) -> int:
+    """Count active admin users."""
+    result = await session.execute(
+        select(sa.func.count())
+        .select_from(User)
+        .where(User.role == "admin", User.is_active.is_(True))
+    )
+    return result.scalar_one()
+
+
 # --- API Keys ---
 
 

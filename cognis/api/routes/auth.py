@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 from fastapi import APIRouter, HTTPException, Request
 from starlette.responses import JSONResponse, Response
 
-from cognis.api.common import api_exception, require_jwt_user
+from cognis.api.common import api_exception, require_current_user, require_jwt_user
 from cognis.api.models import (
     ApiKeyCreateRequest,
     ApiKeyCreateResponse,
@@ -17,6 +17,7 @@ from cognis.api.models import (
     LoginRequest,
     LogoutRequest,
     PasswordChangeRequest,
+    ProfileUpdateRequest,
     RefreshRequest,
     SetupRequest,
     TokenResponse,
@@ -30,6 +31,8 @@ from cognis.store.queries import (
     get_setting_value,
     get_user,
     list_api_keys,
+    update_user,
+    update_user_last_login,
     update_user_password,
 )
 
@@ -113,12 +116,16 @@ async def login(request: Request, payload: LoginRequest) -> TokenResponse:
         if user is None or user.password_hash is None:
             app_state.login_rate_limiter.record_failure(payload.email)
             raise HTTPException(status_code=401, detail="Invalid credentials")
+        if not user.is_active:
+            raise HTTPException(status_code=403, detail="Account disabled")
         try:
             app_state.password_hasher.verify(user.password_hash, payload.password)
         except Exception:
             app_state.login_rate_limiter.record_failure(payload.email)
             raise HTTPException(status_code=401, detail="Invalid credentials") from None
         app_state.login_rate_limiter.clear(payload.email)
+        await update_user_last_login(session, user.email)
+        await session.commit()
         ttl = _as_int(await get_setting_value(session, "security.token_ttl_seconds", 3600), 3600)
         token = app_state.auth_provider.sign_access_token(user.email, user.name, user.role)
         refresh_token = app_state.auth_provider.sign_refresh_token(user.email)
@@ -146,6 +153,8 @@ async def refresh(request: Request, payload: RefreshRequest) -> TokenResponse:
         user = await get_user(session, str(claims["sub"]))
         if user is None:
             raise HTTPException(status_code=401, detail="Unknown user")
+        if not user.is_active:
+            raise HTTPException(status_code=403, detail="Account disabled")
         ttl = _as_int(await get_setting_value(session, "security.token_ttl_seconds", 3600), 3600)
         token = app_state.auth_provider.sign_access_token(user.email, user.name, user.role)
         refresh_token = app_state.auth_provider.sign_refresh_token(user.email)
@@ -182,6 +191,18 @@ async def logout(request: Request, payload: LogoutRequest) -> Response:
 @router.get("/api/auth/me")
 async def me(request: Request) -> dict[str, str | None]:
     user = request.state.user
+    return {"email": user.email, "name": user.name, "role": user.role}
+
+
+@router.patch("/api/auth/me")
+async def update_profile(request: Request, payload: ProfileUpdateRequest) -> dict[str, str | None]:
+    """Update the current user's profile (name only)."""
+    current = require_current_user(request)
+    async with request.app.state.session_factory() as session:
+        user = await update_user(session, current.email, name=payload.name)
+        if user is None:
+            raise api_exception(404, "not_found", "User not found")
+        await session.commit()
     return {"email": user.email, "name": user.name, "role": user.role}
 
 

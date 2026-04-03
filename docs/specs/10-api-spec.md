@@ -43,11 +43,31 @@ POST   /api/auth/refresh         → Refresh JWT
 POST   /api/auth/logout          → Invalidate token
 POST   /api/auth/change-password → Change current user's password
 GET    /api/auth/me              → Current user info
+PATCH  /api/auth/me              → Update current user's profile (name)
 GET    /api/v1/auth/api-keys     → List current user's API keys
 POST   /api/v1/auth/api-keys     → Create current user's API key
 DELETE /api/v1/auth/api-keys/:id → Revoke current user's API key
 POST   /api/v1/auth/exchange-token → Issue short-lived token for Intaris/Mnemory UI access
 ```
+
+### Admin User Management
+
+All endpoints require admin role.
+
+```
+GET    /api/v1/admin/users              → List users (?include_disabled=true)
+POST   /api/v1/admin/users              → Create user (email, name, password, role)
+GET    /api/v1/admin/users/:email       → Get user details
+PATCH  /api/v1/admin/users/:email       → Update user (name, role)
+DELETE /api/v1/admin/users/:email       → Hard delete user + cascade (?confirm=true)
+POST   /api/v1/admin/users/:email/disable → Disable user (soft delete)
+POST   /api/v1/admin/users/:email/enable  → Re-enable user
+```
+
+Safety guards:
+- Cannot delete/disable yourself
+- Cannot demote/disable/delete the last admin
+- Hard delete requires `?confirm=true` query parameter
 
 ### Conversations
 

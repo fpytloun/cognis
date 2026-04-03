@@ -89,6 +89,34 @@ class ApiKeyCreateResponse(ApiKeyResponse):
     api_key: str
 
 
+class UserResponse(BaseModel):
+    email: str
+    name: str | None = None
+    role: str
+    is_active: bool = True
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    last_login_at: datetime | None = None
+    disabled_at: datetime | None = None
+    disabled_by: str | None = None
+
+
+class UserCreateRequest(BaseModel):
+    email: EmailStr
+    name: str | None = None
+    password: str = Field(min_length=8)
+    role: str = "user"
+
+
+class UserUpdateRequest(BaseModel):
+    name: str | None = None
+    role: str | None = None
+
+
+class ProfileUpdateRequest(BaseModel):
+    name: str | None = None
+
+
 class ProviderTestResultResponse(BaseModel):
     ok: bool
     model_resolved: str | None = None

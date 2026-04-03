@@ -29,6 +29,7 @@ from cognis.api.routes.skills import router as skills_router
 from cognis.api.routes.system import router as system_router
 from cognis.api.routes.tasks import router as tasks_router
 from cognis.api.routes.tools import router as tools_router
+from cognis.api.routes.users import router as users_router
 from cognis.api.routes.workflows import router as workflows_router
 from cognis.api.runtime_support import build_shared_runtime, build_step_runtime_factory
 from cognis.api.websocket import handle_websocket
@@ -333,6 +334,7 @@ def create_app() -> FastAPI:
     app.include_router(skills_router)
     app.include_router(executors_router)
     app.include_router(escalations_router)
+    app.include_router(users_router)
 
     @app.exception_handler(StarletteHTTPException)
     async def http_exception_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:

@@ -327,6 +327,14 @@ export const auth = {
     return get(store).accessToken;
   },
 
+  updateUser(user: UserSummary): void {
+    store.update((state) => {
+      const next = { ...state, user };
+      persistState(next);
+      return next;
+    });
+  },
+
   clear(error: string | null = null): void {
     setAnonymous(error);
   }

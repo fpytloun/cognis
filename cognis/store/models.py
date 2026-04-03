@@ -46,9 +46,18 @@ class User(Base):
     name: Mapped[str | None] = mapped_column(String, nullable=True)
     password_hash: Mapped[str | None] = mapped_column(String, nullable=True)
     role: Mapped[str] = mapped_column(String, nullable=False, default="user")
+    is_active: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="1"
+    )
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, default=_utcnow
     )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+    last_login_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    disabled_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    disabled_by: Mapped[str | None] = mapped_column(String, nullable=True)
 
 
 class ApiKey(Base):

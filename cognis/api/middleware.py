@@ -71,6 +71,16 @@ class AuthenticationMiddleware(BaseHTTPMiddleware):
                         error=ErrorBody(code="unauthorized", message="Invalid or expired token")
                     ).model_dump(),
                 )
+            # Check if user is disabled (JWT may have been issued before disable)
+            async with session_factory() as session:
+                user_row = await get_user(session, str(claims["sub"]))
+                if user_row is not None and not user_row.is_active:
+                    return JSONResponse(
+                        status_code=403,
+                        content=ErrorResponse(
+                            error=ErrorBody(code="account_disabled", message="Account disabled")
+                        ).model_dump(),
+                    )
             context_token = current_user_email.set(str(claims["sub"]))
             request.state.user = AuthenticatedUser(
                 email=str(claims["sub"]),
@@ -134,6 +144,13 @@ class AuthenticationMiddleware(BaseHTTPMiddleware):
                             error=ErrorBody(code="unauthorized", message="Unknown API key owner")
                         ).model_dump(),
                     )
+                if not user.is_active:
+                    return JSONResponse(
+                        status_code=403,
+                        content=ErrorResponse(
+                            error=ErrorBody(code="account_disabled", message="Account disabled")
+                        ).model_dump(),
+                    )
                 await touch_api_key_last_used(session, record.key_id)
                 await session.commit()
                 request.state.user = AuthenticatedUser(
@@ -167,6 +184,16 @@ class AuthenticationMiddleware(BaseHTTPMiddleware):
                         error=ErrorBody(code="unauthorized", message="Invalid session cookie")
                     ).model_dump(),
                 )
+            # Check if user is disabled
+            async with session_factory() as session:
+                user_row = await get_user(session, str(claims["sub"]))
+                if user_row is not None and not user_row.is_active:
+                    return JSONResponse(
+                        status_code=403,
+                        content=ErrorResponse(
+                            error=ErrorBody(code="account_disabled", message="Account disabled")
+                        ).model_dump(),
+                    )
             context_token = current_user_email.set(str(claims["sub"]))
             request.state.user = AuthenticatedUser(
                 email=str(claims["sub"]),

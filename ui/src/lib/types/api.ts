@@ -8,6 +8,27 @@ export interface UserSummary {
   role: UserRole;
 }
 
+export interface UserDetail extends UserSummary {
+  is_active: boolean;
+  created_at: string | null;
+  updated_at: string | null;
+  last_login_at: string | null;
+  disabled_at: string | null;
+  disabled_by: string | null;
+}
+
+export interface UserCreatePayload {
+  email: string;
+  name?: string | null;
+  password: string;
+  role?: UserRole;
+}
+
+export interface UserUpdatePayload {
+  name?: string | null;
+  role?: UserRole;
+}
+
 export interface TokenResponse {
   token: string;
   refresh_token: string | null;
