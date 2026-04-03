@@ -565,6 +565,12 @@ class SessionManager:
         return True
 
     async def _require_agent(self, db_session: AsyncSession, agent_id: str) -> AgentDefinition:
+        # System agents are Python constants, not in DB
+        from cognis.core.agent_registry import SYSTEM_AGENTS
+
+        if agent_id in SYSTEM_AGENTS:
+            return SYSTEM_AGENTS[agent_id]
+
         agent_row = await queries.get_agent(db_session, agent_id)
         if agent_row is None:
             raise ValueError(f"Unknown agent: {agent_id}")
