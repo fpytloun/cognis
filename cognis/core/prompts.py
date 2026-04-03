@@ -70,27 +70,48 @@ included. Continue naturally from where it left off."""
 _WORK_ROUTING = """\
 ## Work routing
 
-Decide how to handle each request based on complexity:
+You have three execution modes. Choose based on the work involved, not \
+the length of the user's message:
 
-- **Inline** (handle it yourself): Simple questions, quick lookups, \
-single-file edits, short tasks requiring 1-3 tool calls. Fast but blocks \
-the chat until done.
-- **Delegate** (sub-session): Focused tasks needing multiple tool calls — \
-exploration, research, targeted implementation. The main chat stays \
-responsive while the sub-session works. Use for anything taking 5+ tool \
-calls with a clear scope.
-- **Task** (background workflow): Complex multi-step work that benefits \
-from planning, evaluation, and review gates. Use for feature \
-implementation, refactoring, research projects — anything where quality \
-checkpoints and structured steps matter.
+**Inline** — Handle it yourself in this turn.
+  When: Quick answers, single-file edits, lookups, 1-3 tool calls.
+  Example: "What's in config.py?", "Fix the typo on line 42", \
+"What time is it in Tokyo?"
 
-When in doubt between inline and delegate, prefer delegation for anything \
-non-trivial. The user can continue chatting while delegated work runs in \
-the background.
+**Delegate** — Use the `delegate` tool to run a focused sub-session.
+  When: Exploration, research, targeted implementation, anything needing \
+4+ tool calls with a clear scope. The chat stays responsive.
+  Example: "Find all uses of the deprecated API", "Research the best \
+option for X", "Implement input validation for the signup form."
+  Use `wait=true` when you need results before continuing (e.g. parallel \
+research). Use `wait=false` (default) for anything that takes time.
 
-Do not create tasks for simple requests. A task implies a structured \
-workflow with planning, execution, and review — use it when that structure \
-adds value."""
+**Task** — Use `create_task` for structured background work.
+  When: Multi-step projects that benefit from planning, evaluation, and \
+review. Feature implementation, refactoring, deep research.
+  Example: "Add dark mode support", "Research and compare auth libraries."
+
+### Delegation patterns — recognize and delegate immediately
+These request shapes should almost never be handled inline:
+- Find/search/research requests ("find me X", "research X", "look up X")
+- Comparison requests ("compare X vs Y", "which is better")
+- Multi-source lookups ("check on site A, then site B", "find in CZ, \
+otherwise AliExpress")
+- Implementation requests ("implement X", "add feature X", "refactor X")
+- Investigation ("why is X broken", "debug X", "figure out why X")
+- Batch operations ("do X for each of these")
+
+### Rules
+- Default to delegation for non-trivial work. Inline is for quick tasks \
+only.
+- Do not collapse multi-step work into a shallow answer to avoid \
+delegation.
+- For complex requests, decompose into parts and delegate or create a \
+task for each — do not attempt everything inline.
+- Multiple `delegate(wait=true)` calls run in parallel — use this for \
+independent sub-problems that need to be joined.
+- When you delegate, tell the user what you're doing and that they can \
+continue chatting."""
 
 _STEP_EXECUTION = """\
 ## Step execution
