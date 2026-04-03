@@ -234,9 +234,22 @@ class WorkflowEngine:
                 )
 
                 if step_result is None:
-                    # Step failed without producing output — retry up to
-                    # max_attempts before going to exhaustion handling.
-                    handled = await self._handle_step_retry(task, step_def, state, workflow)
+                    # Step failed after internal LLM retries — go to
+                    # exhaustion handling (gate/continue/fail).
+                    exhausted_action = self._get_on_exhausted(step_def, workflow)
+                    logger.warning(
+                        "Step execution failed",
+                        extra={
+                            "extra_data": {
+                                "task_id": task.task_id,
+                                "step": step_def.name,
+                                "on_exhausted": exhausted_action,
+                            }
+                        },
+                    )
+                    handled = await self._handle_exhausted(
+                        task, step_def, state, workflow, exhausted_action
+                    )
                     if not handled:
                         state.status = "failed"
                         break

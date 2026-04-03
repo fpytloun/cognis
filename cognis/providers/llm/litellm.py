@@ -200,7 +200,7 @@ class LiteLLMProvider:
             operation=f"generate({prefixed_model})",
             **request_kwargs,
         )
-        response_dict = dict(response)
+        response_dict = response.model_dump()
 
         # Diagnostic: log response structure for debugging reasoning model issues
         choices = response_dict.get("choices")

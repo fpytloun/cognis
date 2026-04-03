@@ -1013,20 +1013,20 @@ class AgentLoop:
         # Assemble initial context — unified path for all execution modes.
         # The caller provides prior_context (for workflow step input) and
         # user_message. Retries include evaluation feedback in the message.
-        effective_user_message = ctx.user_message or ctx.step_definition.prompt
-        if ctx.is_retry and ctx.workflow_state and ctx.workflow_state.last_evaluation_feedback:
-            feedback_text = (
-                f"\n\n<evaluation_feedback>\n"
-                f"{ctx.workflow_state.last_evaluation_feedback}\n"
-                f"</evaluation_feedback>\n\n"
-            )
-            ctx.workflow_state.last_evaluation_feedback = None
-            effective_user_message = (
-                f"{feedback_text}Address the evaluation feedback above and complete this step."
-            )
-        elif ctx.policy.require_step_complete and not ctx.is_retry:
-            # First-attempt workflow step — use the built step prompt
+        if ctx.policy.require_step_complete:
+            # Workflow step — always build the rich prompt with task context
+            # and prior step outputs, on both first attempt and retry.
             effective_user_message = self._build_step_prompt(ctx)
+            if ctx.is_retry and ctx.workflow_state and ctx.workflow_state.last_evaluation_feedback:
+                feedback_text = (
+                    "<evaluation_feedback>\n"
+                    f"{ctx.workflow_state.last_evaluation_feedback}\n"
+                    "</evaluation_feedback>\n\n"
+                )
+                ctx.workflow_state.last_evaluation_feedback = None
+                effective_user_message = f"{feedback_text}{effective_user_message}"
+        else:
+            effective_user_message = ctx.user_message or ctx.step_definition.prompt
 
         context_result = await self.context_assembler.assemble(
             session=ctx.session,
@@ -1061,6 +1061,8 @@ class AgentLoop:
 
         # Main agentic loop
         reprompted = False
+        mid_stream_retries = 0
+        _MAX_MID_STREAM_RETRIES = 2
         while True:
             self._raise_if_cancelled(ctx)
 
@@ -1108,7 +1110,25 @@ class AgentLoop:
                     await on_token(text_delta)
 
             if mid_stream_error:
-                # Capture partial content accumulated before stream failure
+                if mid_stream_retries < _MAX_MID_STREAM_RETRIES:
+                    mid_stream_retries += 1
+                    logger.warning(
+                        "agent: mid-stream failure, retrying LLM call (%d/%d)",
+                        mid_stream_retries,
+                        _MAX_MID_STREAM_RETRIES,
+                        extra={
+                            "extra_data": {
+                                "session_id": ctx.session.session_id,
+                                "error": mid_stream_error[:200],
+                            }
+                        },
+                    )
+                    if on_token:
+                        await on_token("\n\n[Retrying...]\n\n")
+                    await asyncio.sleep(1.0 * mid_stream_retries)
+                    continue  # retry — messages is clean, accumulator is fresh next iteration
+
+                # Retries exhausted — capture partial content and inform user
                 partial_content = accumulator.get_content()
                 if partial_content:
                     events_to_record.append(
@@ -1116,11 +1136,8 @@ class AgentLoop:
                     )
                     assistant_content_parts.append(partial_content)
 
-                # Pre-stream errors are retried with exponential backoff at
-                # the provider level.  Mid-stream failures that reach here
-                # are non-recoverable for this turn — inform the user.
                 logger.warning(
-                    "agent: mid-stream failure after provider retries exhausted",
+                    "agent: mid-stream failure after retries exhausted",
                     extra={
                         "extra_data": {
                             "session_id": ctx.session.session_id,
