@@ -450,6 +450,7 @@ class StepRunResponse(BaseModel):
     status: str
     attempt: int = 1
     agent_id: str
+    conversation_id: str | None = None
     session_id: str | None = None
     intaris_session_id: str | None = None
     output: dict[str, Any] | None = None

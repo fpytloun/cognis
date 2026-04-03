@@ -374,9 +374,16 @@ class ContextAssembler:
                 {"role": "system", "content": _format_active_delegations(active_delegations)}
             )
 
-        # Prior context from caller (e.g. prior workflow step output)
+        # Prior context from caller (e.g. prior workflow step output).
+        # Mark these messages so _prune_messages can protect them.
         if prior_context:
+            for msg in prior_context:
+                msg["_prior_context"] = True
             messages.extend(prior_context)
+            logger.debug(
+                "context: injecting prior step context",
+                extra={"extra_data": {"message_count": len(prior_context)}},
+            )
 
         if not skip_user_message:
             messages.append({"role": user_message_role, "content": user_message})
@@ -388,6 +395,10 @@ class ContextAssembler:
             system_prompt=agent.system_prompt,
             tool_schema_tokens=tool_schema_tokens,
         )
+
+        # Strip internal markers before sending to LLM
+        for msg in messages:
+            msg.pop("_prior_context", None)
 
         # Recompute cache breakpoint after pruning (immutable messages may have shifted)
         cache_breakpoint_index = _find_cache_breakpoint(messages)
@@ -828,7 +839,11 @@ def _is_immutable_prefix_message(message: dict[str, Any], system_prompt: str | N
     - Memory instructions (server-generated behavioral guidance)
     - Core memories (untrusted wrapper with pinned facts)
     - Compaction summary (continuation context)
+    - Prior step context (workflow step output from a previous step)
     """
+    # Prior step context is critical for workflow step continuity
+    if message.get("_prior_context"):
+        return True
     if message.get("role") != "system":
         return False
     content = message.get("content")

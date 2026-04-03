@@ -193,6 +193,7 @@ def step_run_to_response(row: Any) -> StepRunResponse:
         status=row.status,
         attempt=row.attempt,
         agent_id=row.agent_id,
+        conversation_id=getattr(row, "conversation_id", None),
         session_id=row.session_id,
         intaris_session_id=row.intaris_session_id,
         output=row.output,

@@ -402,11 +402,34 @@ class WorkflowEngine:
         # Determine step index
         step_index = self._find_step_index(workflow, step_def.name) or 0
 
-        # Session handling: reuse on retry, create new on first attempt
-        if is_retry:
+        # Session handling: reuse existing conversation on retry OR when a
+        # prior step_run exists (gate-revise resets the attempt counter but
+        # we still want to reuse the conversation so session logs remain
+        # accessible for all attempts).
+        has_prior_run = False
+        if not is_retry:
+            async with self._session_factory() as db_session:
+                prior_run = await get_latest_step_run_for_task_step(
+                    db_session, task.task_id, step_def.name
+                )
+                has_prior_run = prior_run is not None
+
+        if is_retry or has_prior_run:
             conversation, session = await self._reuse_or_create_step_session(task, step_def, agent)
         else:
             conversation, session = await self._create_step_session(task, step_def, agent)
+
+        # For type="full" input, fork the source step's events into the new
+        # session so the conversation appears as natural history.  Skipped on
+        # retry (the session already has events from the prior attempt).
+        if not is_retry and not has_prior_run:
+            effective_input = resolve_effective_input(step_def, step_index, workflow.steps)
+            if effective_input.type == "full":
+                await self._fork_source_events(
+                    source_name=effective_input.single_source(),
+                    target_session=session,
+                    state=state,
+                )
 
         # Create StepRun record
         step_run_id = f"sr_{uuid.uuid4().hex}"
@@ -419,6 +442,7 @@ class WorkflowEngine:
                 agent_id=agent.agent_id,
                 attempt=attempt,
                 step_run_id=step_run_id,
+                conversation_id=conversation.conversation_id,
             )
             await update_step_run(
                 db_session,
@@ -910,9 +934,11 @@ class WorkflowEngine:
                 data={
                     "conversation_id": target_conversation_id,
                     "task_id": task.task_id,
+                    "task_title": task.title,
                     "agent_id": task.agent_id,
                     "user_email": task.created_by,
                     "status": str(task.status),
+                    "result_summary": task.result_summary,
                 },
             )
         )
@@ -965,154 +991,128 @@ class WorkflowEngine:
         workflow_steps: list[StepDefinition],
         state: WorkflowState,
     ) -> list[dict[str, Any]] | None:
-        """Load prior step context for injection into the LLM prompt.
+        """Resolve prior step context for the current step.
 
-        Resolves the step's input configuration and loads context from
-        the appropriate source.  Returns ``None`` for null input (first
-        step or explicit ``type="null"``).
+        Prior step output is delivered through two mechanisms:
 
-        Priority for ``type="full"``:
-          1. Session cache (warm — prior step just ran)
-          2. Intaris read (cold — mandatory, retry on failure)
-          3. step_outputs content (defensive — indicates recording failure)
+        * **``type="full"``** — source step events are forked into the new
+          session (via ``_fork_source_events``) so they appear as natural
+          history.  No separate ``prior_context`` injection needed.
+        * **``type="last"`` / ``type="summary"``** — structured step output
+          (summary, claims, content) is included directly in the step prompt
+          by ``_build_step_prompt`` → ``_format_prior_step_outputs``.
 
-        ``type="last"`` reads directly from ``step_outputs`` (Cognis DB).
+        In all cases this method returns ``None`` — the prior context is
+        handled elsewhere.  The method is kept for logging and future
+        extensibility.
         """
         effective_input = resolve_effective_input(step_def, step_index, workflow_steps)
-        if effective_input.type == "null":
-            return None
-
-        if effective_input.type == "last":
-            messages: list[dict[str, Any]] = []
-            for source_name in effective_input.source_names():
-                raw = state.step_outputs.get(source_name)
-                if raw is None:
-                    continue
-                output = StepOutput.model_validate(raw)
-                claims_str = (
-                    "\n".join(f"  - {c}" for c in output.claims) if output.claims else "(none)"
-                )
-                messages.append(
-                    {
-                        "role": "system",
-                        "content": (
-                            f'<step_output source="{source_name}">\n'
-                            f"Summary: {output.summary}\n"
-                            f"Claims:\n{claims_str}\n"
-                            f"</step_output>"
-                        ),
-                    }
-                )
-            return messages or None
-
-        if effective_input.type == "full":
-            source_name = effective_input.single_source()
-            if source_name is None:
-                return None
-            return await self._load_full_step_context(source_name, state)
-
-        if effective_input.type == "summary":
-            # For summary mode, use step_outputs directly (summary + content
-            # are already there). LLM-based summarization can be added later.
-            messages = []
-            for source_name in effective_input.source_names():
-                raw = state.step_outputs.get(source_name)
-                if raw is None:
-                    continue
-                output = StepOutput.model_validate(raw)
-                messages.append(
-                    {
-                        "role": "system",
-                        "content": (
-                            f'<step_output source="{source_name}">\n'
-                            f"Summary: {output.summary}\n"
-                            f"</step_output>"
-                        ),
-                    }
-                )
-            return messages or None
-
+        logger.info(
+            "workflow: resolved step input",
+            extra={
+                "extra_data": {
+                    "step": step_def.name,
+                    "input_type": effective_input.type,
+                    "sources": effective_input.source_names(),
+                    "available_outputs": list(state.step_outputs.keys()),
+                }
+            },
+        )
         return None
 
-    async def _load_full_step_context(
+    async def _fork_source_events(
         self,
-        source_name: str,
+        source_name: str | None,
+        target_session: Any,
         state: WorkflowState,
-    ) -> list[dict[str, Any]]:
-        """Load full event history from a source step.
+    ) -> None:
+        """Copy events from a source step's session into the target session.
 
-        Priority:
-          1. Session cache (warm — prior step just ran)
-          2. Intaris read (mandatory, retry on failure)
-          3. step_outputs content (defensive fallback)
+        This implements the ``type="full"`` fork behaviour: the new step
+        session starts with the source step's conversation as natural
+        history.  Events are written to Intaris (durable) and seeded into
+        the session cache (avoids a cold load on context assembly).
+
+        Failures are logged but do not block step execution — the step
+        prompt still includes a structured summary from
+        ``_build_step_prompt`` as a fallback.
         """
-        from cognis.core.context import events_to_messages
+        from cognis.core.session_cache import CachedEvent
+
+        if source_name is None:
+            return
 
         raw_output = state.step_outputs.get(source_name, {})
-
-        # 1. Try session cache
         cognis_session_id = raw_output.get("session_id")
+        intaris_session_id = raw_output.get("intaris_session_id")
+
+        # Read source events — try session cache first, then Intaris
+        source_events: list[CachedEvent] = []
         if cognis_session_id:
             cache_entry = self._session_cache.get_entry(cognis_session_id)
             if cache_entry is not None and cache_entry.initialized and cache_entry.events:
-                logger.info(
-                    "workflow: loaded prior step from session cache",
-                    extra={
-                        "extra_data": {
-                            "source_step": source_name,
-                            "event_count": len(cache_entry.events),
-                        }
-                    },
+                source_events = list(cache_entry.events)
+
+        if not source_events and intaris_session_id:
+            try:
+                event_read = await self._providers.guardrails.read_events(
+                    session_id=intaris_session_id,
+                    after_seq=0,
                 )
-                return events_to_messages(cache_entry.events)
-
-        # 2. Intaris read (mandatory — retry on failure)
-        intaris_session_id = raw_output.get("intaris_session_id")
-        if intaris_session_id:
-            for attempt in range(3):
-                try:
-                    event_read = await self._providers.guardrails.read_events(
-                        session_id=intaris_session_id,
-                        after_seq=0,
+                for raw_event in sorted(event_read.events, key=lambda e: int(e.get("seq", 0))):
+                    source_events.append(
+                        CachedEvent(
+                            seq=int(raw_event.get("seq", 0)),
+                            type=str(raw_event.get("type", "")),
+                            data=dict(raw_event.get("data", {})),
+                            source=raw_event.get("source"),
+                            ts=raw_event.get("ts"),
+                        )
                     )
-                    if event_read.events:
-                        logger.info(
-                            "workflow: loaded prior step from Intaris",
-                            extra={
-                                "extra_data": {
-                                    "source_step": source_name,
-                                    "event_count": len(event_read.events),
-                                }
-                            },
-                        )
-                        return events_to_messages(event_read.events)
-                    break  # Empty but no error — fall through to step_outputs
-                except Exception:
-                    if attempt == 2:
-                        logger.error(
-                            "workflow: Intaris read failed for prior step after retries",
-                            extra={"extra_data": {"source_step": source_name}},
-                            exc_info=True,
-                        )
-                    else:
-                        await asyncio.sleep(0.5 * (attempt + 1))
+            except Exception:
+                logger.warning(
+                    "workflow: failed to read source events for fork",
+                    extra={"extra_data": {"source_step": source_name}},
+                    exc_info=True,
+                )
 
-        # 3. step_outputs content (defensive fallback)
-        content = raw_output.get("content", "") or raw_output.get("summary", "")
-        if content:
-            logger.warning(
-                "workflow: falling back to step_outputs for prior step context",
+        if not source_events:
+            logger.debug(
+                "workflow: no source events to fork",
                 extra={"extra_data": {"source_step": source_name}},
             )
-            return [
-                {"role": "system", "content": f"Output from step '{source_name}':\n\n{content}"}
-            ]
+            return
 
-        logger.warning(
-            "workflow: no prior step context available",
-            extra={"extra_data": {"source_step": source_name}},
-        )
-        return []
+        # Write source events to the new Intaris session
+        target_intaris_id = target_session.intaris_session_id or target_session.session_id
+        session_events = [SessionEvent(type=e.type, data=e.data) for e in source_events]
+        try:
+            append_result = await self._providers.guardrails.record_events(
+                session_id=target_intaris_id,
+                events=session_events,
+                source="cognis:fork",
+            )
+            # Seed the session cache so context assembly doesn't need a cold load
+            await self._session_cache.seed_events(
+                target_session, source_events, append_result.last_seq
+            )
+            logger.info(
+                "workflow: forked source events into step session",
+                extra={
+                    "extra_data": {
+                        "source_step": source_name,
+                        "target_session": target_session.session_id,
+                        "event_count": len(source_events),
+                        "last_seq": append_result.last_seq,
+                    }
+                },
+            )
+        except Exception:
+            logger.warning(
+                "workflow: failed to fork source events into step session",
+                extra={"extra_data": {"source_step": source_name}},
+                exc_info=True,
+            )
 
     async def _resolve_step_runtime(
         self,

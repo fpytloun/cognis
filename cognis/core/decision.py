@@ -10,13 +10,13 @@ conversational messages) to short-circuit the turn lifecycle.
 from __future__ import annotations
 
 import asyncio
-import json
-from typing import Any, cast
+from typing import Any
 
 from prometheus_client import Counter
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from cognis.core.json_utils import extract_json_object, extract_text_from_response
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.store.queries import get_setting_value
@@ -210,26 +210,6 @@ class DecisionEngine:
         )
 
 
-def _extract_text_from_response(response: dict[str, Any]) -> str:
-    choices = response.get("choices")
-    if not isinstance(choices, list) or not choices:
-        return ""
-    message = choices[0].get("message")
-    if not isinstance(message, dict):
-        return ""
-    content = message.get("content")
-    return content if isinstance(content, str) else ""
-
-
-def _parse_classifier_payload(content: str) -> dict[str, Any]:
-    cleaned = content.strip()
-    if cleaned.startswith("```"):
-        cleaned = cleaned.strip("`")
-        if cleaned.startswith("json"):
-            cleaned = cleaned[4:].strip()
-    return cast(dict[str, Any], json.loads(cleaned))
-
-
 # ---------------------------------------------------------------------------
 # Workflow selection
 # ---------------------------------------------------------------------------
@@ -288,8 +268,10 @@ async def select_workflow(
         {
             "role": "system",
             "content": (
-                "Select the best workflow for the given task. Return JSON only: "
-                '{"workflow_id": "...", "confidence": 0.0-1.0, "reason": "..."}'
+                "Select the best workflow for the given task. "
+                "You MUST respond with a single JSON object and nothing else. "
+                "No markdown, no explanation, no text before or after the JSON.\n"
+                'Example: {"workflow_id": "...", "confidence": 0.8, "reason": "..."}'
             ),
         },
         {
@@ -308,10 +290,10 @@ async def select_workflow(
             ),
             timeout=classifier_timeout_seconds,
         )
-        content = _extract_text_from_response(response)
+        content = extract_text_from_response(response)
         if not content or not content.strip():
             raise ValueError("Classifier returned empty response")
-        payload = _parse_classifier_payload(content)
+        payload = extract_json_object(content, label="classifier")
         workflow_id = str(payload.get("workflow_id", ""))
 
         # Validate the selected workflow exists

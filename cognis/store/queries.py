@@ -1108,6 +1108,7 @@ async def create_step_run(
     agent_id: str,
     attempt: int = 1,
     step_run_id: str | None = None,
+    conversation_id: str | None = None,
 ) -> StepRun:
     """Create a new step run record."""
     row = StepRun(
@@ -1117,6 +1118,7 @@ async def create_step_run(
         step_type=step_type,
         agent_id=agent_id,
         attempt=attempt,
+        conversation_id=conversation_id,
     )
     session.add(row)
     await session.flush()
@@ -1128,6 +1130,7 @@ async def update_step_run(
     step_run_id: str,
     *,
     status: str | None = None,
+    conversation_id: str | None = None,
     session_id: str | None = None,
     intaris_session_id: str | None = None,
     output: dict[str, object] | None = None,
@@ -1140,6 +1143,8 @@ async def update_step_run(
     values: dict[str, object] = {}
     if status is not None:
         values["status"] = status
+    if conversation_id is not None:
+        values["conversation_id"] = conversation_id
     if session_id is not None:
         values["session_id"] = session_id
     if intaris_session_id is not None:

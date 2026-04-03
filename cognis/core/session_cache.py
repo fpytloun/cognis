@@ -127,6 +127,28 @@ class SessionCache:
             entry.touched_at = monotonic()
         return entry
 
+    async def seed_events(
+        self,
+        session: SessionModel,
+        events: list[CachedEvent],
+        last_seq: int,
+    ) -> CachedSessionState:
+        """Pre-populate a session's cache with events from another session.
+
+        Used by the workflow engine to implement ``type="full"`` fork
+        behaviour: events from the source step's session are written to
+        the new Intaris session and then seeded into the cache so the
+        context assembler sees them as natural history without a cold load.
+        """
+        entry = await self._ensure_entry(session)
+        async with entry.lock:
+            for event in events:
+                self._apply_cached_event(entry, event)
+            entry.last_event_seq = max(entry.last_event_seq, last_seq)
+            entry.initialized = True
+            entry.touched_at = monotonic()
+        return entry
+
     async def apply_compaction(
         self,
         session: SessionModel,

@@ -330,6 +330,7 @@ export interface StepRun {
   status: string;
   attempt: number;
   agent_id: string;
+  conversation_id: string | null;
   session_id: string | null;
   intaris_session_id: string | null;
   output: Record<string, unknown> | null;

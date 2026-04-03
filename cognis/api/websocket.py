@@ -45,28 +45,75 @@ logger = get_logger(__name__)
 _NEW_SESSION_STREAM_GRACE = timedelta(seconds=30)
 
 
-def _follow_up_turn_prompt(status: str | None) -> str:
+def _follow_up_turn_prompt(
+    status: str | None,
+    *,
+    task_id: str | None = None,
+    task_title: str | None = None,
+    result_summary: str | None = None,
+) -> str:
+    """Build a system prompt for the follow-up turn after a task/delegation completes.
+
+    When task details are available (task-based follow-ups), the prompt includes
+    the task_id, title, and result summary so the agent can present the result
+    without needing to look it up.  For delegation-based follow-ups (no task_id),
+    a generic prompt is used.
+    """
     status_name = (status or "updated").lower()
+
+    # Task-specific prompts (from workflow engine)
+    if task_id:
+        title_str = f'"{task_title}"' if task_title else task_id
+        if status_name == "completed":
+            lines = [
+                f"Background task {title_str} (task_id: {task_id}) has completed.",
+            ]
+            if result_summary:
+                lines.append(f"\nResult summary: {result_summary}")
+            lines.append(
+                "\nPresent this result to the user concisely. "
+                f'If you need the full detailed output, use the get_task_output tool with task_id="{task_id}".'
+            )
+            return "\n".join(lines)
+        if status_name == "failed":
+            lines = [
+                f"Background task {title_str} (task_id: {task_id}) has failed.",
+            ]
+            if result_summary:
+                lines.append(f"\nError details: {result_summary}")
+            lines.append(
+                "\nInform the user about the failure concisely. "
+                f'Use get_task_output with task_id="{task_id}" if you need more details about what went wrong.'
+            )
+            return "\n".join(lines)
+        if status_name == "cancelled":
+            return (
+                f"Background task {title_str} (task_id: {task_id}) was cancelled. "
+                "Provide a brief follow-up to the user if warranted."
+            )
+        # Generic task update
+        return (
+            f"Background task {title_str} (task_id: {task_id}) status: {status_name}. "
+            f"Summary: {result_summary or 'No summary available.'}. "
+            "Provide a concise follow-up to the user."
+        )
+
+    # Delegation-specific prompts (from agent_loop async delegations)
     if status_name == "failed":
         return (
-            "A background task or delegated sub-session has failed. "
-            "Review the recent delegation_failed or task_failed event in the session "
+            "A delegated sub-session has failed. "
+            "Review the recent delegation_failed event in the session history "
             "and provide a concise user-facing follow-up."
-        )
-    if status_name == "cancelled":
-        return (
-            "A background task cancellation was delivered to this conversation. "
-            "Review the recent task_cancelled event and provide a concise user-facing follow-up if warranted."
         )
     if status_name == "completed":
         return (
-            "A delegated sub-session has completed and its result has been recorded "
-            "in the session events. Review the delegation_completed event and present "
-            "the result to the user."
+            "A delegated sub-session has completed. "
+            "Review the recent delegation_completed event in the session history "
+            "and present the result to the user."
         )
     return (
-        "A background task update was delivered to this conversation. "
-        "Review the recent task_result event and provide a concise user-facing follow-up if warranted."
+        "A background operation has completed. "
+        "Review the recent events in the session history and provide a concise follow-up."
     )
 
 
@@ -888,7 +935,16 @@ class WebSocketConnectionManager:
         # The turn results persist to Intaris and are visible when the
         # user reconnects.  Streaming callbacks are simply skipped.
         prompt = _follow_up_turn_prompt(
-            event.data.get("status") if isinstance(event.data.get("status"), str) else None
+            event.data.get("status") if isinstance(event.data.get("status"), str) else None,
+            task_id=event.data.get("task_id")
+            if isinstance(event.data.get("task_id"), str)
+            else None,
+            task_title=event.data.get("task_title")
+            if isinstance(event.data.get("task_title"), str)
+            else None,
+            result_summary=event.data.get("result_summary")
+            if isinstance(event.data.get("result_summary"), str)
+            else None,
         )
         if conversation_id in self._active_turns and not self._active_turns[conversation_id].done():
             # Turn already active — queue the follow-up instead of dropping it

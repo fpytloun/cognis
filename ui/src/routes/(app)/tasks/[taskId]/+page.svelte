@@ -96,14 +96,17 @@
   function openSessionLogs(stepRun: StepRun): void {
     const sessionId = String(stepRun.output?.session_id ?? stepRun.session_id ?? '');
     if (!sessionId || !task) return;
-    // Step sessions each get their own conversation (title: "Task: X / Step: Y").
-    // Find it by matching the session_id in the conversation's sessions.
-    // Fall back to searching by task context ref, then to the session ID itself
-    // (the API will return 404 if invalid — the drawer handles this gracefully).
-    const conv = conversations.find((c) =>
-      c.context?.ref === task!.task_id && c.title?.includes(stepRun.step_name)
-    ) ?? conversations.find((c) => c.context?.ref === task!.task_id);
-    const conversationId = conv?.conversation_id ?? sessionId;
+    // Use the conversation_id stored directly on the step_run record.
+    // This is reliable even for retried steps where each attempt may
+    // have a different conversation.  Fall back to heuristic matching
+    // for older step_runs that predate the conversation_id column.
+    let conversationId = stepRun.conversation_id;
+    if (!conversationId) {
+      const conv = conversations.find((c) =>
+        c.context?.ref === task!.task_id && c.title?.includes(stepRun.step_name)
+      ) ?? conversations.find((c) => c.context?.ref === task!.task_id);
+      conversationId = conv?.conversation_id ?? sessionId;
+    }
     sessionDrawer = {
       conversationId,
       sessionId,

@@ -132,3 +132,99 @@ async def test_evaluator_uses_step_inputs() -> None:
     )
 
     assert result.decision == "approved"
+
+
+# ---------------------------------------------------------------------------
+# Robust parsing fallback tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_evaluator_json_in_code_fences() -> None:
+    response = '```json\n{"decision": "revise", "reasoning": "tests missing", "feedback": "add tests"}\n```'
+    evaluator = StepEvaluator(llm=_LLM(response=response), evaluator_timeout_seconds=5.0)
+
+    result = await evaluator.evaluate(
+        step_definition=_step_def("Implement with tests"),
+        step_output=_step_output(claims=["Implemented feature"]),
+        step_inputs={},
+    )
+
+    assert result.decision == "revise"
+    assert "tests" in result.reasoning.lower()
+
+
+@pytest.mark.asyncio
+async def test_evaluator_json_in_prose() -> None:
+    response = (
+        "After analysis, here is my evaluation:\n"
+        '{"decision": "failed", "reasoning": "API is broken", "feedback": "fix the endpoint"}\n'
+        "Please review."
+    )
+    evaluator = StepEvaluator(llm=_LLM(response=response), evaluator_timeout_seconds=5.0)
+
+    result = await evaluator.evaluate(
+        step_definition=_step_def(),
+        step_output=_step_output(),
+        step_inputs={},
+    )
+
+    assert result.decision == "failed"
+    assert "broken" in result.reasoning.lower()
+
+
+@pytest.mark.asyncio
+async def test_evaluator_plain_text_revise_via_inference() -> None:
+    """When the model returns plain text instead of JSON, semantic inference kicks in."""
+    response = "The step is incomplete because unit tests are missing from the implementation."
+    evaluator = StepEvaluator(llm=_LLM(response=response), evaluator_timeout_seconds=5.0)
+
+    result = await evaluator.evaluate(
+        step_definition=_step_def("Implement with tests"),
+        step_output=_step_output(claims=["Implemented feature"]),
+        step_inputs={},
+    )
+
+    assert result.decision == "revise"
+    assert "Inferred from text" in result.reasoning
+
+
+@pytest.mark.asyncio
+async def test_evaluator_plain_text_failed_via_inference() -> None:
+    response = "This step cannot succeed because the external API is fundamentally broken."
+    evaluator = StepEvaluator(llm=_LLM(response=response), evaluator_timeout_seconds=5.0)
+
+    result = await evaluator.evaluate(
+        step_definition=_step_def(),
+        step_output=_step_output(),
+        step_inputs={},
+    )
+
+    assert result.decision == "failed"
+
+
+@pytest.mark.asyncio
+async def test_evaluator_empty_response_defaults_to_approved() -> None:
+    evaluator = StepEvaluator(llm=_LLM(response=""), evaluator_timeout_seconds=5.0)
+
+    result = await evaluator.evaluate(
+        step_definition=_step_def(),
+        step_output=_step_output(),
+        step_inputs={},
+    )
+
+    assert result.decision == "approved"
+
+
+@pytest.mark.asyncio
+async def test_evaluator_invalid_decision_defaults_to_approved() -> None:
+    response = json.dumps({"decision": "maybe", "reasoning": "not sure"})
+    evaluator = StepEvaluator(llm=_LLM(response=response), evaluator_timeout_seconds=5.0)
+
+    result = await evaluator.evaluate(
+        step_definition=_step_def(),
+        step_output=_step_output(),
+        step_inputs={},
+    )
+
+    assert result.decision == "approved"

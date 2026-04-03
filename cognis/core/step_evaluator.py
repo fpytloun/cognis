@@ -9,11 +9,16 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import UTC, datetime
-from typing import Any, cast
+from typing import Any
 
 from prometheus_client import Counter, Histogram
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from cognis.core.json_utils import (
+    extract_json_object,
+    extract_text_from_response,
+    infer_evaluation_from_text,
+)
 from cognis.logging import get_logger
 from cognis.models.workflow import StepDefinition, StepEvaluation, StepOutput
 from cognis.store.queries import get_setting_value
@@ -110,7 +115,12 @@ class StepEvaluator:
                         [
                             {
                                 "role": "system",
-                                "content": "You are a workflow step evaluator. Respond with JSON only.",
+                                "content": (
+                                    "You are a workflow step evaluator. "
+                                    "You MUST respond with a single JSON object and nothing else. "
+                                    "No markdown, no explanation, no text before or after the JSON.\n"
+                                    'Example: {"decision": "approved", "reasoning": "...", "feedback": "..."}'
+                                ),
                             },
                             {"role": "user", "content": prompt},
                         ],
@@ -173,51 +183,33 @@ class StepEvaluator:
         )
 
     def _parse_response(self, response: dict[str, Any]) -> StepEvaluation:
-        """Parse the LLM evaluator response into a StepEvaluation."""
-        content = _extract_text_from_response(response)
+        """Parse the LLM evaluator response into a StepEvaluation.
+
+        Uses multi-layer JSON extraction with semantic inference fallback.
+        For capable models that respect ``response_format``, the first
+        layer (direct parse) succeeds immediately with no overhead.
+        """
+        content = extract_text_from_response(response)
         try:
-            payload = _parse_json_payload(content)
-            decision = str(payload.get("decision", "approved")).lower()
-            if decision not in {"approved", "revise", "failed"}:
-                decision = "approved"
-            evaluation = StepEvaluation(
-                decision=decision,
-                reasoning=str(payload.get("reasoning", "")),
-                feedback=payload.get("feedback"),
-                evaluated_at=datetime.now(UTC),
-            )
-        except (json.JSONDecodeError, ValueError):
+            payload = extract_json_object(content, label="evaluator")
+        except ValueError:
+            # All JSON extraction layers failed — use semantic inference
             logger.warning(
-                "Could not parse evaluator response, defaulting to approved",
+                "JSON extraction failed for evaluator response, using semantic inference",
                 extra={"extra_data": {}},
             )
-            evaluation = StepEvaluation(
-                decision="approved",
-                reasoning="Could not parse evaluator response",
-                evaluated_at=datetime.now(UTC),
-            )
+            payload = infer_evaluation_from_text(content)
+
+        decision = str(payload.get("decision", "approved")).lower()
+        if decision not in {"approved", "revise", "failed"}:
+            decision = "approved"
+
+        evaluation = StepEvaluation(
+            decision=decision,
+            reasoning=str(payload.get("reasoning", "")),
+            feedback=payload.get("feedback"),
+            evaluated_at=datetime.now(UTC),
+        )
 
         EVALUATIONS_TOTAL.labels(decision=evaluation.decision).inc()
         return evaluation
-
-
-def _extract_text_from_response(response: dict[str, Any]) -> str:
-    """Extract text content from an LLM response."""
-    choices = response.get("choices")
-    if not isinstance(choices, list) or not choices:
-        return ""
-    message = choices[0].get("message")
-    if not isinstance(message, dict):
-        return ""
-    content = message.get("content")
-    return content if isinstance(content, str) else ""
-
-
-def _parse_json_payload(content: str) -> dict[str, Any]:
-    """Parse JSON from content that may be wrapped in markdown code fences."""
-    cleaned = content.strip()
-    if cleaned.startswith("```"):
-        cleaned = cleaned.strip("`")
-        if cleaned.startswith("json"):
-            cleaned = cleaned[4:].strip()
-    return cast(dict[str, Any], json.loads(cleaned))

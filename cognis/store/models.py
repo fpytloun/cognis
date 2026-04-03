@@ -305,6 +305,7 @@ class StepRun(Base):
     status: Mapped[str] = mapped_column(String, nullable=False, default="pending")
     attempt: Mapped[int] = mapped_column(nullable=False, default=1)
     agent_id: Mapped[str] = mapped_column(String, nullable=False)
+    conversation_id: Mapped[str | None] = mapped_column(String, nullable=True)
     session_id: Mapped[str | None] = mapped_column(String, nullable=True)
     intaris_session_id: Mapped[str | None] = mapped_column(String, nullable=True)
     output: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)

@@ -1039,9 +1039,11 @@ class AgentLoop:
         messages = context_result.messages
 
         # Record user message event (unless already recorded early for
-        # intention tracking above).  System-initiated turns (delegations)
-        # also record their task description so it appears in session logs.
-        if effective_user_message and not _user_msg_recorded_early:
+        # intention tracking above).  System-initiated follow-up turns
+        # (task completion, delegation results) are NOT recorded — the
+        # lifecycle event already provides the audit trail and the prompt
+        # is an internal instruction, not user-visible content.
+        if effective_user_message and not _user_msg_recorded_early and not ctx.system_initiated:
             events_to_record.append(
                 SessionEvent(type="user_message", data={"content": effective_user_message})
             )
@@ -1059,7 +1061,6 @@ class AgentLoop:
 
         # Main agentic loop
         reprompted = False
-        _mid_stream_retried = False
         while True:
             self._raise_if_cancelled(ctx)
 
@@ -1115,21 +1116,18 @@ class AgentLoop:
                     )
                     assistant_content_parts.append(partial_content)
 
-                # Retry once — the mid-stream error may be transient
-                if not _mid_stream_retried:
-                    _mid_stream_retried = True
-                    logger.warning(
-                        "agent: mid-stream failure, retrying LLM call",
-                        extra={
-                            "extra_data": {
-                                "session_id": ctx.session.session_id,
-                                "error": mid_stream_error[:200],
-                            }
-                        },
-                    )
-                    continue  # Retry the while loop (new LLM call)
-
-                # Retry exhausted — add error message and break cleanly
+                # Pre-stream errors are retried with exponential backoff at
+                # the provider level.  Mid-stream failures that reach here
+                # are non-recoverable for this turn — inform the user.
+                logger.warning(
+                    "agent: mid-stream failure after provider retries exhausted",
+                    extra={
+                        "extra_data": {
+                            "session_id": ctx.session.session_id,
+                            "error": mid_stream_error[:200],
+                        }
+                    },
+                )
                 error_notice = (
                     "I encountered a model error while generating my response. "
                     "Your tool results have been saved. Please try sending your message again."
@@ -1912,7 +1910,7 @@ class AgentLoop:
         elif is_subsession_tool(tc.name):
             return await self._handle_subsession_management(tc, ctx=ctx)
         elif is_task_tool(tc.name):
-            return await self._handle_task_tool(tc, ctx=ctx)
+            return await self._handle_task_tool(tc, ctx=ctx, events_to_record=events_to_record)
         else:
             return ToolResult(
                 output=json.dumps({"status": "error", "message": f"Unknown tool: {tc.name}"}),
@@ -2169,7 +2167,13 @@ class AgentLoop:
             is_error=True,
         )
 
-    async def _handle_task_tool(self, tc: ToolCall, *, ctx: StepContext) -> ToolResult:
+    async def _handle_task_tool(
+        self,
+        tc: ToolCall,
+        *,
+        ctx: StepContext,
+        events_to_record: list[SessionEvent],
+    ) -> ToolResult:
         """Handle create_task, list_tasks, get_task, update_task, cancel_task."""
         from cognis.store.queries import (
             get_task,
@@ -2206,6 +2210,38 @@ class AgentLoop:
                     delivery=TaskDelivery(mode="same_conversation"),
                     workflow_id=tc.arguments.get("workflow_id"),
                 )
+
+                # Record delegation event so the card appears in session
+                # history on page refresh.
+                events_to_record.append(
+                    SessionEvent(
+                        type="delegation",
+                        data={
+                            "mode": "task",
+                            "call_id": tc.call_id,
+                            "task": task.title,
+                            "child_session_id": task.task_id,
+                            "status": "started",
+                        },
+                    )
+                )
+
+                # Publish event for real-time WebSocket delivery so the
+                # delegation card appears immediately in the UI.
+                await self.event_bus.publish(
+                    Event(
+                        type=EventType.DELEGATION_STARTED,
+                        data={
+                            "conversation_id": ctx.conversation.conversation_id,
+                            "parent_session_id": ctx.session.session_id,
+                            "child_session_id": task.task_id,
+                            "mode": "task",
+                            "agent_id": task.agent_id,
+                            "task": task.title,
+                        },
+                    )
+                )
+
                 return ToolResult(
                     output=json.dumps(
                         {
@@ -2975,12 +3011,10 @@ class AgentLoop:
     def _build_step_prompt(self, ctx: StepContext) -> str:
         """Build the step objective prompt.
 
-        For first-attempt workflow steps the ``StepContextAssembler``
-        handles prior-step input injection, so this method only includes
-        the task context, step objective, and any in-progress todos.
-
-        For retries the regular ``ContextAssembler`` reads session history
-        directly, so there is no step_inputs section here either.
+        Includes task context, prior step outputs (resolved from the step's
+        input configuration), the step objective, and any in-progress todos.
+        Prior step outputs are included directly in the prompt so they are
+        visible in session logs and prominent to the LLM.
         """
         parts: list[str] = []
 
@@ -2994,6 +3028,13 @@ class AgentLoop:
             if ctx.task_expected_output:
                 parts.append(f"**Expected output:** {ctx.task_expected_output}\n\n")
 
+        # Inject prior step outputs so the LLM has context from previous steps.
+        # This resolves the step's input configuration and reads structured
+        # outputs from workflow state, making them visible in session logs.
+        prior_output_text = self._format_prior_step_outputs(ctx)
+        if prior_output_text:
+            parts.append(f"## Prior Step Output\n\n{prior_output_text}\n\n")
+
         prompt_text = ctx.user_message or ctx.step_definition.prompt
         parts.append(f"## Step: {ctx.step_definition.name}\n\n{prompt_text}")
 
@@ -3005,6 +3046,51 @@ class AgentLoop:
                 parts.append(f"- [{status}] {content}")
 
         return "".join(parts)
+
+    def _format_prior_step_outputs(self, ctx: StepContext) -> str:
+        """Format prior step outputs for inclusion in the step prompt.
+
+        Resolves the step's input configuration and reads structured outputs
+        from ``workflow_state.step_outputs``.  Returns empty string if no
+        prior outputs are available (first step or null input).
+        """
+        from cognis.models.workflow import StepOutput, resolve_effective_input
+
+        if not ctx.workflow_state or not ctx.workflow_steps:
+            return ""
+
+        effective_input = resolve_effective_input(
+            ctx.step_definition, ctx.step_index, ctx.workflow_steps
+        )
+        if effective_input.type == "null":
+            return ""
+
+        source_names = effective_input.source_names()
+        if not source_names:
+            return ""
+
+        sections: list[str] = []
+        for source_name in source_names:
+            raw = ctx.workflow_state.step_outputs.get(source_name)
+            if raw is None:
+                continue
+            output = StepOutput.model_validate(raw)
+            section_parts = [f'<step_output source="{source_name}">']
+            if output.summary:
+                section_parts.append(f"Summary: {output.summary}")
+            if output.claims:
+                claims_str = "\n".join(f"  - {c}" for c in output.claims)
+                section_parts.append(f"Claims:\n{claims_str}")
+            if output.content:
+                section_parts.append(f"Content:\n{output.content}")
+            if output.outputs:
+                section_parts.append(
+                    f"Structured outputs:\n{json.dumps(output.outputs, indent=2, default=str)}"
+                )
+            section_parts.append("</step_output>")
+            sections.append("\n".join(section_parts))
+
+        return "\n\n".join(sections)
 
     def _build_controller_tool_schemas(self, ctx: StepContext) -> list[dict[str, Any]]:
         """Build JSON schemas for controller-injected tools."""

@@ -9,6 +9,7 @@ from prometheus_client import Counter
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from cognis.core.json_utils import extract_text_from_response
 from cognis.logging import get_logger
 from cognis.models.session import SessionEvent, SessionModel
 from cognis.runtime_context import scoped_runtime_context
@@ -133,7 +134,7 @@ class CompactionStrategy:
 
         try:
             response = await self.llm.generate(prompt_messages, task_type="compaction")
-            summary = _extract_text_from_response(response).strip()
+            summary = extract_text_from_response(response).strip()
             if not summary:
                 raise ValueError("LLM compaction returned empty summary")
         except Exception:
@@ -295,14 +296,3 @@ def _mechanical_summary(events: list[Any]) -> str:
         summary_lines.append("Recent preserved requests before compaction:")
         summary_lines.extend(f"- {request}" for request in recent_user_requests[-5:])
     return "\n".join(summary_lines)
-
-
-def _extract_text_from_response(response: dict[str, Any]) -> str:
-    choices = response.get("choices")
-    if not isinstance(choices, list) or not choices:
-        return ""
-    message = choices[0].get("message")
-    if not isinstance(message, dict):
-        return ""
-    content = message.get("content")
-    return content if isinstance(content, str) else ""

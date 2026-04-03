@@ -129,6 +129,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_provider_is_default_column)
         await conn.run_sync(_ensure_active_session_id_column)
         await conn.run_sync(_ensure_task_expected_output_column)
+        await conn.run_sync(_ensure_step_run_conversation_id_column)
 
 
 def _ensure_session_lifecycle_columns(sync_conn: object) -> None:
@@ -215,6 +216,18 @@ def _ensure_task_expected_output_column(sync_conn: object) -> None:
 
     if "expected_output" not in task_columns:
         execute(text("ALTER TABLE tasks ADD COLUMN expected_output TEXT"))
+
+
+def _ensure_step_run_conversation_id_column(sync_conn: object) -> None:
+    inspector = cast(Any, inspect(sync_conn))
+    try:
+        columns = {column["name"] for column in inspector.get_columns("step_runs")}
+    except Exception:
+        return  # table doesn't exist yet (create_all will handle it)
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+
+    if "conversation_id" not in columns:
+        execute(text("ALTER TABLE step_runs ADD COLUMN conversation_id VARCHAR"))
 
 
 async def seed_default_settings(session: AsyncSession) -> None:

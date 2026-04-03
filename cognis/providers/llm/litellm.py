@@ -182,6 +182,8 @@ class LiteLLMProvider:
         cache_breakpoint_index: int | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
+        from cognis.providers.llm.retry import with_llm_retry
+
         resolved_model, provider = await self._resolve_model_target(model, task_type=task_type)
         prefixed_model = self._apply_model_prefix(resolved_model, provider)
         request_kwargs = {**await self._resolve_provider_kwargs(provider), **kwargs}
@@ -190,8 +192,13 @@ class LiteLLMProvider:
             "LLM generate",
             extra={"extra_data": {"model": prefixed_model, "task_type": task_type}},
         )
-        response = await litellm.acompletion(
-            model=prefixed_model, messages=prepared_messages, stream=False, **request_kwargs
+        response = await with_llm_retry(
+            litellm.acompletion,
+            model=prefixed_model,
+            messages=prepared_messages,
+            stream=False,
+            operation=f"generate({prefixed_model})",
+            **request_kwargs,
         )
         return dict(response)
 
@@ -203,6 +210,8 @@ class LiteLLMProvider:
         cache_breakpoint_index: int | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[dict[str, Any]]:
+        from cognis.providers.llm.retry import with_llm_retry
+
         resolved_model, provider = await self._resolve_model_target(model, task_type=task_type)
         prefixed_model = self._apply_model_prefix(resolved_model, provider)
         request_kwargs = {**await self._resolve_provider_kwargs(provider), **kwargs}
@@ -211,8 +220,16 @@ class LiteLLMProvider:
             "LLM stream_generate",
             extra={"extra_data": {"model": prefixed_model, "task_type": task_type}},
         )
-        stream = await litellm.acompletion(
-            model=prefixed_model, messages=prepared_messages, stream=True, **request_kwargs
+        # Retry pre-stream errors (connection refused, rate limit, etc.)
+        # with exponential backoff.  Once the stream is established,
+        # mid-stream failures are caught and yielded as error markers.
+        stream = await with_llm_retry(
+            litellm.acompletion,
+            model=prefixed_model,
+            messages=prepared_messages,
+            stream=True,
+            operation=f"stream_generate({prefixed_model})",
+            **request_kwargs,
         )
         try:
             async for chunk in stream:
