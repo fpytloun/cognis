@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from typing import Any
 
 from prometheus_client import Counter
@@ -187,25 +186,14 @@ class CompactionStrategy:
                 "method": method,
             },
         )
-        append_result = None
-        last_error: Exception | None = None
+        # Retry is handled by the Intaris provider (exponential backoff).
         idempotency_key = f"{session.session_id}:compaction:{method}:{older_events[-1].seq}"
         with scoped_runtime_context(user_email=session.user_email, agent_id=session.agent_id):
-            for attempt in range(3):
-                try:
-                    append_result = await self.guardrails.record_events(
-                        session_id=session.intaris_session_id or session.session_id,
-                        events=[compaction_event],
-                        idempotency_key=idempotency_key,
-                    )
-                    break
-                except Exception as exc:
-                    last_error = exc
-                    if attempt == 2:
-                        break
-                    await asyncio.sleep(0.1 * (attempt + 1))
-        if append_result is None:
-            raise last_error or RuntimeError("Compaction event write failed")
+            append_result = await self.guardrails.record_events(
+                session_id=session.intaris_session_id or session.session_id,
+                events=[compaction_event],
+                idempotency_key=idempotency_key,
+            )
         await self.session_cache.apply_compaction(
             session,
             summary=summary,

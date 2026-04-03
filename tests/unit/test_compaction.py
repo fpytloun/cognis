@@ -119,17 +119,15 @@ async def test_compaction_write_failure_leaves_cache_unchanged() -> None:
 
 
 @pytest.mark.asyncio
-async def test_compaction_retries_with_stable_idempotency_key() -> None:
+async def test_compaction_uses_idempotency_key() -> None:
+    """Compaction passes an idempotency key to record_events.
+
+    Retry logic is now in the Intaris provider (exponential backoff),
+    so compaction calls record_events once.  The idempotency key
+    ensures safe retries at the provider level.
+    """
     cache = _Cache()
-
-    class _FlakyGuardrails(_Guardrails):
-        async def record_events(self, **kwargs: object) -> EventAppendResult:
-            result = await super().record_events(**kwargs)
-            if self.calls < 3:
-                raise RuntimeError("timeout after write")
-            return result
-
-    guardrails = _FlakyGuardrails()
+    guardrails = _Guardrails()
     strategy = CompactionStrategy(
         guardrails=guardrails,
         llm=_LLM(),
@@ -141,4 +139,5 @@ async def test_compaction_retries_with_stable_idempotency_key() -> None:
     result = await strategy.compact(_session())
 
     assert result.compacted is True
-    assert len(set(guardrails.idempotency_keys)) == 1
+    assert len(guardrails.idempotency_keys) == 1
+    assert guardrails.idempotency_keys[0] is not None

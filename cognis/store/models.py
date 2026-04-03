@@ -16,6 +16,7 @@ from sqlalchemy import (
     TIMESTAMP,
     Boolean,
     ForeignKey,
+    Index,
     LargeBinary,
     String,
     Text,
@@ -427,6 +428,39 @@ class SkillRow(Base):
     )
     updated_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+
+class NotificationRow(Base):
+    """Persistent notifications for escalations, gates, and step questions.
+
+    Notifications are the durable record of user-facing prompts that
+    require resolution (approve/deny, gate continue, step input).  The
+    in-memory PauseWaiter provides the async synchronization; this table
+    provides durability across restarts and a unified query surface.
+    """
+
+    __tablename__ = "notifications"
+
+    notification_id: Mapped[str] = mapped_column(String, primary_key=True)
+    notification_type: Mapped[str] = mapped_column(String, nullable=False)
+    user_email: Mapped[str] = mapped_column(String, ForeignKey("users.email"), nullable=False)
+    conversation_id: Mapped[str] = mapped_column(String, nullable=False)
+    task_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    step_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    step_run_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    session_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    status: Mapped[str] = mapped_column(String, nullable=False, default="pending")
+    resolution: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+
+    __table_args__ = (
+        Index("ix_notifications_user_status", "user_email", "status"),
+        Index("ix_notifications_conv_status", "conversation_id", "status"),
     )
 
 

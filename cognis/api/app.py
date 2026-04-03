@@ -22,6 +22,7 @@ from cognis.api.routes.auth import router as auth_router
 from cognis.api.routes.conversations import router as conversations_router
 from cognis.api.routes.escalations import router as escalations_router
 from cognis.api.routes.executors import router as executors_router
+from cognis.api.routes.notifications import router as notifications_router
 from cognis.api.routes.secrets import router as secrets_router
 from cognis.api.routes.sessions import router as sessions_router
 from cognis.api.routes.settings import router as settings_router
@@ -295,6 +296,21 @@ def create_app() -> FastAPI:
         app.state.recovered_task_ids = frozenset(recovered_tasks)
         app.state.recovered_paused_task_ids = frozenset(recovered_paused_tasks)
 
+        # Unified notification service
+        from cognis.core.notifications import NotificationService
+
+        notification_service = NotificationService(
+            session_factory=session_factory,
+            pause_waiter=pause_waiter,
+            event_bus=event_bus,
+            providers=providers,
+        )
+        app.state.notification_service = notification_service
+        agent_loop.notification_service = notification_service
+
+        # Reconcile pending notifications from before restart
+        await notification_service.reconcile_pending()
+
         yield
 
         await task_queue.stop()
@@ -334,6 +350,7 @@ def create_app() -> FastAPI:
     app.include_router(skills_router)
     app.include_router(executors_router)
     app.include_router(escalations_router)
+    app.include_router(notifications_router)
     app.include_router(users_router)
 
     @app.exception_handler(StarletteHTTPException)

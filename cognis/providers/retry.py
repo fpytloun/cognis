@@ -1,18 +1,25 @@
-"""Retry utility for LLM provider calls with exponential backoff.
+"""Shared retry utility for HTTP provider calls with exponential backoff.
 
-Provides a shared retry mechanism that classifies errors as retryable
-(rate limits, server errors, transient connection issues) vs non-retryable
-(auth failures, invalid requests, model not found) and applies exponential
-backoff with jitter for retryable errors.
+Provides a generic retry mechanism for httpx-based provider calls that
+classifies errors as retryable (rate limits, server errors, transient
+connection issues) vs non-retryable (auth failures, invalid requests)
+and applies exponential backoff with jitter.
+
+This module is provider-agnostic.  Provider-specific retry utilities
+(e.g. ``providers/llm/retry.py``) may import ``compute_delay`` from
+here and add their own error classification.
 """
 
 from __future__ import annotations
 
 import asyncio
+import random
 from collections.abc import Awaitable, Callable
 
+import httpx
+
 from cognis.logging import get_logger
-from cognis.providers.retry import compute_delay
+from cognis.providers.circuit_breaker import CircuitBreakerError
 
 logger = get_logger(__name__)
 
@@ -23,106 +30,89 @@ DEFAULT_MAX_DELAY = 30.0  # seconds
 DEFAULT_JITTER = True
 
 
-def is_retryable_error(exc: Exception) -> bool:
-    """Classify whether an LLM error is retryable.
+def compute_delay(attempt: int, base_delay: float, max_delay: float, jitter: bool) -> float:
+    """Compute delay with exponential backoff and optional jitter.
+
+    Delay formula: ``min(base_delay * 2^attempt, max_delay)`` with ±25%
+    jitter to prevent thundering herd.
+    """
+    delay = min(base_delay * (2**attempt), max_delay)
+    if jitter:
+        delay *= 0.75 + random.random() * 0.5  # noqa: S311
+    return delay
+
+
+def is_retryable_http_error(exc: Exception) -> bool:
+    """Classify whether an HTTP error is retryable.
 
     Retryable errors are transient issues that may resolve on retry:
-    - Rate limits (429)
-    - Server errors (500, 502, 503)
-    - Connection errors
-    - Timeouts
-    - LiteLLM mid-stream failures
+    - Rate limits (HTTP 429)
+    - Server errors (HTTP 500, 502, 503, 504)
+    - Connection errors (httpx.ConnectError, httpx.ConnectTimeout)
+    - Timeouts (httpx.TimeoutException, asyncio.TimeoutError)
 
     Non-retryable errors should fail immediately:
-    - Authentication failures (401, 403)
-    - Invalid requests (400)
-    - Model not found (404)
-    - Content policy violations
+    - Circuit breaker open (CircuitBreakerError)
+    - Authentication failures (HTTP 401, 403)
+    - Invalid requests (HTTP 400)
+    - Not found (HTTP 404)
+    - Conflict (HTTP 409)
+    - Unprocessable entity (HTTP 422)
     """
-    exc_name = type(exc).__name__
-    exc_msg = str(exc).lower()
-
-    # LiteLLM-specific error types (check class name to avoid import dependency)
-    non_retryable_names = {
-        "AuthenticationError",
-        "PermissionDeniedError",
-        "NotFoundError",
-        "BadRequestError",
-        "UnprocessableEntityError",
-        "ContentPolicyViolationError",
-    }
-    if exc_name in non_retryable_names:
+    # Circuit breaker open — never retry, the service is known-down
+    if isinstance(exc, CircuitBreakerError):
         return False
 
-    retryable_names = {
-        "RateLimitError",
-        "ServiceUnavailableError",
-        "InternalServerError",
-        "APIConnectionError",
-        "APITimeoutError",
-        "Timeout",
-        "MidStreamFallbackError",
-    }
-    if exc_name in retryable_names:
+    # httpx-specific error types
+    if isinstance(exc, httpx.TimeoutException):
+        return True
+    if isinstance(exc, httpx.ConnectError):
         return True
 
-    # Check HTTP status codes embedded in error messages
-    for code in ("429", "500", "502", "503", "504"):
-        if code in exc_msg:
-            return True
+    # HTTP status code errors
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in {429, 500, 502, 503, 504}
 
-    # Connection-related errors
-    connection_keywords = (
-        "connection",
-        "timeout",
-        "timed out",
-        "rate limit",
-        "rate_limit",
-        "too many requests",
-        "server error",
-        "service unavailable",
-        "bad gateway",
-        "gateway timeout",
-        "temporarily unavailable",
-    )
-    if any(kw in exc_msg for kw in connection_keywords):
-        return True
-
-    # asyncio-level errors
+    # asyncio-level errors; unknown errors are not retried
     return isinstance(exc, (asyncio.TimeoutError, ConnectionError, OSError))
 
 
-async def with_llm_retry[T](
+async def with_retry[T](
     fn: Callable[..., Awaitable[T]],
     *args: object,
     max_retries: int = DEFAULT_MAX_RETRIES,
     base_delay: float = DEFAULT_BASE_DELAY,
     max_delay: float = DEFAULT_MAX_DELAY,
     jitter: bool = DEFAULT_JITTER,
-    operation: str = "LLM call",
+    retryable_check: Callable[[Exception], bool] | None = None,
+    operation: str = "HTTP call",
     **kwargs: object,
 ) -> T:
     """Execute an async function with retry and exponential backoff.
 
-    Only retries errors classified as retryable by ``is_retryable_error``.
-    Non-retryable errors are raised immediately.
+    Only retries errors classified as retryable by *retryable_check*
+    (defaults to :func:`is_retryable_http_error`).  Non-retryable errors
+    are raised immediately.
 
     Args:
         fn: Async function to call.
-        *args: Positional arguments for fn.
+        *args: Positional arguments for *fn*.
         max_retries: Maximum number of retry attempts (0 = no retries).
         base_delay: Base delay in seconds for exponential backoff.
         max_delay: Maximum delay cap in seconds.
         jitter: Whether to add random jitter to delays.
+        retryable_check: Callable that returns ``True`` for retryable
+            errors.  Defaults to :func:`is_retryable_http_error`.
         operation: Human-readable operation name for logging.
-        **kwargs: Keyword arguments for fn.
+        **kwargs: Keyword arguments for *fn*.
 
     Returns:
-        The return value of fn.
+        The return value of *fn*.
 
     Raises:
         The last exception if all retries are exhausted.
     """
+    check = retryable_check or is_retryable_http_error
     last_exc: Exception | None = None
 
     for attempt in range(max_retries + 1):
@@ -131,12 +121,10 @@ async def with_llm_retry[T](
         except Exception as exc:
             last_exc = exc
 
-            if not is_retryable_error(exc):
-                # Non-retryable — fail immediately
+            if not check(exc):
                 raise
 
             if attempt >= max_retries:
-                # Exhausted retries
                 logger.error(
                     "%s failed after %d retries",
                     operation,

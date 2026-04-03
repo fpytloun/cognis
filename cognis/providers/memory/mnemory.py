@@ -1,9 +1,10 @@
-"""Mnemory HTTP provider."""
+"""Mnemory HTTP provider with retry and circuit breaker protection."""
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from time import perf_counter
-from typing import Any
+from typing import Any, TypeVar
 
 import httpx
 
@@ -11,13 +12,22 @@ from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.config import ProviderHealth
 from cognis.providers.circuit_breaker import CircuitBreaker
+from cognis.providers.retry import with_retry
 from cognis.runtime_context import current_agent_id, current_user_email
 
 logger = get_logger(__name__)
 
+T = TypeVar("T")
+
 
 class MnemoryProvider:
-    """HTTP client for Mnemory with graceful degradation."""
+    """HTTP client for Mnemory with graceful degradation.
+
+    All methods are protected by retry with exponential backoff and a
+    circuit breaker.  On failure, read methods degrade gracefully
+    (return empty results) while write methods raise to allow upstream
+    retry queues to handle them.
+    """
 
     def __init__(
         self, base_url: str, auth_provider: Any, user_email: str = "system@example.com"
@@ -27,6 +37,32 @@ class MnemoryProvider:
         self.user_email = user_email
         self.client = httpx.AsyncClient(base_url=self.base_url, timeout=60)
         self.breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=30.0)
+
+    async def _call_with_retry(
+        self,
+        fn: Callable[..., Awaitable[T]],
+        *args: Any,
+        max_retries: int = 2,
+        base_delay: float = 1.0,
+        operation: str = "mnemory call",
+        use_breaker: bool = True,
+        **kwargs: Any,
+    ) -> T:
+        """Execute a provider call with retry inside circuit breaker."""
+
+        async def _with_retries() -> T:
+            return await with_retry(
+                fn,
+                *args,
+                max_retries=max_retries,
+                base_delay=base_delay,
+                operation=operation,
+                **kwargs,
+            )
+
+        if use_breaker:
+            return await self.breaker.call(_with_retries)
+        return await _with_retries()
 
     def _headers(
         self, agent_id: str | None = None, user_email: str | None = None
@@ -75,11 +111,19 @@ class MnemoryProvider:
             },
         )
         try:
-            response = await self.breaker.call(
-                lambda: self.client.post("/api/recall", json=payload, headers=self._headers())
+
+            async def _do() -> dict[str, Any]:
+                response = await self.client.post(
+                    "/api/recall", json=payload, headers=self._headers()
+                )
+                response.raise_for_status()
+                return dict(response.json())
+
+            result = await self._call_with_retry(
+                _do,
+                max_retries=2,
+                operation="mnemory recall",
             )
-            response.raise_for_status()
-            result = dict(response.json())
             stats = result.get("stats", {})
             logger.info(
                 "mnemory: recall complete",
@@ -139,14 +183,20 @@ class MnemoryProvider:
             "context": context,
         }
         try:
-            response = await self.breaker.call(
-                lambda: self.client.post(
+
+            async def _do() -> None:
+                response = await self.client.post(
                     "/api/remember",
                     json=payload,
                     headers=self._headers(agent_id=agent_id, user_email=user_email),
                 )
+                response.raise_for_status()
+
+            await self._call_with_retry(
+                _do,
+                max_retries=2,
+                operation="mnemory remember",
             )
-            response.raise_for_status()
         except Exception:
             logger.warning(
                 "mnemory: remember failed",
@@ -176,12 +226,20 @@ class MnemoryProvider:
             "pinned": pinned,
             "labels": labels or {},
         }
-        response = await self.client.post(
-            "/api/memories", json=payload, headers=self._headers(agent_id, user_email)
+
+        async def _do() -> str:
+            response = await self.client.post(
+                "/api/memories", json=payload, headers=self._headers(agent_id, user_email)
+            )
+            response.raise_for_status()
+            data = response.json()
+            return str(data.get("memory_id", ""))
+
+        return await self._call_with_retry(
+            _do,
+            max_retries=2,
+            operation="mnemory add_memory",
         )
-        response.raise_for_status()
-        data = response.json()
-        return str(data.get("memory_id", ""))
 
     async def search(
         self,
@@ -193,8 +251,9 @@ class MnemoryProvider:
         user_email: str | None = None,
     ) -> list[dict[str, Any]]:
         try:
-            response = await self.breaker.call(
-                lambda: self.client.post(
+
+            async def _do() -> list[dict[str, Any]]:
+                response = await self.client.post(
                     "/api/search",
                     json={
                         "query": query,
@@ -204,10 +263,15 @@ class MnemoryProvider:
                     },
                     headers=self._headers(agent_id, user_email),
                 )
+                response.raise_for_status()
+                data = response.json()
+                return list(data.get("results", []))
+
+            return await self._call_with_retry(
+                _do,
+                max_retries=2,
+                operation="mnemory search",
             )
-            response.raise_for_status()
-            data = response.json()
-            return list(data.get("results", []))
         except Exception:
             logger.warning("Mnemory search degraded")
             return []

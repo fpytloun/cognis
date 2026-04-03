@@ -64,6 +64,7 @@ cognis/
 │   │
 │   ├── providers/                  # Provider interfaces + implementations
 │   │   ├── base.py                 # Protocol definitions (all 6 providers)
+│   │   ├── retry.py               # Shared retry utility (exponential backoff + jitter)
 │   │   ├── registry.py
 │   │   ├── memory/
 │   │   │   ├── protocol.py        # MemoryProvider Protocol
@@ -137,6 +138,7 @@ cognis/
 | **Orchestration Core** | `core/` | Agent loop, Decision Engine, Session Manager, context assembly, compaction, tool routing, event bus |
 | **Session Cache** | `core/session_cache.py` | L1 in-memory cache for Intaris-derived state (events, seq, compaction, intention). No DB persistence. |
 | **Remember Queue** | `core/remember_queue.py` | Bounded async retry queue for failed Mnemory remember() calls |
+| **Notification Service** | `core/notifications.py` | Unified lifecycle for escalations, gates, and step questions. DB-persistent, PauseWaiter-backed. |
 | **Agent Registry** | `core/agent_registry.py` | System agent definitions (Python constants) + registry merging system and DB agents |
 | **Domain Models** | `models/` | Pydantic models for agents, sessions, tools, delegations, config |
 | **Providers** | `providers/` | Protocol definitions + implementations (memory, guardrails, executor, secrets, LLM, auth) |
@@ -316,6 +318,7 @@ uv run alembic -c cognis/store/migrations/alembic.ini downgrade -1
   - Secrets: fail-closed
 - Internal errors logged with `logger.exception()` for stack traces
 - Circuit breaker on all provider calls (5 failures → OPEN → 30s → HALF_OPEN)
+- Exponential backoff retry on all provider HTTP calls via shared `providers/retry.py`
 - Never let raw exceptions propagate to WebSocket clients — always send structured error messages
 
 ### Configuration
@@ -379,6 +382,7 @@ uv run alembic -c cognis/store/migrations/alembic.ini downgrade -1
 | `llm_providers` | `provider_id` | LLM provider configurations |
 | `model_routing` | `task_type` | Model routing policy |
 | `secrets` | `secret_id` | Encrypted secrets (AES-256-GCM) |
+| `notifications` | `notification_id` | Persistent notifications (escalations, gates, step questions) |
 | `audit_log` | `log_id` | System-level audit events (NOT session content) |
 
 ### Session cache

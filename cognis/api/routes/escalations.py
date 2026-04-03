@@ -1,4 +1,8 @@
-"""Escalation proxy routes."""
+"""Escalation proxy routes.
+
+These endpoints are kept for backward compatibility.  New clients should
+use the unified ``/api/v1/notifications`` endpoints instead.
+"""
 
 from __future__ import annotations
 
@@ -10,6 +14,7 @@ from cognis.api.common import require_current_user
 from cognis.api.models import EscalationResolveRequest, EscalationResponse
 from cognis.api.serializers import escalation_to_response
 from cognis.core.agent_loop import PauseResolution
+from cognis.core.notifications import NotificationService
 
 router = APIRouter(prefix="/api/v1/escalations", tags=["escalations"])
 
@@ -33,7 +38,20 @@ async def resolve_escalation(
 ) -> dict[str, object]:
     require_current_user(request)
 
-    # Resolve the PauseWaiter first (unblocks the agent loop)
+    # Try the unified notification service first (call_id is the notification_id
+    # for escalation-type notifications).
+    svc: NotificationService | None = getattr(request.app.state, "notification_service", None)
+    if svc is not None:
+        ok = await svc.resolve(
+            call_id,
+            payload.decision,
+            {"note": payload.note or ""},
+        )
+        if ok:
+            return {"ok": True, "call_id": call_id, "decision": payload.decision}
+
+    # Fallback: resolve via PauseWaiter directly (legacy path for
+    # escalations created before the notification service was available).
     pause_id = f"escalation:{call_id}"
     request.app.state.pause_waiter.resolve(
         pause_id,

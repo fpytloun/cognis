@@ -1202,19 +1202,30 @@ async def handle_websocket(websocket: WebSocket) -> None:
 
                     tool_name = (pending.context or {}).get("tool_name", "tool call")
                     intaris_call_id = (pending.context or {}).get("call_id", pending.pause_id)
-                    websocket.app.state.pause_waiter.resolve(
-                        pending.pause_id,
-                        PauseResolution(
-                            decision=esc_decision,
-                            data={"note": note or ""},
-                        ),
-                    )
-                    # Submit to Intaris for audit trail
+
+                    # Try the unified notification service first
                     current_user_email.set(connection.user_email)
-                    with contextlib.suppress(Exception):
-                        await websocket.app.state.providers.guardrails.submit_decision(
-                            intaris_call_id, esc_decision, note
+                    svc = getattr(websocket.app.state, "notification_service", None)
+                    if svc is not None:
+                        await svc.resolve(
+                            pending.pause_id,
+                            esc_decision,
+                            {"note": note or ""},
                         )
+                    else:
+                        # Legacy fallback
+                        websocket.app.state.pause_waiter.resolve(
+                            pending.pause_id,
+                            PauseResolution(
+                                decision=esc_decision,
+                                data={"note": note or ""},
+                            ),
+                        )
+                        with contextlib.suppress(Exception):
+                            await websocket.app.state.providers.guardrails.submit_decision(
+                                intaris_call_id, esc_decision, note
+                            )
+
                     # Emit system message for the action
                     verb = "approved" if is_approve else "denied"
                     note_suffix = f": {note}" if note else ""
@@ -1333,24 +1344,52 @@ async def handle_websocket(websocket: WebSocket) -> None:
                     continue
                 current_user_email.set(connection.user_email)
                 # Look up the pending pause to get tool_name for the system message
-                pause_id = f"escalation:{call_id}"
-                pending_pause = websocket.app.state.pause_waiter.get(pause_id)
+                # Try both notification_id (call_id) and legacy pause_id formats
+                pending_pause = websocket.app.state.pause_waiter.find_pending(
+                    pause_type="escalation",
+                )
+                # Match by call_id in context or by pause_id
+                if (
+                    pending_pause
+                    and (pending_pause.context or {}).get("call_id") != call_id
+                    and pending_pause.pause_id != call_id
+                ):
+                    pending_pause = None
                 tool_name = (
                     (pending_pause.context or {}).get("tool_name", "tool call")
                     if pending_pause
                     else "tool call"
                 )
-                # Resolve the PauseWaiter (unblocks the agent loop)
-                resolved = websocket.app.state.pause_waiter.resolve(
-                    pause_id,
-                    PauseResolution(
-                        decision=decision,
-                        data={"note": note if isinstance(note, str) else ""},
-                    ),
-                )
+                # Try the unified notification service first (call_id is notification_id)
+                svc = getattr(websocket.app.state, "notification_service", None)
+                resolved = False
+                if svc is not None:
+                    resolved = await svc.resolve(
+                        call_id,
+                        decision,
+                        {"note": note if isinstance(note, str) else ""},
+                    )
                 if not resolved:
-                    # No pending pause — check Intaris as fallback (may be
-                    # an ex-post resolution or the pause already timed out)
+                    # Legacy fallback: try PauseWaiter directly
+                    pause_id = f"escalation:{call_id}"
+                    resolved = websocket.app.state.pause_waiter.resolve(
+                        pause_id,
+                        PauseResolution(
+                            decision=decision,
+                            data={"note": note if isinstance(note, str) else ""},
+                        ),
+                    )
+                    if not resolved:
+                        # Also try call_id directly as pause_id
+                        resolved = websocket.app.state.pause_waiter.resolve(
+                            call_id,
+                            PauseResolution(
+                                decision=decision,
+                                data={"note": note if isinstance(note, str) else ""},
+                            ),
+                        )
+                if not resolved:
+                    # No pending pause — check Intaris as fallback
                     pending_escalations = (
                         await websocket.app.state.providers.guardrails.list_pending_escalations()
                     )
@@ -1362,11 +1401,12 @@ async def handle_websocket(websocket: WebSocket) -> None:
                             recoverable=True,
                         )
                         continue
-                # Submit to Intaris for audit trail
-                with contextlib.suppress(Exception):
-                    await websocket.app.state.providers.guardrails.submit_decision(
-                        call_id, decision, note if isinstance(note, str) else None
-                    )
+                # Submit to Intaris for audit trail (if not already done by notification service)
+                if svc is None:
+                    with contextlib.suppress(Exception):
+                        await websocket.app.state.providers.guardrails.submit_decision(
+                            call_id, decision, note if isinstance(note, str) else None
+                        )
                 # Emit system message for the action
                 verb = "approved" if decision == "approve" else "denied"
                 note_str = note if isinstance(note, str) and note else ""
@@ -2442,6 +2482,54 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
             "method": event.data.get("method"),
             "turns_compacted": event.data.get("turns_compacted"),
         }
+    # Unified notification events — map to the appropriate legacy WS type
+    # so existing UI clients continue to work without changes.
+    if event.type == EventType.NOTIFICATION_CREATED:
+        ntype = event.data.get("notification_type")
+        payload = event.data.get("payload", {})
+        if ntype == "escalation":
+            return {
+                "type": "escalation",
+                "conversation_id": conversation_id,
+                "session_id": event.data.get("session_id"),
+                "call_id": payload.get("call_id"),
+                "tool_name": payload.get("tool_name"),
+                "risk": payload.get("risk"),
+                "reasoning": payload.get("reasoning"),
+                "timeout_seconds": payload.get("timeout_seconds"),
+                "task_id": event.data.get("task_id"),
+            }
+        if ntype == "gate":
+            return {
+                "type": "workflow_gate",
+                "conversation_id": conversation_id,
+                "notification_id": event.data.get("notification_id"),
+                "task_id": event.data.get("task_id"),
+                "step_name": event.data.get("step_name"),
+                "message": payload.get("message"),
+                "options": payload.get("options"),
+                "context": payload.get("context"),
+            }
+        if ntype == "step_question":
+            return {
+                "type": "workflow_step_question",
+                "conversation_id": conversation_id,
+                "notification_id": event.data.get("notification_id"),
+                "task_id": event.data.get("task_id"),
+                "step_name": event.data.get("step_name"),
+                "question": payload.get("question"),
+                "options": payload.get("options"),
+                "context": payload.get("context"),
+            }
+    if event.type == EventType.NOTIFICATION_RESOLVED:
+        ntype = event.data.get("notification_type")
+        if ntype == "escalation":
+            return {
+                "type": "escalation_resolved",
+                "conversation_id": conversation_id,
+                "call_id": event.data.get("notification_id"),
+                "decision": event.data.get("decision"),
+            }
     return None
 
 

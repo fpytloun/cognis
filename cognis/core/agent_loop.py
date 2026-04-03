@@ -283,7 +283,7 @@ CHAT_POLICY = ExecutionPolicy(
     require_step_complete=False,
     step_complete_available=False,
     enable_auto_compaction=True,
-    event_flush_strategy="batch",
+    event_flush_strategy="incremental",
 )
 
 WORKFLOW_POLICY = ExecutionPolicy(
@@ -567,6 +567,7 @@ class AgentLoop:
         self.session_lock = session_lock
         self.pause_waiter = pause_waiter
         self.tool_output_store = tool_output_store
+        self.notification_service: Any = None
         self._task_queue: Any = None
         # Emergency event flush support — tracks pending events across
         # _execute_step and run_step for exception-path persistence.
@@ -982,13 +983,12 @@ class AgentLoop:
 
         # Record user message to Intaris event store BEFORE context
         # assembly so the IntentionBarrier can start updating the session
-        # intention while we assemble context and call the LLM.
+        # intention while we assemble context and call the LLM.  This
+        # fires for all flush strategies — the IntentionBarrier needs the
+        # user message early regardless of whether events are flushed
+        # incrementally or in batch.
         _user_msg_recorded_early = False
-        if (
-            ctx.policy.event_flush_strategy == "batch"
-            and ctx.user_message
-            and not ctx.system_initiated
-        ):
+        if ctx.user_message and not ctx.system_initiated:
             intaris_id = ctx.session.intaris_session_id or ctx.session.session_id
             user_msg_event = SessionEvent(type="user_message", data={"content": ctx.user_message})
             try:
@@ -1731,7 +1731,6 @@ class AgentLoop:
             # No call_id from Intaris — cannot track, treat as denied
             return result
 
-        pause_id = f"escalation:{intaris_call_id}"
         conversation_id = ctx.conversation.conversation_id
 
         # Read escalation timeout from settings
@@ -1741,30 +1740,21 @@ class AgentLoop:
             )
         timeout_f = float(timeout_raw)
 
-        # Register the pause so WebSocket/REST handlers can find it
-        self.pause_waiter.register(
-            PendingPause(
-                pause_id=pause_id,
-                pause_type="escalation",
-                session_id=ctx.session.session_id,
+        # Use the notification service to create the escalation.
+        # For task-originated escalations, the service resolves the
+        # target to the task's source conversation so the user sees
+        # the escalation in their chat, not in the invisible task step.
+        # The intaris_call_id is used as notification_id so the existing
+        # /escalations/{call_id}/resolve endpoint can find it.
+        if self.notification_service is not None:
+            await self.notification_service.create(
+                notification_type="escalation",
+                user_email=ctx.session.user_email,
                 conversation_id=conversation_id,
-                context={
-                    "call_id": intaris_call_id,
-                    "tool_name": tc.name,
-                    "arguments": tc.arguments,
-                    "risk": eval_meta.get("risk"),
-                    "reasoning": eval_meta.get("reasoning"),
-                },
-            )
-        )
-
-        # Notify all channel subscribers (web, signal, slack, etc.)
-        await self.event_bus.publish(
-            Event(
-                type=EventType.ESCALATION_CREATED,
-                data={
-                    "conversation_id": conversation_id,
-                    "session_id": ctx.session.session_id,
+                task_id=ctx.task_id,
+                session_id=ctx.session.session_id,
+                notification_id=intaris_call_id,
+                payload={
                     "call_id": intaris_call_id,
                     "tool_name": tc.name,
                     "risk": eval_meta.get("risk"),
@@ -1772,7 +1762,39 @@ class AgentLoop:
                     "timeout_seconds": timeout_raw,
                 },
             )
-        )
+            pause_id = intaris_call_id
+        else:
+            # Fallback: direct PauseWaiter registration (no notification service)
+            pause_id = f"escalation:{intaris_call_id}"
+            self.pause_waiter.register(
+                PendingPause(
+                    pause_id=pause_id,
+                    pause_type="escalation",
+                    session_id=ctx.session.session_id,
+                    conversation_id=conversation_id,
+                    context={
+                        "call_id": intaris_call_id,
+                        "tool_name": tc.name,
+                        "arguments": tc.arguments,
+                        "risk": eval_meta.get("risk"),
+                        "reasoning": eval_meta.get("reasoning"),
+                    },
+                )
+            )
+            await self.event_bus.publish(
+                Event(
+                    type=EventType.ESCALATION_CREATED,
+                    data={
+                        "conversation_id": conversation_id,
+                        "session_id": ctx.session.session_id,
+                        "call_id": intaris_call_id,
+                        "tool_name": tc.name,
+                        "risk": eval_meta.get("risk"),
+                        "reasoning": eval_meta.get("reasoning"),
+                        "timeout_seconds": timeout_raw,
+                    },
+                )
+            )
 
         # Send an interim tool_result to the WebSocket so the UI shows
         # the escalation status on the tool call block immediately.
@@ -3086,6 +3108,13 @@ class AgentLoop:
                 content = todo.get("content", "")
                 parts.append(f"- [{status}] {content}")
 
+        parts.append(
+            "\n\n---\n"
+            "When you have completed the objective, write out your findings and "
+            "deliverables as a detailed text response. Then call step_complete "
+            "with a summary, structured outputs, and verifiable claims."
+        )
+
         return "".join(parts)
 
     def _format_prior_step_outputs(self, ctx: StepContext) -> str:
@@ -3147,9 +3176,11 @@ class AgentLoop:
                     "function": {
                         "name": STEP_COMPLETE,
                         "description": (
-                            "Signal that this step is complete. You MUST call this "
-                            "when the objective is satisfied. All todos must be "
-                            "completed or cancelled before calling this."
+                            "Signal that this step is complete. Before calling this "
+                            "tool, you MUST write out your findings, deliverables, or "
+                            "results as a text message — the evaluator verifies your "
+                            "work against your written output. Then call this tool. "
+                            "All todos must be completed or cancelled before calling this."
                         ),
                         "parameters": {
                             "type": "object",
@@ -3160,12 +3191,21 @@ class AgentLoop:
                                 },
                                 "outputs": {
                                     "type": "object",
-                                    "description": "Structured output data",
+                                    "description": (
+                                        "Key structured data produced by this step "
+                                        "(e.g., URLs found, metrics gathered, file paths "
+                                        "modified). Include data that downstream steps or "
+                                        "the evaluator need."
+                                    ),
                                 },
                                 "claims": {
                                     "type": "array",
                                     "items": {"type": "string"},
-                                    "description": "Specific claims about what was done",
+                                    "description": (
+                                        "Specific, verifiable claims about what was "
+                                        "accomplished. Each claim should be independently "
+                                        "checkable against your written output above."
+                                    ),
                                 },
                             },
                             "required": ["summary"],

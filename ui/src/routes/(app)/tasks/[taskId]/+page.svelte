@@ -55,7 +55,9 @@
   };
 
   const TERMINAL_STATUSES = ['completed', 'failed', 'cancelled'];
+  const CANCELLABLE_STATUSES = ['queued', 'ready', 'running', 'paused', 'draft'];
   let isEditable = $derived(task != null && !TERMINAL_STATUSES.includes(task.status));
+  let isCancellable = $derived(task != null && CANCELLABLE_STATUSES.includes(task.status));
 
   function taskIdFromRoute(): string {
     return $page.params.taskId ?? '';
@@ -253,6 +255,36 @@
     }
   }
 
+  async function cancelTask(): Promise<void> {
+    if (!task) return;
+    const confirmed = await confirmAction({
+      title: 'Cancel task?',
+      message: 'This stops the task and marks it as cancelled. This action cannot be undone.',
+      confirmLabel: 'Cancel task'
+    });
+    if (!confirmed) return;
+    try {
+      await api.tasks.cancel(task.task_id);
+      task = await api.tasks.detail(task.task_id);
+      addToast('Task cancelled.', 'success');
+    } catch (caughtError) {
+      error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to cancel task');
+    }
+  }
+
+  function formatDuration(startIso: string | null | undefined, endIso: string | null | undefined): string {
+    if (!startIso) return '';
+    const start = new Date(startIso).getTime();
+    const end = endIso ? new Date(endIso).getTime() : Date.now();
+    const seconds = Math.floor((end - start) / 1000);
+    if (seconds < 60) return `${seconds}s`;
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
+    const hours = Math.floor(minutes / 60);
+    return `${hours}h ${minutes % 60}m`;
+  }
+
   // ---------------------------------------------------------------------------
   // Lifecycle
   // ---------------------------------------------------------------------------
@@ -287,7 +319,12 @@
         <p class="text-sm uppercase tracking-[0.25em] text-slate-400">Task detail</p>
         <h1 class="mt-1 text-2xl font-semibold text-white">{task.title}</h1>
       </div>
-      <span class="rounded-full border border-slate-700 bg-slate-900 px-3 py-1 text-xs font-semibold uppercase tracking-[0.2em] text-slate-200">{task.status}</span>
+      <div class="flex items-center gap-3">
+        {#if isCancellable}
+          <Button size="sm" variant="danger" onclick={cancelTask}>Cancel task</Button>
+        {/if}
+        <span class="rounded-full border border-slate-700 bg-slate-900 px-3 py-1 text-xs font-semibold uppercase tracking-[0.2em] text-slate-200">{task.status}</span>
+      </div>
     </div>
 
     {#if error}
@@ -422,8 +459,17 @@
                       <h3 class="font-semibold text-white">{stepRun.step_name}</h3>
                       <p class="text-xs text-slate-500">
                         {stepRun.step_type} · attempt {stepRun.attempt}
+                        {#if stepRun.agent_id}
+                          · <span class="text-slate-400">{agents.find((a) => a.agent_id === stepRun.agent_id)?.name ?? stepRun.agent_id}</span>
+                        {/if}
+                        {#if stepRun.started_at}
+                          <span title={formatAbsoluteTime(stepRun.started_at)}> · started {formatRelativeTime(stepRun.started_at)}</span>
+                        {/if}
                         {#if stepRun.completed_at}
                           <span title={formatAbsoluteTime(stepRun.completed_at)}> · {formatRelativeTime(stepRun.completed_at)}</span>
+                        {/if}
+                        {#if stepRun.started_at}
+                          · <span class="font-mono">{formatDuration(stepRun.started_at, stepRun.completed_at)}</span>
                         {/if}
                       </p>
                     </div>
@@ -516,6 +562,38 @@
 
       <!-- Sidebar -->
       <div class="space-y-5">
+        <!-- Timing -->
+        <Card class="p-5">
+          <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Timing</p>
+          <dl class="mt-3 space-y-2 text-sm">
+            {#if task.created_at}
+              <div class="flex justify-between">
+                <dt class="text-slate-500">Created</dt>
+                <dd class="text-slate-300" title={formatAbsoluteTime(task.created_at)}>{formatRelativeTime(task.created_at)}</dd>
+              </div>
+            {/if}
+            {#if task.started_at}
+              <div class="flex justify-between">
+                <dt class="text-slate-500">Started</dt>
+                <dd class="text-slate-300" title={formatAbsoluteTime(task.started_at)}>{formatRelativeTime(task.started_at)}</dd>
+              </div>
+            {/if}
+            {#if task.completed_at}
+              <div class="flex justify-between">
+                <dt class="text-slate-500">Completed</dt>
+                <dd class="text-slate-300" title={formatAbsoluteTime(task.completed_at)}>{formatRelativeTime(task.completed_at)}</dd>
+              </div>
+            {/if}
+            {#if task.started_at}
+              <div class="flex justify-between">
+                <dt class="text-slate-500">Duration</dt>
+                <dd class="font-mono text-slate-200">{formatDuration(task.started_at, task.completed_at)}</dd>
+              </div>
+            {/if}
+          </dl>
+        </Card>
+
+        <!-- Result -->
         <Card class="p-5">
           <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Result</p>
           <p class="mt-3 text-sm leading-6 text-slate-300">{task.result_summary ?? 'This task has not produced a final result yet.'}</p>

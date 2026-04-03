@@ -65,6 +65,10 @@ class EventType(StrEnum):
     DELEGATION_COMPLETED = "delegation_completed"
     DELEGATION_FAILED = "delegation_failed"
 
+    # Unified notifications
+    NOTIFICATION_CREATED = "notification_created"
+    NOTIFICATION_RESOLVED = "notification_resolved"
+
 
 class Event(BaseModel):
     """A controller-internal event."""
