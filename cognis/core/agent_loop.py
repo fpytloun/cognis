@@ -981,59 +981,11 @@ class AgentLoop:
         # Build tool definitions for LLM (controller-injected tools)
         controller_tool_schemas = self._build_controller_tool_schemas(ctx)
 
-        # Record user message to Intaris event store BEFORE context
-        # assembly so the IntentionBarrier can start updating the session
-        # intention while we assemble context and call the LLM.  This
-        # fires for all flush strategies — the IntentionBarrier needs the
-        # user message early regardless of whether events are flushed
-        # incrementally or in batch.
-        #
-        # On step retry (is_retry=True), the Intaris session already has
-        # the original step prompt from the first attempt.  Recording it
-        # again would cause the agent to see the prompt multiple times
-        # in its conversation history, making it restart from scratch
-        # instead of revising its prior work.
-        _user_msg_recorded_early = False
-        if ctx.user_message and not ctx.system_initiated and not ctx.is_retry:
-            intaris_id = ctx.session.intaris_session_id or ctx.session.session_id
-            user_msg_event = SessionEvent(type="user_message", data={"content": ctx.user_message})
-            try:
-                await self.providers.guardrails.record_events(
-                    session_id=intaris_id,
-                    events=[user_msg_event],
-                    source="cognis",
-                )
-                _user_msg_recorded_early = True
-            except Exception:
-                logger.warning(
-                    "agent: failed to record early user_message event",
-                    extra={"extra_data": {"session_id": ctx.session.session_id}},
-                )
-
-            # Trigger intention update. When the event was recorded
-            # successfully, use from_events to avoid re-sending content.
-            # Fall back to sending content directly if recording failed.
-            try:
-                if _user_msg_recorded_early:
-                    await self.providers.guardrails.report_reasoning(
-                        session_id=intaris_id,
-                        from_events=True,
-                    )
-                else:
-                    await self.providers.guardrails.report_reasoning(
-                        session_id=intaris_id,
-                        content=f"User message: {ctx.user_message}",
-                    )
-            except Exception:
-                logger.warning(
-                    "agent: failed to trigger intention update",
-                    extra={"extra_data": {"session_id": ctx.session.session_id}},
-                    exc_info=True,
-                )
-
-        # Assemble initial context — unified path for all execution modes.
-        # The caller provides prior_context (for workflow step input) and
-        # user_message. Retries include evaluation feedback in the message.
+        # ---------------------------------------------------------------
+        # Step 1: Build effective_user_message BEFORE recording so that
+        # Intaris always receives the full prompt the LLM will see (not
+        # just the raw step prompt from ctx.user_message).
+        # ---------------------------------------------------------------
         if ctx.policy.require_step_complete:
             if ctx.is_retry:
                 # On retry with a reused Intaris session, the conversation
@@ -1070,6 +1022,60 @@ class AgentLoop:
         else:
             effective_user_message = ctx.user_message or ctx.step_definition.prompt
 
+        # ---------------------------------------------------------------
+        # Step 2: Record effective_user_message to Intaris BEFORE context
+        # assembly so the IntentionBarrier can start updating the session
+        # intention in parallel.  This records the FULL prompt (including
+        # task context and prior step outputs for workflow steps), not
+        # just the raw step prompt.
+        #
+        # Skipped for:
+        # - system_initiated turns (lifecycle event provides the trail)
+        # - retry turns (session already has the original prompt)
+        # ---------------------------------------------------------------
+        _user_msg_recorded_early = False
+        if effective_user_message and not ctx.system_initiated and not ctx.is_retry:
+            intaris_id = ctx.session.intaris_session_id or ctx.session.session_id
+            user_msg_event = SessionEvent(
+                type="user_message", data={"content": effective_user_message}
+            )
+            try:
+                await self.providers.guardrails.record_events(
+                    session_id=intaris_id,
+                    events=[user_msg_event],
+                    source="cognis",
+                )
+                _user_msg_recorded_early = True
+            except Exception:
+                logger.warning(
+                    "agent: failed to record early user_message event",
+                    extra={"extra_data": {"session_id": ctx.session.session_id}},
+                )
+
+            # Trigger intention update. When the event was recorded
+            # successfully, use from_events to avoid re-sending content.
+            # Fall back to sending content directly if recording failed.
+            try:
+                if _user_msg_recorded_early:
+                    await self.providers.guardrails.report_reasoning(
+                        session_id=intaris_id,
+                        from_events=True,
+                    )
+                else:
+                    await self.providers.guardrails.report_reasoning(
+                        session_id=intaris_id,
+                        content=f"User message: {effective_user_message[:500]}",
+                    )
+            except Exception:
+                logger.warning(
+                    "agent: failed to trigger intention update",
+                    extra={"extra_data": {"session_id": ctx.session.session_id}},
+                    exc_info=True,
+                )
+
+        # ---------------------------------------------------------------
+        # Step 3: Assemble context (reads Intaris history + memory)
+        # ---------------------------------------------------------------
         context_result = await self.context_assembler.assemble(
             session=ctx.session,
             conversation=ctx.conversation,
