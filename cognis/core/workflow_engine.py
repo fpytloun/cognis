@@ -265,8 +265,13 @@ class WorkflowEngine:
                         step_def, step_result, state, task, workflow
                     )
 
-                    # Persist evaluation in the step_run record so the UI
-                    # can display it regardless of the decision outcome.
+                    # Persist evaluation and update step_run status based
+                    # on the evaluation decision.
+                    eval_status = {
+                        "approved": "approved",
+                        "revise": "rejected",
+                        "failed": "failed",
+                    }.get(evaluation.decision, "rejected")
                     async with self._session_factory() as db_session:
                         step_run = await get_latest_step_run_for_task_step(
                             db_session, task.task_id, step_def.name
@@ -276,6 +281,7 @@ class WorkflowEngine:
                                 db_session,
                                 step_run.step_run_id,
                                 evaluation=evaluation.model_dump(mode="json"),
+                                status=eval_status,
                             )
                             await db_session.commit()
 
@@ -349,18 +355,29 @@ class WorkflowEngine:
                     )
                 )
 
-            # Workflow completed
-            if state.status != "failed":
-                state.status = "completed"
-                state.current_step_status = None
-                state.pending_pause_type = None
-                state.pending_pause_payload = None
-                task.status = TaskStatus.COMPLETED
-                task.result_summary = self._build_result_summary(state, workflow)
+            # Workflow completed — determine final status.
+            # If any steps were skipped due to exhaustion, the task failed.
+            state.current_step_status = None
+            state.pending_pause_type = None
+            state.pending_pause_payload = None
+
+            if state.status == "failed" or state.skipped_steps:
+                state.status = "failed"
+                task.status = TaskStatus.FAILED
+                if state.skipped_steps:
+                    skipped = ", ".join(state.skipped_steps)
+                    task.result_summary = (
+                        f"Workflow failed: steps skipped after exhausting retries ({skipped})"
+                    )
+                else:
+                    task.result_summary = (
+                        self._build_result_summary(state, workflow) or "Workflow failed"
+                    )
                 task.completed_at = datetime.now(UTC)
             else:
-                state.current_step_status = None
-                task.status = TaskStatus.FAILED
+                state.status = "completed"
+                task.status = TaskStatus.COMPLETED
+                task.result_summary = self._build_result_summary(state, workflow)
                 task.completed_at = datetime.now(UTC)
 
             await self._persist_task_final(task)
@@ -560,13 +577,20 @@ class WorkflowEngine:
             output.session_id = session.session_id
             output.intaris_session_id = session.intaris_session_id
 
-        # Update StepRun record — a StepOutput with error set is a failure
+        # Update StepRun record — a StepOutput with error set is a failure.
+        # If evaluation is configured, set status to "evaluating" instead of
+        # premature "approved" — the evaluation will set the final status.
         step_failed = output is None or output.error is not None
+        if step_failed:
+            initial_status = "failed"
+        else:
+            completion = self._resolve_completion(step_def, workflow)
+            initial_status = "evaluating" if (completion and completion.evaluate) else "approved"
         async with self._session_factory() as db_session:
             await update_step_run(
                 db_session,
                 step_run_id,
-                status="failed" if step_failed else "approved",
+                status=initial_status,
                 output=output.model_dump(mode="json") if output else None,
                 completed_at=datetime.now(UTC),
             )
@@ -901,7 +925,18 @@ class WorkflowEngine:
         )
 
         if action == "continue":
-            # Skip and advance
+            # Skip and advance — record the skipped step so the final
+            # task status reflects that not all steps succeeded.
+            state.skipped_steps.append(step_def.name)
+            logger.warning(
+                "Step skipped due to exhaustion",
+                extra={
+                    "extra_data": {
+                        "task_id": task.task_id,
+                        "step": step_def.name,
+                    }
+                },
+            )
             state.current_step_index += 1
             await self._persist_workflow_state(task)
             return True
@@ -931,6 +966,7 @@ class WorkflowEngine:
                 workflow,
             )
             if result == "continue":
+                state.skipped_steps.append(step_def.name)
                 state.current_step_index += 1
                 await self._persist_workflow_state(task)
                 return True

@@ -196,6 +196,7 @@ class WorkflowState(BaseModel):
     step_outputs: dict[str, dict[str, Any]] = Field(default_factory=dict)
     loop_iterations: dict[str, int] = Field(default_factory=dict)  # "step_a->step_b" -> count
     status: str = "running"  # "running" | "paused" | "completed" | "failed" | "cancelled"
+    skipped_steps: list[str] = Field(default_factory=list)  # Steps skipped due to exhaustion
     last_evaluation_feedback: str | None = None  # Feedback from evaluator for retries
     pending_pause_type: str | None = None
     pending_pause_payload: dict[str, Any] | None = None

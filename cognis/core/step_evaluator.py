@@ -49,17 +49,21 @@ Agent's completion claim:
   Claims: {claims}
   Outputs: {outputs}
 
+Agent's last response:
+{content}
+
 Task context:
 {task_context}
 
 Decide:
-- "approved" if the step objective is satisfactorily met
+- "approved" if the step objective is satisfactorily met based on the \
+agent's actual response content
 - "revise" if the step is incomplete or the claims don't match the objective
 - "failed" if the step fundamentally cannot succeed
 
 Be skeptical. Agents tend to declare victory prematurely.
-Check whether the claims are consistent with the objective.
-If the step says "implement with tests" and the claims don't mention tests,
+Verify the agent's claims against the actual response content above.
+If the step says "implement with tests" and the response doesn't include tests,
 that is a revise.
 
 Respond with JSON only: {{"decision": "...", "reasoning": "...", "feedback": "..."}}
@@ -183,12 +187,22 @@ class StepEvaluator:
         formatted_outputs = json.dumps(step_output.outputs, default=str)[:2000]
         formatted_claims = "\n".join(f"  - {c}" for c in step_output.claims) or "(none)"
 
+        # Include the agent's actual response content so the evaluator can
+        # verify claims against evidence.  Use the tail of the content since
+        # the final deliverable is typically at the end.
+        raw_content = step_output.content or ""
+        if len(raw_content) > 4000:
+            formatted_content = f"...(truncated)...\n{raw_content[-4000:]}"
+        else:
+            formatted_content = raw_content or "(no content produced)"
+
         return template.format(
             objective=step_definition.prompt or step_definition.description,
             inputs=formatted_inputs,
             summary=step_output.summary,
             claims=formatted_claims,
             outputs=formatted_outputs,
+            content=formatted_content,
             task_context=task_context or "(none)",
         )
 
