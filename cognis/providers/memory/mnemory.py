@@ -25,7 +25,7 @@ class MnemoryProvider:
         self.base_url = base_url.rstrip("/")
         self.auth_provider = auth_provider
         self.user_email = user_email
-        self.client = httpx.AsyncClient(base_url=self.base_url, timeout=30)
+        self.client = httpx.AsyncClient(base_url=self.base_url, timeout=60)
         self.breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=30.0)
 
     def _headers(
@@ -101,6 +101,7 @@ class MnemoryProvider:
             logger.warning(
                 "mnemory: recall failed",
                 extra={"extra_data": {"session_id": session_id, "search_mode": search_mode}},
+                exc_info=True,
             )
             return {
                 "session_id": session_id or "",
@@ -150,6 +151,7 @@ class MnemoryProvider:
             logger.warning(
                 "mnemory: remember failed",
                 extra={"extra_data": {"session_id": session_id}},
+                exc_info=True,
             )
             raise
 
