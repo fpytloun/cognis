@@ -130,7 +130,17 @@ class StepEvaluator:
                     ),
                     timeout=self.evaluator_timeout_seconds,
                 )
-                return self._parse_response(response)
+                evaluation = self._parse_response(response)
+                logger.info(
+                    "Step evaluation complete",
+                    extra={
+                        "extra_data": {
+                            "step": step_definition.name,
+                            "decision": evaluation.decision,
+                        }
+                    },
+                )
+                return evaluation
             except TimeoutError:
                 logger.warning(
                     "Step evaluator timed out, defaulting to approved",
@@ -194,11 +204,16 @@ class StepEvaluator:
             payload = extract_json_object(content, label="evaluator")
         except ValueError:
             # All JSON extraction layers failed — use semantic inference
+            payload = infer_evaluation_from_text(content)
             logger.warning(
                 "JSON extraction failed for evaluator response, using semantic inference",
-                extra={"extra_data": {}},
+                extra={
+                    "extra_data": {
+                        "inferred_decision": payload.get("decision"),
+                        "content_length": len(content),
+                    }
+                },
             )
-            payload = infer_evaluation_from_text(content)
 
         decision = str(payload.get("decision", "approved")).lower()
         if decision not in {"approved", "revise", "failed"}:

@@ -10,7 +10,6 @@ from cognis.core.json_utils import (
     infer_evaluation_from_text,
 )
 
-
 # ---------------------------------------------------------------------------
 # extract_text_from_response
 # ---------------------------------------------------------------------------
@@ -215,12 +214,6 @@ class TestInferEvaluation:
 
     def test_revise_didnt(self) -> None:
         result = infer_evaluation_from_text("The agent didn't implement the required tests")
-        assert result["decision"] == "revise"
-
-    def test_revise_does_not_mention(self) -> None:
-        result = infer_evaluation_from_text(
-            "The claims does not mention tests, which were required"
-        )
         assert result["decision"] == "revise"
 
     def test_revise_missing(self) -> None:

@@ -268,6 +268,17 @@ class WorkflowEngine:
                             )
                             await db_session.commit()
 
+                    logger.info(
+                        "Step evaluation result",
+                        extra={
+                            "extra_data": {
+                                "task_id": task.task_id,
+                                "step": step_def.name,
+                                "decision": evaluation.decision,
+                            }
+                        },
+                    )
+
                     if evaluation.decision == "revise":
                         # Store feedback for retry
                         state.last_evaluation_feedback = evaluation.feedback or evaluation.reasoning
@@ -300,6 +311,16 @@ class WorkflowEngine:
                         continue
 
                 # Step approved or no evaluation — advance
+                logger.info(
+                    "Step approved, advancing",
+                    extra={
+                        "extra_data": {
+                            "task_id": task.task_id,
+                            "step": step_def.name,
+                            "next_step_index": state.current_step_index + 1,
+                        }
+                    },
+                )
                 state.current_step_status = None
                 state.pending_pause_type = None
                 state.pending_pause_payload = None
@@ -682,10 +703,35 @@ class WorkflowEngine:
         if current_iterations >= on_reject.max_loop_iterations:
             # Loop exhausted
             exhausted_action = on_reject.on_exhausted
+            logger.warning(
+                "Review loop exhausted",
+                extra={
+                    "extra_data": {
+                        "task_id": task.task_id,
+                        "step": step_def.name,
+                        "target": on_reject.target,
+                        "iterations": current_iterations,
+                        "on_exhausted": exhausted_action,
+                    }
+                },
+            )
             return await self._handle_exhausted(task, step_def, state, workflow, exhausted_action)
 
         REVIEW_LOOPS.labels(step_name=step_def.name).inc()
         state.loop_iterations[loop_key] = current_iterations + 1
+
+        logger.info(
+            "Review loop iteration",
+            extra={
+                "extra_data": {
+                    "task_id": task.task_id,
+                    "step": step_def.name,
+                    "target": on_reject.target,
+                    "iteration": current_iterations + 1,
+                    "max_iterations": on_reject.max_loop_iterations,
+                }
+            },
+        )
 
         # Jump back to the target step
         target_idx = self._find_step_index(workflow, on_reject.target)
@@ -721,12 +767,35 @@ class WorkflowEngine:
 
         if current_attempts >= max_attempts:
             exhausted_action = self._get_on_exhausted(step_def, workflow)
+            logger.warning(
+                "Step revision attempts exhausted",
+                extra={
+                    "extra_data": {
+                        "task_id": task.task_id,
+                        "step": step_def.name,
+                        "attempts": current_attempts,
+                        "max_attempts": max_attempts,
+                        "on_exhausted": exhausted_action,
+                    }
+                },
+            )
             return await self._handle_exhausted(task, step_def, state, workflow, exhausted_action)
 
         # Record evaluation feedback to the existing step session in Intaris
         await self._record_evaluation_feedback(task, step_def, state, evaluation)
 
         state.loop_iterations[attempt_key] = current_attempts + 1
+        logger.info(
+            "Step revision attempt",
+            extra={
+                "extra_data": {
+                    "task_id": task.task_id,
+                    "step": step_def.name,
+                    "attempt": current_attempts + 1,
+                    "max_attempts": max_attempts,
+                }
+            },
+        )
         await self._persist_workflow_state(task)
         # Stay on the same step — the main loop will re-execute it
         return True
@@ -798,6 +867,18 @@ class WorkflowEngine:
 
         Returns True if handled (workflow continues), False if workflow should fail.
         """
+        logger.info(
+            "Handling exhausted step",
+            extra={
+                "extra_data": {
+                    "task_id": task.task_id,
+                    "step": step_def.name,
+                    "action": action,
+                    "interaction_mode": workflow.interaction.mode,
+                }
+            },
+        )
+
         if action == "continue":
             # Skip and advance
             state.current_step_index += 1
@@ -807,6 +888,15 @@ class WorkflowEngine:
         elif action == "gate":
             if workflow.interaction.mode == "none":
                 # Autonomous mode — gate becomes fail
+                logger.warning(
+                    "Gate action in autonomous mode, failing step",
+                    extra={
+                        "extra_data": {
+                            "task_id": task.task_id,
+                            "step": step_def.name,
+                        }
+                    },
+                )
                 return False
             # Create a gate for user decision
             result = await self._handle_gate_step(
