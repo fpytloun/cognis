@@ -503,6 +503,11 @@ class ChannelAccountRow(Base):
     allow_new_conversations: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, server_default="1"
     )
+    # Adapter location
+    adapter_location: Mapped[str] = mapped_column(
+        String, nullable=False, default="controller", server_default="controller"
+    )
+    executor_id: Mapped[str | None] = mapped_column(String, nullable=True)
     # Access control
     allowed_senders: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
     dm_policy: Mapped[str] = mapped_column(String, nullable=False, default="pairing")

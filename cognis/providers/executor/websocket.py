@@ -108,6 +108,10 @@ class WebSocketExecutorConnection:
         # LLM inference streaming queues (request_id → queue)
         self._inference_queues: dict[str, asyncio.Queue[dict[str, Any]]] = {}
 
+        # Channel adapter notification callbacks (account_id → callback)
+        self._channel_message_callbacks: dict[str, Any] = {}
+        self._channel_status_callbacks: dict[str, Any] = {}
+
     @property
     def connected(self) -> bool:
         return self._connected
@@ -349,6 +353,18 @@ class WebSocketExecutorConnection:
                     if req_id and req_id in self._inference_queues:
                         params["done"] = True
                         self._inference_queues[req_id].put_nowait(params)
+                elif method == "channel.message":
+                    params = data.get("params", {})
+                    acct_id = params.get("account_id")
+                    cb = self._channel_message_callbacks.get(acct_id) if acct_id else None
+                    if cb is not None:
+                        asyncio.create_task(cb(params.get("message", {})))
+                elif method == "channel.status":
+                    params = data.get("params", {})
+                    acct_id = params.get("account_id")
+                    cb = self._channel_status_callbacks.get(acct_id) if acct_id else None
+                    if cb is not None:
+                        cb(params.get("status", {}))
                 else:
                     _logger.debug(
                         "executor_ws: unknown notification",
@@ -370,6 +386,26 @@ class WebSocketExecutorConnection:
         finally:
             self._connected = False
             self._fail_pending("Executor disconnected")
+
+    # ------------------------------------------------------------------
+    # Channel adapter callback registration
+    # ------------------------------------------------------------------
+
+    def register_channel_callback(
+        self,
+        account_id: str,
+        on_message: Any,
+        on_status: Any | None = None,
+    ) -> None:
+        """Register callbacks for channel.message and channel.status notifications."""
+        self._channel_message_callbacks[account_id] = on_message
+        if on_status is not None:
+            self._channel_status_callbacks[account_id] = on_status
+
+    def unregister_channel_callback(self, account_id: str) -> None:
+        """Remove channel notification callbacks for an account."""
+        self._channel_message_callbacks.pop(account_id, None)
+        self._channel_status_callbacks.pop(account_id, None)
 
     def _fail_pending(self, reason: str) -> None:
         """Fail all pending RPC futures with a disconnection error."""

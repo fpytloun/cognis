@@ -380,6 +380,9 @@ def create_app() -> FastAPI:
             session_factory=session_factory,
             inbound_pipeline=inbound_pipeline,
             secrets_provider=providers.secrets,
+            ws_provider=providers.executor.ws_provider
+            if hasattr(providers.executor, "ws_provider")
+            else None,
         )
         _channel_manager_holder[0] = channel_manager
 

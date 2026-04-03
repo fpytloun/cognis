@@ -67,6 +67,7 @@ class ExecutorCapabilities(BaseModel):
     inference: bool = False
     inference_models: list[str] = Field(default_factory=list)
     inference_type: str | None = None
+    channels: bool = False  # Can host channel adapters
 
 
 class InferenceConfig(BaseModel):

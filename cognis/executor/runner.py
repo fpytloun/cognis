@@ -33,6 +33,7 @@ class ExecutorRunner:
         self._tool_handlers: dict[str, Any] = {}
         self._configured_tool_definitions: list[ToolDefinition] = []
         self._inference_handler: Any | None = None
+        self._channel_handler: Any | None = None
         self._started_at = perf_counter()
 
     async def run(self) -> None:
@@ -50,6 +51,9 @@ class ExecutorRunner:
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 2, _RECONNECT_MAX)
         finally:
+            if self._channel_handler is not None:
+                with contextlib.suppress(Exception):
+                    await self._channel_handler.stop_all()
             if self._inference_handler is not None:
                 with contextlib.suppress(Exception):
                     await self._inference_handler.close()
@@ -133,6 +137,12 @@ class ExecutorRunner:
                     self._active_calls[call_id].cancel()
             elif method == "llm.complete":
                 asyncio.create_task(self._handle_llm_complete(ws, msg_id, params))
+            elif method == "channel.start":
+                asyncio.create_task(self._handle_channel_start(ws, msg_id, params))
+            elif method == "channel.stop":
+                asyncio.create_task(self._handle_channel_stop(ws, msg_id, params))
+            elif method == "channel.send":
+                asyncio.create_task(self._handle_channel_send(ws, msg_id, params))
             elif method == "executor.cancel":
                 self._running = False
                 break
@@ -159,6 +169,12 @@ class ExecutorRunner:
 
             self._inference_handler = InferenceHandler()
 
+        if self._channel_handler is None:
+            from cognis.executor.channel_handler import ChannelHandler
+
+            self._channel_handler = ChannelHandler()
+        self._channel_handler.set_ws(ws)
+
         self._configured = True
         if msg_id:
             await ws.send(
@@ -172,6 +188,7 @@ class ExecutorRunner:
                                 "inference": True,
                                 "inference_models": [],
                                 "inference_type": "litellm_proxy",
+                                "channels": True,
                             },
                             "config_keys": sorted(config.keys())
                             if isinstance(config, dict)
@@ -319,6 +336,54 @@ class ExecutorRunner:
                         }
                     )
                 )
+
+    # ------------------------------------------------------------------
+    # Channel adapter methods
+    # ------------------------------------------------------------------
+
+    async def _handle_channel_start(
+        self, ws: Any, msg_id: str | None, params: dict[str, Any]
+    ) -> None:
+        if self._channel_handler is None:
+            await self._send_rpc_error(ws, msg_id, -32601, "Channel handler unavailable")
+            return
+        try:
+            result = await self._channel_handler.start(
+                account_id=params.get("account_id", ""),
+                channel_type=params.get("channel_type", ""),
+                config=params.get("config", {}),
+                credentials=params.get("credentials", {}),
+            )
+            await self._send_rpc_result(ws, msg_id, result)
+        except Exception as exc:
+            await self._send_rpc_error(ws, msg_id, -32000, str(exc)[:500])
+
+    async def _handle_channel_stop(
+        self, ws: Any, msg_id: str | None, params: dict[str, Any]
+    ) -> None:
+        if self._channel_handler is None:
+            await self._send_rpc_error(ws, msg_id, -32601, "Channel handler unavailable")
+            return
+        try:
+            result = await self._channel_handler.stop(account_id=params.get("account_id", ""))
+            await self._send_rpc_result(ws, msg_id, result)
+        except Exception as exc:
+            await self._send_rpc_error(ws, msg_id, -32000, str(exc)[:500])
+
+    async def _handle_channel_send(
+        self, ws: Any, msg_id: str | None, params: dict[str, Any]
+    ) -> None:
+        if self._channel_handler is None:
+            await self._send_rpc_error(ws, msg_id, -32601, "Channel handler unavailable")
+            return
+        try:
+            result = await self._channel_handler.send(
+                account_id=params.get("account_id", ""),
+                message=params.get("message", {}),
+            )
+            await self._send_rpc_result(ws, msg_id, result)
+        except Exception as exc:
+            await self._send_rpc_error(ws, msg_id, -32000, str(exc)[:500])
 
     async def _heartbeat_loop(self, ws: Any) -> None:
         while self._running:

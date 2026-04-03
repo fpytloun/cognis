@@ -101,6 +101,7 @@ async def handle_executor_websocket(
         inference=bool(caps_raw.get("inference", False)),
         inference_models=list(caps_raw.get("inference_models") or []),
         inference_type=caps_raw.get("inference_type"),
+        channels=bool(caps_raw.get("channels", False)),
     )
     ws_provider.mark_ready(
         executor_id,
@@ -120,6 +121,18 @@ async def handle_executor_websocket(
         }
     )
 
+    # Start any channel accounts assigned to this executor
+    channel_manager = getattr(ws.app.state, "channel_manager", None)
+    if channel_manager is not None:
+        try:
+            await channel_manager.start_executor_channels(executor_id, conn)
+        except Exception:
+            _logger.warning(
+                "executor_ws: failed to start executor channels",
+                extra={"extra_data": {"executor_id": executor_id}},
+                exc_info=True,
+            )
+
     try:
         await conn.wait_until_closed()
     except Exception:
@@ -129,6 +142,16 @@ async def handle_executor_websocket(
             exc_info=True,
         )
     finally:
+        # Clean up executor-hosted channel adapters before unregistering
+        if channel_manager is not None:
+            try:
+                await channel_manager.stop_executor_channels(executor_id)
+            except Exception:
+                _logger.warning(
+                    "executor_ws: failed to stop executor channels on disconnect",
+                    extra={"extra_data": {"executor_id": executor_id}},
+                    exc_info=True,
+                )
         ws_provider.unregister_connection(executor_id)
 
 

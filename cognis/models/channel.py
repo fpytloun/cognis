@@ -103,6 +103,10 @@ class ChannelAccountConfig(BaseModel):
     default_conversation_id: str | None = None
     allow_new_conversations: bool = True
 
+    # Adapter location
+    adapter_location: str = "controller"  # "controller" or "executor"
+    executor_id: str | None = None  # preferred executor (null = any with channels capability)
+
     # Access control
     allowed_senders: list[str] = Field(default_factory=list)
     dm_policy: str = "pairing"  # "open", "pairing", "allowlist", "disabled"

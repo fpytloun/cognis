@@ -135,9 +135,13 @@
   let webhookInfo = $state<{ url: string; secret: string | null; channelType: string } | null>(null);
   let webhookInfoDismissed = $state(false);
 
+  let executors = $state<{ executor_id: string; name: string; status: string }[]>([]);
+
   let createForm = $state({
     display_name: '',
     agent_id: '',
+    adapter_location: 'controller' as string,
+    executor_id: '' as string,
     dm_policy: 'pairing',
     group_policy: 'pairing',
     allow_new_conversations: true,
@@ -205,6 +209,8 @@
     webhookInfoDismissed = false;
     createForm.display_name = `${meta.label} Account`;
     createForm.agent_id = agents[0]?.agent_id ?? '';
+    createForm.adapter_location = 'controller';
+    createForm.executor_id = '';
     createForm.dm_policy = 'pairing';
     createForm.group_policy = 'pairing';
     createForm.allow_new_conversations = true;
@@ -218,18 +224,20 @@
     loading = true;
     error = '';
     try {
-      const [types, accountsResult, contactsResult, pairingResult, agentsResult] = await Promise.all([
+      const [types, accountsResult, contactsResult, pairingResult, agentsResult, executorsResult] = await Promise.all([
         api.channels.listTypes(),
         api.channels.listAccounts(),
         api.channels.listContacts(),
         api.channels.listPairingRequests(),
-        api.agents.listAll({ include_hidden: false, include_system: true })
+        api.agents.listAll({ include_hidden: false, include_system: true }),
+        api.executor.list().catch(() => [])
       ]);
       channelTypes = types;
       accounts = accountsResult;
       contacts = contactsResult;
       pairingRequests = pairingResult;
       agents = agentsResult.filter((agent) => agent.status !== 'archived');
+      executors = (executorsResult as { executor_id: string; name: string; status: string }[]) ?? [];
       if (!selectedType && types.length > 0) {
         beginCreate(types[0]);
       }
@@ -302,6 +310,8 @@
         agent_id: createForm.agent_id,
         settings,
         credential_refs,
+        adapter_location: createForm.adapter_location,
+        executor_id: createForm.executor_id || null,
         dm_policy: createForm.dm_policy,
         group_policy: createForm.group_policy,
         allow_new_conversations: createForm.allow_new_conversations
@@ -553,6 +563,9 @@
                   </div>
                   <p class="text-sm text-slate-300">Agent: {agentName(account.agent_id)}</p>
                   <div class="flex flex-wrap gap-2 text-xs text-slate-400">
+                    {#if account.adapter_location === 'executor'}
+                      <span class="rounded-full border border-violet-500/20 bg-violet-500/10 px-3 py-1 text-violet-300">executor</span>
+                    {/if}
                     <span class="rounded-full border border-slate-700 px-3 py-1">DM: {account.dm_policy}</span>
                     <span class="rounded-full border border-slate-700 px-3 py-1">Groups: {account.group_policy}</span>
                     <span class="rounded-full border border-slate-700 px-3 py-1">New conversations: {account.allow_new_conversations ? 'yes' : 'no'}</span>
@@ -649,6 +662,34 @@
                     {/each}
                   </select>
                 </label>
+
+                <label class="grid gap-2 text-sm text-slate-300">
+                  Adapter location
+                  <select bind:value={createForm.adapter_location} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+                    <option value="controller">Controller (default)</option>
+                    <option value="executor">Executor (remote)</option>
+                  </select>
+                  <span class="text-xs text-slate-500">
+                    {#if createForm.adapter_location === 'executor'}
+                      The adapter will run on the selected executor. Use this for platforms that need user-local services (e.g. Signal via signal-cli).
+                    {:else}
+                      The adapter runs on the Cognis controller. Best for cloud APIs and webhook-based platforms.
+                    {/if}
+                  </span>
+                </label>
+
+                {#if createForm.adapter_location === 'executor'}
+                  <label class="grid gap-2 text-sm text-slate-300">
+                    Executor
+                    <select bind:value={createForm.executor_id} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+                      <option value="">Any connected executor</option>
+                      {#each executors as executor}
+                        <option value={executor.executor_id}>{executor.name} ({executor.status})</option>
+                      {/each}
+                    </select>
+                    <span class="text-xs text-slate-500">The executor must be connected and running when the channel starts.</span>
+                  </label>
+                {/if}
 
                 {#each selectedType.credential_fields as field}
                   <label class="grid gap-2 text-sm text-slate-300">
