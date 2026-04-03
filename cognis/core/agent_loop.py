@@ -987,8 +987,14 @@ class AgentLoop:
         # fires for all flush strategies — the IntentionBarrier needs the
         # user message early regardless of whether events are flushed
         # incrementally or in batch.
+        #
+        # On step retry (is_retry=True), the Intaris session already has
+        # the original step prompt from the first attempt.  Recording it
+        # again would cause the agent to see the prompt multiple times
+        # in its conversation history, making it restart from scratch
+        # instead of revising its prior work.
         _user_msg_recorded_early = False
-        if ctx.user_message and not ctx.system_initiated:
+        if ctx.user_message and not ctx.system_initiated and not ctx.is_retry:
             intaris_id = ctx.session.intaris_session_id or ctx.session.session_id
             user_msg_event = SessionEvent(type="user_message", data={"content": ctx.user_message})
             try:
@@ -1029,17 +1035,38 @@ class AgentLoop:
         # The caller provides prior_context (for workflow step input) and
         # user_message. Retries include evaluation feedback in the message.
         if ctx.policy.require_step_complete:
-            # Workflow step — always build the rich prompt with task context
-            # and prior step outputs, on both first attempt and retry.
-            effective_user_message = self._build_step_prompt(ctx)
-            if ctx.is_retry and ctx.workflow_state and ctx.workflow_state.last_evaluation_feedback:
-                feedback_text = (
-                    "<evaluation_feedback>\n"
-                    f"{ctx.workflow_state.last_evaluation_feedback}\n"
-                    "</evaluation_feedback>\n\n"
-                )
-                ctx.workflow_state.last_evaluation_feedback = None
-                effective_user_message = f"{feedback_text}{effective_user_message}"
+            if ctx.is_retry:
+                # On retry with a reused Intaris session, the conversation
+                # history already contains the original step prompt, all
+                # the agent's prior work, and the evaluation feedback event.
+                # Sending the full step prompt again would cause the agent
+                # to see it multiple times and restart from scratch.
+                #
+                # Instead, send only a revision directive.  If the Intaris
+                # recording of evaluation feedback failed, deliver it inline.
+                if ctx.workflow_state and ctx.workflow_state.last_evaluation_feedback:
+                    effective_user_message = (
+                        "The evaluator has reviewed your previous attempt and "
+                        "requested revisions:\n\n"
+                        f"{ctx.workflow_state.last_evaluation_feedback}\n\n"
+                        "Please revise your work based on this feedback. "
+                        "When done, write out your updated findings and call "
+                        "step_complete."
+                    )
+                    ctx.workflow_state.last_evaluation_feedback = None
+                else:
+                    # Feedback was recorded to Intaris — it's already in the
+                    # session history.  Send a minimal revision directive.
+                    effective_user_message = (
+                        "The evaluator has reviewed your previous attempt and "
+                        "requested revisions. Review the evaluation feedback "
+                        "above and revise your work accordingly. When done, "
+                        "write out your updated findings and call step_complete."
+                    )
+            else:
+                # First attempt — build the full rich prompt with task context
+                # and prior step outputs.
+                effective_user_message = self._build_step_prompt(ctx)
         else:
             effective_user_message = ctx.user_message or ctx.step_definition.prompt
 
@@ -2261,9 +2288,16 @@ class AgentLoop:
             try:
                 from cognis.models.task import TaskDelivery
 
+                # Resolve agent_id: LLMs sometimes pass "self" literally
+                # instead of omitting the field.  Fall back to the current
+                # agent to avoid FK violations.
+                raw_agent_id = tc.arguments.get("agent_id")
+                if not raw_agent_id or raw_agent_id == "self":
+                    raw_agent_id = ctx.agent.agent_id
+
                 task = await task_queue.submit(
                     created_by=ctx.session.user_email,
-                    agent_id=tc.arguments.get("agent_id") or ctx.agent.agent_id,
+                    agent_id=raw_agent_id,
                     title=tc.arguments.get("title", "Untitled task"),
                     description=tc.arguments.get("description", ""),
                     expected_output=tc.arguments.get("expected_output"),

@@ -82,8 +82,11 @@ def _follow_up_turn_prompt(
             if result_summary:
                 lines.append(f"\nError details: {result_summary}")
             lines.append(
-                "\nInform the user about the failure concisely. "
-                f'Use get_task_output with task_id="{task_id}" if you need more details about what went wrong.'
+                "\nInform the user that the task has failed and briefly explain "
+                "why based on the error details above. Do NOT attempt to complete "
+                "the task yourself or make additional tool calls to gather the "
+                "task's results. Offer to retry the task or investigate the "
+                "failure further if the user wants."
             )
             return "\n".join(lines)
         if status_name == "cancelled":
