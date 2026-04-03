@@ -103,6 +103,48 @@ delegations). Each loop:
    c. Check compaction threshold
 ```
 
+### Turn Scheduler
+
+Transport-agnostic turn orchestration. Owns the full lifecycle of a chat
+turn — from user message to response — without any dependency on WebSocket
+or other transport layers.
+
+```
+User message (WS / REST / channel adapter)
+  → TurnScheduler.submit_turn()
+    → Authorization + session state checks
+    → DecisionEngine.decide() (inline vs delegate)
+    → [delegate] TaskQueue.submit()
+    → [inline] WorkflowEngine.run_direct_turn()
+    → EventBus.publish(TURN_COMPLETED)
+  → TurnObserver callbacks (streaming to connected clients)
+```
+
+Responsibilities:
+- Turn submission and per-conversation serialization (one active turn at a time)
+- Decision engine dispatch (inline vs delegate)
+- Follow-up turns (system-initiated, via EventBus FOLLOW_UP_TURN_REQUESTED)
+- Turn cancellation (active turn + child sub-sessions)
+- Error classification (provider health checks → structured TurnError)
+- Post-turn housekeeping (last_message_at, session cache refresh, title change)
+- Conversation runtime loading (including deferred session creation after compaction)
+- Authorization enforcement (conversation ownership check)
+- Escalation-pending blocking (queue messages when escalation is pending)
+- Per-user concurrent turn limits
+
+Streaming design: **Hybrid** — `TurnObserver` callbacks for real-time
+streaming (no EventBus overhead per token), EventBus lifecycle events
+(`TURN_STARTED`, `TURN_COMPLETED`, `TURN_ERROR`) for non-streaming
+consumers (unread tracking, browser notifications).
+
+### Command Dispatcher
+
+Transport-agnostic slash command handling. Each command returns a
+`CommandResult` that the transport layer renders into its native format.
+
+Supported commands: `/compact`, `/new`, `/model`, `/thinking`, `/context`,
+`/info`, `/lsp`, `/help`, `/approve`, `/deny`.
+
 ### Decision Engine
 
 Determines how to handle each user message. Decisions are **deterministic**:
@@ -719,11 +761,13 @@ cognis/
 │   │   │   ├── schedules.py        # Schedule CRUD (task factory)
 │   │   │   ├── escalations.py
 │   │   │   └── system.py           # Health, metrics, JWKS
-│   │   ├── websocket.py            # WebSocket chat handler
+│   │   ├── websocket.py            # WebSocket transport layer (thin adapter)
 │   │   ├── middleware.py           # Auth, rate limiting
 │   │   └── models.py              # API request/response models
 │   │
 │   ├── core/                       # Orchestration Core
+│   │   ├── turn_scheduler.py      # Turn orchestration (transport-agnostic)
+│   │   ├── commands.py            # Slash command dispatch (transport-agnostic)
 │   │   ├── agent_loop.py          # Agent loop engine (step runner)
 │   │   ├── task_queue.py          # Queue picking, capacity, dependency resolution
 │   │   ├── workflow_engine.py     # Workflow orchestration (step sequencing, gates, loops)

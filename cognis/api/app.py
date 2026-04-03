@@ -267,16 +267,38 @@ def create_app() -> FastAPI:
         # PauseWaiters from DB so gates/escalations/step-questions survive).
         await notification_service.reconcile_pending()
 
-        # Follow-up turn handler — core-layer, no WebSocket dependency.
+        # TurnScheduler — core-layer turn orchestration, no WebSocket dependency.
         # Must be registered BEFORE task_queue.start() so recovered tasks
         # that complete during startup have a handler for their follow-up.
-        from cognis.core.follow_up import FollowUpTurnHandler
+        from cognis.core.turn_scheduler import TurnScheduler
 
-        follow_up_handler = FollowUpTurnHandler(
+        turn_scheduler = TurnScheduler(
             session_factory=session_factory,
             workflow_engine=workflow_engine,
+            decision_engine=decision_engine,
+            task_queue=task_queue,
             session_manager=session_manager,
+            session_cache=session_cache,
+            compaction_strategy=compaction_strategy,
+            agent_loop=agent_loop,
+            pause_waiter=pause_waiter,
+            notification_service=notification_service,
+            providers=providers,
+            workflow_registry=workflow_registry,
             event_bus=event_bus,
+        )
+
+        # CommandDispatcher — transport-agnostic slash command handling.
+        from cognis.core.commands import CommandDispatcher
+
+        command_dispatcher = CommandDispatcher(
+            session_factory=session_factory,
+            session_manager=session_manager,
+            session_cache=session_cache,
+            compaction_strategy=compaction_strategy,
+            providers=providers,
+            pause_waiter=pause_waiter,
+            notification_service=notification_service,
         )
 
         recovered_sessions = await session_manager.recover_stale_sessions()
@@ -326,7 +348,8 @@ def create_app() -> FastAPI:
         app.state.recovered_paused_task_ids = frozenset(recovered_paused_tasks)
 
         app.state.notification_service = notification_service
-        app.state.follow_up_handler = follow_up_handler
+        app.state.turn_scheduler = turn_scheduler
+        app.state.command_dispatcher = command_dispatcher
 
         yield
 

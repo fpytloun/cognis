@@ -66,6 +66,11 @@ class EventType(StrEnum):
     DELEGATION_COMPLETED = "delegation_completed"
     DELEGATION_FAILED = "delegation_failed"
 
+    # Turn lifecycle (TurnScheduler)
+    TURN_STARTED = "turn_started"
+    TURN_COMPLETED = "turn_completed"
+    TURN_ERROR = "turn_error"
+
     # Unified notifications
     NOTIFICATION_CREATED = "notification_created"
     NOTIFICATION_RESOLVED = "notification_resolved"

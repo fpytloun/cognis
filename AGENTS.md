@@ -36,11 +36,13 @@ cognis/
 │   │   │   ├── schedules.py        # Schedule CRUD (task factory)
 │   │   │   ├── escalations.py
 │   │   │   └── system.py           # Health, metrics, JWKS
-│   │   ├── websocket.py            # WebSocket chat handler + reconnection
+│   │   ├── websocket.py            # WebSocket transport layer (thin adapter)
 │   │   ├── middleware.py           # Auth (JWT + API key), rate limiting
 │   │   └── models.py              # API request/response Pydantic models
 │   │
 │   ├── core/                       # Orchestration Core
+│   │   ├── turn_scheduler.py      # Turn orchestration (transport-agnostic)
+│   │   ├── commands.py            # Slash command dispatch (transport-agnostic)
 │   │   ├── agent_loop.py          # Agent loop engine (step runner)
 │   │   ├── task_queue.py          # Queue picking, capacity, dependency resolution
 │   │   ├── workflow_engine.py     # Workflow orchestration (step sequencing, gates, loops)
@@ -134,7 +136,9 @@ cognis/
 | Layer | Directory | Responsibility |
 |---|---|---|
 | **CLI** | `cli/` | Typer commands: `serve`, `admin create-user`, `admin reset-password`, `admin api-key`, `config init`, `status` |
-| **API Gateway** | `api/` | FastAPI routes, WebSocket handler, auth middleware, request/response models |
+| **API Gateway** | `api/` | FastAPI routes, WebSocket transport layer (thin adapter), auth middleware, request/response models |
+| **Turn Scheduler** | `core/turn_scheduler.py` | Transport-agnostic turn orchestration: submission, serialization, decision dispatch, follow-up turns, cancellation, error classification |
+| **Command Dispatcher** | `core/commands.py` | Transport-agnostic slash command handling: /compact, /new, /model, /thinking, /context, /info, /lsp, /help, /approve, /deny |
 | **Orchestration Core** | `core/` | Agent loop, Decision Engine, Session Manager, context assembly, compaction, tool routing, event bus |
 | **Session Cache** | `core/session_cache.py` | L1 in-memory cache for Intaris-derived state (events, seq, compaction, intention). No DB persistence. |
 | **Remember Queue** | `core/remember_queue.py` | Bounded async retry queue for failed Mnemory remember() calls |

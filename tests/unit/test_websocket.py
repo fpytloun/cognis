@@ -1,6 +1,6 @@
-"""Dedicated WebSocket handler unit tests.
+"""Dedicated WebSocket handler and turn scheduler unit tests.
 
-Covers _classify_turn_error, authentication flow, rate limiting,
+Covers classify_turn_error, authentication flow, rate limiting,
 backpressure, and access control.
 """
 
@@ -16,15 +16,15 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
-from cognis.api.websocket import (
-    AuthenticatedWebSocket,
+from cognis.api.websocket import AuthenticatedWebSocket
+from cognis.core.turn_scheduler import (
     SessionCreationFailedError,
-    _classify_turn_error,
+    classify_turn_error,
 )
 from cognis.models.config import ProviderHealth
 
 # ---------------------------------------------------------------------------
-# Helpers — fake app state for _classify_turn_error
+# Helpers — fake providers for classify_turn_error
 # ---------------------------------------------------------------------------
 
 
@@ -50,146 +50,104 @@ class _FakeProviders:
     memory: Any = field(default_factory=lambda: _FakeProvider())
 
 
-@dataclass
-class _FakeAppState:
-    providers: _FakeProviders = field(default_factory=_FakeProviders)
-
-
-@dataclass
-class _FakeApp:
-    state: _FakeAppState = field(default_factory=_FakeAppState)
-
-
 # ---------------------------------------------------------------------------
-# _classify_turn_error tests
+# classify_turn_error tests
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_classify_session_creation_failed() -> None:
-    app = _FakeApp()
-    code, message, recoverable, detail = await _classify_turn_error(
-        app, SessionCreationFailedError("intaris returned 500")
+    providers = _FakeProviders()
+    result = await classify_turn_error(
+        providers, SessionCreationFailedError("intaris returned 500")
     )
-    assert code == "session_creation_failed"
-    assert recoverable is True
-    assert detail is not None
-    assert "error_detail" in detail
+    assert result.code == "session_creation_failed"
+    assert result.recoverable is True
+    assert result.detail is not None
+    assert "error_detail" in result.detail
 
 
 @pytest.mark.asyncio
 async def test_classify_no_llm_model_configured_valueerror() -> None:
-    app = _FakeApp()
-    code, message, recoverable, _ = await _classify_turn_error(
-        app, ValueError("No LLM model configured")
-    )
-    assert code == "provider_not_configured:llm"
-    assert recoverable is True
+    providers = _FakeProviders()
+    result = await classify_turn_error(providers, ValueError("No LLM model configured"))
+    assert result.code == "provider_not_configured:llm"
+    assert result.recoverable is True
 
 
 @pytest.mark.asyncio
 async def test_classify_unhealthy_guardrails() -> None:
-    app = _FakeApp(
-        state=_FakeAppState(
-            providers=_FakeProviders(
-                guardrails=_FakeProvider("unhealthy"),
-            )
-        )
-    )
-    code, _, _, _ = await _classify_turn_error(app, RuntimeError("something broke"))
-    assert code == "provider_unreachable:guardrails"
+    providers = _FakeProviders(guardrails=_FakeProvider("unhealthy"))
+    result = await classify_turn_error(providers, RuntimeError("something broke"))
+    assert result.code == "provider_unreachable:guardrails"
 
 
 @pytest.mark.asyncio
 async def test_classify_unhealthy_llm_not_configured() -> None:
-    app = _FakeApp(
-        state=_FakeAppState(
-            providers=_FakeProviders(
-                llm=_FakeProvider("unhealthy"),
-            )
-        )
-    )
-    code, _, _, _ = await _classify_turn_error(app, ValueError("not configured for this provider"))
-    assert code == "provider_not_configured:llm"
+    providers = _FakeProviders(llm=_FakeProvider("unhealthy"))
+    result = await classify_turn_error(providers, ValueError("not configured for this provider"))
+    assert result.code == "provider_not_configured:llm"
 
 
 @pytest.mark.asyncio
 async def test_classify_unhealthy_llm_generic_error() -> None:
-    app = _FakeApp(
-        state=_FakeAppState(
-            providers=_FakeProviders(
-                llm=_FakeProvider("unhealthy"),
-            )
-        )
-    )
-    code, _, _, _ = await _classify_turn_error(app, RuntimeError("model refused to answer"))
-    assert code == "provider_error:llm"
+    providers = _FakeProviders(llm=_FakeProvider("unhealthy"))
+    result = await classify_turn_error(providers, RuntimeError("model refused to answer"))
+    assert result.code == "provider_error:llm"
 
 
 @pytest.mark.asyncio
 async def test_classify_unhealthy_memory() -> None:
-    app = _FakeApp(
-        state=_FakeAppState(
-            providers=_FakeProviders(
-                memory=_FakeProvider("unhealthy"),
-            )
-        )
-    )
-    code, _, _, _ = await _classify_turn_error(app, RuntimeError("something broke"))
-    assert code == "provider_unreachable:memory"
+    providers = _FakeProviders(memory=_FakeProvider("unhealthy"))
+    result = await classify_turn_error(providers, RuntimeError("something broke"))
+    assert result.code == "provider_unreachable:memory"
 
 
 @pytest.mark.asyncio
 async def test_classify_httpx_error() -> None:
-    app = _FakeApp()
-    code, _, recoverable, _ = await _classify_turn_error(
-        app, httpx.ConnectError("Connection refused")
-    )
-    assert code == "provider_error:llm"
-    assert recoverable is True
+    providers = _FakeProviders()
+    result = await classify_turn_error(providers, httpx.ConnectError("Connection refused"))
+    assert result.code == "provider_error:llm"
+    assert result.recoverable is True
 
 
 @pytest.mark.asyncio
 async def test_classify_timeout_error() -> None:
-    app = _FakeApp()
-    code, _, _, _ = await _classify_turn_error(app, TimeoutError("timed out"))
-    assert code == "provider_error:llm"
+    providers = _FakeProviders()
+    result = await classify_turn_error(providers, TimeoutError("timed out"))
+    assert result.code == "provider_error:llm"
 
 
 @pytest.mark.asyncio
 async def test_classify_generic_runtime_error_all_healthy() -> None:
-    app = _FakeApp()
-    code, message, _, _ = await _classify_turn_error(app, RuntimeError("unexpected NoneType"))
-    assert code == "turn_failed"
-    assert "failed" in message.lower()
+    providers = _FakeProviders()
+    result = await classify_turn_error(providers, RuntimeError("unexpected NoneType"))
+    assert result.code == "turn_failed"
+    assert "failed" in result.message.lower()
 
 
 @pytest.mark.asyncio
 async def test_classify_skips_provider_whose_health_raises() -> None:
     """If a provider health() check itself raises, it's skipped."""
-    app = _FakeApp(
-        state=_FakeAppState(
-            providers=_FakeProviders(
-                guardrails=_FakeRaisingProvider(),
-                llm=_FakeProvider("unhealthy"),
-            )
-        )
+    providers = _FakeProviders(
+        guardrails=_FakeRaisingProvider(),
+        llm=_FakeProvider("unhealthy"),
     )
     # guardrails health raises → skipped; llm is unhealthy → detected
-    code, _, _, _ = await _classify_turn_error(app, RuntimeError("something broke"))
-    assert code == "provider_error:llm"
+    result = await classify_turn_error(providers, RuntimeError("something broke"))
+    assert result.code == "provider_error:llm"
 
 
 @pytest.mark.asyncio
 async def test_classify_error_detail_is_sanitized() -> None:
     """Verify that API keys and long content are stripped from error_detail."""
-    app = _FakeApp()
+    providers = _FakeProviders()
     error = RuntimeError(
         'OpenAI returned 401: {"error": "Invalid API key: sk-proj-1234567890abcdef"}'
     )
-    _, _, _, detail = await _classify_turn_error(app, error)
-    assert detail is not None
-    assert "sk-proj" not in str(detail.get("error_detail", ""))
+    result = await classify_turn_error(providers, error)
+    assert result.detail is not None
+    assert "sk-proj" not in str(result.detail.get("error_detail", ""))
 
 
 # ---------------------------------------------------------------------------
