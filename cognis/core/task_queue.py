@@ -15,7 +15,7 @@ from typing import Any
 from prometheus_client import Counter, Gauge, Histogram
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from cognis.core.agent_loop import PauseResolution, PendingPause
+from cognis.core.agent_loop import PauseResolution
 from cognis.core.events import Event, EventBus, EventType
 from cognis.core.workflow_engine import WorkflowEngine
 from cognis.core.workflow_registry import WorkflowRegistry
@@ -502,7 +502,15 @@ class TaskQueue:
         return recovered
 
     async def recover_paused_tasks(self) -> list[str]:
-        """Re-enter paused workflows so prompts and waits are recreated after restart."""
+        """Re-enter paused workflows so prompts and waits are recreated after restart.
+
+        Gates are re-launched (the workflow engine re-creates the gate
+        notification).  Step-input pauses are normally recovered by
+        ``NotificationService.reconcile_pending()`` which runs before
+        this method.  As a safety net for tasks paused before the
+        notification service migration, we also re-register PauseWaiters
+        directly if no PauseWaiter entry exists yet.
+        """
         recovered: list[str] = []
         async with self._session_factory() as db_session:
             paused_rows = await list_tasks_by_status(db_session, ["paused"], limit=1000)
@@ -517,31 +525,38 @@ class TaskQueue:
             if pause_type == "gate":
                 self._launch_task_run(task)
             elif pause_type == "step_input":
+                # Check if reconcile_pending already handled this
                 payload = task.workflow_state.pending_pause_payload or {}
-                self._workflow_engine._pause_waiter.register(  # noqa: SLF001
-                    PendingPause(
-                        pause_id=str(payload.get("pause_id", f"recovered_{task.task_id}")),
-                        pause_type="step_input",
-                        task_id=task.task_id,
-                        step_name=payload.get("step_name"),
-                        step_run_id=payload.get("step_run_id"),
-                        session_id=payload.get("session_id"),
-                        question=payload.get("question"),
-                        options=(
-                            [
-                                {"label": str(item), "action": str(item)}
-                                for item in payload.get("options", [])
-                            ]
-                            if isinstance(payload.get("options"), list)
-                            else None
-                        ),
-                        context=(
-                            {"context": payload.get("context")}
-                            if isinstance(payload.get("context"), str)
-                            else None
-                        ),
+                pause_id = str(payload.get("pause_id", f"recovered_{task.task_id}"))
+                existing = self._workflow_engine._pause_waiter.get(pause_id)  # noqa: SLF001
+                if existing is None:
+                    # Not yet registered — register directly as safety net
+                    from cognis.core.agent_loop import PendingPause
+
+                    self._workflow_engine._pause_waiter.register(  # noqa: SLF001
+                        PendingPause(
+                            pause_id=pause_id,
+                            pause_type="step_input",
+                            task_id=task.task_id,
+                            step_name=payload.get("step_name"),
+                            step_run_id=payload.get("step_run_id"),
+                            session_id=payload.get("session_id"),
+                            question=payload.get("question"),
+                            options=(
+                                [
+                                    {"label": str(item), "action": str(item)}
+                                    for item in payload.get("options", [])
+                                ]
+                                if isinstance(payload.get("options"), list)
+                                else None
+                            ),
+                            context=(
+                                {"context": payload.get("context")}
+                                if isinstance(payload.get("context"), str)
+                                else None
+                            ),
+                        )
                     )
-                )
             recovered.append(task.task_id)
 
         return recovered

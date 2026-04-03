@@ -50,6 +50,7 @@ class EventType(StrEnum):
     TASK_COMPLETED = "task_completed"
     TASK_FAILED = "task_failed"
     TASK_CANCELLED = "task_cancelled"
+    TASK_PAUSED = "task_paused"
     FOLLOW_UP_TURN_REQUESTED = "follow_up_turn_requested"
 
     # Workflow

@@ -1453,58 +1453,24 @@ class AgentLoop:
                         else None
                     )
 
-                    # Use the unified notification service so the step
-                    # question is persisted, resolved to the source
-                    # conversation, and survives restarts.
-                    if self.notification_service is not None:
-                        await self.notification_service.create(
-                            notification_type="step_question",
-                            user_email=ctx.session.user_email,
-                            conversation_id=ctx.conversation.conversation_id,
-                            task_id=ctx.task_id,
-                            step_name=ctx.step_definition.name,
-                            step_run_id=ctx.step_run_id,
-                            session_id=ctx.session.session_id,
-                            notification_id=pause_id,
-                            payload={
-                                "question": question,
-                                "options": formatted_options,
-                                "context": pause_context,
-                            },
-                        )
-                    else:
-                        # Fallback: direct PauseWaiter (no DB persistence)
-                        self.pause_waiter.register(
-                            PendingPause(
-                                pause_id=pause_id,
-                                pause_type="step_input",
-                                task_id=ctx.task_id,
-                                step_name=ctx.step_definition.name,
-                                step_run_id=ctx.step_run_id,
-                                session_id=ctx.session.session_id,
-                                question=question,
-                                options=formatted_options,
-                                context={"context": pause_context}
-                                if isinstance(pause_context, str)
-                                else None,
-                            )
-                        )
-                        await self.event_bus.publish(
-                            Event(
-                                type=EventType.STEP_PAUSED,
-                                data={
-                                    "pause_id": pause_id,
-                                    "pause_type": "step_input",
-                                    "question": question,
-                                    "options": pause_options,
-                                    "context": pause_context,
-                                    "session_id": ctx.session.session_id,
-                                    "task_id": ctx.task_id,
-                                    "step_name": ctx.step_definition.name,
-                                    "step_run_id": ctx.step_run_id,
-                                },
-                            )
-                        )
+                    # Create the step question via the notification service
+                    # so it is persisted, resolved to the source conversation,
+                    # and survives restarts.
+                    await self.notification_service.create(
+                        notification_type="step_question",
+                        user_email=ctx.session.user_email,
+                        conversation_id=ctx.conversation.conversation_id,
+                        task_id=ctx.task_id,
+                        step_name=ctx.step_definition.name,
+                        step_run_id=ctx.step_run_id,
+                        session_id=ctx.session.session_id,
+                        notification_id=pause_id,
+                        payload={
+                            "question": question,
+                            "options": formatted_options,
+                            "context": pause_context,
+                        },
+                    )
 
                     await self._set_interactive_pause_state(
                         ctx,
@@ -1794,61 +1760,28 @@ class AgentLoop:
             )
         timeout_f = float(timeout_raw)
 
-        # Use the notification service to create the escalation.
-        # For task-originated escalations, the service resolves the
-        # target to the task's source conversation so the user sees
-        # the escalation in their chat, not in the invisible task step.
+        # Create the escalation via the notification service.  For
+        # task-originated escalations, the service resolves the target
+        # to the task's source conversation so the user sees the
+        # escalation in their chat, not in the invisible task step.
         # The intaris_call_id is used as notification_id so the existing
         # /escalations/{call_id}/resolve endpoint can find it.
-        if self.notification_service is not None:
-            await self.notification_service.create(
-                notification_type="escalation",
-                user_email=ctx.session.user_email,
-                conversation_id=conversation_id,
-                task_id=ctx.task_id,
-                session_id=ctx.session.session_id,
-                notification_id=intaris_call_id,
-                payload={
-                    "call_id": intaris_call_id,
-                    "tool_name": tc.name,
-                    "risk": eval_meta.get("risk"),
-                    "reasoning": eval_meta.get("reasoning"),
-                    "timeout_seconds": timeout_raw,
-                },
-            )
-            pause_id = intaris_call_id
-        else:
-            # Fallback: direct PauseWaiter registration (no notification service)
-            pause_id = f"escalation:{intaris_call_id}"
-            self.pause_waiter.register(
-                PendingPause(
-                    pause_id=pause_id,
-                    pause_type="escalation",
-                    session_id=ctx.session.session_id,
-                    conversation_id=conversation_id,
-                    context={
-                        "call_id": intaris_call_id,
-                        "tool_name": tc.name,
-                        "arguments": tc.arguments,
-                        "risk": eval_meta.get("risk"),
-                        "reasoning": eval_meta.get("reasoning"),
-                    },
-                )
-            )
-            await self.event_bus.publish(
-                Event(
-                    type=EventType.ESCALATION_CREATED,
-                    data={
-                        "conversation_id": conversation_id,
-                        "session_id": ctx.session.session_id,
-                        "call_id": intaris_call_id,
-                        "tool_name": tc.name,
-                        "risk": eval_meta.get("risk"),
-                        "reasoning": eval_meta.get("reasoning"),
-                        "timeout_seconds": timeout_raw,
-                    },
-                )
-            )
+        await self.notification_service.create(
+            notification_type="escalation",
+            user_email=ctx.session.user_email,
+            conversation_id=conversation_id,
+            task_id=ctx.task_id,
+            session_id=ctx.session.session_id,
+            notification_id=intaris_call_id,
+            payload={
+                "call_id": intaris_call_id,
+                "tool_name": tc.name,
+                "risk": eval_meta.get("risk"),
+                "reasoning": eval_meta.get("reasoning"),
+                "timeout_seconds": timeout_raw,
+            },
+        )
+        pause_id = intaris_call_id
 
         # Send an interim tool_result to the WebSocket so the UI shows
         # the escalation status on the tool call block immediately.

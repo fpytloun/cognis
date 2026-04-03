@@ -49,7 +49,7 @@ export interface DelegationTimelineItem {
   kind: 'delegation';
   taskId: string;
   taskLabel: string;
-  status: 'started' | 'running' | 'completed' | 'failed' | 'cancelled';
+  status: 'started' | 'running' | 'paused' | 'completed' | 'failed' | 'cancelled';
   result: string | null;
   timestamp: string | null;
 }
@@ -570,6 +570,17 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
       return next;
     }
     next.push(delegation);
+    return next;
+  }
+
+  if (event.type === 'task_paused') {
+    const taskId = event.task_id;
+    const itemId = `delegation:${taskId}`;
+    const index = next.findIndex((item) => item.id === itemId && item.kind === 'delegation');
+    if (index >= 0) {
+      const existing = next[index] as DelegationTimelineItem;
+      next[index] = { ...existing, status: 'paused', result: 'Waiting for input' };
+    }
     return next;
   }
 

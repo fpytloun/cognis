@@ -2492,6 +2492,13 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
             "step": "workflow",
             "progress": "running",
         }
+    if event.type == EventType.TASK_PAUSED:
+        return {
+            "type": "task_paused",
+            "conversation_id": conversation_id,
+            "task_id": event.data.get("task_id"),
+            "task_title": event.data.get("task_title"),
+        }
     if event.type == EventType.TASK_COMPLETED:
         return {
             "type": "workflow_completed",

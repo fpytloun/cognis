@@ -21,7 +21,6 @@ from cognis.core.agent_loop import (
     WORKFLOW_POLICY,
     AgentLoop,
     PauseWaiter,
-    PendingPause,
     StepContext,
     StepInterrupted,
     TokenCallback,
@@ -678,49 +677,34 @@ class WorkflowEngine:
             await update_task_status(db_session, task.task_id, "paused")
             await db_session.commit()
 
-        # Use the unified notification service so the gate is persisted
-        # to DB, resolved to the source conversation, and survives restarts.
-        if self._notification_service is not None:
-            await self._notification_service.create(
-                notification_type="gate",
-                user_email=task.created_by,
-                conversation_id=task.source_ref or "",
-                task_id=task.task_id,
-                step_name=step_def.name,
-                notification_id=pause_id,
-                payload={
-                    "message": gate.message,
-                    "context": gate_context,
-                    "options": gate_options,
-                    "question": gate.message,
+        # Publish TASK_PAUSED so the chat delegation card updates status
+        await self._event_bus.publish(
+            Event(
+                type=EventType.TASK_PAUSED,
+                data={
+                    "task_id": task.task_id,
+                    "task_title": task.title,
+                    "conversation_id": task.source_ref,
                 },
             )
-        else:
-            # Fallback: direct PauseWaiter (no DB persistence)
-            self._pause_waiter.register(
-                PendingPause(
-                    pause_id=pause_id,
-                    pause_type="gate",
-                    task_id=task.task_id,
-                    step_name=step_def.name,
-                    question=gate.message,
-                    options=gate_options,
-                    context=gate_context,
-                )
-            )
-            await self._event_bus.publish(
-                Event(
-                    type=EventType.WORKFLOW_GATE,
-                    data={
-                        "pause_id": pause_id,
-                        "task_id": task.task_id,
-                        "step": step_def.name,
-                        "message": gate.message,
-                        "context": gate_context,
-                        "options": gate_options,
-                    },
-                )
-            )
+        )
+
+        # Create the gate via the notification service so it is persisted
+        # to DB, resolved to the source conversation, and survives restarts.
+        await self._notification_service.create(
+            notification_type="gate",
+            user_email=task.created_by,
+            conversation_id=task.source_ref or "",
+            task_id=task.task_id,
+            step_name=step_def.name,
+            notification_id=pause_id,
+            payload={
+                "message": gate.message,
+                "context": gate_context,
+                "options": gate_options,
+                "question": gate.message,
+            },
+        )
 
         # Wait for resolution
         try:

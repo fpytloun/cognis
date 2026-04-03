@@ -250,6 +250,23 @@ def create_app() -> FastAPI:
             llm_provider=providers.llm,
         )
         agent_loop.set_task_queue(task_queue)
+        # Unified notification service — created early so recovery code
+        # can use it.  Must be before recover_paused_tasks().
+        from cognis.core.notifications import NotificationService
+
+        notification_service = NotificationService(
+            session_factory=session_factory,
+            pause_waiter=pause_waiter,
+            event_bus=event_bus,
+            providers=providers,
+        )
+        agent_loop.notification_service = notification_service
+        workflow_engine._notification_service = notification_service  # noqa: SLF001
+
+        # Reconcile pending notifications from before restart (re-registers
+        # PauseWaiters from DB so gates/escalations/step-questions survive).
+        await notification_service.reconcile_pending()
+
         recovered_sessions = await session_manager.recover_stale_sessions()
         recovered_tasks = await task_queue.recover_stale_tasks()
         recovered_paused_tasks = await task_queue.recover_paused_tasks()
@@ -296,21 +313,7 @@ def create_app() -> FastAPI:
         app.state.recovered_task_ids = frozenset(recovered_tasks)
         app.state.recovered_paused_task_ids = frozenset(recovered_paused_tasks)
 
-        # Unified notification service
-        from cognis.core.notifications import NotificationService
-
-        notification_service = NotificationService(
-            session_factory=session_factory,
-            pause_waiter=pause_waiter,
-            event_bus=event_bus,
-            providers=providers,
-        )
         app.state.notification_service = notification_service
-        agent_loop.notification_service = notification_service
-        workflow_engine._notification_service = notification_service  # noqa: SLF001
-
-        # Reconcile pending notifications from before restart
-        await notification_service.reconcile_pending()
 
         yield
 
