@@ -123,11 +123,16 @@ def prune_tool_outputs(
                 cleared_calls.append(tc)
                 continue
             func = tc.get("function", {})
-            args_str = json.dumps(func.get("arguments", {}), default=str)
+            raw_args = func.get("arguments", {})
+            args_str = (
+                json.dumps(raw_args, default=str) if not isinstance(raw_args, str) else raw_args
+            )
             if len(args_str) > arg_clear_threshold:
                 cleared_func = {
                     **func,
-                    "arguments": {"_cleared": f"[Arguments cleared — {len(args_str)} chars]"},
+                    "arguments": json.dumps(
+                        {"_cleared": f"[Arguments cleared — {len(args_str)} chars]"}
+                    ),
                 }
                 cleared_calls.append({**tc, "function": cleared_func})
             else:

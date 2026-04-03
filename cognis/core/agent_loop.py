@@ -626,13 +626,24 @@ class AgentLoop:
                 "Agent loop step failed",
                 extra={"extra_data": {"session_id": ctx.session.session_id}},
             )
-            # Emergency flush: persist any accumulated events before
-            # reporting failure — preserves tool call history for the UI.
+            # Record a system_notice so the failure is visible in the
+            # step session logs (UI chat timeline).
+            error_msg = f"{type(exc).__name__}: {exc}"
+            self._pending_events.append(
+                SessionEvent(
+                    type="lifecycle",
+                    data={
+                        "event": "system_notice",
+                        "message": f"Step failed: {error_msg[:500]}",
+                    },
+                )
+            )
+            # Emergency flush: persist any accumulated events (including
+            # the error notice) before reporting failure.
             await self._emergency_flush_events(ctx, self._pending_events)
             STEPS_TOTAL.labels(step_type=ctx.step_definition.type, status="error").inc()
             # Return a StepOutput with the error so it can be stored and
             # displayed in the UI instead of silently returning None.
-            error_msg = f"{type(exc).__name__}: {exc}"
             return StepOutput(
                 summary=f"Step failed: {type(exc).__name__}",
                 error=error_msg[:2000],

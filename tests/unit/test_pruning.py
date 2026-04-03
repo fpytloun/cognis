@@ -114,10 +114,11 @@ def test_large_arguments_cleared() -> None:
     )
     # Tool result should be cleared
     assert "Tool result cleared" in result[2]["content"]
-    # Tool call arguments should also be cleared
+    # Tool call arguments should also be cleared (as a JSON string)
     func = result[1]["tool_calls"][0]["function"]
+    assert isinstance(func["arguments"], str), "arguments must be a JSON string"
     assert "_cleared" in func["arguments"]
-    assert "Arguments cleared" in func["arguments"]["_cleared"]
+    assert "Arguments cleared" in func["arguments"]
 
 
 def test_short_arguments_preserved() -> None:

@@ -84,9 +84,9 @@ def _follow_up_turn_prompt(
             lines.append(
                 "\nInform the user that the task has failed and briefly explain "
                 "why based on the error details above. Do NOT attempt to complete "
-                "the task yourself or make additional tool calls to gather the "
-                "task's results. Offer to retry the task or investigate the "
-                "failure further if the user wants."
+                "the task yourself, do NOT call retry_task or create_task, and do "
+                "NOT make additional tool calls to gather the task's results. "
+                "Simply inform the user and let them decide what to do next."
             )
             return "\n".join(lines)
         if status_name == "cancelled":

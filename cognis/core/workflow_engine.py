@@ -224,6 +224,29 @@ class WorkflowEngine:
                     await self._persist_workflow_state(task)
                     continue
 
+                # Skip this step if any of its input sources were skipped —
+                # running without required input would produce garbage.
+                if state.skipped_steps:
+                    source_names = resolve_source_names(
+                        step_def, state.current_step_index, workflow.steps
+                    )
+                    missing = [s for s in source_names if s in state.skipped_steps]
+                    if missing:
+                        logger.warning(
+                            "Skipping step — input source was skipped",
+                            extra={
+                                "extra_data": {
+                                    "task_id": task.task_id,
+                                    "step": step_def.name,
+                                    "missing_sources": missing,
+                                }
+                            },
+                        )
+                        state.skipped_steps.append(step_def.name)
+                        state.current_step_index += 1
+                        await self._persist_workflow_state(task)
+                        continue
+
                 # Run step
                 step_result = await self._execute_run_step(
                     task,
