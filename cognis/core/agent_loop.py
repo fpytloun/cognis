@@ -2734,7 +2734,12 @@ class AgentLoop:
         ctx: StepContext,
         content_parts: list[str] | None,
     ) -> None:
-        """Enqueue assistant content to Mnemory remember queue."""
+        """Enqueue last turn (user + assistant) to Mnemory remember queue.
+
+        Sends both the user message and assistant response so mnemory can
+        extract facts from the full exchange — matching the pattern used by
+        the OpenWebUI and OpenClaw mnemory integrations.
+        """
         if not content_parts:
             return
         if not ctx.session.mnemory_session_id:
@@ -2744,15 +2749,27 @@ class AgentLoop:
             )
             return
         assistant_content = " ".join(content_parts)
-        if assistant_content.strip():
-            await self.remember_queue.enqueue(
-                {
-                    "session_id": ctx.session.mnemory_session_id,
-                    "messages": [{"role": "assistant", "content": assistant_content[:5000]}],
-                    "user_email": ctx.session.user_email,
-                    "agent_id": ctx.session.agent_id,
-                }
-            )
+        if not assistant_content.strip():
+            return
+
+        # Build the last turn: user message + assistant response.
+        # Mnemory's remember endpoint expects OpenAI-format messages
+        # and extracts facts from both roles.  System-initiated turns
+        # (workflow steps, delegations) use internal prompts as
+        # user_message — skip those to avoid polluting user memory.
+        messages: list[dict[str, str]] = []
+        if not ctx.system_initiated and ctx.user_message and ctx.user_message.strip():
+            messages.append({"role": "user", "content": ctx.user_message[:5000]})
+        messages.append({"role": "assistant", "content": assistant_content[:5000]})
+
+        await self.remember_queue.enqueue(
+            {
+                "session_id": ctx.session.mnemory_session_id,
+                "messages": messages,
+                "user_email": ctx.session.user_email,
+                "agent_id": ctx.session.agent_id,
+            }
+        )
 
     async def _auto_compact(self, ctx: StepContext) -> None:
         """Automatically compact and rotate the session post-turn.

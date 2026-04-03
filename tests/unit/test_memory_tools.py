@@ -20,7 +20,7 @@ class TestMemoryToolDefinitions:
 
     def test_memory_tools_count(self) -> None:
         defs = memory_tools()
-        assert len(defs) == 14
+        assert len(defs) == 15
 
     def test_all_have_builtin_source(self) -> None:
         for tool in ALL_MEMORY_TOOLS:
@@ -45,6 +45,7 @@ class TestMemoryToolDefinitions:
             "memory_recent",
             "memory_save_artifact",
             "memory_get_artifact",
+            "memory_get_artifact_url",
             "memory_list_artifacts",
             "memory_delete_artifact",
         }
@@ -65,6 +66,7 @@ class TestMemoryToolDefinitions:
             "memory_categories",
             "memory_recent",
             "memory_get_artifact",
+            "memory_get_artifact_url",
             "memory_list_artifacts",
         }
 
@@ -189,6 +191,35 @@ class TestMemoryToolHandlers:
         assert not result.is_error
 
     @pytest.mark.asyncio()
+    async def test_memory_get_artifact_url(self) -> None:
+        provider = self._mock_provider({"url": "https://example.com/dl", "expires_in": 3600})
+        result = await handle_memory_tool(
+            "memory_get_artifact_url",
+            {"memory_id": "mem_123", "artifact_id": "art_456"},
+            provider,
+            "agent1",
+            "user@test.com",
+        )
+        assert not result.is_error
+        provider.client.post.assert_called_once()
+        call_args = provider.client.post.call_args
+        assert "/download-token" in call_args[0][0]
+
+    @pytest.mark.asyncio()
+    async def test_memory_get_artifact_url_with_ttl(self) -> None:
+        provider = self._mock_provider({"url": "https://example.com/dl", "expires_in": 7200})
+        result = await handle_memory_tool(
+            "memory_get_artifact_url",
+            {"memory_id": "mem_123", "artifact_id": "art_456", "ttl": 7200},
+            provider,
+            "agent1",
+            "user@test.com",
+        )
+        assert not result.is_error
+        call_args = provider.client.post.call_args
+        assert call_args[1]["json"]["ttl"] == 7200
+
+    @pytest.mark.asyncio()
     async def test_unknown_memory_tool(self) -> None:
         provider = self._mock_provider()
         result = await handle_memory_tool(
@@ -256,8 +287,8 @@ class TestStaticToolDefinitionsComplete:
         from cognis.api.runtime_support import static_tool_definitions
 
         defs = static_tool_definitions()
-        # 2 system + 12 orchestration + 4 workflow + 14 memory + 2 tool_output + 9 executor + 5 web = 48
-        assert len(defs) == 48
+        # 2 system + 12 orchestration + 4 workflow + 15 memory + 2 tool_output + 9 executor + 5 web = 49
+        assert len(defs) == 49
 
 
 class TestToolRouterMemoryClassification:
@@ -273,4 +304,96 @@ class TestToolRouterMemoryClassification:
         assert router.classify("memory_search", registry) == ToolRoute.MEMORY
         assert router.classify("memory_add", registry) == ToolRoute.MEMORY
         assert router.classify("memory_delete", registry) == ToolRoute.MEMORY
+        assert router.classify("memory_get_artifact_url", registry) == ToolRoute.MEMORY
         assert router.classify("bash", registry) == ToolRoute.UNKNOWN  # not in registry
+
+
+class TestAdaptMemoryInstructions:
+    """Test MCP-to-Cognis tool name adaptation in instructions."""
+
+    def test_basic_replacements(self) -> None:
+        from cognis.core.context import _adapt_memory_instructions
+
+        text = "Use search_memories to find things. Call add_memory to store."
+        result = _adapt_memory_instructions(text)
+        assert "memory_search" in result
+        assert "memory_add" in result
+        assert "search_memories" not in result
+        assert "add_memory" not in result
+
+    def test_add_memories_before_add_memory(self) -> None:
+        """add_memories must be replaced before add_memory to avoid partial match."""
+        from cognis.core.context import _adapt_memory_instructions
+
+        text = "Use add_memories for batch and add_memory for single."
+        result = _adapt_memory_instructions(text)
+        assert "memory_add_batch" in result
+        assert "memory_add" in result
+        # Ensure add_memories didn't become "memory_add_batch" via partial
+        assert "memory_addies" not in result
+
+    def test_get_artifact_url_before_get_artifact(self) -> None:
+        """get_artifact_url must be replaced before get_artifact."""
+        from cognis.core.context import _adapt_memory_instructions
+
+        text = "Use get_artifact_url for downloads and get_artifact for content."
+        result = _adapt_memory_instructions(text)
+        assert "memory_get_artifact_url" in result
+        assert "memory_get_artifact" in result
+        # get_artifact_url should not become "memory_get_artifact_url"
+        # via partial match of get_artifact
+        assert "memory_get_artifact_url" in result
+
+    def test_nonexistent_tools_annotated(self) -> None:
+        from cognis.core.context import _adapt_memory_instructions
+
+        text = "Do NOT call initialize_memory or get_core_memories — already done"
+        result = _adapt_memory_instructions(text)
+        assert "initialize_memory (not available)" in result
+        assert "get_core_memories (not available)" in result
+
+    def test_all_tool_names_replaced(self) -> None:
+        from cognis.core.context import _adapt_memory_instructions
+
+        text = (
+            "search_memories find_memories ask_memories add_memory add_memories "
+            "update_memory delete_memory list_memories list_categories "
+            "get_recent_memories save_artifact get_artifact get_artifact_url "
+            "list_artifacts delete_artifact"
+        )
+        result = _adapt_memory_instructions(text)
+        assert "memory_search" in result
+        assert "memory_find" in result
+        assert "memory_ask" in result
+        assert "memory_add " in result  # space to distinguish from memory_add_batch
+        assert "memory_add_batch" in result
+        assert "memory_update" in result
+        assert "memory_delete" in result
+        assert "memory_list " in result  # space to distinguish from memory_list_artifacts
+        assert "memory_categories" in result
+        assert "memory_recent" in result
+        assert "memory_save_artifact" in result
+        assert "memory_get_artifact " in result  # space to distinguish from _url
+        assert "memory_get_artifact_url" in result
+        assert "memory_list_artifacts" in result
+        assert "memory_delete_artifact" in result
+
+    def test_passthrough_no_tool_names(self) -> None:
+        from cognis.core.context import _adapt_memory_instructions
+
+        text = "This text has no MCP tool names at all."
+        result = _adapt_memory_instructions(text)
+        assert result == text
+
+    def test_word_boundary_prevents_partial_match(self) -> None:
+        from cognis.core.context import _adapt_memory_instructions
+
+        # "my_add_memory_function" should not be affected
+        text = "my_add_memory_function is custom"
+        result = _adapt_memory_instructions(text)
+        # Word boundary \b matches between \w and \W, but _ is \w,
+        # so add_memory inside my_add_memory_function won't match
+        # because there's no boundary before 'add' (preceded by '_')
+        # Actually \b is between \w and \W. Since _ is \w and the
+        # preceding char is also \w, there's no boundary. Good.
+        assert "my_add_memory_function" in result

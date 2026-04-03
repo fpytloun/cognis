@@ -26,7 +26,11 @@ _SOURCE = ToolSource(type="builtin")
 
 MEMORY_SEARCH_TOOL = ToolDefinition(
     name="memory_search",
-    description="Search long-term memories by semantic similarity. Returns relevant memories ranked by relevance and importance.",
+    description=(
+        "Search memories by semantic similarity with filtering and importance reranking. "
+        "Results are ranked by relevance and importance. Memories with artifacts "
+        "show has_artifacts: true — use memory_get_artifact to fetch details."
+    ),
     parameters={
         "type": "object",
         "properties": {
@@ -60,7 +64,13 @@ MEMORY_SEARCH_TOOL = ToolDefinition(
 
 MEMORY_FIND_TOOL = ToolDefinition(
     name="memory_find",
-    description="Find memories relevant to a complex question using AI-powered search. Generates multiple targeted searches and reranks results. Slower but higher quality for complex questions.",
+    description=(
+        "Find memories relevant to a complex question using AI-powered search. "
+        "Generates multiple targeted searches covering different angles and "
+        "associations, then reranks results by relevance. Temporal-aware. "
+        "Slower than memory_search (2 extra LLM calls) but higher quality "
+        "for complex, multi-faceted questions."
+    ),
     parameters={
         "type": "object",
         "properties": {
@@ -90,7 +100,12 @@ MEMORY_FIND_TOOL = ToolDefinition(
 
 MEMORY_ASK_TOOL = ToolDefinition(
     name="memory_ask",
-    description="Ask a question and get a human-readable answer based on stored memories. Most expensive operation (3 LLM calls). Use when you need a synthesized answer.",
+    description=(
+        "Ask a question and get a human-readable answer based on stored memories. "
+        "Uses memory_find internally, then generates a natural language answer. "
+        "Most expensive operation (3 LLM calls). Use when you need a synthesized "
+        "answer rather than raw memory results."
+    ),
     parameters={
         "type": "object",
         "properties": {
@@ -121,7 +136,15 @@ MEMORY_ASK_TOOL = ToolDefinition(
 
 MEMORY_ADD_TOOL = ToolDefinition(
     name="memory_add",
-    description="Store a new memory. Content is automatically analyzed for facts, classified, and deduplicated.",
+    description=(
+        "Store a memory about the user or agent. "
+        "Call this whenever the user shares personal information, preferences, "
+        "facts, decisions, project context, or anything worth remembering. "
+        "Content must be concise (max 1000 chars). For detailed content, store "
+        "a summary here and attach the full content with memory_save_artifact. "
+        "All metadata fields are OPTIONAL — if omitted, the server auto-classifies "
+        "them using an LLM."
+    ),
     parameters={
         "type": "object",
         "properties": {
@@ -170,7 +193,11 @@ MEMORY_ADD_TOOL = ToolDefinition(
 
 MEMORY_ADD_BATCH_TOOL = ToolDefinition(
     name="memory_add_batch",
-    description="Store multiple memories in a single call. Each memory is processed independently.",
+    description=(
+        "Store multiple memories in a single call (batch operation). "
+        "Each memory is processed independently — failures on individual "
+        "items do not block the rest."
+    ),
     parameters={
         "type": "object",
         "properties": {
@@ -202,7 +229,7 @@ MEMORY_ADD_BATCH_TOOL = ToolDefinition(
 
 MEMORY_UPDATE_TOOL = ToolDefinition(
     name="memory_update",
-    description="Update an existing memory's content or metadata by its ID.",
+    description="Update an existing memory's content or metadata.",
     parameters={
         "type": "object",
         "properties": {
@@ -229,7 +256,7 @@ MEMORY_UPDATE_TOOL = ToolDefinition(
 
 MEMORY_DELETE_TOOL = ToolDefinition(
     name="memory_delete",
-    description="Delete a memory by its ID.",
+    description="Delete a specific memory and all its artifacts.",
     parameters={
         "type": "object",
         "properties": {
@@ -245,7 +272,7 @@ MEMORY_DELETE_TOOL = ToolDefinition(
 
 MEMORY_LIST_TOOL = ToolDefinition(
     name="memory_list",
-    description="List stored memories with optional filters.",
+    description="List all stored memories for a user, optionally filtered.",
     parameters={
         "type": "object",
         "properties": {
@@ -269,7 +296,11 @@ MEMORY_LIST_TOOL = ToolDefinition(
 
 MEMORY_CATEGORIES_TOOL = ToolDefinition(
     name="memory_categories",
-    description="List all available memory categories with descriptions and counts.",
+    description=(
+        "List all available memory categories with descriptions and counts. "
+        "Shows predefined categories and any dynamic project:<name> categories. "
+        "Categories are PREDEFINED — do not invent new ones."
+    ),
     parameters={"type": "object", "properties": {}},
     source=_SOURCE,
     category="memory",
@@ -279,7 +310,7 @@ MEMORY_CATEGORIES_TOOL = ToolDefinition(
 
 MEMORY_RECENT_TOOL = ToolDefinition(
     name="memory_recent",
-    description="Get recent memories from the last N days, ordered by most recent first.",
+    description="Get recent memories from the last N days. Returns memories of all types ordered by most recent first.",
     parameters={
         "type": "object",
         "properties": {
@@ -301,7 +332,11 @@ MEMORY_RECENT_TOOL = ToolDefinition(
 
 MEMORY_SAVE_ARTIFACT_TOOL = ToolDefinition(
     name="memory_save_artifact",
-    description="Attach an artifact to a memory (slow memory tier). Use for detailed content too long for fast memory.",
+    description=(
+        "Attach an artifact to a memory (slow memory tier). "
+        "Use for detailed content too long for fast memory — research reports, "
+        "analysis, logs, notes, code, data, images, PDFs (max 10MB)."
+    ),
     parameters={
         "type": "object",
         "properties": {
@@ -323,7 +358,10 @@ MEMORY_SAVE_ARTIFACT_TOOL = ToolDefinition(
 
 MEMORY_GET_ARTIFACT_TOOL = ToolDefinition(
     name="memory_get_artifact",
-    description="Retrieve artifact content attached to a memory. Text artifacts support pagination.",
+    description=(
+        "Retrieve artifact content. Text artifacts support pagination. "
+        "Binary artifacts >1MB require memory_get_artifact_url instead."
+    ),
     parameters={
         "type": "object",
         "properties": {
@@ -373,6 +411,32 @@ MEMORY_DELETE_ARTIFACT_TOOL = ToolDefinition(
     timeout_seconds=15,
 )
 
+MEMORY_GET_ARTIFACT_URL_TOOL = ToolDefinition(
+    name="memory_get_artifact_url",
+    description=(
+        "Generate a short-lived signed URL for direct artifact download. "
+        "Use instead of memory_get_artifact for binary artifacts (images, PDFs), "
+        "large artifacts (>1MB), or when a direct browser URL is needed."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "memory_id": {"type": "string", "description": "ID of the parent memory."},
+            "artifact_id": {"type": "string", "description": "ID of the artifact."},
+            "ttl": {
+                "type": "integer",
+                "description": "URL lifetime in seconds (default ~3600, max ~86400).",
+                "minimum": 60,
+            },
+        },
+        "required": ["memory_id", "artifact_id"],
+    },
+    source=_SOURCE,
+    category="memory",
+    read_only=True,
+    timeout_seconds=15,
+)
+
 ALL_MEMORY_TOOLS: list[ToolDefinition] = [
     MEMORY_SEARCH_TOOL,
     MEMORY_FIND_TOOL,
@@ -386,6 +450,7 @@ ALL_MEMORY_TOOLS: list[ToolDefinition] = [
     MEMORY_RECENT_TOOL,
     MEMORY_SAVE_ARTIFACT_TOOL,
     MEMORY_GET_ARTIFACT_TOOL,
+    MEMORY_GET_ARTIFACT_URL_TOOL,
     MEMORY_LIST_ARTIFACTS_TOOL,
     MEMORY_DELETE_ARTIFACT_TOOL,
 ]
@@ -573,6 +638,20 @@ async def _dispatch(
         memory_id = args.get("memory_id", "")
         response = await client.get(
             f"/api/memories/{memory_id}/artifacts",
+            headers=headers,
+        )
+        response.raise_for_status()
+        return _json_output(response.json())
+
+    if tool_name == "memory_get_artifact_url":
+        memory_id = args.get("memory_id", "")
+        artifact_id = args.get("artifact_id", "")
+        payload: dict[str, Any] = {}
+        if args.get("ttl") is not None:
+            payload["ttl"] = args["ttl"]
+        response = await client.post(
+            f"/api/memories/{memory_id}/artifacts/{artifact_id}/download-token",
+            json=payload,
             headers=headers,
         )
         response.raise_for_status()

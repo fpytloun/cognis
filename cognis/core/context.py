@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -254,7 +255,7 @@ class ContextAssembler:
         raw_search = recall_payload.get("search_results")
 
         if isinstance(raw_instructions, str) and raw_instructions.strip():
-            immutable_instructions = raw_instructions.strip()
+            immutable_instructions = _adapt_memory_instructions(raw_instructions.strip())
         if isinstance(raw_core, str) and raw_core.strip():
             immutable_core_memories = raw_core.strip()
 
@@ -844,6 +845,76 @@ def _is_immutable_prefix_message(message: dict[str, Any], system_prompt: str | N
         return True
     # Core memories (untrusted wrapper without "Recalled memories" marker)
     return '<memory_context trust="untrusted">' in content and "Recalled memories:" not in content
+
+
+# ---------------------------------------------------------------------------
+# Instruction adaptation: MCP tool names → Cognis builtin tool names
+# ---------------------------------------------------------------------------
+
+# Mnemory instructions reference MCP tool names (search_memories, add_memory,
+# etc.) but Cognis exposes builtin tools with different names (memory_search,
+# memory_add, etc.).  This mapping translates instruction text so the LLM
+# can connect the guidance to the actual tools it has available.
+#
+# Ordered longest-first within each group to prevent partial-match collisions
+# (e.g. "add_memories" must be replaced before "add_memory").
+_MCP_TO_COGNIS_TOOL_NAMES: list[tuple[str, str]] = [
+    ("get_recent_memories", "memory_recent"),
+    ("search_memories", "memory_search"),
+    ("find_memories", "memory_find"),
+    ("ask_memories", "memory_ask"),
+    ("add_memories", "memory_add_batch"),
+    ("add_memory", "memory_add"),
+    ("update_memory", "memory_update"),
+    ("delete_memory", "memory_delete"),
+    ("list_memories", "memory_list"),
+    ("list_categories", "memory_categories"),
+    ("get_artifact_url", "memory_get_artifact_url"),
+    ("save_artifact", "memory_save_artifact"),
+    ("delete_artifact", "memory_delete_artifact"),
+    ("list_artifacts", "memory_list_artifacts"),
+    ("get_artifact", "memory_get_artifact"),
+]
+
+# MCP tools that don't exist in Cognis — handled automatically by the
+# controller.  References in instructions are annotated so the LLM knows
+# these are not callable.  List (not set) for deterministic iteration.
+_MCP_NONEXISTENT_TOOLS: list[str] = ["initialize_memory", "get_core_memories"]
+
+# Pre-compiled regex patterns for each mapping (word-boundary safe).
+_TOOL_NAME_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(rf"\b{re.escape(mcp_name)}\b"), cognis_name)
+    for mcp_name, cognis_name in _MCP_TO_COGNIS_TOOL_NAMES
+]
+
+# Pre-compiled patterns for non-existent tools.
+_NONEXISTENT_TOOL_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(rf"\b{re.escape(name)}\b"), f"{name} (not available)")
+    for name in _MCP_NONEXISTENT_TOOLS
+]
+
+
+def _adapt_memory_instructions(instructions: str) -> str:
+    """Adapt mnemory instructions for Cognis builtin tool names.
+
+    Replaces MCP-style tool names (search_memories, add_memory, etc.) with
+    Cognis builtin names (memory_search, memory_add, etc.) so the LLM can
+    connect the behavioral guidance to the actual tools in its schema.
+
+    Also annotates references to tools that don't exist in Cognis
+    (initialize_memory, get_core_memories) with "(not available)".
+    """
+    text = instructions
+
+    # Annotate references to non-existent tools first (before renaming).
+    for pattern, replacement in _NONEXISTENT_TOOL_PATTERNS:
+        text = pattern.sub(replacement, text)
+
+    # Replace MCP tool names with Cognis builtin names.
+    for pattern, replacement in _TOOL_NAME_PATTERNS:
+        text = pattern.sub(replacement, text)
+
+    return text
 
 
 def _format_delegation_status(data: dict[str, Any]) -> str:
