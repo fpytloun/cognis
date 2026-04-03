@@ -1055,6 +1055,7 @@ class AgentLoop:
 
         # Main agentic loop
         reprompted = False
+        _mid_stream_retried = False
         while True:
             self._raise_if_cancelled(ctx)
 
@@ -1109,9 +1110,33 @@ class AgentLoop:
                         SessionEvent(type="assistant_message", data={"content": partial_content})
                     )
                     assistant_content_parts.append(partial_content)
-                # Flush events before raising so tool call history is preserved
-                await self._emergency_flush_events(ctx, events_to_record)
-                raise RuntimeError(mid_stream_error)
+
+                # Retry once — the mid-stream error may be transient
+                if not _mid_stream_retried:
+                    _mid_stream_retried = True
+                    logger.warning(
+                        "agent: mid-stream failure, retrying LLM call",
+                        extra={
+                            "extra_data": {
+                                "session_id": ctx.session.session_id,
+                                "error": mid_stream_error[:200],
+                            }
+                        },
+                    )
+                    continue  # Retry the while loop (new LLM call)
+
+                # Retry exhausted — add error message and break cleanly
+                error_notice = (
+                    "I encountered a model error while generating my response. "
+                    "Your tool results have been saved. Please try sending your message again."
+                )
+                events_to_record.append(
+                    SessionEvent(type="assistant_message", data={"content": error_notice})
+                )
+                assistant_content_parts.append(error_notice)
+                if on_token:
+                    await on_token(f"\n\n{error_notice}")
+                break  # Exit while loop → _finalize_step runs normally
 
             content = accumulator.get_content()
             tool_calls = accumulator.get_tool_calls()
