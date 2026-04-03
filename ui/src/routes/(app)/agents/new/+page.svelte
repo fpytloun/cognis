@@ -4,6 +4,7 @@
 
   import { createEmptyAgentForm, defaultSystemPrompt, type AgentFormState } from '$lib/agents';
   import { api, asApiError } from '$lib/api/client';
+  import { auth } from '$lib/stores/auth';
   import AgentForm from '$lib/components/agents/AgentForm.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import { installBeforeUnloadGuard, blockNavigationIfDirty } from '$lib/navigation/unsaved';
@@ -45,7 +46,9 @@
 
       // These are non-critical — load gracefully
       try { secrets = await api.secrets.list(); } catch { secrets = []; }
-      try { providers = (await api.llmProviders.list()).items; } catch { providers = []; }
+      if (auth.getSnapshot().user?.role === 'admin') {
+        try { providers = (await api.llmProviders.list()).items; } catch { providers = []; }
+      }
       try { intarisMcpServers = await api.tools.intarisMcpServers(); } catch { intarisMcpServers = []; }
 
       // Update form with system workflows pre-selected
