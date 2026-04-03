@@ -28,6 +28,8 @@
   let stepResponse = $state('');
   let expandedSteps = $state<Set<string>>(new Set());
   let pollTimer: number | null = null;
+  let tickNow = $state(Date.now());
+  let durationTimer: ReturnType<typeof setInterval> | null = null;
   let visibilityHandler: (() => void) | null = null;
 
   // Session logs drawer
@@ -276,13 +278,23 @@
   function formatDuration(startIso: string | null | undefined, endIso: string | null | undefined): string {
     if (!startIso) return '';
     const start = new Date(startIso).getTime();
-    const end = endIso ? new Date(endIso).getTime() : Date.now();
+    // Use tickNow for live-updating duration on running tasks
+    const end = endIso ? new Date(endIso).getTime() : tickNow;
     const seconds = Math.floor((end - start) / 1000);
     if (seconds < 60) return `${seconds}s`;
     const minutes = Math.floor(seconds / 60);
     if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
     const hours = Math.floor(minutes / 60);
     return `${hours}h ${minutes % 60}m`;
+  }
+
+  function startDurationTimer(): void {
+    if (durationTimer) return;
+    durationTimer = setInterval(() => { tickNow = Date.now(); }, 1000);
+  }
+
+  function stopDurationTimer(): void {
+    if (durationTimer) { clearInterval(durationTimer); durationTimer = null; }
   }
 
   // ---------------------------------------------------------------------------
@@ -295,9 +307,10 @@
       else { void refreshTaskOnly(); startPolling(); }
     };
     document.addEventListener('visibilitychange', visibilityHandler);
-    void loadTask().then(() => startPolling());
+    void loadTask().then(() => { startPolling(); startDurationTimer(); });
     return () => {
       stopPolling();
+      stopDurationTimer();
       if (visibilityHandler) document.removeEventListener('visibilitychange', visibilityHandler);
     };
   });
@@ -537,10 +550,17 @@
                   {#if stepRun.evaluation}
                     {@const evalDecision = String(stepRun.evaluation.decision ?? '')}
                     {@const evalReasoning = String(stepRun.evaluation.reasoning ?? '')}
+                    {@const evalColor = evalDecision === 'approved' || evalDecision === 'approve'
+                      ? 'text-emerald-400'
+                      : evalDecision === 'revise'
+                        ? 'text-blue-400'
+                        : evalDecision === 'failed' || evalDecision === 'reject'
+                          ? 'text-rose-400'
+                          : 'text-amber-400'}
                     <div class="mt-3 rounded-xl border border-slate-800 bg-slate-950/80 px-3 py-2">
                       <p class="text-xs font-medium uppercase tracking-widest text-slate-500">Evaluation</p>
                       <p class="mt-1 text-sm text-slate-300">
-                        <span class="font-medium {evalDecision === 'approve' ? 'text-emerald-400' : 'text-amber-400'}">
+                        <span class="font-medium {evalColor}">
                           {evalDecision}
                         </span>
                         {#if evalReasoning}

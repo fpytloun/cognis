@@ -377,6 +377,31 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
       }
       continue;
     }
+
+    // Evaluation feedback events from the step evaluator
+    if (event.type === 'evaluation') {
+      const evalEvent = String(event.data?.event ?? '');
+      if (evalEvent === 'evaluation_feedback') {
+        const decision = String(event.data?.decision ?? 'unknown');
+        const feedback = String(event.data?.feedback ?? '');
+        const attempt = event.data?.attempt ?? '?';
+        const tone: 'info' | 'warning' | 'error' =
+          decision === 'approved' || decision === 'approve'
+            ? 'info'
+            : decision === 'failed' || decision === 'reject'
+              ? 'error'
+              : 'warning';
+        items.push({
+          id: `eval:${event.seq}`,
+          kind: 'notice',
+          title: `Step Evaluation (attempt ${attempt})`,
+          description: `${decision} — ${feedback}`,
+          tone,
+          timestamp: event.timestamp
+        });
+      }
+      continue;
+    }
   }
 
   return items;

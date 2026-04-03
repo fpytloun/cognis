@@ -328,7 +328,24 @@ class WorkflowEngine:
                             break
                         continue
 
-                # Step approved or no evaluation — advance
+                # Step approved or no evaluation — advance.
+                # Mark the step session as completed now that it's approved.
+                if step_result and step_result.session_id:
+                    try:
+                        await self._session_manager.mark_completed(
+                            step_result.session_id,
+                            completion_reason="step_approved",
+                        )
+                    except Exception:
+                        logger.warning(
+                            "workflow: failed to mark step session completed",
+                            extra={
+                                "extra_data": {
+                                    "session_id": step_result.session_id,
+                                }
+                            },
+                        )
+
                 logger.info(
                     "Step approved, advancing",
                     extra={
@@ -603,6 +620,17 @@ class WorkflowEngine:
                 completed_at=datetime.now(UTC),
             )
             await db_session.commit()
+
+        # Mark the step session as idle — the step has finished executing
+        # but may be retried if evaluation rejects.  On approval, the
+        # session will be marked completed by the main workflow loop.
+        try:
+            await self._session_manager.mark_idle(session.session_id)
+        except Exception:
+            logger.warning(
+                "workflow: failed to mark step session idle",
+                extra={"extra_data": {"session_id": session.session_id}},
+            )
 
         # Return None for failed steps so the workflow engine treats them
         # as failures (retry logic, on_exhausted handling, etc.)
