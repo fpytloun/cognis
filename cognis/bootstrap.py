@@ -133,6 +133,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_agent_type_columns)
         await conn.run_sync(_ensure_user_management_columns)
         await conn.run_sync(_ensure_conversation_last_read_at)
+        await conn.run_sync(_ensure_avatar_image_id_column)
 
 
 def _ensure_session_lifecycle_columns(sync_conn: object) -> None:
@@ -282,6 +283,18 @@ def _ensure_conversation_last_read_at(sync_conn: object) -> None:
 
     if "last_read_at" not in columns:
         execute(text("ALTER TABLE conversations ADD COLUMN last_read_at TIMESTAMP"))
+
+
+def _ensure_avatar_image_id_column(sync_conn: object) -> None:
+    inspector = cast(Any, inspect(sync_conn))
+    try:
+        columns = {column["name"] for column in inspector.get_columns("agents")}
+    except Exception:
+        return  # table doesn't exist yet (create_all will handle it)
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+
+    if "avatar_image_id" not in columns:
+        execute(text("ALTER TABLE agents ADD COLUMN avatar_image_id VARCHAR"))
 
 
 _SYSTEM_USER_EMAIL = "system@cognis.local"
