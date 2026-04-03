@@ -508,7 +508,7 @@ class TurnScheduler:
         conversation_id = conversation.conversation_id
         message_id = f"msg_{uuid.uuid4().hex[:12]}"
         _pre_turn_title = conversation.title
-        start_time = asyncio.get_event_loop().time()
+        start_time = asyncio.get_running_loop().time()
         turn_type = "system" if system_initiated else "user"
 
         try:
@@ -669,7 +669,7 @@ class TurnScheduler:
             TURNS_TOTAL.labels(outcome="error").inc()
 
         finally:
-            duration = asyncio.get_event_loop().time() - start_time
+            duration = asyncio.get_running_loop().time() - start_time
             TURN_DURATION.labels(type=turn_type).observe(duration)
 
             self._active_turns.pop(conversation_id, None)
@@ -979,13 +979,13 @@ class TurnScheduler:
                 )
                 return conversation_model, new_session, agent_model
 
-            # Periodic cleanup of deferred creation locks
-            if len(self._deferred_creation_locks) > _MAX_DEFERRED_LOCKS:
-                to_remove = [
-                    cid for cid, lk in self._deferred_creation_locks.items() if not lk.locked()
-                ]
-                for cid in to_remove:
-                    self._deferred_creation_locks.pop(cid, None)
+        # Periodic cleanup of deferred creation locks (outside the lock block)
+        if len(self._deferred_creation_locks) > _MAX_DEFERRED_LOCKS:
+            to_remove = [
+                cid for cid, lk in self._deferred_creation_locks.items() if not lk.locked()
+            ]
+            for cid in to_remove:
+                self._deferred_creation_locks.pop(cid, None)
 
         return conversation_model, session_model, agent_model
 

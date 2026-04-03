@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, EmailStr, Field
 
@@ -682,6 +682,18 @@ class ExecutorUpdateRequest(BaseModel):
     config: dict[str, Any] | None = None
     status: str | None = None
     is_default: bool | None = None
+
+
+class SendMessageRequest(BaseModel):
+    """Request body for POST /conversations/{id}/messages."""
+
+    content: str = Field(..., min_length=1, max_length=100_000)
+
+
+class SendMessageResponse(BaseModel):
+    """Response for fire-and-forget message submission (202 Accepted)."""
+
+    status: Literal["accepted", "queued"] = "accepted"
 
 
 class EscalationResolveRequest(BaseModel):

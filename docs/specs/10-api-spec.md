@@ -79,6 +79,7 @@ GET    /api/v1/conversations/:id                          → Get details
 PATCH  /api/v1/conversations/:id                          → Update (title, archive)
 DELETE /api/v1/conversations/:id                          → Delete
 DELETE /api/v1/conversations/:id/purge                    → Purge metadata (+ Intaris cascade)
+POST   /api/v1/conversations/:id/messages                 → Send a chat message (SSE or 202)
 GET    /api/v1/conversations/:id/messages                 → Get history (from Intaris events)
 GET    /api/v1/conversations/:id/sessions                 → List sessions
 GET    /api/v1/conversations/:id/delegations              → Active delegations
@@ -126,6 +127,59 @@ GET /api/v1/conversations/conv_abc/messages?limit=50&after_seq=100
 ```
 
 The controller reads from Intaris event store and formats for the client.
+
+#### Send Message (REST chat)
+```http
+POST /api/v1/conversations/conv_abc/messages
+Content-Type: application/json
+Accept: text/event-stream
+{ "content": "What is the weather?" }
+
+→ 200 OK (SSE stream)
+event: token
+data: {"conversation_id":"conv_abc","session_id":"ses_123","message_id":"msg_abc","delta":"The weather"}
+
+event: tool_call
+data: {"conversation_id":"conv_abc","session_id":"ses_123","call_id":"call_1","tool_name":"weather","status":"started"}
+
+event: tool_result
+data: {"conversation_id":"conv_abc","session_id":"ses_123","call_id":"call_1","tool_name":"weather","is_error":false,"duration_ms":150}
+
+event: complete
+data: {"conversation_id":"conv_abc","session_id":"ses_123","message_id":"msg_abc","last_seq":42,"delegated":false}
+```
+
+Supports two delivery modes via the `Accept` header:
+
+- **`Accept: text/event-stream`** — SSE streaming response with real-time
+  token deltas, tool calls, and turn completion events. Keepalive comments
+  (`: keepalive`) are emitted every 15 seconds to prevent proxy idle
+  disconnections.
+- **`Accept: application/json`** (default) — fire-and-forget 202 Accepted.
+  Poll `GET /conversations/:id/messages?after_seq=N` for the response.
+
+```http
+POST /api/v1/conversations/conv_abc/messages
+Content-Type: application/json
+{ "content": "Hello" }
+
+→ 202 Accepted
+{ "status": "accepted" }
+```
+
+Slash commands (`/compact`, `/new`, `/model`, etc.) are dispatched through
+the `CommandDispatcher` and return their result directly as 200 OK:
+
+```http
+POST /api/v1/conversations/conv_abc/messages
+{ "content": "/info" }
+
+→ 200 OK
+{ "status": "command_executed", "result": {"type": "system_message", "text": "Session: ses_123\n..."} }
+```
+
+Error codes: `not_found` (404), `forbidden` (403), `session_ended` /
+`session_suspended` (409), `rate_limited` / `queue_full` (429).
 
 ### Agents
 

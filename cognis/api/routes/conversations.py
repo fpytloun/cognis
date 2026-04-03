@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from fastapi import APIRouter, Query, Request
+from starlette.responses import JSONResponse, Response, StreamingResponse
 
 from cognis.api.common import (
     api_exception,
@@ -18,10 +21,14 @@ from cognis.api.models import (
     ConversationUpdateRequest,
     CursorPage,
     MessageHistoryResponse,
+    SendMessageRequest,
+    SendMessageResponse,
     SessionEventsResponse,
     SessionResponse,
 )
 from cognis.api.serializers import conversation_to_response, event_to_response, session_to_response
+from cognis.core.turn_scheduler import TurnError
+from cognis.logging import get_logger
 from cognis.models.session import ConversationContext
 from cognis.store.queries import (
     get_agent,
@@ -32,6 +39,8 @@ from cognis.store.queries import (
     list_conversations,
     mark_conversation_read,
 )
+
+logger = get_logger(__name__)
 
 router = APIRouter(prefix="/api/v1/conversations", tags=["conversations"])
 
@@ -250,6 +259,154 @@ async def conversation_messages(
         last_seq=event_result.last_seq,
         has_more=event_result.has_more,
     )
+
+
+@router.post("/{conversation_id}/messages")
+async def send_message(
+    request: Request,
+    conversation_id: str,
+    payload: SendMessageRequest,
+) -> Response:
+    """Send a chat message to a conversation.
+
+    Supports two delivery modes via the ``Accept`` header:
+
+    - ``Accept: text/event-stream`` — SSE streaming response with real-time
+      token deltas, tool calls, and turn completion events.
+    - ``Accept: application/json`` (default) — fire-and-forget 202 Accepted.
+      Poll ``GET /conversations/{id}/messages`` for the response.
+
+    Slash commands (``/compact``, ``/new``, ``/model``, etc.) are dispatched
+    through the ``CommandDispatcher`` and return their result directly.
+    """
+    user = require_current_user(request)
+    forbid_mutation_for_viewer(request)
+
+    async with request.app.state.session_factory() as session:
+        row = await get_conversation(session, conversation_id)
+    if row is None:
+        raise api_exception(404, "not_found", "Conversation not found")
+    require_owner_or_admin(request, row.user_email)
+
+    # --- Slash command dispatch ---
+    command_result = await _try_command_dispatch(request, conversation_id, payload.content, user)
+    if command_result is not None:
+        return JSONResponse(
+            status_code=200,
+            content={"status": "command_executed", "result": command_result},
+        )
+
+    # --- Turn submission ---
+    accept = request.headers.get("accept", "application/json")
+    wants_sse = "text/event-stream" in accept
+    turn_scheduler = request.app.state.turn_scheduler
+
+    if wants_sse:
+        from cognis.api.sse import SSETurnObserver
+
+        observer = SSETurnObserver(conversation_id)
+        turn_scheduler.add_observer(conversation_id, observer)
+        error = await turn_scheduler.submit_turn(
+            conversation_id, payload.content, user_email=user.email
+        )
+        if error is not None:
+            turn_scheduler.remove_observer(conversation_id, observer)
+            raise _turn_error_to_http(error)
+
+        async def _cleanup_generator():  # type: ignore[return]
+            try:
+                async for event in observer.event_generator():
+                    yield event
+            finally:
+                turn_scheduler.remove_observer(conversation_id, observer)
+
+        return StreamingResponse(
+            _cleanup_generator(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+    else:
+        error = await turn_scheduler.submit_turn(
+            conversation_id, payload.content, user_email=user.email
+        )
+        if error is not None:
+            raise _turn_error_to_http(error)
+        return JSONResponse(
+            status_code=202,
+            content=SendMessageResponse(status="accepted").model_dump(),
+        )
+
+
+async def _try_command_dispatch(
+    request: Request,
+    conversation_id: str,
+    content: str,
+    user: Any,
+) -> dict[str, Any] | None:
+    """Try to dispatch a slash command. Returns result dict or None."""
+    command_dispatcher = getattr(request.app.state, "command_dispatcher", None)
+    if command_dispatcher is None:
+        return None
+    if not content.strip().startswith("/"):
+        return None
+
+    from cognis.api.serializers import agent_to_response
+    from cognis.core.session import _to_conversation_model, _to_session_model
+    from cognis.models.agent import AgentDefinition
+
+    async with request.app.state.session_factory() as session:
+        conversation_row = await get_conversation(session, conversation_id)
+        if conversation_row is None:
+            return None
+        agent_row = await get_agent(session, conversation_row.agent_id)
+        if agent_row is None:
+            return None
+        agent_model = AgentDefinition.model_validate(agent_to_response(agent_row).model_dump())
+        conversation_model = _to_conversation_model(conversation_row)
+        session_row = (
+            await get_session_row(session, conversation_row.active_session_id)
+            if conversation_row.active_session_id
+            else None
+        )
+
+    if session_row is None:
+        return None
+    session_model = _to_session_model(session_row)
+
+    turn_scheduler = getattr(request.app.state, "turn_scheduler", None)
+    has_active = turn_scheduler.has_active_turn(conversation_id) if turn_scheduler else False
+
+    cmd_result = await command_dispatcher.dispatch(
+        content,
+        conversation=conversation_model,
+        session=session_model,
+        agent=agent_model,
+        user_email=user.email,
+        has_active_turn=has_active,
+    )
+    if cmd_result is None:
+        return None
+
+    return {
+        "type": cmd_result.type,
+        "text": cmd_result.text,
+        "data": cmd_result.data,
+    }
+
+
+def _turn_error_to_http(error: TurnError) -> Exception:
+    """Map a TurnError to an HTTP exception."""
+    status_map: dict[str, int] = {
+        "not_found": 404,
+        "forbidden": 403,
+        "session_ended": 409,
+        "session_suspended": 409,
+        "conflict": 409,
+        "rate_limited": 429,
+        "queue_full": 429,
+    }
+    status = status_map.get(error.code, 500)
+    return api_exception(status, error.code, error.message)
 
 
 @router.get("/{conversation_id}/sessions", response_model=list[SessionResponse])

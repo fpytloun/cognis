@@ -15,7 +15,6 @@ callbacks from the TurnScheduler and forward them to connected clients.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -32,7 +31,6 @@ from cognis.api.models import (
     WebSocketError,
     WebSocketPong,
 )
-from cognis.core.agent_loop import PauseResolution
 from cognis.core.events import Event, EventType
 from cognis.core.turn_scheduler import (
     SessionCreationFailedError as SessionCreationFailedError,  # noqa: F401 — re-export
@@ -94,7 +92,7 @@ class AuthenticatedWebSocket:
 
     def allow_inbound_message(self) -> bool:
         """Rate-limit inbound messages."""
-        now = asyncio.get_event_loop().time()
+        now = asyncio.get_running_loop().time()
         while self.recent_message_times and now - self.recent_message_times[0] > 1.0:
             self.recent_message_times.popleft()
         if len(self.recent_message_times) >= DEFAULT_INBOUND_RATE_LIMIT:
@@ -333,12 +331,15 @@ class WebSocketConnectionManager:
     def subscribe(self, connection: AuthenticatedWebSocket, conversation_id: str) -> None:
         """Subscribe a connection to a conversation's events."""
         connection.subscriptions.add(conversation_id)
+        already_subscribed = bool(self._by_conversation.get(conversation_id))
         self._by_conversation[conversation_id].add(connection.connection_id)
 
-        # Register observer on TurnScheduler for this conversation
-        turn_scheduler = getattr(self.app.state, "turn_scheduler", None)
-        if turn_scheduler is not None:
-            turn_scheduler.add_observer(conversation_id, self._observer)
+        # Register observer on TurnScheduler only on first subscription
+        # (idempotent — prevents duplicate event delivery)
+        if not already_subscribed:
+            turn_scheduler = getattr(self.app.state, "turn_scheduler", None)
+            if turn_scheduler is not None:
+                turn_scheduler.add_observer(conversation_id, self._observer)
 
     def _unsubscribe(self, connection: AuthenticatedWebSocket, conversation_id: str) -> None:
         """Unsubscribe a connection from a conversation."""
@@ -865,7 +866,11 @@ async def _handle_resolve_escalation(
     connection: AuthenticatedWebSocket,
     message: dict[str, Any],
 ) -> None:
-    """Handle a 'resolve_escalation' type WebSocket frame."""
+    """Handle a 'resolve_escalation' type WebSocket frame.
+
+    Delegates to NotificationService.resolve() — the same path used by
+    the REST ``POST /api/v1/escalations/{call_id}/resolve`` endpoint.
+    """
     call_id = message.get("call_id")
     decision = message.get("decision")
     note = message.get("note")
@@ -888,7 +893,7 @@ async def _handle_resolve_escalation(
 
     current_user_email.set(connection.user_email)
 
-    # Look up the pending pause
+    # Look up tool name for the system message before resolving
     pending_pause = app.state.pause_waiter.find_pending(pause_type="escalation")
     if (
         pending_pause
@@ -902,52 +907,20 @@ async def _handle_resolve_escalation(
         else "tool call"
     )
 
-    # Try the unified notification service first
-    svc = getattr(app.state, "notification_service", None)
-    resolved = False
-    if svc is not None:
-        resolved = await svc.resolve(
-            call_id,
-            decision,
-            {"note": note if isinstance(note, str) else ""},
-        )
+    svc = app.state.notification_service
+    resolved = await svc.resolve(call_id, decision, {"note": note if isinstance(note, str) else ""})
     if not resolved:
-        # Legacy fallback
-        pause_id = f"escalation:{call_id}"
-        resolved = app.state.pause_waiter.resolve(
-            pause_id,
-            PauseResolution(
-                decision=decision,
-                data={"note": note if isinstance(note, str) else ""},
-            ),
+        await manager.send_error(
+            connection,
+            code="not_found",
+            message="Escalation not found or already resolved",
+            recoverable=True,
         )
-        if not resolved:
-            resolved = app.state.pause_waiter.resolve(
-                call_id,
-                PauseResolution(
-                    decision=decision,
-                    data={"note": note if isinstance(note, str) else ""},
-                ),
-            )
-    if not resolved:
-        pending_escalations = await app.state.providers.guardrails.list_pending_escalations()
-        if not any(item.call_id == call_id for item in pending_escalations):
-            await manager.send_error(
-                connection,
-                code="not_found",
-                message="Escalation not found or already resolved",
-                recoverable=True,
-            )
-            return
-    if svc is None:
-        with contextlib.suppress(Exception):
-            await app.state.providers.guardrails.submit_decision(
-                call_id, decision, note if isinstance(note, str) else None
-            )
+        return
 
+    # System message to conversation
     verb = "approved" if decision == "approve" else "denied"
-    note_str = note if isinstance(note, str) and note else ""
-    note_suffix = f": {note_str}" if note_str else ""
+    note_suffix = f": {note}" if isinstance(note, str) and note else ""
     conv_id = pending_pause.conversation_id if pending_pause else None
     if conv_id:
         await manager.send_to_conversation(
@@ -966,10 +939,13 @@ async def _handle_gate_response(
     connection: AuthenticatedWebSocket,
     message: dict[str, Any],
 ) -> None:
-    """Handle a 'gate_response' type WebSocket frame."""
+    """Handle a 'gate_response' type WebSocket frame.
+
+    Delegates to NotificationService — same path as
+    ``POST /api/v1/tasks/{task_id}/gate-response``.
+    """
     task_id = message.get("task_id")
     action = message.get("action")
-    step_name = message.get("step_name")
     feedback = message.get("feedback")
     if not isinstance(task_id, str) or not isinstance(action, str):
         await manager.send_error(
@@ -981,40 +957,39 @@ async def _handle_gate_response(
         return
     if await _load_task_for_user(app, connection, task_id) is None:
         await manager.send_error(
-            connection, code="not_found", message="Task not found", recoverable=True
+            connection,
+            code="not_found",
+            message="Task not found",
+            recoverable=True,
         )
         return
+
+    # Persist feedback to workflow state (read by evaluation loop)
     if isinstance(feedback, str) and feedback:
         await _persist_task_feedback(app, task_id, feedback)
 
     current_user_email.set(connection.user_email)
-    svc = getattr(app.state, "notification_service", None)
-    resolved = False
-    if svc is not None:
-        notif = await svc.find_by_task(task_id, notification_type="gate", status="pending")
-        if notif is not None:
-            resolved = await svc.resolve(
-                notif.notification_id,
-                action,
-                {"feedback": feedback if isinstance(feedback, str) else ""},
-            )
-    if not resolved:
-        pause = app.state.pause_waiter.find_pending(
-            task_id=task_id,
-            step_name=step_name if isinstance(step_name, str) else None,
-            pause_type="gate",
+    svc = app.state.notification_service
+    notif = await svc.find_by_task(task_id, notification_type="gate", status="pending")
+    if notif is None:
+        await manager.send_error(
+            connection,
+            code="not_found",
+            message="No pending gate",
+            recoverable=True,
         )
-        if pause is None:
-            await manager.send_error(
-                connection, code="not_found", message="No pending gate", recoverable=True
-            )
-            return
-        app.state.pause_waiter.resolve(
-            pause.pause_id,
-            PauseResolution(
-                decision=action,
-                data={"feedback": feedback if isinstance(feedback, str) else ""},
-            ),
+        return
+    resolved = await svc.resolve(
+        notif.notification_id,
+        action,
+        {"feedback": feedback if isinstance(feedback, str) else ""},
+    )
+    if not resolved:
+        await manager.send_error(
+            connection,
+            code="conflict",
+            message="Gate already resolved",
+            recoverable=True,
         )
 
 
@@ -1024,9 +999,12 @@ async def _handle_step_response(
     connection: AuthenticatedWebSocket,
     message: dict[str, Any],
 ) -> None:
-    """Handle a 'step_response' type WebSocket frame."""
+    """Handle a 'step_response' type WebSocket frame.
+
+    Delegates to NotificationService — same path as
+    ``POST /api/v1/tasks/{task_id}/step-response``.
+    """
     task_id = message.get("task_id")
-    step_name = message.get("step_name")
     response = message.get("response", "")
     if not isinstance(task_id, str):
         await manager.send_error(
@@ -1038,37 +1016,57 @@ async def _handle_step_response(
         return
     if await _load_task_for_user(app, connection, task_id) is None:
         await manager.send_error(
-            connection, code="not_found", message="Task not found", recoverable=True
+            connection,
+            code="not_found",
+            message="Task not found",
+            recoverable=True,
         )
         return
 
     current_user_email.set(connection.user_email)
-    svc = getattr(app.state, "notification_service", None)
+    svc = app.state.notification_service
     resolved = False
-    if svc is not None:
-        notif = await svc.find_by_task(task_id, notification_type="step_question", status="pending")
-        if notif is not None:
-            resolved = await svc.resolve(
-                notif.notification_id,
-                "continue",
-                {"response": str(response)},
-            )
-    if not resolved:
-        pause = app.state.pause_waiter.find_pending(
-            task_id=task_id,
-            step_name=step_name if isinstance(step_name, str) else None,
-            pause_type="step_input",
+    notif = await svc.find_by_task(task_id, notification_type="step_question", status="pending")
+    if notif is not None:
+        resolved = await svc.resolve(
+            notif.notification_id,
+            "continue",
+            {"response": str(response)},
         )
-        if pause is None:
+        if not resolved:
             await manager.send_error(
-                connection, code="not_found", message="No pending step question", recoverable=True
+                connection,
+                code="conflict",
+                message="Step question already resolved",
+                recoverable=True,
             )
             return
-        app.state.pause_waiter.resolve(
-            pause.pause_id,
-            PauseResolution(decision="continue", data={"response": str(response)}),
-        )
 
+    # Fallback for recovered tasks (PauseWaiter registered but no notification row)
+    if not resolved:
+        from cognis.core.agent_loop import PauseResolution
+
+        pause = app.state.pause_waiter.find_pending(
+            task_id=task_id,
+            pause_type="step_input",
+        )
+        if pause is not None:
+            app.state.pause_waiter.resolve(
+                pause.pause_id,
+                PauseResolution(decision="continue", data={"response": str(response)}),
+            )
+            resolved = True
+
+    if not resolved:
+        await manager.send_error(
+            connection,
+            code="not_found",
+            message="No pending step question",
+            recoverable=True,
+        )
+        return
+
+    # Handle task resume for recovered tasks (task not actively running)
     if not app.state.task_queue.has_active_run(task_id):
         await _store_recovered_step_input_response(app, task_id, str(response))
         pause = app.state.pause_waiter.find_pending(task_id=task_id, pause_type="step_input")
@@ -1078,7 +1076,10 @@ async def _handle_step_response(
             await app.state.task_queue.resume_task(task_id)
         except ValueError as exc:
             await manager.send_error(
-                connection, code="conflict", message=str(exc), recoverable=True
+                connection,
+                code="conflict",
+                message=str(exc),
+                recoverable=True,
             )
 
 

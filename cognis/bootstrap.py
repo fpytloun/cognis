@@ -132,6 +132,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_step_run_conversation_id_column)
         await conn.run_sync(_ensure_agent_type_columns)
         await conn.run_sync(_ensure_user_management_columns)
+        await conn.run_sync(_ensure_conversation_last_read_at)
 
 
 def _ensure_session_lifecycle_columns(sync_conn: object) -> None:
@@ -269,6 +270,18 @@ def _ensure_user_management_columns(sync_conn: object) -> None:
         execute(text("ALTER TABLE users ADD COLUMN disabled_at TIMESTAMP WITH TIME ZONE"))
     if "disabled_by" not in user_columns:
         execute(text("ALTER TABLE users ADD COLUMN disabled_by VARCHAR"))
+
+
+def _ensure_conversation_last_read_at(sync_conn: object) -> None:
+    inspector = cast(Any, inspect(sync_conn))
+    try:
+        columns = {column["name"] for column in inspector.get_columns("conversations")}
+    except Exception:
+        return  # table doesn't exist yet (create_all will handle it)
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+
+    if "last_read_at" not in columns:
+        execute(text("ALTER TABLE conversations ADD COLUMN last_read_at TIMESTAMP"))
 
 
 _SYSTEM_USER_EMAIL = "system@cognis.local"
