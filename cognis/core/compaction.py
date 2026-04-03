@@ -108,27 +108,17 @@ class CompactionStrategy:
         if not older_events:
             return CompactionResult(compacted=False, method="noop")
 
+        from cognis.core.agent_registry import SYSTEM_AGENTS
+
+        compaction_agent = SYSTEM_AGENTS.get("system:compaction")
+        compaction_prompt = (
+            compaction_agent.system_prompt
+            if compaction_agent and compaction_agent.system_prompt
+            else "Summarize the conversation history concisely."
+        )
+
         prompt_messages = [
-            {
-                "role": "system",
-                "content": (
-                    "Summarize the older conversation history into a structured "
-                    "handoff document for the same assistant to continue from. "
-                    "Use exactly these sections (omit empty sections):\n\n"
-                    "## Goal\nWhat the user is trying to accomplish.\n\n"
-                    "## Key Instructions\nConstraints, preferences, and rules "
-                    "the user stated or that emerged during the conversation.\n\n"
-                    "## Discoveries\nImportant findings, decisions, or conclusions "
-                    "reached during the conversation.\n\n"
-                    "## Relevant Files\nFiles read, created, or modified "
-                    "(with brief purpose for each).\n\n"
-                    "## Accomplished\nCompleted actions and their outcomes.\n\n"
-                    "## Current Work\nWhat was in progress when this history "
-                    "ended. Include any open questions or pending decisions.\n\n"
-                    "Be concise. Do not invent information not present in the "
-                    "history. Prefer bullet points over prose."
-                ),
-            },
+            {"role": "system", "content": compaction_prompt},
             {"role": "user", "content": _format_events_for_compaction(older_events)},
         ]
 

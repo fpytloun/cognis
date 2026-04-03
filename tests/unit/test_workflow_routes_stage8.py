@@ -53,13 +53,13 @@ def test_workflow_detail_supports_system_workflow(monkeypatch: object, tmp_path:
         asyncio.run(_seed_user(client.app))
 
         response = client.get(
-            "/api/v1/workflows/system:code-with-review",
+            "/api/v1/workflows/system:software-development",
             headers=_auth_headers(client.app, email="user@example.com"),
         )
 
         assert response.status_code == 200
         body = response.json()
-        assert body["workflow_id"] == "system:code-with-review"
+        assert body["workflow_id"] == "system:software-development"
         assert body["is_system"] is True
         assert body["owner_email"] is None
 

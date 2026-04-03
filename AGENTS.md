@@ -52,7 +52,8 @@ cognis/
 │   │   ├── compaction.py          # Context compaction (LLM + mechanical fallback)
 │   │   ├── context.py             # Context assembly (parallel external fetches)
 │   │   ├── events.py              # Event Bus + hooks
-│   │   └── remember_queue.py      # Bounded retry queue for Mnemory remember
+│   │   ├── remember_queue.py      # Bounded retry queue for Mnemory remember
+│   │   └── agent_registry.py      # System agent definitions + registry
 │   │
 │   ├── models/                     # Domain models (Pydantic)
 │   │   ├── agent.py
@@ -136,6 +137,7 @@ cognis/
 | **Orchestration Core** | `core/` | Agent loop, Decision Engine, Session Manager, context assembly, compaction, tool routing, event bus |
 | **Session Cache** | `core/session_cache.py` | L1 in-memory cache for Intaris-derived state (events, seq, compaction, intention). No DB persistence. |
 | **Remember Queue** | `core/remember_queue.py` | Bounded async retry queue for failed Mnemory remember() calls |
+| **Agent Registry** | `core/agent_registry.py` | System agent definitions (Python constants) + registry merging system and DB agents |
 | **Domain Models** | `models/` | Pydantic models for agents, sessions, tools, delegations, config |
 | **Providers** | `providers/` | Protocol definitions + implementations (memory, guardrails, executor, secrets, LLM, auth) |
 | **Tools** | `tools/` | Built-in tools, MCP client, skill loader, tool registry |
@@ -364,7 +366,8 @@ uv run alembic -c cognis/store/migrations/alembic.ini downgrade -1
 |---|---|---|
 | `users` | `email` | User accounts (email is user_id everywhere) |
 | `api_keys` | `key_id` | API keys for programmatic access |
-| `agents` | `agent_id` | Agent definitions + sync metadata |
+| `agents` | `agent_id` | Agent definitions (primary/secondary types, system flag) |
+| `agent_secondary_bindings` | `(primary_agent_id, secondary_agent_id)` | Junction table for primary→secondary agent bindings |
 | `conversations` | `conversation_id` | Conversation metadata |
 | `sessions` | `session_id` | Session metadata (NO event seq/compaction fields) |
 | `tasks` | `task_id` | Durable work items (kanban cards, queue items) |

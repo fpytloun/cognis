@@ -21,6 +21,8 @@
   let providers = $state<LLMProvider[]>([]);
   let secrets = $state<SecretMetadata[]>([]);
   let intarisMcpServers = $state<IntarisMCPServer[]>([]);
+  let secondaryAgents = $state<Agent[]>([]);
+  let secondaryBindings = $state<string[]>([]);
   let mcpTesting = $state(false);
   let mcpTestResult = $state<MCPServerTestResponse | null>(null);
   let form = $state(agentToFormState({
@@ -40,6 +42,9 @@
     personality_sync_error: null,
     personality_sync_checked_at: null,
     avatar_url: null,
+    agent_type: 'primary',
+    is_system: false,
+    hidden: false,
     status: 'draft',
     created_at: null,
     updated_at: null
@@ -64,12 +69,14 @@
   async function loadAgent(): Promise<void> {
     loading = true;
     try {
-      [agent, tools, workflows, secrets, intarisMcpServers] = await Promise.all([
+      [agent, tools, workflows, secrets, intarisMcpServers, secondaryAgents, secondaryBindings] = await Promise.all([
         api.agents.detail(agentIdFromRoute()),
         api.tools.list(),
         api.workflows.listAll(),
         api.secrets.list(),
         api.tools.intarisMcpServers().catch(() => []),
+        api.agents.listAll({ agent_type: 'secondary' }),
+        api.agents.listBindings(agentIdFromRoute()).catch(() => []),
       ]);
       try {
         providers = (await api.llmProviders.list()).items;
@@ -165,7 +172,7 @@
       <p class="text-sm uppercase tracking-[0.25em] text-slate-400">Agent editor</p>
       <h1 class="mt-1 text-2xl font-semibold text-white">{agent?.name ?? 'Agent'}</h1>
     </div>
-    {#if agent && !agent.personality_synced}
+    {#if agent && !agent.personality_synced && agent.agent_type === 'primary' && !agent.is_system}
       <div class="rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-4 text-sm text-amber-100">
         <div class="flex flex-wrap items-center justify-between gap-3">
           <div>
@@ -176,6 +183,32 @@
         </div>
       </div>
     {/if}
-    <AgentForm mode="edit" {form} {tools} {workflows} {providers} {secrets} {intarisMcpServers} {saving} {error} onSave={saveAgent} onTestMcp={testMcp} {mcpTesting} {mcpTestResult} />
+    <AgentForm
+      mode="edit"
+      {form}
+      {tools}
+      {workflows}
+      {providers}
+      {secrets}
+      {intarisMcpServers}
+      {secondaryAgents}
+      {secondaryBindings}
+      {saving}
+      {error}
+      readonly={agent?.is_system ?? false}
+      onSave={saveAgent}
+      onTestMcp={testMcp}
+      onBindingsChange={async (bindings) => {
+        try {
+          await api.agents.replaceBindings(agentIdFromRoute(), bindings);
+          secondaryBindings = bindings;
+        } catch (caughtError) {
+          error = asApiError(caughtError).message;
+          addToast(error, 'error', 4_000, 'Unable to update bindings');
+        }
+      }}
+      {mcpTesting}
+      {mcpTestResult}
+    />
   </section>
 {/if}

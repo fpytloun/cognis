@@ -259,21 +259,25 @@ async def select_workflow(
             source="default",
         )
 
-    # Build classifier prompt
+    # Build classifier prompt from system agent
+    from cognis.core.agent_registry import SYSTEM_AGENTS
+
+    classifier_agent = SYSTEM_AGENTS.get("system:classifier")
+    classifier_prompt = (
+        classifier_agent.system_prompt
+        if classifier_agent and classifier_agent.system_prompt
+        else (
+            "Select the best workflow for the given task. "
+            "You MUST respond with a single JSON object and nothing else."
+        )
+    )
+
     workflow_options = "\n".join(
         f"- {w['workflow_id']}: {w.get('name', '')} — {w.get('criteria', '')}"
         for w in available_workflows
     )
     prompt = [
-        {
-            "role": "system",
-            "content": (
-                "Select the best workflow for the given task. "
-                "You MUST respond with a single JSON object and nothing else. "
-                "No markdown, no explanation, no text before or after the JSON.\n"
-                'Example: {"workflow_id": "...", "confidence": 0.8, "reason": "..."}'
-            ),
-        },
+        {"role": "system", "content": classifier_prompt},
         {
             "role": "user",
             "content": f"Task: {task_description}\n\nAvailable workflows:\n{workflow_options}",

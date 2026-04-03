@@ -855,7 +855,7 @@ class AgentWorkflowConfig:
     default_workflow_id: str
     workflow_selection_mode: str  # "automatic" | "always_ask" | "use_default"
     step_agent_overrides: dict[str, dict[str, str]]
-    # e.g. {"code-with-review": {"code_review": "reviewer-agent-id"}}
+    # e.g. {"software-development": {"code_review": "reviewer-agent-id"}}
 ```
 
 ## Workflow Registry

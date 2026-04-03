@@ -502,6 +502,7 @@ async def handle_delegate_tool_call(
     session_manager: Any | None = None,
     session: Any | None = None,
     agent: Any | None = None,
+    agent_registry: Any | None = None,
 ) -> tuple[ToolResult, SessionModel | None]:
     """Handle the delegate tool call — creates a child session.
 
@@ -511,6 +512,53 @@ async def handle_delegate_tool_call(
     args = tool_call.arguments
 
     if session_manager is not None and session is not None and agent is not None:
+        # Validate secondary agent binding if delegating to a different agent
+        target_agent_id = args.get("agent_id") or getattr(agent, "agent_id", "")
+        if target_agent_id and target_agent_id != getattr(agent, "agent_id", "") and agent_registry:
+            target_agent = await agent_registry.get(target_agent_id)
+            if target_agent is None:
+                return (
+                    ToolResult(
+                        output=json.dumps(
+                            {
+                                "status": "error",
+                                "mode": "delegate",
+                                "call_id": tool_call.call_id,
+                                "message": f"Agent '{target_agent_id}' not found.",
+                            },
+                            sort_keys=True,
+                        ),
+                        is_error=True,
+                        metadata={"orchestration": True, "mode": "delegate"},
+                    ),
+                    None,
+                )
+            if target_agent.agent_type == "secondary":
+                is_bound = await agent_registry.is_secondary_bound(
+                    getattr(agent, "agent_id", ""), target_agent_id
+                )
+                if not is_bound:
+                    return (
+                        ToolResult(
+                            output=json.dumps(
+                                {
+                                    "status": "error",
+                                    "mode": "delegate",
+                                    "call_id": tool_call.call_id,
+                                    "message": (
+                                        f"Secondary agent '{target_agent_id}' is not bound to "
+                                        f"agent '{getattr(agent, 'agent_id', '')}'. "
+                                        f"Add it to the agent's secondary bindings."
+                                    ),
+                                },
+                                sort_keys=True,
+                            ),
+                            is_error=True,
+                            metadata={"orchestration": True, "mode": "delegate"},
+                        ),
+                        None,
+                    )
+
         try:
             child_session = await session_manager.create_child_session(
                 parent_session=session,

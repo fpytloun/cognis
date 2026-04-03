@@ -52,7 +52,7 @@ def test_workflow_list_includes_system_workflows(
 
     assert "system:direct" in workflow_ids
     assert "system:research" in workflow_ids
-    assert "system:code-with-review" in workflow_ids
+    assert "system:software-development" in workflow_ids
 
 
 @pytest.mark.integration

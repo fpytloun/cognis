@@ -7,6 +7,7 @@ export interface WorkflowStepFormState {
   name: string;
   type: 'run' | 'gate';
   prompt: string;
+  agentOverride: string;
   inputMode: 'auto' | 'null' | 'last' | 'full' | 'summary';
   inputText: string;
   allowQuestions: boolean;
@@ -39,6 +40,7 @@ export function createEmptyStep(): WorkflowStepFormState {
     name: '',
     type: 'run',
     prompt: '',
+    agentOverride: '',
     inputMode: 'null',
     inputText: '',
     allowQuestions: false,
@@ -150,6 +152,7 @@ export function workflowToFormState(workflow: Workflow): WorkflowFormState {
       name: step.name,
       type: (step.type as 'run' | 'gate') ?? 'run',
       prompt: step.prompt ?? '',
+      agentOverride: step.agent_override ?? '',
       inputMode: workflowInputMode(step.input),
       inputText: workflowInputSourceNames(step.input).join(', '),
       allowQuestions: step.allow_questions ?? false,
@@ -209,6 +212,7 @@ export function formStateToWorkflowPayload(form: WorkflowFormState): Record<stri
       name: step.name,
       type: step.type,
       prompt: step.prompt,
+      agent_override: step.agentOverride || null,
       ...(formInputToPayload(step.inputMode, step.inputText) ? { input: formInputToPayload(step.inputMode, step.inputText) } : {}),
       allow_questions: step.allowQuestions,
       completion:

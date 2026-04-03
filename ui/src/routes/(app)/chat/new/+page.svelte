@@ -19,17 +19,18 @@
   }
 
   function getSelectedAgentId(): string {
+    const primary = agents.filter((a) => a.agent_type === 'primary');
     const requestedAgentId = $page.url.searchParams.get('agent_id');
-    if (requestedAgentId && agents.some((a) => a.agent_id === requestedAgentId)) {
+    if (requestedAgentId && primary.some((a) => a.agent_id === requestedAgentId)) {
       return requestedAgentId;
     }
     if (typeof window !== 'undefined') {
       const stored = window.localStorage.getItem('cognis-chat-selected-agent');
-      if (stored && agents.some((a) => a.agent_id === stored && a.status === 'active')) {
+      if (stored && primary.some((a) => a.agent_id === stored && a.status === 'active')) {
         return stored;
       }
     }
-    return agents.find((a) => a.status === 'active')?.agent_id ?? agents[0]?.agent_id ?? '';
+    return primary.find((a) => a.status === 'active')?.agent_id ?? primary[0]?.agent_id ?? '';
   }
 
   async function createConversation(): Promise<void> {

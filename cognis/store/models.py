@@ -11,7 +11,16 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import JSON, TIMESTAMP, ForeignKey, LargeBinary, String, Text, UniqueConstraint
+from sqlalchemy import (
+    JSON,
+    TIMESTAMP,
+    Boolean,
+    ForeignKey,
+    LargeBinary,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -78,12 +87,33 @@ class Agent(Base):
     execution: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     sync_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True, default=dict)
     avatar_url: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Type system
+    agent_type: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="primary", server_default="primary"
+    )
+    is_system: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="0"
+    )
+    hidden: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
     status: Mapped[str] = mapped_column(String, nullable=False, default="active")
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, default=_utcnow
     )
     updated_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+
+class AgentSecondaryBinding(Base):
+    """Junction table for primary-to-secondary agent bindings."""
+
+    __tablename__ = "agent_secondary_bindings"
+
+    primary_agent_id: Mapped[str] = mapped_column(
+        String, ForeignKey("agents.agent_id", ondelete="CASCADE"), primary_key=True
+    )
+    secondary_agent_id: Mapped[str] = mapped_column(
+        String, ForeignKey("agents.agent_id", ondelete="CASCADE"), primary_key=True
     )
 
 

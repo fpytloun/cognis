@@ -114,18 +114,19 @@ class StepEvaluator:
 
         with EVALUATION_DURATION.time():
             try:
+                from cognis.core.agent_registry import SYSTEM_AGENTS
+
+                evaluator_agent = SYSTEM_AGENTS.get("system:evaluator")
+                evaluator_prompt = (
+                    evaluator_agent.system_prompt
+                    if evaluator_agent and evaluator_agent.system_prompt
+                    else "You are a workflow step evaluator. Respond with JSON only."
+                )
+
                 response = await asyncio.wait_for(
                     self.llm.generate(
                         [
-                            {
-                                "role": "system",
-                                "content": (
-                                    "You are a workflow step evaluator. "
-                                    "You MUST respond with a single JSON object and nothing else. "
-                                    "No markdown, no explanation, no text before or after the JSON.\n"
-                                    'Example: {"decision": "approved", "reasoning": "...", "feedback": "..."}'
-                                ),
-                            },
+                            {"role": "system", "content": evaluator_prompt},
                             {"role": "user", "content": prompt},
                         ],
                         task_type="evaluator",

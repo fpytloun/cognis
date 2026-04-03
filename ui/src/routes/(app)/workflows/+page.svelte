@@ -20,13 +20,14 @@
     workflowToFormState,
     type WorkflowFormState
   } from '$lib/workflows';
-  import type { Workflow } from '$lib/types/api';
+  import type { Agent, Workflow } from '$lib/types/api';
 
   let loading = true;
   let saving = false;
   let error = '';
   let importText = '';
   let workflows: Workflow[] = [];
+  let secondaryAgents: Agent[] = [];
   let selectedWorkflow: Workflow | null = null;
   let form: WorkflowFormState = createEmptyWorkflowForm();
   let dragIndex = -1;
@@ -58,7 +59,10 @@
     loading = true;
     error = '';
     try {
-      workflows = await api.workflows.listAll();
+      [workflows, secondaryAgents] = await Promise.all([
+        api.workflows.listAll(),
+        api.agents.listAll({ agent_type: 'secondary' }),
+      ]);
       const nextSelected = selectedId ? workflows.find((workflow) => workflow.workflow_id === selectedId) : selectedWorkflow ? workflows.find((workflow) => workflow.workflow_id === selectedWorkflow?.workflow_id) : workflows[0];
       if (nextSelected) {
         selectedWorkflow = nextSelected;
@@ -364,6 +368,20 @@
                   </label>
                 </div>
 
+                {#if step.type === 'run'}
+                  <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
+                    <span>Agent override</span>
+                    <select bind:value={step.agentOverride} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}>
+                      <option value="">Default (task agent)</option>
+                      {#each secondaryAgents as agent}
+                        <option value={agent.agent_id}>
+                          {agent.name}{agent.is_system ? ' (system)' : ''}
+                        </option>
+                      {/each}
+                    </select>
+                  </label>
+                {/if}
+
                 <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
                   <span>Prompt</span>
                   <textarea bind:value={step.prompt} class="min-h-[110px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}></textarea>
@@ -451,9 +469,12 @@
           <div class="mt-4 flex flex-wrap items-center gap-3">
             {#each form.steps as step, index}
               <div class="contents">
-                <div class="rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3 text-sm text-slate-100">
+                <div class="rounded-2xl border {step.agentOverride ? 'border-sky-500/30 bg-sky-500/5' : 'border-slate-800 bg-slate-950/70'} px-4 py-3 text-sm text-slate-100">
                   <span class="font-medium">{step.name || `step_${index + 1}`}</span>
                   <span class="ml-2 text-xs uppercase tracking-[0.2em] text-slate-500">{step.type}</span>
+                  {#if step.agentOverride}
+                    <span class="ml-2 rounded-full border border-sky-500/30 bg-sky-500/10 px-2 py-0.5 text-[10px] text-sky-300">{step.agentOverride}</span>
+                  {/if}
                 </div>
                 {#if index < form.steps.length - 1}
                   <span class="text-slate-500">→</span>

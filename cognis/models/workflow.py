@@ -118,6 +118,7 @@ class StepDefinition(BaseModel):
     type: str  # "run" | "gate"
     description: str = ""
     prompt: str = ""
+    agent_override: str | None = None  # Secondary agent ID for this step
     input: StepInputConfig | None = None
     completion: CompletionConfig | None = None
     allow_questions: bool = False

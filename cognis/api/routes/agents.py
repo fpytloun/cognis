@@ -23,13 +23,18 @@ from cognis.api.models import (
     CursorPage,
 )
 from cognis.api.serializers import agent_to_response
+from cognis.core.agent_registry import SYSTEM_AGENTS, validate_agent_id
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.store.queries import (
+    add_secondary_binding,
     create_agent,
     get_agent,
     list_agents,
+    list_secondary_bindings,
+    remove_secondary_binding,
     set_agent_status,
+    set_secondary_bindings,
     update_agent,
 )
 
@@ -62,11 +67,33 @@ async def agent_list(
     request: Request,
     cursor: str | None = None,
     limit: int = Query(default=20, ge=1, le=100),
+    agent_type: str | None = Query(default=None),
+    include_hidden: bool = Query(default=False),
+    include_system: bool = Query(default=True),
 ) -> CursorPage[AgentResponse]:
     user = require_current_user(request)
+
+    # Start with system agents (if requested)
+    items: list[AgentResponse] = []
+    if include_system:
+        for agent in SYSTEM_AGENTS.values():
+            if not include_hidden and agent.hidden:
+                continue
+            if agent_type is not None and agent.agent_type != agent_type:
+                continue
+            items.append(_system_agent_to_response(agent))
+
+    # Add DB agents
     async with request.app.state.session_factory() as session:
         rows = await list_agents(session, owner_email=user.email)
-    items = [agent_to_response(row) for row in rows]
+    for row in rows:
+        resp = agent_to_response(row)
+        if not include_hidden and getattr(row, "hidden", False):
+            continue
+        if agent_type is not None and getattr(row, "agent_type", "primary") != agent_type:
+            continue
+        items.append(resp)
+
     page_items, next_cursor, has_more = paginate_items(
         items,
         limit=limit,
@@ -74,6 +101,32 @@ async def agent_list(
         get_item_id=lambda item: item.agent_id,
     )
     return CursorPage(items=page_items, cursor=next_cursor, has_more=has_more)
+
+
+def _system_agent_to_response(agent: AgentDefinition) -> AgentResponse:
+    """Convert a system agent definition to an API response."""
+    return AgentResponse(
+        agent_id=agent.agent_id,
+        owner_email=agent.owner_email,
+        name=agent.name,
+        display_name=agent.name,
+        description=agent.description,
+        system_prompt=agent.system_prompt,
+        personality=agent.personality,
+        skills=agent.skills,
+        tools=agent.tools,
+        permissions=None,
+        llm_config=None,
+        execution=agent.execution,
+        avatar_url=agent.avatar_url,
+        agent_type=agent.agent_type,
+        is_system=agent.is_system,
+        hidden=agent.hidden,
+        status=agent.status,
+        sync_metadata=None,
+        created_at=None,
+        updated_at=None,
+    )
 
 
 @router.post("", response_model=AgentResponse)
@@ -87,6 +140,12 @@ async def create_agent_route(request: Request, payload: AgentCreateRequest) -> A
         from cognis.api.common import slugify
 
         agent_id = slugify(payload.name)
+
+    # Validate agent_id — system: prefix is reserved
+    try:
+        validate_agent_id(agent_id)
+    except ValueError as exc:
+        raise api_exception(400, "validation_error", str(exc)) from exc
 
     # Use display_name as alias for name (backward compat)
     name = payload.name or payload.display_name or agent_id
@@ -110,6 +169,7 @@ async def create_agent_route(request: Request, payload: AgentCreateRequest) -> A
             llm_config=payload.llm_config,
             execution=payload.execution,
             avatar_url=payload.avatar_url,
+            agent_type=payload.agent_type,
             status=payload.status,
         )
         await session.commit()
@@ -137,6 +197,10 @@ async def create_agent_route(request: Request, payload: AgentCreateRequest) -> A
 
 @router.get("/{agent_id}", response_model=AgentResponse)
 async def agent_detail(request: Request, agent_id: str) -> AgentResponse:
+    # Check system agents first
+    if agent_id in SYSTEM_AGENTS:
+        return _system_agent_to_response(SYSTEM_AGENTS[agent_id])
+
     async with request.app.state.session_factory() as session:
         row = await get_agent(session, agent_id)
     if row is None:
@@ -152,6 +216,8 @@ async def update_agent_route(
     payload: AgentUpdateRequest,
 ) -> AgentResponse:
     forbid_mutation_for_viewer(request)
+    if agent_id in SYSTEM_AGENTS:
+        raise api_exception(403, "forbidden", "System agents are read-only")
     async with request.app.state.session_factory() as session:
         row = await get_agent(session, agent_id)
         if row is None:
@@ -172,6 +238,8 @@ async def update_agent_route(
 @router.delete("/{agent_id}", response_model=dict)
 async def archive_agent(request: Request, agent_id: str) -> dict[str, bool]:
     forbid_mutation_for_viewer(request)
+    if agent_id in SYSTEM_AGENTS:
+        raise api_exception(403, "forbidden", "System agents are read-only")
     async with request.app.state.session_factory() as session:
         row = await get_agent(session, agent_id)
         if row is None:
@@ -246,6 +314,74 @@ async def sync_personality(request: Request, agent_id: str) -> dict[str, bool]:
         ) from exc
     await _persist_sync_metadata(request, agent_id, True)
     return {"ok": True}
+
+
+@router.get("/{agent_id}/bindings", response_model=list[str])
+async def list_agent_bindings(request: Request, agent_id: str) -> list[str]:
+    """List secondary agent IDs bound to a primary agent."""
+    if agent_id in SYSTEM_AGENTS:
+        return []  # System agents don't have bindings
+    async with request.app.state.session_factory() as session:
+        row = await get_agent(session, agent_id)
+    if row is None:
+        raise api_exception(404, "not_found", "Agent not found")
+    require_owner_or_admin(request, row.owner_email)
+    async with request.app.state.session_factory() as session:
+        return await list_secondary_bindings(session, agent_id)
+
+
+@router.put("/{agent_id}/bindings", response_model=dict)
+async def replace_agent_bindings(
+    request: Request, agent_id: str, payload: list[str]
+) -> dict[str, bool]:
+    """Replace all secondary agent bindings for a primary agent."""
+    forbid_mutation_for_viewer(request)
+    if agent_id in SYSTEM_AGENTS:
+        raise api_exception(403, "forbidden", "System agents are read-only")
+    async with request.app.state.session_factory() as session:
+        row = await get_agent(session, agent_id)
+        if row is None:
+            raise api_exception(404, "not_found", "Agent not found")
+        require_owner_or_admin(request, row.owner_email)
+        await set_secondary_bindings(session, agent_id, payload)
+        await session.commit()
+    return {"ok": True}
+
+
+@router.post("/{agent_id}/bindings/{secondary_agent_id}", response_model=dict)
+async def add_agent_binding(
+    request: Request, agent_id: str, secondary_agent_id: str
+) -> dict[str, bool]:
+    """Add a single secondary agent binding."""
+    forbid_mutation_for_viewer(request)
+    if agent_id in SYSTEM_AGENTS:
+        raise api_exception(403, "forbidden", "System agents are read-only")
+    async with request.app.state.session_factory() as session:
+        row = await get_agent(session, agent_id)
+        if row is None:
+            raise api_exception(404, "not_found", "Agent not found")
+        require_owner_or_admin(request, row.owner_email)
+        ok = await add_secondary_binding(session, agent_id, secondary_agent_id)
+        await session.commit()
+    return {"ok": ok}
+
+
+@router.delete("/{agent_id}/bindings/{secondary_agent_id}", response_model=dict)
+async def remove_agent_binding(
+    request: Request, agent_id: str, secondary_agent_id: str
+) -> dict[str, bool]:
+    """Remove a single secondary agent binding."""
+    forbid_mutation_for_viewer(request)
+    if agent_id in SYSTEM_AGENTS:
+        raise api_exception(403, "forbidden", "System agents are read-only")
+    async with request.app.state.session_factory() as session:
+        row = await get_agent(session, agent_id)
+        if row is None:
+            raise api_exception(404, "not_found", "Agent not found")
+        require_owner_or_admin(request, row.owner_email)
+        ok = await remove_secondary_binding(session, agent_id, secondary_agent_id)
+        await session.commit()
+    return {"ok": ok}
 
 
 @router.get("/{agent_id}/card", response_model=AgentCardResponse)

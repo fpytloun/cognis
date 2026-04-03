@@ -272,6 +272,12 @@ class ExecutionPolicy:
     event_flush_strategy: str = "batch"
     """``"batch"`` = single write at turn end; ``"incremental"`` = after each tool batch."""
 
+    skip_memory: bool = False
+    """Skip Mnemory recall/remember and memory instructions in context assembly."""
+
+    skip_orchestration: bool = False
+    """Skip orchestration tools (delegate, spawn_worker, tasks)."""
+
 
 CHAT_POLICY = ExecutionPolicy(
     require_step_complete=False,
@@ -292,6 +298,15 @@ DELEGATION_POLICY = ExecutionPolicy(
     step_complete_available=True,
     enable_auto_compaction=False,
     event_flush_strategy="incremental",
+)
+
+SECONDARY_POLICY = ExecutionPolicy(
+    require_step_complete=True,
+    step_complete_available=True,
+    enable_auto_compaction=True,
+    event_flush_strategy="incremental",
+    skip_memory=True,
+    skip_orchestration=True,
 )
 
 
@@ -1035,6 +1050,7 @@ class AgentLoop:
             user_message=effective_user_message,
             user_message_role="system" if ctx.system_initiated else "user",
             prior_context=ctx.prior_context,
+            skip_memory=ctx.policy.skip_memory,
         )
         messages = context_result.messages
 
@@ -1952,11 +1968,19 @@ class AgentLoop:
         if ctx.orchestration_mode == OrchestrationMode.DELEGATE_SYNC_ONLY:
             wait = True
 
+        # Resolve agent registry for binding validation
+        _agent_registry = None
+        if hasattr(self.session_manager, "_session_factory"):
+            from cognis.core.agent_registry import AgentRegistry
+
+            _agent_registry = AgentRegistry(self.session_manager._session_factory)
+
         result, child_session = await handle_delegate_tool_call(
             tc,
             session_manager=self.session_manager,
             session=ctx.session,
             agent=ctx.agent,
+            agent_registry=_agent_registry,
         )
 
         if child_session is None:

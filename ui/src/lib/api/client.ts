@@ -298,12 +298,19 @@ export const api = {
   },
 
   agents: {
-    list(cursor: string | null = null): Promise<CursorPage<Agent>> {
-      return request<CursorPage<Agent>>(`/api/v1/agents${encodeQuery({ cursor, limit: 100 })}`);
+    list(
+      cursor: string | null = null,
+      params?: { agent_type?: string; include_hidden?: boolean; include_system?: boolean }
+    ): Promise<CursorPage<Agent>> {
+      return request<CursorPage<Agent>>(
+        `/api/v1/agents${encodeQuery({ cursor, limit: 100, ...params })}`
+      );
     },
 
-    async listAll(): Promise<Agent[]> {
-      return collectCursorPages((cursor) => this.list(cursor));
+    async listAll(
+      params?: { agent_type?: string; include_hidden?: boolean; include_system?: boolean }
+    ): Promise<Agent[]> {
+      return collectCursorPages((cursor) => this.list(cursor, params));
     },
 
     detail(agentId: string): Promise<Agent> {
@@ -342,6 +349,17 @@ export const api = {
 
     tools(agentId: string): Promise<ToolDefinitionSummary[]> {
       return request<ToolDefinitionSummary[]>(`/api/v1/agents/${agentId}/tools`);
+    },
+
+    listBindings(agentId: string): Promise<string[]> {
+      return request<string[]>(`/api/v1/agents/${agentId}/bindings`);
+    },
+
+    replaceBindings(agentId: string, secondaryAgentIds: string[]): Promise<{ ok: boolean }> {
+      return request<{ ok: boolean }>(`/api/v1/agents/${agentId}/bindings`, {
+        method: 'PUT',
+        body: JSON.stringify(secondaryAgentIds)
+      });
     }
   },
 

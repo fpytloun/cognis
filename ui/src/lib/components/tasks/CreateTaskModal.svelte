@@ -28,7 +28,8 @@
     }) => void;
   }>();
 
-  const defaultAgentId = agents.find((a: Agent) => a.status === 'active')?.agent_id ?? agents[0]?.agent_id ?? '';
+  const primaryAgents = agents.filter((a: Agent) => a.agent_type === 'primary');
+  const defaultAgentId = primaryAgents.find((a: Agent) => a.status === 'active')?.agent_id ?? primaryAgents[0]?.agent_id ?? '';
 
   let form = $state({
     title: '',
@@ -108,7 +109,7 @@
         <div class="space-y-1">
           <label for="task-agent" class="text-xs font-medium uppercase tracking-widest text-slate-400">Agent</label>
           <select id="task-agent" bind:value={form.agent_id} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
-            {#each agents as agent}
+            {#each primaryAgents as agent}
               <option value={agent.agent_id}>{agent.display_name ?? agent.name}</option>
             {/each}
           </select>

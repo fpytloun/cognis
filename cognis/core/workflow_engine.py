@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cognis.core.agent_loop import (
     CHAT_POLICY,
+    SECONDARY_POLICY,
     WORKFLOW_POLICY,
     AgentLoop,
     PauseWaiter,
@@ -46,13 +47,13 @@ from cognis.models.workflow import (
 )
 from cognis.store.queries import (
     create_step_run,
-    get_agent,
     get_latest_active_conversation_for_agent,
     get_latest_step_run_for_task_step,
     update_step_run,
     update_task_status,
     update_task_workflow_state,
 )
+from cognis.tools.builtin.orchestration import OrchestrationMode
 
 logger = get_logger(__name__)
 
@@ -141,7 +142,6 @@ class WorkflowEngine:
             agent=agent,
             user_email=session.user_email,
         )
-        from cognis.tools.builtin.orchestration import OrchestrationMode
 
         direct_step = StepDefinition(name="direct", type="run", prompt=user_message)
         ctx = StepContext(
@@ -520,14 +520,21 @@ class WorkflowEngine:
             user_email=task.created_by,
         )
 
-        from cognis.tools.builtin.orchestration import OrchestrationMode
-
         # Load prior step context for injection into the LLM prompt.
         # This replaces the former StepContextAssembler — the caller now
         # resolves prior context and passes it to the unified assembler.
         prior_context = await self._load_prior_step_context(
             step_def, step_index, workflow.steps, state
         )
+
+        # Select execution policy based on agent type.
+        # Secondary agents get SECONDARY_POLICY (skip memory, no orchestration).
+        if agent.agent_type == "secondary":
+            step_policy = SECONDARY_POLICY
+            step_orchestration = OrchestrationMode.NONE
+        else:
+            step_policy = WORKFLOW_POLICY
+            step_orchestration = OrchestrationMode.DELEGATE_SYNC_ONLY
 
         # Build step context — task steps can delegate (sync only)
         ctx = StepContext(
@@ -540,7 +547,7 @@ class WorkflowEngine:
             task_description=task.description,
             task_expected_output=task.expected_output,
             step_run_id=step_run_id,
-            policy=WORKFLOW_POLICY,
+            policy=step_policy,
             is_retry=is_retry,
             user_message=step_def.prompt.replace("{user_message}", task.description or task.title),
             prior_context=prior_context,
@@ -551,7 +558,7 @@ class WorkflowEngine:
             workflow_steps=workflow.steps,
             step_index=step_index,
             cancel_event=cancel_event,
-            orchestration_mode=OrchestrationMode.DELEGATE_SYNC_ONLY,
+            orchestration_mode=step_orchestration,
         )
 
         # Run agent loop
@@ -1285,18 +1292,34 @@ class WorkflowEngine:
         task: TaskModel,
         step_def: StepDefinition,
     ) -> AgentDefinition | None:
-        """Resolve which agent runs a step."""
-        # Check step_agent_overrides from agent's execution config
-        async with self._session_factory() as db_session:
-            agent_row = await get_agent(db_session, task.agent_id)
-        if agent_row is None:
-            return None
+        """Resolve which agent runs a step.
 
-        from cognis.models.agent import AgentDefinition
+        If the step has ``agent_override``, resolve that agent (checking
+        the AgentRegistry for system agents first, then DB). Otherwise,
+        resolve the task's primary agent.
+        """
+        from cognis.core.agent_registry import AgentRegistry
 
-        return AgentDefinition.model_validate(
-            {c.name: getattr(agent_row, c.name) for c in agent_row.__table__.columns}
-        )
+        registry = AgentRegistry(self._session_factory)
+
+        if step_def.agent_override:
+            override_agent = await registry.get(step_def.agent_override)
+            if override_agent is None:
+                logger.warning(
+                    "agent_override agent not found, falling back to task agent",
+                    extra={
+                        "extra_data": {
+                            "agent_override": step_def.agent_override,
+                            "task_id": task.task_id,
+                            "step_name": step_def.name,
+                        }
+                    },
+                )
+            else:
+                return override_agent
+
+        # Default: use the task's primary agent
+        return await registry.get(task.agent_id)
 
     async def _create_step_session(
         self,

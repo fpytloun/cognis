@@ -151,6 +151,9 @@ export interface Agent {
   personality_sync_error: string | null;
   personality_sync_checked_at: string | null;
   avatar_url: string | null;
+  agent_type: string;
+  is_system: boolean;
+  hidden: boolean;
   status: string;
   created_at: string | null;
   updated_at: string | null;
@@ -384,6 +387,7 @@ export interface WorkflowStep {
   type: string;
   description?: string;
   prompt?: string;
+  agent_override?: string | null;
   input?: {
     type: string;
     source?: string | string[] | null;

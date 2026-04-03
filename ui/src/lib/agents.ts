@@ -17,6 +17,7 @@ export interface MCPServerFormState {
 export interface AgentFormState {
   agentId: string;
   customId: boolean;
+  agentType: 'primary' | 'secondary';
   name: string;
   description: string;
   avatarUrl: string;
@@ -71,6 +72,7 @@ export function createEmptyAgentForm(workflows: Workflow[] = []): AgentFormState
   return {
     agentId: '',
     customId: false,
+    agentType: 'primary',
     name: '',
     description: '',
     avatarUrl: '',
@@ -110,6 +112,7 @@ export function agentToFormState(agent: Agent): AgentFormState {
     ...form,
     agentId: agent.agent_id,
     customId: true, // existing agent always has a custom ID
+    agentType: (agent.agent_type === 'secondary' ? 'secondary' : 'primary') as 'primary' | 'secondary',
     name: agent.display_name || agent.name,
     description: agent.description ?? '',
     avatarUrl: agent.avatar_url ?? '',
@@ -189,6 +192,7 @@ export function formStateToPayload(form: AgentFormState): Record<string, unknown
 
   const payload: Record<string, unknown> = {
     agent_id: form.agentId || undefined, // let backend auto-generate if empty
+    agent_type: form.agentType,
     name: form.name,
     description: form.description || null,
     avatar_url: form.avatarUrl || null,

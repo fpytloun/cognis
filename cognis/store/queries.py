@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from cognis.store.models import (
     Agent,
+    AgentSecondaryBinding,
     ApiKey,
     Conversation,
     ExecutorRow,
@@ -310,6 +311,7 @@ async def create_agent(
     llm_config: dict[str, Any] | None = None,
     execution: dict[str, Any] | None = None,
     avatar_url: str | None = None,
+    agent_type: str = "primary",
     status: str = "draft",
 ) -> Agent:
     """Create an agent row."""
@@ -327,6 +329,7 @@ async def create_agent(
         llm_config=llm_config,
         execution=execution,
         avatar_url=avatar_url,
+        agent_type=agent_type,
         status=status,
     )
     session.add(row)
@@ -361,6 +364,74 @@ async def set_agent_status(session: AsyncSession, agent_id: str, status: str) ->
     row.updated_at = datetime.now(UTC)
     await session.flush()
     return True
+
+
+async def list_secondary_bindings(session: AsyncSession, primary_agent_id: str) -> list[str]:
+    """List secondary agent IDs bound to a primary agent."""
+    result = await session.execute(
+        select(AgentSecondaryBinding.secondary_agent_id).where(
+            AgentSecondaryBinding.primary_agent_id == primary_agent_id
+        )
+    )
+    return [row[0] for row in result.all()]
+
+
+async def set_secondary_bindings(
+    session: AsyncSession, primary_agent_id: str, secondary_agent_ids: list[str]
+) -> None:
+    """Replace all secondary agent bindings for a primary agent."""
+    from sqlalchemy import delete
+
+    await session.execute(
+        delete(AgentSecondaryBinding).where(
+            AgentSecondaryBinding.primary_agent_id == primary_agent_id
+        )
+    )
+    for secondary_id in secondary_agent_ids:
+        session.add(
+            AgentSecondaryBinding(
+                primary_agent_id=primary_agent_id,
+                secondary_agent_id=secondary_id,
+            )
+        )
+    await session.flush()
+
+
+async def add_secondary_binding(
+    session: AsyncSession, primary_agent_id: str, secondary_agent_id: str
+) -> bool:
+    """Add a single secondary agent binding. Returns False if already exists."""
+    existing = await session.execute(
+        select(AgentSecondaryBinding).where(
+            AgentSecondaryBinding.primary_agent_id == primary_agent_id,
+            AgentSecondaryBinding.secondary_agent_id == secondary_agent_id,
+        )
+    )
+    if existing.scalar_one_or_none() is not None:
+        return False
+    session.add(
+        AgentSecondaryBinding(
+            primary_agent_id=primary_agent_id,
+            secondary_agent_id=secondary_agent_id,
+        )
+    )
+    await session.flush()
+    return True
+
+
+async def remove_secondary_binding(
+    session: AsyncSession, primary_agent_id: str, secondary_agent_id: str
+) -> bool:
+    """Remove a single secondary agent binding. Returns False if not found."""
+    from sqlalchemy import delete
+
+    result = await session.execute(
+        delete(AgentSecondaryBinding).where(
+            AgentSecondaryBinding.primary_agent_id == primary_agent_id,
+            AgentSecondaryBinding.secondary_agent_id == secondary_agent_id,
+        )
+    )
+    return result.rowcount > 0  # type: ignore[union-attr]
 
 
 async def get_llm_provider(session: AsyncSession, provider_id: str) -> LLMProvider | None:

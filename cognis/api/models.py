@@ -228,6 +228,7 @@ class AgentRequestBase(BaseModel):
 
 class AgentCreateRequest(AgentRequestBase):
     agent_id: str | None = None  # optional: auto-generated from name
+    agent_type: str = "primary"  # "primary" | "secondary"
     status: str = "draft"
 
 
@@ -263,6 +264,11 @@ class AgentResponse(BaseModel):
     personality_sync_error: str | None = None
     personality_sync_checked_at: datetime | None = None
     avatar_url: str | None = None
+    # Type system
+    agent_type: str = "primary"
+    is_system: bool = False
+    hidden: bool = False
+    sync_metadata: dict[str, Any] | None = None
     status: str
     created_at: datetime | None = None
     updated_at: datetime | None = None

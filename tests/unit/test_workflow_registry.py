@@ -19,7 +19,7 @@ from cognis.models.workflow import (
 def test_system_workflows_are_registered() -> None:
     assert "system:direct" in SYSTEM_WORKFLOWS
     assert "system:research" in SYSTEM_WORKFLOWS
-    assert "system:code-with-review" in SYSTEM_WORKFLOWS
+    assert "system:software-development" in SYSTEM_WORKFLOWS
     assert "system:creative" in SYSTEM_WORKFLOWS
 
 

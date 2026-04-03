@@ -310,7 +310,7 @@
             <label class="space-y-2 text-sm font-medium text-slate-200">
               <span>Agent</span>
               <select bind:value={editForm.agent_id} disabled={!isEditable} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100 disabled:opacity-50">
-                {#each agents as agent}
+                {#each agents.filter((a) => a.agent_type === 'primary') as agent}
                   <option value={agent.agent_id}>{agent.display_name ?? agent.name}</option>
                 {/each}
               </select>

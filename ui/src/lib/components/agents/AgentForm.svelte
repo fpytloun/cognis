@@ -11,7 +11,7 @@
     type MCPEnvVar,
     type MCPServerFormState
   } from '$lib/agents';
-  import type { IntarisMCPServer, LLMProvider, MCPServerTestResponse, SecretMetadata, ToolDefinitionSummary, Workflow } from '$lib/types/api';
+  import type { Agent, IntarisMCPServer, LLMProvider, MCPServerTestResponse, SecretMetadata, ToolDefinitionSummary, Workflow } from '$lib/types/api';
 
   let {
     mode,
@@ -21,10 +21,14 @@
     providers,
     secrets = [],
     intarisMcpServers = [],
+    secondaryAgents = [],
+    secondaryBindings = [],
     saving = false,
     error = '',
+    readonly = false,
     onSave,
     onTestMcp,
+    onBindingsChange,
     mcpTesting = false,
     mcpTestResult = null
   } = $props<{
@@ -35,13 +39,28 @@
     providers: LLMProvider[];
     secrets?: SecretMetadata[];
     intarisMcpServers?: IntarisMCPServer[];
+    secondaryAgents?: Agent[];
+    secondaryBindings?: string[];
     saving?: boolean;
     error?: string;
+    readonly?: boolean;
     onSave: (payload: Record<string, unknown>) => void | Promise<void>;
     onTestMcp?: (() => void | Promise<void>) | null;
+    onBindingsChange?: ((bindings: string[]) => void | Promise<void>) | null;
     mcpTesting?: boolean;
     mcpTestResult?: MCPServerTestResponse | null;
   }>();
+
+  let localBindings = $state<string[]>([...secondaryBindings]);
+
+  function toggleBinding(agentId: string): void {
+    if (localBindings.includes(agentId)) {
+      localBindings = localBindings.filter((id) => id !== agentId);
+    } else {
+      localBindings = [...localBindings, agentId];
+    }
+    onBindingsChange?.(localBindings);
+  }
 
   const permissionOptions = ['', 'allow', 'evaluate', 'deny'];
 
@@ -194,7 +213,7 @@
         <div class="grid gap-4 md:grid-cols-2">
           <label class="space-y-2 text-sm font-medium text-slate-200">
             <span>Name <span class="text-rose-300">*</span></span>
-            <Input aria-invalid={errors.name ? 'true' : 'false'} bind:value={form.name} placeholder="Research Assistant" />
+            <Input aria-invalid={errors.name ? 'true' : 'false'} bind:value={form.name} placeholder="Research Assistant" disabled={readonly} />
             {#if errors.name}
               <span class="text-xs text-rose-300">{errors.name}</span>
             {/if}
@@ -203,7 +222,7 @@
             <span>ID <span class="text-slate-500">(optional)</span></span>
             <Input
               bind:value={form.agentId}
-              disabled={mode === 'edit'}
+              disabled={mode === 'edit' || readonly}
               placeholder="auto-generated from name"
               oninput={() => { if (mode === 'create') form.customId = true; }}
             />
@@ -214,38 +233,50 @@
             {/if}
           </label>
           <label class="space-y-2 text-sm font-medium text-slate-200">
+            <span>Type</span>
+            <select bind:value={form.agentType} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={mode === 'edit' || readonly}>
+              <option value="primary">Primary</option>
+              <option value="secondary">Secondary</option>
+            </select>
+            <span class="block text-xs text-slate-400">
+              {form.agentType === 'primary' ? 'Interactive agent with personality and memory.' : 'Lightweight task executor for focused sub-tasks.'}
+            </span>
+          </label>
+          <label class="space-y-2 text-sm font-medium text-slate-200">
             <span>Avatar URL</span>
-            <Input bind:value={form.avatarUrl} placeholder="https://…" />
+            <Input bind:value={form.avatarUrl} placeholder="https://…" disabled={readonly} />
           </label>
         </div>
         <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
           <span>Description</span>
-          <textarea bind:value={form.description} class="min-h-[90px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500"></textarea>
+          <textarea bind:value={form.description} class="min-h-[90px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500" disabled={readonly}></textarea>
         </label>
       </Card>
 
-      <!-- Personality -->
-      <Card class="p-5">
-        <p class="mb-3 text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Personality</p>
-        <div class="grid gap-4 md:grid-cols-3">
-          <label class="space-y-2 text-sm font-medium text-slate-200">
-            <span>Tone</span>
-            <Input bind:value={form.tone} placeholder="calm, direct, curious" />
+      <!-- Personality (primary only) -->
+      {#if form.agentType === 'primary'}
+        <Card class="p-5">
+          <p class="mb-3 text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Personality</p>
+          <div class="grid gap-4 md:grid-cols-3">
+            <label class="space-y-2 text-sm font-medium text-slate-200">
+              <span>Tone</span>
+              <Input bind:value={form.tone} placeholder="calm, direct, curious" disabled={readonly} />
+            </label>
+            <label class="space-y-2 text-sm font-medium text-slate-200">
+              <span>Temperament</span>
+              <Input bind:value={form.temperament} placeholder="patient" disabled={readonly} />
+            </label>
+            <label class="space-y-2 text-sm font-medium text-slate-200">
+              <span>Purpose</span>
+              <Input bind:value={form.purpose} placeholder="research specialist" disabled={readonly} />
+            </label>
+          </div>
+          <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
+            <span>Behavioral rules (one per line)</span>
+            <textarea bind:value={form.behavioralRules} class="min-h-[110px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500" placeholder="Always cite sources&#10;Prefer concise answers" disabled={readonly}></textarea>
           </label>
-          <label class="space-y-2 text-sm font-medium text-slate-200">
-            <span>Temperament</span>
-            <Input bind:value={form.temperament} placeholder="patient" />
-          </label>
-          <label class="space-y-2 text-sm font-medium text-slate-200">
-            <span>Purpose</span>
-            <Input bind:value={form.purpose} placeholder="research specialist" />
-          </label>
-        </div>
-        <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
-          <span>Behavioral rules (one per line)</span>
-          <textarea bind:value={form.behavioralRules} class="min-h-[110px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500" placeholder="Always cite sources&#10;Prefer concise answers"></textarea>
-        </label>
-      </Card>
+        </Card>
+      {/if}
 
       <!-- System prompt -->
       <Card class="p-5">
@@ -253,7 +284,7 @@
           <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">System prompt</p>
           <Button size="sm" variant="secondary" type="button" onclick={resetSystemPrompt}>Reset to default</Button>
         </div>
-        <textarea bind:value={form.systemPrompt} class="min-h-[180px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500" placeholder="You are {'{'}name{'}'}.&#10;&#10;Be helpful, direct, and concise."></textarea>
+        <textarea bind:value={form.systemPrompt} class="min-h-[180px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500" placeholder="You are {'{'}name{'}'}.&#10;&#10;Be helpful, direct, and concise." disabled={readonly}></textarea>
         <p class="mt-2 text-xs text-slate-400">The agent's base instructions. Memory context and tool descriptions are injected separately at runtime.</p>
       </Card>
 
@@ -470,7 +501,34 @@
         </div>
       </Card>
 
-      <!-- Workflow Settings -->
+      <!-- Secondary Agent Bindings (primary only) -->
+      {#if form.agentType === 'primary' && !readonly && secondaryAgents.length > 0}
+        <Card class="p-5">
+          <div>
+            <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Secondary agent bindings</p>
+            <p class="mt-1 text-sm text-slate-400">Select which user-created secondary agents this primary agent can delegate to. System secondary agents are always available.</p>
+          </div>
+          <div class="mt-3 grid gap-2 md:grid-cols-2">
+            {#each secondaryAgents.filter((a: Agent) => !a.is_system) as agent}
+              <label class="flex items-center gap-3 rounded-xl border border-slate-800 bg-slate-950/60 px-3 py-2 text-sm text-slate-200">
+                <input
+                  checked={localBindings.includes(agent.agent_id)}
+                  class="h-4 w-4 rounded border-slate-600 bg-slate-950"
+                  type="checkbox"
+                  onchange={() => toggleBinding(agent.agent_id)}
+                />
+                <span>{agent.display_name ?? agent.name}</span>
+                <span class="text-xs text-slate-400">({agent.agent_id})</span>
+              </label>
+            {:else}
+              <p class="text-sm text-slate-500">No user-created secondary agents. System agents are always available.</p>
+            {/each}
+          </div>
+        </Card>
+      {/if}
+
+      <!-- Workflow Settings (primary only) -->
+      {#if form.agentType === 'primary'}
       <Card class="p-5">
         <div class="space-y-4">
           <div>
@@ -522,6 +580,7 @@
           </label>
         </div>
       </Card>
+      {/if}
 
       {#if error}
         <p class="rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-100">
@@ -529,16 +588,26 @@
         </p>
       {/if}
 
-      <div class="flex justify-end gap-3">
-        <Button type="submit" disabled={saving || !canSubmit}>{saving ? 'Saving…' : mode === 'create' ? 'Create agent' : 'Save changes'}</Button>
-      </div>
+      {#if !readonly}
+        <div class="flex justify-end gap-3">
+          <Button type="submit" disabled={saving || !canSubmit}>{saving ? 'Saving…' : mode === 'create' ? 'Create agent' : 'Save changes'}</Button>
+        </div>
+      {/if}
     </div>
 
     <div class="space-y-5">
-      <Card class="p-5">
-        <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Mnemory bootstrap preview</p>
-        <pre class="mt-4 whitespace-pre-wrap rounded-2xl border border-slate-800 bg-slate-950/70 p-4 text-sm leading-6 text-slate-200">{buildBootstrapPreview(form)}</pre>
-      </Card>
+      {#if form.agentType === 'primary'}
+        <Card class="p-5">
+          <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Mnemory bootstrap preview</p>
+          <pre class="mt-4 whitespace-pre-wrap rounded-2xl border border-slate-800 bg-slate-950/70 p-4 text-sm leading-6 text-slate-200">{buildBootstrapPreview(form)}</pre>
+        </Card>
+      {:else}
+        <Card class="p-5">
+          <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Secondary agent</p>
+          <p class="mt-2 text-sm text-slate-300">Secondary agents are lightweight task executors. They have no personality or memory integration — just a focused system prompt and scoped tools.</p>
+          <p class="mt-2 text-sm text-slate-300">They are invoked by primary agents via delegation or by the workflow engine via step agent overrides.</p>
+        </Card>
+      {/if}
     </div>
   </div>
 </form>

@@ -130,6 +130,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_active_session_id_column)
         await conn.run_sync(_ensure_task_expected_output_column)
         await conn.run_sync(_ensure_step_run_conversation_id_column)
+        await conn.run_sync(_ensure_agent_type_columns)
 
 
 def _ensure_session_lifecycle_columns(sync_conn: object) -> None:
@@ -228,6 +229,25 @@ def _ensure_step_run_conversation_id_column(sync_conn: object) -> None:
 
     if "conversation_id" not in columns:
         execute(text("ALTER TABLE step_runs ADD COLUMN conversation_id VARCHAR"))
+
+
+def _ensure_agent_type_columns(sync_conn: object) -> None:
+    """Add agent_type, is_system, hidden columns to agents table."""
+    inspector = cast(Any, inspect(sync_conn))
+    try:
+        agent_columns = {column["name"] for column in inspector.get_columns("agents")}
+    except Exception:
+        return  # table doesn't exist yet (create_all will handle it)
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+
+    if "agent_type" not in agent_columns:
+        execute(
+            text("ALTER TABLE agents ADD COLUMN agent_type VARCHAR(20) NOT NULL DEFAULT 'primary'")
+        )
+    if "is_system" not in agent_columns:
+        execute(text("ALTER TABLE agents ADD COLUMN is_system BOOLEAN NOT NULL DEFAULT 0"))
+    if "hidden" not in agent_columns:
+        execute(text("ALTER TABLE agents ADD COLUMN hidden BOOLEAN NOT NULL DEFAULT 0"))
 
 
 async def seed_default_settings(session: AsyncSession) -> None:

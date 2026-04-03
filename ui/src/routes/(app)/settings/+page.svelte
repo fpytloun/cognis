@@ -71,7 +71,7 @@
   let showSecretModal = false;
   let secretModalName = '';
   let secretModalValue = '';
-  let agents: Array<{ agent_id: string; name: string }> = [];
+  let agents: Array<{ agent_id: string; name: string; is_system?: boolean }> = [];
   let apiKeys: ApiKeyMetadata[] = [];
   let createdApiKey: ApiKeyCreateResponse | null = null;
   let newApiKeyName = '';
@@ -337,7 +337,7 @@
       [providers, diagnostics, agents, executorConfigs, executorTools] = await Promise.all([
         api.llmProviders.list().then((page) => page.items),
         api.system.diagnostics(),
-        api.agents.list().then((page) => page.items.map((a) => ({ agent_id: a.agent_id, name: a.name }))),
+        api.agents.list().then((page) => page.items.map((a) => ({ agent_id: a.agent_id, name: a.name, is_system: a.is_system }))),
         api.executor.list().catch(() => []),
         api.tools.executorTools().catch(() => []),
       ]);
@@ -1021,7 +1021,7 @@
                 <span>Agent</span>
                 <select bind:value={secretForm.agent_id} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
                   <option value="">Select agent...</option>
-                  {#each agents as agent}
+                  {#each agents.filter((a) => !a.is_system) as agent}
                     <option value={agent.agent_id}>{agent.name} ({agent.agent_id})</option>
                   {/each}
                 </select>

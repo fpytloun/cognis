@@ -972,7 +972,7 @@
               onchange={handleAgentFilterChange}
               class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
             >
-              {#each agents.filter((a) => a.status === 'active') as agent}
+              {#each agents.filter((a) => a.status === 'active' && a.agent_type === 'primary') as agent}
                 <option value={agent.agent_id}>{agent.display_name ?? agent.name}</option>
               {/each}
             </select>

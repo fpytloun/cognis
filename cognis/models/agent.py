@@ -30,6 +30,11 @@ class AgentDefinition(BaseModel):
     llm_config: AgentLLMConfig | None = None
     execution: dict[str, Any] | None = None
     avatar_url: str | None = None
+    # Type system
+    agent_type: str = "primary"  # "primary" | "secondary"
+    is_system: bool = False
+    hidden: bool = False
+    # Metadata
     status: str = "active"
     created_at: datetime | None = None
     updated_at: datetime | None = None

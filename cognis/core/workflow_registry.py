@@ -64,6 +64,7 @@ RESEARCH_WORKFLOW = Workflow(
         StepDefinition(
             name="research",
             type="run",
+            agent_override="system:research",
             prompt="Execute the research plan. Gather information from available sources.",
             input=StepInputConfig(type="full", source="plan"),
             completion=CompletionConfig(evaluate=True, max_attempts=2),
@@ -79,73 +80,103 @@ RESEARCH_WORKFLOW = Workflow(
     is_system=True,
 )
 
-CODE_WITH_REVIEW_WORKFLOW = Workflow(
-    workflow_id="system:code-with-review",
-    name="Code with Review",
-    description="Structured coding workflow with planning, implementation, testing, and review.",
-    criteria="Coding tasks, implementation requests, feature development.",
+SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
+    workflow_id="system:software-development",
+    name="Software Development",
+    description="Full development pipeline: plan, architect review, implement, docs, code review, commit, remember.",
+    criteria="Implementation tasks, feature development, bug fixes requiring structured quality pipeline.",
     tags=["code", "development"],
     interaction=InteractionMode(mode="explicit_gates"),
     steps=[
         StepDefinition(
             name="plan",
             type="run",
-            prompt="Break down this task into implementation steps. Include success criteria, test strategy, and documentation plan.",
+            prompt=(
+                "Explore the codebase to understand the relevant areas. "
+                "Launch multiple explore sub-sessions in parallel to "
+                "efficiently understand different aspects of the codebase. "
+                "Then produce a detailed implementation plan covering: "
+                "files to create/modify (with rationale), specific changes "
+                "per file, edge cases and error handling, testing strategy, "
+                "migration or compatibility concerns."
+            ),
             input=StepInputConfig(type="null"),
             completion=CompletionConfig(evaluate=True, max_attempts=2),
+            # Primary agent runs this — has memory, personality, project context
         ),
         StepDefinition(
             name="architect_review",
             type="run",
-            prompt="Review this plan critically. Check for missing edge cases, security concerns, and architectural issues.",
+            agent_override="system:architect",
+            prompt="Review this implementation plan as an ARB reviewer.",
             input=StepInputConfig(type="full", source="plan"),
-            completion=CompletionConfig(evaluate=True),
-            on_reject=OnRejectConfig(target="plan", max_loop_iterations=2, on_exhausted="gate"),
+            completion=CompletionConfig(evaluate=True, max_attempts=3),
+            on_reject=OnRejectConfig(
+                target="plan",
+                max_loop_iterations=3,
+                on_exhausted="gate",
+            ),
         ),
         StepDefinition(
             name="implement",
             type="run",
-            prompt="Implement the plan with tests and documentation.",
+            prompt=(
+                "Implement the approved plan. Follow the plan step by step. "
+                "After implementation, run relevant tests and linters."
+            ),
             input=StepInputConfig(type="summary", source=["plan", "architect_review"]),
             completion=CompletionConfig(evaluate=True, max_attempts=3),
+            # Primary agent — needs memory and full tool access
         ),
         StepDefinition(
-            name="run_tests",
+            name="update_docs",
             type="run",
-            prompt="Run the test suite and fix any failures.",
-            # Default: type=last, source=implement (previous step)
-            completion=CompletionConfig(evaluate=True, max_attempts=2),
-            on_reject=OnRejectConfig(
-                target="implement",
-                max_loop_iterations=2,
-                on_exhausted="continue",
+            prompt=(
+                "Review and update documentation affected by the changes: "
+                "README, API docs, CHANGELOG, inline comments, architecture "
+                "documents, configuration examples. If no documentation "
+                "updates are needed, explicitly note this."
             ),
+            completion=CompletionConfig(evaluate=False),
+            # Primary agent — knows what changed
         ),
         StepDefinition(
             name="code_review",
             type="run",
-            prompt="Review code quality, test coverage, documentation.",
-            input=StepInputConfig(type="summary", source=["plan", "implement", "run_tests"]),
-            completion=CompletionConfig(evaluate=True),
+            agent_override="system:code-review",
+            prompt="Review all changes made during implementation.",
+            input=StepInputConfig(
+                type="summary",
+                source=["plan", "implement", "update_docs"],
+            ),
+            completion=CompletionConfig(evaluate=True, max_attempts=3),
             on_reject=OnRejectConfig(
                 target="implement",
-                max_loop_iterations=2,
-                on_exhausted="continue",
+                max_loop_iterations=3,
+                on_exhausted="gate",
             ),
         ),
         StepDefinition(
             name="commit",
             type="run",
-            prompt="Create a conventional commit with a clear message.",
-            # Default: type=last, source=code_review (previous step)
+            agent_override="system:committer",
+            prompt="Create a conventional commit for all changes.",
             completion=CompletionConfig(evaluate=False),
         ),
         StepDefinition(
-            name="update_memory",
+            name="remember",
             type="run",
-            prompt="Store key findings and decisions as memories for future reference.",
-            input=StepInputConfig(type="last", source=["plan", "implement", "code_review"]),
+            prompt=(
+                "Store key findings, decisions, and implementation details "
+                "as memories for future reference. Attach a detailed summary "
+                "as an artifact."
+            ),
+            input=StepInputConfig(
+                type="last",
+                source=["plan", "implement", "code_review"],
+            ),
             completion=CompletionConfig(evaluate=False),
+            # Primary agent — has memory tools
         ),
     ],
     is_system=True,
@@ -172,7 +203,7 @@ CREATIVE_WORKFLOW = Workflow(
 
 SYSTEM_WORKFLOWS: dict[str, Workflow] = {
     w.workflow_id: w
-    for w in [DIRECT_WORKFLOW, RESEARCH_WORKFLOW, CODE_WITH_REVIEW_WORKFLOW, CREATIVE_WORKFLOW]
+    for w in [DIRECT_WORKFLOW, RESEARCH_WORKFLOW, SOFTWARE_DEVELOPMENT_WORKFLOW, CREATIVE_WORKFLOW]
 }
 
 

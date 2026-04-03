@@ -16,7 +16,7 @@
   approve/revise/fail outcomes.
 - Event bus with topic-based pub/sub and global subscribers.
 - Workflow registry with bundled system workflows (direct, research,
-  code-with-review) and user workflow CRUD.
+  software-development) and user workflow CRUD.
 - 102 unit tests added covering all domain models and core logic.
 
 **Repo**: `cognis`
