@@ -9,10 +9,13 @@
   import Button from '$lib/components/ui/Button.svelte';
   import Card from '$lib/components/ui/Card.svelte';
   import Input from '$lib/components/ui/Input.svelte';
+  import Tooltip from '$lib/components/ui/Tooltip.svelte';
+  import WorkflowDiagram from '$lib/components/workflows/WorkflowDiagram.svelte';
   import { confirmAction } from '$lib/stores/confirm';
   import { addToast } from '$lib/stores/toasts';
   import { renderMarkdown } from '$lib/markdown';
-  import { formatAbsoluteTime, formatRelativeTime } from '$lib/time';
+  import { formatAbsoluteTime, formatDuration, formatRelativeTime } from '$lib/time';
+  import { workflowToFormState } from '$lib/workflows';
   import type { Agent, Conversation, StepRun, Task, TaskDetail, Workflow } from '$lib/types/api';
 
   let loading = $state(true);
@@ -48,12 +51,26 @@
 
   const statusColors: Record<string, string> = {
     pending: 'border-slate-600 text-slate-400',
-    running: 'border-amber-700 text-amber-300',
+    running: 'border-sky-600 text-sky-300',
+    evaluating: 'border-violet-600 text-violet-300',
     approved: 'border-emerald-700 text-emerald-300',
     completed: 'border-emerald-700 text-emerald-300',
     failed: 'border-rose-700 text-rose-300',
     cancelled: 'border-slate-600 text-slate-500',
     paused: 'border-yellow-700 text-yellow-300',
+    rejected: 'border-amber-700 text-amber-300',
+  };
+
+  const statusHints: Record<string, string> = {
+    pending: 'Step is queued and waiting to start',
+    running: 'Agent is actively working on this step',
+    evaluating: 'Evaluator LLM is checking if the step objective was met',
+    approved: 'Evaluator approved the step output',
+    completed: 'Step finished (no evaluation or evaluation skipped)',
+    failed: 'Step failed after exhausting all attempts',
+    cancelled: 'Step was cancelled',
+    paused: 'Step is paused waiting for human input',
+    rejected: 'Evaluator rejected the output — agent will revise',
   };
 
   const TERMINAL_STATUSES = ['completed', 'failed', 'cancelled'];
@@ -61,13 +78,22 @@
   let isEditable = $derived(task != null && !TERMINAL_STATUSES.includes(task.status));
   let isCancellable = $derived(task != null && CANCELLABLE_STATUSES.includes(task.status));
 
+  // ---------------------------------------------------------------------------
+  // Helpers
+  // ---------------------------------------------------------------------------
+
   function taskIdFromRoute(): string {
     return $page.params.taskId ?? '';
   }
 
   function workflowName(workflowId: string | null): string {
-    if (!workflowId) return 'auto';
+    if (!workflowId) return 'Auto';
     return workflows.find((w) => w.workflow_id === workflowId)?.name ?? workflowId;
+  }
+
+  function agentName(agentId: string | null): string {
+    if (!agentId) return 'Unknown';
+    return agents.find((a) => a.agent_id === agentId)?.name ?? agentId;
   }
 
   function toggleStepExpand(stepRunId: string): void {
@@ -97,13 +123,14 @@
     return typeof val === 'string' ? val : '';
   }
 
+  function stepEvalFeedback(stepRun: StepRun): string {
+    const val = stepRun.evaluation?.feedback;
+    return typeof val === 'string' ? val : '';
+  }
+
   function openSessionLogs(stepRun: StepRun): void {
     const sessionId = String(stepRun.output?.session_id ?? stepRun.session_id ?? '');
     if (!sessionId || !task) return;
-    // Use the conversation_id stored directly on the step_run record.
-    // This is reliable even for retried steps where each attempt may
-    // have a different conversation.  Fall back to heuristic matching
-    // for older step_runs that predate the conversation_id column.
     let conversationId = stepRun.conversation_id;
     if (!conversationId) {
       const conv = conversations.find((c) =>
@@ -117,6 +144,117 @@
       stepName: `${stepRun.step_name} (attempt ${stepRun.attempt})`
     };
   }
+
+  // ---------------------------------------------------------------------------
+  // Diagram helpers
+  // ---------------------------------------------------------------------------
+
+  /** Resolve the workflow definition for the diagram */
+  let workflowDef = $derived.by(() => {
+    if (!task?.workflow_id) return null;
+    return workflows.find((w) => w.workflow_id === task!.workflow_id) ?? null;
+  });
+
+  let diagramSteps = $derived.by(() => {
+    if (!workflowDef) return [];
+    return workflowToFormState(workflowDef).steps;
+  });
+
+  let diagramActiveStep = $derived(task?.workflow_run?.current_step_name ?? '');
+
+  /** Build step status map from step_runs (latest attempt per step) */
+  let diagramStepStatuses = $derived.by(() => {
+    if (!task) return {};
+    const map: Record<string, string> = {};
+    for (const sr of task.step_runs) {
+      // Keep the latest attempt's status for each step
+      const existing = map[sr.step_name];
+      if (!existing || sr.attempt > (task.step_runs.find((s) => s.step_name === sr.step_name && s.status === existing)?.attempt ?? 0)) {
+        map[sr.step_name] = sr.status;
+      }
+    }
+    return map;
+  });
+
+  /** Build step duration map (latest attempt per step) */
+  let diagramStepDurations = $derived.by(() => {
+    if (!task) return {};
+    const map: Record<string, string> = {};
+    // Group by step_name, take the latest attempt
+    const latestByStep = new Map<string, StepRun>();
+    for (const sr of task.step_runs) {
+      const existing = latestByStep.get(sr.step_name);
+      if (!existing || sr.attempt > existing.attempt) {
+        latestByStep.set(sr.step_name, sr);
+      }
+    }
+    for (const [name, sr] of latestByStep) {
+      const dur = formatDuration(sr.started_at, sr.completed_at, tickNow);
+      if (dur) map[name] = dur;
+    }
+    return map;
+  });
+
+  let diagramSkippedSteps = $derived(task?.workflow_state?.skipped_steps ?? []);
+
+  // ---------------------------------------------------------------------------
+  // Statistics
+  // ---------------------------------------------------------------------------
+
+  let stats = $derived.by(() => {
+    if (!task) return null;
+    const runs = task.step_runs;
+    const totalAttempts = runs.length;
+    const completedSteps = new Set(
+      runs.filter((r) => ['approved', 'completed'].includes(r.status)).map((r) => r.step_name)
+    ).size;
+    const evalRevisions = runs.filter((r) => r.evaluation && String(r.evaluation.decision) === 'revise').length;
+    const evalFailures = runs.filter((r) => r.evaluation && String(r.evaluation.decision) === 'failed').length;
+    const multiAttemptSteps = new Set(
+      runs.filter((r) => r.attempt > 1).map((r) => r.step_name)
+    ).size;
+    const skipped = diagramSkippedSteps.length;
+
+    // Loop iterations from workflow state
+    const loopIters = task.workflow_state?.loop_iterations;
+    const totalLoops = loopIters ? Object.values(loopIters).reduce((a, b) => a + b, 0) : 0;
+
+    // Unique step names that have run
+    const uniqueSteps = new Set(runs.map((r) => r.step_name)).size;
+
+    return {
+      uniqueSteps,
+      completedSteps,
+      totalAttempts,
+      evalRevisions,
+      evalFailures,
+      multiAttemptSteps,
+      skipped,
+      totalLoops,
+    };
+  });
+
+  // ---------------------------------------------------------------------------
+  // Origin / initiator
+  // ---------------------------------------------------------------------------
+
+  let sourceLabel = $derived.by(() => {
+    if (!task) return '';
+    const labels: Record<string, string> = {
+      chat: 'Chat conversation',
+      agent: 'Agent delegation',
+      api: 'API request',
+      scheduler: 'Scheduled',
+      webhook: 'Webhook',
+    };
+    return labels[task.source_type] ?? task.source_type;
+  });
+
+  let sourceConversation = $derived.by(() => {
+    if (!task?.source_ref) return null;
+    if (task.source_type !== 'chat' && task.source_type !== 'agent') return null;
+    return conversations.find((c) => c.conversation_id === task!.source_ref) ?? null;
+  });
 
   // ---------------------------------------------------------------------------
   // Data loading
@@ -275,19 +413,6 @@
     }
   }
 
-  function formatDuration(startIso: string | null | undefined, endIso: string | null | undefined): string {
-    if (!startIso) return '';
-    const start = new Date(startIso).getTime();
-    // Use tickNow for live-updating duration on running tasks
-    const end = endIso ? new Date(endIso).getTime() : tickNow;
-    const seconds = Math.floor((end - start) / 1000);
-    if (seconds < 60) return `${seconds}s`;
-    const minutes = Math.floor(seconds / 60);
-    if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
-    const hours = Math.floor(minutes / 60);
-    return `${hours}h ${minutes % 60}m`;
-  }
-
   function startDurationTimer(): void {
     if (durationTimer) return;
     durationTimer = setInterval(() => { tickNow = Date.now(); }, 1000);
@@ -336,7 +461,9 @@
         {#if isCancellable}
           <Button size="sm" variant="danger" onclick={cancelTask}>Cancel task</Button>
         {/if}
-        <span class="rounded-full border border-slate-700 bg-slate-900 px-3 py-1 text-xs font-semibold uppercase tracking-[0.2em] text-slate-200">{task.status}</span>
+        <span class="rounded-full border px-3 py-1 text-xs font-semibold uppercase tracking-[0.2em] {statusColors[task.status] ?? 'border-slate-700 text-slate-200'}">
+          {task.status}
+        </span>
       </div>
     </div>
 
@@ -346,8 +473,24 @@
 
     <div class="grid gap-5 xl:grid-cols-[minmax(0,1fr)_380px]">
       <div class="space-y-5">
+        <!-- Pipeline diagram -->
+        {#if diagramSteps.length > 0}
+          <Card class="p-5">
+            <p class="mb-3 text-xs uppercase tracking-[0.25em] text-slate-400">Pipeline</p>
+            <WorkflowDiagram
+              steps={diagramSteps}
+              interactionMode={workflowDef?.interaction?.mode?.toString() ?? 'explicit_gates'}
+              activeStepName={diagramActiveStep}
+              stepStatuses={diagramStepStatuses}
+              stepDurations={diagramStepDurations}
+              skippedSteps={diagramSkippedSteps}
+            />
+          </Card>
+        {/if}
+
         <!-- Edit form -->
         <Card class="p-5">
+          <p class="mb-3 text-xs uppercase tracking-[0.25em] text-slate-400">Task configuration</p>
           <div class="grid gap-4 md:grid-cols-2">
             <label class="space-y-2 text-sm font-medium text-slate-200">
               <span>Title</span>
@@ -388,7 +531,12 @@
 
           <div class="mt-4 grid gap-4 md:grid-cols-2">
             <label class="space-y-2 text-sm font-medium text-slate-200">
-              <span>Delivery mode</span>
+              <span class="inline-flex items-center gap-2">
+                Delivery mode
+                <Tooltip text="How the task result is delivered back. 'Same conversation' posts to the originating chat. 'Silent' stores the result without notifying.">
+                  <span class="cursor-help text-slate-500">(?)</span>
+                </Tooltip>
+              </span>
               <select bind:value={editForm.delivery_mode} disabled={!isEditable} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100 disabled:opacity-50">
                 <option value="same_conversation">Same conversation</option>
                 <option value="specific_conversation">Specific conversation</option>
@@ -449,12 +597,17 @@
           </Card>
         {/if}
 
-        <!-- Workflow progress -->
+        <!-- Workflow progress / step runs -->
         <Card class="p-5">
           <div class="space-y-4">
-            <div>
-              <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Workflow progress</p>
-              <h2 class="mt-1 text-lg font-semibold text-white">{workflowName(task.workflow_id)}</h2>
+            <div class="flex items-center justify-between gap-3">
+              <div>
+                <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Step runs</p>
+                <h2 class="mt-1 text-lg font-semibold text-white">{workflowName(task.workflow_id)}</h2>
+              </div>
+              {#if task.step_runs.length > 0}
+                <span class="text-xs text-slate-500">{task.step_runs.length} run{task.step_runs.length !== 1 ? 's' : ''}</span>
+              {/if}
             </div>
 
             <div class="space-y-3">
@@ -463,36 +616,43 @@
                 {@const content = stepOutputContent(stepRun)}
                 {@const claims = stepOutputClaims(stepRun)}
                 {@const stepError = stepOutputError(stepRun)}
+                {@const feedback = stepEvalFeedback(stepRun)}
                 {@const isExpanded = expandedSteps.has(stepRun.step_run_id)}
 
                 <article class="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
                   <!-- Header -->
                   <div class="flex flex-wrap items-center justify-between gap-3">
                     <div>
-                      <h3 class="font-semibold text-white">{stepRun.step_name}</h3>
-                      <p class="text-xs text-slate-500">
-                        {stepRun.step_type} · attempt {stepRun.attempt}
+                      <div class="flex items-center gap-2">
+                        <h3 class="font-semibold text-white">{stepRun.step_name}</h3>
+                        <span class="text-xs text-slate-600">#{stepRun.attempt}</span>
+                      </div>
+                      <div class="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-500">
+                        <span>{stepRun.step_type === 'gate' ? 'Gate' : 'Run'}</span>
                         {#if stepRun.agent_id}
-                          · <span class="text-slate-400">{agents.find((a) => a.agent_id === stepRun.agent_id)?.name ?? stepRun.agent_id}</span>
+                          <span class="text-slate-400">{agentName(stepRun.agent_id)}</span>
                         {/if}
                         {#if stepRun.started_at}
-                          <span title={formatAbsoluteTime(stepRun.started_at)}> · started {formatRelativeTime(stepRun.started_at)}</span>
-                        {/if}
-                        {#if stepRun.completed_at}
-                          <span title={formatAbsoluteTime(stepRun.completed_at)}> · {formatRelativeTime(stepRun.completed_at)}</span>
+                          <Tooltip text={formatAbsoluteTime(stepRun.started_at)}>
+                            <span class="cursor-help">started {formatRelativeTime(stepRun.started_at)}</span>
+                          </Tooltip>
                         {/if}
                         {#if stepRun.started_at}
-                          · <span class="font-mono">{formatDuration(stepRun.started_at, stepRun.completed_at)}</span>
+                          <span class="font-mono text-slate-300" title="{formatAbsoluteTime(stepRun.started_at)} — {stepRun.completed_at ? formatAbsoluteTime(stepRun.completed_at) : 'running'}">
+                            {formatDuration(stepRun.started_at, stepRun.completed_at, tickNow)}
+                          </span>
                         {/if}
-                      </p>
+                      </div>
                     </div>
                     <div class="flex items-center gap-2">
                       {#if stepRun.output?.session_id || stepRun.session_id}
                         <Button size="sm" variant="ghost" onclick={() => openSessionLogs(stepRun)}>Logs</Button>
                       {/if}
-                      <span class="rounded-full border px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wider {statusColors[stepRun.status] ?? 'border-slate-600 text-slate-400'}">
-                        {stepRun.status}
-                      </span>
+                      <Tooltip text={statusHints[stepRun.status] ?? stepRun.status}>
+                        <span class="cursor-help rounded-full border px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wider {statusColors[stepRun.status] ?? 'border-slate-600 text-slate-400'}">
+                          {stepRun.status}
+                        </span>
+                      </Tooltip>
                     </div>
                   </div>
 
@@ -560,13 +720,18 @@
                     <div class="mt-3 rounded-xl border border-slate-800 bg-slate-950/80 px-3 py-2">
                       <p class="text-xs font-medium uppercase tracking-widest text-slate-500">Evaluation</p>
                       <p class="mt-1 text-sm text-slate-300">
-                        <span class="font-medium {evalColor}">
-                          {evalDecision}
-                        </span>
+                        <Tooltip text={evalDecision === 'approved' ? 'Step objective was met' : evalDecision === 'revise' ? 'Agent needs to revise and retry' : evalDecision === 'failed' ? 'Step cannot succeed — will not retry' : evalDecision}>
+                          <span class="cursor-help font-medium {evalColor}">{evalDecision}</span>
+                        </Tooltip>
                         {#if evalReasoning}
                           — {evalReasoning}
                         {/if}
                       </p>
+                      {#if feedback}
+                        <p class="mt-2 rounded-lg border border-slate-700/50 bg-slate-900/50 px-2 py-1.5 text-xs text-slate-400">
+                          <span class="font-medium text-slate-500">Feedback:</span> {feedback}
+                        </p>
+                      {/if}
                     </div>
                   {/if}
                 </article>
@@ -582,6 +747,46 @@
 
       <!-- Sidebar -->
       <div class="space-y-5">
+        <!-- Origin -->
+        <Card class="p-5">
+          <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Origin</p>
+          <dl class="mt-3 space-y-2 text-sm">
+            <div class="flex justify-between gap-3">
+              <dt class="text-slate-500">Source</dt>
+              <dd class="text-slate-300">{sourceLabel}</dd>
+            </div>
+            {#if sourceConversation}
+              <div class="flex justify-between gap-3">
+                <dt class="text-slate-500">Conversation</dt>
+                <dd>
+                  <a href="/chat?conversation={sourceConversation.conversation_id}" class="text-sky-400 hover:text-sky-300 hover:underline">
+                    {sourceConversation.title ?? 'Untitled'}
+                  </a>
+                </dd>
+              </div>
+            {:else if task.source_ref}
+              <div class="flex justify-between gap-3">
+                <dt class="text-slate-500">Reference</dt>
+                <dd class="truncate text-slate-400" title={task.source_ref}>{task.source_ref}</dd>
+              </div>
+            {/if}
+            {#if task.created_by}
+              <div class="flex justify-between gap-3">
+                <dt class="text-slate-500">Created by</dt>
+                <dd class="truncate text-slate-300" title={task.created_by}>{task.created_by}</dd>
+              </div>
+            {/if}
+            <div class="flex justify-between gap-3">
+              <dt class="text-slate-500">Agent</dt>
+              <dd class="text-slate-300">{agentName(task.agent_id)}</dd>
+            </div>
+            <div class="flex justify-between gap-3">
+              <dt class="text-slate-500">Workflow</dt>
+              <dd class="text-slate-300">{workflowName(task.workflow_id)}</dd>
+            </div>
+          </dl>
+        </Card>
+
         <!-- Timing -->
         <Card class="p-5">
           <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Timing</p>
@@ -607,11 +812,78 @@
             {#if task.started_at}
               <div class="flex justify-between">
                 <dt class="text-slate-500">Duration</dt>
-                <dd class="font-mono text-slate-200">{formatDuration(task.started_at, task.completed_at)}</dd>
+                <dd class="font-mono text-slate-200">{formatDuration(task.started_at, task.completed_at, tickNow)}</dd>
               </div>
             {/if}
           </dl>
         </Card>
+
+        <!-- Statistics -->
+        {#if stats && stats.totalAttempts > 0}
+          <Card class="p-5">
+            <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Statistics</p>
+            <dl class="mt-3 space-y-2 text-sm">
+              <div class="flex justify-between">
+                <dt class="text-slate-500">Steps completed</dt>
+                <dd class="font-mono text-slate-200">{stats.completedSteps} / {stats.uniqueSteps}</dd>
+              </div>
+              <div class="flex justify-between">
+                <dt class="inline-flex items-center gap-1 text-slate-500">
+                  Total step runs
+                  <Tooltip text="Total number of step execution attempts, including retries. Higher than step count when steps are retried after evaluation rejection.">
+                    <span class="cursor-help text-slate-600">(?)</span>
+                  </Tooltip>
+                </dt>
+                <dd class="font-mono text-slate-200">{stats.totalAttempts}</dd>
+              </div>
+              {#if stats.evalRevisions > 0}
+                <div class="flex justify-between">
+                  <dt class="inline-flex items-center gap-1 text-slate-500">
+                    Eval revisions
+                    <Tooltip text="Times the evaluator sent a step back for revision. The agent retries within the same step run.">
+                      <span class="cursor-help text-slate-600">(?)</span>
+                    </Tooltip>
+                  </dt>
+                  <dd class="font-mono text-amber-300">{stats.evalRevisions}</dd>
+                </div>
+              {/if}
+              {#if stats.evalFailures > 0}
+                <div class="flex justify-between">
+                  <dt class="text-slate-500">Eval failures</dt>
+                  <dd class="font-mono text-rose-300">{stats.evalFailures}</dd>
+                </div>
+              {/if}
+              {#if stats.totalLoops > 0}
+                <div class="flex justify-between">
+                  <dt class="inline-flex items-center gap-1 text-slate-500">
+                    Review loops
+                    <Tooltip text="Times a review loop sent execution back to an earlier step (e.g. code review rejecting implementation back to the plan step).">
+                      <span class="cursor-help text-slate-600">(?)</span>
+                    </Tooltip>
+                  </dt>
+                  <dd class="font-mono text-amber-300">{stats.totalLoops}</dd>
+                </div>
+              {/if}
+              {#if stats.multiAttemptSteps > 0}
+                <div class="flex justify-between">
+                  <dt class="inline-flex items-center gap-1 text-slate-500">
+                    Re-executed steps
+                    <Tooltip text="Steps that were executed more than once (full re-execution, not just in-place revision). Happens when a review loop sends execution back to an earlier step.">
+                      <span class="cursor-help text-slate-600">(?)</span>
+                    </Tooltip>
+                  </dt>
+                  <dd class="font-mono text-slate-200">{stats.multiAttemptSteps}</dd>
+                </div>
+              {/if}
+              {#if stats.skipped > 0}
+                <div class="flex justify-between">
+                  <dt class="text-slate-500">Skipped steps</dt>
+                  <dd class="font-mono text-slate-400">{stats.skipped}</dd>
+                </div>
+              {/if}
+            </dl>
+          </Card>
+        {/if}
 
         <!-- Result -->
         <Card class="p-5">
@@ -619,12 +891,10 @@
           <p class="mt-3 text-sm leading-6 text-slate-300">{task.result_summary ?? 'This task has not produced a final result yet.'}</p>
         </Card>
 
+        <!-- Dependencies -->
         <Card class="p-5">
           <div class="space-y-4">
-            <div>
-              <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Dependencies</p>
-              <h2 class="mt-1 text-lg font-semibold text-white">Dependency graph</h2>
-            </div>
+            <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Dependencies</p>
             <div class="space-y-3">
               {#each task.dependencies as dependency}
                 <div class="flex items-center justify-between gap-3 rounded-2xl border border-slate-800 bg-slate-950/60 px-4 py-3">

@@ -362,17 +362,28 @@ _EVALUATOR_PROMPT = """\
 You are a workflow step evaluator. Assess whether the agent's work \
 satisfies the step's objective.
 
-Be skeptical. Agents tend to declare victory prematurely. Verify the \
-agent's claims against the actual response content. If the step says \
-"implement with tests" and the response doesn't include tests, that \
-is a revise.
+Be skeptical. Agents tend to declare victory prematurely. Apply these \
+checks:
+
+1. Compare each claim against the actual response content. If a claim \
+   says "implemented X" but the response shows no evidence of X, reject.
+2. Check completeness: does the response address ALL parts of the step \
+   objective? Partial completion is a revise, not an approval.
+3. Check quality: are there obvious errors, missing error handling, or \
+   incomplete implementations? If the step says "with tests" and there \
+   are no tests, that is a revise.
+4. Use "failed" only when the step fundamentally cannot succeed (wrong \
+   approach, impossible constraint, repeated identical failures).
 
 Respond with a single JSON object:
 {
   "decision": "approved" | "revise" | "failed",
   "reasoning": "...",
   "feedback": "..."
-}"""
+}
+
+The "feedback" field is shown to the agent on revise — make it specific \
+and actionable so the agent knows exactly what to fix."""
 
 
 # ---------------------------------------------------------------------------

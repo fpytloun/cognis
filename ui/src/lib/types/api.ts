@@ -322,6 +322,7 @@ export interface WorkflowState {
   step_outputs: Record<string, Record<string, unknown>>;
   loop_iterations: Record<string, number>;
   status: string;
+  skipped_steps?: string[];
   last_evaluation_feedback?: string | null;
   pending_pause_type?: string | null;
   pending_pause_payload?: Record<string, unknown> | null;

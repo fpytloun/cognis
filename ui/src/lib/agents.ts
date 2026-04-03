@@ -44,9 +44,9 @@ export interface AgentFormState {
   originalTools: Record<string, unknown>;
 }
 
-const DEFAULT_SYSTEM_PROMPT = `You are {name}.
+const DEFAULT_SYSTEM_PROMPT = `You are {name}, an AI assistant.
 
-Be helpful, direct, and concise.`;
+Be helpful, direct, and concise. Focus on accuracy over agreement.`;
 
 export function defaultSystemPrompt(name: string): string {
   return DEFAULT_SYSTEM_PROMPT.replace('{name}', name || 'an AI assistant');

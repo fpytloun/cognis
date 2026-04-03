@@ -7,6 +7,8 @@
   import Button from '$lib/components/ui/Button.svelte';
   import Card from '$lib/components/ui/Card.svelte';
   import Input from '$lib/components/ui/Input.svelte';
+  import Tooltip from '$lib/components/ui/Tooltip.svelte';
+  import WorkflowDiagram from '$lib/components/workflows/WorkflowDiagram.svelte';
   import { confirmAction } from '$lib/stores/confirm';
   import { addToast } from '$lib/stores/toasts';
   import { blockNavigationIfDirty, installBeforeUnloadGuard } from '$lib/navigation/unsaved';
@@ -213,6 +215,11 @@
     }
   }
 
+  /** Collect step names preceding a given index for reject-target dropdown */
+  function previousStepNames(index: number): string[] {
+    return form.steps.slice(0, index).map((s) => s.name).filter(Boolean);
+  }
+
   onMount(() => {
     const cleanup = installBeforeUnloadGuard(isDirty);
     void loadWorkflows();
@@ -282,7 +289,17 @@
           </Card>
         {/if}
 
+        <!-- Pipeline diagram (first thing the user sees) -->
         <Card class="p-5">
+          <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Pipeline diagram</p>
+          <div class="mt-3">
+            <WorkflowDiagram steps={form.steps} interactionMode={form.interactionMode} />
+          </div>
+        </Card>
+
+        <!-- Workflow metadata -->
+        <Card class="p-5">
+          <p class="mb-3 text-xs uppercase tracking-[0.25em] text-slate-400">Metadata</p>
           <div class="grid gap-4 md:grid-cols-2">
             <label class="space-y-2 text-sm font-medium text-slate-200">
               <span>Workflow ID</span>
@@ -290,15 +307,15 @@
             </label>
             <label class="space-y-2 text-sm font-medium text-slate-200">
               <span>Name</span>
-                <Input bind:value={form.name} disabled={!!selectedWorkflow?.is_system} />
+              <Input bind:value={form.name} disabled={!!selectedWorkflow?.is_system} />
             </label>
             <label class="space-y-2 text-sm font-medium text-slate-200">
               <span>Version</span>
-                <Input bind:value={form.version} disabled={!!selectedWorkflow?.is_system} type="number" />
+              <Input bind:value={form.version} disabled={!!selectedWorkflow?.is_system} type="number" />
             </label>
             <label class="space-y-2 text-sm font-medium text-slate-200">
               <span>Tags</span>
-                <Input bind:value={form.tagsText} disabled={!!selectedWorkflow?.is_system} placeholder="code, review" />
+              <Input bind:value={form.tagsText} disabled={!!selectedWorkflow?.is_system} placeholder="code, review" />
             </label>
           </div>
 
@@ -308,40 +325,68 @@
           </label>
 
           <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
-            <span>Selection criteria</span>
+            <span class="inline-flex items-center gap-2">
+              Selection criteria
+              <Tooltip text="Natural language description of when this workflow should be auto-selected by the classifier. Used by the Decision Engine to match incoming tasks to workflows.">
+                <span class="cursor-help text-slate-500">(?)</span>
+              </Tooltip>
+            </span>
             <textarea bind:value={form.criteria} class="min-h-[90px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}></textarea>
           </label>
         </Card>
 
+        <!-- Workflow defaults -->
         <Card class="p-5">
+          <p class="mb-3 text-xs uppercase tracking-[0.25em] text-slate-400">Workflow defaults</p>
           <div class="grid gap-4 md:grid-cols-3">
             <label class="space-y-2 text-sm font-medium text-slate-200">
-              <span>Interaction mode</span>
-                <select bind:value={form.interactionMode} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}>
-                <option value="none">none</option>
-                <option value="explicit_gates">explicit_gates</option>
-                <option value="step_requests">step_requests</option>
+              <span class="inline-flex items-center gap-2">
+                Interaction mode
+                <Tooltip text="Controls when the workflow can pause for human input. 'Autonomous' never pauses. 'Gates only' pauses at defined gate steps. 'Steps can ask' also allows run steps to request input mid-execution.">
+                  <span class="cursor-help text-slate-500">(?)</span>
+                </Tooltip>
+              </span>
+              <select bind:value={form.interactionMode} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}>
+                <option value="none">Autonomous</option>
+                <option value="explicit_gates">Gates only</option>
+                <option value="step_requests">Steps can ask</option>
               </select>
             </label>
             <label class="space-y-2 text-sm font-medium text-slate-200">
-              <span>Default max attempts</span>
+              <span class="inline-flex items-center gap-2">
+                Default max attempts
+                <Tooltip text="How many times a step can retry after evaluation rejection before triggering the 'on exhausted' action. Applies to all steps unless overridden per step.">
+                  <span class="cursor-help text-slate-500">(?)</span>
+                </Tooltip>
+              </span>
               <Input bind:value={form.defaultMaxAttempts} disabled={!!selectedWorkflow?.is_system} type="number" />
             </label>
             <label class="space-y-2 text-sm font-medium text-slate-200">
-              <span>On exhausted</span>
-                <select bind:value={form.defaultOnExhausted} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}>
-                <option value="continue">continue</option>
-                <option value="fail">fail</option>
-                <option value="gate">gate</option>
+              <span class="inline-flex items-center gap-2">
+                On exhausted
+                <Tooltip text="What happens when a step exhausts all retry attempts. 'Continue anyway' advances to the next step. 'Fail task' marks the entire task as failed. 'Ask human' pauses and notifies the user for a decision.">
+                  <span class="cursor-help text-slate-500">(?)</span>
+                </Tooltip>
+              </span>
+              <select bind:value={form.defaultOnExhausted} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}>
+                <option value="continue">Continue anyway</option>
+                <option value="fail">Fail task</option>
+                <option value="gate">Ask human</option>
               </select>
             </label>
           </div>
           <label class="mt-4 flex items-center gap-3 text-sm text-slate-200">
             <input bind:checked={form.defaultEvaluate} class="h-4 w-4 rounded border-slate-600 bg-slate-950" disabled={!!selectedWorkflow?.is_system} type="checkbox" />
-            <span>Evaluate run steps by default</span>
+            <span class="inline-flex items-center gap-2">
+              Evaluate steps by default
+              <Tooltip text="When enabled, an evaluator LLM checks whether each step's objective was met before advancing to the next step. Disable for simple or fire-and-forget steps.">
+                <span class="cursor-help text-slate-500">(?)</span>
+              </Tooltip>
+            </span>
           </label>
         </Card>
 
+        <!-- Step editor -->
         <Card class="p-5">
           <div class="flex items-center justify-between gap-3">
             <div>
@@ -354,6 +399,16 @@
           <div class="mt-4 space-y-4">
             {#each form.steps as step, index}
               <article class="rounded-2xl border border-slate-800 bg-slate-950/70 p-4" draggable={!selectedWorkflow?.is_system} ondragstart={() => (dragIndex = index)} ondragover={(event) => event.preventDefault()} ondrop={() => moveStep(index)}>
+                <!-- Step header: name, type, step number badge -->
+                <div class="mb-3 flex items-center gap-3">
+                  <span class="flex h-6 w-6 items-center justify-center rounded-full bg-slate-800 text-[11px] font-medium text-slate-400">{index + 1}</span>
+                  <span class="text-sm font-medium text-slate-100">{step.name || `Step ${index + 1}`}</span>
+                  <span class="rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-widest {step.type === 'gate' ? 'border-amber-600/40 text-amber-400' : 'border-slate-700 text-slate-400'}">{step.type === 'gate' ? 'Gate' : 'Run'}</span>
+                  {#if step.agentOverride && step.type === 'run'}
+                    <span class="rounded-full border border-sky-500/30 bg-sky-500/10 px-2 py-0.5 text-[10px] text-sky-300">{step.agentOverride}</span>
+                  {/if}
+                </div>
+
                 <div class="grid gap-4 md:grid-cols-2">
                   <label class="space-y-2 text-sm font-medium text-slate-200">
                     <span>Name</span>
@@ -362,15 +417,20 @@
                   <label class="space-y-2 text-sm font-medium text-slate-200">
                     <span>Type</span>
                     <select bind:value={step.type} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}>
-                      <option value="run">run</option>
-                      <option value="gate">gate</option>
+                      <option value="run">Run (agent executes)</option>
+                      <option value="gate">Gate (pause for approval)</option>
                     </select>
                   </label>
                 </div>
 
                 {#if step.type === 'run'}
                   <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
-                    <span>Agent override</span>
+                    <span class="inline-flex items-center gap-2">
+                      Agent override
+                      <Tooltip text="Run this step with a different agent instead of the task's primary agent. Useful for specialized steps like code review or architecture review.">
+                        <span class="cursor-help text-slate-500">(?)</span>
+                      </Tooltip>
+                    </span>
                     <select bind:value={step.agentOverride} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}>
                       <option value="">Default (task agent)</option>
                       {#each secondaryAgents as agent}
@@ -387,99 +447,141 @@
                   <textarea bind:value={step.prompt} class="min-h-[110px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}></textarea>
                 </label>
 
-                <div class="mt-4 grid gap-4 md:grid-cols-4">
+                <!-- Input configuration -->
+                <div class="mt-4 grid gap-4 md:grid-cols-2">
                   <label class="space-y-2 text-sm font-medium text-slate-200">
-                    <span>Input mode</span>
+                    <span class="inline-flex items-center gap-2">
+                      Input from previous steps
+                      <Tooltip text="What context from previous steps flows into this step. 'Step output' passes the completion summary (recommended). 'Summary' generates an LLM summary. 'Full history' passes the entire session (expensive, rarely needed). 'None' starts with fresh context.">
+                        <span class="cursor-help text-slate-500">(?)</span>
+                      </Tooltip>
+                    </span>
                     <select bind:value={step.inputMode} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}>
-                      <option value="auto">auto</option>
-                      <option value="null">null</option>
-                      <option value="last">last</option>
-                      <option value="full">full</option>
-                      <option value="summary">summary</option>
+                      <option value="auto">Auto (server default)</option>
+                      <option value="null">None (fresh context)</option>
+                      <option value="last">Step output (recommended)</option>
+                      <option value="summary">Summary (LLM-generated)</option>
+                      <option value="full">Full history (expensive)</option>
                     </select>
                   </label>
                   <label class="space-y-2 text-sm font-medium text-slate-200">
-                    <span>Input sources</span>
+                    <span class="inline-flex items-center gap-2">
+                      Source steps
+                      <Tooltip text="Comma-separated names of steps to pull input from. Leave empty to use the immediately preceding step. Only applies when input mode is not 'None'.">
+                        <span class="cursor-help text-slate-500">(?)</span>
+                      </Tooltip>
+                    </span>
                     <Input bind:value={step.inputText} disabled={!!selectedWorkflow?.is_system || step.inputMode === 'null'} placeholder={step.inputMode === 'full' ? 'plan' : 'plan, review'} />
-                  </label>
-                  <label class="space-y-2 text-sm font-medium text-slate-200">
-                    <span>Max attempts</span>
-                    <Input bind:value={step.maxAttempts} disabled={!!selectedWorkflow?.is_system} type="number" />
-                  </label>
-                  <label class="space-y-2 text-sm font-medium text-slate-200">
-                    <span>On exhausted</span>
-                    <select bind:value={step.onExhausted} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}>
-                      <option value="continue">continue</option>
-                      <option value="fail">fail</option>
-                      <option value="gate">gate</option>
-                    </select>
                   </label>
                 </div>
 
-                <label class="mt-4 flex items-center gap-3 text-sm text-slate-200">
-                  <input bind:checked={step.allowQuestions} class="h-4 w-4 rounded border-slate-600 bg-slate-950" disabled={!!selectedWorkflow?.is_system} type="checkbox" />
-                  <span>Allow in-step questions</span>
-                </label>
+                <!-- Completion configuration -->
+                {#if step.type === 'run'}
+                  <div class="mt-4 grid gap-4 md:grid-cols-2">
+                    <label class="space-y-2 text-sm font-medium text-slate-200">
+                      <span class="inline-flex items-center gap-2">
+                        Max attempts
+                        <Tooltip text="How many times this step can retry after evaluation rejection before triggering the 'on exhausted' action.">
+                          <span class="cursor-help text-slate-500">(?)</span>
+                        </Tooltip>
+                      </span>
+                      <Input bind:value={step.maxAttempts} disabled={!!selectedWorkflow?.is_system} type="number" />
+                    </label>
+                    <label class="space-y-2 text-sm font-medium text-slate-200">
+                      <span class="inline-flex items-center gap-2">
+                        On exhausted
+                        <Tooltip text="What happens when this step exhausts all retry attempts.">
+                          <span class="cursor-help text-slate-500">(?)</span>
+                        </Tooltip>
+                      </span>
+                      <select bind:value={step.onExhausted} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}>
+                        <option value="continue">Continue anyway</option>
+                        <option value="fail">Fail task</option>
+                        <option value="gate">Ask human</option>
+                      </select>
+                    </label>
+                  </div>
 
-                <label class="mt-2 flex items-center gap-3 text-sm text-slate-200">
-                  <input bind:checked={step.evaluate} class="h-4 w-4 rounded border-slate-600 bg-slate-950" disabled={!!selectedWorkflow?.is_system} type="checkbox" />
-                  <span>Evaluate completion</span>
-                </label>
+                  <div class="mt-4 flex flex-wrap gap-x-8 gap-y-2">
+                    <label class="flex items-center gap-3 text-sm text-slate-200">
+                      <input bind:checked={step.evaluate} class="h-4 w-4 rounded border-slate-600 bg-slate-950" disabled={!!selectedWorkflow?.is_system} type="checkbox" />
+                      <span class="inline-flex items-center gap-2">
+                        Evaluate completion
+                        <Tooltip text="When enabled, an evaluator LLM checks if the step objective was met before advancing. Rejected steps are sent back for revision.">
+                          <span class="cursor-help text-slate-500">(?)</span>
+                        </Tooltip>
+                      </span>
+                    </label>
+                    {#if form.interactionMode === 'step_requests'}
+                      <label class="flex items-center gap-3 text-sm text-slate-200">
+                        <input bind:checked={step.allowQuestions} class="h-4 w-4 rounded border-slate-600 bg-slate-950" disabled={!!selectedWorkflow?.is_system} type="checkbox" />
+                        <span class="inline-flex items-center gap-2">
+                          Allow questions
+                          <Tooltip text="Let the agent ask clarifying questions mid-step. The workflow pauses until the user responds. Only available when interaction mode is 'Steps can ask'.">
+                            <span class="cursor-help text-slate-500">(?)</span>
+                          </Tooltip>
+                        </span>
+                      </label>
+                    {/if}
+                  </div>
+                {/if}
 
+                <!-- Gate configuration -->
                 {#if step.type === 'gate'}
                   <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
                     <span>Gate message</span>
                     <textarea bind:value={step.gateMessage} class="min-h-[90px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}></textarea>
                   </label>
                   <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
-                    <span>Gate options</span>
-                    <textarea bind:value={step.gateOptionsText} class="min-h-[90px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 font-mono text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system} placeholder="Approve|continue\nRequest changes|revise(plan)"></textarea>
+                    <span class="inline-flex items-center gap-2">
+                      Gate options
+                      <Tooltip text="One option per line in 'Label|action' format. Actions: 'continue' advances, 'revise(step_name)' loops back. Example: Approve|continue">
+                        <span class="cursor-help text-slate-500">(?)</span>
+                      </Tooltip>
+                    </span>
+                    <textarea bind:value={step.gateOptionsText} class="min-h-[90px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 font-mono text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system} placeholder="Approve|continue&#10;Request changes|revise(plan)"></textarea>
                   </label>
                 {/if}
 
-                <div class="mt-4 grid gap-4 md:grid-cols-3">
-                  <label class="space-y-2 text-sm font-medium text-slate-200">
-                    <span>Reject target</span>
-                    <Input bind:value={step.rejectTarget} disabled={!!selectedWorkflow?.is_system} placeholder="implement" />
-                  </label>
-                  <label class="space-y-2 text-sm font-medium text-slate-200">
-                    <span>Reject max loops</span>
-                    <Input bind:value={step.rejectMaxLoops} disabled={!!selectedWorkflow?.is_system} type="number" />
-                  </label>
-                  <label class="space-y-2 text-sm font-medium text-slate-200">
-                    <span>Reject on exhausted</span>
-                    <select bind:value={step.rejectOnExhausted} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}>
-                      <option value="continue">continue</option>
-                      <option value="fail">fail</option>
-                      <option value="gate">gate</option>
-                    </select>
-                  </label>
-                </div>
+                <!-- Review loop (only shown when evaluate is on or step has a reject target) -->
+                {#if step.evaluate || step.rejectTarget}
+                  <details class="mt-4" open={!!step.rejectTarget}>
+                    <summary class="cursor-pointer text-sm font-medium text-slate-300 hover:text-slate-100">
+                      Review loop
+                      <Tooltip text="Configure a review loop: when the evaluator rejects this step, it loops back to a previous step for revision. Without a reject target, rejected steps simply retry in place.">
+                        <span class="cursor-help text-slate-500">(?)</span>
+                      </Tooltip>
+                    </summary>
+                    <div class="mt-3 grid gap-4 md:grid-cols-3">
+                      <label class="space-y-2 text-sm font-medium text-slate-200">
+                        <span>Reject target</span>
+                        <select bind:value={step.rejectTarget} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}>
+                          <option value="">None (retry in place)</option>
+                          {#each previousStepNames(index) as prevName}
+                            <option value={prevName}>{prevName}</option>
+                          {/each}
+                        </select>
+                      </label>
+                      <label class="space-y-2 text-sm font-medium text-slate-200">
+                        <span>Max review loops</span>
+                        <Input bind:value={step.rejectMaxLoops} disabled={!!selectedWorkflow?.is_system || !step.rejectTarget} type="number" />
+                      </label>
+                      <label class="space-y-2 text-sm font-medium text-slate-200">
+                        <span>On loops exhausted</span>
+                        <select bind:value={step.rejectOnExhausted} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system || !step.rejectTarget}>
+                          <option value="continue">Continue anyway</option>
+                          <option value="fail">Fail task</option>
+                          <option value="gate">Ask human</option>
+                        </select>
+                      </label>
+                    </div>
+                  </details>
+                {/if}
 
                 <div class="mt-4 flex justify-end">
                   <Button size="sm" variant="danger" onclick={() => removeStep(index)} disabled={!!selectedWorkflow?.is_system}>Remove step</Button>
                 </div>
               </article>
-            {/each}
-          </div>
-        </Card>
-
-        <Card class="p-5">
-          <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Pipeline preview</p>
-          <div class="mt-4 flex flex-wrap items-center gap-3">
-            {#each form.steps as step, index}
-              <div class="contents">
-                <div class="rounded-2xl border {step.agentOverride ? 'border-sky-500/30 bg-sky-500/5' : 'border-slate-800 bg-slate-950/70'} px-4 py-3 text-sm text-slate-100">
-                  <span class="font-medium">{step.name || `step_${index + 1}`}</span>
-                  <span class="ml-2 text-xs uppercase tracking-[0.2em] text-slate-500">{step.type}</span>
-                  {#if step.agentOverride}
-                    <span class="ml-2 rounded-full border border-sky-500/30 bg-sky-500/10 px-2 py-0.5 text-[10px] text-sky-300">{step.agentOverride}</span>
-                  {/if}
-                </div>
-                {#if index < form.steps.length - 1}
-                  <span class="text-slate-500">→</span>
-                {/if}
-              </div>
             {/each}
           </div>
         </Card>

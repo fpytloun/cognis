@@ -55,16 +55,22 @@ Agent's last response:
 Task context:
 {task_context}
 
-Decide:
-- "approved" if the step objective is satisfactorily met based on the \
-agent's actual response content
-- "revise" if the step is incomplete or the claims don't match the objective
-- "failed" if the step fundamentally cannot succeed
+Evaluation checklist:
+1. Does the response address ALL parts of the step objective?
+2. For each claim, is there evidence in the response content?
+3. Are there obvious errors, missing pieces, or incomplete work?
+4. If the objective mentions tests/validation, are they present and passing?
 
-Be skeptical. Agents tend to declare victory prematurely.
-Verify the agent's claims against the actual response content above.
-If the step says "implement with tests" and the response doesn't include tests,
-that is a revise.
+Decide:
+- "approved" — the step objective is satisfactorily met based on actual \
+response content (not just claims)
+- "revise" — the step is incomplete, claims don't match content, or \
+quality is insufficient. Provide specific, actionable feedback.
+- "failed" — the step fundamentally cannot succeed (wrong approach, \
+impossible constraint, repeated identical failures)
+
+Be skeptical. Agents tend to declare victory prematurely. Partial \
+completion is a revise, not an approval.
 
 Respond with JSON only: {{"decision": "...", "reasoning": "...", "feedback": "..."}}
 """

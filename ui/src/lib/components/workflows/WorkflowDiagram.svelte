@@ -1,0 +1,300 @@
+<script lang="ts">
+  import type { WorkflowStepFormState } from '$lib/workflows';
+
+  let {
+    steps = [],
+    interactionMode = 'explicit_gates',
+    // Task-aware mode (optional — omit for workflow editor)
+    activeStepName = '',
+    stepStatuses = {} as Record<string, string>,
+    stepDurations = {} as Record<string, string>,
+    skippedSteps = [] as string[],
+  } = $props<{
+    steps: WorkflowStepFormState[];
+    interactionMode: string;
+    activeStepName?: string;
+    stepStatuses?: Record<string, string>;
+    stepDurations?: Record<string, string>;
+    skippedSteps?: string[];
+  }>();
+
+  let isTaskMode = $derived(activeStepName !== '' || Object.keys(stepStatuses).length > 0);
+
+  // Layout constants
+  const NODE_W = 160;
+  const NODE_H = 56;
+  const GAP_X = 60;
+  const PAD_X = 24;
+  const PAD_TOP = 24;
+  const LOOP_ARC_Y = 52;
+  const BADGE_ROW_H = 22; // space for badges + duration below nodes
+
+  interface RejectArc {
+    fromIndex: number;
+    toIndex: number;
+    maxLoops: number;
+  }
+
+  function getRejectArcs(steps: WorkflowStepFormState[]): RejectArc[] {
+    const arcs: RejectArc[] = [];
+    const nameToIndex = new Map(steps.map((s, i) => [s.name, i]));
+    for (let i = 0; i < steps.length; i++) {
+      const step = steps[i];
+      if (step.rejectTarget) {
+        const targetIdx = nameToIndex.get(step.rejectTarget);
+        if (targetIdx !== undefined && targetIdx < i) {
+          arcs.push({ fromIndex: i, toIndex: targetIdx, maxLoops: step.rejectMaxLoops || 2 });
+        }
+      }
+    }
+    return arcs;
+  }
+
+  function nodeX(index: number): number {
+    return PAD_X + index * (NODE_W + GAP_X);
+  }
+
+  function arcY(arcIndex: number, totalArcs: number): number {
+    return PAD_TOP + (totalArcs - 1 - arcIndex) * 18;
+  }
+
+  // Status-based styling for task mode
+  function nodeStroke(stepName: string, defaultStroke: string): string {
+    if (!isTaskMode) return defaultStroke;
+    if (skippedSteps.includes(stepName)) return '#334155';
+    if (stepName === activeStepName) return '#0ea5e9';
+    const status = stepStatuses[stepName];
+    if (!status) return '#334155';
+    if (status === 'approved' || status === 'completed') return '#059669';
+    if (status === 'failed' || status === 'cancelled') return '#dc2626';
+    if (status === 'rejected' || status === 'revise') return '#d97706';
+    if (status === 'running' || status === 'evaluating') return '#0ea5e9';
+    if (status === 'paused') return '#eab308';
+    return defaultStroke;
+  }
+
+  function nodeStrokeWidth(stepName: string): string {
+    if (isTaskMode && stepName === activeStepName) return '2.5';
+    return '1.5';
+  }
+
+  function nodeFill(stepName: string, defaultFill: string): string {
+    if (!isTaskMode) return defaultFill;
+    if (skippedSteps.includes(stepName)) return '#0c0a0940';
+    const status = stepStatuses[stepName];
+    if (status === 'approved' || status === 'completed') return '#05966910';
+    if (status === 'failed' || status === 'cancelled') return '#dc262610';
+    return defaultFill;
+  }
+
+  function nodeOpacity(stepName: string): string {
+    if (isTaskMode && skippedSteps.includes(stepName)) return '0.4';
+    return '1';
+  }
+
+  let arcs = $derived(getRejectArcs(steps));
+  let arcHeadroom = $derived(arcs.length > 0 ? LOOP_ARC_Y + (arcs.length - 1) * 18 : 0);
+  let nodesY = $derived(PAD_TOP + arcHeadroom);
+  let svgW = $derived(Math.max(300, PAD_X * 2 + steps.length * NODE_W + (steps.length - 1) * GAP_X));
+  let svgH = $derived(nodesY + NODE_H + BADGE_ROW_H + 16);
+</script>
+
+{#if steps.length === 0}
+  <p class="text-sm text-slate-500">Add steps to see the pipeline diagram.</p>
+{:else}
+  <div class="overflow-x-auto rounded-xl">
+    <svg
+      viewBox="0 0 {svgW} {svgH}"
+      width={svgW}
+      height={svgH}
+      class="block"
+      xmlns="http://www.w3.org/2000/svg"
+    >
+      <defs>
+        <marker id="arrow" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+          <path d="M0,0 L8,3 L0,6" fill="#475569" />
+        </marker>
+        <marker id="arrow-amber" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+          <path d="M0,0 L8,3 L0,6" fill="#d97706" />
+        </marker>
+        <!-- Pulsing animation for active step -->
+        {#if isTaskMode}
+          <style>
+            @keyframes pulse-stroke {
+              0%, 100% { opacity: 1; }
+              50% { opacity: 0.5; }
+            }
+            .node-active { animation: pulse-stroke 2s ease-in-out infinite; }
+          </style>
+        {/if}
+      </defs>
+
+      <!-- Forward flow arrows -->
+      {#each steps as _, i}
+        {#if i < steps.length - 1}
+          <line
+            x1={nodeX(i) + NODE_W}
+            y1={nodesY + NODE_H / 2}
+            x2={nodeX(i + 1)}
+            y2={nodesY + NODE_H / 2}
+            stroke="#475569"
+            stroke-width="1.5"
+            marker-end="url(#arrow)"
+          />
+        {/if}
+      {/each}
+
+      <!-- Reject loop arcs -->
+      {#each arcs as arc, ai}
+        {@const fromCx = nodeX(arc.fromIndex) + NODE_W / 2}
+        {@const toCx = nodeX(arc.toIndex) + NODE_W / 2}
+        {@const topY = arcY(ai, arcs.length)}
+        <path
+          d="M {fromCx} {nodesY} C {fromCx} {topY}, {toCx} {topY}, {toCx} {nodesY}"
+          fill="none"
+          stroke="#d97706"
+          stroke-width="1.5"
+          stroke-dasharray="6 3"
+          marker-end="url(#arrow-amber)"
+        />
+        <text
+          x={(fromCx + toCx) / 2}
+          y={topY - 4}
+          text-anchor="middle"
+          class="fill-amber-500 text-[10px]"
+        >
+          reject (max {arc.maxLoops})
+        </text>
+      {/each}
+
+      <!-- Step nodes -->
+      {#each steps as step, i}
+        {@const x = nodeX(i)}
+        {@const y = nodesY}
+        {@const isGate = step.type === 'gate'}
+        {@const hasAgent = !!step.agentOverride}
+        {@const hasEval = step.evaluate && step.type === 'run'}
+        {@const hasQuestions = step.allowQuestions && interactionMode === 'step_requests'}
+        {@const isActive = isTaskMode && step.name === activeStepName}
+        {@const duration = stepDurations[step.name] ?? ''}
+
+        {#if isGate}
+          <!-- Gate: diamond shape -->
+          <g opacity={nodeOpacity(step.name)}>
+            <polygon
+              points="{x + NODE_W / 2},{y} {x + NODE_W},{y + NODE_H / 2} {x + NODE_W / 2},{y + NODE_H} {x},{y + NODE_H / 2}"
+              fill={nodeFill(step.name, '#1c1917')}
+              stroke={nodeStroke(step.name, '#d97706')}
+              stroke-width={nodeStrokeWidth(step.name)}
+              class={isActive ? 'node-active' : ''}
+            />
+            <text
+              x={x + NODE_W / 2}
+              y={y + NODE_H / 2 - 4}
+              text-anchor="middle"
+              dominant-baseline="central"
+              class="fill-amber-200 text-[12px] font-medium"
+            >
+              {step.name || `step_${i + 1}`}
+            </text>
+            <text
+              x={x + NODE_W / 2}
+              y={y + NODE_H / 2 + 12}
+              text-anchor="middle"
+              class="fill-amber-500/60 text-[9px] uppercase tracking-widest"
+            >
+              gate
+            </text>
+          </g>
+        {:else}
+          <!-- Run: rounded rectangle -->
+          <g opacity={nodeOpacity(step.name)}>
+            <rect
+              {x}
+              {y}
+              width={NODE_W}
+              height={NODE_H}
+              rx="12"
+              fill={nodeFill(step.name, '#0c0a09')}
+              stroke={isActive ? '#0ea5e9' : nodeStroke(step.name, hasAgent ? '#0ea5e9' : '#334155')}
+              stroke-width={nodeStrokeWidth(step.name)}
+              class={isActive ? 'node-active' : ''}
+            />
+            <text
+              x={x + NODE_W / 2}
+              y={y + (hasAgent ? NODE_H / 2 - 6 : NODE_H / 2)}
+              text-anchor="middle"
+              dominant-baseline="central"
+              class="fill-slate-100 text-[12px] font-medium"
+            >
+              {step.name || `step_${i + 1}`}
+            </text>
+            {#if hasAgent}
+              <text
+                x={x + NODE_W / 2}
+                y={y + NODE_H / 2 + 10}
+                text-anchor="middle"
+                class="fill-sky-400/70 text-[9px]"
+              >
+                {step.agentOverride}
+              </text>
+            {/if}
+          </g>
+        {/if}
+
+        <!-- Below-node row: badges (editor mode) or duration (task mode) -->
+        {#if isTaskMode && duration}
+          <text
+            x={x + NODE_W / 2}
+            y={y + NODE_H + 16}
+            text-anchor="middle"
+            class="fill-slate-400 text-[10px]"
+            opacity={nodeOpacity(step.name)}
+          >
+            {duration}
+          </text>
+        {:else if !isTaskMode}
+          {#if hasEval || hasQuestions}
+            {@const badges = [
+              ...(hasEval ? ['eval'] : []),
+              ...(hasQuestions ? ['ask'] : []),
+            ]}
+            {#each badges as badge, bi}
+              {@const bx = x + NODE_W / 2 - (badges.length * 18) + bi * 36}
+              <rect
+                x={bx}
+                y={y + NODE_H + 4}
+                width="32"
+                height="14"
+                rx="7"
+                fill={badge === 'eval' ? '#065f4620' : '#7c3aed20'}
+                stroke={badge === 'eval' ? '#065f46' : '#7c3aed'}
+                stroke-width="0.75"
+              />
+              <text
+                x={bx + 16}
+                y={y + NODE_H + 13}
+                text-anchor="middle"
+                class="text-[8px] {badge === 'eval' ? 'fill-emerald-400' : 'fill-violet-400'}"
+              >
+                {badge === 'eval' ? 'eval' : 'ask'}
+              </text>
+            {/each}
+          {/if}
+        {/if}
+
+        <!-- Input mode label on incoming arrow (editor mode only) -->
+        {#if !isTaskMode && i > 0 && step.inputMode && step.inputMode !== 'null' && step.inputMode !== 'auto'}
+          <text
+            x={nodeX(i) - GAP_X / 2}
+            y={nodesY + NODE_H / 2 - 8}
+            text-anchor="middle"
+            class="fill-slate-500 text-[9px]"
+          >
+            {step.inputMode === 'last' ? 'output' : step.inputMode}
+          </text>
+        {/if}
+      {/each}
+    </svg>
+  </div>
+{/if}

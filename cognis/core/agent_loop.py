@@ -23,6 +23,7 @@ from prometheus_client import Counter, Histogram
 
 from cognis.core.compaction import ROTATION_TOTAL
 from cognis.core.events import Event, EventBus, EventType
+from cognis.core.prompts import PromptContext
 from cognis.core.pruning import prune_tool_outputs
 from cognis.core.truncation import middle_truncate
 from cognis.logging import get_logger
@@ -1087,6 +1088,14 @@ class AgentLoop:
         # ---------------------------------------------------------------
         # Step 3: Assemble context (reads Intaris history + memory)
         # ---------------------------------------------------------------
+        # Derive prompt context from execution policy
+        if ctx.policy is WORKFLOW_POLICY:
+            _prompt_ctx = PromptContext.TASK_STEP
+        elif ctx.policy is DELEGATION_POLICY:
+            _prompt_ctx = PromptContext.DELEGATION
+        else:
+            _prompt_ctx = PromptContext.CHAT
+
         context_result = await self.context_assembler.assemble(
             session=ctx.session,
             conversation=ctx.conversation,
@@ -1095,6 +1104,7 @@ class AgentLoop:
             user_message_role="system" if ctx.system_initiated else "user",
             prior_context=ctx.prior_context,
             skip_memory=ctx.policy.skip_memory,
+            prompt_context=_prompt_ctx,
         )
         messages = context_result.messages
 

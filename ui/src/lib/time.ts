@@ -73,6 +73,32 @@ export function formatRelativeTime(value: string | null, now = new Date()): stri
   return relativeFormatter.format(diffYears, 'year');
 }
 
+/**
+ * Format a duration between two ISO timestamps as a human-readable string.
+ *
+ * Uses {@link normalizeDate} internally so SQLite timestamps without a
+ * timezone suffix are correctly interpreted as UTC.  When `endIso` is
+ * null/undefined the duration is computed against `nowMs` (defaults to
+ * `Date.now()`), which is useful for live-updating running durations.
+ */
+export function formatDuration(
+  startIso: string | null | undefined,
+  endIso: string | null | undefined,
+  nowMs: number = Date.now(),
+): string {
+  if (!startIso) return '';
+  const start = normalizeDate(startIso);
+  if (!start) return '';
+  const end = endIso ? normalizeDate(endIso) : null;
+  const endMs = end ? end.getTime() : nowMs;
+  const seconds = Math.max(0, Math.floor((endMs - start.getTime()) / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ${minutes % 60}m`;
+}
+
 /** Format as "20:34 · 3 min ago". Updates via the `now` parameter. */
 export function formatCompactTime(value: string | null, now = new Date()): string {
   const short = formatShortTime(value);

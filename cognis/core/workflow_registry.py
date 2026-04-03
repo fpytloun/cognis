@@ -57,7 +57,12 @@ RESEARCH_WORKFLOW = Workflow(
         StepDefinition(
             name="plan",
             type="run",
-            prompt="Create a research plan for this task. Identify key questions, sources, and methodology.",
+            prompt=(
+                "Create a research plan for this task. Identify:\n"
+                "- Key questions to answer\n"
+                "- Sources and methodology (web search, codebase, documentation)\n"
+                "- Expected deliverables and format"
+            ),
             input=StepInputConfig(type="null"),
             completion=CompletionConfig(evaluate=True, max_attempts=2),
         ),
@@ -65,15 +70,25 @@ RESEARCH_WORKFLOW = Workflow(
             name="research",
             type="run",
             agent_override="system:research",
-            prompt="Execute the research plan. Gather information from available sources.",
-            input=StepInputConfig(type="full", source="plan"),
+            prompt=(
+                "Execute the research plan. Gather information from available "
+                "sources. Cross-reference findings for accuracy. Note any gaps "
+                "or conflicting information."
+            ),
+            input=StepInputConfig(type="last", source="plan"),
             completion=CompletionConfig(evaluate=True, max_attempts=2),
         ),
         StepDefinition(
             name="synthesize",
             type="run",
-            prompt="Synthesize findings into a coherent report with key insights and recommendations.",
-            input=StepInputConfig(type="summary", source=["plan", "research"]),
+            prompt=(
+                "Synthesize the research findings into a coherent report with:\n"
+                "- Key findings and insights\n"
+                "- Areas of consensus and disagreement\n"
+                "- Actionable recommendations\n"
+                "- Gaps in available information"
+            ),
+            input=StepInputConfig(type="last", source=["plan", "research"]),
             completion=CompletionConfig(evaluate=True),
         ),
     ],
@@ -94,11 +109,13 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
             prompt=(
                 "Explore the codebase to understand the relevant areas. "
                 "Launch multiple explore sub-sessions in parallel to "
-                "efficiently understand different aspects of the codebase. "
-                "Then produce a detailed implementation plan covering: "
-                "files to create/modify (with rationale), specific changes "
-                "per file, edge cases and error handling, testing strategy, "
-                "migration or compatibility concerns."
+                "efficiently understand different aspects of the codebase.\n\n"
+                "Then produce a detailed implementation plan covering:\n"
+                "- Files to create/modify (with rationale)\n"
+                "- Specific changes per file\n"
+                "- Edge cases and error handling\n"
+                "- Testing strategy\n"
+                "- Migration or compatibility concerns"
             ),
             input=StepInputConfig(type="null"),
             completion=CompletionConfig(evaluate=True, max_attempts=2),
@@ -109,7 +126,7 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
             type="run",
             agent_override="system:architect",
             prompt="Review this implementation plan as an ARB reviewer.",
-            input=StepInputConfig(type="full", source="plan"),
+            input=StepInputConfig(type="last", source="plan"),
             completion=CompletionConfig(evaluate=True, max_attempts=3),
             on_reject=OnRejectConfig(
                 target="plan",
@@ -122,9 +139,10 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
             type="run",
             prompt=(
                 "Implement the approved plan. Follow the plan step by step. "
-                "After implementation, run relevant tests and linters."
+                "After implementation, run relevant tests and linters to "
+                "verify correctness."
             ),
-            input=StepInputConfig(type="summary", source=["plan", "architect_review"]),
+            input=StepInputConfig(type="last", source=["plan", "architect_review"]),
             completion=CompletionConfig(evaluate=True, max_attempts=3),
             # Primary agent — needs memory and full tool access
         ),
@@ -137,6 +155,7 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
                 "documents, configuration examples. If no documentation "
                 "updates are needed, explicitly note this."
             ),
+            input=StepInputConfig(type="last", source="implement"),
             completion=CompletionConfig(evaluate=False),
             # Primary agent — knows what changed
         ),
@@ -146,7 +165,7 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
             agent_override="system:code-review",
             prompt="Review all changes made during implementation.",
             input=StepInputConfig(
-                type="summary",
+                type="last",
                 source=["plan", "implement", "update_docs"],
             ),
             completion=CompletionConfig(evaluate=True, max_attempts=3),

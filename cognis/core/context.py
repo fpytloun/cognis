@@ -16,6 +16,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from cognis.core.prompts import PromptContext, build_system_instructions
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.session import ConversationModel, SessionModel
@@ -147,6 +148,7 @@ class ContextAssembler:
         prior_context: list[dict[str, Any]] | None = None,
         skip_user_message: bool = False,
         skip_memory: bool = False,
+        prompt_context: PromptContext = PromptContext.CHAT,
     ) -> ContextAssemblyResult:
         """Build the LLM message list for a single turn.
 
@@ -156,6 +158,9 @@ class ContextAssembler:
 
         ``skip_memory`` skips Mnemory recall and memory instructions.
         Used for secondary agents that don't have memory integration.
+
+        ``prompt_context`` selects which system instructions to inject
+        (chat routing, step execution, or delegation focus).
         """
 
         logger.debug(
@@ -175,6 +180,7 @@ class ContextAssembler:
                 active_delegations=active_delegations,
                 prior_context=prior_context,
                 skip_user_message=skip_user_message,
+                prompt_context=prompt_context,
             )
 
         cached_intention = self.session_cache.get_intention(session.session_id)
@@ -355,11 +361,16 @@ class ContextAssembler:
         # ----- Build messages: immutable prefix first, then mutable suffix -----
         messages: list[dict[str, Any]] = []
 
-        # Immutable prefix block 1: system prompt
+        # Immutable prefix block 1: agent identity prompt (user-editable)
         if agent.system_prompt:
             messages.append({"role": "system", "content": agent.system_prompt})
 
-        # Immutable prefix block 2: environment info (home dir, cwd, platform)
+        # Immutable prefix block 2: system instructions (context-dependent, not editable)
+        system_instructions = build_system_instructions(prompt_context, agent_id=agent.agent_id)
+        if system_instructions:
+            messages.append({"role": "system", "content": system_instructions})
+
+        # Immutable prefix block 3: environment info (home dir, cwd, platform)
         messages.append({"role": "system", "content": _build_environment_info()})
 
         # Immutable prefix block 3: memory instructions (behavioral guidance)
@@ -500,12 +511,13 @@ class ContextAssembler:
         active_delegations: list[dict[str, Any]] | None = None,
         prior_context: list[dict[str, Any]] | None = None,
         skip_user_message: bool = False,
+        prompt_context: PromptContext = PromptContext.TASK_STEP,
     ) -> ContextAssemblyResult:
         """Assemble context without Mnemory calls — for secondary agents.
 
         Skips: Mnemory recall, memory instructions, core memories,
         recalled memories, intention fetch. Keeps: system prompt,
-        compaction summary, history, prior step context.
+        system instructions, compaction summary, history, prior step context.
         """
         degraded_sources: list[str] = []
 
@@ -545,11 +557,16 @@ class ContextAssembler:
         dynamic_tokens = max(0, max_context_tokens - static_tokens - reserve_output_tokens)
         max_prompt_tokens = max(0, max_context_tokens - reserve_output_tokens)
 
-        # Build messages: system prompt + compaction + history + prior context
+        # Build messages: identity + system instructions + env + compaction + history
         messages: list[dict[str, Any]] = []
 
         if agent.system_prompt:
             messages.append({"role": "system", "content": agent.system_prompt})
+
+        # System instructions (context-dependent, not editable)
+        system_instructions = build_system_instructions(prompt_context, agent_id=agent.agent_id)
+        if system_instructions:
+            messages.append({"role": "system", "content": system_instructions})
 
         # Environment info (same as primary assembly)
         messages.append({"role": "system", "content": _build_environment_info()})
