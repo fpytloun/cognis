@@ -82,6 +82,36 @@ messages through `TurnScheduler.submit_turn()`. Channel accounts should default
 to the `pairing` policy so an unknown remote sender must first redeem a
 short-lived verification code in the Cognis UI before a turn is submitted.
 
+Webhook adapters are already naturally stateless on the controller side.
+
+Deployment model:
+
+- **Controller-hosted adapters** remain the default for cloud APIs and webhook
+  platforms.
+- **Executor-hosted adapters** are the target design for channels that need
+  user-local services or reachability, such as Signal backed by `signal-cli`.
+- **Long-lived controller-hosted adapters** will need DB-based lease ownership
+  in multi-controller deployments so only one replica owns each live polling
+  loop at a time.
+
+Planned executor-hosted flow:
+
+```text
+external platform/service
+        |
+        v
+executor-hosted channel adapter
+        |
+        v   channel.message
+controller inbound pipeline -> TurnScheduler -> agent loop
+        |
+        v   channel.send
+executor-hosted channel adapter -> external platform/service
+```
+
+The executor reuses the exact same adapter implementation as the controller.
+There is no separate thin proxy channel runtime.
+
 ### Agent Loop Engine
 
 Runs agent conversation loops. Can run N loops concurrently (main chat +

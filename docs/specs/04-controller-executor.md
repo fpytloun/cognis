@@ -27,21 +27,26 @@ local models (e.g., ollama on a Mac Studio).
 │  │ Record events     │     └────────────────────┬─────────┘  │
 │  └──────────────────┘                           │            │
 │                                                  │            │
-└──────────────────────────────────────────────────┼────────────┘
-                                                   │
-                                    WebSocket + JSON-RPC
-                                                   │
-                              ┌─────────────────────┼──────────────┐
-                              │                     │              │
-                       ┌──────▼──────┐  ┌───────────▼──┐  ┌───────▼─────┐
-                       │ InProcess   │  │   Docker     │  │ Kubernetes  │
-                       │ Executor    │  │  Executor    │  │  Executor   │
-                       │ (MVP)       │  │  (Phase 2)   │  │  (Phase 2)  │
-                       │             │  │              │  │             │
-                        │ Native tools│  │ Native tools │  │ Native tools│
-                        │ + MCP       │  │ + MCP        │  │ + MCP       │
-                        │ + opt. LLM  │  │ + opt. LLM   │  │ + opt. LLM  │
-                       └─────────────┘  └──────────────┘  └─────────────┘
+│  Inference Router (for location="executor" providers)        │
+│  ┌──────────────────────────────────────────────────────┐    │
+│  │ Resolve provider → match executor by labels → proxy  │    │
+│  └──────────────────────────────────────┬───────────────┘    │
+└──────────────────────────────────────────┼────────────────────┘
+                                           │
+                            WebSocket + JSON-RPC 2.0
+                            (permessage-deflate, JWT auth)
+                                           │
+              ┌────────────────────────────┼────────────────────┐
+              │                            │                    │
+       ┌──────▼──────┐  ┌─────────────────▼──┐  ┌──────────────▼──┐
+       │ InProcess   │  │  WebSocket (Remote) │  │  Subprocess     │
+       │ Executor    │  │  Executor           │  │  Executor       │
+       │             │  │                     │  │                 │
+       │ Native tools│  │  Native tools       │  │  Native tools   │
+       │ + MCP       │  │  + MCP              │  │  + MCP          │
+       │             │  │  + LLM proxy        │  │  + LLM proxy    │
+       └─────────────┘  └─────────────────────┘  └─────────────────┘
+                         (any machine, wss://)    (local subprocess)
 ```
 
 ## Executor Provider Interface
@@ -70,25 +75,33 @@ class ExecutorProvider(Protocol):
         """Clean up stale executors."""
         ...
 
+    async def health(self) -> ProviderHealth:
+        """Report provider health status."""
+        ...
+
 
 class ExecutorHandle(BaseModel):
     executor_id: str
-    executor_type: str             # "in_process", "subprocess", "docker", "kubernetes"
+    executor_type: str             # "in_process", "subprocess", "websocket"
     started_at: datetime
     capabilities: ExecutorCapabilities
+    status: str = "ready"          # "pending", "ready", "disconnected"
     metadata: dict[str, Any] = {}
 
 
 class ExecutorCapabilities(BaseModel):
     tools: list[str]               # Available tool names
-    inference: bool = False        # Can run LLM inference
-    inference_models: list[str] = []  # Available models
-    inference_type: str | None = None  # "openai_compatible" | "custom"
+    inference: bool = False        # Can proxy LLM inference
+    inference_models: list[str] = []  # Available models (informational)
+    inference_type: str | None = None  # "litellm_proxy"
 ```
 
 ## Executor Configuration
 
-Everything the executor needs:
+The executor is a **stateless remote hand** — it only needs a controller URL
+and a JWT token to start.  All tool, MCP, and inference configuration is
+managed on the controller side (DB + UI) and pushed to the executor via the
+``executor.configure`` message after authentication.
 
 ```python
 class ExecutorConfig(BaseModel):
@@ -96,39 +109,27 @@ class ExecutorConfig(BaseModel):
 
     executor_id: str
 
-    # Tools
-    tools: list[ToolDefinition]         # Available tool definitions
-    mcp_servers: list[MCPServerConfig]  # Local MCP server configs
-    secrets: dict[str, str]             # For MCP servers (already decrypted)
+    # Tools (populated by controller via executor.configure)
+    tools: list[ToolDefinition] = []
+    mcp_servers: list[MCPServerConfig] = []
+    secrets: dict[str, str] = {}
 
-    # Optional: LLM inference capability
-    inference: InferenceConfig | None
-
-    # Connection to controller
-    controller_url: str                  # WebSocket URL
-    controller_token: str                # Auth token for controller
+    # Connection to controller (only needed for remote/subprocess executors)
+    controller_url: str | None = None    # WebSocket URL
+    controller_token: str | None = None  # JWT auth token
 
     # Resource limits
-    resource_limits: ResourceLimits | None
+    resource_limits: ResourceLimits | None = None
 
-
-class InferenceConfig(BaseModel):
-    """Executor-side LLM inference. General-purpose, not just ollama."""
-
-    type: str = "openai_compatible"
-    # "openai_compatible" — any endpoint speaking OpenAI API format
-    #   (ollama, vllm, llama.cpp, LiteLLM proxy, self-hosted, any cloud)
-    # "custom" — executor handles LLM internally (Claude Code, Opencode, etc.)
-
-    # For openai_compatible:
-    endpoint: str | None = None       # e.g., "http://localhost:11434/v1"
-    api_key_secret: str | None = None # Secret name (resolved from SecretsProvider)
-    default_model: str | None = None
-    models: list[str] = []
-    provider_hint: str | None = None  # LiteLLM provider hint (e.g., "ollama")
-
-    # For custom: no endpoint — the executor implementation handles LLM internally
+    # Internal routing metadata
+    metadata: dict[str, Any] = {}        # e.g. {"executor_type": "websocket"}
 ```
+
+Note: ``InferenceConfig`` is no longer used by the executor.  LLM inference
+configuration lives on the ``LLMProviderConfig`` (see 05-integrations.md).
+When a provider has ``location="executor"``, the controller sends the fully
+resolved model string and LiteLLM kwargs in each ``llm.complete`` call.  The
+executor runs ``litellm.acompletion()`` locally as a transparent proxy.
 
 ### Secret Lifecycle
 
@@ -139,9 +140,10 @@ SecretsProvider). The executor never contacts the secrets store directly.
 | Executor Type | Secret Delivery | Secret Lifetime | Cleanup |
 |---------------|----------------|-----------------|---------|
 | **In-process** | In-memory dict | Cleared on executor cleanup | Controller calls `cleanup()` |
-| **Subprocess** | Environment variables or stdin config | Process lifetime | Secrets die with the process on exit |
-| **Docker** | Environment variables | Container lifetime | Container destroyed after work; secrets not persisted to image |
-| **Kubernetes** | K8s Secrets or environment | Pod lifetime | Pod terminated after work |
+| **Subprocess** | JWT token via stdin (never CLI args) | Process lifetime | Secrets die with the process on exit |
+| **WebSocket (remote)** | Via encrypted WS after auth (executor.configure) | Connection lifetime | Cleared on disconnect |
+| **Docker** (planned) | Environment variables | Container lifetime | Container destroyed after work |
+| **Kubernetes** (planned) | K8s Secrets or environment | Pod lifetime | Pod terminated after work |
 
 Rules:
 - **No secret persistence on executor side.** Executors must not write
@@ -165,17 +167,39 @@ Bidirectional JSON-RPC 2.0 over WebSocket between controller and executor.
 ### Connection Lifecycle
 
 ```
-1. Controller spawns executor (process/container/pod)
-2. Executor connects to controller via WebSocket
-3. Executor sends executor.ready with capabilities
-4. Controller dispatches tool calls as needed
-5. Executor returns results
-6. On shutdown: executor.cancel or graceful disconnect
+1. Admin creates executor in UI (name, type, labels, enabled tools)
+2. Admin generates a JWT token (POST /api/v1/executors/{id}/token)
+3. Executor process starts: cognis executor run --controller-url wss://... --token <jwt>
+4. Executor connects to WS /api/executor/ws (permessage-deflate)
+5. Executor sends executor.ready with JWT token + platform info
+6. Controller validates JWT (aud=cognis-executor, sub=executor_id)
+7. Controller looks up executor config from DB
+8. Controller sends executor.configure with enabled tools/groups
+9. Executor initializes tool handlers, responds with capabilities
+10. Controller marks executor as ready
+11. Controller dispatches tool.execute / llm.complete as needed
+12. Executor sends executor.heartbeat every 15 seconds
+13. On shutdown: executor.cancel or graceful disconnect
 ```
+
+For subprocess executors, steps 1-3 are automated: the controller spawns
+``python -m cognis.executor`` with a short-lived JWT (5 min) piped via stdin.
 
 ### Controller → Executor
 
 ```python
+# Push configuration after authentication (mandatory before tool.execute)
+"executor.configure" → {
+    "enabled_tools": list[str],       # Tool names or ["*"]
+    "enabled_tool_groups": list[str], # Tool categories
+    "config": dict                    # Type-specific config from DB
+}
+# → {"status": "configured", "capabilities": {...}, "config_keys": [...]}
+
+# List available tools on the executor
+"tool.list" → {}
+# → {"tools": [ToolDefinition, ...]}
+
 # Execute a tool call
 "tool.execute" → {
     "call_id": str,
@@ -190,17 +214,17 @@ Bidirectional JSON-RPC 2.0 over WebSocket between controller and executor.
     "call_id": str
 }
 
-# LLM completion (only for inference-capable executors)
+# LLM completion — proxy through executor's local LiteLLM
+# The controller resolves the provider, model prefix, and credentials,
+# then sends the fully resolved call for the executor to proxy.
 "llm.complete" → {
     "request_id": str,
     "messages": list[dict],
-    "model": str,
-    "tools": list[dict] | None,
-    "temperature": float,
-    "max_tokens": int,
-    "stream": bool
+    "model": str,                     # Prefixed model string (e.g. "ollama/llama3.2")
+    "request_kwargs": dict            # All LiteLLM kwargs (api_key, api_base, etc.)
 }
-# If stream=true, executor sends llm.chunk notifications, then llm.done
+# Executor acknowledges with {"status": "streaming"}, then sends
+# llm.chunk notifications, then llm.done.
 
 # Shut down executor
 "executor.cancel" → {
@@ -211,16 +235,18 @@ Bidirectional JSON-RPC 2.0 over WebSocket between controller and executor.
 ### Executor → Controller
 
 ```python
-# Registration on connect
+# Authentication on connect (first message, before any other exchange)
 "executor.ready" → {
-    "executor_id": str,
-    "capabilities": {
-        "tools": list[str],        # Available tool names
-        "inference": bool,
-        "inference_models": list[str]
+    "token": str,                  # JWT (aud=cognis-executor, sub=executor_id)
+    "platform": {
+        "os": str,                 # e.g. "darwin", "linux"
+        "arch": str,               # e.g. "arm64", "x86_64"
+        "python": str              # e.g. "3.12.4"
     }
 }
-# → {"status": "registered"}
+# Controller validates JWT, looks up executor in DB, then sends
+# executor.configure.  After configuration, controller responds:
+# → {"status": "registered", "executor_id": str}
 
 # Tool execution result (response to tool.execute)
 # Returned as JSON-RPC response to the tool.execute request
@@ -231,27 +257,107 @@ Bidirectional JSON-RPC 2.0 over WebSocket between controller and executor.
     "output_chunk": str
 }
 
-# LLM streaming chunk (for local inference)
+# LLM streaming chunk (proxied inference)
 "llm.chunk" → {
     "request_id": str,
     "content": str | None,
     "tool_calls": list[dict] | None,
+    "reasoning_content": str | None,  # Extended thinking / reasoning tokens
     "index": int
 }
 
-# LLM completion done (for local inference)
+# LLM completion done (proxied inference)
 "llm.done" → {
     "request_id": str,
     "usage": {"prompt_tokens": int, "completion_tokens": int},
-    "finish_reason": str
+    "finish_reason": str,
+    "error": str | None            # Non-null on inference failure
 }
 
-# Heartbeat
+# Heartbeat (every 15 seconds)
 "executor.heartbeat" → {
-    "uptime_seconds": float,
-    "active_calls": int
+    "uptime_seconds": int,
+    "active_calls": int,
+    "configured": bool             # False until executor.configure processed
 }
 ```
+
+### Planned: Channel Adapter Routing via Executor
+
+For adapters that depend on software or network access local to the user's
+machine (for example Signal via `signal-cli`, IRC connections, or homeserver-
+local Matrix access), the executor is the natural remote hand. The controller
+remains stateless and orchestration-only; the executor reuses the same
+`cognis.channels.adapters.*` code and hosts the platform connection locally.
+
+This is the target architecture and is documented here before implementation.
+
+#### Location Model
+
+- **`controller`** (default): adapter runs on the controller process. Best for
+  webhook-driven or cloud-hosted APIs such as WhatsApp, Slack HTTP events,
+  Google Chat, and simple Telegram polling.
+- **`executor`**: adapter runs on a connected executor selected by the
+  controller. Best for adapters that need user-local services or network
+  reachability, such as Signal backed by a user-managed `signal-cli` instance.
+
+The intended per-account configuration is:
+
+```python
+channel_account = {
+    "adapter_location": "controller",  # or "executor"
+    "executor_id": None,  # optional preferred executor ID
+}
+```
+
+#### Planned JSON-RPC Methods
+
+```python
+# Controller → Executor
+"channel.start" → {
+    "account_id": str,
+    "channel_type": str,
+    "config": dict,
+    "credentials": dict,
+}
+
+"channel.stop" → {
+    "account_id": str,
+}
+
+"channel.send" → {
+    "account_id": str,
+    "message": dict,
+}
+
+# Executor → Controller (notifications)
+"channel.message" → {
+    "account_id": str,
+    "message": dict,
+}
+
+"channel.status" → {
+    "account_id": str,
+    "status": dict,
+}
+```
+
+#### Signal Example
+
+```text
+1. User runs Cognis controller in the cloud.
+2. User runs Cognis executor on a machine they control.
+3. User runs signal-cli REST API on that executor machine.
+4. Channel account is configured with adapter_location="executor".
+5. Controller sends channel.start to the executor.
+6. Executor starts the Signal adapter locally and talks to signal-cli.
+7. Inbound Signal messages flow back to controller via channel.message.
+8. Controller orchestrates the turn and sends outbound replies via channel.send.
+```
+
+This keeps the controller free of platform-side connection state while
+allowing stateful platform-side services to live next to the executor
+controlled by the user.
 
 ### Error Handling
 
@@ -372,16 +478,27 @@ Native tools include: `read`, `write`, `edit`, `patch`, `multiedit`,
 
 ### Subprocess Executor
 
-Runs as a separate Python process on the same machine:
+Runs as a separate Python process on the same machine.  The controller
+generates a short-lived JWT (5 min) and pipes it via stdin — the token
+never appears in CLI arguments or the process listing.
 
 ```python
-class SubprocessExecutor(ExecutorProvider):
+class SubprocessExecutorProvider(ExecutorProvider):
     async def spawn(self, config: ExecutorConfig) -> ExecutorHandle:
+        token = self._auth_provider.sign_executor_token(
+            config.executor_id, ttl_seconds=300
+        )
         process = await asyncio.create_subprocess_exec(
             sys.executable, "-m", "cognis.executor",
-            "--config-json", config.model_dump_json(),
-            "--controller-url", config.controller_url,
+            "--controller-url", f"ws://localhost:{port}/api/executor/ws",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
         )
+        # Token via stdin (never CLI args)
+        process.stdin.write(token.encode())
+        process.stdin.close()
+        # Delegates to WebSocketExecutorProvider for connection lifecycle
         ...
 ```
 
@@ -431,36 +548,79 @@ Agents specify `execution.node_selector` to match pools.
 ## Executor-Side LLM Inference
 
 Executor-side LLM is a **first-class, general-purpose capability** — not an
-edge case. The LLM Router (in the controller) detects when an agent's
-provider has `location: "executor"` and routes `llm.complete` calls to a
-matching executor via WebSocket JSON-RPC.
+edge case.  LLM providers are configured normally in the controller (same UI,
+same DB table), just with ``location: "executor"`` to route inference through
+a matching remote executor instead of calling the API directly from the
+controller.
+
+The executor is a **transparent LiteLLM proxy**.  It receives the fully
+resolved model string (e.g. ``ollama/llama3.2``) and all LiteLLM kwargs
+(``api_key``, ``api_base``, ``temperature``, etc.) in each ``llm.complete``
+call and runs ``litellm.acompletion()`` locally.  This means the executor
+supports **any provider LiteLLM supports** — not just OpenAI-compatible HTTP
+endpoints.
 
 Covers:
-- **Local models**: ollama, vllm, llama.cpp
+- **Local models**: ollama, vllm, llama.cpp (via LiteLLM's provider prefixes)
+- **Cloud providers from a different network**: OpenAI, Anthropic, etc. routed
+  through an executor for network locality or compliance
 - **Self-hosted proxies**: LiteLLM proxy, OpenRouter on local network
-- **Custom executors**: Claude Code (with user's Claude subscription),
-  Opencode, or any custom implementation that handles LLM internally
-- **Network-optimized**: executor co-located with LLM provider
-- **Air-gapped**: no cloud access from controller
+- **Air-gapped**: no cloud access from controller, executor has the network path
 
 ```
 Controller-side provider (default):
-  LLM Router → LiteLLM / direct SDK → Cloud Provider
+  LiteLLMProvider → litellm.acompletion() → Cloud Provider
 
-Executor-side provider (openai_compatible):
-  LLM Router → Executor (llm.complete via WS) → local endpoint (ollama, etc.)
-
-Executor-side provider (custom):
-  LLM Router → Executor (llm.complete via WS) → executor's internal LLM
+Executor-side provider (location="executor"):
+  LiteLLMProvider → InferenceRouter → executor (llm.complete via WS)
+    → executor runs litellm.acompletion() locally → any provider
 ```
 
-The controller still handles memory injection and guardrails evaluation. The
-executor just runs the LLM inference. The agent loop is identical regardless
-of where inference happens.
+The controller still handles memory injection, guardrails evaluation, and
+context assembly.  The executor just proxies the LLM call.  The agent loop
+is identical regardless of where inference happens.
 
 Executor-provided models are available to **all Cognis tasks**, not just the
-agent that declared them. Internal tasks (compaction, classification) can use
-executor-hosted models via the LLM Router's model routing policy.
+agent that declared them.  Internal tasks (compaction, classification) can use
+executor-hosted models via the model routing policy.
+
+### LLM Provider Configuration for Executor Routing
+
+An LLM provider with ``location: "executor"`` is configured identically to a
+controller-side provider, plus ``executor_labels`` for matching:
+
+```python
+# Example: route OpenAI calls through a local executor
+LLMProviderConfig(
+    provider_id="local-openai",
+    display_name="OpenAI via Local Executor",
+    location="executor",              # Route through executor
+    backend="litellm",
+    litellm_provider="openai",
+    api_key_secret="OPENAI_API_KEY",
+    executor_labels={"location": "local"},  # Match executor by labels
+    default_model="gpt-4o-mini",
+    models=[ModelInfo(model_id="gpt-4o-mini"), ModelInfo(model_id="gpt-4o")],
+)
+
+# Example: local ollama on a Mac Studio
+LLMProviderConfig(
+    provider_id="local-ollama",
+    display_name="Local Ollama",
+    location="executor",
+    backend="litellm",
+    litellm_provider="ollama",
+    executor_labels={"location": "local"},
+    default_model="llama3.2",
+    models=[ModelInfo(model_id="llama3.2")],
+)
+```
+
+The ``InferenceRouter`` in the controller finds a connected executor whose
+labels match ``executor_labels``, then sends ``llm.complete`` with the
+resolved model prefix and all LiteLLM kwargs.  The executor calls
+``litellm.acompletion(model="ollama/llama3.2", ...)`` and streams chunks
+back.
 
 ### Deployment: Cloud Controller + Local Executor
 
@@ -547,14 +707,24 @@ implements the JSON-RPC protocol for `tool.execute` (and optionally
 ```
 Phase 1 (MVP):
   Single controller, in-process executor
-  All in one Python process
+  + remote WebSocket executors, subprocess executors
+  + executor-side LLM inference via LiteLLM proxy
 
 Phase 2:
-  Controller + subprocess/Docker/K8s executors
+  Docker/K8s executors
   Multiple executor pools with label selectors
+  Channel adapters may run on executors for user-local services
 
 Phase 3:
   Multiple controller instances (sticky WebSocket sessions)
   Decompose: cognis-api, cognis-orchestrator, cognis-inference
   Each component scales independently
 ```
+
+For channel adapters in multi-controller deployments, the intended model is:
+
+- **Webhook channels** stay effectively stateless on the controller side.
+- **Long-lived controller-hosted adapters** will require DB-based lease
+  ownership so only one controller replica polls a given account.
+- **Executor-hosted adapters** do not need controller-side leader election;
+  the selected executor owns the live platform connection.

@@ -757,32 +757,38 @@ class OAuthProviderConfig(BaseModel):
 
 ### LLM Router
 
-The `LLMRouter` is the unified entry point for all LLM calls — agent loops,
-system tasks (compaction, classification), and future ecosystem proxy:
+The `LiteLLMProvider` is the unified entry point for all LLM calls — agent
+loops, system tasks (compaction, classification), and future ecosystem proxy.
+It resolves the model, finds the provider, and routes based on `location`:
 
 ```python
-class LLMRouter:
+class LiteLLMProvider:
     """Routes LLM calls to the appropriate backend."""
 
-    async def complete(self, messages, model=None, task_type="default",
-                       agent=None, session=None, **kwargs):
-        # 1. Resolve model from: explicit → agent config → routing policy → default
-        resolved_model = self._resolve_model(task_type, agent, model)
+    async def stream_generate(self, messages, model=None, task_type="default", **kwargs):
+        # 1. Resolve model from: explicit → routing policy → default provider
+        resolved_model, provider = await self._resolve_model_target(model, task_type)
 
-        # 2. Find provider hosting this model
-        provider = self._find_provider(resolved_model)
+        # 2. Apply provider prefix and resolve credentials
+        prefixed_model = self._apply_model_prefix(resolved_model, provider)
+        request_kwargs = await self._resolve_provider_kwargs(provider)
 
-        # 3. Route based on backend
-        match provider.backend:
-            case "litellm":
-                return await self._call_litellm(provider, resolved_model, messages, **kwargs)
-            case "direct":
-                return await self._call_direct_sdk(provider, resolved_model, messages, **kwargs)
-            case "passthrough":
-                return await self._call_passthrough(provider, resolved_model, messages, **kwargs)
-            case "executor":
-                executor = self._get_executor_for_provider(provider)
-                return await executor.llm_complete(messages, model=resolved_model, **kwargs)
+        # 3. Route based on location
+        if provider.location == "executor":
+            # Route through matching remote executor (LiteLLM proxy)
+            async for chunk in self._inference_router.route_stream(
+                messages=messages, model=prefixed_model,
+                executor_labels=provider.config.get("executor_labels"),
+                request_kwargs=request_kwargs,
+            ):
+                yield chunk
+        else:
+            # Run locally via litellm.acompletion()
+            async for chunk in litellm.acompletion(
+                model=prefixed_model, messages=messages,
+                stream=True, **request_kwargs,
+            ):
+                yield chunk
 ```
 
 ### Model Routing Policy
@@ -802,29 +808,25 @@ Agents can override this per-agent in their `AgentLLMConfig.model_routing`.
 
 ### Backend Implementations
 
+The current implementation uses `LiteLLMProvider` as the single backend,
+with `location` controlling where inference runs:
+
 ```python
-# LiteLLM backend — cloud multi-provider abstraction
-class LiteLLMBackend(LLMProvider):
-    """Uses LiteLLM library. Default for cloud providers."""
-    # Multi-provider, cost tracking, fallbacks, retry
-    ...
+# Controller-side (location="controller") — default
+#   LiteLLMProvider calls litellm.acompletion() directly.
+#   Supports all LiteLLM providers: openai, anthropic, azure, etc.
 
-# Direct SDK backend — for provider-specific features
-class DirectBackend(LLMProvider):
-    """Uses native provider SDK (anthropic, openai packages)."""
-    # Anthropic prompt caching, extended thinking, etc.
-    ...
+# Executor-side (location="executor")
+#   LiteLLMProvider delegates to InferenceRouter, which finds a matching
+#   executor by executor_labels and sends llm.complete over WebSocket.
+#   The executor runs litellm.acompletion() locally as a transparent proxy.
+#   Supports any LiteLLM provider — the executor just needs network access.
 
-# Passthrough backend — simple HTTP, no LiteLLM overhead
-class PassthroughBackend(LLMProvider):
-    """Simple HTTP POST to any OpenAI-compatible endpoint."""
-    # For local ollama, vllm, self-hosted LiteLLM proxy
-    ...
-
-# Executor backend — routes to inference-capable executor
-class ExecutorBackend(LLMProvider):
-    """Routes llm.complete to executor via WebSocket JSON-RPC."""
-    # For executor-side inference (local models, custom executors)
+class InferenceRouter:
+    """Routes LLM calls to matching remote executors."""
+    # Finds executor by label match
+    # Sends prefixed model + resolved kwargs per call
+    # Streams llm.chunk / llm.done back to the agent loop
     ...
 ```
 
@@ -870,13 +872,13 @@ llm_providers:
         supports_prompt_caching: true
         supports_extended_thinking: true
 
-  # Local ollama — passthrough, no LiteLLM overhead
+  # Local ollama — routed through a remote executor running LiteLLM proxy
   - provider_id: "local-ollama"
     display_name: "Local Ollama"
     location: executor
-    backend: passthrough
-    api_base: "http://localhost:11434/v1"
-    executor_labels: {"cognis.io/inference": "true"}
+    backend: litellm
+    litellm_provider: ollama
+    executor_labels: {"location": "local"}
     default_model: "llama3.3"
     models:
       - model_id: "llama3.3"

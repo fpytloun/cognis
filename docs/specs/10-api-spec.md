@@ -257,10 +257,18 @@ POST   /api/v1/skills/:id/export             → Export skill as YAML
 POST   /api/v1/skills/import                  → Import skill from YAML
 ```
 
-### Executor
+### Executors
 
 ```
-GET    /api/v1/executor/status                → Executor status and capabilities
+GET    /api/v1/executors                       → List executor configurations
+GET    /api/v1/executors/:id                   → Get executor configuration
+POST   /api/v1/executors                       → Create executor configuration
+PUT    /api/v1/executors/:id                   → Update executor configuration
+DELETE /api/v1/executors/:id                   → Delete executor configuration
+POST   /api/v1/executors/:id/default           → Set as default executor
+POST   /api/v1/executors/:id/token             → Generate executor JWT (admin only)
+GET    /api/v1/executor/status                 → Executor status and capabilities
+GET    /api/v1/tools/executor                  → List executor-native tool definitions
 ```
 
 ### Secrets

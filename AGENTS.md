@@ -37,6 +37,8 @@ cognis/
 │   │   │   ├── escalations.py
 │   │   │   └── system.py           # Health, metrics, JWKS
 │   │   ├── websocket.py            # WebSocket transport layer (thin adapter)
+│   │   ├── executor_ws.py          # Executor WebSocket endpoint (auth + configure)
+│   │   ├── runtime_support.py      # Step runtime factory (executor resolution)
 │   │   ├── middleware.py           # Auth (JWT + API key), rate limiting
 │   │   └── models.py              # API request/response Pydantic models
 │   │
@@ -55,14 +57,26 @@ cognis/
 │   │   ├── context.py             # Context assembly (parallel external fetches)
 │   │   ├── events.py              # Event Bus + hooks
 │   │   ├── remember_queue.py      # Bounded retry queue for Mnemory remember
-│   │   └── agent_registry.py      # System agent definitions + registry
+│   │   ├── agent_registry.py      # System agent definitions + registry
+│   │   └── executor_resolution.py # Executor selection (labels, defaults, tool enablement)
 │   │
 │   ├── models/                     # Domain models (Pydantic)
 │   │   ├── agent.py
+│   │   ├── channel.py
 │   │   ├── session.py
 │   │   ├── tool.py
 │   │   ├── delegation.py
 │   │   └── config.py              # LLMProviderConfig, ModelRoutingPolicy, etc.
+│   │
+│   ├── channels/                   # External messaging adapters + pairing
+│   │   ├── protocol.py            # ChannelAdapter protocol + base adapter
+│   │   ├── manager.py             # Channel lifecycle + adapter orchestration
+│   │   ├── inbound.py             # Channel -> TurnScheduler pipeline
+│   │   ├── delivery.py            # EventBus -> channel delivery
+│   │   ├── pairing.py             # Sender-initiated remote verification flow
+│   │   ├── formatting.py          # Message splitting + markdown stripping
+│   │   ├── registry.py            # Channel metadata for setup UI
+│   │   └── adapters/              # Signal/Slack/etc. concrete adapters
 │   │
 │   ├── providers/                  # Provider interfaces + implementations
 │   │   ├── base.py                 # Protocol definitions (all 6 providers)
@@ -80,8 +94,8 @@ cognis/
 │   │   │   ├── websocket.py       # WebSocket remote executor connection + provider
 │   │   │   ├── subprocess.py      # Local subprocess executor (spawns process)
 │   │   │   ├── composite.py       # Composite provider (routes by executor_type)
-│   │   │   ├── docker.py          # Phase 2
-│   │   │   └── kubernetes.py      # Phase 2
+│   │   │   ├── docker.py          # Phase 2 (planned, not yet created)
+│   │   │   └── kubernetes.py      # Phase 2 (planned, not yet created)
 │   │   ├── secrets/
 │   │   │   ├── protocol.py
 │   │   │   └── encrypted_db.py    # AES-256-GCM encrypted secrets
@@ -125,7 +139,7 @@ cognis/
 │   │   ├── __init__.py
 │   │   ├── __main__.py            # Entry point (python -m cognis.executor)
 │   │   ├── runner.py              # ExecutorRunner (WS client, tool dispatch, heartbeat)
-│   │   └── inference.py           # InferenceHandler (local LLM proxy)
+│   │   └── inference.py           # InferenceHandler (LiteLLM proxy for controller-routed calls)
 │   │
 │   └── cli/                        # Typer CLI commands
 │       ├── __init__.py
@@ -154,7 +168,10 @@ cognis/
 | **Remember Queue** | `core/remember_queue.py` | Bounded async retry queue for failed Mnemory remember() calls |
 | **Notification Service** | `core/notifications.py` | Unified lifecycle for escalations, gates, and step questions. DB-persistent, PauseWaiter-backed. |
 | **Agent Registry** | `core/agent_registry.py` | System agent definitions (Python constants) + registry merging system and DB agents |
+| **Executor Resolution** | `core/executor_resolution.py` | Executor selection by ID, labels, and default; tool enablement checks |
+| **Executor WS Endpoint** | `api/executor_ws.py` | Accepts remote executor WebSocket connections, handles JWT auth and executor.configure handshake |
 | **Domain Models** | `models/` | Pydantic models for agents, sessions, tools, delegations, config |
+| **Channels** | `channels/` | Channel adapter lifecycle, pairing, inbound routing, outbound delivery, and message formatting |
 | **Providers** | `providers/` | Protocol definitions + implementations (memory, guardrails, executor, secrets, LLM, auth) |
 | **Tools** | `tools/` | Built-in tools, MCP client, skill loader, tool registry |
 | **Storage** | `store/` | SQLAlchemy async engine, ORM models, Alembic migrations, query helpers |
@@ -188,6 +205,12 @@ cognis/
 12. **Compaction creates new sessions**: When context exceeds 85% capacity, compaction creates a new Intaris session within the same conversation. The compacted summary is injected as system context. Manual compaction (`/compact`) defers session creation until the next user message; automatic compaction creates it immediately since the user message is available. The old session is marked completed with `completion_reason="compacted"`.
 
 13. **Prompt caching via immutable prefix**: Context is structured with an immutable prefix (system prompt → tool schemas → memory instructions + core memories → compaction summary) followed by a mutable suffix (history → recalled memories → delegations → user message). The immutable prefix benefits from LLM prompt caching (Anthropic `cache_control`, OpenAI automatic prefix caching). Memory instructions and core memories are cached in the session cache for the duration of the session with a 30-minute TTL refresh.
+
+14. **External channel senders must be verifiable**: Channel accounts should default to `pairing` so unknown remote senders cannot talk to an agent until they redeem a short-lived verification code in the Cognis UI.
+
+15. **Channel adapters may run on executors**: The default location is still the controller, but the target architecture allows a channel account to run on a connected executor when the platform needs user-local services or network reachability (for example Signal via `signal-cli`). The executor reuses the exact same adapter code; the controller does not own the platform-side connection state.
+
+16. **LLM provider executor routing**: LLM providers are configured normally (same UI, same DB table). Setting `location="executor"` on a provider routes inference through a matching remote executor instead of calling the API from the controller. The executor is a transparent LiteLLM proxy — it receives the fully resolved model string and kwargs per-call. `executor_labels` on the provider config selects which executor to use. This means any LiteLLM-supported provider can run on any executor.
 
 ## Build / Run / Test
 
@@ -396,6 +419,7 @@ uv run alembic -c cognis/store/migrations/alembic.ini downgrade -1
 | `llm_providers` | `provider_id` | LLM provider configurations |
 | `model_routing` | `task_type` | Model routing policy |
 | `secrets` | `secret_id` | Encrypted secrets (AES-256-GCM) |
+| `executors` | `executor_id` | Executor configurations (type, labels, enabled tools, config) |
 | `notifications` | `notification_id` | Persistent notifications (escalations, gates, step questions) |
 | `channel_accounts` | `account_id` | Configured external messaging connections |
 | `channel_contacts` | `contact_id` | Verified external sender to Cognis user mappings |
@@ -430,6 +454,7 @@ class SessionCache:
 - JWKS endpoint at `GET /.well-known/jwks.json`
 - User JWT: `sub` = email, `aud` = `["cognis"]`, `role` = user role
 - Service JWT (to Mnemory/Intaris): `sub` = user email, `aud` = `["mnemory", "intaris"]`
+- Executor JWT: `sub` = executor_id, `aud` = `["cognis-executor"]`, `typ` = `"executor"`. Default TTL 30 days (configurable). Short-lived (5 min) for subprocess executors.
 - Password hashing: argon2id (`time_cost=3, memory_cost=65536, parallelism=4`)
 
 ### Content redaction
