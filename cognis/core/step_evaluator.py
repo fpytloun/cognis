@@ -116,6 +116,7 @@ class StepEvaluator:
                         ],
                         task_type="evaluator",
                         temperature=0,
+                        response_format={"type": "json_object"},
                     ),
                     timeout=self.evaluator_timeout_seconds,
                 )

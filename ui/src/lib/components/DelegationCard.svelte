@@ -15,6 +15,10 @@
         ? 'border-rose-500/40 bg-rose-500/10 text-rose-100'
         : 'border-sky-500/30 bg-sky-500/10 text-sky-100';
   }
+
+  // Task delegations have IDs starting with "task_" — link to task detail
+  // instead of trying to load session events.
+  let isTaskDelegation = $derived(item.taskId.startsWith('task_'));
 </script>
 
 <article class={`rounded-3xl border px-4 py-4 shadow-card ${toneClass()}`}>
@@ -42,8 +46,15 @@
     <p class="mt-3 text-sm leading-6 opacity-90">{item.result}</p>
   {/if}
 
-  {#if onViewSession}
-    <div class="mt-3 flex justify-end">
+  <div class="mt-3 flex justify-end">
+    {#if isTaskDelegation}
+      <a
+        href="/tasks/{item.taskId}"
+        class="text-xs font-medium opacity-75 hover:opacity-100"
+      >
+        View task
+      </a>
+    {:else if onViewSession}
       <Button
         size="sm"
         variant="ghost"
@@ -51,6 +62,6 @@
       >
         View session
       </Button>
-    </div>
-  {/if}
+    {/if}
+  </div>
 </article>

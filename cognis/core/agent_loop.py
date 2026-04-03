@@ -620,6 +620,9 @@ class AgentLoop:
             return StepOutput(
                 summary=f"Step failed: {type(exc).__name__}",
                 error=error_msg[:2000],
+                session_id=ctx.session.session_id,
+                intaris_session_id=ctx.session.intaris_session_id or ctx.session.session_id,
+                completed_at=datetime.now(UTC),
             )
         finally:
             self.session_lock.release(ctx.session.session_id)
@@ -1036,8 +1039,9 @@ class AgentLoop:
         messages = context_result.messages
 
         # Record user message event (unless already recorded early for
-        # intention tracking above).
-        if effective_user_message and not ctx.system_initiated and not _user_msg_recorded_early:
+        # intention tracking above).  System-initiated turns (delegations)
+        # also record their task description so it appears in session logs.
+        if effective_user_message and not _user_msg_recorded_early:
             events_to_record.append(
                 SessionEvent(type="user_message", data={"content": effective_user_message})
             )
@@ -1180,6 +1184,9 @@ class AgentLoop:
                         content="\n\n".join(assistant_content_parts),
                         outputs={},
                         claims=[],
+                        session_id=ctx.session.session_id,
+                        intaris_session_id=ctx.session.intaris_session_id or ctx.session.session_id,
+                        completed_at=datetime.now(UTC),
                     )
                     break
                 elif not reprompted:
@@ -1294,6 +1301,9 @@ class AgentLoop:
                         content="\n\n".join(assistant_content_parts),
                         outputs=tc.arguments.get("outputs", {}),
                         claims=tc.arguments.get("claims", []),
+                        session_id=ctx.session.session_id,
+                        intaris_session_id=ctx.session.intaris_session_id or ctx.session.session_id,
+                        completed_at=datetime.now(UTC),
                     )
                     events_to_record.append(
                         SessionEvent(

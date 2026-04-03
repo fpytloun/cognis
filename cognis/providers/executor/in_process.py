@@ -127,8 +127,11 @@ class InProcessExecutorConnection:
             return ToolResult(output="Tool execution timed out.", is_error=True)
         except asyncio.CancelledError:
             return ToolResult(output="Tool execution cancelled.", is_error=True)
-        except Exception:
-            return ToolResult(output="Tool execution failed.", is_error=True)
+        except Exception as exc:
+            # Include the actual error message so the LLM knows WHY
+            # the tool failed and can adjust its approach.
+            error_detail = str(exc)[:1000]
+            return ToolResult(output=f"Tool execution failed: {error_detail}", is_error=True)
         finally:
             self._active_calls.pop(tool_call.call_id, None)
 

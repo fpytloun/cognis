@@ -246,6 +246,36 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
       continue;
     }
 
+    // Delegation events from Intaris use type="delegation" with data.status
+    // (started, completed, failed). These are the actual recorded events.
+    if (event.type === 'delegation') {
+      const childSessionId = String(event.data?.child_session_id ?? event.seq);
+      const itemId = `delegation:${childSessionId}`;
+      const existingIdx = items.findIndex((i) => i.id === itemId && i.kind === 'delegation');
+      const dataStatus = String(event.data?.status ?? 'started');
+      const statusMap: Record<string, string> = {
+        started: 'started',
+        completed: 'completed',
+        failed: 'failed',
+      };
+      const delegation: DelegationTimelineItem = {
+        id: itemId,
+        kind: 'delegation',
+        taskId: childSessionId,
+        taskLabel: String(event.data?.task ?? event.data?.description ?? 'Sub-session'),
+        status: statusMap[dataStatus] ?? 'started',
+        result: typeof event.data?.result_summary === 'string' ? event.data.result_summary : (typeof event.data?.result_content === 'string' ? event.data.result_content : null),
+        timestamp: event.timestamp
+      };
+      if (existingIdx >= 0) {
+        const existing = items[existingIdx] as DelegationTimelineItem;
+        items[existingIdx] = { ...existing, ...delegation, taskLabel: existing.taskLabel || delegation.taskLabel };
+      } else {
+        items.push(delegation);
+      }
+      continue;
+    }
+
     if (event.type === 'task_result') {
       const taskId = String(event.data.task_id ?? event.seq);
       const itemId = `delegation:${taskId}`;

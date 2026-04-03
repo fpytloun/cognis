@@ -300,10 +300,17 @@ async def select_workflow(
 
     try:
         response = await asyncio.wait_for(
-            llm.generate(prompt, task_type="classifier", temperature=0),
+            llm.generate(
+                prompt,
+                task_type="classifier",
+                temperature=0,
+                response_format={"type": "json_object"},
+            ),
             timeout=classifier_timeout_seconds,
         )
         content = _extract_text_from_response(response)
+        if not content or not content.strip():
+            raise ValueError("Classifier returned empty response")
         payload = _parse_classifier_payload(content)
         workflow_id = str(payload.get("workflow_id", ""))
 
