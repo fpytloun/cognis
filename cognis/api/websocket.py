@@ -1448,31 +1448,43 @@ async def handle_websocket(websocket: WebSocket) -> None:
                         recoverable=True,
                     )
                     continue
-                pause = websocket.app.state.pause_waiter.find_pending(
-                    task_id=task_id,
-                    step_name=step_name if isinstance(step_name, str) else None,
-                    pause_type="gate",
-                )
-                if pause is None:
-                    await manager.send_error(
-                        connection, code="not_found", message="No pending gate", recoverable=True
-                    )
-                    continue
                 if isinstance(feedback, str) and feedback:
                     await _persist_task_feedback(websocket.app, task_id, feedback)
-                ok = websocket.app.state.pause_waiter.resolve(
-                    pause.pause_id,
-                    PauseResolution(
-                        decision=action,
-                        data={"feedback": feedback if isinstance(feedback, str) else ""},
-                    ),
-                )
-                if not ok:
-                    await manager.send_error(
-                        connection,
-                        code="conflict",
-                        message="Gate already resolved",
-                        recoverable=True,
+                current_user_email.set(connection.user_email)
+                # Try the unified notification service first
+                svc = getattr(websocket.app.state, "notification_service", None)
+                resolved = False
+                if svc is not None:
+                    notif = await svc.find_by_task(
+                        task_id, notification_type="gate", status="pending"
+                    )
+                    if notif is not None:
+                        resolved = await svc.resolve(
+                            notif.notification_id,
+                            action,
+                            {"feedback": feedback if isinstance(feedback, str) else ""},
+                        )
+                if not resolved:
+                    # Legacy fallback: direct PauseWaiter
+                    pause = websocket.app.state.pause_waiter.find_pending(
+                        task_id=task_id,
+                        step_name=step_name if isinstance(step_name, str) else None,
+                        pause_type="gate",
+                    )
+                    if pause is None:
+                        await manager.send_error(
+                            connection,
+                            code="not_found",
+                            message="No pending gate",
+                            recoverable=True,
+                        )
+                        continue
+                    websocket.app.state.pause_waiter.resolve(
+                        pause.pause_id,
+                        PauseResolution(
+                            decision=action,
+                            data={"feedback": feedback if isinstance(feedback, str) else ""},
+                        ),
                     )
                 continue
 
@@ -1496,38 +1508,51 @@ async def handle_websocket(websocket: WebSocket) -> None:
                         recoverable=True,
                     )
                     continue
-                pause = websocket.app.state.pause_waiter.find_pending(
-                    task_id=task_id,
-                    step_name=step_name if isinstance(step_name, str) else None,
-                    pause_type="step_input",
-                )
-                if pause is None:
-                    await manager.send_error(
-                        connection,
-                        code="not_found",
-                        message="No pending step question",
-                        recoverable=True,
+                current_user_email.set(connection.user_email)
+                # Try the unified notification service first
+                svc = getattr(websocket.app.state, "notification_service", None)
+                resolved = False
+                if svc is not None:
+                    notif = await svc.find_by_task(
+                        task_id, notification_type="step_question", status="pending"
                     )
-                    continue
-                ok = websocket.app.state.pause_waiter.resolve(
-                    pause.pause_id,
-                    PauseResolution(decision="continue", data={"response": str(response)}),
-                )
-                if not ok:
-                    await manager.send_error(
-                        connection,
-                        code="conflict",
-                        message="Question already resolved",
-                        recoverable=True,
+                    if notif is not None:
+                        resolved = await svc.resolve(
+                            notif.notification_id,
+                            "continue",
+                            {"response": str(response)},
+                        )
+                if not resolved:
+                    # Legacy fallback: direct PauseWaiter
+                    pause = websocket.app.state.pause_waiter.find_pending(
+                        task_id=task_id,
+                        step_name=step_name if isinstance(step_name, str) else None,
+                        pause_type="step_input",
                     )
-                    continue
+                    if pause is None:
+                        await manager.send_error(
+                            connection,
+                            code="not_found",
+                            message="No pending step question",
+                            recoverable=True,
+                        )
+                        continue
+                    websocket.app.state.pause_waiter.resolve(
+                        pause.pause_id,
+                        PauseResolution(decision="continue", data={"response": str(response)}),
+                    )
                 if not websocket.app.state.task_queue.has_active_run(task_id):
+                    # Post-restart recovery path
                     await _store_recovered_step_input_response(
                         websocket.app,
                         task_id,
                         str(response),
                     )
-                    websocket.app.state.pause_waiter.clear(pause.pause_id)
+                    pause = websocket.app.state.pause_waiter.find_pending(
+                        task_id=task_id, pause_type="step_input"
+                    )
+                    if pause is not None:
+                        websocket.app.state.pause_waiter.clear(pause.pause_id)
                     try:
                         await websocket.app.state.task_queue.resume_task(task_id)
                     except ValueError as exc:
@@ -2300,6 +2325,70 @@ async def _read_compaction_summary_from_session(app: Any, session: SessionModel)
 
 
 async def _load_pending_task_prompts(app: Any, conversation_id: str) -> list[dict[str, Any]]:
+    """Load pending notifications for a conversation on reconnect.
+
+    Queries the unified notification service first (DB-persistent,
+    survives restarts).  Falls back to PauseWaiter for legacy pauses.
+    """
+    payloads: list[dict[str, Any]] = []
+
+    # Try the unified notification service first
+    svc = getattr(app.state, "notification_service", None)
+    if svc is not None:
+        # We need a user_email for the query — get it from the conversation
+        from cognis.store.queries import get_conversation
+
+        user_email: str | None = None
+        async with app.state.session_factory() as session:
+            conv_row = await get_conversation(session, conversation_id)
+            if conv_row is not None:
+                user_email = conv_row.user_email
+
+        if user_email:
+            notifications = await svc.list_pending(user_email, conversation_id=conversation_id)
+            for notif in notifications:
+                payload = notif.payload or {}
+                if notif.notification_type == "gate":
+                    payloads.append(
+                        {
+                            "type": "workflow_gate",
+                            "notification_id": notif.notification_id,
+                            "task_id": notif.task_id,
+                            "step_name": notif.step_name,
+                            "message": payload.get("message") or payload.get("question", ""),
+                            "options": payload.get("options"),
+                            "context": payload.get("context"),
+                        }
+                    )
+                elif notif.notification_type == "step_question":
+                    payloads.append(
+                        {
+                            "type": "workflow_step_question",
+                            "notification_id": notif.notification_id,
+                            "task_id": notif.task_id,
+                            "step_name": notif.step_name,
+                            "question": payload.get("question", ""),
+                            "options": payload.get("options"),
+                            "context": payload.get("context"),
+                        }
+                    )
+                elif notif.notification_type == "escalation":
+                    payloads.append(
+                        {
+                            "type": "escalation",
+                            "notification_id": notif.notification_id,
+                            "call_id": payload.get("call_id"),
+                            "tool_name": payload.get("tool_name"),
+                            "risk": payload.get("risk"),
+                            "reasoning": payload.get("reasoning"),
+                            "timeout_seconds": payload.get("timeout_seconds"),
+                            "task_id": notif.task_id,
+                        }
+                    )
+            if payloads:
+                return payloads
+
+    # Legacy fallback: PauseWaiter (in-memory only, lost on restart)
     async with app.state.session_factory() as session:
         rows = list(
             (
@@ -2315,7 +2404,6 @@ async def _load_pending_task_prompts(app: Any, conversation_id: str) -> list[dic
             .all()
         )
 
-    payloads: list[dict[str, Any]] = []
     for row in rows:
         pause = app.state.pause_waiter.find_pending(task_id=row.task_id)
         if pause is None:

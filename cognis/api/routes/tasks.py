@@ -260,6 +260,33 @@ async def gate_response(
 ) -> TaskActionResponse:
     forbid_mutation_for_viewer(request)
     task = await _require_task(request, task_id)
+    if payload.feedback:
+        await _update_last_feedback(request, task_id, task.workflow_state, payload.feedback)
+
+    # Try the unified notification service first
+    svc = getattr(request.app.state, "notification_service", None)
+    if svc is not None:
+        from cognis.core.notifications import NotificationService
+
+        svc_typed: NotificationService = svc
+        notif = await svc_typed.find_by_task(task_id, notification_type="gate", status="pending")
+        if notif is not None:
+            ok = await svc_typed.resolve(
+                notif.notification_id,
+                payload.action,
+                {"feedback": payload.feedback or ""},
+            )
+            if ok:
+                return TaskActionResponse(ok=True, task_id=task_id, status=str(task.status))
+            raise api_exception(409, "conflict", "Gate has already been resolved")
+        # Check if there's a recently resolved gate (409 vs 404)
+        resolved_notif = await svc_typed.find_by_task(
+            task_id, notification_type="gate", status="resolved"
+        )
+        if resolved_notif is not None:
+            raise api_exception(409, "conflict", "Gate has already been resolved")
+
+    # Legacy fallback: direct PauseWaiter
     pause = request.app.state.pause_waiter.find_pending(
         task_id=task_id,
         step_name=payload.step_name,
@@ -275,8 +302,6 @@ async def gate_response(
         if resolved_pause is not None:
             raise api_exception(409, "conflict", "Pause has already been resolved")
         raise api_exception(404, "not_found", "No pending gate for task")
-    if payload.feedback:
-        await _update_last_feedback(request, task_id, task.workflow_state, payload.feedback)
     ok = request.app.state.pause_waiter.resolve(
         pause.pause_id,
         PauseResolution(decision=payload.action, data={"feedback": payload.feedback or ""}),
@@ -294,20 +319,39 @@ async def step_response(
 ) -> TaskActionResponse:
     forbid_mutation_for_viewer(request)
     task = await _require_task(request, task_id)
+
+    # Try the unified notification service first
+    svc = getattr(request.app.state, "notification_service", None)
+    if svc is not None:
+        from cognis.core.notifications import NotificationService
+
+        svc_typed: NotificationService = svc
+        notif = await svc_typed.find_by_task(
+            task_id, notification_type="step_question", status="pending"
+        )
+        if notif is not None:
+            ok = await svc_typed.resolve(
+                notif.notification_id,
+                "continue",
+                {"response": payload.response},
+            )
+            if ok:
+                if not request.app.state.task_queue.has_active_run(task_id):
+                    await _store_recovered_step_input_response(request, task_id, payload.response)
+                    resumed_task = await request.app.state.task_queue.resume_task(task_id)
+                    return TaskActionResponse(
+                        ok=True, task_id=task_id, status=str(resumed_task.status)
+                    )
+                return TaskActionResponse(ok=True, task_id=task_id, status=str(task.status))
+            raise api_exception(409, "conflict", "Step question has already been resolved")
+
+    # Legacy fallback: direct PauseWaiter
     pause = request.app.state.pause_waiter.find_pending(
         task_id=task_id,
         step_name=payload.step_name,
         pause_type="step_input",
     )
     if pause is None:
-        resolved_pause = request.app.state.pause_waiter.find_pending(
-            task_id=task_id,
-            step_name=payload.step_name,
-            pause_type="step_input",
-            include_resolved=True,
-        )
-        if resolved_pause is not None:
-            raise api_exception(409, "conflict", "Pause has already been resolved")
         raise api_exception(404, "not_found", "No pending step question for task")
     ok = request.app.state.pause_waiter.resolve(
         pause.pause_id,

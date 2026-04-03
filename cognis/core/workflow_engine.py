@@ -105,6 +105,7 @@ class WorkflowEngine:
         shared_tool_registry: Any = None,
         shared_executor_connection: Any = None,
         session_cache: Any = None,
+        notification_service: Any = None,
     ) -> None:
         self._session_factory = session_factory
         self._providers = providers
@@ -118,6 +119,7 @@ class WorkflowEngine:
         self._shared_tool_registry = shared_tool_registry
         self._session_cache = session_cache
         self._shared_executor_connection = shared_executor_connection
+        self._notification_service = notification_service
 
     async def run_direct_turn(
         self,
@@ -660,6 +662,7 @@ class WorkflowEngine:
         state.status = "paused"
         state.current_step_status = "paused"
         pause_id = f"gate_{uuid.uuid4().hex[:12]}"
+        gate_options = [opt.model_dump(mode="json") for opt in gate.options]
         state.pending_pause_type = "gate"
         state.pending_pause_payload = {
             "pause_id": pause_id,
@@ -667,7 +670,7 @@ class WorkflowEngine:
             "step_name": step_def.name,
             "message": gate.message,
             "context": gate_context,
-            "options": [opt.model_dump(mode="json") for opt in gate.options],
+            "options": gate_options,
         }
         await self._persist_workflow_state(task)
 
@@ -675,30 +678,49 @@ class WorkflowEngine:
             await update_task_status(db_session, task.task_id, "paused")
             await db_session.commit()
 
-        self._pause_waiter.register(
-            PendingPause(
-                pause_id=pause_id,
-                pause_type="gate",
+        # Use the unified notification service so the gate is persisted
+        # to DB, resolved to the source conversation, and survives restarts.
+        if self._notification_service is not None:
+            await self._notification_service.create(
+                notification_type="gate",
+                user_email=task.created_by,
+                conversation_id=task.source_ref or "",
                 task_id=task.task_id,
                 step_name=step_def.name,
-                question=gate.message,
-                options=[opt.model_dump(mode="json") for opt in gate.options],
-                context=gate_context,
-            )
-        )
-        await self._event_bus.publish(
-            Event(
-                type=EventType.WORKFLOW_GATE,
-                data={
-                    "pause_id": pause_id,
-                    "task_id": task.task_id,
-                    "step": step_def.name,
+                notification_id=pause_id,
+                payload={
                     "message": gate.message,
                     "context": gate_context,
-                    "options": [opt.model_dump(mode="json") for opt in gate.options],
+                    "options": gate_options,
+                    "question": gate.message,
                 },
             )
-        )
+        else:
+            # Fallback: direct PauseWaiter (no DB persistence)
+            self._pause_waiter.register(
+                PendingPause(
+                    pause_id=pause_id,
+                    pause_type="gate",
+                    task_id=task.task_id,
+                    step_name=step_def.name,
+                    question=gate.message,
+                    options=gate_options,
+                    context=gate_context,
+                )
+            )
+            await self._event_bus.publish(
+                Event(
+                    type=EventType.WORKFLOW_GATE,
+                    data={
+                        "pause_id": pause_id,
+                        "task_id": task.task_id,
+                        "step": step_def.name,
+                        "message": gate.message,
+                        "context": gate_context,
+                        "options": gate_options,
+                    },
+                )
+            )
 
         # Wait for resolution
         try:
@@ -1361,6 +1383,7 @@ class WorkflowEngine:
                 )
             if prior_run is not None and prior_run.session_id is not None:
                 # Recover session and conversation from the prior run
+                from cognis.core.session import _to_conversation_model, _to_session_model
                 from cognis.store.queries import get_conversation, get_session_row
 
                 async with self._session_factory() as db_session:
@@ -1368,20 +1391,8 @@ class WorkflowEngine:
                     if session_row is not None:
                         conv_row = await get_conversation(db_session, session_row.conversation_id)
                         if conv_row is not None:
-                            from cognis.models.session import ConversationModel, SessionModel
-
-                            conversation = ConversationModel.model_validate(
-                                {
-                                    c.name: getattr(conv_row, c.name)
-                                    for c in conv_row.__table__.columns
-                                }
-                            )
-                            session = SessionModel.model_validate(
-                                {
-                                    c.name: getattr(session_row, c.name)
-                                    for c in session_row.__table__.columns
-                                }
-                            )
+                            conversation = _to_conversation_model(conv_row)
+                            session = _to_session_model(session_row)
                             return conversation, session
         except Exception:
             logger.warning(
@@ -1392,6 +1403,7 @@ class WorkflowEngine:
                         "step_name": step_def.name,
                     }
                 },
+                exc_info=True,
             )
 
         # Fallback — create a fresh session

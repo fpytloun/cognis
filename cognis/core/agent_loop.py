@@ -1447,25 +1447,65 @@ class AgentLoop:
                     pause_options = (
                         [str(option) for option in options] if isinstance(options, list) else None
                     )
-                    self.pause_waiter.register(
-                        PendingPause(
-                            pause_id=pause_id,
-                            pause_type="step_input",
+                    formatted_options = (
+                        [{"label": option, "action": option} for option in pause_options]
+                        if pause_options is not None
+                        else None
+                    )
+
+                    # Use the unified notification service so the step
+                    # question is persisted, resolved to the source
+                    # conversation, and survives restarts.
+                    if self.notification_service is not None:
+                        await self.notification_service.create(
+                            notification_type="step_question",
+                            user_email=ctx.session.user_email,
+                            conversation_id=ctx.conversation.conversation_id,
                             task_id=ctx.task_id,
                             step_name=ctx.step_definition.name,
                             step_run_id=ctx.step_run_id,
                             session_id=ctx.session.session_id,
-                            question=question,
-                            options=(
-                                [{"label": option, "action": option} for option in pause_options]
-                                if pause_options is not None
-                                else None
-                            ),
-                            context={"context": pause_context}
-                            if isinstance(pause_context, str)
-                            else None,
+                            notification_id=pause_id,
+                            payload={
+                                "question": question,
+                                "options": formatted_options,
+                                "context": pause_context,
+                            },
                         )
-                    )
+                    else:
+                        # Fallback: direct PauseWaiter (no DB persistence)
+                        self.pause_waiter.register(
+                            PendingPause(
+                                pause_id=pause_id,
+                                pause_type="step_input",
+                                task_id=ctx.task_id,
+                                step_name=ctx.step_definition.name,
+                                step_run_id=ctx.step_run_id,
+                                session_id=ctx.session.session_id,
+                                question=question,
+                                options=formatted_options,
+                                context={"context": pause_context}
+                                if isinstance(pause_context, str)
+                                else None,
+                            )
+                        )
+                        await self.event_bus.publish(
+                            Event(
+                                type=EventType.STEP_PAUSED,
+                                data={
+                                    "pause_id": pause_id,
+                                    "pause_type": "step_input",
+                                    "question": question,
+                                    "options": pause_options,
+                                    "context": pause_context,
+                                    "session_id": ctx.session.session_id,
+                                    "task_id": ctx.task_id,
+                                    "step_name": ctx.step_definition.name,
+                                    "step_run_id": ctx.step_run_id,
+                                },
+                            )
+                        )
+
                     await self._set_interactive_pause_state(
                         ctx,
                         pause_type="step_input",
@@ -1478,22 +1518,6 @@ class AgentLoop:
                             "options": pause_options,
                             "context": pause_context,
                         },
-                    )
-                    await self.event_bus.publish(
-                        Event(
-                            type=EventType.STEP_PAUSED,
-                            data={
-                                "pause_id": pause_id,
-                                "pause_type": "step_input",
-                                "question": question,
-                                "options": pause_options,
-                                "context": pause_context,
-                                "session_id": ctx.session.session_id,
-                                "task_id": ctx.task_id,
-                                "step_name": ctx.step_definition.name,
-                                "step_run_id": ctx.step_run_id,
-                            },
-                        )
                     )
                     try:
                         resolution = await self.pause_waiter.wait(pause_id, timeout=300.0)

@@ -307,6 +307,7 @@ def create_app() -> FastAPI:
         )
         app.state.notification_service = notification_service
         agent_loop.notification_service = notification_service
+        workflow_engine._notification_service = notification_service  # noqa: SLF001
 
         # Reconcile pending notifications from before restart
         await notification_service.reconcile_pending()
