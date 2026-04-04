@@ -25,7 +25,7 @@
     </Card>
 
     <Card class="p-4 sm:p-6">
-      <div class="docs-markdown chat-markdown min-w-0 max-w-full overflow-x-hidden break-words prose prose-invert max-w-none prose-headings:text-white prose-p:text-slate-300 prose-strong:text-white prose-li:text-slate-300 prose-code:text-sky-200 prose-pre:border prose-pre:border-slate-800 prose-pre:bg-slate-950/80 prose-table:text-slate-200">{@html html}</div>
+      <div class="docs-markdown min-w-0 max-w-full overflow-x-hidden break-words prose prose-invert max-w-none prose-headings:text-white prose-p:text-slate-300 prose-strong:text-white prose-li:text-slate-300 prose-code:text-sky-200 prose-pre:border prose-pre:border-slate-800 prose-pre:bg-slate-950/80 prose-table:text-slate-200">{@html html}</div>
     </Card>
 
     {#if relatedDocs.length > 0}

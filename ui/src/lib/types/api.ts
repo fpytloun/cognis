@@ -408,6 +408,9 @@ export interface PairingRequest {
   request_id: string;
   owner_email: string;
   account_id: string;
+  account_display_name: string | null;
+  agent_id: string | null;
+  agent_name: string | null;
   channel_type: string;
   sender_id: string;
   sender_name: string | null;

@@ -17,7 +17,13 @@ This lets a user talk to a Cognis agent through an external service while keepin
 
 ## Creating a channel account
 
-Open `Channels` and choose an adapter type. Cognis shows:
+Open `Channels` and start in the `Accounts` view. The page is organized around three workflows:
+
+- `Accounts` for platform setup and lifecycle management
+- `Pairing inbox` for pending remote-sender approvals
+- `Verified senders` for manual trust overrides
+
+When you add or edit an account, Cognis shows:
 
 - a short platform description
 - manual setup guidance
@@ -27,7 +33,7 @@ Open `Channels` and choose an adapter type. Cognis shows:
 
 After the account is saved, Cognis uses the configured adapter to receive and send messages for that platform.
 
-The page also keeps the platform-specific manual setup steps next to the form so you can finish vendor-side configuration while filling in the Cognis settings.
+The platform-specific setup steps stay next to the editor so you can finish vendor-side configuration while filling in the Cognis settings.
 
 ## Controller vs executor placement
 
@@ -44,7 +50,7 @@ Channel accounts can require sender verification before unknown remote users are
 
 This pairing flow helps prevent an unverified external sender from immediately gaining access to a user-owned agent. The UI stores verified mappings between external contacts and Cognis users.
 
-In practice, the pairing tab becomes your operational view for pending verifications, while the contacts tab shows which remote senders have already been trusted.
+In practice, the pairing inbox becomes the operational view for pending verifications, while verified senders is the advanced list of remote contacts that have already been trusted.
 
 ## Platform-specific setup
 

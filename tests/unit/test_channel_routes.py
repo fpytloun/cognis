@@ -10,10 +10,10 @@ from cognis.api.app import create_app
 from cognis.store.queries import (
     create_agent,
     create_channel_account,
-    get_channel_contact,
     create_pairing_request,
     create_user,
     get_channel_account,
+    get_channel_contact,
 )
 
 
@@ -186,6 +186,9 @@ def test_pairing_endpoints(monkeypatch: object, tmp_path: Path) -> None:
         )
         assert listed.status_code == 200
         assert len(listed.json()) == 1
+        assert listed.json()[0]["account_display_name"] == "Signal"
+        assert listed.json()[0]["agent_id"] == "agent-1"
+        assert listed.json()[0]["agent_name"] == "Agent 1"
 
         invalid = client.post(
             "/api/v1/channels/pair",
@@ -201,6 +204,8 @@ def test_pairing_endpoints(monkeypatch: object, tmp_path: Path) -> None:
         )
         assert valid.status_code == 200
         assert valid.json()["status"] == "completed"
+        assert valid.json()["account_display_name"] == "Signal"
+        assert valid.json()["agent_name"] == "Agent 1"
 
         async def _verify_contact() -> bool:
             async with app.state.session_factory() as session:

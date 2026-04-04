@@ -483,6 +483,26 @@ class WorkflowRunResponse(BaseModel):
     pending_pause: PendingPauseResponse | None = None
 
 
+class ChannelPairingRequestResponse(BaseModel):
+    request_id: str
+    owner_email: str
+    account_id: str
+    account_display_name: str | None = None
+    agent_id: str | None = None
+    agent_name: str | None = None
+    channel_type: str
+    sender_id: str
+    sender_name: str | None = None
+    chat_id: str
+    chat_name: str | None = None
+    code: str
+    status: str
+    attempts: int = 0
+    expires_at: datetime
+    created_at: datetime
+    completed_at: datetime | None = None
+
+
 class StepRunResponse(BaseModel):
     step_run_id: str
     task_id: str

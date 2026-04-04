@@ -13,12 +13,55 @@ from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse
 
 from cognis.api.common import error_response, require_current_user
+from cognis.api.models import ChannelPairingRequestResponse
 from cognis.channels.registry import get_channel_meta, list_channel_types
 from cognis.logging import get_logger
 
 logger = get_logger(__name__)
 
 router = APIRouter(prefix="/api/v1/channels", tags=["channels"])
+
+
+async def _pairing_response(
+    request: Request,
+    row: Any,
+) -> ChannelPairingRequestResponse:
+    session_factory = request.app.state.session_factory
+
+    from cognis.store.queries import get_agent, get_channel_account
+
+    account_display_name: str | None = None
+    agent_id: str | None = None
+    agent_name: str | None = None
+
+    async with session_factory() as session:
+        account = await get_channel_account(session, row.account_id)
+        if account is not None:
+            account_display_name = account.display_name
+            agent_id = account.agent_id
+            agent = await get_agent(session, account.agent_id)
+            if agent is not None:
+                agent_name = agent.display_name or agent.name
+
+    return ChannelPairingRequestResponse(
+        request_id=row.request_id,
+        owner_email=row.owner_email,
+        account_id=row.account_id,
+        account_display_name=account_display_name,
+        agent_id=agent_id,
+        agent_name=agent_name,
+        channel_type=row.channel_type,
+        sender_id=row.sender_id,
+        sender_name=row.sender_name,
+        chat_id=row.chat_id,
+        chat_name=row.chat_name,
+        code=row.code,
+        status=str(row.status),
+        attempts=row.attempts,
+        expires_at=row.expires_at,
+        created_at=row.created_at,
+        completed_at=row.completed_at,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -366,8 +409,8 @@ async def handle_webhook_verification(
 # ---------------------------------------------------------------------------
 
 
-@router.get("/pairing-requests")
-async def list_pairing_requests(request: Request) -> list[dict[str, Any]]:
+@router.get("/pairing-requests", response_model=list[ChannelPairingRequestResponse])
+async def list_pairing_requests(request: Request) -> list[ChannelPairingRequestResponse]:
     """List pending pairing requests for the authenticated user."""
     pairing_service = getattr(request.app.state, "pairing_service", None)
     if pairing_service is None:
@@ -376,10 +419,10 @@ async def list_pairing_requests(request: Request) -> list[dict[str, Any]]:
     rows = await pairing_service.list_pending_requests(
         owner_email=require_current_user(request).email
     )
-    return [row.model_dump(mode="json") for row in rows]
+    return [await _pairing_response(request, row) for row in rows]
 
 
-@router.post("/pair", response_model=None)
+@router.post("/pair", response_model=ChannelPairingRequestResponse)
 async def redeem_pairing_code(request: Request) -> Any:
     """Redeem a sender-initiated pairing code from the web UI."""
     pairing_service = getattr(request.app.state, "pairing_service", None)
@@ -397,7 +440,7 @@ async def redeem_pairing_code(request: Request) -> Any:
         )
     except ValueError as exc:
         return error_response(400, "validation_error", str(exc))
-    return row.model_dump(mode="json")
+    return await _pairing_response(request, row)
 
 
 @router.post("/pairing-requests/{request_id}/reject", response_model=None)
