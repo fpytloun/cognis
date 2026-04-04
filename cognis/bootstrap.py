@@ -136,6 +136,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_user_management_columns)
         await conn.run_sync(_ensure_conversation_last_read_at)
         await conn.run_sync(_ensure_avatar_image_id_column)
+        await conn.run_sync(_ensure_executor_runtime_state_columns)
 
 
 def _ensure_session_lifecycle_columns(sync_conn: object) -> None:
@@ -285,6 +286,39 @@ def _ensure_conversation_last_read_at(sync_conn: object) -> None:
 
     if "last_read_at" not in columns:
         execute(text("ALTER TABLE conversations ADD COLUMN last_read_at TIMESTAMP"))
+
+
+def _ensure_executor_runtime_state_columns(sync_conn: object) -> None:
+    """Add executor runtime-state columns for existing databases."""
+    inspector = cast(Any, inspect(sync_conn))
+    try:
+        columns = {column["name"] for column in inspector.get_columns("executors")}
+    except Exception:
+        return  # table doesn't exist yet (create_all will handle it)
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+
+    if "desired_config_version" not in columns:
+        execute(
+            text(
+                "ALTER TABLE executors ADD COLUMN desired_config_version INTEGER NOT NULL DEFAULT 0"
+            )
+        )
+    if "applied_config_version" not in columns:
+        execute(
+            text(
+                "ALTER TABLE executors ADD COLUMN applied_config_version INTEGER NOT NULL DEFAULT 0"
+            )
+        )
+    if "observed_tools" not in columns:
+        execute(text("ALTER TABLE executors ADD COLUMN observed_tools JSON"))
+    if "last_observed_at" not in columns:
+        execute(text("ALTER TABLE executors ADD COLUMN last_observed_at TIMESTAMP WITH TIME ZONE"))
+    if "runtime_state" not in columns:
+        execute(
+            text(
+                "ALTER TABLE executors ADD COLUMN runtime_state VARCHAR NOT NULL DEFAULT 'offline'"
+            )
+        )
 
 
 def _ensure_avatar_image_id_column(sync_conn: object) -> None:

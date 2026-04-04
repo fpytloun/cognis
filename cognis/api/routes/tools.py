@@ -113,11 +113,16 @@ async def list_executor_tools(request: Request) -> list[ToolResponse]:
 @router.get("/api/v1/agents/{agent_id}/effective-tools", response_model=EffectiveToolsResponse)
 async def get_agent_effective_tools(request: Request, agent_id: str) -> EffectiveToolsResponse:
     async with request.app.state.session_factory() as session:
-        agent = await get_agent(session, agent_id)
-    if agent is None:
+        row = await get_agent(session, agent_id)
+    if row is None:
         raise api_exception(404, "not_found", "Agent not found")
-    require_owner_or_admin(request, agent.owner_email)
-    return await _resolve_effective_tools_response(request, agent, user_email=agent.owner_email)
+    require_owner_or_admin(request, row.owner_email)
+    agent = AgentDefinition.model_validate(agent_to_response(row).model_dump())
+    return await _resolve_effective_tools_response(
+        request,
+        agent,
+        user_email=agent.owner_email,
+    )
 
 
 @router.post("/api/v1/agents/effective-tools/preview", response_model=EffectiveToolsResponse)
@@ -168,6 +173,8 @@ def _tool_identifier(tool: ToolDefinition) -> str:
 def _tool_permission(agent: AgentDefinition, tool: ToolDefinition) -> str:
     if agent.permissions is None:
         return "evaluate"
+    if isinstance(agent.permissions, dict):
+        agent.permissions = AgentPermissions.model_validate(agent.permissions)
     tool_id = _tool_identifier(tool)
     if agent.permissions.tool_permissions and tool_id in agent.permissions.tool_permissions:
         return str(agent.permissions.tool_permissions[tool_id])
