@@ -1175,13 +1175,12 @@
           </label>
           <label class="space-y-2 text-sm font-medium text-slate-200">
             <span>image_generation</span>
-            <select bind:value={routingForm.image_generation} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
-              <option value="">Not configured</option>
-              {#each modelOptions() as option}
-                <option value={option.value}>{option.label}</option>
-              {/each}
-            </select>
-            <span class="block text-xs text-slate-400">Image generation (avatars, tools). e.g. gpt-image-1, dall-e-3.</span>
+            <input
+              bind:value={routingForm.image_generation}
+              class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-500"
+              placeholder="e.g. gpt-image-1, dall-e-3, gemini-2.0-flash-image-generation"
+            />
+            <span class="block text-xs text-slate-400">Image-capable model for avatars and tools. Must support image generation.</span>
           </label>
         </div>
 

@@ -848,6 +848,9 @@ class LiteLLMProvider:
             config = dict(provider.config) if hasattr(provider, "config") else {}
             preset = config.get("preset", "") if isinstance(config, dict) else ""
         strategy = _IMAGE_GEN_STRATEGY.get(preset, "aimage_generation")
+        # Proxy/compatible presets are pass-through — detect Gemini by model name
+        if strategy == "aimage_generation" and "gemini" in prefixed_model.lower():
+            strategy = "acompletion_modalities"
 
         # Route to executor if configured
         if self._should_route_to_executor(provider):
