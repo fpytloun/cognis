@@ -449,6 +449,10 @@ export interface ExecutorConfig {
   enabled_tool_groups: string[];
   config: Record<string, unknown>;
   status: string;
+  runtime_state: string;
+  desired_config_version: number;
+  applied_config_version: number;
+  last_observed_at: string | null;
   is_default: boolean;
   owner_email: string | null;
   created_at: string | null;

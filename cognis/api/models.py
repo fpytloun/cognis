@@ -725,6 +725,10 @@ class ExecutorConfigResponse(BaseModel):
     enabled_tool_groups: list[str] = Field(default_factory=list)
     config: dict[str, Any] = Field(default_factory=dict)
     status: str = "active"
+    runtime_state: str = "offline"
+    desired_config_version: int = 0
+    applied_config_version: int = 0
+    last_observed_at: datetime | None = None
     is_default: bool = False
     owner_email: str | None = None
     created_at: datetime | None = None

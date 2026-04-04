@@ -51,7 +51,6 @@
     system: 'system',
     account: 'account'
   };
-  $: tabs = isAdmin ? ALL_TABS : ALL_TABS.filter((t) => t !== 'users' && t !== 'system');
   let activeTab: SettingsTab = 'providers';
   let loading = true;
   let busy = false;
@@ -77,6 +76,7 @@
   let editingMcpServer: MCPServerConfigResponse | null = null;
   let mcpForm = { name: '', transport: 'stdio', command: '', url: '', args: '', envVars: [] as MCPEnvVar[], timeout_seconds: 30, description: '' };
   let isAdmin = false;
+  let tabs = $derived(isAdmin ? ALL_TABS : ALL_TABS.filter((t) => t !== 'users' && t !== 'system'));
   let selectedProviderId = '';
   let selectedSettingKey = '';
   let settingValueText = '';
@@ -104,6 +104,7 @@
   let userEditForm = { name: '', role: 'user' as UserRole };
   let accountNameForm = '';
   let accountNameDirty = false;
+  let executorPollTimer: ReturnType<typeof setInterval> | null = null;
 
   let routingForm = {
     default: '',
@@ -444,6 +445,27 @@
       }
     }
     initialSnapshot = snapshotState();
+  }
+
+  function executorRuntimeBadgeStatus(executor: ExecutorConfig): 'healthy' | 'degraded' | 'unhealthy' {
+    if (executor.status !== 'active') return 'degraded';
+    if (executor.runtime_state === 'active') return 'healthy';
+    if (executor.runtime_state === 'reconfiguring') return 'degraded';
+    if (executor.runtime_state === 'blocked') return 'unhealthy';
+    return 'unhealthy';
+  }
+
+  function executorRuntimeLabel(executor: ExecutorConfig): string {
+    if (executor.status !== 'active') return 'disabled';
+    if (executor.runtime_state === 'active') return 'connected';
+    if (executor.runtime_state === 'reconfiguring') return 'reconfiguring';
+    if (executor.runtime_state === 'blocked') return 'blocked';
+    return 'offline';
+  }
+
+  function executorObservedNote(executor: ExecutorConfig): string | null {
+    if (!executor.last_observed_at) return null;
+    return `last seen ${new Date(executor.last_observed_at).toLocaleString()}`;
   }
 
   async function loadSettings(): Promise<void> {
@@ -949,7 +971,27 @@
   onMount(() => {
     const cleanup = installBeforeUnloadGuard(isDirty);
     void loadSettings();
-    return cleanup;
+    return () => {
+      if (executorPollTimer) clearInterval(executorPollTimer);
+      cleanup();
+    };
+  });
+
+  $effect(() => {
+    if (executorPollTimer) {
+      clearInterval(executorPollTimer);
+      executorPollTimer = null;
+    }
+    if (!isAdmin || activeTab !== 'executors') return;
+    executorPollTimer = setInterval(() => {
+      void refreshPageState();
+    }, 5000);
+    return () => {
+      if (executorPollTimer) {
+        clearInterval(executorPollTimer);
+        executorPollTimer = null;
+      }
+    };
   });
 </script>
 
@@ -1495,6 +1537,10 @@
                 <h3 class="text-lg font-medium text-white">{exec.name}</h3>
                 <span class="px-2 py-0.5 bg-zinc-700 text-zinc-300 text-xs font-mono rounded">{exec.executor_type}</span>
                 <span class="px-2 py-0.5 rounded text-xs {exec.status === 'active' ? 'bg-emerald-500/20 text-emerald-300' : 'bg-zinc-700 text-zinc-400'}">{exec.status}</span>
+                <span class="inline-flex items-center gap-2 rounded px-2 py-0.5 text-xs">
+                  <ProviderStatusBadge status={executorRuntimeBadgeStatus(exec)} />
+                  <span class="text-slate-300">{executorRuntimeLabel(exec)}</span>
+                </span>
                 {#if exec.is_default}
                   <span class="px-2 py-0.5 bg-blue-500/20 text-blue-300 text-xs rounded">default</span>
                 {/if}
@@ -1543,6 +1589,14 @@
             {/if}
 
             <div class="text-xs text-slate-500 font-mono">ID: {exec.executor_id}</div>
+            {#if executorObservedNote(exec)}
+              <div class="text-xs text-slate-500">{executorObservedNote(exec)}</div>
+            {/if}
+            {#if exec.desired_config_version !== exec.applied_config_version}
+              <div class="text-xs text-amber-300">
+                config pending: desired v{exec.desired_config_version}, applied v{exec.applied_config_version}
+              </div>
+            {/if}
 
             {#if executorToken && executorToken.executor_id === exec.executor_id}
               {@const execCommand = `cognis executor run --controller-url ${window.location.origin.replace('http', 'ws')}/api/executor/ws --token ${executorToken.token}`}
