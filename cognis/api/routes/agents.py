@@ -442,21 +442,22 @@ async def generate_agent_field(request: Request, payload: GenerateFieldRequest) 
         user_msg = (
             f"The agent's '{field}' field currently contains:\n\n"
             f"{current_value}\n\n"
-            f"Expand and polish this text while strictly preserving the user's exact intent, "
-            f"terminology, and meaning. Do NOT replace their content with something different. "
-            f"If the text is brief notes or keywords, expand them into proper sentences "
-            f"while keeping every original concept.\n\n"
+            f"The user wants this expanded into a complete, well-written version. "
+            f"Use their text as the starting point and core idea, then elaborate it "
+            f"into a proper, professional value for this field. "
+            f"Keep their core meaning and any specific terms they used, "
+            f"but feel free to rephrase and expand significantly.\n\n"
             f"Agent context:\n{ctx_summary}"
         )
         system_msg = (
-            f"You are helping refine an AI agent's configuration. The user has already "
-            f"written content for the '{field}' field. Your job is to expand and polish "
-            f"their text while preserving their exact intent and terminology. "
-            f"Do NOT replace their content with something different — build on what they wrote. "
+            f"You are helping configure an AI agent. The user provided brief input "
+            f"for the '{field}' field. Expand it into a complete, polished version. "
+            f"Preserve the user's core idea and any specific terminology, but produce "
+            f"a substantially more complete result. "
             f"{field_instruction} "
-            f"Output ONLY the refined field value, nothing else."
+            f"Output ONLY the expanded field value, nothing else."
         )
-        temperature = 0.5
+        temperature = 0.6
     else:
         user_msg = f"Generate the '{field}' field for this agent.\n\nAgent context:\n{ctx_summary}"
         system_msg = (
