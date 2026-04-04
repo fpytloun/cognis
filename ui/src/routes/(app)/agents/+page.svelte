@@ -197,7 +197,7 @@
 
     <div class="mt-5 flex flex-wrap gap-2">
       {#if !agent.is_system}
-        <Button size="sm" variant="secondary" onclick={() => goto(`/agents/${agent.agent_id}`)}>Open</Button>
+        <Button size="sm" variant="secondary" onclick={() => goto(`/agents/${agent.agent_id}`)}>Edit</Button>
         <Button size="sm" variant="secondary" onclick={() => toggleStatus(agent)}>{agent.status === 'active' ? 'Suspend' : 'Activate'}</Button>
         {#if agent.agent_type === 'primary'}
           <Button size="sm" variant="secondary" onclick={() => syncPersonality(agent)}>Sync personality</Button>

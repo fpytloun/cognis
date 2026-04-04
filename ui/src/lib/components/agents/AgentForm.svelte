@@ -1,9 +1,11 @@
 <script lang="ts">
+  import { Sparkles, Loader2 } from 'lucide-svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import Card from '$lib/components/ui/Card.svelte';
   import Input from '$lib/components/ui/Input.svelte';
   import AgentAvatar from '$lib/components/AgentAvatar.svelte';
   import AvatarGenerateModal from '$lib/components/agents/AvatarGenerateModal.svelte';
+  import ImageLightbox from '$lib/components/ImageLightbox.svelte';
   import { api } from '$lib/api/client';
   import {
     buildBootstrapPreview,
@@ -56,6 +58,7 @@
 
   let localBindings = $state<string[]>([...secondaryBindings]);
   let showAvatarModal = $state(false);
+  let showAvatarLightbox = $state(false);
   let uploadingAvatar = $state(false);
   let fileInput: HTMLInputElement | undefined = $state();
 
@@ -86,6 +89,32 @@
   function removeAvatar() {
     form.avatarImageId = '';
     form.avatarUrl = '';
+  }
+
+  let generatingField = $state<string | null>(null);
+
+  function fieldContext(): Record<string, string> {
+    return {
+      name: form.name,
+      description: form.description,
+      tone: form.tone,
+      temperament: form.temperament,
+      purpose: form.purpose,
+      behavioral_rules: form.behavioralRules,
+      system_prompt: form.systemPrompt
+    };
+  }
+
+  async function generateField(field: string, getter: () => string, setter: (v: string) => void) {
+    generatingField = field;
+    try {
+      const result = await api.agents.generateField(field, getter(), fieldContext());
+      setter(result.value);
+    } catch (e) {
+      error = e instanceof Error ? e.message : 'Failed to generate field';
+    } finally {
+      generatingField = null;
+    }
   }
 
   function toggleBinding(agentId: string): void {
@@ -280,7 +309,13 @@
           <div class="space-y-2 text-sm font-medium text-slate-200">
             <span>Avatar</span>
             <div class="flex items-center gap-3">
-              <AgentAvatar name={form.name || 'A'} avatarUrl={form.avatarUrl || null} class="h-14 w-14" />
+              {#if form.avatarUrl}
+                <button type="button" class="cursor-pointer" onclick={() => { showAvatarLightbox = true; }} title="View full size">
+                  <AgentAvatar name={form.name || 'A'} avatarUrl={form.avatarUrl} class="h-14 w-14" />
+                </button>
+              {:else}
+                <AgentAvatar name={form.name || 'A'} avatarUrl={null} class="h-14 w-14" />
+              {/if}
               <div class="flex flex-col gap-1.5">
                 {#if !readonly}
                   <div class="flex gap-2">
@@ -321,10 +356,23 @@
             </div>
           </div>
         </div>
-        <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
-          <span>Description</span>
+        <div class="mt-4 space-y-2 text-sm font-medium text-slate-200">
+          <div class="flex items-center justify-between">
+            <span>Description</span>
+            {#if !readonly}
+              <button
+                type="button"
+                class="flex items-center gap-1 text-xs text-sky-400 hover:text-sky-300 disabled:opacity-50"
+                disabled={generatingField === 'description'}
+                onclick={() => generateField('description', () => form.description, (v) => { form.description = v; })}
+                title="Generate with AI"
+              >
+                {#if generatingField === 'description'}<Loader2 class="h-3 w-3 animate-spin" />{:else}<Sparkles class="h-3 w-3" />{/if}
+              </button>
+            {/if}
+          </div>
           <textarea bind:value={form.description} class="min-h-[90px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500" disabled={readonly}></textarea>
-        </label>
+        </div>
       </Card>
 
       <!-- Personality (primary only) -->
@@ -332,23 +380,51 @@
         <Card class="p-5">
           <p class="mb-3 text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Personality</p>
           <div class="grid gap-4 md:grid-cols-3">
-            <label class="space-y-2 text-sm font-medium text-slate-200">
-              <span>Tone</span>
+            <div class="space-y-2 text-sm font-medium text-slate-200">
+              <div class="flex items-center justify-between">
+                <span>Tone</span>
+                {#if !readonly}
+                  <button type="button" class="text-sky-400 hover:text-sky-300 disabled:opacity-50" disabled={generatingField === 'tone'} onclick={() => generateField('tone', () => form.tone, (v) => { form.tone = v; })} title="Generate with AI">
+                    {#if generatingField === 'tone'}<Loader2 class="h-3 w-3 animate-spin" />{:else}<Sparkles class="h-3 w-3" />{/if}
+                  </button>
+                {/if}
+              </div>
               <Input bind:value={form.tone} placeholder="calm, direct, curious" disabled={readonly} />
-            </label>
-            <label class="space-y-2 text-sm font-medium text-slate-200">
-              <span>Temperament</span>
+            </div>
+            <div class="space-y-2 text-sm font-medium text-slate-200">
+              <div class="flex items-center justify-between">
+                <span>Temperament</span>
+                {#if !readonly}
+                  <button type="button" class="text-sky-400 hover:text-sky-300 disabled:opacity-50" disabled={generatingField === 'temperament'} onclick={() => generateField('temperament', () => form.temperament, (v) => { form.temperament = v; })} title="Generate with AI">
+                    {#if generatingField === 'temperament'}<Loader2 class="h-3 w-3 animate-spin" />{:else}<Sparkles class="h-3 w-3" />{/if}
+                  </button>
+                {/if}
+              </div>
               <Input bind:value={form.temperament} placeholder="patient" disabled={readonly} />
-            </label>
-            <label class="space-y-2 text-sm font-medium text-slate-200">
-              <span>Purpose</span>
+            </div>
+            <div class="space-y-2 text-sm font-medium text-slate-200">
+              <div class="flex items-center justify-between">
+                <span>Purpose</span>
+                {#if !readonly}
+                  <button type="button" class="text-sky-400 hover:text-sky-300 disabled:opacity-50" disabled={generatingField === 'purpose'} onclick={() => generateField('purpose', () => form.purpose, (v) => { form.purpose = v; })} title="Generate with AI">
+                    {#if generatingField === 'purpose'}<Loader2 class="h-3 w-3 animate-spin" />{:else}<Sparkles class="h-3 w-3" />{/if}
+                  </button>
+                {/if}
+              </div>
               <Input bind:value={form.purpose} placeholder="research specialist" disabled={readonly} />
-            </label>
+            </div>
           </div>
-          <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
-            <span>Behavioral rules (one per line)</span>
+          <div class="mt-4 space-y-2 text-sm font-medium text-slate-200">
+            <div class="flex items-center justify-between">
+              <span>Behavioral rules (one per line)</span>
+              {#if !readonly}
+                <button type="button" class="flex items-center gap-1 text-xs text-sky-400 hover:text-sky-300 disabled:opacity-50" disabled={generatingField === 'behavioral_rules'} onclick={() => generateField('behavioral_rules', () => form.behavioralRules, (v) => { form.behavioralRules = v; })} title="Generate with AI">
+                  {#if generatingField === 'behavioral_rules'}<Loader2 class="h-3 w-3 animate-spin" />{:else}<Sparkles class="h-3 w-3" />{/if}
+                </button>
+              {/if}
+            </div>
             <textarea bind:value={form.behavioralRules} class="min-h-[110px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500" placeholder="Always cite sources&#10;Prefer concise answers" disabled={readonly}></textarea>
-          </label>
+          </div>
         </Card>
       {/if}
 
@@ -694,4 +770,8 @@
     onAccept={handleAvatarAccept}
     onClose={() => { showAvatarModal = false; }}
   />
+{/if}
+
+{#if showAvatarLightbox && form.avatarUrl}
+  <ImageLightbox src={form.avatarUrl} alt="{form.name} avatar" onClose={() => { showAvatarLightbox = false; }} />
 {/if}

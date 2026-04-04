@@ -81,14 +81,40 @@ class GoogleChatAdapter(BaseChannelAdapter):
         if self._client is None:
             return None
 
-        # message.chat_id is the space name (e.g., "spaces/AAAA")
         payload: dict[str, Any] = {
             "text": message.content,
         }
 
+        # Add image cards for media attachments
+        if message.media:
+            cards: list[dict[str, Any]] = []
+            for media in message.media:
+                if media.url and (media.mime_type or "").startswith("image/"):
+                    cards.append(
+                        {
+                            "sections": [
+                                {
+                                    "widgets": [
+                                        {
+                                            "image": {
+                                                "imageUrl": media.url,
+                                                "altText": media.filename or "image",
+                                            }
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    )
+                elif media.url:
+                    payload["text"] = (
+                        f"{payload.get('text', '')}\n[{media.filename or 'attachment'}]({media.url})"
+                    )
+            if cards:
+                payload["cards"] = cards
+
         if message.thread_id:
             payload["thread"] = {"name": message.thread_id}
-            # Reply in thread
             params = {"messageReplyOption": "REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD"}
         else:
             params = {}

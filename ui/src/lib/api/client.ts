@@ -425,6 +425,13 @@ export const api = {
         method: 'PUT',
         body: JSON.stringify(secondaryAgentIds)
       });
+    },
+
+    generateField(field: string, currentValue: string, context: Record<string, string>): Promise<{ value: string }> {
+      return request<{ value: string }>('/api/v1/agents/generate-field', {
+        method: 'POST',
+        body: JSON.stringify({ field, current_value: currentValue, context })
+      });
     }
   },
 

@@ -124,6 +124,22 @@ class SignalAdapter(BaseChannelAdapter):
         if message.reply_to_id:
             payload["quote_timestamp"] = message.reply_to_id
 
+        # Attach media as base64
+        if message.media:
+            b64_attachments: list[str] = []
+            for media in message.media:
+                if not media.url:
+                    continue
+                try:
+                    async with httpx.AsyncClient(timeout=60.0) as dl:
+                        resp = await dl.get(media.url)
+                        resp.raise_for_status()
+                    b64_attachments.append(base64.b64encode(resp.content).decode("ascii"))
+                except Exception:
+                    logger.warning("signal adapter: media download failed", exc_info=True)
+            if b64_attachments:
+                payload["base64_attachments"] = b64_attachments
+
         resp = await self._client.post("/v2/send", json=payload)
         resp.raise_for_status()
         result = resp.json()

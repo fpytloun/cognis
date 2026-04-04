@@ -146,9 +146,15 @@ class IRCAdapter(BaseChannelAdapter):
         if self._writer is None:
             return None
 
-        # Split long messages for IRC's 512-byte limit
         target = message.chat_id
-        max_content = 400  # Leave room for PRIVMSG prefix
+        max_content = 400
+
+        # Text fallback for media (IRC has no native media support)
+        for media in message.media:
+            note = f"[attachment: {media.filename or 'file'}]"
+            if media.url:
+                note += f" {media.url}"
+            self._send_raw(f"PRIVMSG {target} :{note[:max_content]}")
 
         lines = message.content.split("\n")
         for line in lines:

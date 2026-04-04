@@ -23,6 +23,7 @@ from cognis.models.artifact import ArtifactKind, AttachmentRef
 from cognis.models.channel import (
     ChannelAccountConfig,
     InboundMessage,
+    MediaAttachment,
     OutboundMessage,
 )
 from cognis.models.session import ConversationContext
@@ -485,34 +486,65 @@ class ChannelTurnObserver:
         # Remove self from observers
         self._turn_scheduler_remove()
 
-        if not self._accumulated_text:
-            return
-
         adapter = self._get_adapter()
         if adapter is None:
             return
 
-        # Format and split for channel
-        chunks = format_for_channel(self._accumulated_text, adapter.capabilities)
+        # Extract outbound attachments from the turn result
+        outbound_media: list[MediaAttachment] = []
+        if result is not None:
+            result_attachments = getattr(result, "attachments", None)
+            if isinstance(result_attachments, list):
+                for att in result_attachments:
+                    if isinstance(att, dict):
+                        outbound_media.append(
+                            MediaAttachment(
+                                url=att.get("url"),
+                                mime_type=att.get("mime_type"),
+                                filename=att.get("filename"),
+                                size_bytes=att.get("size_bytes"),
+                            )
+                        )
 
-        for chunk in chunks:
+        # Send text response
+        if self._accumulated_text:
+            chunks = format_for_channel(self._accumulated_text, adapter.capabilities)
+            for chunk in chunks:
+                with contextlib.suppress(Exception):
+                    await adapter.send_message(
+                        OutboundMessage(
+                            channel_type=self._channel_type,
+                            account_id=self._account_id,
+                            chat_id=self._chat_id,
+                            content=chunk,
+                            reply_to_id=self._reply_to_id,
+                            thread_id=self._thread_id,
+                        )
+                    )
+                    CHANNEL_OUTBOUND_TOTAL.labels(
+                        channel_type=self._channel_type,
+                        account_id=self._account_id,
+                    ).inc()
+                    self._reply_to_id = None
+
+        # Send outbound media attachments
+        for media in outbound_media:
             with contextlib.suppress(Exception):
                 await adapter.send_message(
                     OutboundMessage(
                         channel_type=self._channel_type,
                         account_id=self._account_id,
                         chat_id=self._chat_id,
-                        content=chunk,
+                        content="",
                         reply_to_id=self._reply_to_id,
                         thread_id=self._thread_id,
+                        media=[media],
                     )
                 )
                 CHANNEL_OUTBOUND_TOTAL.labels(
                     channel_type=self._channel_type,
                     account_id=self._account_id,
                 ).inc()
-                # Only reply to the original message for the first chunk
-                self._reply_to_id = None
 
     async def on_turn_error(self, conversation_id: str, error: Any) -> None:
         """Send error message to the channel."""

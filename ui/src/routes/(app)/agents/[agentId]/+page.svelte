@@ -43,6 +43,7 @@
     personality_sync_error: null,
     personality_sync_checked_at: null,
     avatar_url: null,
+    avatar_image_id: null,
     agent_type: 'primary',
     is_system: false,
     hidden: false,

@@ -130,6 +130,13 @@ class SlackAdapter(BaseChannelAdapter):
     async def send_message(self, message: OutboundMessage) -> str | None:
         if self._client is None:
             return None
+
+        # Upload media attachments first
+        for media in message.media:
+            await self._send_media(
+                message.chat_id, media, thread_ts=message.thread_id or message.reply_to_id
+            )
+
         payload: dict[str, Any] = {"channel": message.chat_id, "text": message.content}
         if self._agent_name:
             payload["username"] = self._agent_name
@@ -139,6 +146,11 @@ class SlackAdapter(BaseChannelAdapter):
             payload["thread_ts"] = message.thread_id
         if message.reply_to_id:
             payload["thread_ts"] = message.reply_to_id
+
+        # Skip text-only post if we only had media and no meaningful text
+        if not message.content.strip() and message.media:
+            return None
+
         resp = await self._client.post("/chat.postMessage", json=payload)
         resp.raise_for_status()
         data = resp.json()
@@ -149,6 +161,39 @@ class SlackAdapter(BaseChannelAdapter):
             )
             return None
         return data.get("ts")
+
+    async def _send_media(
+        self, channel_id: str, media: MediaAttachment, *, thread_ts: str | None = None
+    ) -> None:
+        if self._client is None or not media.url:
+            return
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as dl:
+                resp = await dl.get(media.url)
+                resp.raise_for_status()
+                content = resp.content
+            upload_payload = {
+                "channels": channel_id,
+                "filename": media.filename or "attachment",
+                "filetype": (media.mime_type or "application/octet-stream").split("/")[-1],
+            }
+            if thread_ts:
+                upload_payload["thread_ts"] = thread_ts
+            files = {
+                "file": (
+                    media.filename or "attachment",
+                    content,
+                    media.mime_type or "application/octet-stream",
+                )
+            }
+            upload_resp = await self._client.post("/files.upload", data=upload_payload, files=files)
+            upload_resp.raise_for_status()
+        except Exception:
+            logger.warning(
+                "slack adapter: media upload failed",
+                extra={"extra_data": {"account_id": self.account_id}},
+                exc_info=True,
+            )
 
     async def sync_profile(self, profile: AgentProfile) -> None:
         self._agent_name = profile.effective_name

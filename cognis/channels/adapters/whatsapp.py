@@ -87,8 +87,15 @@ class WhatsAppAdapter(BaseChannelAdapter):
         await self._stop_event.wait()
 
     async def send_message(self, message: OutboundMessage) -> str | None:
-        """Send a text message via WhatsApp Cloud API."""
+        """Send a message via WhatsApp Cloud API."""
         if self._client is None:
+            return None
+
+        # Send media attachments
+        for media in message.media:
+            await self._send_media(message.chat_id, media, reply_to=message.reply_to_id)
+
+        if not message.content.strip() and message.media:
             return None
 
         payload: dict[str, Any] = {
@@ -109,6 +116,39 @@ class WhatsAppAdapter(BaseChannelAdapter):
         result = resp.json()
         messages = result.get("messages", [])
         return messages[0].get("id") if messages else None
+
+    async def _send_media(
+        self, chat_id: str, media: MediaAttachment, *, reply_to: str | None = None
+    ) -> None:
+        if self._client is None or not media.url:
+            return
+        try:
+            mime = media.mime_type or "application/octet-stream"
+            if mime.startswith("image/"):
+                media_type = "image"
+            elif mime.startswith("video/"):
+                media_type = "video"
+            elif mime.startswith("audio/"):
+                media_type = "audio"
+            else:
+                media_type = "document"
+            payload: dict[str, Any] = {
+                "messaging_product": "whatsapp",
+                "to": chat_id,
+                "type": media_type,
+                media_type: {"link": media.url},
+            }
+            if media.filename and media_type == "document":
+                payload[media_type]["filename"] = media.filename
+            if reply_to:
+                payload["context"] = {"message_id": reply_to}
+            await self._client.post(f"/{self._phone_number_id}/messages", json=payload)
+        except Exception:
+            logger.warning(
+                "whatsapp adapter: media send failed",
+                extra={"extra_data": {"account_id": self.account_id}},
+                exc_info=True,
+            )
 
     async def mark_read(self, chat_id: str, message_id: str) -> None:
         """Mark a message as read."""

@@ -356,6 +356,114 @@ async def delete_agent_avatar(request: Request, agent_id: str) -> dict[str, bool
     return {"ok": ok}
 
 
+_GENERATABLE_FIELDS = {"description", "tone", "temperament", "purpose", "behavioral_rules"}
+
+_FIELD_INSTRUCTIONS: dict[str, str] = {
+    "description": (
+        "Write a concise 1-3 sentence description of this AI agent. "
+        "Describe what it does and what makes it unique."
+    ),
+    "tone": (
+        "Suggest a communication tone for this agent as a short comma-separated list "
+        "of 2-4 adjectives (e.g. 'calm, direct, curious'). "
+        "Match the agent's purpose and personality."
+    ),
+    "temperament": (
+        "Suggest a temperament for this agent as a short comma-separated list "
+        "of 1-3 adjectives (e.g. 'patient, methodical'). "
+        "Match the agent's purpose and personality."
+    ),
+    "purpose": (
+        "Write a concise purpose statement for this agent in 3-8 words "
+        "(e.g. 'research specialist', 'code review and refactoring assistant'). "
+        "Describe the agent's primary role."
+    ),
+    "behavioral_rules": (
+        "Write 3-7 clear behavioral rules for this agent, one per line. "
+        "Each rule should be a concrete, actionable instruction "
+        "(e.g. 'Always cite sources when making claims'). "
+        "Match the agent's purpose and personality."
+    ),
+}
+
+
+@router.post("/generate-field")
+async def generate_agent_field(request: Request) -> dict[str, str]:
+    """Generate or expand an agent field value using the LLM.
+
+    Accepts the field name, its current value (if any), and the full
+    context of all other agent fields. If current_value is non-empty,
+    the LLM expands/refines it rather than generating from scratch.
+    """
+    require_current_user(request)
+    llm = request.app.state.providers.llm
+
+    body = await request.json()
+    field = body.get("field", "")
+    current_value = body.get("current_value", "").strip()
+    context = body.get("context", {})
+
+    if field not in _GENERATABLE_FIELDS:
+        raise api_exception(400, "validation_error", f"Field '{field}' is not generatable")
+
+    # Build context summary from all agent fields
+    ctx_parts: list[str] = []
+    if context.get("name"):
+        ctx_parts.append(f"Agent name: {context['name']}")
+    if context.get("description") and field != "description":
+        ctx_parts.append(f"Description: {context['description']}")
+    if context.get("tone") and field != "tone":
+        ctx_parts.append(f"Tone: {context['tone']}")
+    if context.get("temperament") and field != "temperament":
+        ctx_parts.append(f"Temperament: {context['temperament']}")
+    if context.get("purpose") and field != "purpose":
+        ctx_parts.append(f"Purpose: {context['purpose']}")
+    if context.get("behavioral_rules") and field != "behavioral_rules":
+        ctx_parts.append(f"Behavioral rules:\n{context['behavioral_rules']}")
+    if context.get("system_prompt"):
+        ctx_parts.append(f"System prompt:\n{context['system_prompt']}")
+    ctx_summary = "\n".join(ctx_parts) if ctx_parts else "No other fields set yet."
+
+    field_instruction = _FIELD_INSTRUCTIONS[field]
+
+    if current_value:
+        user_msg = (
+            f"The agent's '{field}' field currently contains:\n\n"
+            f"{current_value}\n\n"
+            f"Expand and refine this into a more complete version. "
+            f"Keep the original intent and meaning, but make it more detailed and professional.\n\n"
+            f"Agent context:\n{ctx_summary}"
+        )
+    else:
+        user_msg = f"Generate the '{field}' field for this agent.\n\nAgent context:\n{ctx_summary}"
+
+    system_msg = (
+        f"You are helping configure an AI agent. {field_instruction} "
+        f"Output ONLY the field value, nothing else. No quotes, no field name prefix, "
+        f"no explanation."
+    )
+
+    try:
+        response = await llm.generate(
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            task_type="default",
+            temperature=0.8,
+            max_tokens=500,
+        )
+        choices = response.get("choices", [])
+        if choices:
+            value = choices[0].get("message", {}).get("content", "").strip()
+            if value:
+                return {"value": value}
+    except Exception:
+        logger.warning("Agent field generation failed", exc_info=True)
+
+    raise api_exception(502, "provider_error", "Failed to generate field value")
+
+
 @router.get("/{agent_id}/bindings", response_model=list[str])
 async def list_agent_bindings(request: Request, agent_id: str) -> list[str]:
     """List secondary agent IDs bound to a primary agent."""

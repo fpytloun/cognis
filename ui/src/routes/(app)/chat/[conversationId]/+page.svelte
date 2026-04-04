@@ -5,6 +5,7 @@
   import { ArrowDown, ArrowLeft, ChevronsLeft, ChevronsRight, Search, Copy, Check, Info, Paperclip, X } from 'lucide-svelte';
 
   import AgentAvatar from '$lib/components/AgentAvatar.svelte';
+  import AgentProfilePopover from '$lib/components/AgentProfilePopover.svelte';
   import ChatMessage from '$lib/components/ChatMessage.svelte';
   import CompactionCard from '$lib/components/CompactionCard.svelte';
   import DelegationCard from '$lib/components/DelegationCard.svelte';
@@ -44,6 +45,8 @@
   let composerElement: HTMLTextAreaElement | null = null;
   let attachmentInput: HTMLInputElement | null = null;
   let composerAttachments: AttachmentRef[] = [];
+  let showDropZone = $state(false);
+  let dragCounter = 0;
   let selectedAgentId = '';
   let archivingConversation = false;
   let deletingConversation = false;
@@ -51,7 +54,7 @@
   let enterToSend = true;
   let queuedCount = 0;
   let timeline: TimelineItem[] = [];
-  let visibleConversations: Conversation[] = [];
+
   let visibleStartIndex = 0;
   let activeConversationId = '';
   let escalationTimeoutSeconds = 300;
@@ -66,6 +69,7 @@
   let editingTitle = false;
   let editTitleValue = '';
   let sessionIdCopied = false;
+  let showAgentProfile = false;
   let subSessionPanelOpen = false;
   let subSessionClosing = false;
   let subSessionId = '';
@@ -688,22 +692,71 @@
     wsClient.sendMessage(currentConversation.conversation_id, content, attachments);
   }
 
+  async function uploadFiles(files: File[]): Promise<void> {
+    if (files.length === 0) return;
+    try {
+      const uploaded = await Promise.all(files.map((file) => api.artifacts.upload(file)));
+      composerAttachments = [...composerAttachments, ...uploaded];
+      addToast(files.length === 1 ? 'Attachment uploaded.' : `${files.length} attachments uploaded.`, 'success');
+    } catch (caughtError) {
+      addToast(asApiError(caughtError).message, 'error', 4000, 'Unable to upload attachment');
+    }
+  }
+
   async function handleAttachmentSelect(event: Event): Promise<void> {
     const files = (event.currentTarget as HTMLInputElement).files;
     if (!files || files.length === 0) return;
-    try {
-      const uploaded = await Promise.all(Array.from(files).map((file) => api.artifacts.upload(file)));
-      composerAttachments = [...composerAttachments, ...uploaded];
-      addToast('Attachment uploaded.', 'success');
-    } catch (caughtError) {
-      addToast(asApiError(caughtError).message, 'error', 4000, 'Unable to upload attachment');
-    } finally {
-      if (attachmentInput) attachmentInput.value = '';
-    }
+    await uploadFiles(Array.from(files));
+    if (attachmentInput) attachmentInput.value = '';
   }
 
   function removeAttachment(artifactId: string): void {
     composerAttachments = composerAttachments.filter((item) => item.artifact_id !== artifactId);
+  }
+
+  function handleDragEnter(event: DragEvent): void {
+    event.preventDefault();
+    dragCounter++;
+    if (dragCounter === 1) showDropZone = true;
+  }
+
+  function handleDragLeave(event: DragEvent): void {
+    event.preventDefault();
+    dragCounter--;
+    if (dragCounter <= 0) {
+      dragCounter = 0;
+      showDropZone = false;
+    }
+  }
+
+  function handleDragOver(event: DragEvent): void {
+    event.preventDefault();
+  }
+
+  async function handleDrop(event: DragEvent): Promise<void> {
+    event.preventDefault();
+    dragCounter = 0;
+    showDropZone = false;
+    const files = event.dataTransfer?.files;
+    if (files && files.length > 0) {
+      await uploadFiles(Array.from(files));
+    }
+  }
+
+  async function handlePaste(event: ClipboardEvent): Promise<void> {
+    const items = event.clipboardData?.items;
+    if (!items) return;
+    const files: File[] = [];
+    for (const item of items) {
+      if (item.kind === 'file') {
+        const file = item.getAsFile();
+        if (file) files.push(file);
+      }
+    }
+    if (files.length > 0) {
+      event.preventDefault();
+      await uploadFiles(files);
+    }
   }
 
   async function retryLastTurn(): Promise<void> {
@@ -973,12 +1026,25 @@
     }, 250);
   }
 
-  $: if ($page.params.conversationId && $page.params.conversationId !== activeConversationId) {
-    void openConversation($page.params.conversationId);
-  }
+  $effect(() => {
+    if ($page.params.conversationId && $page.params.conversationId !== activeConversationId) {
+      void openConversation($page.params.conversationId);
+    }
+  });
 
-  $: visibleConversations = filteredConversations();
-  $: displayedTimeline = timeline.slice(visibleStartIndex);
+  let visibleConversationList = $derived.by(() => {
+    let list = conversations;
+    if (selectedAgentId && selectedAgentId !== 'all') {
+      list = list.filter((c) => c.agent_id === selectedAgentId);
+    }
+    const query = conversationSearch.trim().toLowerCase();
+    if (query) {
+      list = list.filter((c) => conversationTitle(c).toLowerCase().includes(query));
+    }
+    return list;
+  });
+
+  let displayedTimeline = $derived(timeline.slice(visibleStartIndex));
 
   onMount(() => {
     restoreEnterToSendPreference();
@@ -1091,12 +1157,12 @@
       <!-- Scrollable middle: conversation list -->
       <div class="min-h-0 flex-1 overflow-y-auto px-4 py-2">
         <div class="space-y-1">
-          {#if visibleConversations.length === 0}
+          {#if visibleConversationList.length === 0}
             <p class="rounded-2xl border border-dashed border-slate-700 px-4 py-6 text-center text-sm text-slate-400">
               No conversations found.
             </p>
           {:else}
-            {#each visibleConversations as conversation}
+            {#each visibleConversationList as conversation}
               {@const agent = conversationAgent(conversation)}
               {@const isActive = conversation.conversation_id === currentConversation?.conversation_id}
               {@const unread = conversation.has_unread && !isActive}
@@ -1149,7 +1215,22 @@
     </aside>
 
     <!-- Main chat area -->
-    <section class={`${mobileListOpen && currentConversation ? 'hidden' : 'flex'} relative min-h-0 flex-col rounded-3xl border border-slate-800/80 bg-slate-900/70 shadow-card backdrop-blur xl:flex`}>
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <section
+      class={`${mobileListOpen && currentConversation ? 'hidden' : 'flex'} relative min-h-0 flex-col rounded-3xl border border-slate-800/80 bg-slate-900/70 shadow-card backdrop-blur xl:flex`}
+      ondragenter={handleDragEnter}
+      ondragleave={handleDragLeave}
+      ondragover={handleDragOver}
+      ondrop={(event) => void handleDrop(event)}
+    >
+      {#if showDropZone}
+        <div class="pointer-events-none absolute inset-0 z-50 flex items-center justify-center rounded-3xl border-2 border-dashed border-sky-400 bg-sky-500/10 backdrop-blur-sm">
+          <div class="rounded-2xl bg-slate-900/90 px-6 py-4 text-center">
+            <p class="text-lg font-medium text-sky-300">Drop files here to attach</p>
+            <p class="mt-1 text-sm text-slate-400">Images, PDFs, audio, and other files</p>
+          </div>
+        </div>
+      {/if}
       <!-- Header -->
       <div class="border-b border-slate-800/80 px-5 py-4">
         <div class="flex flex-wrap items-start justify-between gap-3">
@@ -1199,9 +1280,18 @@
               {#if currentConversation}
                 {@const agent = conversationAgent(currentConversation)}
                 {#if agent}
-                  <div class="flex items-center gap-1.5">
-                    <AgentAvatar name={agent.display_name ?? agent.name} avatarUrl={agent.avatar_url ?? null} class="h-5 w-5" />
-                    <span>{agent.display_name ?? agent.name}</span>
+                  <div class="relative">
+                    <button
+                      type="button"
+                      class="flex items-center gap-1.5 rounded-lg px-1 py-0.5 transition hover:bg-slate-800"
+                      onclick={() => { showAgentProfile = !showAgentProfile; }}
+                    >
+                      <AgentAvatar name={agent.display_name ?? agent.name} avatarUrl={agent.avatar_url ?? null} class="h-5 w-5" />
+                      <span>{agent.display_name ?? agent.name}</span>
+                    </button>
+                    {#if showAgentProfile}
+                      <AgentProfilePopover {agent} onClose={() => { showAgentProfile = false; }} />
+                    {/if}
                   </div>
                 {/if}
 
@@ -1461,6 +1551,7 @@
               disabled={!currentConversation || isReadOnly(currentConversation) || isLlmUnavailableForSetup()}
               onkeydown={handleComposerKeydown}
               oninput={updateSlashSuggestions}
+              onpaste={(event) => void handlePaste(event)}
               placeholder={isLlmUnavailableForSetup() ? 'Configure an LLM provider to start chatting.' : 'Send a message to Cognis...'}
             ></textarea>
             <div class="flex flex-wrap items-center justify-between gap-3">

@@ -129,6 +129,13 @@ class MatrixAdapter(BaseChannelAdapter):
 
         import uuid
 
+        # Send media attachments first
+        for media in message.media:
+            await self._send_media(message.chat_id, media, thread_id=message.thread_id)
+
+        if not message.content.strip() and message.media:
+            return None
+
         txn_id = uuid.uuid4().hex
 
         content: dict[str, Any] = {
@@ -136,12 +143,10 @@ class MatrixAdapter(BaseChannelAdapter):
             "body": message.content,
         }
 
-        # Add formatted body for markdown
         if self.capabilities.supports_markdown:
             content["format"] = "org.matrix.custom.html"
-            content["formatted_body"] = message.content  # Could convert MD→HTML
+            content["formatted_body"] = message.content
 
-        # Thread support
         if message.thread_id:
             content["m.relates_to"] = {
                 "rel_type": "m.thread",
@@ -159,6 +164,50 @@ class MatrixAdapter(BaseChannelAdapter):
         resp.raise_for_status()
         result = resp.json()
         return result.get("event_id")
+
+    async def _send_media(
+        self, room_id: str, media: MediaAttachment, *, thread_id: str | None = None
+    ) -> None:
+        if self._client is None or not media.url:
+            return
+        try:
+            import uuid as uuid_mod
+
+            async with httpx.AsyncClient(timeout=60.0) as dl:
+                resp = await dl.get(media.url)
+                resp.raise_for_status()
+                file_content = resp.content
+            mime = media.mime_type or "application/octet-stream"
+            upload_resp = await self._client.post(
+                "/_matrix/media/v3/upload",
+                content=file_content,
+                headers={"Content-Type": mime},
+                params={"filename": media.filename or "attachment"},
+            )
+            upload_resp.raise_for_status()
+            mxc_url = upload_resp.json().get("content_uri")
+            if not mxc_url:
+                return
+            msgtype = "m.image" if mime.startswith("image/") else "m.file"
+            event_content: dict[str, Any] = {
+                "msgtype": msgtype,
+                "body": media.filename or "attachment",
+                "url": mxc_url,
+                "info": {"mimetype": mime, "size": len(file_content)},
+            }
+            if thread_id:
+                event_content["m.relates_to"] = {"rel_type": "m.thread", "event_id": thread_id}
+            txn = uuid_mod.uuid4().hex
+            await self._client.put(
+                f"/_matrix/client/v3/rooms/{room_id}/send/m.room.message/{txn}",
+                json=event_content,
+            )
+        except Exception:
+            logger.warning(
+                "matrix adapter: media send failed",
+                extra={"extra_data": {"account_id": self.account_id}},
+                exc_info=True,
+            )
 
     async def sync_profile(self, profile: AgentProfile) -> None:
         if self._client is None:

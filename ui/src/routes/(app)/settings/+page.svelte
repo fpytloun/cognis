@@ -55,7 +55,7 @@
   let notice = '';
   let settings: SettingsCategory[] = [];
   let providers: LLMProvider[] = [];
-  let modelRouting: ModelRouting = { default: null, classifier: null, compaction: null, simple_inline: null, items: {} };
+  let modelRouting: ModelRouting = { default: null, classifier: null, compaction: null, simple_inline: null, image_generation: null, items: {} };
   let secrets: SecretMetadata[] = [];
   let health: HealthResponse | null = null;
   let diagnostics: SystemDiagnostics | null = null;

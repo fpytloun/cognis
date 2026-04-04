@@ -12,6 +12,8 @@ The ChannelManager:
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from typing import Any
 
 from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -70,6 +72,8 @@ class ChannelManager:
         self._configs: dict[str, ChannelAccountConfig] = {}
         # account_id → cached AgentProfile
         self._agent_profiles: dict[str, AgentProfile] = {}
+        self._avatar_refresh_task: asyncio.Task[None] | None = None
+        self._avatar_refresh_interval = 4 * 3600  # 4 hours
 
         # Subscribe to agent profile updates
         event_bus.subscribe(EventType.AGENT_PROFILE_UPDATED, self._handle_agent_profile_updated)
@@ -102,6 +106,15 @@ class ChannelManager:
                     },
                 )
 
+        # Start periodic avatar URL refresh
+        if self._avatar_refresh_task is not None:
+            self._avatar_refresh_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._avatar_refresh_task
+        self._avatar_refresh_task = asyncio.create_task(
+            self._avatar_refresh_loop(), name="channel-avatar-refresh"
+        )
+
         logger.info(
             "channel manager: startup complete",
             extra={"extra_data": {"started": started, "total": len(rows)}},
@@ -109,6 +122,11 @@ class ChannelManager:
 
     async def stop_all(self) -> None:
         """Stop all running adapters."""
+        if self._avatar_refresh_task is not None:
+            self._avatar_refresh_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._avatar_refresh_task
+            self._avatar_refresh_task = None
         for account_id in list(self._adapters.keys()):
             try:
                 await self.stop_account(account_id)
@@ -523,6 +541,30 @@ class ChannelManager:
     def get_agent_profile(self, account_id: str) -> AgentProfile | None:
         """Return the cached agent profile for an account."""
         return self._agent_profiles.get(account_id)
+
+    async def _avatar_refresh_loop(self) -> None:
+        """Periodically re-sign avatar URLs so they don't expire."""
+        while True:
+            await asyncio.sleep(self._avatar_refresh_interval)
+            for account_id, profile in list(self._agent_profiles.items()):
+                if not profile.avatar_url:
+                    continue
+                config = self._configs.get(account_id)
+                adapter = self._adapters.get(account_id)
+                if config is None or adapter is None:
+                    continue
+                try:
+                    refreshed = await self._resolve_agent_profile(config.agent_id)
+                    if refreshed is None:
+                        continue
+                    self._agent_profiles[account_id] = refreshed
+                    await adapter.sync_profile(refreshed)
+                except Exception:
+                    logger.debug(
+                        "channel manager: avatar URL refresh failed",
+                        extra={"extra_data": {"account_id": account_id}},
+                        exc_info=True,
+                    )
 
     async def stop_executor_channels(self, executor_id: str) -> None:
         """Stop all channel accounts hosted on a disconnected executor.

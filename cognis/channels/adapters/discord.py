@@ -200,12 +200,52 @@ class DiscordAdapter(BaseChannelAdapter):
     async def send_message(self, message: OutboundMessage) -> str | None:
         if self._rest_client is None:
             return None
+
+        if message.media:
+            return await self._send_with_attachments(message)
+
         payload: dict[str, Any] = {"content": message.content}
         if message.reply_to_id:
             payload["message_reference"] = {"message_id": message.reply_to_id}
         resp = await self._rest_client.post(f"/channels/{message.chat_id}/messages", json=payload)
         resp.raise_for_status()
         return resp.json().get("id")
+
+    async def _send_with_attachments(self, message: OutboundMessage) -> str | None:
+        if self._rest_client is None:
+            return None
+        try:
+            files: dict[str, tuple[str, bytes, str]] = {}
+            for idx, media in enumerate(message.media):
+                if not media.url:
+                    continue
+                async with httpx.AsyncClient(timeout=60.0) as dl:
+                    resp = await dl.get(media.url)
+                    resp.raise_for_status()
+                files[f"files[{idx}]"] = (
+                    media.filename or f"attachment_{idx}",
+                    resp.content,
+                    media.mime_type or "application/octet-stream",
+                )
+            if not files:
+                return None
+            data: dict[str, Any] = {}
+            if message.content.strip():
+                data["payload_json"] = json.dumps({"content": message.content})
+            resp = await self._rest_client.post(
+                f"/channels/{message.chat_id}/messages",
+                data=data,
+                files=files,
+            )
+            resp.raise_for_status()
+            return resp.json().get("id")
+        except Exception:
+            logger.warning(
+                "discord adapter: media send failed",
+                extra={"extra_data": {"account_id": self.account_id}},
+                exc_info=True,
+            )
+            return None
 
     async def sync_profile(self, profile: AgentProfile) -> None:
         if self._rest_client is None:

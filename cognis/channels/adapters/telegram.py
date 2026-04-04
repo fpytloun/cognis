@@ -115,6 +115,13 @@ class TelegramAdapter(BaseChannelAdapter):
         if self._client is None:
             return None
 
+        # Send media attachments first
+        for media in message.media:
+            await self._send_media(message.chat_id, media, reply_to=message.reply_to_id)
+
+        if not message.content.strip() and message.media:
+            return None
+
         payload: dict[str, Any] = {
             "chat_id": message.chat_id,
             "text": message.content,
@@ -126,7 +133,6 @@ class TelegramAdapter(BaseChannelAdapter):
 
         try:
             resp = await self._client.post("/sendMessage", json=payload)
-            # If markdown parsing fails, retry without parse_mode
             if resp.status_code == 400:
                 payload.pop("parse_mode", None)
                 resp = await self._client.post("/sendMessage", json=payload)
@@ -139,6 +145,42 @@ class TelegramAdapter(BaseChannelAdapter):
                 extra={"extra_data": {"account_id": self.account_id}},
             )
             return None
+
+    async def _send_media(
+        self, chat_id: str, media: MediaAttachment, *, reply_to: str | None = None
+    ) -> None:
+        if self._client is None or not media.url:
+            return
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as dl:
+                resp = await dl.get(media.url)
+                resp.raise_for_status()
+                content = resp.content
+            mime = media.mime_type or "application/octet-stream"
+            filename = media.filename or "attachment"
+            files = {"document": (filename, content, mime)}
+            data: dict[str, Any] = {"chat_id": chat_id}
+            if reply_to:
+                data["reply_to_message_id"] = reply_to
+
+            if mime.startswith("image/"):
+                files = {"photo": (filename, content, mime)}
+                resp = await self._client.post("/sendPhoto", data=data, files=files)
+            elif mime.startswith("audio/"):
+                files = {"audio": (filename, content, mime)}
+                resp = await self._client.post("/sendAudio", data=data, files=files)
+            elif mime.startswith("video/"):
+                files = {"video": (filename, content, mime)}
+                resp = await self._client.post("/sendVideo", data=data, files=files)
+            else:
+                resp = await self._client.post("/sendDocument", data=data, files=files)
+            resp.raise_for_status()
+        except Exception:
+            logger.warning(
+                "telegram adapter: media send failed",
+                extra={"extra_data": {"account_id": self.account_id}},
+                exc_info=True,
+            )
 
     async def sync_profile(self, profile: AgentProfile) -> None:
         if self._client is None:
