@@ -10,7 +10,7 @@ from fastapi import APIRouter, Query, Request
 
 from cognis.api.common import api_exception, forbid_mutation_for_viewer, require_owner_or_admin
 from cognis.api.models import SessionCancelResponse, SessionEventsResponse, SessionResponse
-from cognis.api.serializers import event_to_response, session_to_response
+from cognis.api.serializers import serialize_event_rows, session_to_response
 from cognis.store.queries import get_session_row, set_session_status
 
 logger = logging.getLogger(__name__)
@@ -72,10 +72,25 @@ async def session_events(
         session_id=row.intaris_session_id or row.session_id,
         after_seq=after_seq,
         limit=limit,
+        allow_missing_stream=True,
     )
+    if result.missing_stream_fallback_used:
+        logger.warning(
+            "Session history missing in Intaris; returning empty history",
+            extra={
+                "extra_data": {
+                    "session_id": row.session_id,
+                    "intaris_session_id": row.intaris_session_id or row.session_id,
+                }
+            },
+        )
     return SessionEventsResponse(
         session_id=session_id,
-        items=[event_to_response(item) for item in result.events],
+        items=serialize_event_rows(
+            result.events,
+            log_label="session_events",
+            log_context={"session_id": row.session_id},
+        ),
         last_seq=result.last_seq,
         has_more=result.has_more,
     )

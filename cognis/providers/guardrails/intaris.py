@@ -361,7 +361,12 @@ class IntarisProvider:
                         "intaris: read_events 404 — new session, returning empty",
                         extra={"extra_data": {"session_id": session_id}},
                     )
-                    return EventReadResult(events=[], last_seq=0, has_more=False)
+                    return EventReadResult(
+                        events=[],
+                        last_seq=0,
+                        has_more=False,
+                        missing_stream_fallback_used=True,
+                    )
                 logger.warning(
                     "intaris: read_events 404 — event stream not found",
                     extra={"extra_data": {"session_id": session_id, "after_seq": after_seq}},

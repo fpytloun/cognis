@@ -101,6 +101,7 @@ class EventReadResult(BaseModel):
     events: list[dict[str, Any]]
     last_seq: int
     has_more: bool
+    missing_stream_fallback_used: bool = False
 
 
 class IntarisSession(BaseModel):

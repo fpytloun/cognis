@@ -14,7 +14,9 @@
   const codeCopyResetTimers = new Map<string, number>();
 
   function sizeClass(): string {
-    return item.role === 'assistant' ? 'w-full min-w-0' : 'max-w-[80%]';
+    return item.role === 'assistant'
+      ? 'w-full min-w-0 xl:max-w-3xl'
+      : 'w-full min-w-0 sm:max-w-[88%] xl:max-w-2xl';
   }
 
   onMount(() => {
@@ -132,7 +134,7 @@
   }
 </script>
 
-<article class={`rounded-3xl px-4 py-3 shadow-card overflow-hidden ${sizeClass()} ${bubbleClass()}`}>
+<article class={`overflow-hidden rounded-[1.4rem] px-3 py-2.5 shadow-card sm:rounded-3xl sm:px-4 sm:py-3 ${sizeClass()} ${bubbleClass()}`}>
   {#if item.html}
     <div use:addCodeCopyButtons={item.html} class={`chat-markdown prose max-w-none overflow-x-auto break-words prose-pre:overflow-x-auto ${proseClass()}`}>{@html item.html}</div>
   {:else}
@@ -159,8 +161,8 @@
     </div>
   {/if}
 
-  <div class="mt-3 flex items-center justify-between gap-4 text-[11px] uppercase tracking-[0.2em] opacity-70">
-    <div class="flex items-center gap-3">
+  <div class="mt-2.5 flex items-center justify-between gap-3 text-[10px] uppercase tracking-[0.18em] opacity-70 sm:mt-3 sm:text-[11px]">
+    <div class="flex items-center gap-2 sm:gap-3">
       <span>{item.role}</span>
       <span title={formatAbsoluteTime(item.timestamp)}>{formatCompactTime(item.timestamp, now)}</span>
     </div>

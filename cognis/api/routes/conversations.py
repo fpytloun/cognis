@@ -26,7 +26,11 @@ from cognis.api.models import (
     SessionEventsResponse,
     SessionResponse,
 )
-from cognis.api.serializers import conversation_to_response, event_to_response, session_to_response
+from cognis.api.serializers import (
+    conversation_to_response,
+    serialize_event_rows,
+    session_to_response,
+)
 from cognis.core.turn_scheduler import TurnError
 from cognis.logging import get_logger
 from cognis.models.session import ConversationContext
@@ -255,7 +259,19 @@ async def conversation_messages(
         session_id=session_row.intaris_session_id or session_row.session_id,
         after_seq=after_seq,
         limit=limit,
+        allow_missing_stream=True,
     )
+    if event_result.missing_stream_fallback_used:
+        logger.warning(
+            "Conversation history missing in Intaris; returning empty history",
+            extra={
+                "extra_data": {
+                    "conversation_id": conversation_id,
+                    "session_id": session_row.session_id,
+                    "intaris_session_id": session_row.intaris_session_id or session_row.session_id,
+                }
+            },
+        )
 
     artifact_store = request.app.state.artifact_store
     async with request.app.state.session_factory() as artifact_session:
@@ -289,7 +305,14 @@ async def conversation_messages(
                 )
             data["attachments"] = refreshed
     return MessageHistoryResponse(
-        items=[event_to_response(item) for item in event_result.events],
+        items=serialize_event_rows(
+            event_result.events,
+            log_label="conversation_messages",
+            log_context={
+                "conversation_id": conversation_id,
+                "session_id": session_row.session_id,
+            },
+        ),
         last_seq=event_result.last_seq,
         has_more=event_result.has_more,
     )
@@ -513,10 +536,29 @@ async def session_events(
         session_id=session_row.intaris_session_id or session_row.session_id,
         after_seq=after_seq,
         limit=limit,
+        allow_missing_stream=True,
     )
+    if event_result.missing_stream_fallback_used:
+        logger.warning(
+            "Conversation session history missing in Intaris; returning empty history",
+            extra={
+                "extra_data": {
+                    "conversation_id": conversation_id,
+                    "session_id": session_row.session_id,
+                    "intaris_session_id": session_row.intaris_session_id or session_row.session_id,
+                }
+            },
+        )
     return SessionEventsResponse(
         session_id=session_id,
-        items=[event_to_response(item) for item in event_result.events],
+        items=serialize_event_rows(
+            event_result.events,
+            log_label="conversation_session_events",
+            log_context={
+                "conversation_id": conversation_id,
+                "session_id": session_row.session_id,
+            },
+        ),
         last_seq=event_result.last_seq,
         has_more=event_result.has_more,
     )

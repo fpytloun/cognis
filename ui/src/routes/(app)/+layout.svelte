@@ -233,8 +233,8 @@
   <ToastViewport />
   <ConfirmDialog />
   <ShortcutHelp />
-  <div class="h-screen overflow-hidden">
-    <div class="mx-auto flex h-screen max-w-[1600px] gap-6 overflow-hidden px-4 py-4 lg:px-6">
+  <div class="min-h-[100dvh] overflow-hidden">
+    <div class="mx-auto flex min-h-[100dvh] max-w-[1600px] gap-3 overflow-hidden px-2 py-2 sm:px-3 sm:py-3 lg:gap-6 lg:px-6 lg:py-4">
       <!-- svelte-ignore a11y_no_static_element_interactions -->
       <aside
         class={`hidden shrink-0 overflow-hidden whitespace-nowrap rounded-3xl border border-slate-800/80 bg-slate-900/80 shadow-card backdrop-blur transition-all duration-200 ease-in-out md:flex md:flex-col md:justify-between ${sidebarExpanded ? 'w-72 p-5' : 'w-16 p-3'}`}
@@ -294,8 +294,8 @@
         </div>
       </aside>
 
-      <main class="flex h-[calc(100vh-2rem)] min-w-0 flex-1 flex-col gap-4 overflow-hidden rounded-3xl border border-slate-800/80 bg-slate-950/70 p-4 shadow-card backdrop-blur lg:p-6" id="main-content">
-        <header class="flex flex-col gap-3 rounded-2xl border border-slate-800/80 bg-slate-900/80 px-4 py-4 sm:flex-row sm:items-center sm:justify-between">
+      <main class="flex min-h-0 flex-1 flex-col gap-3 overflow-hidden rounded-[1.75rem] border border-slate-800/80 bg-slate-950/70 p-3 shadow-card backdrop-blur sm:rounded-3xl sm:p-4 lg:gap-4 lg:p-6" id="main-content">
+        <header class="flex flex-col gap-3 rounded-2xl border border-slate-800/80 bg-slate-900/80 px-3 py-3 sm:flex-row sm:items-center sm:justify-between sm:px-4 sm:py-4">
           <div>
             <p class="text-sm font-medium uppercase tracking-[0.25em] text-slate-400">Cognis</p>
             <h2 class="mt-1 text-xl font-semibold text-white">{currentTitle($page.url.pathname)}</h2>
@@ -366,9 +366,9 @@
           </div>
         {/if}
 
-        <div class="min-h-0 flex-1 overflow-y-auto">
-          <slot />
-        </div>
+          <div class="min-h-0 flex-1 overflow-y-auto">
+            <slot />
+          </div>
       </main>
     </div>
   </div>

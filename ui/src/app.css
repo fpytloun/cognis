@@ -14,10 +14,17 @@ body,
 
 body {
   @apply bg-slate-950 text-slate-100 antialiased;
+  min-height: 100dvh;
   background-image:
     radial-gradient(circle at top left, rgb(59 130 246 / 0.18), transparent 28%),
     radial-gradient(circle at top right, rgb(14 165 233 / 0.12), transparent 24%),
     linear-gradient(180deg, rgb(2 6 23) 0%, rgb(15 23 42) 100%);
+}
+
+@supports (padding: max(0px)) {
+  body {
+    padding-bottom: env(safe-area-inset-bottom, 0);
+  }
 }
 
 .skip-link {
@@ -92,4 +99,16 @@ textarea:focus-visible,
 .chat-code-copy-button svg {
   width: 0.85rem;
   height: 0.85rem;
+}
+
+@media (max-width: 640px) {
+  .chat-markdown pre {
+    padding-top: 2.5rem;
+  }
+
+  .chat-code-copy-button {
+    top: 0.55rem;
+    right: 0.55rem;
+    padding: 0.25rem 0.45rem;
+  }
 }

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+from collections.abc import Mapping
 from datetime import datetime
 from typing import Any
 
@@ -27,8 +28,11 @@ from cognis.api.models import (
     WorkflowResponse,
     WorkflowRunResponse,
 )
+from cognis.logging import get_logger
 from cognis.models.task import TaskModel
 from cognis.models.workflow import Workflow
+
+logger = get_logger(__name__)
 
 
 def conversation_to_response(row: Any) -> ConversationResponse:
@@ -295,13 +299,36 @@ def pending_pause_to_response(pause: Any | None) -> PendingPauseResponse | None:
     )
 
 
-def event_to_response(row: dict[str, Any]) -> MessageEventResponse:
+def event_to_response(row: Mapping[str, Any]) -> MessageEventResponse:
+    data = row.get("data", {})
+    normalized_data = dict(data) if isinstance(data, Mapping) else {}
     return MessageEventResponse(
         seq=row.get("seq"),
         type=str(row.get("type", "")),
-        data=dict(row.get("data", {})),
-        timestamp=row.get("ts"),
+        data=normalized_data,
+        timestamp=row.get("ts") or row.get("timestamp"),
     )
+
+
+def serialize_event_rows(
+    rows: list[object],
+    *,
+    log_label: str,
+    log_context: dict[str, Any],
+) -> list[MessageEventResponse]:
+    responses: list[MessageEventResponse] = []
+    skipped_rows = 0
+    for row in rows:
+        if not isinstance(row, Mapping):
+            skipped_rows += 1
+            continue
+        responses.append(event_to_response(row))
+    if skipped_rows:
+        logger.warning(
+            "Skipped malformed event rows during API serialization",
+            extra={"extra_data": {**log_context, "route": log_label, "skipped_rows": skipped_rows}},
+        )
+    return responses
 
 
 def escalation_to_response(row: Any) -> EscalationResponse:

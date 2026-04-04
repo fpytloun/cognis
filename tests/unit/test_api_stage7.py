@@ -583,6 +583,325 @@ def test_session_events_are_proxied(monkeypatch: object, tmp_path: Path) -> None
         assert body["items"][0]["type"] == "assistant_message"
 
 
+def test_conversation_messages_returns_empty_when_stream_missing(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> tuple[str, str]:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                conversation = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                    title="Conversation",
+                )
+                session_row = await create_session(
+                    session,
+                    conversation_id=conversation.conversation_id,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                )
+                await set_session_intaris_session_id(
+                    session, session_row.session_id, session_row.session_id
+                )
+                await update_conversation_active_session(
+                    session, conversation.conversation_id, session_row.session_id
+                )
+                await session.commit()
+                return conversation.conversation_id, session_row.session_id
+
+        conversation_id, _session_id = asyncio.run(_seed())
+
+        async def _fake_read_events(
+            session_id: str,
+            after_seq: int = 0,
+            limit: int = 0,
+            allow_missing_stream: bool = False,
+            **_: object,
+        ) -> EventReadResult:
+            assert session_id
+            assert after_seq == 7
+            assert limit == 25
+            assert allow_missing_stream is True
+            return EventReadResult(
+                events=[],
+                last_seq=0,
+                has_more=False,
+                missing_stream_fallback_used=True,
+            )
+
+        app.state.providers.guardrails.read_events = _fake_read_events
+
+        response = client.get(
+            f"/api/v1/conversations/{conversation_id}/messages?after_seq=7&limit=25",
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+        assert response.status_code == 200
+        assert response.json() == {"items": [], "last_seq": 0, "has_more": False}
+
+
+def test_conversation_session_events_skip_malformed_rows(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> tuple[str, str]:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                conversation = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                    title="Conversation",
+                )
+                session_row = await create_session(
+                    session,
+                    conversation_id=conversation.conversation_id,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                )
+                await set_session_intaris_session_id(
+                    session, session_row.session_id, session_row.session_id
+                )
+                await update_conversation_active_session(
+                    session, conversation.conversation_id, session_row.session_id
+                )
+                await session.commit()
+                return conversation.conversation_id, session_row.session_id
+
+        conversation_id, session_id = asyncio.run(_seed())
+
+        async def _fake_read_events(
+            session_id: str,
+            after_seq: int = 0,
+            limit: int = 0,
+            allow_missing_stream: bool = False,
+            **_: object,
+        ) -> object:
+            assert session_id
+            assert allow_missing_stream is True
+            return type(
+                "EventRead",
+                (),
+                {
+                    "events": [
+                        {
+                            "seq": 1,
+                            "type": "assistant_message",
+                            "data": {"content": "hello"},
+                            "ts": "2026-03-28T00:00:00Z",
+                        },
+                        ["broken"],
+                    ],
+                    "last_seq": 1,
+                    "has_more": False,
+                    "missing_stream_fallback_used": False,
+                },
+            )()
+
+        app.state.providers.guardrails.read_events = _fake_read_events
+
+        response = client.get(
+            f"/api/v1/conversations/{conversation_id}/sessions/{session_id}/events",
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["session_id"] == session_id
+        assert len(body["items"]) == 1
+        assert body["items"][0]["type"] == "assistant_message"
+
+
+def test_conversation_session_events_return_empty_when_stream_missing(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> tuple[str, str]:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                conversation = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                    title="Conversation",
+                )
+                session_row = await create_session(
+                    session,
+                    conversation_id=conversation.conversation_id,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                )
+                await set_session_intaris_session_id(
+                    session, session_row.session_id, session_row.session_id
+                )
+                await update_conversation_active_session(
+                    session, conversation.conversation_id, session_row.session_id
+                )
+                await session.commit()
+                return conversation.conversation_id, session_row.session_id
+
+        conversation_id, session_id = asyncio.run(_seed())
+
+        async def _fake_read_events(
+            session_id: str,
+            after_seq: int = 0,
+            limit: int = 0,
+            allow_missing_stream: bool = False,
+            **_: object,
+        ) -> EventReadResult:
+            assert session_id
+            assert after_seq == 3
+            assert limit == 17
+            assert allow_missing_stream is True
+            return EventReadResult(
+                events=[],
+                last_seq=0,
+                has_more=False,
+                missing_stream_fallback_used=True,
+            )
+
+        app.state.providers.guardrails.read_events = _fake_read_events
+
+        response = client.get(
+            f"/api/v1/conversations/{conversation_id}/sessions/{session_id}/events?after_seq=3&limit=17",
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+        assert response.status_code == 200
+        assert response.json() == {
+            "session_id": session_id,
+            "items": [],
+            "last_seq": 0,
+            "has_more": False,
+        }
+
+
+def test_session_events_route_returns_empty_when_stream_missing(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> str:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                conversation = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                    title="Conversation",
+                )
+                session_row = await create_session(
+                    session,
+                    conversation_id=conversation.conversation_id,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                )
+                await set_session_intaris_session_id(
+                    session, session_row.session_id, session_row.session_id
+                )
+                await update_conversation_active_session(
+                    session, conversation.conversation_id, session_row.session_id
+                )
+                await session.commit()
+                return session_row.session_id
+
+        session_id = asyncio.run(_seed())
+
+        async def _fake_read_events(
+            session_id: str,
+            after_seq: int = 0,
+            limit: int = 0,
+            allow_missing_stream: bool = False,
+            **_: object,
+        ) -> EventReadResult:
+            assert session_id
+            assert after_seq == 9
+            assert limit == 11
+            assert allow_missing_stream is True
+            return EventReadResult(
+                events=[],
+                last_seq=0,
+                has_more=False,
+                missing_stream_fallback_used=True,
+            )
+
+        app.state.providers.guardrails.read_events = _fake_read_events
+
+        response = client.get(
+            f"/api/v1/sessions/{session_id}/events?after_seq=9&limit=11",
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+        assert response.status_code == 200
+        assert response.json() == {
+            "session_id": session_id,
+            "items": [],
+            "last_seq": 0,
+            "has_more": False,
+        }
+
+
 def test_websocket_queues_second_message_while_turn_active(
     monkeypatch: object, tmp_path: Path
 ) -> None:

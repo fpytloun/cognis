@@ -17,6 +17,7 @@
   import Card from '$lib/components/ui/Card.svelte';
   import Input from '$lib/components/ui/Input.svelte';
   import { api, asApiError } from '$lib/api/client';
+  import { getConversationRetryScope, getNextHistoryAfterSeq, isCurrentConversationLoad, nextConversationLoadId } from '$lib/chat-page';
   import { confirmAction } from '$lib/stores/confirm';
   import { addToast } from '$lib/stores/toasts';
   import { onCancelActiveTurnRequest, onChatComposerFocusRequest } from '$lib/shortcuts';
@@ -34,6 +35,8 @@
 
   let loading = $state(true);
   let error = $state('');
+  let historyError = $state('');
+  let sessionsError = $state('');
   let conversations = $state<Conversation[]>([]);
   let conversationCursor: string | null = null;
   let conversationsHasMore = $state(false);
@@ -102,6 +105,8 @@
   let unsubscribeComposerFocus: (() => void) | null = null;
   let unsubscribeCancelTurn: (() => void) | null = null;
   let visibilityHandler: (() => void) | null = null;
+  let conversationLoadRequestId = 0;
+  let mobileDrawerPreviouslyFocused: HTMLElement | null = null;
 
   function isLlmUnavailableForSetup(): boolean {
     const llmDetails = JSON.stringify($workspaceHealth.health?.providers?.llm ?? {}).toLowerCase();
@@ -211,6 +216,15 @@
     return conversation.title?.trim() || 'Untitled conversation';
   }
 
+  function beginConversationLoad(): number {
+    conversationLoadRequestId = nextConversationLoadId(conversationLoadRequestId);
+    return conversationLoadRequestId;
+  }
+
+  function isStaleConversationLoad(requestId: number): boolean {
+    return !isCurrentConversationLoad(requestId, conversationLoadRequestId);
+  }
+
   function conversationAgent(conversation: Conversation): Agent | undefined {
     return agents.find((agent) => agent.agent_id === conversation.agent_id);
   }
@@ -235,8 +249,7 @@
         return events;
       }
 
-      const lastItem = response.items[response.items.length - 1];
-      afterSeq = typeof lastItem?.seq === 'number' ? lastItem.seq : afterSeq;
+      afterSeq = getNextHistoryAfterSeq(response);
       if (afterSeq === 0) {
         return events;
       }
@@ -365,6 +378,19 @@
     }
   }
 
+  function openMobileList(): void {
+    mobileDrawerPreviouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    mobileListOpen = true;
+    document.body.style.overflow = 'hidden';
+  }
+
+  function closeMobileList(): void {
+    mobileListOpen = false;
+    document.body.style.overflow = '';
+    mobileDrawerPreviouslyFocused?.focus();
+    mobileDrawerPreviouslyFocused = null;
+  }
+
   async function loadSessionInfo(): Promise<void> {
     const sid = currentConversation?.active_session_id;
     if (!sid) return;
@@ -406,66 +432,163 @@
     }
   }
 
+  async function reloadConversationSubloads(
+    conversationId: string,
+    requestId: number,
+    options: { reloadSessions?: boolean; reloadHistory?: boolean; resubscribe?: boolean } = {},
+  ): Promise<void> {
+    const reloadSessions = options.reloadSessions ?? true;
+    const reloadHistory = options.reloadHistory ?? true;
+    const shouldResubscribe = options.resubscribe ?? false;
+
+    const [sessionResult, historyResult] = await Promise.allSettled([
+      reloadSessions ? api.conversations.sessions(conversationId) : Promise.resolve(sessions),
+      reloadHistory ? loadHistory(conversationId) : Promise.resolve([]),
+    ]);
+
+    if (isStaleConversationLoad(requestId)) {
+      return;
+    }
+
+    sessionsError = '';
+    historyError = '';
+
+    if (reloadSessions && sessionResult.status === 'fulfilled') {
+      sessions = sessionResult.value;
+      resetSessionFilter();
+    } else if (reloadSessions && sessionResult.status === 'rejected') {
+      sessions = [];
+      sessionIds.clear();
+      sessionsError = asApiError(sessionResult.reason).message;
+    }
+
+    if (reloadHistory && historyResult.status === 'fulfilled') {
+      timeline = normalizeHistory(historyResult.value);
+      syncVisibleWindow();
+      userScrolledUp = false;
+    } else if (reloadHistory && historyResult.status === 'rejected') {
+      timeline = [];
+      syncVisibleWindow();
+      historyError = asApiError(historyResult.reason).message;
+    }
+
+    if (shouldResubscribe) {
+      wsClient.subscribeConversation(
+        conversationId,
+        reloadHistory && historyResult.status === 'fulfilled' ? latestSeq(historyResult.value) : 0
+      );
+    }
+
+    if (!sessionsError) {
+      await refreshEscalations();
+      if (isStaleConversationLoad(requestId)) {
+        return;
+      }
+    } else {
+      escalations = [];
+      escalationError = '';
+    }
+
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        if (timelineEl && !userScrolledUp) {
+          timelineEl.scrollTop = timelineEl.scrollHeight;
+        }
+      });
+    });
+  }
+
+  async function retryConversationSubloads(): Promise<void> {
+    if (!currentConversation) return;
+    const requestId = beginConversationLoad();
+    error = '';
+    const retryScope = getConversationRetryScope({
+      sessionsError,
+      historyError,
+    });
+    await reloadConversationSubloads(currentConversation.conversation_id, requestId, {
+      reloadSessions: retryScope.sessions,
+      reloadHistory: retryScope.history,
+      resubscribe: false,
+    });
+  }
+
   async function openConversation(conversationId: string): Promise<void> {
-    if (!conversationId || conversationId === activeConversationId) return;
+    if (!conversationId) {
+      loading = false;
+      return;
+    }
+
+    if (conversationId === activeConversationId && currentConversation) {
+      loading = false;
+      return;
+    }
+
+    const requestId = beginConversationLoad();
+    const previousConversationId = activeConversationId;
 
     showAgentProfile = false;
     loading = true;
     error = '';
+    historyError = '';
+    sessionsError = '';
+    escalationError = '';
+    mobileListOpen = false;
+    document.body.style.overflow = '';
 
-    if (activeConversationId) {
-      wsClient.unsubscribeConversation(activeConversationId);
+    if (previousConversationId) {
+      wsClient.unsubscribeConversation(previousConversationId);
     }
 
     try {
-      const [conversation, sessionList, events] = await Promise.all([
-        api.conversations.detail(conversationId),
-        api.conversations.sessions(conversationId),
-        loadHistory(conversationId)
-      ]);
+      const conversation = await api.conversations.detail(conversationId);
+      if (isStaleConversationLoad(requestId)) {
+        return;
+      }
 
       activeConversationId = conversationId;
       currentConversation = conversation;
       if (!conversations.some((item) => item.conversation_id === conversation.conversation_id)) {
         conversations = [conversation, ...conversations];
       }
-      sessions = sessionList;
-      resetSessionFilter();
-      timeline = normalizeHistory(events);
-      syncVisibleWindow();
       queuedCount = 0;
       turnInProgress = false;
       awaitingAssistantStart = false;
       lastRecoverableMessage = '';
       editingTitle = false;
       contextUsage = null;
+      subSessionPanelOpen = false;
 
-      wsClient.subscribeConversation(conversationId, latestSeq(events));
-      await refreshEscalations();
+      await reloadConversationSubloads(conversationId, requestId, {
+        reloadSessions: true,
+        reloadHistory: true,
+        resubscribe: true,
+      });
+      if (isStaleConversationLoad(requestId)) {
+        return;
+      }
 
-      // Mark conversation as read and update local state
       api.conversations.markRead(conversationId).catch(() => {});
-      if (currentConversation) {
-        currentConversation = { ...currentConversation, has_unread: false };
-        const idx = conversations.findIndex((c) => c.conversation_id === conversationId);
-        if (idx >= 0) {
-          conversations[idx] = { ...conversations[idx], has_unread: false };
-          conversations = [...conversations];
-        }
+      currentConversation = { ...conversation, has_unread: false };
+      const idx = conversations.findIndex((c) => c.conversation_id === conversationId);
+      if (idx >= 0) {
+        conversations[idx] = { ...conversations[idx], has_unread: false };
+        conversations = [...conversations];
       }
     } catch (caughtError) {
+      if (isStaleConversationLoad(requestId)) {
+        return;
+      }
       error = asApiError(caughtError).message;
+      currentConversation = null;
+      sessions = [];
+      timeline = [];
+      escalations = [];
+      sessionIds.clear();
     } finally {
-      loading = false;
-      // Scroll to bottom after DOM renders the timeline
-      userScrolledUp = false;
-      requestAnimationFrame(() => {
-        requestAnimationFrame(() => {
-          if (timelineEl) {
-            timelineEl.scrollTop = timelineEl.scrollHeight;
-          }
-        });
-      });
+      if (!isStaleConversationLoad(requestId)) {
+        loading = false;
+      }
     }
   }
 
@@ -475,15 +598,15 @@
 
     try {
       await refreshSidebarData();
-      await openConversation(conversationIdFromRoute());
+      if (!conversationIdFromRoute()) {
+        loading = false;
+      }
     } catch (caughtError) {
       error = asApiError(caughtError).message;
       loading = false;
     }
 
-    // Request notification permission once (non-blocking, after page loads)
     if (notificationsSupported() && !notificationsGranted() && !hasAskedPermission()) {
-      // Delay slightly so it doesn't interfere with initial page load
       setTimeout(() => { void requestPermission(); }, 5000);
     }
   }
@@ -672,6 +795,7 @@
     }
     error = '';
     composer = '';
+    syncComposerHeight();
     const attachments = [...composerAttachments];
     composerAttachments = [];
     syncVisibleWindow();
@@ -750,7 +874,14 @@
   async function retryLastTurn(): Promise<void> {
     if (!currentConversation || !lastSubmittedMessage) return;
     composer = lastSubmittedMessage;
+    syncComposerHeight();
     await handleSend();
+  }
+
+  function syncComposerHeight(): void {
+    if (!composerElement) return;
+    composerElement.style.height = '0px';
+    composerElement.style.height = `${Math.min(composerElement.scrollHeight, 220)}px`;
   }
 
   function handleComposerKeydown(event: KeyboardEvent): void {
@@ -1017,7 +1148,27 @@
   $effect(() => {
     if (page.params.conversationId && page.params.conversationId !== activeConversationId) {
       void openConversation(page.params.conversationId);
+    } else if (!page.params.conversationId) {
+      loading = false;
     }
+  });
+
+  $effect(() => {
+    if (!mobileListOpen) {
+      return;
+    }
+
+    const handleKeydown = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        closeMobileList();
+      }
+    };
+
+    window.addEventListener('keydown', handleKeydown);
+    return () => {
+      window.removeEventListener('keydown', handleKeydown);
+    };
   });
 
   let visibleConversationList = $derived.by(() => {
@@ -1039,6 +1190,9 @@
     restoreSelectedChannel();
     restoreChatSidebarState();
     mobileListOpen = !conversationIdFromRoute();
+    if (mobileListOpen) {
+      document.body.style.overflow = 'hidden';
+    }
     unsubscribeWs = wsClient.subscribe(handleSocketEvent);
     unsubscribeComposerFocus = onChatComposerFocusRequest(() => {
       composerElement?.focus();
@@ -1058,6 +1212,7 @@
     void initialize();
 
     return () => {
+      document.body.style.overflow = '';
       unsubscribeWs?.();
       unsubscribeComposerFocus?.();
       unsubscribeCancelTurn?.();
@@ -1080,11 +1235,30 @@
 {#if loading}
   <LoadingState label="Loading conversation" description="Fetching history, restoring workflow prompts, and preparing the live stream." />
 {:else}
-  <div class={`grid h-full gap-4 overflow-hidden ${chatSidebarCollapsed ? '' : 'xl:grid-cols-[320px_minmax(0,1fr)]'}`}>
+  <div class={`relative flex h-full min-h-0 flex-col gap-3 overflow-hidden ${chatSidebarCollapsed ? '' : 'xl:grid xl:grid-cols-[320px_minmax(0,1fr)] xl:gap-4'}`}>
+    {#if mobileListOpen}
+      <button
+        aria-label="Close conversation list"
+        class="fixed inset-0 z-30 bg-slate-950/80 backdrop-blur-sm xl:hidden"
+        onclick={closeMobileList}
+        type="button"
+      ></button>
+    {/if}
+
     <!-- Sidebar -->
-    <aside class={`${chatSidebarCollapsed ? 'hidden' : `${mobileListOpen || !currentConversation ? 'flex' : 'hidden'} xl:flex`} min-h-0 flex-col rounded-3xl border border-slate-800/80 bg-slate-900/70 shadow-card backdrop-blur`}>
+    <aside
+      aria-label="Conversation list"
+      aria-modal={mobileListOpen ? 'true' : undefined}
+      class={`${chatSidebarCollapsed ? 'hidden' : `${mobileListOpen || !currentConversation ? 'flex' : 'hidden'} xl:flex`} fixed inset-y-3 left-3 z-40 w-[min(22rem,calc(100vw-1.5rem))] min-h-0 flex-col rounded-[1.75rem] border border-slate-800/80 bg-slate-900/95 shadow-card backdrop-blur xl:static xl:z-auto xl:w-auto xl:rounded-3xl xl:bg-slate-900/70`}
+      role={mobileListOpen ? 'dialog' : undefined}
+    >
       <!-- Static top: filters -->
-      <div class="shrink-0 space-y-3 p-4 pb-2">
+      <div class="shrink-0 space-y-3 p-4 pb-2 sm:p-4">
+        <div class="flex items-center justify-between xl:hidden">
+          <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Conversations</p>
+          <Button aria-label="Close conversation list" size="sm" variant="secondary" onclick={closeMobileList}>Close</Button>
+        </div>
+
         {#if agents.length === 0}
           <div class="space-y-3">
             <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Setup incomplete</p>
@@ -1157,7 +1331,7 @@
               <a
                 class={`flex items-start gap-3 rounded-2xl border px-3 py-2.5 transition ${isActive ? 'border-sky-400/40 bg-sky-500/10' : 'border-transparent bg-slate-950/60 hover:border-slate-700 hover:bg-slate-900'}`}
                 href={`/chat/${conversation.conversation_id}`}
-                onclick={() => { mobileListOpen = false; }}
+                onclick={closeMobileList}
               >
                 <div class="relative shrink-0">
                   <AgentAvatar name={agent?.display_name ?? agent?.name ?? conversation.agent_id} avatarUrl={agent?.avatar_url ?? null} class="h-8 w-8" />
@@ -1205,7 +1379,7 @@
     <!-- Main chat area -->
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <section
-      class={`${mobileListOpen && currentConversation ? 'hidden' : 'flex'} relative min-h-0 flex-col rounded-3xl border border-slate-800/80 bg-slate-900/70 shadow-card backdrop-blur xl:flex`}
+      class="relative flex min-h-0 flex-1 flex-col rounded-[1.75rem] border border-slate-800/80 bg-slate-900/70 shadow-card backdrop-blur xl:rounded-3xl"
       ondragenter={handleDragEnter}
       ondragleave={handleDragLeave}
       ondragover={handleDragOver}
@@ -1220,7 +1394,7 @@
         </div>
       {/if}
       <!-- Header -->
-      <div class="border-b border-slate-800/80 px-5 py-4">
+      <div class="border-b border-slate-800/80 px-3 py-3 sm:px-5 sm:py-4">
         <div class="flex flex-wrap items-start justify-between gap-3">
           <div class="min-w-0 flex-1">
             <div class="mb-2 flex items-center gap-2">
@@ -1235,7 +1409,7 @@
                 </button>
               {/if}
               <div class="xl:hidden">
-                <Button size="sm" variant="secondary" onclick={() => (mobileListOpen = true)}>
+                <Button size="sm" variant="secondary" onclick={openMobileList}>
                   <ArrowLeft class="mr-2 h-4 w-4" />
                   Conversations
                 </Button>
@@ -1386,13 +1560,31 @@
             </div>
           </div>
         {/if}
+
+        {#if sessionsError}
+          <div class="mt-3 rounded-2xl border border-amber-500/30 bg-amber-500/10 px-3 py-3 text-sm text-amber-100">
+            <div class="flex flex-wrap items-center justify-between gap-3">
+              <p>Session details are temporarily unavailable: {sessionsError}</p>
+              <Button size="sm" variant="secondary" onclick={retryConversationSubloads}>Retry</Button>
+            </div>
+          </div>
+        {/if}
       </div>
 
       <!-- Message area + composer -->
-      <div class="flex min-h-0 flex-1 flex-col gap-4 p-4">
+      <div class="flex min-h-0 flex-1 flex-col gap-3 p-3 sm:gap-4 sm:p-4">
         {#if isMemoryDegraded()}
           <div class="rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
             Memory is currently unavailable — this conversation won't have access to past context.
+          </div>
+        {/if}
+
+        {#if historyError}
+          <div class="rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
+            <div class="flex flex-wrap items-center justify-between gap-3">
+              <p>Conversation history is temporarily unavailable: {historyError}</p>
+              <Button size="sm" variant="secondary" onclick={retryConversationSubloads}>Retry history</Button>
+            </div>
           </div>
         {/if}
 
@@ -1407,7 +1599,7 @@
 
         <!-- Timeline -->
         <div
-          class="relative min-h-0 flex-1 space-y-3 overflow-y-auto p-4"
+          class="relative min-h-0 flex-1 space-y-3 overflow-y-auto p-2 sm:p-4"
           bind:this={timelineEl}
           onscroll={handleTimelineScroll}
         >
@@ -1504,7 +1696,7 @@
             {/if}
           </div>
         {:else}
-          <form class="shrink-0 space-y-3 rounded-3xl border border-slate-800/80 bg-slate-900/80 p-4" onsubmit={(event) => { event.preventDefault(); void handleSend(); }}>
+          <form class="shrink-0 space-y-3 rounded-[1.5rem] border border-slate-800/80 bg-slate-900/90 p-3 sm:rounded-3xl sm:p-4" onsubmit={(event) => { event.preventDefault(); void handleSend(); }}>
             <!-- Slash command suggestions dropdown -->
             {#if slashSuggestionsVisible}
               <div class="mb-1 rounded-xl border border-slate-700 bg-slate-900/95 py-1 text-sm shadow-lg">
@@ -1535,10 +1727,10 @@
             <textarea
               bind:this={composerElement}
               bind:value={composer}
-              class="min-h-[80px] w-full resize-none rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500"
+              class="min-h-[56px] w-full resize-none rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500"
               disabled={!currentConversation || isReadOnly(currentConversation) || isLlmUnavailableForSetup()}
               onkeydown={handleComposerKeydown}
-              oninput={updateSlashSuggestions}
+              oninput={() => { updateSlashSuggestions(); syncComposerHeight(); }}
               onpaste={(event) => void handlePaste(event)}
               placeholder={isLlmUnavailableForSetup() ? 'Configure an LLM provider to start chatting.' : 'Send a message to Cognis...'}
             ></textarea>
@@ -1547,14 +1739,16 @@
                 <input bind:checked={enterToSend} class="h-4 w-4 rounded border-slate-700 bg-slate-950" onchange={persistEnterToSendPreference} type="checkbox" />
                 <span>Press Enter to send</span>
               </label>
-              <div class="flex gap-2">
+              <div class="flex flex-wrap justify-end gap-2">
                 <input bind:this={attachmentInput} class="hidden" type="file" multiple onchange={(event) => void handleAttachmentSelect(event)} />
                 <Button size="sm" variant="secondary" type="button" onclick={() => attachmentInput?.click()}>
                   <Paperclip class="mr-2 h-4 w-4" /> Attach
                 </Button>
-                <Button size="sm" variant="secondary" type="button" onclick={() => currentConversation && wsClient.cancelTurn(currentConversation.conversation_id)}>
-                  Cancel turn
-                </Button>
+                {#if turnInProgress}
+                  <Button size="sm" variant="secondary" type="button" onclick={() => currentConversation && wsClient.cancelTurn(currentConversation.conversation_id)}>
+                    Cancel turn
+                  </Button>
+                {/if}
                 <Button size="sm" type="submit" disabled={(!composer.trim() && composerAttachments.length === 0) || !currentConversation || isReadOnly(currentConversation) || isLlmUnavailableForSetup()}>
                   Send
                 </Button>
