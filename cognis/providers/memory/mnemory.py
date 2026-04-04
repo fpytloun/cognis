@@ -277,18 +277,27 @@ class MnemoryProvider:
             return []
 
     async def bootstrap_agent(self, agent: AgentDefinition) -> None:
+        """Bootstrap agent identity into Mnemory as a pinned core memory.
+
+        Sends the structured personality fields (purpose, tone, temperament,
+        behavioral rules) as the evolution seed.  Falls back to the raw
+        system_prompt when no personality fields are set, so agents that
+        only have a system_prompt still get bootstrapped.
+        """
+        content = agent.compose_personality() or agent.system_prompt
         logger.info(
             "mnemory: bootstrap started",
             extra={
                 "extra_data": {
                     "agent_id": agent.agent_id,
+                    "has_personality": bool(agent.compose_personality()),
                     "has_system_prompt": bool(agent.system_prompt),
                 }
             },
         )
-        if agent.system_prompt:
+        if content:
             await self.add_memory(
-                content=agent.system_prompt,
+                content=content,
                 role="assistant",
                 pinned=True,
                 agent_id=agent.agent_id,
@@ -300,7 +309,7 @@ class MnemoryProvider:
             )
         else:
             logger.info(
-                "mnemory: bootstrap skipped (no system_prompt)",
+                "mnemory: bootstrap skipped (no personality or system_prompt)",
                 extra={"extra_data": {"agent_id": agent.agent_id}},
             )
 

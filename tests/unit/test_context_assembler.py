@@ -145,6 +145,22 @@ def _agent() -> AgentDefinition:
     )
 
 
+def _agent_with_personality() -> AgentDefinition:
+    return AgentDefinition(
+        agent_id="agent-1",
+        owner_email="user@example.com",
+        name="Agent",
+        system_prompt="Be helpful.",
+        personality={
+            "purpose": "research specialist",
+            "tone": "formal, precise",
+            "temperament": "patient, methodical",
+            "behavioral_rules": ["Always cite sources"],
+        },
+        llm_config=AgentLLMConfig(model="test-model", max_tokens=128),
+    )
+
+
 def _conversation() -> ConversationModel:
     return ConversationModel(
         conversation_id="conv-1",
@@ -348,3 +364,33 @@ async def test_context_assembler_includes_environment_info() -> None:
     content = env_messages[0]["content"]
     assert str(Path.home()) in content
     assert sys.platform in content
+
+
+@pytest.mark.asyncio
+async def test_context_assembler_includes_composed_identity_prompt() -> None:
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=_SessionCache(),
+        session_manager=_SessionManager(),
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+
+    result = await assembler.assemble(
+        session=_session(),
+        conversation=_conversation(),
+        agent=_agent_with_personality(),
+        user_message="hello",
+        tool_definitions=[],
+    )
+
+    first_message = result.messages[0]
+    assert first_message["role"] == "system"
+    content = str(first_message["content"])
+    assert "Purpose: research specialist" in content
+    assert "Tone: formal, precise" in content
+    assert "Temperament: patient, methodical" in content
+    assert "- Always cite sources" in content
+    assert content.endswith("Be helpful.")

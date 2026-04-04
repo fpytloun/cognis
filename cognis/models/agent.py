@@ -40,6 +40,40 @@ class AgentDefinition(BaseModel):
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
+    def compose_personality(self) -> str | None:
+        """Compose structured personality fields into a text block.
+
+        Returns a formatted string with purpose, tone, temperament, and
+        behavioral rules.  Returns ``None`` if *personality* is ``None``
+        or contains no non-empty fields.
+        """
+        if not self.personality:
+            return None
+        p = self.personality
+
+        def _clean_text(value: object) -> str | None:
+            return value.strip() if isinstance(value, str) and value.strip() else None
+
+        def _clean_rules(value: object) -> list[str]:
+            if not isinstance(value, list):
+                return []
+            return [rule.strip() for rule in value if isinstance(rule, str) and rule.strip()]
+
+        lines: list[str] = []
+        purpose = _clean_text(p.get("purpose"))
+        tone = _clean_text(p.get("tone"))
+        temperament = _clean_text(p.get("temperament"))
+        rules = _clean_rules(p.get("behavioral_rules"))
+        if purpose:
+            lines.append(f"Purpose: {purpose}")
+        if tone:
+            lines.append(f"Tone: {tone}")
+        if temperament:
+            lines.append(f"Temperament: {temperament}")
+        if rules:
+            lines.append("Behavioral rules:\n" + "\n".join(f"- {r}" for r in rules))
+        return "\n".join(lines) if lines else None
+
 
 class AgentPermissions(BaseModel):
     """Agent permission configuration."""

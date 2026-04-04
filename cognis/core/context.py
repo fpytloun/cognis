@@ -128,6 +128,12 @@ def _build_environment_info() -> str:
     )
 
 
+def _compose_identity_prompt(agent: AgentDefinition) -> str | None:
+    """Compose the immutable identity prompt for an agent."""
+    identity_parts = [part for part in [agent.compose_personality(), agent.system_prompt] if part]
+    return "\n\n".join(identity_parts) if identity_parts else None
+
+
 class ContextAssembler:
     """Assemble LLM prompt context from cache, memory, and session state."""
 
@@ -405,9 +411,10 @@ class ContextAssembler:
             if agent.llm_config and agent.llm_config.max_tokens is not None
             else model_info.max_output_tokens
         )
+        identity_prompt = _compose_identity_prompt(agent)
         system_prompt_tokens, tool_schema_tokens = self._count_static_tokens(
             resolved_model=resolved_model,
-            system_prompt=agent.system_prompt,
+            system_prompt=identity_prompt,
             tool_definitions=tool_definitions or [],
         )
         static_tokens = system_prompt_tokens + tool_schema_tokens
@@ -417,9 +424,15 @@ class ContextAssembler:
         # ----- Build messages: immutable prefix first, then mutable suffix -----
         messages: list[dict[str, Any]] = []
 
-        # Immutable prefix block 1: agent identity prompt (user-editable)
-        if agent.system_prompt:
-            messages.append({"role": "system", "content": agent.system_prompt})
+        # Immutable prefix block 1: agent identity (personality fields + system prompt).
+        # Personality fields (purpose, tone, temperament, behavioral_rules) form the
+        # static core identity that is always present.  The system_prompt provides
+        # additional user-written instructions.  Note: personality text may also
+        # appear in Mnemory core memories (block 4) after bootstrap — this is
+        # intentional.  The system prompt is the guaranteed baseline; Mnemory is the
+        # evolution layer that can refine or extend the agent's self-understanding.
+        if identity_prompt:
+            messages.append({"role": "system", "content": identity_prompt})
 
         # Immutable prefix block 2: system instructions (context-dependent, not editable)
         system_instructions = build_system_instructions(prompt_context, agent_id=agent.agent_id)
@@ -538,7 +551,7 @@ class ContextAssembler:
             messages=messages,
             resolved_model=resolved_model,
             max_prompt_tokens=max_prompt_tokens,
-            system_prompt=agent.system_prompt,
+            system_prompt=identity_prompt,
             tool_schema_tokens=tool_schema_tokens,
         )
 
@@ -633,9 +646,10 @@ class ContextAssembler:
             if agent.llm_config and agent.llm_config.max_tokens is not None
             else model_info.max_output_tokens
         )
+        identity_prompt = _compose_identity_prompt(agent)
         system_prompt_tokens, tool_schema_tokens = self._count_static_tokens(
             resolved_model=resolved_model,
-            system_prompt=agent.system_prompt,
+            system_prompt=identity_prompt,
             tool_definitions=tool_definitions or [],
         )
         static_tokens = system_prompt_tokens + tool_schema_tokens
@@ -645,8 +659,8 @@ class ContextAssembler:
         # Build messages: identity + system instructions + env + compaction + history
         messages: list[dict[str, Any]] = []
 
-        if agent.system_prompt:
-            messages.append({"role": "system", "content": agent.system_prompt})
+        if identity_prompt:
+            messages.append({"role": "system", "content": identity_prompt})
 
         # System instructions (context-dependent, not editable)
         system_instructions = build_system_instructions(prompt_context, agent_id=agent.agent_id)
@@ -721,7 +735,7 @@ class ContextAssembler:
             messages=messages,
             resolved_model=resolved_model,
             max_prompt_tokens=max_prompt_tokens,
-            system_prompt=agent.system_prompt,
+            system_prompt=identity_prompt,
             tool_schema_tokens=tool_schema_tokens,
         )
 

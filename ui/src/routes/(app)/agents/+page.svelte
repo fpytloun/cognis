@@ -8,6 +8,7 @@
   import Button from '$lib/components/ui/Button.svelte';
   import Card from '$lib/components/ui/Card.svelte';
   import { api, asApiError } from '$lib/api/client';
+  import { confirmAction } from '$lib/stores/confirm';
   import { addToast } from '$lib/stores/toasts';
   import type { Agent, Workflow } from '$lib/types/api';
 
@@ -56,9 +57,16 @@
   }
 
   async function syncPersonality(agent: Agent): Promise<void> {
+    const confirmed = await confirmAction({
+      title: 'Sync personality to Mnemory?',
+      message: 'This will re-bootstrap the agent personality in Mnemory. If the agent has evolved its identity through conversations, this may override those changes.',
+      confirmLabel: 'Sync',
+      variant: 'danger',
+    });
+    if (!confirmed) return;
     try {
       await api.agents.syncPersonality(agent.agent_id);
-      addToast('Personality sync requested.', 'success');
+      addToast('Personality synced.', 'success');
     } catch (caughtError) {
       error = asApiError(caughtError).message;
       addToast(error, 'error', 4_000, 'Unable to sync personality');
