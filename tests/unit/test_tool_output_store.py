@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import pytest
 
-from cognis.core.tool_output_store import ToolOutputStore
+from cognis.core.tool_output_store import FilesystemToolOutputBackend, ToolOutputStore
 
 
 @pytest.fixture
 def store(tmp_path):
-    return ToolOutputStore(tmp_path, ttl_hours=1, max_size_mb=1)
+    backend = FilesystemToolOutputBackend(tmp_path)
+    return ToolOutputStore(backend, ttl_hours=1, max_size_mb=1)
 
 
 @pytest.mark.asyncio

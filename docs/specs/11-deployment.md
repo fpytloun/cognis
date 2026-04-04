@@ -66,9 +66,35 @@ COGNIS_INTARIS_URL=http://localhost:8060  # Intaris URL (default)
 COGNIS_JWT_PRIVATE_KEY_PATH=~/.cognis/keys/private.pem
 COGNIS_JWT_PUBLIC_KEY_PATH=~/.cognis/keys/public.pem
 COGNIS_SECRETS_KEY_PATH=~/.cognis/secrets.key
+COGNIS_REQUIRE_EXTERNAL_CRYPTO=false  # true = fail fast if keys missing
 ```
 
-For production: provide your own keys. For local: auto-generation is fine.
+For production: provide your own keys and set
+`COGNIS_REQUIRE_EXTERNAL_CRYPTO=true`. For local: auto-generation is fine.
+
+#### Redis (session cache L2)
+
+```bash
+COGNIS_REDIS_URL=                      # empty = L1-only (default)
+# COGNIS_REDIS_URL=redis://localhost:6379/0
+```
+
+When set, the session cache uses Redis as an L2 shared store. On Redis
+failure, the cache degrades to L1 in-process + Intaris cold loads.
+
+#### Tool Output Storage
+
+```bash
+COGNIS_TOOL_OUTPUT_BACKEND=filesystem  # "filesystem" or "s3" (default: filesystem)
+COGNIS_TOOL_OUTPUT_S3_ENDPOINT=http://localhost:9000
+COGNIS_TOOL_OUTPUT_S3_ACCESS_KEY=
+COGNIS_TOOL_OUTPUT_S3_SECRET_KEY=
+COGNIS_TOOL_OUTPUT_S3_BUCKET=cognis-tool-outputs
+COGNIS_TOOL_OUTPUT_S3_REGION=
+```
+
+When `s3`, tool outputs are stored in MinIO/S3 instead of the local
+filesystem. TTL cleanup uses object `LastModified` timestamps.
 
 #### Database (optional override)
 
@@ -199,7 +225,109 @@ EXPOSE 8080
 CMD ["cognis", "serve"]
 ```
 
-## Kubernetes (Phase 2)
+## Kubernetes
+
+### Single-Replica Production (Current)
+
+Cognis runs as a single replica alongside Mnemory and Intaris in a shared
+namespace. The bundled image serves both the API and the UI on `:8080`.
+
+```
+Namespace: openwebui (shared with Mnemory, Intaris)
+  Deployment: cognis (replicas: 1, strategy: Recreate)
+  Service: cognis (ClusterIP, port 8080)
+  Ingress: cognis.fpy.cz (TLS via cert-manager)
+  Certificate: cognis.fpy.cz (letsencrypt-prod)
+  Secret: cognis-secret (JWT keys, secrets key, DB URL, MinIO creds)
+  PVC: cognis-data (1Gi, local-path, for COGNIS_DATA_DIR)
+```
+
+#### Dependencies
+
+| Dependency | Service URL | Purpose |
+|------------|-------------|---------|
+| PostgreSQL | `postgresql.postgresql.svc.cluster.local:5432` | Cognis metadata DB |
+| Redis | `redis.redis.svc.cluster.local:6379` | L2 session cache |
+| MinIO | `http://minio.minio.svc.cluster.local:9000` | Artifacts + tool outputs |
+| Mnemory | `http://mnemory.openwebui.svc.cluster.local:8050` | Memory provider |
+| Intaris | `http://intaris.openwebui.svc.cluster.local:8060` | Guardrails provider |
+
+#### JWT/JWKS Integration
+
+Cognis issues ES256 JWTs. Mnemory and Intaris validate them via JWKS:
+
+```bash
+# Mnemory
+MNEMORY_JWKS_URL=http://cognis.openwebui.svc.cluster.local:8080/.well-known/jwks.json
+
+# Intaris
+INTARIS_JWKS_URL=http://cognis.openwebui.svc.cluster.local:8080/.well-known/jwks.json
+```
+
+Existing API key auth on Mnemory/Intaris is preserved for standalone
+access. Cognis uses JWT bearer tokens exclusively.
+
+#### Production Crypto
+
+JWT private/public keys, secrets encryption key, and artifact signing
+secret are mounted from a Kubernetes Secret into `/keys/`. Set
+`COGNIS_REQUIRE_EXTERNAL_CRYPTO=true` to fail fast on startup if any
+key file is missing (prevents auto-generation of divergent keys).
+
+```yaml
+volumes:
+  - name: keys
+    secret:
+      secretName: cognis-secret
+      items:
+        - key: jwt-private.pem
+          path: private.pem
+        - key: jwt-public.pem
+          path: public.pem
+        - key: secrets.key
+          path: secrets.key
+```
+
+#### Executor Policy
+
+For multi-user production, disable local executor modes via the UI
+Settings page (`Settings → Executors`):
+
+- `executors.allow_in_process` → `false`
+- `executors.allow_subprocess` → `false`
+
+Only WebSocket (remote) executors are permitted. These settings are
+DB-backed and persist across restarts. Default settings are seeded only
+when missing (non-destructive), so manual changes are never overwritten.
+
+#### Storage Backends
+
+| Data | Backend | Config |
+|------|---------|--------|
+| Metadata (users, agents, settings) | PostgreSQL | `DATABASE_URL` |
+| Artifacts (images, uploads) | MinIO/S3 | `COGNIS_ARTIFACT_BACKEND=s3` |
+| Tool outputs (ephemeral) | MinIO/S3 | `COGNIS_TOOL_OUTPUT_BACKEND=s3` |
+| Session cache (L2 shared) | Redis | `COGNIS_REDIS_URL` |
+| Session cache (L1 hot) | In-process memory | Always active |
+
+Tool outputs use S3 with metadata stored alongside the object. TTL
+cleanup uses S3 object `LastModified` timestamps. The `read_tool_output`
+and `search_tool_output` built-in tools load the full object into memory
+for line-based read/search — acceptable for ephemeral tool outputs.
+
+#### Rollout Order
+
+1. Deploy Cognis manifests. Wait for `/api/health` to return healthy.
+2. Verify JWKS endpoint: `GET /cognis/.well-known/jwks.json`.
+3. Bootstrap first admin via `COGNIS_INITIAL_ADMIN_*` env vars or setup URL.
+4. Update Mnemory deployment with `MNEMORY_JWKS_URL`.
+5. Update Intaris deployment with `INTARIS_JWKS_URL`.
+6. Verify cross-service health at `/api/health/providers`.
+
+Rollback: remove `*_JWKS_URL` env vars from Mnemory/Intaris to revert
+to API-key-only auth. Cognis can be deleted independently.
+
+### Multi-Replica Production (Phase 2+)
 
 ```
 Namespace: cognis
@@ -211,11 +339,13 @@ Namespace: cognis
 
 Namespace: cognis-executors
   Job: cognis-exec-{id} (on-demand, created by controller)
-
-Namespace: cognis-services
-  Deployment: mnemory
-  Deployment: intaris
 ```
+
+Multi-replica requires:
+- Redis-backed shared session cache (implemented)
+- Sticky WebSocket sessions via ingress affinity
+- Shared tool output storage via S3 (implemented)
+- Distributed turn scheduling / session locking (not yet implemented)
 
 Network policies: executor pods can reach cognis-controller only. They
 cannot reach Mnemory or Intaris directly.

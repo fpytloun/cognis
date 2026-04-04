@@ -9,7 +9,7 @@ from cognis.bootstrap import DEFAULT_SETTINGS, bootstrap_runtime, run_schema_boo
 from cognis.config import load_config
 from cognis.security import create_password_hasher
 from cognis.store.database import create_engine
-from cognis.store.queries import list_settings
+from cognis.store.queries import get_setting, list_settings, upsert_setting
 
 
 @pytest.mark.asyncio
@@ -30,6 +30,51 @@ async def test_bootstrap_creates_keys_db_and_settings(monkeypatch: object, tmp_p
     assert len(settings) == len(DEFAULT_SETTINGS)
 
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_does_not_overwrite_existing_settings(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    """Settings seeding is non-destructive — existing values are preserved."""
+    monkeypatch.setenv("COGNIS_DATA_DIR", str(tmp_path))  # type: ignore[attr-defined]
+    config = load_config()
+    password_hasher = create_password_hasher()
+
+    # First bootstrap — seeds defaults
+    _, engine, session_factory, _ = await bootstrap_runtime(config, password_hasher)
+
+    # Manually change a setting (simulates UI change)
+    async with session_factory() as session:
+        await upsert_setting(
+            session, key="executors.allow_in_process", value=False, category="executors"
+        )
+        await session.commit()
+
+    # Second bootstrap — should NOT overwrite
+    _, engine2, session_factory2, _ = await bootstrap_runtime(config, password_hasher)
+
+    async with session_factory2() as session:
+        setting = await get_setting(session, "executors.allow_in_process")
+        assert setting is not None
+        assert setting.value is False  # preserved, not reset to True
+
+    await engine.dispose()
+    await engine2.dispose()
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_fails_fast_with_require_external_crypto(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    """When COGNIS_REQUIRE_EXTERNAL_CRYPTO=true, missing keys cause RuntimeError."""
+    monkeypatch.setenv("COGNIS_DATA_DIR", str(tmp_path))  # type: ignore[attr-defined]
+    monkeypatch.setenv("COGNIS_REQUIRE_EXTERNAL_CRYPTO", "true")  # type: ignore[attr-defined]
+    config = load_config()
+    password_hasher = create_password_hasher()
+
+    with pytest.raises(RuntimeError, match="COGNIS_REQUIRE_EXTERNAL_CRYPTO"):
+        await bootstrap_runtime(config, password_hasher)
 
 
 @pytest.mark.asyncio

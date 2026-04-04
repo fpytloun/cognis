@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from cognis.config import CognisConfig
 from cognis.logging import get_logger
 from cognis.store.database import create_engine, create_session_factory
-from cognis.store.queries import count_users, create_user, upsert_setting
+from cognis.store.queries import count_users, create_user, get_setting, upsert_setting
 
 logger = get_logger(__name__)
 
@@ -91,11 +91,28 @@ def ensure_data_dir(config: CognisConfig) -> None:
 
 
 def ensure_jwt_keypair(config: CognisConfig) -> None:
-    """Generate ES256 keypair if missing or incomplete."""
+    """Generate ES256 keypair if missing or incomplete.
+
+    When ``config.require_external_crypto`` is True, raise instead of
+    generating — production deployments must supply pre-generated keys.
+    """
     private_exists = config.jwt_private_key_path.exists()
     public_exists = config.jwt_public_key_path.exists()
     if private_exists and public_exists:
         return
+
+    if config.require_external_crypto:
+        missing = []
+        if not private_exists:
+            missing.append(str(config.jwt_private_key_path))
+        if not public_exists:
+            missing.append(str(config.jwt_public_key_path))
+        msg = (
+            "COGNIS_REQUIRE_EXTERNAL_CRYPTO is enabled but JWT key files "
+            f"are missing: {', '.join(missing)}. "
+            "Mount pre-generated keys or disable the flag for local dev."
+        )
+        raise RuntimeError(msg)
 
     private_key = ec.generate_private_key(ec.SECP256R1())
     private_bytes = private_key.private_bytes(
@@ -112,9 +129,22 @@ def ensure_jwt_keypair(config: CognisConfig) -> None:
 
 
 def ensure_secrets_key(config: CognisConfig) -> None:
-    """Generate AES-256-GCM key if missing."""
+    """Generate AES-256-GCM key if missing.
+
+    When ``config.require_external_crypto`` is True, raise instead of
+    generating.
+    """
     if config.secrets_key_path.exists():
         return
+
+    if config.require_external_crypto:
+        msg = (
+            "COGNIS_REQUIRE_EXTERNAL_CRYPTO is enabled but secrets key "
+            f"is missing: {config.secrets_key_path}. "
+            "Mount a pre-generated key or disable the flag for local dev."
+        )
+        raise RuntimeError(msg)
+
     _write_bytes_atomic(config.secrets_key_path, base64.urlsafe_b64encode(os.urandom(32)))
 
 
@@ -388,9 +418,15 @@ async def seed_system_agents(session: AsyncSession) -> None:
 
 
 async def seed_default_settings(session: AsyncSession) -> None:
-    """Seed application settings into the settings table."""
+    """Seed application settings into the settings table.
+
+    Only inserts defaults for keys that do not already exist.  Existing
+    values (e.g. executor flags changed via the UI) are never overwritten.
+    """
     for key, (category, value) in DEFAULT_SETTINGS.items():
-        await upsert_setting(session, key=key, value=value, category=category)
+        existing = await get_setting(session, key)
+        if existing is None:
+            await upsert_setting(session, key=key, value=value, category=category)
 
 
 async def maybe_seed_initial_admin(

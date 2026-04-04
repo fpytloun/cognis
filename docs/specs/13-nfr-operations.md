@@ -63,8 +63,12 @@ the sum.
 
 Phase 1 (MVP): single controller process handles all sessions.
 
-Phase 2+: multiple controller replicas with sticky WebSocket sessions and
-Redis-backed cache for shared session state.
+Phase 1.5 (current): single controller replica with Redis-backed L2
+session cache for restart resilience and future multi-replica readiness.
+S3-backed tool output storage for shared/persistent tool outputs.
+
+Phase 2+: multiple controller replicas with sticky WebSocket sessions,
+distributed turn scheduling, and Redis-backed shared session state.
 
 ## Availability and Degradation
 
@@ -88,7 +92,8 @@ Degradation should be explicit and visible to users.
 | **Intaris (event record)** | Turn events not persisted | Buffer events in memory; retry on recovery. If buffer exceeds limit, fail the turn. Never silently drop recorded events. |
 | **LLM provider** | No model inference | Retry with fallback model per routing policy. If all providers down: inform user. |
 | **Executor** | No tool execution | Retry spawn. On persistent failure: inform LLM, inform user. |
-| **Redis (when used)** | No L2 cache | Fall back to L1 in-memory cache only. Higher cold-start cost on session load. |
+| **Redis (when used)** | No L2 cache | Fall back to L1 in-memory cache only. Higher cold-start cost on session load. Single-replica correctness preserved; multi-replica visibility lost. |
+| **MinIO/S3 (tool outputs)** | No tool output persistence | Tool outputs stored in-memory only for current session. `read_tool_output`/`search_tool_output` return "not found" for outputs from before the outage. |
 | **PostgreSQL** | **Full outage** | Controller cannot function. Return 503 on all requests. |
 
 ### Circuit Breaker
@@ -110,7 +115,10 @@ Circuit breaker state should be visible at `/api/health` per provider.
 | Session metadata (Cognis DB) | 0 (transactional) | PostgreSQL WAL; SQLite WAL mode |
 | Session events (Intaris) | <= 1 turn | Events batch-recorded at turn finalization; a crash mid-turn loses at most the current turn's events |
 | Memory writes (Mnemory) | best-effort | Retry queue reduces loss window; not transactional |
-| In-memory session cache | lost on restart | Rebuilt from Intaris on next session access |
+| In-memory session cache (L1) | lost on restart | Rebuilt from Redis L2 or Intaris on next session access |
+| Redis session cache (L2) | best-effort | Survives controller restart; lost on Redis flush; rebuilt from Intaris |
+| Tool outputs (S3) | 0 (written immediately) | S3 durability; TTL-based cleanup |
+| Tool outputs (filesystem) | lost on pod restart | Ephemeral; acceptable for single-session tool exploration |
 
 ### RTO (Recovery Time Objective)
 

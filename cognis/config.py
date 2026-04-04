@@ -66,6 +66,22 @@ class CognisConfig:
     artifact_signed_url_ttl_seconds: int
     artifact_signing_secret: str
 
+    # Production crypto
+    require_external_crypto: bool
+
+    # Redis (session cache L2)
+    redis_url: str
+
+    # Tool output storage
+    tool_output_backend: str
+    tool_output_s3_endpoint: str
+    tool_output_s3_access_key: str
+    tool_output_s3_secret_key: str
+    tool_output_s3_bucket: str
+    tool_output_s3_region: str
+    tool_output_ttl_hours: int
+    tool_output_max_size_mb: int
+
     # Initial admin (container/CI bootstrap)
     initial_admin_email: str | None
     initial_admin_password: str | None
@@ -143,6 +159,21 @@ def load_config() -> CognisConfig:
             os.environ.get("COGNIS_ARTIFACT_SIGNED_URL_TTL_SECONDS", "3600")
         ),
         artifact_signing_secret=os.environ.get("COGNIS_ARTIFACT_SIGNING_SECRET", ""),
+        require_external_crypto=os.environ.get("COGNIS_REQUIRE_EXTERNAL_CRYPTO", "false")
+        .strip()
+        .lower()
+        in {"1", "true", "yes", "on"},
+        redis_url=os.environ.get("COGNIS_REDIS_URL", ""),
+        tool_output_backend=os.environ.get("COGNIS_TOOL_OUTPUT_BACKEND", "filesystem"),
+        tool_output_s3_endpoint=os.environ.get(
+            "COGNIS_TOOL_OUTPUT_S3_ENDPOINT", "http://localhost:9000"
+        ),
+        tool_output_s3_access_key=os.environ.get("COGNIS_TOOL_OUTPUT_S3_ACCESS_KEY", ""),
+        tool_output_s3_secret_key=os.environ.get("COGNIS_TOOL_OUTPUT_S3_SECRET_KEY", ""),
+        tool_output_s3_bucket=os.environ.get("COGNIS_TOOL_OUTPUT_S3_BUCKET", "cognis-tool-outputs"),
+        tool_output_s3_region=os.environ.get("COGNIS_TOOL_OUTPUT_S3_REGION", ""),
+        tool_output_ttl_hours=int(os.environ.get("COGNIS_TOOL_OUTPUT_TTL_HOURS", "24")),
+        tool_output_max_size_mb=int(os.environ.get("COGNIS_TOOL_OUTPUT_MAX_SIZE_MB", "500")),
         initial_admin_email=os.environ.get("COGNIS_INITIAL_ADMIN_EMAIL"),
         initial_admin_password=os.environ.get("COGNIS_INITIAL_ADMIN_PASSWORD"),
     )
@@ -170,6 +201,7 @@ ENV_TEMPLATE = """\
 # COGNIS_JWT_PRIVATE_KEY_PATH=~/.cognis/keys/private.pem
 # COGNIS_JWT_PUBLIC_KEY_PATH=~/.cognis/keys/public.pem
 # COGNIS_SECRETS_KEY_PATH=~/.cognis/secrets.key
+# COGNIS_REQUIRE_EXTERNAL_CRYPTO=false
 
 # Logging
 # COGNIS_LOG_LEVEL=info
@@ -199,6 +231,19 @@ ENV_TEMPLATE = """\
 # COGNIS_ARTIFACT_MAX_SIZE_MB=50
 # COGNIS_ARTIFACT_SIGNED_URL_TTL_SECONDS=3600
 # COGNIS_ARTIFACT_SIGNING_SECRET=
+
+# Redis (session cache L2 — empty = L1-only)
+# COGNIS_REDIS_URL=redis://localhost:6379/0
+
+# Tool output storage
+# COGNIS_TOOL_OUTPUT_BACKEND=filesystem
+# COGNIS_TOOL_OUTPUT_S3_ENDPOINT=http://localhost:9000
+# COGNIS_TOOL_OUTPUT_S3_ACCESS_KEY=
+# COGNIS_TOOL_OUTPUT_S3_SECRET_KEY=
+# COGNIS_TOOL_OUTPUT_S3_BUCKET=cognis-tool-outputs
+# COGNIS_TOOL_OUTPUT_S3_REGION=
+# COGNIS_TOOL_OUTPUT_TTL_HOURS=24
+# COGNIS_TOOL_OUTPUT_MAX_SIZE_MB=500
 
 # Container/CI: auto-create admin on first start
 # COGNIS_INITIAL_ADMIN_EMAIL=admin@example.com

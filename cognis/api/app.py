@@ -183,7 +183,11 @@ def create_app() -> FastAPI:
                 sys.stdout.flush()
 
         event_bus = EventBus()
-        session_cache = SessionCache(providers.guardrails, max_entries=cache_max_entries)
+        session_cache = SessionCache(
+            providers.guardrails,
+            max_entries=cache_max_entries,
+            redis_url=config_runtime.redis_url,
+        )
         session_manager = SessionManager(
             session_factory, providers, session_cache, event_bus=event_bus
         )
@@ -207,7 +211,27 @@ def create_app() -> FastAPI:
         )
         pause_waiter = PauseWaiter()
         session_lock = SessionLock()
-        tool_output_store = ToolOutputStore(Path(config_runtime.data_dir))
+        from cognis.core.tool_output_store import (
+            FilesystemToolOutputBackend,
+            S3ToolOutputBackend,
+        )
+
+        if config_runtime.tool_output_backend == "s3":
+            tool_output_backend = S3ToolOutputBackend(
+                endpoint=config_runtime.tool_output_s3_endpoint,
+                access_key=config_runtime.tool_output_s3_access_key,
+                secret_key=config_runtime.tool_output_s3_secret_key,
+                bucket=config_runtime.tool_output_s3_bucket,
+                region=config_runtime.tool_output_s3_region,
+            )
+        else:
+            tool_output_backend = FilesystemToolOutputBackend(Path(config_runtime.data_dir))
+
+        tool_output_store = ToolOutputStore(
+            tool_output_backend,
+            ttl_hours=config_runtime.tool_output_ttl_hours,
+            max_size_mb=config_runtime.tool_output_max_size_mb,
+        )
         await tool_output_store.cleanup_expired()
 
         # Artifact store for images and other binary content
@@ -463,6 +487,7 @@ def create_app() -> FastAPI:
         await shared_runtime_cleanup()
         await remember_queue.stop()
         await providers.executor.cleanup()
+        await session_cache.aclose()
         await providers.memory.client.aclose()
         await providers.guardrails.client.aclose()
         await engine.dispose()

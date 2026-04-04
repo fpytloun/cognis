@@ -776,7 +776,7 @@ Three-layer context management for tool outputs:
 |-------|---------|-----|---------|
 | LLM context | Middle-truncated + pruned | Current turn | What the LLM reasons over |
 | Intaris event | Middle-truncated preview (~50K) | Session lifetime | Compaction, audit, replay |
-| ToolOutputStore | Full executor output | 24h (configurable) | LLM exploration via tools |
+| ToolOutputStore | Full executor output | 24h (configurable) | LLM exploration via tools (filesystem or S3 backend) |
 | WebSocket | Head-truncated (10KB) | Ephemeral | UI display |
 
 #### Layer 3: Post-Execution Content Evaluation (Phase 2)

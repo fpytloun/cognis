@@ -21,7 +21,7 @@ COPY docs/ ./docs/
 COPY ui/ ./ui/
 COPY --from=ui-build /app/ui/build ./ui/build
 
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir ".[postgres,s3,redis]"
 
 EXPOSE 8080
 
