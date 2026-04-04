@@ -69,7 +69,7 @@
   let editingTitle = false;
   let editTitleValue = '';
   let sessionIdCopied = false;
-  let showAgentProfile = false;
+  let showAgentProfile = $state(false);
   let subSessionPanelOpen = false;
   let subSessionClosing = false;
   let subSessionId = '';
@@ -422,6 +422,7 @@
   async function openConversation(conversationId: string): Promise<void> {
     if (!conversationId || conversationId === activeConversationId) return;
 
+    showAgentProfile = false;
     loading = true;
     error = '';
 

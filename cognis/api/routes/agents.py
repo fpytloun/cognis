@@ -6,6 +6,7 @@ import asyncio
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Query, Request
+from pydantic import BaseModel, Field
 
 from cognis.api.common import (
     api_exception,
@@ -387,21 +388,29 @@ _FIELD_INSTRUCTIONS: dict[str, str] = {
 }
 
 
+class GenerateFieldRequest(BaseModel):
+    """Request body for agent field generation."""
+
+    field: str
+    current_value: str = Field(default="", max_length=2000)
+    context: dict[str, str] = Field(default_factory=dict)
+
+
 @router.post("/generate-field")
-async def generate_agent_field(request: Request) -> dict[str, str]:
+async def generate_agent_field(request: Request, payload: GenerateFieldRequest) -> dict[str, str]:
     """Generate or expand an agent field value using the LLM.
 
     Accepts the field name, its current value (if any), and the full
     context of all other agent fields. If current_value is non-empty,
     the LLM expands/refines it rather than generating from scratch.
     """
+    forbid_mutation_for_viewer(request)
     require_current_user(request)
     llm = request.app.state.providers.llm
 
-    body = await request.json()
-    field = body.get("field", "")
-    current_value = body.get("current_value", "").strip()
-    context = body.get("context", {})
+    field = payload.field
+    current_value = payload.current_value.strip()
+    context = {k: v[:2000] for k, v in payload.context.items()}
 
     if field not in _GENERATABLE_FIELDS:
         raise api_exception(400, "validation_error", f"Field '{field}' is not generatable")
