@@ -1,53 +1,90 @@
 # Configuring Providers
 
+Providers tell Cognis which model backends are available for chat, routing, classification, compaction, and workflow execution.
+
+## Where provider settings live
+
+Open `Settings` and use the providers and routing sections.
+
+Provider configuration is stored in the Cognis database. You usually do not need to edit raw JSON unless you are using the custom preset.
+
 ## Supported presets
 
-The Settings page provides guided forms for:
+The UI currently includes guided forms for:
 
-- **OpenAI** — direct OpenAI API
-- **OpenAI Compatible** — any endpoint speaking the OpenAI API format (vLLM, local servers, etc.)
-- **Anthropic** — direct Anthropic API
-- **Ollama** — local Ollama instance
-- **LiteLLM Proxy** — a running [LiteLLM proxy](https://docs.litellm.ai/docs/providers/litellm_proxy) that handles model routing internally
-- **Custom** — raw JSON configuration
+- **OpenAI** for direct OpenAI API access
+- **OpenAI Compatible** for APIs that follow the OpenAI chat format
+- **Anthropic** for direct Anthropic API access
+- **Ollama** for local Ollama deployments
+- **LiteLLM Proxy** for a LiteLLM proxy that performs routing upstream
+- **Custom** for manual configuration
 
-The UI stores provider settings as JSON in the database, but you do not need to edit raw JSON unless you choose the Custom preset.
+## Common provider choices
 
-### LiteLLM Proxy
+### OpenAI
 
-If you run a LiteLLM proxy server that aggregates multiple LLM backends, use the **LiteLLM Proxy** preset. Cognis will use LiteLLM's dedicated `litellm_proxy/` model prefix so the proxy handles all routing internally. Enter the proxy's base URL (default `http://localhost:4000`) and the proxy API key.
+Use this when Cognis should call OpenAI directly. Provide the API key and a default model.
 
 ### OpenAI Compatible
 
-Use **OpenAI Compatible** for non-proxy endpoints that speak the OpenAI chat completions format (vLLM, text-generation-inference, local servers, etc.). Cognis prefixes model names with `openai/` so LiteLLM routes correctly even for non-standard model names.
+Use this for vLLM, TGI, local gateways, or other services that expose an OpenAI-style API.
 
-## API keys vs encrypted secrets
+### Anthropic
 
-- **LLM provider credentials** are typically read from environment variables before Cognis starts.
-- **Encrypted secrets** are injected into executor sandboxes for tool use.
+Use this when Cognis should call Anthropic directly for chat or routing tasks.
 
-Examples:
+### Ollama
 
-- `OPENAI_API_KEY` for OpenAI provider traffic
-- encrypted `github_token` for tools that access GitHub
+Use this for local models exposed through Ollama. Make sure the selected model is already installed and reachable from the Cognis host or executor.
 
-## Testing providers
+### LiteLLM Proxy
 
-Use **Test provider** to run a small completion against the configured default model.
+Use this when a LiteLLM proxy is already aggregating your models. Cognis treats the proxy as the provider and lets the proxy perform the final upstream routing.
 
-The test reports:
+## Provider location and executor routing
 
-- resolved model name
-- latency
-- sanitized failure details
+Some providers can run on the controller, while others can be routed through an executor. This is useful when:
+
+- the model endpoint is only reachable from a remote executor
+- inference should stay on a user-local machine
+- you want tool execution and model access to share the same remote environment
+
+## Testing a provider
+
+Use the built-in test action before depending on a provider for chat or workflows.
+
+The test confirms:
+
+- model resolution
+- basic credentials
+- connectivity
+- sanitized error details when something fails
 
 ## Model routing
 
-Use **Settings → Routing** to choose models for:
+Use model routing to choose which provider/model should handle different kinds of work, such as:
 
-- `default`
-- `classifier`
-- `compaction`
-- `simple_inline`
+- default chat
+- lightweight classification
+- context compaction
+- simple inline turns
 
-The routing UI shows models from all configured providers and warns when a route references a model that is not present in the configured catalog.
+Routing lets you use a cheaper or faster model for simple tasks and keep a stronger model for heavier work.
+
+## Credentials and secrets
+
+There are two different credential layers in Cognis:
+
+- provider credentials used for model calls
+- encrypted secrets used by tools and executors
+
+For example:
+
+- `OPENAI_API_KEY` may power provider traffic
+- a stored secret may be injected into a GitHub MCP server or other tool runtime
+
+## Troubleshooting tips
+
+- Confirm the default model name is valid for the selected provider.
+- If using Ollama or a local compatible API, verify the base URL from the Cognis host or executor.
+- If a provider is routed through an executor, confirm the executor is connected and healthy.

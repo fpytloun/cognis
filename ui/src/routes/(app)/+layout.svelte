@@ -5,6 +5,7 @@
   import { fade } from 'svelte/transition';
   import {
     Bot,
+    BookOpen,
     BrainCircuit,
     ChevronsLeft,
     ChevronsRight,
@@ -42,6 +43,7 @@
     { href: '/agents', label: 'Agents', icon: Bot },
     { href: '/tasks', label: 'Tasks', icon: ListTodo },
     { href: '/workflows', label: 'Workflows', icon: Workflow },
+    { href: '/docs', label: 'Docs', icon: BookOpen },
     { href: '/tools', label: 'Tools', icon: Wrench },
     { href: '/channels', label: 'Channels', icon: Radio },
     { href: '/settings', label: 'Settings', icon: Settings }

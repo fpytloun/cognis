@@ -88,6 +88,8 @@ After creating the admin:
 
 Use **Settings → System** or **Getting started** for readiness checks and diagnostics.
 
+The bundled UI also includes embedded user-facing documentation under `Docs`.
+
 For headless setup, use the CLI:
 
 ```bash
@@ -220,12 +222,6 @@ Executors are user-scoped. MCP servers are also user-scoped and are assigned to 
 
 For multi-user production deployments, disable local executor modes with the DB-backed settings `executors.allow_in_process=false` and `executors.allow_subprocess=false`, then use only WebSocket executors.
 
-The same split is the planned deployment model for stateful channel adapters.
-For example, a user can run Signal's `signal-cli` REST API next to a Cognis
-executor they control, while the cloud controller continues to orchestrate
-pairing, turns, and outbound delivery without owning the Signal session state
-itself.
-
 **Generating a token:** Create the executor in **Settings > Executors**, then click **Generate token**. The token is displayed once — copy it or the ready-made CLI command. Alternatively, use the API: `POST /api/v1/executors/{id}/token` (admin only).
 
 **Subprocess mode:** When using `python -m cognis.executor`, the token can also be piped via stdin (used internally by the subprocess executor to avoid exposing the token in process listings).
@@ -244,13 +240,17 @@ itself.
 
 See [docs/specs/](docs/specs/) for the full specification set and [docs/specs/implementation/](docs/specs/implementation/) for the implementation stage tracker.
 
-## User guides
+## Documentation
 
+- [Documentation Index](docs/README.md)
 - [Getting Started](docs/guide/getting-started.md)
 - [Configuring Providers](docs/guide/configuring-providers.md)
 - [Creating Agents](docs/guide/creating-agents.md)
 - [Using Chat](docs/guide/using-chat.md)
 - [Managing Tasks](docs/guide/managing-tasks.md)
+- [Workflows](docs/guide/workflows.md)
+- [Channels](docs/guide/channels.md)
+- [Executors](docs/guide/executors.md)
 - [Troubleshooting](docs/guide/troubleshooting.md)
 
 ## License

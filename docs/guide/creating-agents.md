@@ -1,6 +1,6 @@
 # Creating Agents
 
-Open **Agents → New** to create an agent.
+Open `Agents` to create or edit agents. An agent defines how Cognis should behave, what tools it can use, which model it prefers, and which workflows it may run.
 
 ## Key sections
 
@@ -10,6 +10,8 @@ Open **Agents → New** to create an agent.
 - name / display name
 - description
 - avatar URL
+
+These fields make the agent recognizable in the UI and help you distinguish between general-purpose, specialist, and background agents.
 
 ### Personality
 
@@ -31,6 +33,8 @@ If you use **Sync personality**, Cognis re-bootstraps the structured
 personality fields to Mnemory as the evolution seed. This can override evolved
 identity in Mnemory, so the UI asks for confirmation first.
 
+For a first agent, keep personality instructions short and practical. Add more constraints only when you know the agent needs them.
+
 ### Tools and permissions
 
 - executor binding (specific executor or label selector)
@@ -50,6 +54,8 @@ set is:
 
 If you leave the executor empty, Cognis resolves it from the agent's label
 selector or the system default executor.
+
+This means agent safety is shaped by both executor capabilities and the agent's own restrictions.
 
 ### MCP servers
 
@@ -77,9 +83,13 @@ MCP tool categories provided by that executor.
 - temperature
 - max tokens
 
+Use overrides only when the agent really needs different behavior from the default routing policy.
+
 ### Workflow settings
 
 - available workflows
 - default workflow
 - selection mode
 - step agent overrides
+
+Workflow settings matter most when the agent should do structured background work instead of only direct chat responses.

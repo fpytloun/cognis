@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
 
   import { api, asApiError } from '$lib/api/client';
+  import { getDocHref, getOnboardingDocs } from '$lib/docs';
   import { deriveGettingStartedSteps, setGettingStartedDismissed } from '$lib/getting-started';
   import { auth } from '$lib/stores/auth';
   import LoadingState from '$lib/components/LoadingState.svelte';
@@ -9,14 +10,7 @@
   import Card from '$lib/components/ui/Card.svelte';
   import type { SystemDiagnostics } from '$lib/types/api';
 
-  const guideLinks = [
-    ['Getting started', 'https://github.com/fpytloun/cognis/blob/main/docs/guide/getting-started.md'],
-    ['Configuring providers', 'https://github.com/fpytloun/cognis/blob/main/docs/guide/configuring-providers.md'],
-    ['Creating agents', 'https://github.com/fpytloun/cognis/blob/main/docs/guide/creating-agents.md'],
-    ['Using chat', 'https://github.com/fpytloun/cognis/blob/main/docs/guide/using-chat.md'],
-    ['Managing tasks', 'https://github.com/fpytloun/cognis/blob/main/docs/guide/managing-tasks.md'],
-    ['Troubleshooting', 'https://github.com/fpytloun/cognis/blob/main/docs/guide/troubleshooting.md']
-  ] as const;
+  const guideLinks = getOnboardingDocs();
 
   let loading = true;
   let error = '';
@@ -98,9 +92,9 @@
       <Card class="p-5">
         <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Documentation</p>
         <div class="mt-4 grid gap-3 md:grid-cols-2">
-          {#each guideLinks as [label, href]}
-            <a class="rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3 text-sm text-slate-200" href={href} target="_blank" rel="noreferrer">
-              {label}
+          {#each guideLinks as guide}
+            <a class="rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3 text-sm text-slate-200" href={getDocHref(guide.slug)}>
+              {guide.title}
             </a>
           {/each}
         </div>
