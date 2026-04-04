@@ -85,7 +85,7 @@ class AgentPermissions(BaseModel):
     max_delegation_depth: int = 5
     can_delegate: bool = True
 
-    def resolve_permission(self, tool_name: str) -> Permission:
+    def resolve_permission(self, tool_name: str, *, tool_id: str | None = None) -> Permission:
         """Resolve permission for a tool using new rules, then legacy fallback."""
 
         if self.tool_permissions:
@@ -93,6 +93,8 @@ class AgentPermissions(BaseModel):
                 logger.warning(
                     "AgentPermissions uses both tool_permissions and legacy tool lists; tool_permissions take precedence"
                 )
+            if tool_id and tool_id in self.tool_permissions:
+                return self.tool_permissions[tool_id]
             return _resolve_from_map(self.tool_permissions, tool_name)
         if _matches_any(tool_name, self.denied_tools):
             return Permission.DENY

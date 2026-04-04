@@ -397,6 +397,13 @@ class ExecutorRow(Base):
     enabled_tool_groups: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
     config: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     status: Mapped[str] = mapped_column(String, nullable=False, default="active")
+    desired_config_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    applied_config_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    observed_tools: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
+    last_observed_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    runtime_state: Mapped[str] = mapped_column(String, nullable=False, default="offline")
     is_default: Mapped[bool] = mapped_column(nullable=False, default=False, server_default="0")
     owner_email: Mapped[str | None] = mapped_column(
         String, ForeignKey("users.email"), nullable=True

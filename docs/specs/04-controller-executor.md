@@ -174,9 +174,9 @@ Bidirectional JSON-RPC 2.0 over WebSocket between controller and executor.
 5. Executor sends executor.ready with JWT token + platform info
 6. Controller validates JWT (aud=cognis-executor, sub=executor_id)
 7. Controller looks up executor config from DB
-8. Controller sends executor.configure with enabled tools/groups
-9. Executor initializes tool handlers, responds with capabilities
-10. Controller marks executor as ready
+8. Controller increments desired config version and sends executor.configure with enabled tools/groups, executor-assigned MCP servers, and scoped secrets
+9. Executor applies the config, starts/refreshes MCP clients, discovers tools, and ACKs with applied version + observed tool manifest
+10. Controller persists the observed manifest and marks executor as ready
 11. Controller dispatches tool.execute / llm.complete as needed
 12. Executor sends executor.heartbeat every 15 seconds
 13. On shutdown: executor.cancel or graceful disconnect
@@ -190,11 +190,16 @@ For subprocess executors, steps 1-3 are automated: the controller spawns
 ```python
 # Push configuration after authentication (mandatory before tool.execute)
 "executor.configure" → {
+    "config_version": int,          # Strictly increasing per executor
     "enabled_tools": list[str],       # Tool names or ["*"]
     "enabled_tool_groups": list[str], # Tool categories
-    "config": dict                    # Type-specific config from DB
+    "config": dict,                   # Type-specific config from DB
+    "mcp_servers": list[dict],        # Resolved stdio MCP server configs
+    "secrets": dict[str, str]         # Only secrets needed by those MCP servers
 }
-# → {"status": "configured", "capabilities": {...}, "config_keys": [...]}
+# → {"status": "configured", "applied_version": int, "ready": bool,
+#    "observed_at": str, "observed_tools": [...], "capabilities": {...},
+#    "config_keys": [...]}
 
 # List available tools on the executor
 "tool.list" → {}

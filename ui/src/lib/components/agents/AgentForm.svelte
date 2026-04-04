@@ -14,7 +14,9 @@
     slugify,
     type AgentFormState
   } from '$lib/agents';
-  import type { Agent, ExecutorConfig, IntarisMCPServer, LLMProvider, SecretMetadata, ToolDefinitionSummary, Workflow } from '$lib/types/api';
+  import type { Agent, EffectiveToolItem, ExecutorConfig, IntarisMCPServer, LLMProvider, SecretMetadata, ToolDefinitionSummary, Workflow } from '$lib/types/api';
+
+  type AgentToolOption = (ToolDefinitionSummary & { tool_id?: string; permission?: string }) | EffectiveToolItem;
 
   let {
     mode,
@@ -35,7 +37,7 @@
   } = $props<{
     mode: 'create' | 'edit';
     form: AgentFormState;
-    tools: ToolDefinitionSummary[];
+    tools: AgentToolOption[];
     workflows: Workflow[];
     providers: LLMProvider[];
     executors?: ExecutorConfig[];
@@ -123,11 +125,15 @@
   const permissionOptions = ['', 'allow', 'evaluate', 'deny'];
 
   const toolCategories = $derived<string[]>(
-    [...new Set(tools.map((tool: ToolDefinitionSummary) => tool.category))].sort() as string[]
+    [...new Set(tools.map((tool: AgentToolOption) => tool.category))].sort() as string[]
   );
 
-  function toolsForCategory(category: string): ToolDefinitionSummary[] {
-    return tools.filter((tool: ToolDefinitionSummary) => tool.category === category);
+  function toolsForCategory(category: string): AgentToolOption[] {
+    return tools.filter((tool: AgentToolOption) => tool.category === category);
+  }
+
+  function toolKey(tool: AgentToolOption): string {
+    return tool.tool_id ?? tool.name;
   }
 
   function categoryDisabled(category: string): boolean {
@@ -480,11 +486,11 @@
                     {#each categoryTools as tool}
                       <div class="grid gap-2 md:grid-cols-[1fr_auto_auto] items-center text-sm">
                         <label class="flex items-center gap-3 text-slate-200">
-                          <input type="checkbox" checked={!toolDisabled(tool.name)} onchange={() => toggleTool(tool.name)} disabled={readonly || categoryDisabled(category)} class="h-4 w-4 rounded border-slate-600 bg-slate-950" />
+                          <input type="checkbox" checked={!toolDisabled(toolKey(tool))} onchange={() => toggleTool(toolKey(tool))} disabled={readonly || categoryDisabled(category)} class="h-4 w-4 rounded border-slate-600 bg-slate-950" />
                           <span class="font-mono">{tool.name}</span>
                         </label>
                         <span class="text-xs text-slate-500">{tool.description}</span>
-                        <select bind:value={form.toolPermissions[tool.name]} class="w-32 rounded-lg border border-slate-700 bg-slate-950/80 px-2 py-1 text-xs text-slate-100" disabled={readonly || toolDisabled(tool.name) || categoryDisabled(category)}>
+                        <select bind:value={form.toolPermissions[toolKey(tool)]} class="w-32 rounded-lg border border-slate-700 bg-slate-950/80 px-2 py-1 text-xs text-slate-100" disabled={readonly || toolDisabled(toolKey(tool)) || categoryDisabled(category)}>
                           {#each permissionOptions as option}
                             <option value={option}>{option || 'inherit'}</option>
                           {/each}

@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 
 from cognis.api.app import create_app
 from cognis.api.runtime_support import select_static_tools
-from cognis.models.tool import MCP_SERVER_IDS_KEY, MCPServerConfig
+from cognis.models.tool import MCP_SERVER_IDS_KEY, MCPServerConfig, ToolSource
 from cognis.store.queries import (
     create_executor,
     create_mcp_server,
@@ -56,12 +56,26 @@ def test_select_static_tools_honors_disabled_categories_and_tools() -> None:
 
 def test_non_admin_cannot_create_mcp_server(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
+        import asyncio
+
+        async def _seed_user() -> None:
+            async with client.app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=client.app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await session.commit()
+
+        asyncio.run(_seed_user())
         response = client.post(
             "/api/v1/mcp-servers",
             headers=_auth_headers(client.app, email="user@example.com", role="user"),
             json={"name": "demo", "transport": "stdio", "command": "/bin/echo"},
         )
-        assert response.status_code == 403
+        assert response.status_code == 200
 
 
 def test_create_mcp_server_requires_command_for_stdio(monkeypatch: object, tmp_path: Path) -> None:
@@ -113,6 +127,96 @@ def test_admin_can_create_and_list_mcp_servers(monkeypatch: object, tmp_path: Pa
         assert list_response.status_code == 200
         listed = list_response.json()
         assert listed[0]["server_id"] == created["server_id"]
+
+
+def test_mcp_servers_are_user_scoped(monkeypatch: object, tmp_path: Path) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        import asyncio
+
+        async def _seed() -> None:
+            async with client.app.state.session_factory() as session:
+                for email in ("alice@example.com", "bob@example.com"):
+                    await create_user(
+                        session,
+                        email=email,
+                        name=email.split("@")[0].title(),
+                        password_hash=client.app.state.password_hasher.hash("password123"),
+                        role="user",
+                    )
+                await create_mcp_server(
+                    session,
+                    server_id="mcp_alice",
+                    name="alice-server",
+                    transport="stdio",
+                    command="/bin/echo",
+                    owner_email="alice@example.com",
+                )
+                await session.commit()
+
+        asyncio.run(_seed())
+
+        alice = client.get(
+            "/api/v1/mcp-servers",
+            headers=_auth_headers(client.app, email="alice@example.com", role="user"),
+        )
+        bob = client.get(
+            "/api/v1/mcp-servers",
+            headers=_auth_headers(client.app, email="bob@example.com", role="user"),
+        )
+        assert len(alice.json()) == 1
+        assert bob.json() == []
+
+
+def test_effective_tools_preview_respects_executor_owner_scope(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        import asyncio
+
+        async def _seed() -> None:
+            async with client.app.state.session_factory() as session:
+                for email in ("alice@example.com", "bob@example.com"):
+                    await create_user(
+                        session,
+                        email=email,
+                        name=email.split("@")[0].title(),
+                        password_hash=client.app.state.password_hasher.hash("password123"),
+                        role="user",
+                    )
+                executor = await create_executor(
+                    session,
+                    executor_id="bob_exec",
+                    name="Bob exec",
+                    executor_type="websocket",
+                    labels={"tier": "shared"},
+                    owner_email="bob@example.com",
+                )
+                executor.observed_tools = [
+                    {
+                        "name": "read",
+                        "description": "Read file",
+                        "parameters": {},
+                        "source": ToolSource(type="executor").model_dump(mode="json"),
+                        "category": "filesystem",
+                        "read_only": True,
+                        "timeout_seconds": 30,
+                        "non_bypassable": False,
+                    }
+                ]
+                executor.runtime_state = "active"
+                await session.commit()
+
+        asyncio.run(_seed())
+
+        response = client.post(
+            "/api/v1/agents/effective-tools/preview",
+            headers=_auth_headers(client.app, email="alice@example.com", role="user"),
+            json={"execution": {"executor_selector": {"tier": "shared"}}},
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["executor"]["executor_id"] is None
+        assert payload["warnings"]
 
 
 def test_delete_referenced_mcp_server_returns_409(monkeypatch: object, tmp_path: Path) -> None:

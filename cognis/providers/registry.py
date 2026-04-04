@@ -63,6 +63,7 @@ def build_provider_registry(
         in_process=in_process,
         websocket=ws_provider,
         subprocess=subprocess_provider,
+        session_factory=session_factory,
     )
 
     # Build inference router (decouples LLM from executor)
@@ -74,7 +75,7 @@ def build_provider_registry(
         inference_router=inference_router,
     )
 
-    return ProviderRegistry(
+    registry = ProviderRegistry(
         memory=MnemoryProvider(config.mnemory_url, auth_provider),
         guardrails=IntarisProvider(config.intaris_url, auth_provider),
         executor=composite_executor,
@@ -84,3 +85,5 @@ def build_provider_registry(
         # LiteLLMProvider implements ImageGenerationProvider
         image_generation=llm_provider,
     )
+    registry._session_factory = session_factory  # type: ignore[attr-defined]
+    return registry

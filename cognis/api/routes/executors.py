@@ -6,12 +6,17 @@ from typing import Any
 
 from fastapi import APIRouter, Request
 
-from cognis.api.common import api_exception, require_admin, require_current_user
+from cognis.api.common import api_exception, require_current_user
 from cognis.api.models import (
     ExecutorConfigResponse,
     ExecutorCreateRequest,
     ExecutorTokenResponse,
     ExecutorUpdateRequest,
+)
+from cognis.core.executor_policy import (
+    ensure_executor_type_allowed,
+    load_executor_policy,
+    validate_executor_mcp_scope,
 )
 from cognis.store.queries import (
     create_executor,
@@ -43,17 +48,17 @@ def _executor_to_response(row: Any) -> ExecutorConfigResponse:
 
 @router.get("/api/v1/executors", response_model=list[ExecutorConfigResponse])
 async def list_executors_route(request: Request) -> list[ExecutorConfigResponse]:
-    require_current_user(request)
+    user = require_current_user(request)
     async with request.app.state.session_factory() as session:
-        rows = await list_executors(session)
+        rows = await list_executors(session, owner_email=user.email)
     return [_executor_to_response(row) for row in rows]
 
 
 @router.get("/api/v1/executors/{executor_id}", response_model=ExecutorConfigResponse)
 async def get_executor_route(request: Request, executor_id: str) -> ExecutorConfigResponse:
-    require_current_user(request)
+    user = require_current_user(request)
     async with request.app.state.session_factory() as session:
-        row = await get_executor_row(session, executor_id)
+        row = await get_executor_row(session, executor_id, owner_email=user.email)
     if row is None:
         raise api_exception(404, "not_found", "Executor not found")
     return _executor_to_response(row)
@@ -64,7 +69,20 @@ async def create_executor_route(
     request: Request, body: ExecutorCreateRequest
 ) -> ExecutorConfigResponse:
     user = require_current_user(request)
+    policy = await load_executor_policy(request.app.state.session_factory)
+    try:
+        ensure_executor_type_allowed(body.executor_type, policy)
+    except ValueError as exc:
+        raise api_exception(400, "validation_error", str(exc)) from exc
     async with request.app.state.session_factory() as session:
+        try:
+            await validate_executor_mcp_scope(
+                session,
+                owner_email=user.email,
+                config=body.config or None,
+            )
+        except ValueError as exc:
+            raise api_exception(400, "validation_error", str(exc)) from exc
         row = await create_executor(
             session,
             executor_id=body.executor_id,
@@ -86,9 +104,9 @@ async def generate_executor_token_route(
     request: Request,
     executor_id: str,
 ) -> ExecutorTokenResponse:
-    require_admin(request)
+    user = require_current_user(request)
     async with request.app.state.session_factory() as session:
-        row = await get_executor_row(session, executor_id)
+        row = await get_executor_row(session, executor_id, owner_email=user.email)
     if row is None:
         raise api_exception(404, "not_found", "Executor not found")
     token = request.app.state.providers.auth.sign_executor_token(executor_id)
@@ -99,12 +117,26 @@ async def generate_executor_token_route(
 async def update_executor_route(
     request: Request, executor_id: str, body: ExecutorUpdateRequest
 ) -> ExecutorConfigResponse:
-    require_current_user(request)
+    user = require_current_user(request)
     updates = body.model_dump(exclude_none=True)
     if not updates:
         raise api_exception(400, "validation_error", "No fields to update")
     async with request.app.state.session_factory() as session:
-        row = await update_executor(session, executor_id, **updates)
+        existing = await get_executor_row(session, executor_id, owner_email=user.email)
+        if existing is None:
+            raise api_exception(404, "not_found", "Executor not found")
+        policy = await load_executor_policy(request.app.state.session_factory)
+        executor_type = str(updates.get("executor_type", existing.executor_type))
+        try:
+            ensure_executor_type_allowed(executor_type, policy)
+            await validate_executor_mcp_scope(
+                session,
+                owner_email=user.email,
+                config=updates.get("config", existing.config or {}),
+            )
+        except ValueError as exc:
+            raise api_exception(400, "validation_error", str(exc)) from exc
+        row = await update_executor(session, executor_id, owner_email=user.email, **updates)
         if row is None:
             raise api_exception(404, "not_found", "Executor not found")
         await session.commit()
@@ -113,14 +145,14 @@ async def update_executor_route(
 
 @router.delete("/api/v1/executors/{executor_id}", status_code=204)
 async def delete_executor_route(request: Request, executor_id: str) -> None:
-    require_current_user(request)
+    user = require_current_user(request)
     async with request.app.state.session_factory() as session:
-        row = await get_executor_row(session, executor_id)
+        row = await get_executor_row(session, executor_id, owner_email=user.email)
         if row is None:
             raise api_exception(404, "not_found", "Executor not found")
         if row.is_default:
             raise api_exception(400, "validation_error", "Cannot delete the default executor")
-        deleted = await delete_executor(session, executor_id)
+        deleted = await delete_executor(session, executor_id, owner_email=user.email)
         if not deleted:
             raise api_exception(404, "not_found", "Executor not found")
         await session.commit()

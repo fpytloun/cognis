@@ -181,6 +181,21 @@
     return settings.flatMap((group) => group.items);
   }
 
+  function settingBool(key: string, fallback = true): boolean {
+    const item = groupedSettings().find((setting) => setting.key === key);
+    return typeof item?.value === 'boolean' ? item.value : fallback;
+  }
+
+  async function toggleBooleanSetting(key: string, nextValue: boolean): Promise<void> {
+    try {
+      await api.settings.update(key, nextValue);
+      await refreshPageState();
+      addToast(`Updated ${key}.`, 'success');
+    } catch (e) {
+      error = asApiError(e).message;
+    }
+  }
+
   function selectedProvider(): LLMProvider | null {
     return providers.find((provider) => provider.provider_id === selectedProviderId) ?? null;
   }
@@ -1671,7 +1686,7 @@
             </details>
 
             <!-- MCP Server Assignment -->
-            {#if mcpServerConfigs.length > 0 && exec.executor_type === 'in_process'}
+            {#if mcpServerConfigs.length > 0}
               {@const assignedIds = ((exec.config || {}).mcp_server_ids || []) as string[]}
               <details class="group">
                 <summary class="cursor-pointer text-xs uppercase tracking-wider text-slate-400 hover:text-slate-300 select-none">
@@ -1702,10 +1717,6 @@
                   {/each}
                 </div>
               </details>
-            {:else if mcpServerConfigs.length > 0}
-              <div class="rounded-xl border border-amber-500/20 bg-amber-500/5 px-3 py-3 text-xs text-amber-100">
-                Executor-assigned MCP servers are currently supported only for in-process executors.
-              </div>
             {/if}
           </Card>
         {/each}
@@ -1719,6 +1730,32 @@
     {:else if activeTab === 'system'}
       <div class="space-y-5">
         {#if diagnostics}
+          {#if isAdmin}
+            <Card class="p-5">
+              <div class="space-y-3">
+                <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Production executor policy</p>
+                <h2 class="text-lg font-semibold text-white">Local executor modes</h2>
+                <p class="text-sm text-slate-400">For multi-user production deployments, disable local executor modes and rely on websocket executors only.</p>
+                <div class="grid gap-3 md:grid-cols-2">
+                  <button class="rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-4 text-left" onclick={() => toggleBooleanSetting('executors.allow_in_process', !settingBool('executors.allow_in_process', true))}>
+                    <div class="flex items-center justify-between gap-3">
+                      <p class="font-medium text-white">Allow in-process executors</p>
+                      <ProviderStatusBadge status={settingBool('executors.allow_in_process', true) ? 'healthy' : 'degraded'} />
+                    </div>
+                    <p class="mt-2 text-sm text-slate-400">Disable to prevent controller-local tool execution in production.</p>
+                  </button>
+                  <button class="rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-4 text-left" onclick={() => toggleBooleanSetting('executors.allow_subprocess', !settingBool('executors.allow_subprocess', true))}>
+                    <div class="flex items-center justify-between gap-3">
+                      <p class="font-medium text-white">Allow subprocess executors</p>
+                      <ProviderStatusBadge status={settingBool('executors.allow_subprocess', true) ? 'healthy' : 'degraded'} />
+                    </div>
+                    <p class="mt-2 text-sm text-slate-400">Disable to require persistent websocket executors instead of local child processes.</p>
+                  </button>
+                </div>
+              </div>
+            </Card>
+          {/if}
+
           <Card class="p-5">
             <div class="flex items-center justify-between gap-3">
               <div>

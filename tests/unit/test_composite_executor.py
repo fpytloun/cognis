@@ -161,13 +161,12 @@ def test_get_lsp_managers_delegates_to_in_process() -> None:
 
 @pytest.mark.asyncio
 async def test_unknown_type_falls_back_to_in_process() -> None:
-    """Unknown executor_type falls back to in_process."""
+    """Unknown executor_type is rejected explicitly."""
     ip = _make_mock_provider("in_process")
     ws = _make_mock_provider("websocket")
     sp = _make_mock_provider("subprocess")
 
     composite = CompositeExecutorProvider(ip, ws, sp)
     config = ExecutorConfig(executor_id="test", metadata={"executor_type": "unknown_type"})
-    await composite.spawn(config)
-
-    ip.spawn.assert_called_once()
+    with pytest.raises(ValueError, match="Unknown executor type"):
+        await composite.spawn(config)

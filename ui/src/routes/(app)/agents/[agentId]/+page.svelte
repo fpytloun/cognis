@@ -12,13 +12,13 @@
   import { installBeforeUnloadGuard, blockNavigationIfDirty } from '$lib/navigation/unsaved';
   import { confirmAction } from '$lib/stores/confirm';
   import { addToast } from '$lib/stores/toasts';
-  import type { Agent, ExecutorConfig, IntarisMCPServer, LLMProvider, SecretMetadata, ToolDefinitionSummary, Workflow } from '$lib/types/api';
+  import type { Agent, EffectiveToolItem, ExecutorConfig, IntarisMCPServer, LLMProvider, SecretMetadata, Workflow } from '$lib/types/api';
 
   let loading = $state(true);
   let saving = $state(false);
   let error = $state('');
   let agent = $state<Agent | null>(null);
-  let tools = $state<ToolDefinitionSummary[]>([]);
+  let tools = $state<EffectiveToolItem[]>([]);
   let workflows = $state<Workflow[]>([]);
   let providers = $state<LLMProvider[]>([]);
   let executors = $state<ExecutorConfig[]>([]);
@@ -26,6 +26,7 @@
   let intarisMcpServers = $state<IntarisMCPServer[]>([]);
   let secondaryAgents = $state<Agent[]>([]);
   let secondaryBindings = $state<string[]>([]);
+  let previewTimer: ReturnType<typeof setTimeout> | null = null;
   let form = $state(agentToFormState({
     agent_id: '',
     owner_email: '',
@@ -71,28 +72,29 @@
   async function loadAgent(): Promise<void> {
     loading = true;
     try {
-      [agent, tools, workflows, secrets, intarisMcpServers, secondaryAgents, secondaryBindings] = await Promise.all([
+      [agent, workflows, secrets, intarisMcpServers, secondaryAgents, secondaryBindings] = await Promise.all([
         api.agents.detail(agentIdFromRoute()),
-        api.tools.list(),
         api.workflows.listAll(),
         api.secrets.list(),
         api.tools.intarisMcpServers().catch(() => []),
         api.agents.listAll({ agent_type: 'secondary' }),
         api.agents.listBindings(agentIdFromRoute()).catch(() => []),
       ]);
+      try {
+        executors = await api.executor.list();
+      } catch {
+        executors = [];
+      }
       if (auth.getSnapshot().user?.role === 'admin') {
         try {
           providers = (await api.llmProviders.list()).items;
         } catch {
           providers = [];
         }
-        try {
-          executors = await api.executor.list();
-        } catch {
-          executors = [];
-        }
       }
       Object.assign(form, agentToFormState(agent));
+      const preview = await api.agents.effectiveTools(agentIdFromRoute());
+      tools = preview.configured_state.tools;
       loading = false;
       await tick(); // Let AgentForm mount and settle select bindings before capturing snapshot
       initialSnapshot = JSON.stringify($state.snapshot(form));
@@ -140,6 +142,49 @@
     const cleanup = installBeforeUnloadGuard(isDirty);
     void loadAgent();
     return cleanup;
+  });
+
+  $effect(() => {
+    if (loading || !agent) return;
+    const payload = {
+      tools: {
+        ...form.originalTools,
+        disabled_categories: form.disabledCategories,
+        disabled_tools: form.disabledTools,
+        delegation_tools: form.canDelegate,
+      },
+      permissions: {
+        tool_permissions: form.toolPermissions,
+        allowed_secrets: form.allowedSecrets,
+        max_delegation_depth: form.maxDelegationDepth,
+        can_delegate: form.canDelegate,
+      },
+      execution: {
+        executor_id: form.executorId || undefined,
+        executor_selector: form.executorSelector
+          ? Object.fromEntries(
+              form.executorSelector
+                .split('\n')
+                .map((entry) => entry.trim())
+                .filter(Boolean)
+                .map((entry) => {
+                  const [key, ...rest] = entry.split('=');
+                  return [key.trim(), rest.join('=').trim()];
+                })
+            )
+          : undefined,
+      },
+      agent_id: form.agentId || null,
+    };
+    if (previewTimer) clearTimeout(previewTimer);
+    previewTimer = setTimeout(async () => {
+      try {
+        const preview = await api.agents.previewEffectiveTools(payload);
+        tools = preview.configured_state.tools;
+      } catch {
+        // best-effort preview only
+      }
+    }, 200);
   });
 </script>
 

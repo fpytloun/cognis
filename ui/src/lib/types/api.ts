@@ -218,6 +218,48 @@ export interface ToolDefinitionSummary {
   non_bypassable: boolean;
 }
 
+export interface EffectiveToolItem {
+  tool_id: string;
+  name: string;
+  description: string;
+  category: string;
+  read_only: boolean;
+  source: Record<string, unknown>;
+  permission: string;
+  enabled: boolean;
+  disabled_reason?: string | null;
+  timeout_seconds: number;
+  non_bypassable: boolean;
+}
+
+export interface EffectiveToolsState {
+  tools: EffectiveToolItem[];
+  connected: boolean;
+  observed_at: string | null;
+  stale_after: string | null;
+}
+
+export interface EffectiveToolsExecutorSummary {
+  executor_id: string | null;
+  executor_type: string | null;
+  selection_source: string;
+}
+
+export interface EffectiveToolsResponse {
+  executor: EffectiveToolsExecutorSummary;
+  configured_state: EffectiveToolsState;
+  live_state: EffectiveToolsState;
+  warnings: string[];
+}
+
+export interface EffectiveToolsPreviewRequest {
+  tools?: Record<string, unknown>;
+  permissions?: Record<string, unknown>;
+  execution?: Record<string, unknown>;
+  skills?: Record<string, unknown>;
+  agent_id?: string | null;
+}
+
 export interface MCPServer {
   name: string;
   type: string;

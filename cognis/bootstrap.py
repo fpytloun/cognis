@@ -44,6 +44,8 @@ DEFAULT_SETTINGS: Final[dict[str, tuple[str, object]]] = {
     "security.max_connections": ("security", 100),
     "security.ws_auth_timeout_seconds": ("security", 10),
     "web.backend": ("web", "direct"),
+    "executors.allow_in_process": ("executors", True),
+    "executors.allow_subprocess": ("executors", True),
 }
 
 

@@ -19,6 +19,8 @@ import type {
   ExecutorCreateRequest,
   ExecutorStatus,
   ExecutorTokenResponse,
+  EffectiveToolsPreviewRequest,
+  EffectiveToolsResponse,
   ExecutorUpdateRequest,
   ExchangeTokenResponse,
   HealthResponse,
@@ -417,6 +419,17 @@ export const api = {
 
     tools(agentId: string): Promise<ToolDefinitionSummary[]> {
       return request<ToolDefinitionSummary[]>(`/api/v1/agents/${agentId}/tools`);
+    },
+
+    effectiveTools(agentId: string): Promise<EffectiveToolsResponse> {
+      return request<EffectiveToolsResponse>(`/api/v1/agents/${agentId}/effective-tools`);
+    },
+
+    previewEffectiveTools(payload: EffectiveToolsPreviewRequest): Promise<EffectiveToolsResponse> {
+      return request<EffectiveToolsResponse>(`/api/v1/agents/effective-tools/preview`, {
+        method: 'POST',
+        body: JSON.stringify(payload)
+      });
     },
 
     listBindings(agentId: string): Promise<string[]> {

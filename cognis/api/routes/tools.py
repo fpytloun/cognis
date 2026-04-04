@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import uuid
+from datetime import timedelta
 from time import monotonic
 from typing import Any
 
@@ -12,11 +14,15 @@ from pydantic import ValidationError
 
 from cognis.api.common import (
     api_exception,
-    require_admin,
     require_current_user,
     require_owner_or_admin,
 )
 from cognis.api.models import (
+    EffectiveToolItemResponse,
+    EffectiveToolsExecutorResponse,
+    EffectiveToolsPreviewRequest,
+    EffectiveToolsResponse,
+    EffectiveToolsStateResponse,
     ExecutorStatusResponse,
     IntarisMCPServerResponse,
     MCPServerCreateRequest,
@@ -28,14 +34,17 @@ from cognis.api.models import (
 )
 from cognis.api.runtime_support import select_static_tools
 from cognis.api.serializers import agent_to_response, mcp_server_to_response, tool_to_response
-from cognis.models.agent import AgentDefinition
-from cognis.models.tool import ExecutorConfig, MCPServerConfig
+from cognis.core.executor_policy import load_executor_policy
+from cognis.core.executor_resolution import is_tool_enabled, select_executor_for_agent
+from cognis.models.agent import AgentDefinition, AgentPermissions
+from cognis.models.tool import MCP_SERVER_IDS_KEY, ExecutorConfig, MCPServerConfig, ToolDefinition
 from cognis.store.queries import (
     create_mcp_server,
     delete_mcp_server,
     get_agent,
     get_mcp_server,
     list_agents,
+    list_executors,
     mcp_server_referenced_by_executors,
     update_mcp_server,
 )
@@ -43,6 +52,7 @@ from cognis.store.queries import (
     list_mcp_servers as list_global_mcp_servers,
 )
 from cognis.tools.executor.definitions import executor_tool_definitions
+from cognis.tools.mcp import StdioMCPClient, mcp_tools_to_definitions, resolve_secret_refs
 
 router = APIRouter(tags=["tools"])
 
@@ -100,6 +110,33 @@ async def list_executor_tools(request: Request) -> list[ToolResponse]:
     return [tool_to_response(tool) for tool in executor_tool_definitions()]
 
 
+@router.get("/api/v1/agents/{agent_id}/effective-tools", response_model=EffectiveToolsResponse)
+async def get_agent_effective_tools(request: Request, agent_id: str) -> EffectiveToolsResponse:
+    async with request.app.state.session_factory() as session:
+        agent = await get_agent(session, agent_id)
+    if agent is None:
+        raise api_exception(404, "not_found", "Agent not found")
+    require_owner_or_admin(request, agent.owner_email)
+    return await _resolve_effective_tools_response(request, agent, user_email=agent.owner_email)
+
+
+@router.post("/api/v1/agents/effective-tools/preview", response_model=EffectiveToolsResponse)
+async def preview_effective_tools(
+    request: Request, payload: EffectiveToolsPreviewRequest
+) -> EffectiveToolsResponse:
+    user = require_current_user(request)
+    agent = AgentDefinition(
+        agent_id=payload.agent_id or "preview",
+        owner_email=user.email,
+        name="Preview",
+        skills=payload.skills,
+        tools=payload.tools,
+        permissions=AgentPermissions.model_validate(payload.permissions or {}),
+        execution=payload.execution,
+    )
+    return await _resolve_effective_tools_response(request, agent, user_email=user.email)
+
+
 @router.get("/api/v1/executor/status", response_model=ExecutorStatusResponse)
 async def executor_status(request: Request) -> ExecutorStatusResponse:
     """Get executor status and capabilities."""
@@ -117,6 +154,208 @@ async def executor_status(request: Request) -> ExecutorStatusResponse:
             "native_tools_count": len(native_tool_names),
         },
         native_tools=native_tool_names,
+    )
+
+
+def _tool_identifier(tool: ToolDefinition) -> str:
+    if tool.source.type == "local_mcp":
+        server_id = tool.source.server_id or tool.source.server_name or "unknown"
+        raw_name = tool.name.split("/", 1)[1] if "/" in tool.name else tool.name
+        return f"mcp:{server_id}:{raw_name}"
+    return f"builtin:{tool.name}"
+
+
+def _tool_permission(agent: AgentDefinition, tool: ToolDefinition) -> str:
+    if agent.permissions is None:
+        return "evaluate"
+    tool_id = _tool_identifier(tool)
+    if agent.permissions.tool_permissions and tool_id in agent.permissions.tool_permissions:
+        return str(agent.permissions.tool_permissions[tool_id])
+    return str(agent.permissions.resolve_permission(tool.name))
+
+
+async def _discover_temp_mcp_tools(
+    providers: Any,
+    servers: list[MCPServerConfig],
+    user_email: str,
+) -> list[ToolDefinition]:
+    if not servers:
+        return []
+    secret_names = {
+        value[len("$secret:") :]
+        for server in servers
+        for value in server.env.values()
+        if isinstance(value, str) and value.startswith("$secret:")
+    }
+    secrets: dict[str, str] = {}
+    for name in secret_names:
+        with contextlib.suppress(Exception):
+            secrets[name] = await providers.secrets.get_secret(name, user_email)
+    clients: list[StdioMCPClient] = []
+    discovered: list[ToolDefinition] = []
+    try:
+        for server in servers:
+            client = StdioMCPClient(server, env=resolve_secret_refs(server.env, secrets))
+            await client.start()
+            clients.append(client)
+            tools = await client.list_tools()
+            discovered.extend(
+                mcp_tools_to_definitions(
+                    server.name,
+                    tools,
+                    timeout_seconds=server.timeout_seconds,
+                    server_id=server.server_id,
+                )
+            )
+    finally:
+        for client in clients:
+            with contextlib.suppress(Exception):
+                await client.close()
+    return discovered
+
+
+async def _resolve_effective_tools_response(
+    request: Request,
+    agent: AgentDefinition,
+    *,
+    user_email: str,
+) -> EffectiveToolsResponse:
+    session_factory = request.app.state.session_factory
+    policy = await load_executor_policy(session_factory)
+    warnings: list[str] = []
+
+    async with session_factory() as session:
+        executors = await list_executors(session, owner_email=user_email)
+        selected = select_executor_for_agent(
+            executors,
+            agent.execution if isinstance(agent.execution, dict) else None,
+            owner_email=user_email,
+            policy=policy,
+        )
+
+    if selected is None:
+        warnings.append("No executor could be resolved for this agent.")
+        empty_state = EffectiveToolsStateResponse()
+        return EffectiveToolsResponse(
+            executor=EffectiveToolsExecutorResponse(selection_source="unresolved"),
+            configured_state=empty_state,
+            live_state=empty_state,
+            warnings=warnings,
+        )
+
+    executor_summary = EffectiveToolsExecutorResponse(
+        executor_id=selected.executor_id,
+        executor_type=selected.executor_type,
+        selection_source=(
+            "explicit"
+            if (agent.execution or {}).get("executor_id")
+            else "selector"
+            if (agent.execution or {}).get("executor_selector")
+            else "default"
+        ),
+    )
+
+    configured_tools: list[ToolDefinition] = []
+    for tool in [tool for tool in select_static_tools(agent) if tool.category != "web"]:
+        if tool.source.type == "builtin" or is_tool_enabled(
+            tool, selected.enabled_tools or [], selected.enabled_tool_groups or []
+        ):
+            configured_tools.append(tool)
+
+    config_ids = (selected.config or {}).get(MCP_SERVER_IDS_KEY, [])
+    if isinstance(config_ids, list) and config_ids:
+        if selected.executor_type == "in_process":
+            mcp_servers: list[MCPServerConfig] = []
+            async with session_factory() as session:
+                for server_id in config_ids:
+                    row = await get_mcp_server(session, str(server_id), owner_email=user_email)
+                    if row is None or row.status != "active":
+                        continue
+                    mcp_servers.append(
+                        MCPServerConfig(
+                            server_id=row.server_id,
+                            name=row.name,
+                            transport=row.transport,
+                            command=row.command,
+                            url=row.url,
+                            args=row.args or [],
+                            env=row.env or {},
+                            timeout_seconds=row.timeout_seconds,
+                        )
+                    )
+            configured_tools.extend(
+                await _discover_temp_mcp_tools(request.app.state.providers, mcp_servers, user_email)
+            )
+        elif selected.observed_tools:
+            configured_tools.extend(
+                [ToolDefinition.model_validate(item) for item in selected.observed_tools]
+            )
+        else:
+            warnings.append("Executor has assigned MCP servers but no observed manifest yet.")
+
+    configured_items = [
+        EffectiveToolItemResponse(
+            tool_id=_tool_identifier(tool),
+            name=tool.name,
+            description=tool.description,
+            category=tool.category,
+            read_only=tool.read_only,
+            source=tool.source.model_dump(mode="json"),
+            permission=_tool_permission(agent, tool),
+            enabled=True,
+            timeout_seconds=tool.timeout_seconds,
+            non_bypassable=tool.non_bypassable,
+        )
+        for tool in configured_tools
+    ]
+
+    live_items: list[EffectiveToolItemResponse] = []
+    connected = False
+    observed_at = selected.last_observed_at
+    stale_after = observed_at + timedelta(seconds=45) if observed_at is not None else None
+    if selected.executor_type in {"websocket", "subprocess"}:
+        conn = request.app.state.providers.executor.websocket.get_connection(selected.executor_id)
+        if conn is not None and selected.runtime_state == "active":
+            connected = True
+            for item in await conn.list_tools():
+                tool = ToolDefinition.model_validate(item)
+                live_items.append(
+                    EffectiveToolItemResponse(
+                        tool_id=_tool_identifier(tool),
+                        name=tool.name,
+                        description=tool.description,
+                        category=tool.category,
+                        read_only=tool.read_only,
+                        source=tool.source.model_dump(mode="json"),
+                        permission=_tool_permission(agent, tool),
+                        enabled=True,
+                        timeout_seconds=tool.timeout_seconds,
+                        non_bypassable=tool.non_bypassable,
+                    )
+                )
+        else:
+            warnings.append(
+                "Selected executor is offline or not ready; live tool state unavailable."
+            )
+    else:
+        connected = True
+        live_items = configured_items
+
+    return EffectiveToolsResponse(
+        executor=executor_summary,
+        configured_state=EffectiveToolsStateResponse(
+            tools=configured_items,
+            connected=True,
+            observed_at=observed_at,
+            stale_after=stale_after,
+        ),
+        live_state=EffectiveToolsStateResponse(
+            tools=live_items,
+            connected=connected,
+            observed_at=observed_at,
+            stale_after=stale_after,
+        ),
+        warnings=warnings,
     )
 
 
@@ -315,17 +554,17 @@ def _mcp_row_to_response(row: Any) -> dict[str, Any]:
 
 @router.get("/api/v1/mcp-servers")
 async def list_mcp_servers_route(request: Request) -> list[dict[str, Any]]:
-    require_admin(request)
+    user = require_current_user(request)
     async with request.app.state.session_factory() as session:
-        rows = await list_global_mcp_servers(session)
+        rows = await list_global_mcp_servers(session, owner_email=user.email)
     return [_mcp_row_to_response(r) for r in rows]
 
 
 @router.get("/api/v1/mcp-servers/{server_id}")
 async def get_mcp_server_route(request: Request, server_id: str) -> dict[str, Any]:
-    require_admin(request)
+    user = require_current_user(request)
     async with request.app.state.session_factory() as session:
-        row = await get_mcp_server(session, server_id)
+        row = await get_mcp_server(session, server_id, owner_email=user.email)
     if row is None:
         raise api_exception(404, "not_found", "MCP server not found")
     return _mcp_row_to_response(row)
@@ -333,7 +572,7 @@ async def get_mcp_server_route(request: Request, server_id: str) -> dict[str, An
 
 @router.post("/api/v1/mcp-servers")
 async def create_mcp_server_route(request: Request, body: MCPServerCreateRequest) -> dict[str, Any]:
-    user = require_admin(request)
+    user = require_current_user(request)
     async with request.app.state.session_factory() as session:
         row = await create_mcp_server(
             session,
@@ -356,9 +595,9 @@ async def create_mcp_server_route(request: Request, body: MCPServerCreateRequest
 async def update_mcp_server_route(
     request: Request, server_id: str, body: MCPServerUpdateRequest
 ) -> dict[str, Any]:
-    require_admin(request)
+    user = require_current_user(request)
     async with request.app.state.session_factory() as session:
-        existing = await get_mcp_server(session, server_id)
+        existing = await get_mcp_server(session, server_id, owner_email=user.email)
         if existing is None:
             raise api_exception(404, "not_found", "MCP server not found")
         updates = body.model_dump(exclude_unset=True)
@@ -380,7 +619,7 @@ async def update_mcp_server_route(
             MCPServerConfig.model_validate(merged)
         except ValidationError as exc:
             raise api_exception(422, "validation_error", str(exc)) from exc
-        row = await update_mcp_server(session, server_id, **updates)
+        row = await update_mcp_server(session, server_id, owner_email=user.email, **updates)
         if row is None:
             raise api_exception(404, "not_found", "MCP server not found")
         await session.commit()
@@ -389,10 +628,12 @@ async def update_mcp_server_route(
 
 @router.delete("/api/v1/mcp-servers/{server_id}")
 async def delete_mcp_server_route(request: Request, server_id: str) -> dict[str, str]:
-    require_admin(request)
+    user = require_current_user(request)
     async with request.app.state.session_factory() as session:
         # Check for executor references before deleting
-        referencing = await mcp_server_referenced_by_executors(session, server_id)
+        referencing = await mcp_server_referenced_by_executors(
+            session, server_id, owner_email=user.email
+        )
         if referencing:
             raise api_exception(
                 409,
@@ -400,7 +641,7 @@ async def delete_mcp_server_route(request: Request, server_id: str) -> dict[str,
                 f"MCP server is referenced by executor(s): {', '.join(referencing)}. "
                 "Remove the assignment first.",
             )
-        deleted = await delete_mcp_server(session, server_id)
+        deleted = await delete_mcp_server(session, server_id, owner_email=user.email)
         if not deleted:
             raise api_exception(404, "not_found", "MCP server not found")
         await session.commit()

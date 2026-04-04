@@ -6,10 +6,17 @@ import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any, cast
 
+from cognis.core.executor_policy import load_executor_policy
 from cognis.core.executor_resolution import select_executor_for_agent
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
-from cognis.models.tool import MCP_SERVER_IDS_KEY, ExecutorConfig, MCPServerConfig, ToolDefinition
+from cognis.models.tool import (
+    MCP_SERVER_IDS_KEY,
+    ExecutorConfig,
+    MCPServerConfig,
+    ToolDefinition,
+    stable_tool_id,
+)
 from cognis.providers.executor.in_process import InProcessExecutorConnection
 from cognis.tools.builtin.image import image_tools
 from cognis.tools.builtin.memory import memory_tools
@@ -74,7 +81,11 @@ def select_static_tools(agent: Any | None = None) -> list[ToolDefinition]:
     selected: list[ToolDefinition] = []
     for tool in definitions:
         # Agent-level disable takes precedence
-        if tool.category in disabled_categories or tool.name in disabled_tools:
+        if (
+            tool.category in disabled_categories
+            or tool.name in disabled_tools
+            or stable_tool_id(tool) in disabled_tools
+        ):
             continue
         if tool.category == "orchestration":
             if delegation_enabled:
@@ -132,12 +143,18 @@ async def build_shared_runtime(
     providers: Any,
 ) -> tuple[ToolRegistry, Any, Callable[[], Awaitable[None]]]:
     """Build the shared builtin runtime used as the template for step runtimes."""
+    session_factory = getattr(providers, "_session_factory", None)
+    if session_factory is not None:
+        policy = await load_executor_policy(session_factory)
+        if not policy.allow_in_process:
+            logger.info("Shared in-process executor disabled by policy; using static-only template")
+            return build_static_registry(), None, noop_cleanup
     tools = static_tool_definitions()
     handle = await providers.executor.spawn(
         ExecutorConfig(
             executor_id="controller_shared_builtin",
             tools=tools,
-            metadata={},
+            metadata={"executor_type": "in_process"},
         )
     )
     connection = await providers.executor.get_executor(handle)
@@ -169,8 +186,14 @@ def build_step_runtime_factory(
         agent: AgentDefinition,
         user_email: str,
     ) -> tuple[ToolRegistry, Any, Callable[[], Awaitable[None]]]:
+        session_factory_for_policy = getattr(providers, "_session_factory", None)
+        policy = (
+            await load_executor_policy(session_factory_for_policy)
+            if session_factory_for_policy is not None
+            else None
+        )
         # Resolve executor config from DB
-        executor_config = await _resolve_executor_config(providers, agent)
+        executor_config = await _resolve_executor_config(providers, agent, user_email)
         enabled_tools = executor_config.get("enabled_tools") if executor_config else None
         enabled_groups = executor_config.get("enabled_tool_groups") if executor_config else None
 
@@ -206,7 +229,11 @@ def build_step_runtime_factory(
             )
             filtered: list[ToolDefinition] = []
             for tool in agent_tools:
-                if tool.category in disabled_categories or tool.name in disabled_tools:
+                if (
+                    tool.category in disabled_categories
+                    or tool.name in disabled_tools
+                    or stable_tool_id(tool) in disabled_tools
+                ):
                     continue
                 if tool.source.type in ("builtin",):
                     # Controller tools always pass through
@@ -224,16 +251,11 @@ def build_step_runtime_factory(
             executor_config.get("executor_type", "in_process") if executor_config else "in_process"
         )
 
-        # Resolve MCP servers: executor-assigned first, then legacy inline fallback.
-        # Remote executor MCP hosting is not supported yet; keep it in-process only.
+        # Resolve MCP servers for local in-process execution first, then legacy inline fallback.
+        # Remote executors advertise executor-assigned MCP tools through tool.list.
         mcp_servers: list[MCPServerConfig] = []
         if resolved_type == "in_process":
             mcp_servers = await _resolve_executor_mcp_servers(executor_config, session_factory)
-        elif executor_config and (executor_config.get("config") or {}).get(MCP_SERVER_IDS_KEY):
-            logger.warning(
-                "Executor-assigned MCP servers are currently supported only for in-process executors",
-                extra={"extra_data": {"executor_id": executor_config.get("executor_id")}},
-            )
         if not mcp_servers:
             mcp_servers = _parse_local_mcp_servers(agent)
         if mcp_servers:
@@ -282,6 +304,7 @@ def build_step_runtime_factory(
                         if (
                             tool_def.category in disabled_categories
                             or tool_def.name in disabled_tools
+                            or stable_tool_id(tool_def) in disabled_tools
                         ):
                             continue
                         remote_registry.register(RegisteredTool(definition=tool_def))
@@ -292,7 +315,9 @@ def build_step_runtime_factory(
                         extra={"extra_data": {"executor_id": executor_id}},
                     )
 
-        if isinstance(shared_connection, InProcessExecutorConnection):
+        if isinstance(shared_connection, InProcessExecutorConnection) and not (
+            policy is not None and not policy.allow_in_process
+        ):
             # Build registry WITH handlers so tool_execute() can dispatch
             handler_map = _build_handler_map(
                 session_factory,
@@ -307,6 +332,8 @@ def build_step_runtime_factory(
             )
             return registry, connection, noop_cleanup
 
+        if shared_connection is None:
+            raise RuntimeError("No eligible executor is available for this agent")
         return shared_registry, shared_connection, noop_cleanup
 
     return factory
@@ -315,6 +342,7 @@ def build_step_runtime_factory(
 async def _resolve_executor_config(
     providers: Any,
     agent: AgentDefinition,
+    user_email: str,
 ) -> dict[str, Any] | None:
     """Resolve executor config from DB for an agent.
 
@@ -328,12 +356,16 @@ async def _resolve_executor_config(
     from cognis.store.queries import list_executors
 
     try:
+        policy = await load_executor_policy(session_factory)
         async with session_factory() as session:
-            executors = await list_executors(session)
+            executors = await list_executors(session, owner_email=user_email)
             if not executors:
                 return None
             selected = select_executor_for_agent(
-                executors, agent.execution if isinstance(agent.execution, dict) else None
+                executors,
+                agent.execution if isinstance(agent.execution, dict) else None,
+                owner_email=user_email,
+                policy=policy,
             )
             if selected is None:
                 return None
@@ -344,6 +376,12 @@ async def _resolve_executor_config(
                 "enabled_tool_groups": selected.enabled_tool_groups or [],
                 "labels": selected.labels or {},
                 "config": selected.config or {},
+                "owner_email": selected.owner_email,
+                "desired_config_version": selected.desired_config_version,
+                "applied_config_version": selected.applied_config_version,
+                "observed_tools": selected.observed_tools or [],
+                "last_observed_at": selected.last_observed_at,
+                "runtime_state": selected.runtime_state,
             }
     except Exception:
         logger.warning("Failed to resolve executor config from DB", exc_info=True)
@@ -407,7 +445,6 @@ async def _resolve_executor_mcp_servers(
     session_factory: Any,
 ) -> list[MCPServerConfig]:
     """Resolve MCP servers assigned to an executor via config.mcp_server_ids."""
-    from cognis.models.tool import MCP_SERVER_IDS_KEY
     from cognis.store.queries import get_mcp_server
 
     if not executor_config:
@@ -420,7 +457,11 @@ async def _resolve_executor_mcp_servers(
     servers: list[MCPServerConfig] = []
     async with session_factory() as session:
         for sid in server_ids:
-            row = await get_mcp_server(session, str(sid))
+            row = await get_mcp_server(
+                session,
+                str(sid),
+                owner_email=executor_config.get("owner_email") if executor_config else None,
+            )
             if row is None:
                 logger.warning(
                     "MCP server not found",

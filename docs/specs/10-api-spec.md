@@ -128,6 +128,11 @@ GET /api/v1/conversations/conv_abc/messages?limit=50&after_seq=100
 
 The controller reads from Intaris event store and formats for the client.
 
+If the Cognis conversation/session exists but Intaris has not created an event
+stream yet, the history endpoints return `200 OK` with an empty `items` list
+instead of failing with `500`. This lets new or partially initialized sessions
+degrade safely in the UI.
+
 ### Channels
 
 ```
@@ -233,6 +238,11 @@ GET    /api/v1/sessions/:id/events            → Events (proxied from Intaris)
 POST   /api/v1/sessions/:id/cancel            → Cancel
 ```
 
+`GET /api/v1/sessions/:id/events` and
+`GET /api/v1/conversations/:id/sessions/:sid/events` follow the same degraded
+behavior as conversation history: if the owned session exists locally but the
+Intaris event stream is still missing, they return an empty `items` list.
+
 ### Tools
 
 ```
@@ -266,14 +276,16 @@ POST   /api/v1/executors                       → Create executor configuration
 PUT    /api/v1/executors/:id                   → Update executor configuration
 DELETE /api/v1/executors/:id                   → Delete executor configuration
 POST   /api/v1/executors/:id/default           → Set as default executor
-POST   /api/v1/executors/:id/token             → Generate executor JWT (admin only)
+POST   /api/v1/executors/:id/token             → Generate executor JWT (owner-scoped)
 GET    /api/v1/executor/status                 → Executor status and capabilities
 GET    /api/v1/tools/executor                  → List executor-native tool definitions
-GET    /api/v1/mcp-servers                      → List global MCP server configs
-GET    /api/v1/mcp-servers/:id                  → Get MCP server config
-POST   /api/v1/mcp-servers                      → Create MCP server config (admin)
-PUT    /api/v1/mcp-servers/:id                  → Update MCP server config (admin)
-DELETE /api/v1/mcp-servers/:id                  → Delete MCP server config (admin, 409 if referenced)
+GET    /api/v1/mcp-servers                      → List current user's MCP server configs
+GET    /api/v1/mcp-servers/:id                  → Get current user's MCP server config
+POST   /api/v1/mcp-servers                      → Create MCP server config (user-scoped)
+PUT    /api/v1/mcp-servers/:id                  → Update MCP server config (user-scoped)
+DELETE /api/v1/mcp-servers/:id                  → Delete MCP server config (user-scoped, 409 if referenced)
+GET    /api/v1/agents/:id/effective-tools       → Effective tool set for saved agent
+POST   /api/v1/agents/effective-tools/preview   → Effective tool preview for unsaved agent draft
 ```
 
 ### Secrets

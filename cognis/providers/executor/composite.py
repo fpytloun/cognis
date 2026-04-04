@@ -9,6 +9,13 @@ from __future__ import annotations
 
 from typing import Any
 
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from cognis.core.executor_policy import (
+    ExecutorPolicy,
+    ensure_executor_type_allowed,
+    load_executor_policy,
+)
 from cognis.logging import get_logger
 from cognis.models.config import ProviderHealth
 from cognis.models.tool import ExecutorConfig, ExecutorHandle
@@ -33,10 +40,12 @@ class CompositeExecutorProvider:
         in_process: InProcessExecutorProvider,
         websocket: WebSocketExecutorProvider,
         subprocess: SubprocessExecutorProvider,
+        session_factory: async_sessionmaker[AsyncSession] | None = None,
     ) -> None:
         self._in_process = in_process
         self._websocket = websocket
         self._subprocess = subprocess
+        self._session_factory = session_factory
         # Track executor_id → type for routing get_executor/cancel
         self._handle_types: dict[str, str] = {}
 
@@ -57,6 +66,9 @@ class CompositeExecutorProvider:
     async def spawn(self, config: ExecutorConfig) -> ExecutorHandle:
         """Spawn an executor using the appropriate sub-provider."""
         executor_type = config.metadata.get("executor_type", "in_process")
+        if self._session_factory is not None:
+            policy = await load_executor_policy(self._session_factory)
+            ensure_executor_type_allowed(executor_type, policy)
         provider = self._get_provider(executor_type)
         handle = await provider.spawn(config)
         self._handle_types[handle.executor_id] = executor_type
@@ -65,6 +77,9 @@ class CompositeExecutorProvider:
     async def get_executor(self, handle: ExecutorHandle) -> Any:
         """Get the live connection for an executor handle."""
         executor_type = self._handle_types.get(handle.executor_id, handle.executor_type)
+        if self._session_factory is not None:
+            policy = await load_executor_policy(self._session_factory)
+            ensure_executor_type_allowed(executor_type, policy)
         provider = self._get_provider(executor_type)
         return await provider.get_executor(handle)
 
@@ -88,6 +103,13 @@ class CompositeExecutorProvider:
         await self._subprocess.cleanup()
         await self._websocket.cleanup()
         self._handle_types.clear()
+
+    async def apply_policy(self, policy: ExecutorPolicy) -> None:
+        """Enforce deployment policy on already-active local executors."""
+        if not policy.allow_in_process:
+            await self._in_process.cleanup()
+        if not policy.allow_subprocess:
+            await self._subprocess.cleanup()
 
     async def health(self) -> ProviderHealth:
         """Aggregate health from all sub-providers."""
@@ -134,8 +156,5 @@ class CompositeExecutorProvider:
             return self._subprocess
         if executor_type == "websocket":
             return self._websocket
-        _logger.warning(
-            "executor_composite: unknown type, falling back to in_process",
-            extra={"extra_data": {"executor_type": executor_type}},
-        )
-        return self._in_process
+        msg = f"Unknown executor type: {executor_type}"
+        raise ValueError(msg)

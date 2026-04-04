@@ -8,12 +8,19 @@ import json
 import logging
 import platform
 import uuid
+from datetime import UTC, datetime
 from time import perf_counter
 from typing import Any
 
 from cognis.core.executor_resolution import filter_tools_by_executor
-from cognis.models.tool import ExecutorConfig, ToolCall, ToolDefinition, ToolResult
+from cognis.models.tool import ExecutorConfig, MCPServerConfig, ToolCall, ToolDefinition, ToolResult
 from cognis.tools.executor.definitions import executor_tool_definitions, executor_tool_handlers
+from cognis.tools.mcp import (
+    StdioMCPClient,
+    mcp_tools_to_definitions,
+    resolve_secret_refs,
+    validate_unique_server_names,
+)
 
 logger = logging.getLogger("cognis.executor.runner")
 
@@ -30,14 +37,16 @@ class ExecutorRunner:
         self._active_calls: dict[str, asyncio.Task[Any]] = {}
         self._running = True
         self._configured = False
+        self._runtime_state = "offline"
+        self._config_version = 0
         self._tool_handlers: dict[str, Any] = {}
         self._configured_tool_definitions: list[ToolDefinition] = []
+        self._mcp_clients: dict[str, StdioMCPClient] = {}
         self._inference_handler: Any | None = None
         self._channel_handler: Any | None = None
         self._started_at = perf_counter()
 
     async def run(self) -> None:
-        """Main entry point — connect and serve until cancelled."""
         reconnect_delay = _RECONNECT_BASE
         try:
             while self._running:
@@ -51,6 +60,7 @@ class ExecutorRunner:
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 2, _RECONNECT_MAX)
         finally:
+            await self._close_mcp_clients()
             if self._channel_handler is not None:
                 with contextlib.suppress(Exception):
                     await self._channel_handler.stop_all()
@@ -73,14 +83,11 @@ class ExecutorRunner:
             return
 
         self._configured = False
+        self._runtime_state = "offline"
         self._tool_handlers = {}
         self._configured_tool_definitions = []
 
-        async with websockets.connect(
-            url,
-            compression="deflate",
-            max_size=10 * 1024 * 1024,
-        ) as ws:
+        async with websockets.connect(url, compression="deflate", max_size=10 * 1024 * 1024) as ws:
             ready_id = uuid.uuid4().hex
             await ws.send(
                 json.dumps(
@@ -150,86 +157,108 @@ class ExecutorRunner:
                 break
 
     async def _handle_configure(self, ws: Any, msg_id: str | None, params: dict[str, Any]) -> None:
+        requested_version = int(params.get("config_version") or (self._config_version + 1))
+        if requested_version <= self._config_version:
+            await self._send_rpc_error(ws, msg_id, -32020, "Stale executor.configure version")
+            return
+
+        self._configured = False
+        self._runtime_state = "reconfiguring"
+
         config = params.get("config", {})
         enabled_tools = params.get("enabled_tools", [])
         enabled_tool_groups = params.get("enabled_tool_groups", [])
+        mcp_servers_raw = params.get("mcp_servers") or []
+        secrets = dict(params.get("secrets") or {})
 
-        all_defs = executor_tool_definitions()
-        self._configured_tool_definitions = filter_tools_by_executor(
-            all_defs,
+        try:
+            mcp_servers = [MCPServerConfig.model_validate(item) for item in mcp_servers_raw]
+            for server in mcp_servers:
+                if server.transport != "stdio":
+                    raise ValueError(
+                        f"Executor-hosted MCP currently supports stdio only (server {server.name})"
+                    )
+            validate_unique_server_names(mcp_servers)
+            await self._close_mcp_clients()
+            self._mcp_clients = await self._start_mcp_clients(mcp_servers, secrets)
+            discovered_tools = await self._discover_mcp_tools(mcp_servers)
+        except Exception as exc:
+            self._runtime_state = "blocked"
+            await self._send_rpc_error(ws, msg_id, -32021, f"Executor configure failed: {exc}")
+            return
+
+        native_defs = filter_tools_by_executor(
+            executor_tool_definitions(),
             enabled_tools,
             enabled_tool_groups,
         )
-        allowed = {tool.name for tool in self._configured_tool_definitions}
-        all_handlers = executor_tool_handlers()
+        self._configured_tool_definitions = [*native_defs, *discovered_tools]
+        native_handlers = executor_tool_handlers()
         self._tool_handlers = {
-            name: handler for name, handler in all_handlers.items() if name in allowed
+            name: handler
+            for name, handler in native_handlers.items()
+            if name in {t.name for t in native_defs}
         }
+        for tool in discovered_tools:
+            if tool.source.server_name is not None:
+                self._tool_handlers[tool.name] = self._build_mcp_handler(tool)
 
         if self._inference_handler is None:
             from cognis.executor.inference import InferenceHandler
 
             self._inference_handler = InferenceHandler()
-
         if self._channel_handler is None:
             from cognis.executor.channel_handler import ChannelHandler
 
             self._channel_handler = ChannelHandler()
         self._channel_handler.set_ws(ws)
 
+        self._config_version = requested_version
         self._configured = True
-        if msg_id:
-            await ws.send(
-                json.dumps(
-                    {
-                        "jsonrpc": "2.0",
-                        "result": {
-                            "status": "configured",
-                            "capabilities": {
-                                "tools": [tool.name for tool in self._configured_tool_definitions],
-                                "inference": True,
-                                "inference_models": [],
-                                "inference_type": "litellm_proxy",
-                                "channels": True,
-                            },
-                            "config_keys": sorted(config.keys())
-                            if isinstance(config, dict)
-                            else [],
-                        },
-                        "id": msg_id,
-                    }
-                )
+        self._runtime_state = "active"
+        if msg_id is not None:
+            await self._send_rpc_result(
+                ws,
+                msg_id,
+                {
+                    "status": "configured",
+                    "applied_version": self._config_version,
+                    "ready": True,
+                    "observed_at": datetime.now(UTC).isoformat(),
+                    "capabilities": {
+                        "tools": [tool.name for tool in self._configured_tool_definitions],
+                        "inference": True,
+                        "inference_models": [],
+                        "inference_type": "litellm_proxy",
+                        "channels": True,
+                    },
+                    "observed_tools": [
+                        tool.model_dump(mode="json") for tool in self._configured_tool_definitions
+                    ],
+                    "config_keys": sorted(config.keys()) if isinstance(config, dict) else [],
+                },
             )
 
     async def _handle_tool_list(self, ws: Any, msg_id: str | None) -> None:
-        if not msg_id:
+        if msg_id is None:
             return
-        await ws.send(
-            json.dumps(
-                {
-                    "jsonrpc": "2.0",
-                    "result": {
-                        "tools": [
-                            tool.model_dump(mode="json")
-                            for tool in self._configured_tool_definitions
-                        ],
-                    },
-                    "id": msg_id,
-                }
-            )
+        await self._send_rpc_result(
+            ws,
+            msg_id,
+            {"tools": [tool.model_dump(mode="json") for tool in self._configured_tool_definitions]},
         )
 
     async def _handle_tool_execute(
         self, ws: Any, msg_id: str | None, params: dict[str, Any]
     ) -> None:
         call_id = params.get("call_id", msg_id or uuid.uuid4().hex)
-        if not self._configured:
+        if not self._configured or self._runtime_state != "active":
             await self._send_rpc_result(
                 ws,
                 msg_id,
                 {
                     "call_id": call_id,
-                    "output": "Executor is not configured yet.",
+                    "output": "Executor is not configured or ready yet.",
                     "is_error": True,
                     "duration_ms": 0,
                 },
@@ -290,7 +319,7 @@ class ExecutorRunner:
             return
 
         request_id = params.get("request_id", msg_id or uuid.uuid4().hex)
-        if msg_id:
+        if msg_id is not None:
             await self._send_rpc_result(ws, msg_id, {"status": "streaming"})
 
         request_kwargs = dict(params.get("request_kwargs") or {})
@@ -338,10 +367,6 @@ class ExecutorRunner:
                         }
                     )
                 )
-
-    # ------------------------------------------------------------------
-    # Channel adapter methods
-    # ------------------------------------------------------------------
 
     async def _handle_channel_start(
         self, ws: Any, msg_id: str | None, params: dict[str, Any]
@@ -415,6 +440,8 @@ class ExecutorRunner:
                                 "uptime_seconds": int(perf_counter() - self._started_at),
                                 "active_calls": len(self._active_calls),
                                 "configured": self._configured,
+                                "runtime_state": self._runtime_state,
+                                "config_version": self._config_version,
                             },
                         }
                     )
@@ -422,6 +449,44 @@ class ExecutorRunner:
             except Exception:
                 break
             await asyncio.sleep(_HEARTBEAT_INTERVAL)
+
+    async def _start_mcp_clients(
+        self, servers: list[MCPServerConfig], secrets: dict[str, str]
+    ) -> dict[str, StdioMCPClient]:
+        clients: dict[str, StdioMCPClient] = {}
+        for server in servers:
+            client = StdioMCPClient(server, env=resolve_secret_refs(server.env, secrets))
+            await client.start()
+            clients[server.name] = client
+        return clients
+
+    async def _discover_mcp_tools(self, servers: list[MCPServerConfig]) -> list[ToolDefinition]:
+        discovered: list[ToolDefinition] = []
+        for server in servers:
+            tools = await self._mcp_clients[server.name].list_tools()
+            discovered.extend(
+                mcp_tools_to_definitions(
+                    server.name,
+                    tools,
+                    timeout_seconds=server.timeout_seconds,
+                    server_id=server.server_id,
+                )
+            )
+        return discovered
+
+    def _build_mcp_handler(self, tool: ToolDefinition) -> Any:
+        async def _handler(arguments: dict[str, Any], _: Any) -> str:
+            client = self._mcp_clients[str(tool.source.server_name)]
+            _, raw_tool_name = tool.name.split("/", 1)
+            return await client.call_tool(raw_tool_name, arguments)
+
+        return _handler
+
+    async def _close_mcp_clients(self) -> None:
+        for client in self._mcp_clients.values():
+            with contextlib.suppress(Exception):
+                await client.close()
+        self._mcp_clients = {}
 
     async def _send_rpc_result(self, ws: Any, msg_id: str | None, result: dict[str, Any]) -> None:
         if msg_id is None:
@@ -433,17 +498,12 @@ class ExecutorRunner:
             return
         await ws.send(
             json.dumps(
-                {
-                    "jsonrpc": "2.0",
-                    "error": {"code": code, "message": message},
-                    "id": msg_id,
-                }
+                {"jsonrpc": "2.0", "error": {"code": code, "message": message}, "id": msg_id}
             )
         )
 
 
 def _normalize_result(raw: Any, duration_ms: int) -> ToolResult:
-    """Normalize a handler return value to ToolResult."""
     if isinstance(raw, ToolResult):
         return raw.model_copy(update={"duration_ms": raw.duration_ms or duration_ms})
     if isinstance(raw, (dict, list)):

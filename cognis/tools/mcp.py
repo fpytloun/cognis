@@ -193,7 +193,11 @@ class StdioMCPClient:
 
 
 def mcp_tools_to_definitions(
-    server_name: str, tools: Sequence[dict[str, Any]], timeout_seconds: int
+    server_name: str,
+    tools: Sequence[dict[str, Any]],
+    timeout_seconds: int,
+    *,
+    server_id: str | None = None,
 ) -> list[ToolDefinition]:
     """Convert MCP tool metadata into Cognis tool definitions."""
 
@@ -210,12 +214,31 @@ def mcp_tools_to_definitions(
                 name=f"{server_name}/{name}",
                 description=str(tool.get("description") or f"MCP tool {name}"),
                 parameters=parameters,
-                source=ToolSource(type="local_mcp", server_name=server_name),
+                source=ToolSource(type="local_mcp", server_name=server_name, server_id=server_id),
                 category="mcp",
                 timeout_seconds=timeout_seconds,
             )
         )
     return definitions
+
+
+def resolve_secret_refs(env: dict[str, str], secrets: dict[str, str]) -> dict[str, str]:
+    """Resolve ``$secret:NAME`` references in MCP environment variables."""
+    resolved: dict[str, str] = {}
+    for key, value in env.items():
+        if value.startswith("$secret:"):
+            resolved[key] = secrets.get(value[len("$secret:") :], "")
+        else:
+            resolved[key] = value
+    return resolved
+
+
+def validate_unique_server_names(servers: Sequence[MCPServerConfig]) -> None:
+    names = [server.name for server in servers]
+    if len(names) != len(set(names)):
+        duplicates = sorted({name for name in names if names.count(name) > 1})
+        msg = f"Duplicate MCP server names are not allowed: {', '.join(duplicates)}"
+        raise ValueError(msg)
 
 
 def _normalize_mcp_result(result: dict[str, Any]) -> str:

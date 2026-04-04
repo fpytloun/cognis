@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from cognis.core.truncation import middle_truncate
 from cognis.models.agent import AgentDefinition
 from cognis.models.session import SessionModel
-from cognis.models.tool import Permission, ToolCall, ToolResult
+from cognis.models.tool import Permission, ToolCall, ToolResult, stable_tool_id
 from cognis.store.queries import get_setting_value
 from cognis.tools.builtin.image import handle_image_tool, is_image_tool
 from cognis.tools.builtin.memory import handle_memory_tool, is_memory_tool
@@ -157,7 +157,10 @@ class ToolRouter:
 
         permission = Permission.EVALUATE
         if agent.permissions is not None:
-            permission = agent.permissions.resolve_permission(tool_call.name)
+            permission = agent.permissions.resolve_permission(
+                tool_call.name,
+                tool_id=stable_tool_id(registered_tool.definition),
+            )
         if permission is Permission.DENY:
             return PermissionDecision(
                 decision="deny", reasoning="Tool denied by agent policy", source="agent"

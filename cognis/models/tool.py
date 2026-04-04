@@ -23,6 +23,7 @@ class ToolSource(BaseModel):
 
     type: str
     server_name: str | None = None
+    server_id: str | None = None
     skill_id: str | None = None
 
 
@@ -42,6 +43,15 @@ class ToolDefinition(BaseModel):
     risk_level: str | None = None
 
 
+def stable_tool_id(tool: ToolDefinition) -> str:
+    """Return a stable identifier for a tool definition."""
+    if tool.source.type == "local_mcp":
+        server_id = tool.source.server_id or tool.source.server_name or "unknown"
+        raw_name = tool.name.split("/", 1)[1] if "/" in tool.name else tool.name
+        return f"mcp:{server_id}:{raw_name}"
+    return f"builtin:{tool.name}"
+
+
 class ToolCall(BaseModel):
     """Normalized tool call request."""
 
@@ -53,6 +63,7 @@ class ToolCall(BaseModel):
 class MCPServerConfig(BaseModel):
     """Configuration for a local MCP server."""
 
+    server_id: str | None = None
     name: str
     transport: str = "stdio"
     command: str | None = None  # Required for stdio transport

@@ -10,12 +10,12 @@
   import { installBeforeUnloadGuard, blockNavigationIfDirty } from '$lib/navigation/unsaved';
   import { addToast } from '$lib/stores/toasts';
   import Button from '$lib/components/ui/Button.svelte';
-  import type { ExecutorConfig, IntarisMCPServer, LLMProvider, SecretMetadata, ToolDefinitionSummary, Workflow } from '$lib/types/api';
+  import type { EffectiveToolItem, ExecutorConfig, IntarisMCPServer, LLMProvider, SecretMetadata, Workflow } from '$lib/types/api';
 
   let loading = $state(true);
   let saving = $state(false);
   let error = $state('');
-  let tools = $state<ToolDefinitionSummary[]>([]);
+  let tools = $state<EffectiveToolItem[]>([]);
   let workflows = $state<Workflow[]>([]);
   let providers = $state<LLMProvider[]>([]);
   let executors = $state<ExecutorConfig[]>([]);
@@ -23,6 +23,7 @@
   let intarisMcpServers = $state<IntarisMCPServer[]>([]);
   let form: AgentFormState = $state(createEmptyAgentForm());
   let initialSnapshot = '';
+  let previewTimer: ReturnType<typeof setTimeout> | null = null;
 
   function isDirty(): boolean {
     return JSON.stringify($state.snapshot(form)) !== initialSnapshot;
@@ -38,18 +39,17 @@
   async function loadOptions(): Promise<void> {
     loading = true;
     try {
-      const [loadedTools, loadedWorkflows] = await Promise.all([
+      const [, loadedWorkflows] = await Promise.all([
         api.tools.list(),
         api.workflows.listAll(),
       ]);
-      tools = loadedTools;
       workflows = loadedWorkflows;
 
       // These are non-critical — load gracefully
       try { secrets = await api.secrets.list(); } catch { secrets = []; }
+      try { executors = await api.executor.list(); } catch { executors = []; }
       if (auth.getSnapshot().user?.role === 'admin') {
         try { providers = (await api.llmProviders.list()).items; } catch { providers = []; }
-        try { executors = await api.executor.list(); } catch { executors = []; }
       }
       try { intarisMcpServers = await api.tools.intarisMcpServers(); } catch { intarisMcpServers = []; }
 
@@ -58,6 +58,17 @@
       form.availableWorkflowIds = systemWorkflowIds;
       form.defaultWorkflowId = 'system:direct';
       form.systemPrompt = defaultSystemPrompt('');
+      const preview = await api.agents.previewEffectiveTools({
+        tools: form.originalTools,
+        permissions: {
+          tool_permissions: form.toolPermissions,
+          allowed_secrets: form.allowedSecrets,
+          max_delegation_depth: form.maxDelegationDepth,
+          can_delegate: form.canDelegate,
+        },
+        execution: { executor_id: form.executorId || undefined },
+      });
+      tools = preview.configured_state.tools;
       initialSnapshot = JSON.stringify($state.snapshot(form));
     } catch (caughtError) {
       error = asApiError(caughtError).message;
@@ -85,6 +96,49 @@
     const cleanup = installBeforeUnloadGuard(isDirty);
     void loadOptions();
     return cleanup;
+  });
+
+  $effect(() => {
+    if (loading) return;
+    const payload = {
+      tools: {
+        ...form.originalTools,
+        disabled_categories: form.disabledCategories,
+        disabled_tools: form.disabledTools,
+        delegation_tools: form.canDelegate,
+      },
+      permissions: {
+        tool_permissions: form.toolPermissions,
+        allowed_secrets: form.allowedSecrets,
+        max_delegation_depth: form.maxDelegationDepth,
+        can_delegate: form.canDelegate,
+      },
+      execution: {
+        executor_id: form.executorId || undefined,
+        executor_selector: form.executorSelector
+          ? Object.fromEntries(
+              form.executorSelector
+                .split('\n')
+                .map((entry) => entry.trim())
+                .filter(Boolean)
+                .map((entry) => {
+                  const [key, ...rest] = entry.split('=');
+                  return [key.trim(), rest.join('=').trim()];
+                })
+            )
+          : undefined,
+      },
+      agent_id: form.agentId || null,
+    };
+    if (previewTimer) clearTimeout(previewTimer);
+    previewTimer = setTimeout(async () => {
+      try {
+        const preview = await api.agents.previewEffectiveTools(payload);
+        tools = preview.configured_state.tools;
+      } catch {
+        // best-effort preview only
+      }
+    }, 200);
   });
 </script>
 

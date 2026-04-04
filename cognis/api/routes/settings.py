@@ -23,6 +23,7 @@ from cognis.api.models import (
     WebConfigStatusResponse,
 )
 from cognis.api.serializers import llm_provider_to_response, setting_to_response
+from cognis.core.executor_policy import load_executor_policy
 from cognis.settings_schema import setting_category, validate_setting_value
 from cognis.store.queries import (
     create_llm_provider,
@@ -103,6 +104,9 @@ async def setting_update(
         request.app.state.api_rate_limiter.update_limits(
             write_requests_per_minute=int(payload.value)
         )
+    elif key in {"executors.allow_in_process", "executors.allow_subprocess"}:
+        policy = await load_executor_policy(request.app.state.session_factory)
+        await request.app.state.providers.executor.apply_policy(policy)
     return setting_to_response(row)
 
 

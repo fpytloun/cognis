@@ -1782,25 +1782,39 @@ async def delete_skill(session: AsyncSession, skill_id: str) -> bool:
 # --- Executors ---
 
 
-async def list_executors(session: AsyncSession) -> list[ExecutorRow]:
+async def list_executors(
+    session: AsyncSession, *, owner_email: str | None = None
+) -> list[ExecutorRow]:
     """List all executor configurations."""
-    result = await session.execute(select(ExecutorRow).order_by(ExecutorRow.name))
+    stmt = select(ExecutorRow).order_by(ExecutorRow.name)
+    if owner_email is not None:
+        stmt = stmt.where(ExecutorRow.owner_email == owner_email)
+    result = await session.execute(stmt)
     return list(result.scalars().all())
 
 
-async def get_executor_row(session: AsyncSession, executor_id: str) -> ExecutorRow | None:
+async def get_executor_row(
+    session: AsyncSession,
+    executor_id: str,
+    *,
+    owner_email: str | None = None,
+) -> ExecutorRow | None:
     """Get an executor by ID."""
-    result = await session.execute(
-        select(ExecutorRow).where(ExecutorRow.executor_id == executor_id)
-    )
+    stmt = select(ExecutorRow).where(ExecutorRow.executor_id == executor_id)
+    if owner_email is not None:
+        stmt = stmt.where(ExecutorRow.owner_email == owner_email)
+    result = await session.execute(stmt)
     return result.scalar_one_or_none()
 
 
-async def get_default_executor(session: AsyncSession) -> ExecutorRow | None:
+async def get_default_executor(
+    session: AsyncSession, *, owner_email: str | None = None
+) -> ExecutorRow | None:
     """Get the default executor (is_default=True)."""
-    result = await session.execute(
-        select(ExecutorRow).where(ExecutorRow.is_default.is_(True)).limit(1)
-    )
+    stmt = select(ExecutorRow).where(ExecutorRow.is_default.is_(True)).limit(1)
+    if owner_email is not None:
+        stmt = stmt.where(ExecutorRow.owner_email == owner_email)
+    result = await session.execute(stmt)
     return result.scalar_one_or_none()
 
 
@@ -1837,10 +1851,12 @@ async def create_executor(
 async def update_executor(
     session: AsyncSession,
     executor_id: str,
+    *,
+    owner_email: str | None = None,
     **kwargs: Any,
 ) -> ExecutorRow | None:
     """Update an executor by ID."""
-    row = await get_executor_row(session, executor_id)
+    row = await get_executor_row(session, executor_id, owner_email=owner_email)
     if row is None:
         return None
     for key, value in kwargs.items():
@@ -1850,13 +1866,45 @@ async def update_executor(
     return row
 
 
-async def delete_executor(session: AsyncSession, executor_id: str) -> bool:
+async def delete_executor(
+    session: AsyncSession, executor_id: str, *, owner_email: str | None = None
+) -> bool:
     """Delete an executor by ID."""
-    row = await get_executor_row(session, executor_id)
+    row = await get_executor_row(session, executor_id, owner_email=owner_email)
     if row is None:
         return False
-    await session.execute(delete(ExecutorRow).where(ExecutorRow.executor_id == executor_id))
+    stmt = delete(ExecutorRow).where(ExecutorRow.executor_id == executor_id)
+    if owner_email is not None:
+        stmt = stmt.where(ExecutorRow.owner_email == owner_email)
+    await session.execute(stmt)
     return True
+
+
+async def update_executor_runtime_state(
+    session: AsyncSession,
+    executor_id: str,
+    *,
+    desired_config_version: int | None = None,
+    applied_config_version: int | None = None,
+    observed_tools: list[dict[str, Any]] | None = None,
+    last_observed_at: datetime | None = None,
+    runtime_state: str | None = None,
+) -> ExecutorRow | None:
+    row = await get_executor_row(session, executor_id)
+    if row is None:
+        return None
+    if desired_config_version is not None:
+        row.desired_config_version = desired_config_version
+    if applied_config_version is not None:
+        row.applied_config_version = applied_config_version
+    if observed_tools is not None:
+        row.observed_tools = observed_tools
+    if last_observed_at is not None:
+        row.last_observed_at = last_observed_at
+    if runtime_state is not None:
+        row.runtime_state = runtime_state
+    await session.flush()
+    return row
 
 
 async def ensure_default_executor(session: AsyncSession) -> ExecutorRow:
@@ -1878,15 +1926,28 @@ async def ensure_default_executor(session: AsyncSession) -> ExecutorRow:
 # --- MCP Servers ---
 
 
-async def list_mcp_servers(session: AsyncSession) -> list[MCPServerRow]:
+async def list_mcp_servers(
+    session: AsyncSession, *, owner_email: str | None = None
+) -> list[MCPServerRow]:
     """List all MCP server configurations."""
-    result = await session.execute(select(MCPServerRow).order_by(MCPServerRow.name))
+    stmt = select(MCPServerRow).order_by(MCPServerRow.name)
+    if owner_email is not None:
+        stmt = stmt.where(MCPServerRow.owner_email == owner_email)
+    result = await session.execute(stmt)
     return list(result.scalars().all())
 
 
-async def get_mcp_server(session: AsyncSession, server_id: str) -> MCPServerRow | None:
+async def get_mcp_server(
+    session: AsyncSession,
+    server_id: str,
+    *,
+    owner_email: str | None = None,
+) -> MCPServerRow | None:
     """Get an MCP server by ID."""
-    result = await session.execute(select(MCPServerRow).where(MCPServerRow.server_id == server_id))
+    stmt = select(MCPServerRow).where(MCPServerRow.server_id == server_id)
+    if owner_email is not None:
+        stmt = stmt.where(MCPServerRow.owner_email == owner_email)
+    result = await session.execute(stmt)
     return result.scalar_one_or_none()
 
 
@@ -1927,10 +1988,12 @@ async def create_mcp_server(
 async def update_mcp_server(
     session: AsyncSession,
     server_id: str,
+    *,
+    owner_email: str | None = None,
     **kwargs: Any,
 ) -> MCPServerRow | None:
     """Update an MCP server by ID."""
-    row = await get_mcp_server(session, server_id)
+    row = await get_mcp_server(session, server_id, owner_email=owner_email)
     if row is None:
         return None
     for key, value in kwargs.items():
@@ -1940,20 +2003,27 @@ async def update_mcp_server(
     return row
 
 
-async def delete_mcp_server(session: AsyncSession, server_id: str) -> bool:
+async def delete_mcp_server(
+    session: AsyncSession, server_id: str, *, owner_email: str | None = None
+) -> bool:
     """Delete an MCP server by ID."""
-    row = await get_mcp_server(session, server_id)
+    row = await get_mcp_server(session, server_id, owner_email=owner_email)
     if row is None:
         return False
-    await session.execute(delete(MCPServerRow).where(MCPServerRow.server_id == server_id))
+    stmt = delete(MCPServerRow).where(MCPServerRow.server_id == server_id)
+    if owner_email is not None:
+        stmt = stmt.where(MCPServerRow.owner_email == owner_email)
+    await session.execute(stmt)
     return True
 
 
-async def mcp_server_referenced_by_executors(session: AsyncSession, server_id: str) -> list[str]:
+async def mcp_server_referenced_by_executors(
+    session: AsyncSession, server_id: str, *, owner_email: str | None = None
+) -> list[str]:
     """Return executor IDs that reference this MCP server in their config."""
     from cognis.models.tool import MCP_SERVER_IDS_KEY
 
-    executors = await list_executors(session)
+    executors = await list_executors(session, owner_email=owner_email)
     referencing: list[str] = []
     for ex in executors:
         config = ex.config or {}

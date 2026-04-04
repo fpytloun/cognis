@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from cognis.core.executor_policy import ExecutorPolicy, is_executor_row_usable
 from cognis.logging import get_logger
 from cognis.models.tool import ToolDefinition
 
@@ -64,6 +65,9 @@ def labels_match(
 def select_executor_for_agent(
     executors: list[Any],
     agent_execution: dict[str, Any] | None,
+    *,
+    owner_email: str | None = None,
+    policy: ExecutorPolicy | None = None,
 ) -> Any | None:
     """Select the best executor for an agent based on its execution config.
 
@@ -81,7 +85,12 @@ def select_executor_for_agent(
     # 1. Explicit executor ID
     if explicit_id:
         for ex in executors:
-            if ex.executor_id == explicit_id and ex.status == "active":
+            if ex.executor_id == explicit_id and (
+                is_executor_row_usable(ex, policy, owner_email=owner_email)
+                if policy is not None
+                else ex.status == "active"
+                and (owner_email is None or ex.owner_email == owner_email)
+            ):
                 return ex
         logger.warning(
             "executor_resolution: explicit executor not found or inactive",
@@ -91,9 +100,24 @@ def select_executor_for_agent(
 
     # 2. Label selector matching
     if selector:
+        matches: list[Any] = []
         for ex in executors:
-            if ex.status == "active" and labels_match(ex.labels, selector):
-                return ex
+            usable = (
+                is_executor_row_usable(ex, policy, owner_email=owner_email)
+                if policy is not None
+                else ex.status == "active"
+                and (owner_email is None or ex.owner_email == owner_email)
+            )
+            if usable and labels_match(ex.labels, selector):
+                matches.append(ex)
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            logger.warning(
+                "executor_resolution: selector matched multiple executors",
+                extra={"extra_data": {"selector": selector, "count": len(matches)}},
+            )
+            return None
         logger.warning(
             "executor_resolution: no executor matches selector",
             extra={"extra_data": {"selector": selector}},
@@ -102,12 +126,22 @@ def select_executor_for_agent(
 
     # 3. Default executor
     for ex in executors:
-        if ex.is_default and ex.status == "active":
+        usable = (
+            is_executor_row_usable(ex, policy, owner_email=owner_email)
+            if policy is not None
+            else ex.status == "active" and (owner_email is None or ex.owner_email == owner_email)
+        )
+        if ex.is_default and usable:
             return ex
 
     # 4. Fallback: first active executor
     for ex in executors:
-        if ex.status == "active":
+        usable = (
+            is_executor_row_usable(ex, policy, owner_email=owner_email)
+            if policy is not None
+            else ex.status == "active" and (owner_email is None or ex.owner_email == owner_email)
+        )
+        if usable:
             return ex
 
     return None

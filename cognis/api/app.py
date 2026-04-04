@@ -146,7 +146,11 @@ def create_app() -> FastAPI:
         async with session_factory() as session:
             from cognis.store.queries import count_users, ensure_default_executor, get_setting_value
 
-            await ensure_default_executor(session)
+            allow_in_process = bool(
+                await get_setting_value(session, "executors.allow_in_process", True)
+            )
+            if allow_in_process:
+                await ensure_default_executor(session)
             await session.commit()
 
             auth_provider.token_ttl_seconds = _as_int(
@@ -538,11 +542,10 @@ def create_app() -> FastAPI:
         from cognis.api.executor_ws import handle_executor_websocket
 
         ws_provider = app.state.providers.executor.websocket
-        auth_provider = app.state.providers.auth
         await handle_executor_websocket(
             websocket,
             ws_provider,
-            auth_provider,
+            app.state.providers,
             app.state.session_factory,
         )
 
