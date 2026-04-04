@@ -5,6 +5,7 @@ COPY ui/package.json ui/package-lock.json* ./
 RUN npm ci
 
 COPY ui/ ./
+COPY docs/ ../docs/
 RUN npm run build
 
 
