@@ -86,6 +86,17 @@ async def handle_executor_websocket(
         },
     )
 
+    # Acknowledge executor.ready before sending executor.configure.
+    # The runner waits for this response before entering the normal
+    # message loop that can process controller-initiated RPC requests.
+    await ws.send_json(
+        {
+            "jsonrpc": "2.0",
+            "result": {"status": "registered", "executor_id": executor_id},
+            "id": msg_id,
+        }
+    )
+
     try:
         desired_version = row.desired_config_version + 1
         mcp_servers, scoped_secrets = await _resolve_executor_mcp_payload(row, providers)
@@ -153,14 +164,6 @@ async def handle_executor_websocket(
             runtime_state="active",
         )
         await session.commit()
-
-    await ws.send_json(
-        {
-            "jsonrpc": "2.0",
-            "result": {"status": "registered", "executor_id": executor_id},
-            "id": msg_id,
-        }
-    )
 
     # Start any channel accounts assigned to this executor
     channel_manager = getattr(ws.app.state, "channel_manager", None)
