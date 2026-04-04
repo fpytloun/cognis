@@ -257,11 +257,11 @@
     <div class="mx-auto flex h-[100dvh] max-w-[1600px] gap-3 overflow-hidden px-2 py-2 sm:px-3 sm:py-3 lg:gap-6 lg:px-6 lg:py-4">
       <!-- svelte-ignore a11y_no_static_element_interactions -->
       <aside
-        class={`hidden shrink-0 overflow-hidden whitespace-nowrap rounded-3xl border border-slate-800/80 bg-slate-900/80 shadow-card backdrop-blur transition-all duration-200 ease-in-out md:flex md:flex-col md:justify-between ${sidebarExpanded ? 'w-72 p-5' : 'w-16 p-3'}`}
+        class={`hidden min-h-0 shrink-0 overflow-hidden whitespace-nowrap rounded-3xl border border-slate-800/80 bg-slate-900/80 shadow-card backdrop-blur transition-all duration-200 ease-in-out md:flex md:flex-col md:justify-between ${sidebarExpanded ? 'w-72 p-5' : 'w-16 p-3'}`}
         onmouseenter={() => { sidebarHovered = true; }}
         onmouseleave={() => { sidebarHovered = false; }}
       >
-        <div class="min-w-0 overflow-hidden">
+        <div class="min-w-0 min-h-0 flex-1 overflow-y-auto">
           {#if sidebarExpanded}
             <div class="space-y-2 border-b border-slate-800/80 pb-5">
               <p class="text-sm font-medium uppercase tracking-[0.3em] text-sky-300">Cognis</p>
@@ -290,7 +290,7 @@
           </nav>
         </div>
 
-        <div class={`space-y-4 border-t border-slate-800/80 ${sidebarExpanded ? 'pt-6' : 'pt-4'}`}>
+        <div class={`shrink-0 space-y-4 border-t border-slate-800/80 ${sidebarExpanded ? 'pt-6' : 'pt-4'}`}>
           {#if sidebarExpanded}
             <div class="space-y-1">
               <p class="text-sm font-medium text-white">{$auth.user?.name ?? $auth.user?.email}</p>

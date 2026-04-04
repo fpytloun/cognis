@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { collectModelOptions, createProviderForm, detectProviderPreset, providerFormToPayload } from '$lib/providers';
+import { collectModelOptions, createProviderForm, deriveProviderId, detectProviderPreset, providerFormToPayload } from '$lib/providers';
 import type { LLMProvider } from '$lib/types/api';
 
 describe('provider presets', () => {
@@ -100,5 +100,16 @@ describe('provider presets', () => {
         providerId: 'default'
       }
     ]);
+  });
+
+  it('derives provider ids from display names and omits empty provider ids from payload', () => {
+    expect(deriveProviderId('My OpenAI Proxy')).toBe('my-openai-proxy');
+
+    const form = createProviderForm();
+    form.display_name = 'My OpenAI Proxy';
+    form.default_model = 'gpt-4o-mini';
+    const payload = providerFormToPayload(form);
+
+    expect(payload).not.toHaveProperty('provider_id');
   });
 });

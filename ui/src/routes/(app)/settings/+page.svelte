@@ -2,11 +2,13 @@
   import { beforeNavigate, goto } from '$app/navigation';
   import { onMount } from 'svelte';
 
+  import type { MCPEnvVar } from '$lib/agents';
   import { api, asApiError } from '$lib/api/client';
   import { deriveGettingStartedSteps } from '$lib/getting-started';
-  import { collectModelOptions, createProviderForm, presetHasBaseUrl, presetNeedsAuth, PRESET_LABELS, providerFormToPayload, type ProviderFormState, type ProviderPreset } from '$lib/providers';
+  import { collectModelOptions, createProviderForm, deriveProviderId, presetHasBaseUrl, presetNeedsAuth, PRESET_LABELS, providerFormToPayload, type ProviderFormState, type ProviderPreset } from '$lib/providers';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import ProviderStatusBadge from '$lib/components/ProviderStatusBadge.svelte';
+  import EnvVarEditor from '$lib/components/settings/EnvVarEditor.svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import Card from '$lib/components/ui/Card.svelte';
   import Input from '$lib/components/ui/Input.svelte';
@@ -73,7 +75,7 @@
   let mcpServerConfigs: MCPServerConfigResponse[] = [];
   let showMcpForm = false;
   let editingMcpServer: MCPServerConfigResponse | null = null;
-  let mcpForm = { name: '', transport: 'stdio', command: '', url: '', args: '', env: '', timeout_seconds: 30, description: '' };
+  let mcpForm = { name: '', transport: 'stdio', command: '', url: '', args: '', envVars: [] as MCPEnvVar[], timeout_seconds: 30, description: '' };
   let isAdmin = false;
   let selectedProviderId = '';
   let selectedSettingKey = '';
@@ -81,6 +83,8 @@
   let providerForm: ProviderFormState = createProviderForm();
   let providerTestResult: ProviderTestResult | null = null;
   let showSecretModal = false;
+  let secretModalTarget: 'provider' | 'mcp' = 'provider';
+  let mcpSecretTargetKey = '';
   let secretModalName = '';
   let secretModalValue = '';
   let agents: Array<{ agent_id: string; name: string; is_system?: boolean }> = [];
@@ -301,9 +305,34 @@
   }
 
   function openSecretModal(): void {
+    secretModalTarget = 'provider';
     secretModalName = providerForm.auth_secret_name || `${providerForm.preset}_api_key`;
     secretModalValue = '';
     showSecretModal = true;
+  }
+
+  function openMcpSecretModal(key: string): void {
+    secretModalTarget = 'mcp';
+    mcpSecretTargetKey = key;
+    secretModalName = key ? key.toLowerCase() : 'mcp_secret';
+    secretModalValue = '';
+    showSecretModal = true;
+  }
+
+  function parseMcpEnvVars(env: Record<string, string>): MCPEnvVar[] {
+    return Object.entries(env).map(([key, value]) => ({
+      key,
+      value: value.startsWith('$secret:') ? value.slice('$secret:'.length) : value,
+      type: value.startsWith('$secret:') ? 'secret' : 'literal'
+    }));
+  }
+
+  function serializeMcpEnvVars(envVars: MCPEnvVar[]): Record<string, string> {
+    return Object.fromEntries(
+      envVars
+        .filter((entry) => entry.key.trim() && entry.value.trim())
+        .map((entry) => [entry.key.trim(), entry.type === 'secret' ? `$secret:${entry.value.trim()}` : entry.value.trim()])
+    );
   }
 
   async function saveSecretFromModal(): Promise<void> {
@@ -319,9 +348,17 @@
         value: secretModalValue,
         scope: 'global',
         agent_id: null,
-        description: `API key for provider ${providerForm.display_name || providerForm.provider_id}`
+        description: secretModalTarget === 'provider'
+          ? `API key for provider ${providerForm.display_name || providerForm.provider_id}`
+          : `MCP environment secret for ${mcpSecretTargetKey || 'variable'}`
       });
-      providerForm.auth_secret_name = secretModalName;
+      if (secretModalTarget === 'provider') {
+        providerForm.auth_secret_name = secretModalName;
+      } else {
+        mcpForm.envVars = mcpForm.envVars.map((entry) =>
+          entry.key === mcpSecretTargetKey ? { ...entry, type: 'secret', value: secretModalName } : entry
+        );
+      }
       secretModalValue = '';
       showSecretModal = false;
       // Refresh secrets list
@@ -425,8 +462,8 @@
   }
 
   async function saveProvider(): Promise<void> {
-    if (!providerForm.provider_id.trim() || !providerForm.display_name.trim()) {
-      error = 'Provider ID and display name are required.';
+    if (!providerForm.display_name.trim()) {
+      error = 'Display name is required.';
       return;
     }
     if (providerForm.preset === 'custom') {
@@ -445,8 +482,8 @@
       if (selectedProviderId) {
         await api.llmProviders.update(selectedProviderId, payload);
       } else {
-        await api.llmProviders.create(payload);
-        selectedProviderId = providerForm.provider_id;
+        const created = await api.llmProviders.create(payload);
+        selectedProviderId = created.provider_id;
       }
       await refreshPageState();
       notice = 'Provider saved.';
@@ -980,6 +1017,11 @@
                 <span class="block rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-400">{providerForm.provider_id || 'auto-generated from name'}</span>
               {/if}
             </div>
+            {#if !selectedProviderId}
+              <div class="md:col-span-2 text-xs text-slate-500">
+                Provider ID will be auto-generated as <span class="font-mono text-slate-300">{deriveProviderId(providerForm.display_name) || 'unnamed'}</span>.
+              </div>
+            {/if}
             <label class="space-y-2 text-sm font-medium text-slate-200">
               <span>Provider type</span>
               <select bind:value={providerForm.preset} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
@@ -1844,7 +1886,7 @@
             </p>
           </div>
           <Button variant="primary" size="sm" onclick={() => {
-            mcpForm = { name: '', transport: 'stdio', command: '', url: '', args: '', env: '', timeout_seconds: 30, description: '' };
+            mcpForm = { name: '', transport: 'stdio', command: '', url: '', args: '', envVars: [], timeout_seconds: 30, description: '' };
             editingMcpServer = null;
             showMcpForm = true;
           }}>New MCP server</Button>
@@ -1888,10 +1930,10 @@
                 <textarea bind:value={mcpForm.args} class="min-h-[60px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500 font-mono" placeholder="--port&#10;3000"></textarea>
               </label>
             {/if}
-            <label class="space-y-1 text-sm text-slate-200">
-              <span>Environment variables (KEY=VALUE, one per line. Use $secret:name for secrets)</span>
-              <textarea bind:value={mcpForm.env} class="min-h-[60px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500 font-mono" placeholder="GITHUB_TOKEN=$secret:GITHUB_TOKEN"></textarea>
-            </label>
+            <div class="space-y-1 text-sm text-slate-200">
+              <span>Environment variables</span>
+              <EnvVarEditor envVars={mcpForm.envVars} {secrets} onChange={(next) => (mcpForm.envVars = next)} onCreateSecret={openMcpSecretModal} />
+            </div>
             <label class="space-y-1 text-sm text-slate-200">
               <span>Description</span>
               <Input bind:value={mcpForm.description} placeholder="Optional description" />
@@ -1900,12 +1942,7 @@
               <Button variant="secondary" size="sm" onclick={() => showMcpForm = false}>Cancel</Button>
               <Button variant="primary" size="sm" disabled={!mcpForm.name.trim()} onclick={async () => {
                 const args = mcpForm.args.split('\n').map(s => s.trim()).filter(Boolean);
-                const env = Object.fromEntries(
-                  mcpForm.env.split('\n').map(s => s.trim()).filter(Boolean).map(s => {
-                    const [k, ...v] = s.split('=');
-                    return [k.trim(), v.join('=').trim()];
-                  })
-                );
+                const env = serializeMcpEnvVars(mcpForm.envVars);
                 try {
                   if (editingMcpServer) {
                     await api.tools.updateMcpServer(editingMcpServer.server_id, {
@@ -1956,7 +1993,7 @@
                     command: srv.command || '',
                     url: srv.url || '',
                     args: (srv.args || []).join('\n'),
-                    env: Object.entries(srv.env || {}).map(([k, v]) => `${k}=${v}`).join('\n'),
+                    envVars: parseMcpEnvVars(srv.env || {}),
                     timeout_seconds: srv.timeout_seconds,
                     description: srv.description || '',
                   };
@@ -2143,15 +2180,15 @@
   <div class="fixed inset-0 z-[80] flex items-center justify-center bg-slate-950/80 backdrop-blur" role="dialog" aria-modal="true">
     <div class="w-full max-w-md rounded-3xl border border-slate-800 bg-slate-950 p-6 shadow-card">
       <p class="text-xs uppercase tracking-[0.25em] text-slate-400">New credential</p>
-      <h3 class="mt-1 text-lg font-semibold text-white">Create API key secret</h3>
+      <h3 class="mt-1 text-lg font-semibold text-white">{secretModalTarget === 'provider' ? 'Create API key secret' : 'Create environment secret'}</h3>
       <div class="mt-4 space-y-4">
         <label class="space-y-2 text-sm font-medium text-slate-200">
           <span>Secret name</span>
           <Input bind:value={secretModalName} placeholder="openai_api_key" />
         </label>
         <label class="space-y-2 text-sm font-medium text-slate-200">
-          <span>API key value</span>
-          <Input bind:value={secretModalValue} type="password" placeholder="sk-..." />
+          <span>{secretModalTarget === 'provider' ? 'API key value' : 'Secret value'}</span>
+          <Input bind:value={secretModalValue} type="password" placeholder={secretModalTarget === 'provider' ? 'sk-...' : 'secret-value'} />
         </label>
       </div>
       <div class="mt-5 flex justify-end gap-2">

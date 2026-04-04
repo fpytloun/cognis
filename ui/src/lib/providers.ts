@@ -1,3 +1,4 @@
+import { slugify } from '$lib/agents';
 import type { LLMProvider } from '$lib/types/api';
 
 export type ProviderPreset = 'openai' | 'openai_compatible' | 'anthropic' | 'ollama' | 'litellm_proxy' | 'custom';
@@ -147,6 +148,10 @@ export function createProviderForm(provider: LLMProvider | null = null): Provide
   };
 }
 
+export function deriveProviderId(displayName: string): string {
+  return slugify(displayName);
+}
+
 export function providerFormToPayload(form: ProviderFormState): Record<string, unknown> {
   const executorLabels = Object.fromEntries(
     form.executor_selector
@@ -166,7 +171,7 @@ export function providerFormToPayload(form: ProviderFormState): Record<string, u
       config.executor_labels = executorLabels;
     }
     return {
-      provider_id: form.provider_id,
+      ...(form.provider_id.trim() ? { provider_id: form.provider_id } : {}),
       display_name: form.display_name,
       location: form.location,
       backend: form.backend,
@@ -187,7 +192,7 @@ export function providerFormToPayload(form: ProviderFormState): Record<string, u
         : { mode: 'none' };
 
   return {
-    provider_id: form.provider_id,
+    ...(form.provider_id.trim() ? { provider_id: form.provider_id } : {}),
     display_name: form.display_name,
     location: form.location,
     backend: 'litellm',
