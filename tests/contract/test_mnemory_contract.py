@@ -185,3 +185,51 @@ def test_api_key_auth_still_works_when_configured(
 
     assert response.status_code == 200
     assert response.json()["user_id"] == "api-key-user@example.com"
+
+
+def test_memories_list_returns_created_memory(
+    http_client: httpx.Client,
+    mnemory_url: str,
+    make_service_jwt: Callable[..., str],
+    contract_agent_id: str,
+    unique_label: str,
+) -> None:
+    token = make_service_jwt("mnemory", agent_id=contract_agent_id)
+    create = http_client.post(
+        f"{mnemory_url}/api/memories",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "X-Agent-Id": contract_agent_id,
+        },
+        json={
+            "content": f"contract memory {unique_label}",
+            "role": "assistant",
+            "pinned": True,
+            "labels": {"contract_run": unique_label},
+        },
+    )
+    assert create.status_code == 200
+    memory_id = create.json()["memory_id"]
+
+    listed = http_client.get(
+        f"{mnemory_url}/api/memories",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "X-Agent-Id": contract_agent_id,
+        },
+        params={"role": "assistant", "limit": 100},
+    )
+    assert listed.status_code == 200
+    data = listed.json()
+    items = data if isinstance(data, list) else data.get("items", [])
+    assert isinstance(items, list)
+    assert any(item.get("memory_id") == memory_id for item in items if isinstance(item, dict))
+
+    delete = http_client.delete(
+        f"{mnemory_url}/api/memories/{memory_id}",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "X-Agent-Id": contract_agent_id,
+        },
+    )
+    assert delete.is_success

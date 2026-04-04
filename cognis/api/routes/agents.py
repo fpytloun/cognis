@@ -225,9 +225,14 @@ async def update_agent_route(
         if row is None:
             raise api_exception(404, "not_found", "Agent not found")
         require_owner_or_admin(request, row.owner_email)
+        previous_definition = AgentDefinition.model_validate(agent_to_response(row).model_dump())
         updates = payload.model_dump(exclude_unset=True)
         profile_fields = {"name", "display_name", "avatar_image_id"}
+        identity_fields = {"system_prompt", "personality"}
         profile_changed = bool(profile_fields & updates.keys())
+        identity_changed = any(
+            field in updates and getattr(row, field) != updates[field] for field in identity_fields
+        )
         ok = await update_agent(
             session,
             agent_id,
@@ -237,6 +242,40 @@ async def update_agent_route(
             raise api_exception(400, "validation_error", "Agent update failed")
         await session.commit()
         await session.refresh(row)
+
+    if identity_changed:
+        definition = AgentDefinition.model_validate(agent_to_response(row).model_dump())
+        previous_content = (
+            previous_definition.compose_personality() or previous_definition.system_prompt
+        )
+        try:
+            replace_identity = getattr(
+                request.app.state.providers.memory, "replace_bootstrap_identity", None
+            )
+            if callable(replace_identity):
+                await asyncio.wait_for(
+                    replace_identity(
+                        definition,
+                        previous_content=previous_content,
+                        allow_legacy_cleanup=True,
+                    ),
+                    timeout=60.0,
+                )
+            else:
+                await asyncio.wait_for(
+                    request.app.state.providers.memory.bootstrap_agent(definition),
+                    timeout=60.0,
+                )
+            await _persist_sync_metadata(request, agent_id, True)
+            row.sync_metadata = _sync_metadata(True)
+        except Exception as exc:
+            safe_detail = sanitize_client_error_detail(exc, fallback="Mnemory bootstrap failed")
+            logger.warning(
+                "Mnemory personality bootstrap failed during agent update",
+                extra={"extra_data": {"agent_id": agent_id, "error_detail": safe_detail}},
+            )
+            await _persist_sync_metadata(request, agent_id, False, safe_detail)
+            row.sync_metadata = _sync_metadata(False, safe_detail)
 
     if profile_changed:
         from cognis.core.events import Event, EventType
@@ -322,8 +361,19 @@ async def sync_personality(request: Request, agent_id: str) -> dict[str, bool]:
         raise api_exception(404, "not_found", "Agent not found")
     require_owner_or_admin(request, row.owner_email)
     definition = AgentDefinition.model_validate(agent_to_response(row).model_dump())
+    current_content = definition.compose_personality() or definition.system_prompt
     try:
-        await request.app.state.providers.memory.bootstrap_agent(definition)
+        replace_identity = getattr(
+            request.app.state.providers.memory, "replace_bootstrap_identity", None
+        )
+        if callable(replace_identity):
+            await replace_identity(
+                definition,
+                previous_content=current_content,
+                allow_legacy_cleanup=True,
+            )
+        else:
+            await request.app.state.providers.memory.bootstrap_agent(definition)
     except Exception as exc:
         safe_detail = sanitize_client_error_detail(exc, fallback="Mnemory bootstrap failed")
         await _persist_sync_metadata(request, agent_id, False, safe_detail)

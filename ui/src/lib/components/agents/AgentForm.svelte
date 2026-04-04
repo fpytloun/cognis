@@ -708,7 +708,7 @@
     <div class="space-y-5">
       {#if form.agentType === 'primary'}
         <Card class="p-5">
-          <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">System prompt preview</p>
+          <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Runtime identity preview</p>
           <pre class="mt-4 whitespace-pre-wrap rounded-2xl border border-slate-800 bg-slate-950/70 p-4 text-sm leading-6 text-slate-200">{buildSystemPromptPreview(form)}</pre>
         </Card>
       {:else}

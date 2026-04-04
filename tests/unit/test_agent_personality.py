@@ -187,10 +187,18 @@ class TestIdentityComposition:
 class _RecordingMnemoryProvider(MnemoryProvider):
     def __init__(self) -> None:
         self.recorded: list[dict[str, Any]] = []
+        self.listed: list[dict[str, Any]] = []
+        self.deleted: list[str] = []
 
     async def add_memory(self, **kwargs: Any) -> str:  # type: ignore[override]
         self.recorded.append(kwargs)
         return "memory-1"
+
+    async def list_memories(self, **kwargs: Any) -> list[dict[str, Any]]:  # type: ignore[override]
+        return list(self.listed)
+
+    async def delete_memory(self, memory_id: str, **kwargs: Any) -> None:  # type: ignore[override]
+        self.deleted.append(memory_id)
 
 
 class TestBootstrapAgent:
@@ -234,3 +242,79 @@ class TestBootstrapAgent:
         await provider.bootstrap_agent(agent)
 
         assert provider.recorded == []
+
+    async def test_replace_bootstrap_identity_deletes_labeled_and_legacy_matches(self) -> None:
+        provider = self._provider()
+        provider.listed = [
+            {
+                "memory_id": "mem-bootstrap",
+                "content": "old bootstrap",
+                "pinned": True,
+                "labels": {"cognis_bootstrap": "agent_identity"},
+            },
+            {
+                "memory_id": "mem-legacy",
+                "content": "Old prompt",
+                "pinned": True,
+                "labels": {},
+            },
+            {
+                "memory_id": "mem-keep",
+                "content": "Other assistant memory",
+                "pinned": True,
+                "labels": {},
+            },
+        ]
+        agent = _agent(personality={"purpose": "new purpose"}, system_prompt="New prompt")
+
+        await provider.replace_bootstrap_identity(
+            agent, previous_content="Old prompt", allow_legacy_cleanup=True
+        )
+
+        assert provider.deleted == ["mem-bootstrap", "mem-legacy"]
+        assert provider.recorded[0]["content"] == "Purpose: new purpose"
+        assert provider.recorded[0]["labels"] == {"cognis_bootstrap": "agent_identity"}
+
+    async def test_replace_bootstrap_identity_clears_without_readding_when_empty(self) -> None:
+        provider = self._provider()
+        provider.listed = [
+            {
+                "memory_id": "mem-legacy",
+                "content": "Old prompt",
+                "pinned": True,
+                "labels": {},
+            }
+        ]
+        agent = _agent(personality=None, system_prompt=None)
+
+        await provider.replace_bootstrap_identity(
+            agent, previous_content="Old prompt", allow_legacy_cleanup=True
+        )
+
+        assert provider.deleted == ["mem-legacy"]
+        assert provider.recorded == []
+
+    async def test_replace_bootstrap_identity_skips_ambiguous_legacy_matches(self) -> None:
+        provider = self._provider()
+        provider.listed = [
+            {
+                "memory_id": "mem-1",
+                "content": "Old prompt",
+                "pinned": True,
+                "labels": {},
+            },
+            {
+                "memory_id": "mem-2",
+                "content": "Old prompt",
+                "pinned": True,
+                "labels": {},
+            },
+        ]
+        agent = _agent(personality={"purpose": "new purpose"}, system_prompt=None)
+
+        await provider.replace_bootstrap_identity(
+            agent, previous_content="Old prompt", allow_legacy_cleanup=True
+        )
+
+        assert provider.deleted == []
+        assert provider.recorded[0]["content"] == "Purpose: new purpose"

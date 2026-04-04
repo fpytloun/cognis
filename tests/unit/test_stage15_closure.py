@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from cognis.api.app import create_app
 from cognis.core.events import EventBus, EventType
 from cognis.core.session import SessionManager
+from cognis.models.agent import AgentDefinition
 from cognis.models.session import ConversationContext
 from cognis.store.database import create_engine, create_session_factory
 from cognis.store.models import Base
@@ -138,10 +139,14 @@ def test_agent_sync_endpoint_persists_sync_error(monkeypatch: object, tmp_path: 
 
         asyncio.run(_seed())
 
-        async def _fail_bootstrap(_: object) -> None:
+        async def _fail_bootstrap(
+            _: object,
+            previous_content: str | None = None,
+            allow_legacy_cleanup: bool = False,
+        ) -> None:
             raise RuntimeError("api_key=secret-value")
 
-        app.state.providers.memory.bootstrap_agent = _fail_bootstrap
+        app.state.providers.memory.replace_bootstrap_identity = _fail_bootstrap
         response = client.post(
             "/api/v1/agents/agent-sync/sync-personality",
             headers=_auth_headers(app, email="user@example.com"),
@@ -156,6 +161,108 @@ def test_agent_sync_endpoint_persists_sync_error(monkeypatch: object, tmp_path: 
         payload = detail.json()
         assert payload["personality_synced"] is False
         assert "secret-value" not in str(payload["personality_sync_error"])
+
+
+def test_agent_update_resyncs_personality_when_identity_changes(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+        asyncio.run(_seed_user(app, "user@example.com"))
+
+        async def _seed() -> None:
+            async with app.state.session_factory() as session:
+                await create_agent(
+                    session,
+                    agent_id="agent-sync",
+                    owner_email="user@example.com",
+                    name="Agent Sync",
+                    system_prompt="Old prompt",
+                    personality={"purpose": "old purpose"},
+                    status="active",
+                )
+                await session.commit()
+
+        asyncio.run(_seed())
+        bootstrapped: list[tuple[AgentDefinition, str | None]] = []
+
+        async def _capture_bootstrap(
+            definition: AgentDefinition,
+            previous_content: str | None = None,
+            allow_legacy_cleanup: bool = False,
+        ) -> None:
+            bootstrapped.append((definition, previous_content))
+
+        app.state.providers.memory.replace_bootstrap_identity = _capture_bootstrap
+
+        response = client.put(
+            "/api/v1/agents/agent-sync",
+            headers=_auth_headers(app, email="user@example.com"),
+            json={
+                "system_prompt": "New prompt",
+                "personality": {"purpose": "new purpose", "tone": "formal"},
+            },
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["personality_synced"] is True
+        assert len(bootstrapped) == 1
+        assert bootstrapped[0][0].system_prompt == "New prompt"
+        assert bootstrapped[0][0].personality == {
+            "purpose": "new purpose",
+            "tone": "formal",
+        }
+        assert bootstrapped[0][1] == "Purpose: old purpose"
+
+
+def test_agent_update_allows_clearing_nullable_identity_fields(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+        asyncio.run(_seed_user(app, "user@example.com"))
+
+        async def _seed() -> None:
+            async with app.state.session_factory() as session:
+                await create_agent(
+                    session,
+                    agent_id="agent-clear",
+                    owner_email="user@example.com",
+                    name="Agent Clear",
+                    description="Has description",
+                    system_prompt="Has prompt",
+                    personality={"purpose": "helper"},
+                    status="active",
+                )
+                await session.commit()
+
+        asyncio.run(_seed())
+        bootstrapped: list[tuple[AgentDefinition, str | None]] = []
+
+        async def _capture_bootstrap(
+            definition: AgentDefinition,
+            previous_content: str | None = None,
+            allow_legacy_cleanup: bool = False,
+        ) -> None:
+            bootstrapped.append((definition, previous_content))
+
+        app.state.providers.memory.replace_bootstrap_identity = _capture_bootstrap
+
+        response = client.put(
+            "/api/v1/agents/agent-clear",
+            headers=_auth_headers(app, email="user@example.com"),
+            json={"description": None, "system_prompt": None, "personality": None},
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["description"] is None
+        assert payload["system_prompt"] is None
+        assert payload["personality"] is None
+        assert payload["personality_synced"] is True
+        assert len(bootstrapped) == 1
+        assert bootstrapped[0][0].system_prompt is None
+        assert bootstrapped[0][0].personality is None
+        assert bootstrapped[0][1] == "Purpose: helper"
 
 
 def test_conversation_purge_reports_unsupported_intaris_cascade(

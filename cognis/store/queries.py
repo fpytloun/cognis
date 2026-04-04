@@ -517,8 +517,20 @@ async def update_agent(
     row = await get_agent(session, agent_id)
     if row is None:
         return False
+    nullable_fields = {
+        "display_name",
+        "description",
+        "system_prompt",
+        "personality",
+        "skills",
+        "tools",
+        "permissions",
+        "llm_config",
+        "execution",
+        "avatar_image_id",
+    }
     for field_name, value in updates.items():
-        if hasattr(row, field_name) and value is not None:
+        if hasattr(row, field_name) and (value is not None or field_name in nullable_fields):
             setattr(row, field_name, value)
     row.updated_at = datetime.now(UTC)
     await session.flush()
@@ -658,8 +670,9 @@ async def list_conversations(
     user_email: str,
     *,
     context_type: str | None = None,
+    agent_id: str | None = None,
 ) -> list[Conversation]:
-    """List conversations for a user, optionally filtered by context type."""
+    """List conversations for a user, optionally filtered by context type and agent."""
     query = (
         select(Conversation)
         .where(Conversation.user_email == user_email)
@@ -667,6 +680,8 @@ async def list_conversations(
     )
     if context_type is not None:
         query = query.where(Conversation.context_type == context_type)
+    if agent_id is not None:
+        query = query.where(Conversation.agent_id == agent_id)
     result = await session.execute(query)
     return list(result.scalars().all())
 

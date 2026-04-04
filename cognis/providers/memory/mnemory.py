@@ -276,6 +276,121 @@ class MnemoryProvider:
             logger.warning("Mnemory search degraded")
             return []
 
+    async def list_memories(
+        self,
+        *,
+        role: str | None = None,
+        limit: int = 100,
+        agent_id: str | None = None,
+        user_email: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """List memories for an agent/user scope."""
+
+        async def _do() -> list[dict[str, Any]]:
+            params: dict[str, Any] = {"limit": limit}
+            if role is not None:
+                params["role"] = role
+            response = await self.client.get(
+                "/api/memories", params=params, headers=self._headers(agent_id, user_email)
+            )
+            response.raise_for_status()
+            data = response.json()
+            if isinstance(data, list):
+                return [item for item in data if isinstance(item, dict)]
+            if isinstance(data, dict):
+                items = data.get("items") or data.get("results") or []
+                if isinstance(items, list):
+                    return [item for item in items if isinstance(item, dict)]
+            return []
+
+        return await self._call_with_retry(_do, max_retries=2, operation="mnemory list_memories")
+
+    async def delete_memory(
+        self,
+        memory_id: str,
+        *,
+        agent_id: str | None = None,
+        user_email: str | None = None,
+    ) -> None:
+        """Delete a memory by ID."""
+
+        async def _do() -> None:
+            response = await self.client.delete(
+                f"/api/memories/{memory_id}", headers=self._headers(agent_id, user_email)
+            )
+            response.raise_for_status()
+
+        await self._call_with_retry(_do, max_retries=2, operation="mnemory delete_memory")
+
+    async def replace_bootstrap_identity(
+        self,
+        agent: AgentDefinition,
+        previous_content: str | None = None,
+        *,
+        allow_legacy_cleanup: bool = False,
+    ) -> None:
+        """Replace previously bootstrapped identity memories for an agent.
+
+        Deletes known bootstrap memories (via labels) and best-effort deletes any
+        pinned assistant memory whose content matches *previous_content* to clean
+        up legacy bootstrap entries created before labels were added.
+        """
+        existing = await self.list_memories(
+            role="assistant",
+            limit=1000,
+            agent_id=agent.agent_id,
+            user_email=agent.owner_email,
+        )
+        labeled_bootstrap_ids: list[str] = []
+        legacy_match_ids: list[str] = []
+        for memory in existing:
+            labels = memory.get("labels") if isinstance(memory.get("labels"), dict) else {}
+            is_bootstrap = labels.get("cognis_bootstrap") == "agent_identity"
+            matches_previous = (
+                previous_content is not None and memory.get("content") == previous_content
+            )
+            if not memory.get("pinned"):
+                continue
+            memory_id = str(memory.get("memory_id", ""))
+            if not memory_id:
+                continue
+            if is_bootstrap:
+                labeled_bootstrap_ids.append(memory_id)
+            elif matches_previous:
+                legacy_match_ids.append(memory_id)
+
+        if allow_legacy_cleanup and len(legacy_match_ids) > 1:
+            logger.warning(
+                "mnemory: skipping ambiguous legacy bootstrap cleanup",
+                extra={
+                    "extra_data": {
+                        "agent_id": agent.agent_id,
+                        "match_count": len(legacy_match_ids),
+                    }
+                },
+            )
+
+        content = agent.compose_personality() or agent.system_prompt
+        if content:
+            await self.add_memory(
+                content=content,
+                role="assistant",
+                pinned=True,
+                labels={"cognis_bootstrap": "agent_identity"},
+                agent_id=agent.agent_id,
+                user_email=agent.owner_email,
+            )
+
+        for memory_id in labeled_bootstrap_ids:
+            await self.delete_memory(
+                memory_id, agent_id=agent.agent_id, user_email=agent.owner_email
+            )
+
+        if allow_legacy_cleanup and len(legacy_match_ids) == 1:
+            await self.delete_memory(
+                legacy_match_ids[0], agent_id=agent.agent_id, user_email=agent.owner_email
+            )
+
     async def bootstrap_agent(self, agent: AgentDefinition) -> None:
         """Bootstrap agent identity into Mnemory as a pinned core memory.
 
@@ -300,6 +415,7 @@ class MnemoryProvider:
                 content=content,
                 role="assistant",
                 pinned=True,
+                labels={"cognis_bootstrap": "agent_identity"},
                 agent_id=agent.agent_id,
                 user_email=agent.owner_email,
             )
