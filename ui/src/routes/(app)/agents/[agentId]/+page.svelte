@@ -10,8 +10,9 @@
   import LoadingState from '$lib/components/LoadingState.svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import { installBeforeUnloadGuard, blockNavigationIfDirty } from '$lib/navigation/unsaved';
+  import { confirmAction } from '$lib/stores/confirm';
   import { addToast } from '$lib/stores/toasts';
-  import type { Agent, IntarisMCPServer, LLMProvider, MCPServerTestResponse, SecretMetadata, ToolDefinitionSummary, Workflow } from '$lib/types/api';
+  import type { Agent, ExecutorConfig, IntarisMCPServer, LLMProvider, SecretMetadata, ToolDefinitionSummary, Workflow } from '$lib/types/api';
 
   let loading = $state(true);
   let saving = $state(false);
@@ -20,12 +21,11 @@
   let tools = $state<ToolDefinitionSummary[]>([]);
   let workflows = $state<Workflow[]>([]);
   let providers = $state<LLMProvider[]>([]);
+  let executors = $state<ExecutorConfig[]>([]);
   let secrets = $state<SecretMetadata[]>([]);
   let intarisMcpServers = $state<IntarisMCPServer[]>([]);
   let secondaryAgents = $state<Agent[]>([]);
   let secondaryBindings = $state<string[]>([]);
-  let mcpTesting = $state(false);
-  let mcpTestResult = $state<MCPServerTestResponse | null>(null);
   let form = $state(agentToFormState({
     agent_id: '',
     owner_email: '',
@@ -86,6 +86,11 @@
         } catch {
           providers = [];
         }
+        try {
+          executors = await api.executor.list();
+        } catch {
+          executors = [];
+        }
       }
       Object.assign(form, agentToFormState(agent));
       loading = false;
@@ -112,40 +117,14 @@
     }
   }
 
-  async function testMcp(): Promise<void> {
-    mcpTesting = true;
-    error = '';
-    try {
-      mcpTestResult = await api.tools.testAgentMcp(agentIdFromRoute());
-      addToast(mcpTestResult.ok ? 'MCP discovery succeeded.' : 'MCP discovery finished with issues.', mcpTestResult.ok ? 'success' : 'warning');
-      if (mcpTestResult.ok) {
-        const discoveredTools = mcpTestResult.items.flatMap((item) =>
-          item.tools.map((toolName) => ({
-            name: toolName,
-            description: 'Discovered MCP tool',
-            parameters: {},
-            category: 'mcp',
-            read_only: false,
-            source: { type: 'local_mcp', server_name: item.name },
-            timeout_seconds: 30,
-            non_bypassable: false
-          }))
-        );
-        const merged = new Map(tools.map((tool) => [tool.name, tool]));
-        for (const tool of discoveredTools) {
-          merged.set(tool.name, tool);
-        }
-        tools = Array.from(merged.values());
-      }
-    } catch (caughtError) {
-      error = asApiError(caughtError).message;
-      addToast(error, 'error', 4_000, 'Unable to test MCP');
-    } finally {
-      mcpTesting = false;
-    }
-  }
-
   async function retrySyncPersonality(): Promise<void> {
+    const confirmed = await confirmAction({
+      title: 'Sync personality to Mnemory?',
+      message: 'This will re-bootstrap the agent personality in Mnemory. If the agent has evolved its identity through conversations, this may override those changes.',
+      confirmLabel: 'Sync',
+      variant: 'danger',
+    });
+    if (!confirmed) return;
     error = '';
     try {
       await api.agents.syncPersonality(agentIdFromRoute());
@@ -194,6 +173,7 @@
       {tools}
       {workflows}
       {providers}
+      {executors}
       {secrets}
       {intarisMcpServers}
       {secondaryAgents}
@@ -202,7 +182,6 @@
       {error}
       readonly={agent?.is_system ?? false}
       onSave={saveAgent}
-      onTestMcp={testMcp}
       onBindingsChange={async (bindings) => {
         try {
           await api.agents.replaceBindings(agentIdFromRoute(), bindings);
@@ -212,8 +191,6 @@
           addToast(error, 'error', 4_000, 'Unable to update bindings');
         }
       }}
-      {mcpTesting}
-      {mcpTestResult}
     />
   </section>
 {/if}

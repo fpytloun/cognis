@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, EmailStr, Field, model_validator
+from pydantic_core import PydanticCustomError
 
 from cognis.models.artifact import AttachmentRef
 from cognis.models.task import TaskDelivery
@@ -693,6 +694,63 @@ class ExecutorTokenResponse(BaseModel):
     executor_id: str
     token: str
     expires_in: int
+
+
+# --- MCP Servers ---
+
+
+class MCPServerConfigResponse(BaseModel):
+    server_id: str
+    name: str
+    transport: str
+    command: str | None = None
+    url: str | None = None
+    args: list[str] = Field(default_factory=list)
+    env: dict[str, str] = Field(default_factory=dict)
+    timeout_seconds: int = 30
+    description: str | None = None
+    owner_email: str
+    status: str = "active"
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+class MCPServerCreateRequest(BaseModel):
+    server_id: str | None = None
+    name: str
+    transport: str = "stdio"
+    command: str | None = None
+    url: str | None = None
+    args: list[str] = Field(default_factory=list)
+    env: dict[str, str] = Field(default_factory=dict)
+    timeout_seconds: int = 30
+    description: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_transport_fields(self) -> MCPServerCreateRequest:
+        if self.transport == "stdio" and not self.command:
+            raise PydanticCustomError(
+                "mcp_stdio_command_required",
+                "command is required for stdio transport",
+            )
+        if self.transport in ("sse", "streamable_http") and not self.url:
+            raise PydanticCustomError(
+                "mcp_url_required",
+                f"url is required for {self.transport} transport",
+            )
+        return self
+
+
+class MCPServerUpdateRequest(BaseModel):
+    name: str | None = None
+    transport: str | None = None
+    command: str | None = None
+    url: str | None = None
+    args: list[str] | None = None
+    env: dict[str, str] | None = None
+    timeout_seconds: int | None = None
+    description: str | None = None
+    status: str | None = None
 
 
 class SendMessageRequest(BaseModel):

@@ -25,8 +25,11 @@ import type {
   IntarisMCPServer,
   IntarisSessionDetail,
   LLMProvider,
+  MCPServerConfigResponse,
+  MCPServerCreateRequest,
   MCPServerTestResponse,
   MCPServer,
+  MCPServerUpdateRequest,
   MessageHistoryResponse,
   ModelRouting,
   ProviderTestResult,
@@ -497,6 +500,33 @@ export const api = {
       return request<MCPServerTestResponse>(`/api/v1/agents/${agentId}/mcp/test`, {
         method: 'POST'
       });
+    },
+
+    // Global MCP server management
+    listMcpServerConfigs(): Promise<MCPServerConfigResponse[]> {
+      return request<MCPServerConfigResponse[]>('/api/v1/mcp-servers');
+    },
+
+    getMcpServerConfig(serverId: string): Promise<MCPServerConfigResponse> {
+      return request<MCPServerConfigResponse>(`/api/v1/mcp-servers/${serverId}`);
+    },
+
+    createMcpServer(data: MCPServerCreateRequest): Promise<MCPServerConfigResponse> {
+      return request<MCPServerConfigResponse>('/api/v1/mcp-servers', {
+        method: 'POST',
+        body: JSON.stringify(data)
+      });
+    },
+
+    updateMcpServer(serverId: string, data: MCPServerUpdateRequest): Promise<MCPServerConfigResponse> {
+      return request<MCPServerConfigResponse>(`/api/v1/mcp-servers/${serverId}`, {
+        method: 'PUT',
+        body: JSON.stringify(data)
+      });
+    },
+
+    deleteMcpServer(serverId: string): Promise<void> {
+      return request<void>(`/api/v1/mcp-servers/${serverId}`, { method: 'DELETE' });
     }
   },
 

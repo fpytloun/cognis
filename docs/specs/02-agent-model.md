@@ -23,12 +23,12 @@ work by delegating to secondary agents or spawning tasks.
 | Property | Value |
 |---|---|
 | Memory | Full Mnemory integration (auto recall + remember) |
-| Personality | Evolving via Mnemory, bootstrapped on creation |
-| System prompt | Free text (structured default generated from metadata) |
+| Personality | Core identity from structured fields, with Mnemory evolution layered on top |
+| System prompt | Free text appended after the structured personality block |
 | Can delegate | Yes (to other primary or bound secondary agents) |
 | Can spawn tasks | Yes |
 | Orchestration tools | Full (delegate, spawn_worker, tasks) |
-| Mnemory bootstrap | Yes (personality synced as pinned memories) |
+| Mnemory bootstrap | Yes (structured personality fields synced as pinned memories; falls back to system prompt when personality is empty) |
 
 ### Secondary Agents
 
@@ -126,9 +126,22 @@ class AgentToolConfig(BaseModel):
     builtin_tools: list[str] | None = None  # Allowlist (None or ["*"] = all)
     mcp_servers: list[MCPServerConfig] | None = None
     intaris_mcp_servers: list[str] | None = None
+    disabled_categories: list[str] | None = None
+    disabled_tools: list[str] | None = None
     delegation_tools: bool = True           # Orchestration tools (primary only)
     memory_tools: bool = True               # Mnemory tools (primary: auto, secondary: explicit)
 ```
+
+Notes:
+
+- `mcp_servers` is **legacy inline configuration** kept for backward
+  compatibility. New MCP servers are stored globally and assigned to executors.
+- Agents inherit all tools exposed by their executor by default.
+- Effective tool set = executor enabled tools/groups **minus** agent
+  `disabled_categories` / `disabled_tools`, then `tool_permissions` controls
+  allow/evaluate/deny behavior for guardrails.
+- `execution.executor_id` binds an agent to a specific executor.
+- `execution.executor_selector` binds an agent by label match (k8s-style).
 
 ### Permissions
 
@@ -1113,18 +1126,21 @@ own private user context.
 
 1. UI wizard or API creates agent in `draft` state
 2. Definition validated (agent_id format, no `system:` prefix)
-3. For primary agents: personality synced to Mnemory as pinned memories
+3. For primary agents: structured personality fields synced to Mnemory as pinned memories (fallback: system prompt only)
 4. Agent activated -> `active`
 5. For public agents: Agent Card generated (for A2A discovery)
 
 ### Memory Integration (Primary Agents Only)
 
 Personality is stored in two places:
-1. **Cognis DB** — authoritative definition (the "template")
-2. **Mnemory** — runtime personality (pinned memories, `role=assistant`)
+1. **Cognis DB** — authoritative core identity from structured personality fields plus system prompt
+2. **Mnemory** — runtime personality evolution layer (pinned memories, `role=assistant`)
 
-On creation/update, Cognis syncs personality to Mnemory. At runtime, the
-controller loads personality via Mnemory recall. The agent can evolve
+At runtime, Cognis always injects the structured personality block and system
+prompt directly into the immutable system message. Cognis also bootstraps the
+structured personality fields to Mnemory so recall can evolve and reinforce
+that identity over time. When structured personality is empty, bootstrap falls
+back to the raw system prompt so older agents still get a seed.
 through interactions. The Cognis definition is the "reset point."
 
 Secondary agents have no Mnemory integration. Their identity is entirely

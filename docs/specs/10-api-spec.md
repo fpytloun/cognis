@@ -269,6 +269,11 @@ POST   /api/v1/executors/:id/default           → Set as default executor
 POST   /api/v1/executors/:id/token             → Generate executor JWT (admin only)
 GET    /api/v1/executor/status                 → Executor status and capabilities
 GET    /api/v1/tools/executor                  → List executor-native tool definitions
+GET    /api/v1/mcp-servers                      → List global MCP server configs
+GET    /api/v1/mcp-servers/:id                  → Get MCP server config
+POST   /api/v1/mcp-servers                      → Create MCP server config (admin)
+PUT    /api/v1/mcp-servers/:id                  → Update MCP server config (admin)
+DELETE /api/v1/mcp-servers/:id                  → Delete MCP server config (admin, 409 if referenced)
 ```
 
 ### Secrets

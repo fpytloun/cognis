@@ -28,20 +28,22 @@
     Setting,
     SettingsCategory,
     SystemDiagnostics,
+    MCPServerConfigResponse,
     ToolDefinitionSummary,
     UserDetail,
     UserRole,
     WebConfigStatus
   } from '$lib/types/api';
 
-  type SettingsTab = 'providers' | 'routing' | 'secrets' | 'web' | 'executors' | 'users' | 'system' | 'account';
+  type SettingsTab = 'providers' | 'routing' | 'secrets' | 'web' | 'tools' | 'executors' | 'users' | 'system' | 'account';
 
-  const ALL_TABS: SettingsTab[] = ['providers', 'routing', 'secrets', 'web', 'executors', 'users', 'system', 'account'];
+  const ALL_TABS: SettingsTab[] = ['providers', 'routing', 'secrets', 'web', 'tools', 'executors', 'users', 'system', 'account'];
   const TAB_LABELS: Record<SettingsTab, string> = {
     providers: 'providers',
     routing: 'routing',
     secrets: 'secrets',
     web: 'web search',
+    tools: 'tools',
     executors: 'executors',
     users: 'users',
     system: 'system',
@@ -66,8 +68,12 @@
   let webBackendForm = 'direct';
   let webKeySetup: { backend: string; value: string } | null = null;
   let showExecutorForm = false;
-  let executorForm = { executor_id: '', name: '', executor_type: 'in_process', labels: '' };
+  let executorForm = { executor_id: '', name: '', executor_type: 'in_process', labels: '', status: 'active' };
   let executorToken: ExecutorTokenResponse | null = null;
+  let mcpServerConfigs: MCPServerConfigResponse[] = [];
+  let showMcpForm = false;
+  let editingMcpServer: MCPServerConfigResponse | null = null;
+  let mcpForm = { name: '', transport: 'stdio', command: '', url: '', args: '', env: '', timeout_seconds: 30, description: '' };
   let isAdmin = false;
   let selectedProviderId = '';
   let selectedSettingKey = '';
@@ -361,12 +367,13 @@
     accountNameDirty = false;
 
     if (isAdmin) {
-      [providers, diagnostics, agents, executorConfigs, executorTools] = await Promise.all([
+      [providers, diagnostics, agents, executorConfigs, executorTools, mcpServerConfigs] = await Promise.all([
         api.llmProviders.list().then((page) => page.items),
         api.system.diagnostics(),
         api.agents.list().then((page) => page.items.map((a) => ({ agent_id: a.agent_id, name: a.name, is_system: a.is_system }))),
         api.executor.list().catch(() => []),
         api.tools.executorTools().catch(() => []),
+        api.tools.listMcpServerConfigs().catch(() => []),
       ]);
       await loadUsers();
     } else {
@@ -1362,7 +1369,7 @@
               Executors handle tool execution. Enable tools on each executor to make them available to agents.
             </p>
           </div>
-          <Button variant="primary" size="sm" onclick={() => { executorForm = { executor_id: '', name: '', executor_type: 'websocket', labels: '' }; editingExecutor = null; executorToken = null; showExecutorForm = true; }}>New executor</Button>
+          <Button variant="primary" size="sm" onclick={() => { executorForm = { executor_id: '', name: '', executor_type: 'websocket', labels: '', status: 'active' }; editingExecutor = null; executorToken = null; showExecutorForm = true; }}>New executor</Button>
         </div>
 
         {#if showExecutorForm}
@@ -1389,6 +1396,15 @@
                 <span>Labels (key=value, comma-separated)</span>
                 <Input bind:value={executorForm.labels} placeholder="tier=standard, gpu=false" />
               </label>
+              {#if editingExecutor}
+                <label class="space-y-1 text-sm text-slate-200">
+                  <span>Status</span>
+                  <select bind:value={executorForm.status} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+                    <option value="active">active</option>
+                    <option value="disabled">disabled</option>
+                  </select>
+                </label>
+              {/if}
             </div>
             <div class="flex gap-2 justify-end">
               <Button variant="secondary" size="sm" onclick={() => showExecutorForm = false}>Cancel</Button>
@@ -1401,7 +1417,7 @@
                 );
                 try {
                   if (editingExecutor) {
-                    await api.executor.update(editingExecutor.executor_id, { name: executorForm.name, labels });
+                    await api.executor.update(editingExecutor.executor_id, { name: executorForm.name, labels, status: executorForm.status });
                   } else {
                     await api.executor.create({ executor_id: executorForm.executor_id || null, name: executorForm.name, executor_type: executorForm.executor_type, labels });
                   }
@@ -1433,7 +1449,8 @@
                     executor_id: exec.executor_id,
                     name: exec.name,
                     executor_type: exec.executor_type,
-                    labels: Object.entries(exec.labels || {}).map(([k, v]) => `${k}=${v}`).join(', ')
+                    labels: Object.entries(exec.labels || {}).map(([k, v]) => `${k}=${v}`).join(', '),
+                    status: exec.status
                   };
                   showExecutorForm = true;
                 }}>Edit</Button>
@@ -1471,12 +1488,15 @@
             <div class="text-xs text-slate-500 font-mono">ID: {exec.executor_id}</div>
 
             {#if executorToken && executorToken.executor_id === exec.executor_id}
+              {@const execCommand = `cognis executor run --controller-url ${window.location.origin.replace('http', 'ws')}/api/executor/ws --token ${executorToken.token}`}
               <div class="rounded-2xl border border-emerald-500/30 bg-emerald-500/10 p-4 space-y-3">
                 <p class="text-sm text-emerald-100">Copy this token now. It is not stored in the UI.</p>
-                <textarea readonly class="min-h-[96px] w-full rounded-2xl border border-emerald-500/20 bg-slate-950/80 px-4 py-3 font-mono text-xs text-slate-100">{executorToken.token}</textarea>
+                <textarea readonly class="min-h-[72px] w-full rounded-2xl border border-emerald-500/20 bg-slate-950/80 px-4 py-3 font-mono text-xs text-slate-100">{executorToken.token}</textarea>
+                <p class="text-xs text-slate-400 mt-2">Run this command on the remote machine:</p>
+                <pre class="w-full rounded-2xl border border-emerald-500/20 bg-slate-950/80 px-4 py-3 font-mono text-xs text-slate-200 whitespace-pre-wrap break-all">{execCommand}</pre>
                 <div class="flex flex-wrap gap-2">
                   <Button size="sm" variant="secondary" onclick={() => copyToClipboard(executorToken?.token ?? '')}>Copy token</Button>
-                  <Button size="sm" variant="secondary" onclick={() => copyToClipboard(`cognis executor run --controller-url ${window.location.origin.replace('http', 'ws')}/api/executor/ws --token ${executorToken?.token ?? ''}`)}>Copy command</Button>
+                  <Button size="sm" variant="secondary" onclick={() => copyToClipboard(execCommand)}>Copy command</Button>
                 </div>
               </div>
             {/if}
@@ -1649,6 +1669,44 @@
                 </div>
               </div>
             </details>
+
+            <!-- MCP Server Assignment -->
+            {#if mcpServerConfigs.length > 0 && exec.executor_type === 'in_process'}
+              {@const assignedIds = ((exec.config || {}).mcp_server_ids || []) as string[]}
+              <details class="group">
+                <summary class="cursor-pointer text-xs uppercase tracking-wider text-slate-400 hover:text-slate-300 select-none">
+                  MCP Servers
+                  <span class="ml-1 text-slate-500">({assignedIds.length} assigned)</span>
+                </summary>
+                <div class="mt-2 flex flex-wrap gap-2">
+                  {#each mcpServerConfigs as srv}
+                    {@const assigned = assignedIds.includes(srv.server_id)}
+                    <button
+                      class="px-3 py-1.5 rounded-lg text-sm border transition-colors {assigned ? 'bg-emerald-500/20 border-emerald-500/50 text-emerald-300' : 'bg-slate-900 border-slate-700 text-slate-400 hover:border-slate-600'}"
+                      title="{srv.description || srv.name} ({srv.transport})"
+                      onclick={async () => {
+                        const ids = [...assignedIds];
+                        if (assigned) {
+                          ids.splice(ids.indexOf(srv.server_id), 1);
+                        } else {
+                          ids.push(srv.server_id);
+                        }
+                        const cfg = { ...(exec.config || {}), mcp_server_ids: ids };
+                        await api.executor.update(exec.executor_id, { config: cfg });
+                        await refreshPageState();
+                      }}
+                    >
+                      {srv.name}
+                      <span class="ml-1 text-xs opacity-60">{srv.transport}</span>
+                    </button>
+                  {/each}
+                </div>
+              </details>
+            {:else if mcpServerConfigs.length > 0}
+              <div class="rounded-xl border border-amber-500/20 bg-amber-500/5 px-3 py-3 text-xs text-amber-100">
+                Executor-assigned MCP servers are currently supported only for in-process executors.
+              </div>
+            {/if}
           </Card>
         {/each}
 
@@ -1736,6 +1794,184 @@
               {/if}
             </Card>
           </div>
+        {/if}
+      </div>
+    {:else if activeTab === 'tools'}
+      <div class="space-y-5">
+        <div class="flex items-center justify-between">
+          <div>
+            <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Tools</p>
+            <h2 class="mt-1 text-lg font-semibold text-white">MCP Servers</h2>
+            <p class="mt-2 text-sm text-slate-400">
+              Configure MCP servers globally, then assign them to executors. Agents inherit MCP tools from their executor.
+            </p>
+          </div>
+          <Button variant="primary" size="sm" onclick={() => {
+            mcpForm = { name: '', transport: 'stdio', command: '', url: '', args: '', env: '', timeout_seconds: 30, description: '' };
+            editingMcpServer = null;
+            showMcpForm = true;
+          }}>New MCP server</Button>
+        </div>
+
+        {#if showMcpForm}
+          <Card class="p-5 space-y-4">
+            <h3 class="text-lg font-medium text-white">{editingMcpServer ? 'Edit MCP Server' : 'New MCP Server'}</h3>
+            <div class="grid gap-4 md:grid-cols-2">
+              <label class="space-y-1 text-sm text-slate-200">
+                <span>Name</span>
+                <Input bind:value={mcpForm.name} placeholder="e.g. github-api" />
+              </label>
+              <label class="space-y-1 text-sm text-slate-200">
+                <span>Transport</span>
+                <select bind:value={mcpForm.transport} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+                  <option value="stdio">stdio</option>
+                  <option value="sse">sse</option>
+                  <option value="streamable_http">streamable_http</option>
+                </select>
+              </label>
+              {#if mcpForm.transport === 'stdio'}
+                <label class="space-y-1 text-sm text-slate-200">
+                  <span>Command</span>
+                  <Input bind:value={mcpForm.command} placeholder="e.g. npx -y @modelcontextprotocol/server-github" />
+                </label>
+              {:else}
+                <label class="space-y-1 text-sm text-slate-200">
+                  <span>URL</span>
+                  <Input bind:value={mcpForm.url} placeholder="e.g. http://localhost:3000/sse" />
+                </label>
+              {/if}
+              <label class="space-y-1 text-sm text-slate-200">
+                <span>Timeout (seconds)</span>
+                <Input bind:value={mcpForm.timeout_seconds} type="number" />
+              </label>
+            </div>
+            {#if mcpForm.transport === 'stdio'}
+              <label class="space-y-1 text-sm text-slate-200">
+                <span>Arguments (one per line)</span>
+                <textarea bind:value={mcpForm.args} class="min-h-[60px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500 font-mono" placeholder="--port&#10;3000"></textarea>
+              </label>
+            {/if}
+            <label class="space-y-1 text-sm text-slate-200">
+              <span>Environment variables (KEY=VALUE, one per line. Use $secret:name for secrets)</span>
+              <textarea bind:value={mcpForm.env} class="min-h-[60px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500 font-mono" placeholder="GITHUB_TOKEN=$secret:GITHUB_TOKEN"></textarea>
+            </label>
+            <label class="space-y-1 text-sm text-slate-200">
+              <span>Description</span>
+              <Input bind:value={mcpForm.description} placeholder="Optional description" />
+            </label>
+            <div class="flex gap-2 justify-end">
+              <Button variant="secondary" size="sm" onclick={() => showMcpForm = false}>Cancel</Button>
+              <Button variant="primary" size="sm" disabled={!mcpForm.name.trim()} onclick={async () => {
+                const args = mcpForm.args.split('\n').map(s => s.trim()).filter(Boolean);
+                const env = Object.fromEntries(
+                  mcpForm.env.split('\n').map(s => s.trim()).filter(Boolean).map(s => {
+                    const [k, ...v] = s.split('=');
+                    return [k.trim(), v.join('=').trim()];
+                  })
+                );
+                try {
+                  if (editingMcpServer) {
+                    await api.tools.updateMcpServer(editingMcpServer.server_id, {
+                      name: mcpForm.name,
+                      transport: mcpForm.transport,
+                      command: mcpForm.transport === 'stdio' ? mcpForm.command : null,
+                      url: mcpForm.transport !== 'stdio' ? mcpForm.url : null,
+                      args,
+                      env,
+                      timeout_seconds: mcpForm.timeout_seconds,
+                      description: mcpForm.description || null,
+                    });
+                  } else {
+                    await api.tools.createMcpServer({
+                      name: mcpForm.name,
+                      transport: mcpForm.transport,
+                      command: mcpForm.transport === 'stdio' ? mcpForm.command : undefined,
+                      url: mcpForm.transport !== 'stdio' ? mcpForm.url : undefined,
+                      args,
+                      env,
+                      timeout_seconds: mcpForm.timeout_seconds,
+                      description: mcpForm.description || undefined,
+                    });
+                  }
+                  showMcpForm = false;
+                  await refreshPageState();
+                  addToast(editingMcpServer ? 'MCP server updated.' : 'MCP server created.', 'success');
+                } catch (e) { error = asApiError(e).message; }
+              }}>{editingMcpServer ? 'Update' : 'Create'}</Button>
+            </div>
+          </Card>
+        {/if}
+
+        {#each mcpServerConfigs as srv}
+          <Card class="p-5 space-y-3">
+            <div class="flex items-center justify-between">
+              <div class="flex items-center gap-3">
+                <h3 class="text-lg font-medium text-white">{srv.name}</h3>
+                <span class="px-2 py-0.5 bg-zinc-700 text-zinc-300 text-xs font-mono rounded">{srv.transport}</span>
+                <span class="px-2 py-0.5 rounded text-xs {srv.status === 'active' ? 'bg-emerald-500/20 text-emerald-300' : 'bg-zinc-700 text-zinc-400'}">{srv.status}</span>
+              </div>
+              <div class="flex gap-2">
+                <Button variant="secondary" size="sm" onclick={() => {
+                  editingMcpServer = srv;
+                  mcpForm = {
+                    name: srv.name,
+                    transport: srv.transport,
+                    command: srv.command || '',
+                    url: srv.url || '',
+                    args: (srv.args || []).join('\n'),
+                    env: Object.entries(srv.env || {}).map(([k, v]) => `${k}=${v}`).join('\n'),
+                    timeout_seconds: srv.timeout_seconds,
+                    description: srv.description || '',
+                  };
+                  showMcpForm = true;
+                }}>Edit</Button>
+                <Button variant="danger" size="sm" onclick={async () => {
+                  const confirmed = await confirmAction({ title: 'Delete MCP server', message: `Delete "${srv.name}"? This cannot be undone.` });
+                  if (confirmed) {
+                    try {
+                      await api.tools.deleteMcpServer(srv.server_id);
+                      await refreshPageState();
+                      addToast('MCP server deleted.', 'success');
+                    } catch (e) { error = asApiError(e).message; }
+                  }
+                }}>Delete</Button>
+              </div>
+            </div>
+            {#if srv.transport === 'stdio' && srv.command}
+              <p class="text-xs text-slate-400 font-mono">{srv.command} {(srv.args || []).join(' ')}</p>
+            {:else if srv.url}
+              <p class="text-xs text-slate-400 font-mono">{srv.url}</p>
+            {/if}
+            {#if srv.description}
+              <p class="text-sm text-slate-400">{srv.description}</p>
+            {/if}
+            <div class="text-xs text-slate-500 font-mono">ID: {srv.server_id}</div>
+          </Card>
+        {/each}
+
+        {#if mcpServerConfigs.length === 0 && !showMcpForm}
+          <Card class="p-5 text-center text-slate-400">
+            <p>No MCP servers configured. Create one to make MCP tools available to executors.</p>
+          </Card>
+        {/if}
+
+        <!-- Native Tools Reference -->
+        {#if executorTools.length > 0}
+          {@const nativeGroups = [...new Set(executorTools.map(t => t.category))].sort()}
+          <Card class="p-5 space-y-3">
+            <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Native Tools Reference</p>
+            <p class="text-sm text-slate-400">Built-in tools available on executors. Enable them per-executor in the Executors tab.</p>
+            {#each nativeGroups as group}
+              <div>
+                <span class="text-xs font-medium text-slate-300">{group}</span>
+                <div class="mt-1 flex flex-wrap gap-1.5">
+                  {#each executorTools.filter(t => t.category === group) as tool}
+                    <span class="px-2 py-0.5 bg-slate-800 text-slate-300 text-xs font-mono rounded border border-slate-700" title={tool.description}>{tool.name}</span>
+                  {/each}
+                </div>
+              </div>
+            {/each}
+          </Card>
         {/if}
       </div>
     {:else if activeTab === 'users'}

@@ -17,6 +17,7 @@ from sqlalchemy import (
     Boolean,
     ForeignKey,
     Index,
+    Integer,
     LargeBinary,
     String,
     Text,
@@ -406,6 +407,34 @@ class ExecutorRow(Base):
     updated_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
     )
+
+
+class MCPServerRow(Base):
+    """Global MCP server definitions assigned to executors."""
+
+    __tablename__ = "mcp_servers"
+
+    server_id: Mapped[str] = mapped_column(String, primary_key=True)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    transport: Mapped[str] = mapped_column(String, nullable=False, default="stdio")
+    command: Mapped[str | None] = mapped_column(Text, nullable=True)
+    url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    args: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    env: Mapped[dict[str, str] | None] = mapped_column(JSON, nullable=True)
+    timeout_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=30)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    owner_email: Mapped[str] = mapped_column(
+        String, ForeignKey("users.email", ondelete="CASCADE"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(String, nullable=False, default="active")
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__ = (UniqueConstraint("name", "owner_email", name="uq_mcp_server_name_owner"),)
 
 
 class SkillRow(Base):

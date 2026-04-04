@@ -8,21 +8,40 @@ from time import monotonic
 from typing import Any
 
 from fastapi import APIRouter, Request
+from pydantic import ValidationError
 
-from cognis.api.common import api_exception, require_current_user, require_owner_or_admin
+from cognis.api.common import (
+    api_exception,
+    require_admin,
+    require_current_user,
+    require_owner_or_admin,
+)
 from cognis.api.models import (
     ExecutorStatusResponse,
     IntarisMCPServerResponse,
+    MCPServerCreateRequest,
     MCPServerResponse,
     MCPServerTestItemResponse,
     MCPServerTestResponse,
+    MCPServerUpdateRequest,
     ToolResponse,
 )
 from cognis.api.runtime_support import select_static_tools
 from cognis.api.serializers import agent_to_response, mcp_server_to_response, tool_to_response
 from cognis.models.agent import AgentDefinition
 from cognis.models.tool import ExecutorConfig, MCPServerConfig
-from cognis.store.queries import get_agent, list_agents
+from cognis.store.queries import (
+    create_mcp_server,
+    delete_mcp_server,
+    get_agent,
+    get_mcp_server,
+    list_agents,
+    mcp_server_referenced_by_executors,
+    update_mcp_server,
+)
+from cognis.store.queries import (
+    list_mcp_servers as list_global_mcp_servers,
+)
 from cognis.tools.executor.definitions import executor_tool_definitions
 
 router = APIRouter(tags=["tools"])
@@ -252,3 +271,137 @@ async def test_agent_mcp_servers(request: Request, agent_id: str) -> MCPServerTe
         for server_name, tool_names in grouped.items()
     ]
     return MCPServerTestResponse(ok=all(item.ok for item in items), items=items)
+
+
+# --- Global MCP Server CRUD ---
+
+_SECRET_PATTERNS = {"KEY", "SECRET", "TOKEN", "PASSWORD", "CREDENTIAL"}
+
+
+def _redact_env(env: dict[str, str] | None) -> dict[str, str]:
+    """Redact environment variable values that look like secrets."""
+    if not env:
+        return {}
+    redacted: dict[str, str] = {}
+    for key, value in env.items():
+        upper_key = key.upper()
+        if any(pat in upper_key for pat in _SECRET_PATTERNS) or value.startswith("$secret:"):
+            redacted[key] = "***"
+        else:
+            redacted[key] = value
+    return redacted
+
+
+def _mcp_row_to_response(row: Any) -> dict[str, Any]:
+    """Convert an MCPServerRow to a response dict with env redaction."""
+    from cognis.api.models import MCPServerConfigResponse as MCPResp
+
+    return MCPResp(
+        server_id=row.server_id,
+        name=row.name,
+        transport=row.transport,
+        command=row.command,
+        url=row.url,
+        args=row.args or [],
+        env=_redact_env(row.env),
+        timeout_seconds=row.timeout_seconds,
+        description=row.description,
+        owner_email=row.owner_email,
+        status=row.status,
+        created_at=row.created_at.isoformat() if row.created_at else None,
+        updated_at=row.updated_at.isoformat() if row.updated_at else None,
+    ).model_dump()
+
+
+@router.get("/api/v1/mcp-servers")
+async def list_mcp_servers_route(request: Request) -> list[dict[str, Any]]:
+    require_admin(request)
+    async with request.app.state.session_factory() as session:
+        rows = await list_global_mcp_servers(session)
+    return [_mcp_row_to_response(r) for r in rows]
+
+
+@router.get("/api/v1/mcp-servers/{server_id}")
+async def get_mcp_server_route(request: Request, server_id: str) -> dict[str, Any]:
+    require_admin(request)
+    async with request.app.state.session_factory() as session:
+        row = await get_mcp_server(session, server_id)
+    if row is None:
+        raise api_exception(404, "not_found", "MCP server not found")
+    return _mcp_row_to_response(row)
+
+
+@router.post("/api/v1/mcp-servers")
+async def create_mcp_server_route(request: Request, body: MCPServerCreateRequest) -> dict[str, Any]:
+    user = require_admin(request)
+    async with request.app.state.session_factory() as session:
+        row = await create_mcp_server(
+            session,
+            server_id=body.server_id,
+            name=body.name,
+            transport=body.transport,
+            command=body.command,
+            url=body.url,
+            args=body.args,
+            env=body.env,
+            timeout_seconds=body.timeout_seconds,
+            description=body.description,
+            owner_email=user.email,
+        )
+        await session.commit()
+    return _mcp_row_to_response(row)
+
+
+@router.put("/api/v1/mcp-servers/{server_id}")
+async def update_mcp_server_route(
+    request: Request, server_id: str, body: MCPServerUpdateRequest
+) -> dict[str, Any]:
+    require_admin(request)
+    async with request.app.state.session_factory() as session:
+        existing = await get_mcp_server(session, server_id)
+        if existing is None:
+            raise api_exception(404, "not_found", "MCP server not found")
+        updates = body.model_dump(exclude_unset=True)
+        if isinstance(updates.get("env"), dict) and isinstance(existing.env, dict):
+            preserved_env: dict[str, str] = {}
+            for key, value in updates["env"].items():
+                preserved_env[key] = existing.env.get(key) if value == "***" else value
+            updates["env"] = preserved_env
+        merged = {
+            "name": updates.get("name", existing.name),
+            "transport": updates.get("transport", existing.transport),
+            "command": updates.get("command", existing.command),
+            "url": updates.get("url", existing.url),
+            "args": updates.get("args", existing.args or []),
+            "env": updates.get("env", existing.env or {}),
+            "timeout_seconds": updates.get("timeout_seconds", existing.timeout_seconds),
+        }
+        try:
+            MCPServerConfig.model_validate(merged)
+        except ValidationError as exc:
+            raise api_exception(422, "validation_error", str(exc)) from exc
+        row = await update_mcp_server(session, server_id, **updates)
+        if row is None:
+            raise api_exception(404, "not_found", "MCP server not found")
+        await session.commit()
+    return _mcp_row_to_response(row)
+
+
+@router.delete("/api/v1/mcp-servers/{server_id}")
+async def delete_mcp_server_route(request: Request, server_id: str) -> dict[str, str]:
+    require_admin(request)
+    async with request.app.state.session_factory() as session:
+        # Check for executor references before deleting
+        referencing = await mcp_server_referenced_by_executors(session, server_id)
+        if referencing:
+            raise api_exception(
+                409,
+                "referenced",
+                f"MCP server is referenced by executor(s): {', '.join(referencing)}. "
+                "Remove the assignment first.",
+            )
+        deleted = await delete_mcp_server(session, server_id)
+        if not deleted:
+            raise api_exception(404, "not_found", "MCP server not found")
+        await session.commit()
+    return {"status": "deleted"}

@@ -8,15 +8,13 @@
   import ImageLightbox from '$lib/components/ImageLightbox.svelte';
   import { api } from '$lib/api/client';
   import {
-    buildBootstrapPreview,
+    buildSystemPromptPreview,
     defaultSystemPrompt,
     formStateToPayload,
     slugify,
-    type AgentFormState,
-    type MCPEnvVar,
-    type MCPServerFormState
+    type AgentFormState
   } from '$lib/agents';
-  import type { Agent, IntarisMCPServer, LLMProvider, MCPServerTestResponse, SecretMetadata, ToolDefinitionSummary, Workflow } from '$lib/types/api';
+  import type { Agent, ExecutorConfig, IntarisMCPServer, LLMProvider, SecretMetadata, ToolDefinitionSummary, Workflow } from '$lib/types/api';
 
   let {
     mode,
@@ -24,6 +22,7 @@
     tools,
     workflows,
     providers,
+    executors = [],
     secrets = [],
     intarisMcpServers = [],
     secondaryAgents = [],
@@ -32,16 +31,14 @@
     error = '',
     readonly = false,
     onSave,
-    onTestMcp,
     onBindingsChange,
-    mcpTesting = false,
-    mcpTestResult = null
   } = $props<{
     mode: 'create' | 'edit';
     form: AgentFormState;
     tools: ToolDefinitionSummary[];
     workflows: Workflow[];
     providers: LLMProvider[];
+    executors?: ExecutorConfig[];
     secrets?: SecretMetadata[];
     intarisMcpServers?: IntarisMCPServer[];
     secondaryAgents?: Agent[];
@@ -50,10 +47,7 @@
     error?: string;
     readonly?: boolean;
     onSave: (payload: Record<string, unknown>) => void | Promise<void>;
-    onTestMcp?: (() => void | Promise<void>) | null;
     onBindingsChange?: ((bindings: string[]) => void | Promise<void>) | null;
-    mcpTesting?: boolean;
-    mcpTestResult?: MCPServerTestResponse | null;
   }>();
 
   let localBindings = $state<string[]>([...secondaryBindings]);
@@ -128,6 +122,38 @@
 
   const permissionOptions = ['', 'allow', 'evaluate', 'deny'];
 
+  const toolCategories = $derived<string[]>(
+    [...new Set(tools.map((tool: ToolDefinitionSummary) => tool.category))].sort() as string[]
+  );
+
+  function toolsForCategory(category: string): ToolDefinitionSummary[] {
+    return tools.filter((tool: ToolDefinitionSummary) => tool.category === category);
+  }
+
+  function categoryDisabled(category: string): boolean {
+    return form.disabledCategories.includes(category);
+  }
+
+  function toggleCategory(category: string): void {
+    if (categoryDisabled(category)) {
+      form.disabledCategories = form.disabledCategories.filter((value: string) => value !== category);
+      return;
+    }
+    form.disabledCategories = [...form.disabledCategories, category];
+  }
+
+  function toolDisabled(toolName: string): boolean {
+    return form.disabledTools.includes(toolName);
+  }
+
+  function toggleTool(toolName: string): void {
+    if (toolDisabled(toolName)) {
+      form.disabledTools = form.disabledTools.filter((value: string) => value !== toolName);
+      return;
+    }
+    form.disabledTools = [...form.disabledTools, toolName];
+  }
+
   function validateJson(value: string, label: string): string | null {
     if (!value.trim()) {
       return null;
@@ -140,28 +166,6 @@
     }
   }
 
-  function mcpServerError(server: MCPServerFormState): string | null {
-    const hasAnyField = server.name.trim() || server.command.trim() || server.argsText.trim() || server.envVars.length > 0;
-    if (!hasAnyField) {
-      return null;
-    }
-    if (!server.name.trim()) {
-      return 'Server name is required.';
-    }
-    if (!server.command.trim()) {
-      return 'Command is required.';
-    }
-    for (const envVar of server.envVars) {
-      if (!envVar.key.trim()) {
-        return 'Environment variable name is required.';
-      }
-      if (envVar.type === 'secret' && !envVar.value) {
-        return `Secret reference for ${envVar.key} is required.`;
-      }
-    }
-    return null;
-  }
-
   function validationErrors(): Record<string, string> {
     const errors: Record<string, string> = {};
     if (!form.name.trim()) {
@@ -170,12 +174,6 @@
     const stepJsonError = validateJson(form.stepAgentOverridesJson, 'Step agent overrides');
     if (stepJsonError) {
       errors.stepAgentOverridesJson = stepJsonError;
-    }
-    const mcpErrors = form.mcpServers
-      .map((server: MCPServerFormState, index: number) => [index, mcpServerError(server)] as const)
-      .filter((entry: readonly [number, string | null]): entry is readonly [number, string] => Boolean(entry[1]));
-    for (const [index, value] of mcpErrors) {
-      errors[`mcpServers.${index}`] = value;
     }
     return errors;
   }
@@ -215,29 +213,6 @@
       return;
     }
     await onSave(formStateToPayload(form));
-  }
-
-  function addMcpServer(): void {
-    const next: MCPServerFormState = {
-      name: '',
-      command: '',
-      argsText: '',
-      envVars: [],
-      timeoutSeconds: 30
-    };
-    form.mcpServers = [...form.mcpServers, next];
-  }
-
-  function addEnvVar(server: MCPServerFormState): void {
-    server.envVars = [...server.envVars, { key: '', value: '', type: 'literal' }];
-  }
-
-  function removeEnvVar(server: MCPServerFormState, index: number): void {
-    server.envVars = server.envVars.filter((_: MCPEnvVar, i: number) => i !== index);
-  }
-
-  function removeMcpServer(index: number): void {
-    form.mcpServers = form.mcpServers.filter((_: MCPServerFormState, itemIndex: number) => itemIndex !== index);
   }
 
   function resetSystemPrompt(): void {
@@ -442,6 +417,24 @@
 
       <!-- Tools & Permissions -->
       <Card class="p-5">
+        <div class="mb-4 grid gap-4 md:grid-cols-2">
+          <label class="space-y-2 text-sm font-medium text-slate-200">
+            <span>Executor</span>
+            <select bind:value={form.executorId} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={readonly}>
+              <option value="">Use default executor</option>
+              {#each executors as executor}
+                <option value={executor.executor_id}>{executor.name} ({executor.executor_type})</option>
+              {/each}
+            </select>
+            <span class="block text-xs text-slate-400">Choose a specific executor or leave empty to use executor label matching / default resolution.</span>
+          </label>
+          <label class="space-y-2 text-sm font-medium text-slate-200">
+            <span>Executor selector (optional, key=value)</span>
+            <textarea bind:value={form.executorSelector} class="min-h-[72px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 font-mono text-sm text-slate-100" placeholder="tier=standard&#10;location=local" disabled={readonly || !!form.executorId}></textarea>
+            <span class="block text-xs text-slate-400">Used when no explicit executor is selected. Matches executor labels like Kubernetes selectors.</span>
+          </label>
+        </div>
+
         <div class="grid gap-4 md:grid-cols-2">
           <label class="flex items-center gap-3 text-sm font-medium text-slate-200">
             <input bind:checked={form.canDelegate} class="h-4 w-4 rounded border-slate-600 bg-slate-950" type="checkbox" />
@@ -454,17 +447,52 @@
         </div>
 
         {#if tools.length > 0}
-          <div class="mt-4 max-h-64 overflow-y-auto rounded-xl border border-slate-800 bg-slate-950/60 p-3">
-            <div class="space-y-2">
-              {#each tools as tool}
-                <div class="flex items-center justify-between gap-3 text-sm">
-                  <span class="text-slate-200">{tool.name}</span>
-                  <select bind:value={form.toolPermissions[tool.name]} class="w-32 rounded-lg border border-slate-700 bg-slate-950/80 px-2 py-1 text-xs text-slate-100">
-                    {#each permissionOptions as option}
-                      <option value={option}>{option || 'inherit'}</option>
+          <div class="mt-4 space-y-3 rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
+            <div>
+              <p class="text-sm font-medium text-slate-200">Tool categories</p>
+              <p class="mt-1 text-xs text-slate-400">Agents inherit all tools from their executor by default. Disable categories or individual tools here, then use permissions to require evaluation or deny access.</p>
+            </div>
+
+            <div class="flex flex-wrap gap-2">
+              {#each toolCategories as category}
+                {@const disabled = categoryDisabled(category)}
+                <button
+                  type="button"
+                  class="px-3 py-1.5 rounded-lg text-sm border transition-colors {disabled ? 'bg-slate-900 border-slate-700 text-slate-400' : 'bg-emerald-500/15 border-emerald-500/40 text-emerald-200'}"
+                  onclick={() => toggleCategory(category)}
+                  disabled={readonly}
+                >
+                  {category}
+                  <span class="ml-1 text-xs opacity-60">({toolsForCategory(category).length})</span>
+                </button>
+              {/each}
+            </div>
+
+            <div class="space-y-2 max-h-80 overflow-y-auto">
+              {#each toolCategories as category}
+                {@const categoryTools = toolsForCategory(category)}
+                <details class="rounded-xl border border-slate-800 bg-slate-950/50 p-3">
+                  <summary class="cursor-pointer text-sm font-medium text-slate-200">
+                    {category}
+                    <span class="ml-2 text-xs text-slate-500">{categoryDisabled(category) ? 'disabled' : 'enabled'}</span>
+                  </summary>
+                  <div class="mt-3 space-y-2">
+                    {#each categoryTools as tool}
+                      <div class="grid gap-2 md:grid-cols-[1fr_auto_auto] items-center text-sm">
+                        <label class="flex items-center gap-3 text-slate-200">
+                          <input type="checkbox" checked={!toolDisabled(tool.name)} onchange={() => toggleTool(tool.name)} disabled={readonly || categoryDisabled(category)} class="h-4 w-4 rounded border-slate-600 bg-slate-950" />
+                          <span class="font-mono">{tool.name}</span>
+                        </label>
+                        <span class="text-xs text-slate-500">{tool.description}</span>
+                        <select bind:value={form.toolPermissions[tool.name]} class="w-32 rounded-lg border border-slate-700 bg-slate-950/80 px-2 py-1 text-xs text-slate-100" disabled={readonly || toolDisabled(tool.name) || categoryDisabled(category)}>
+                          {#each permissionOptions as option}
+                            <option value={option}>{option || 'inherit'}</option>
+                          {/each}
+                        </select>
+                      </div>
                     {/each}
-                  </select>
-                </div>
+                  </div>
+                </details>
               {/each}
             </div>
           </div>
@@ -521,88 +549,12 @@
           </div>
         {/if}
 
-        <!-- Local MCP Servers -->
-        <div class="mt-4 space-y-3">
-          <div class="flex items-center justify-between gap-3">
-            <p class="text-sm font-medium text-slate-200">Local MCP servers</p>
-            <Button size="sm" variant="secondary" type="button" onclick={addMcpServer}>Add server</Button>
+        {#if form.mcpServers.length > 0}
+          <div class="mt-4 rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
+            <p class="font-medium">This agent still has legacy inline MCP server definitions.</p>
+            <p class="mt-1 text-amber-50/90">Create these servers in Settings → Tools and assign them to an executor. Existing inline MCP config is preserved for backward compatibility.</p>
           </div>
-
-          {#each form.mcpServers as server, index}
-            <div class="rounded-2xl border border-slate-800 bg-slate-950/60 p-4 space-y-3">
-              <div class="grid gap-3 md:grid-cols-2">
-                <label class="space-y-1 text-sm font-medium text-slate-200">
-                  <span>Name</span>
-                  <Input bind:value={server.name} placeholder="filesystem" />
-                </label>
-                <label class="space-y-1 text-sm font-medium text-slate-200">
-                  <span>Command</span>
-                  <Input bind:value={server.command} placeholder="npx" />
-                </label>
-              </div>
-              <label class="block space-y-1 text-sm font-medium text-slate-200">
-                <span>Arguments (one per line)</span>
-                <textarea bind:value={server.argsText} class="min-h-[60px] w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 font-mono text-sm text-slate-100" placeholder="-y&#10;@modelcontextprotocol/server-filesystem&#10;/path/to/project"></textarea>
-              </label>
-              <div class="space-y-2">
-                <div class="flex items-center justify-between gap-2">
-                  <span class="text-sm font-medium text-slate-200">Environment variables</span>
-                  <Button size="sm" variant="secondary" type="button" onclick={() => addEnvVar(server)}>Add variable</Button>
-                </div>
-                {#each server.envVars as envVar, envIndex}
-                  <div class="flex items-center gap-2">
-                    <Input bind:value={envVar.key} placeholder="KEY" class="w-36" />
-                    <select bind:value={envVar.type} class="w-24 rounded-lg border border-slate-700 bg-slate-950/80 px-2 py-2 text-xs text-slate-100">
-                      <option value="literal">Value</option>
-                      <option value="secret">Secret</option>
-                    </select>
-                    {#if envVar.type === 'secret'}
-                      <select bind:value={envVar.value} class="flex-1 rounded-lg border border-slate-700 bg-slate-950/80 px-2 py-2 text-xs text-slate-100">
-                        <option value="">Select secret...</option>
-                        {#each secrets as secret}
-                          <option value={secret.name}>{secret.name}</option>
-                        {/each}
-                      </select>
-                    {:else}
-                      <Input bind:value={envVar.value} placeholder="value" class="flex-1" />
-                    {/if}
-                    <button type="button" class="text-xs text-rose-400 hover:text-rose-300" onclick={() => removeEnvVar(server, envIndex)}>Remove</button>
-                  </div>
-                {/each}
-              </div>
-              <div class="flex items-center gap-3">
-                <label class="space-y-1 text-sm font-medium text-slate-200">
-                  <span>Timeout (s)</span>
-                  <Input bind:value={server.timeoutSeconds} type="number" />
-                </label>
-                <Button size="sm" variant="danger" type="button" onclick={() => removeMcpServer(index)}>Remove</Button>
-              </div>
-              {#if errors[`mcpServers.${index}`]}
-                <p class="text-xs text-rose-300">{errors[`mcpServers.${index}`]}</p>
-              {/if}
-            </div>
-          {/each}
-
-          {#if mode === 'edit' && onTestMcp}
-            <Button variant="secondary" type="button" disabled={mcpTesting} onclick={onTestMcp}>
-              {mcpTesting ? 'Testing…' : 'Test MCP servers'}
-            </Button>
-            {#if mcpTestResult}
-              <div class="space-y-2">
-                {#each mcpTestResult.servers as server}
-                  <div class={`rounded-xl border px-3 py-2 text-sm ${server.ok ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-100' : 'border-rose-500/30 bg-rose-500/10 text-rose-100'}`}>
-                    <span class="font-medium">{server.name}</span>
-                    {#if server.ok}
-                      — {server.tool_count} tools discovered
-                    {:else}
-                      — {server.error}
-                    {/if}
-                  </div>
-                {/each}
-              </div>
-            {/if}
-          {/if}
-        </div>
+        {/if}
       </Card>
 
       <!-- Provider & Model -->
@@ -750,8 +702,8 @@
     <div class="space-y-5">
       {#if form.agentType === 'primary'}
         <Card class="p-5">
-          <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Mnemory bootstrap preview</p>
-          <pre class="mt-4 whitespace-pre-wrap rounded-2xl border border-slate-800 bg-slate-950/70 p-4 text-sm leading-6 text-slate-200">{buildBootstrapPreview(form)}</pre>
+          <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">System prompt preview</p>
+          <pre class="mt-4 whitespace-pre-wrap rounded-2xl border border-slate-800 bg-slate-950/70 p-4 text-sm leading-6 text-slate-200">{buildSystemPromptPreview(form)}</pre>
         </Card>
       {:else}
         <Card class="p-5">

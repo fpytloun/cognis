@@ -9,7 +9,7 @@ from typing import Any, cast
 from cognis.core.executor_resolution import select_executor_for_agent
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
-from cognis.models.tool import ExecutorConfig, MCPServerConfig, ToolDefinition
+from cognis.models.tool import MCP_SERVER_IDS_KEY, ExecutorConfig, MCPServerConfig, ToolDefinition
 from cognis.providers.executor.in_process import InProcessExecutorConnection
 from cognis.tools.builtin.image import image_tools
 from cognis.tools.builtin.memory import memory_tools
@@ -68,8 +68,14 @@ def select_static_tools(agent: Any | None = None) -> list[ToolDefinition]:
     allow_all_builtins = allowlist is None or "*" in allowlist
     delegation_enabled = bool(agent.tools.get("delegation_tools", True))
 
+    disabled_categories = set(agent.tools.get("disabled_categories") or [])
+    disabled_tools = set(agent.tools.get("disabled_tools") or [])
+
     selected: list[ToolDefinition] = []
     for tool in definitions:
+        # Agent-level disable takes precedence
+        if tool.category in disabled_categories or tool.name in disabled_tools:
+            continue
         if tool.category == "orchestration":
             if delegation_enabled:
                 selected.append(tool)
@@ -188,8 +194,20 @@ def build_step_runtime_factory(
         if executor_config is not None:
             # Only include executor-native tools that are enabled on this executor.
             # Controller-side tools (builtin) are always available regardless.
+            disabled_categories = (
+                set(agent.tools.get("disabled_categories") or [])
+                if isinstance(agent.tools, dict)
+                else set()
+            )
+            disabled_tools = (
+                set(agent.tools.get("disabled_tools") or [])
+                if isinstance(agent.tools, dict)
+                else set()
+            )
             filtered: list[ToolDefinition] = []
             for tool in agent_tools:
+                if tool.category in disabled_categories or tool.name in disabled_tools:
+                    continue
                 if tool.source.type in ("builtin",):
                     # Controller tools always pass through
                     filtered.append(tool)
@@ -202,7 +220,22 @@ def build_step_runtime_factory(
                     filtered.append(tool)
             agent_tools = filtered
 
-        mcp_servers = _parse_local_mcp_servers(agent)
+        resolved_type = (
+            executor_config.get("executor_type", "in_process") if executor_config else "in_process"
+        )
+
+        # Resolve MCP servers: executor-assigned first, then legacy inline fallback.
+        # Remote executor MCP hosting is not supported yet; keep it in-process only.
+        mcp_servers: list[MCPServerConfig] = []
+        if resolved_type == "in_process":
+            mcp_servers = await _resolve_executor_mcp_servers(executor_config, session_factory)
+        elif executor_config and (executor_config.get("config") or {}).get(MCP_SERVER_IDS_KEY):
+            logger.warning(
+                "Executor-assigned MCP servers are currently supported only for in-process executors",
+                extra={"extra_data": {"executor_id": executor_config.get("executor_id")}},
+            )
+        if not mcp_servers:
+            mcp_servers = _parse_local_mcp_servers(agent)
         if mcp_servers:
             secrets = await providers.secrets.resolve_for_execution(agent, user_email)
             handle = await providers.executor.spawn(
@@ -222,11 +255,6 @@ def build_step_runtime_factory(
 
             return registry, connection, cleanup
 
-        # Determine executor type from resolved config
-        resolved_type = (
-            executor_config.get("executor_type", "in_process") if executor_config else "in_process"
-        )
-
         if resolved_type in ("websocket", "subprocess"):
             # Remote executor — get tools from the executor itself.
             # The executor manages its own tool handlers and MCP servers.
@@ -237,10 +265,25 @@ def build_step_runtime_factory(
             conn = ws_provider.get_connection(executor_id)
             if conn is not None:
                 try:
+                    disabled_categories = (
+                        set(agent.tools.get("disabled_categories") or [])
+                        if isinstance(agent.tools, dict)
+                        else set()
+                    )
+                    disabled_tools = (
+                        set(agent.tools.get("disabled_tools") or [])
+                        if isinstance(agent.tools, dict)
+                        else set()
+                    )
                     remote_tools = await conn.list_tools()
                     remote_registry = ToolRegistry()
                     for tool_data in remote_tools:
                         tool_def = ToolDefinition.model_validate(tool_data)
+                        if (
+                            tool_def.category in disabled_categories
+                            or tool_def.name in disabled_tools
+                        ):
+                            continue
                         remote_registry.register(RegisteredTool(definition=tool_def))
                     return remote_registry, conn, noop_cleanup
                 except Exception:
@@ -296,6 +339,7 @@ async def _resolve_executor_config(
                 return None
             return {
                 "executor_id": selected.executor_id,
+                "executor_type": selected.executor_type,
                 "enabled_tools": selected.enabled_tools or [],
                 "enabled_tool_groups": selected.enabled_tool_groups or [],
                 "labels": selected.labels or {},
@@ -358,7 +402,54 @@ async def _resolve_web_config(
     }
 
 
+async def _resolve_executor_mcp_servers(
+    executor_config: dict[str, Any] | None,
+    session_factory: Any,
+) -> list[MCPServerConfig]:
+    """Resolve MCP servers assigned to an executor via config.mcp_server_ids."""
+    from cognis.models.tool import MCP_SERVER_IDS_KEY
+    from cognis.store.queries import get_mcp_server
+
+    if not executor_config:
+        return []
+    config = executor_config.get("config") or {}
+    server_ids = config.get(MCP_SERVER_IDS_KEY, [])
+    if not isinstance(server_ids, list) or not server_ids:
+        return []
+
+    servers: list[MCPServerConfig] = []
+    async with session_factory() as session:
+        for sid in server_ids:
+            row = await get_mcp_server(session, str(sid))
+            if row is None:
+                logger.warning(
+                    "MCP server not found",
+                    extra={"extra_data": {"server_id": sid}},
+                )
+                continue
+            if row.status != "active":
+                continue
+            servers.append(
+                MCPServerConfig(
+                    name=row.name,
+                    transport=row.transport,
+                    command=row.command,
+                    url=row.url,
+                    args=row.args or [],
+                    env=row.env or {},
+                    timeout_seconds=row.timeout_seconds,
+                )
+            )
+    if servers:
+        logger.debug(
+            "Resolved executor MCP servers",
+            extra={"extra_data": {"count": len(servers)}},
+        )
+    return servers
+
+
 def _parse_local_mcp_servers(agent: AgentDefinition) -> list[MCPServerConfig]:
+    """Parse legacy inline MCP server configs from agent.tools.mcp_servers."""
     if not isinstance(agent.tools, dict):
         return []
     raw_servers = agent.tools.get("mcp_servers")

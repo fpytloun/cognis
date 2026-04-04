@@ -6,7 +6,8 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+from pydantic_core import PydanticCustomError
 
 
 class Permission(StrEnum):
@@ -54,10 +55,29 @@ class MCPServerConfig(BaseModel):
 
     name: str
     transport: str = "stdio"
-    command: str
+    command: str | None = None  # Required for stdio transport
+    url: str | None = None  # Required for sse/streamable_http transport
     args: list[str] = Field(default_factory=list)
     env: dict[str, str] = Field(default_factory=dict)
     timeout_seconds: int = 30
+
+    @model_validator(mode="after")
+    def _validate_transport_fields(self) -> MCPServerConfig:
+        if self.transport == "stdio" and not self.command:
+            raise PydanticCustomError(
+                "mcp_stdio_command_required",
+                "command is required for stdio transport",
+            )
+        if self.transport in ("sse", "streamable_http") and not self.url:
+            raise PydanticCustomError(
+                "mcp_url_required",
+                f"url is required for {self.transport} transport",
+            )
+        return self
+
+
+# Key used in executor config JSON for MCP server ID references.
+MCP_SERVER_IDS_KEY = "mcp_server_ids"
 
 
 class ExecutorCapabilities(BaseModel):

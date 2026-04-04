@@ -43,6 +43,10 @@ export interface AgentFormState {
   mcpServers: MCPServerFormState[];
   intarisMcpServers: string[];
   originalTools: Record<string, unknown>;
+  executorId: string;
+  executorSelector: string;
+  disabledCategories: string[];
+  disabledTools: string[];
 }
 
 const DEFAULT_SYSTEM_PROMPT = `You are {name}, an AI assistant.
@@ -98,7 +102,11 @@ export function createEmptyAgentForm(workflows: Workflow[] = []): AgentFormState
     stepAgentOverridesJson: '{}',
     mcpServers: [],
     intarisMcpServers: [],
-    originalTools: {}
+    originalTools: {},
+    executorId: '',
+    executorSelector: '',
+    disabledCategories: [],
+    disabledTools: []
   };
 }
 
@@ -152,6 +160,13 @@ export function agentToFormState(agent: Agent): AgentFormState {
       typeof execution.workflow_selection_mode === 'string'
         ? execution.workflow_selection_mode
         : 'automatic',
+    executorId: typeof execution.executor_id === 'string' ? execution.executor_id : '',
+    executorSelector:
+      execution.executor_selector && typeof execution.executor_selector === 'object'
+        ? Object.entries(execution.executor_selector as Record<string, unknown>)
+            .map(([key, value]) => `${key}=${String(value)}`)
+            .join('\n')
+        : '',
     stepAgentOverridesJson: JSON.stringify(execution.step_agent_overrides ?? {}, null, 2),
     mcpServers: Array.isArray(tools.mcp_servers)
       ? tools.mcp_servers
@@ -177,6 +192,12 @@ export function agentToFormState(agent: Agent): AgentFormState {
     intarisMcpServers: Array.isArray(tools.intaris_mcp_servers)
       ? tools.intaris_mcp_servers.filter((v): v is string => typeof v === 'string')
       : [],
+    disabledCategories: Array.isArray(tools.disabled_categories)
+      ? tools.disabled_categories.filter((value): value is string => typeof value === 'string')
+      : [],
+    disabledTools: Array.isArray(tools.disabled_tools)
+      ? tools.disabled_tools.filter((value): value is string => typeof value === 'string')
+      : [],
     originalTools: tools
   };
 }
@@ -191,6 +212,23 @@ function nonEmptyLines(value: string): string[] {
 export function formStateToPayload(form: AgentFormState): Record<string, unknown> {
   const toolPermissions = Object.fromEntries(
     Object.entries(form.toolPermissions).filter(([, value]) => value.length > 0)
+  );
+  const {
+    delegation_tools: _legacyDelegationTools,
+    disabled_categories: _legacyDisabledCategories,
+    disabled_tools: _legacyDisabledTools,
+    intaris_mcp_servers: _legacyIntarisMcpServers,
+    mcp_servers: _legacyMcpServers,
+    ...preservedTools
+  } = (form.originalTools ?? {}) as Record<string, unknown>;
+
+  const executorSelector = Object.fromEntries(
+    nonEmptyLines(form.executorSelector)
+      .map((entry) => {
+        const [key, ...rest] = entry.split('=');
+        return [key?.trim(), rest.join('=').trim()] as const;
+      })
+      .filter(([key, value]) => Boolean(key) && Boolean(value))
   );
 
   const payload: Record<string, unknown> = {
@@ -213,8 +251,14 @@ export function formStateToPayload(form: AgentFormState): Record<string, unknown
       max_delegation_depth: form.maxDelegationDepth
     },
     tools: {
-      ...(form.originalTools ?? {}),
+      ...preservedTools,
       delegation_tools: form.canDelegate,
+      ...(form.disabledCategories.length > 0
+        ? { disabled_categories: [...new Set(form.disabledCategories)] }
+        : {}),
+      ...(form.disabledTools.length > 0
+        ? { disabled_tools: [...new Set(form.disabledTools)] }
+        : {}),
       mcp_servers: form.mcpServers
         .filter((server) => server.name.trim() && server.command.trim())
         .map((server) => ({
@@ -231,7 +275,9 @@ export function formStateToPayload(form: AgentFormState): Record<string, unknown
           ),
           timeout_seconds: server.timeoutSeconds || 30
         })),
-      intaris_mcp_servers: form.intarisMcpServers.length > 0 ? form.intarisMcpServers : undefined
+      ...(form.intarisMcpServers.length > 0
+        ? { intaris_mcp_servers: form.intarisMcpServers }
+        : {})
     },
     llm_config: {
       provider_id: form.providerId || undefined,
@@ -241,6 +287,9 @@ export function formStateToPayload(form: AgentFormState): Record<string, unknown
       reasoning_effort: form.reasoningEffort || undefined
     },
     execution: {
+      executor_id: form.executorId || undefined,
+      executor_selector:
+        !form.executorId && Object.keys(executorSelector).length > 0 ? executorSelector : undefined,
       available_workflow_ids: form.availableWorkflowIds,
       default_workflow_id: form.defaultWorkflowId || undefined,
       workflow_selection_mode: form.workflowSelectionMode,
@@ -251,19 +300,30 @@ export function formStateToPayload(form: AgentFormState): Record<string, unknown
   return payload;
 }
 
-export function buildBootstrapPreview(form: AgentFormState): string {
+/**
+ * Build a preview of the composed system prompt that the LLM will receive.
+ * Mirrors the backend `AgentDefinition.compose_personality()` + system_prompt
+ * composition in `context.py`.
+ */
+export function buildSystemPromptPreview(form: AgentFormState): string {
+  const parts: string[] = [];
+
+  // Personality fields (matches Python compose_personality order)
+  const identityLines: string[] = [];
+  const purpose = form.purpose.trim();
+  const tone = form.tone.trim();
+  const temperament = form.temperament.trim();
+  if (purpose) identityLines.push(`Purpose: ${purpose}`);
+  if (tone) identityLines.push(`Tone: ${tone}`);
+  if (temperament) identityLines.push(`Temperament: ${temperament}`);
   const rules = nonEmptyLines(form.behavioralRules);
-  return [
-    `Name: ${form.name || 'Unnamed Agent'}`,
-    `Purpose: ${form.purpose || 'No explicit purpose configured.'}`,
-    `Tone: ${form.tone || 'adaptive'}`,
-    `Temperament: ${form.temperament || 'balanced'}`,
-    form.description ? `Description: ${form.description}` : null,
-    rules.length > 0 ? `Behavioral rules: ${rules.join('; ')}` : null,
-    form.systemPrompt ? `System prompt preview:\n${form.systemPrompt}` : null
-  ]
-    .filter((value): value is string => Boolean(value))
-    .join('\n\n');
+  if (rules.length > 0) identityLines.push(`Behavioral rules:\n${rules.map((r) => `- ${r}`).join('\n')}`);
+  if (identityLines.length > 0) parts.push(identityLines.join('\n'));
+
+  // System prompt (user-written instructions)
+  if (form.systemPrompt.trim()) parts.push(form.systemPrompt.trim());
+
+  return parts.join('\n\n');
 }
 
 export function providerOptions(providers: LLMProvider[]): Array<{ value: string; label: string }> {

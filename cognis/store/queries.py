@@ -21,6 +21,7 @@ from cognis.store.models import (
     Conversation,
     ExecutorRow,
     LLMProvider,
+    MCPServerRow,
     ModelRouting,
     Schedule,
     Secret,
@@ -219,6 +220,7 @@ async def delete_user_cascade(session: AsyncSession, email: str) -> bool:
     await session.execute(delete(Secret).where(Secret.user_email == email))
     await session.execute(delete(WorkflowRow).where(WorkflowRow.owner_email == email))
     await session.execute(delete(ExecutorRow).where(ExecutorRow.owner_email == email))
+    await session.execute(delete(MCPServerRow).where(MCPServerRow.owner_email == email))
     await session.execute(delete(SkillRow).where(SkillRow.owner_email == email))
     # Nullify settings updated_by references
     await session.execute(
@@ -1871,6 +1873,94 @@ async def ensure_default_executor(session: AsyncSession) -> ExecutorRow:
         enabled_tool_groups=[],
         is_default=True,
     )
+
+
+# --- MCP Servers ---
+
+
+async def list_mcp_servers(session: AsyncSession) -> list[MCPServerRow]:
+    """List all MCP server configurations."""
+    result = await session.execute(select(MCPServerRow).order_by(MCPServerRow.name))
+    return list(result.scalars().all())
+
+
+async def get_mcp_server(session: AsyncSession, server_id: str) -> MCPServerRow | None:
+    """Get an MCP server by ID."""
+    result = await session.execute(select(MCPServerRow).where(MCPServerRow.server_id == server_id))
+    return result.scalar_one_or_none()
+
+
+async def create_mcp_server(
+    session: AsyncSession,
+    *,
+    server_id: str | None = None,
+    name: str,
+    transport: str = "stdio",
+    command: str | None = None,
+    url: str | None = None,
+    args: list[str] | None = None,
+    env: dict[str, str] | None = None,
+    timeout_seconds: int = 30,
+    description: str | None = None,
+    owner_email: str,
+    status: str = "active",
+) -> MCPServerRow:
+    """Create an MCP server configuration."""
+    row = MCPServerRow(
+        server_id=server_id or f"mcp_{uuid.uuid4().hex[:12]}",
+        name=name,
+        transport=transport,
+        command=command,
+        url=url,
+        args=args or [],
+        env=env or {},
+        timeout_seconds=timeout_seconds,
+        description=description,
+        owner_email=owner_email,
+        status=status,
+    )
+    session.add(row)
+    await session.flush()
+    return row
+
+
+async def update_mcp_server(
+    session: AsyncSession,
+    server_id: str,
+    **kwargs: Any,
+) -> MCPServerRow | None:
+    """Update an MCP server by ID."""
+    row = await get_mcp_server(session, server_id)
+    if row is None:
+        return None
+    for key, value in kwargs.items():
+        if hasattr(row, key):
+            setattr(row, key, value)
+    await session.flush()
+    return row
+
+
+async def delete_mcp_server(session: AsyncSession, server_id: str) -> bool:
+    """Delete an MCP server by ID."""
+    row = await get_mcp_server(session, server_id)
+    if row is None:
+        return False
+    await session.execute(delete(MCPServerRow).where(MCPServerRow.server_id == server_id))
+    return True
+
+
+async def mcp_server_referenced_by_executors(session: AsyncSession, server_id: str) -> list[str]:
+    """Return executor IDs that reference this MCP server in their config."""
+    from cognis.models.tool import MCP_SERVER_IDS_KEY
+
+    executors = await list_executors(session)
+    referencing: list[str] = []
+    for ex in executors:
+        config = ex.config or {}
+        ids = config.get(MCP_SERVER_IDS_KEY, [])
+        if isinstance(ids, list) and server_id in ids:
+            referencing.append(ex.executor_id)
+    return referencing
 
 
 # --- Channel Accounts ---

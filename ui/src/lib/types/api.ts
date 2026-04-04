@@ -238,6 +238,46 @@ export interface MCPServerTestResponse {
   items: MCPServerTestItem[];
 }
 
+export interface MCPServerConfigResponse {
+  server_id: string;
+  name: string;
+  transport: string;
+  command: string | null;
+  url: string | null;
+  args: string[];
+  env: Record<string, string>;
+  timeout_seconds: number;
+  description: string | null;
+  owner_email: string;
+  status: string;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface MCPServerCreateRequest {
+  server_id?: string | null;
+  name: string;
+  transport: string;
+  command?: string | null;
+  url?: string | null;
+  args?: string[];
+  env?: Record<string, string>;
+  timeout_seconds?: number;
+  description?: string | null;
+}
+
+export interface MCPServerUpdateRequest {
+  name?: string;
+  transport?: string;
+  command?: string | null;
+  url?: string | null;
+  args?: string[];
+  env?: Record<string, string>;
+  timeout_seconds?: number;
+  description?: string | null;
+  status?: string;
+}
+
 export interface ChannelCapabilities {
   chat_types: string[];
   supports_threads: boolean;
