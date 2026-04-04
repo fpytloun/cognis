@@ -2,7 +2,7 @@
   import { goto } from '$app/navigation';
   import { page } from '$app/stores';
   import { onMount } from 'svelte';
-  import { fade, fly } from 'svelte/transition';
+  import { fade } from 'svelte/transition';
   import {
     Bot,
     BrainCircuit,
@@ -50,8 +50,22 @@
   let bootstrapped = $state(false);
   let diagnostics = $state<SystemDiagnostics | null>(null);
   let mobileNavOpen = $state(false);
+  let mobileNavPreviouslyFocused = $state<HTMLElement | null>(null);
   let sidebarCollapsed = $state(false);
   let sidebarHovered = $state(false);
+
+  function openMobileNav(): void {
+    mobileNavPreviouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    mobileNavOpen = true;
+    document.body.style.overflow = 'hidden';
+  }
+
+  function closeMobileNav(): void {
+    mobileNavOpen = false;
+    document.body.style.overflow = '';
+    mobileNavPreviouslyFocused?.focus();
+    mobileNavPreviouslyFocused = null;
+  }
 
   function restoreSidebarState(): void {
     if (typeof window === 'undefined') return;
@@ -208,6 +222,7 @@
     window.addEventListener('keydown', handleGlobalShortcuts);
 
     return () => {
+      document.body.style.overflow = '';
       window.removeEventListener('keydown', handleGlobalShortcuts);
       wsClient.disconnect();
       workspaceHealth.stop();
@@ -298,7 +313,7 @@
       <main class="flex min-h-0 flex-1 flex-col gap-3 overflow-hidden rounded-[1.75rem] border border-slate-800/80 bg-slate-950/70 p-3 shadow-card backdrop-blur sm:rounded-3xl sm:p-4 lg:gap-4 lg:p-6" id="main-content">
         <header class="sticky top-0 z-10 flex shrink-0 items-center justify-between gap-2 rounded-2xl border border-slate-800/80 bg-slate-900/95 px-3 py-2.5 backdrop-blur sm:gap-3 sm:px-4 sm:py-4">
           <div class="flex min-w-0 flex-1 items-center gap-2 sm:block">
-            <Button aria-label="Open navigation" class="md:hidden" size="sm" variant="secondary" onclick={() => (mobileNavOpen = true)}>
+            <Button aria-label="Open navigation" class="md:hidden" size="sm" variant="secondary" onclick={openMobileNav}>
               <Menu class="h-4 w-4" />
             </Button>
             <div class="min-w-0">
@@ -379,14 +394,14 @@
 
   {#if mobileNavOpen}
     <div class="fixed inset-0 z-[70] md:hidden" role="presentation">
-      <button class="absolute inset-0 bg-slate-950/80 backdrop-blur" onclick={() => (mobileNavOpen = false)} type="button" aria-label="Close navigation" transition:fade={{ duration: 180 }}></button>
-      <div class="ml-auto flex h-full w-[min(22rem,100vw)] flex-col border-l border-slate-800 bg-slate-950 px-5 py-5 shadow-card" transition:fly={{ x: 320, duration: 220, opacity: 1 }}>
+      <button class="absolute inset-0 bg-slate-950/80 backdrop-blur" onclick={closeMobileNav} type="button" aria-label="Close navigation" transition:fade={{ duration: 180 }}></button>
+      <div class="ml-auto flex h-full w-[min(22rem,100vw)] animate-slide-in-right flex-col border-l border-slate-800 bg-slate-950 px-5 py-5 shadow-card">
         <div class="flex items-center justify-between gap-3 border-b border-slate-800 pb-5">
           <div>
             <p class="text-sm uppercase tracking-[0.25em] text-sky-300">Cognis</p>
             <p class="mt-1 text-sm text-slate-400">{$auth.user?.email}</p>
           </div>
-          <Button aria-label="Close navigation" size="sm" variant="secondary" onclick={() => (mobileNavOpen = false)}>
+          <Button aria-label="Close navigation" size="sm" variant="secondary" onclick={closeMobileNav}>
             <X class="h-4 w-4" />
           </Button>
         </div>
@@ -396,7 +411,7 @@
             <a
               class={`flex items-center gap-3 rounded-2xl px-4 py-3 text-sm transition ${$page.url.pathname.startsWith(item.href) ? 'bg-sky-500/20 text-white' : 'text-slate-300 hover:bg-slate-900 hover:text-white'}`}
               href={item.href}
-              onclick={() => (mobileNavOpen = false)}
+              onclick={closeMobileNav}
             >
               <svelte:component this={item.icon} class="h-4 w-4" />
               <span>{item.label}</span>
@@ -406,7 +421,7 @@
 
         <div class="mt-auto space-y-3 border-t border-slate-800 pt-5">
           {#if $auth.user?.role === 'admin'}
-            <Button class="w-full justify-center" variant="secondary" onclick={() => { mobileNavOpen = false; void goto('/getting-started'); }}>Getting started</Button>
+            <Button class="w-full justify-center" variant="secondary" onclick={() => { closeMobileNav(); void goto('/getting-started'); }}>Getting started</Button>
           {/if}
           <Button class="w-full justify-center" variant="secondary" onclick={handleLogout}>Sign out</Button>
         </div>
@@ -414,3 +429,20 @@
     </div>
   {/if}
 {/if}
+
+<style>
+  .animate-slide-in-right {
+    animation: slide-in-right 220ms ease-out;
+  }
+
+  @keyframes slide-in-right {
+    from {
+      opacity: 0;
+      transform: translateX(1.5rem);
+    }
+    to {
+      opacity: 1;
+      transform: translateX(0);
+    }
+  }
+</style>

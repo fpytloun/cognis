@@ -2,7 +2,7 @@
   import { goto } from '$app/navigation';
   import { page } from '$app/state';
   import { onMount } from 'svelte';
-  import { fade, fly } from 'svelte/transition';
+  import { fade } from 'svelte/transition';
   import { ArrowDown, ArrowLeft, Check, ChevronDown, ChevronUp, ChevronsLeft, ChevronsRight, Copy, Info, Paperclip, Search, X } from 'lucide-svelte';
 
   import AgentAvatar from '$lib/components/AgentAvatar.svelte';
@@ -34,7 +34,9 @@
   import type { Agent, AttachmentRef, ContextUsage, Conversation, Escalation, MessageEvent, Session } from '$lib/types/api';
   import { wsClient } from '$lib/ws/client';
 
-  let loading = $state(true);
+  let initializing = $state(true);
+  let switchingConversation = $state(false);
+  let initialConversationResolved = $state(false);
   let error = $state('');
   let historyError = $state('');
   let sessionsError = $state('');
@@ -531,20 +533,25 @@
 
   async function openConversation(conversationId: string): Promise<void> {
     if (!conversationId) {
-      loading = false;
+      initializing = false;
+      switchingConversation = false;
+      initialConversationResolved = true;
       return;
     }
 
     if (conversationId === activeConversationId && currentConversation) {
-      loading = false;
+      initializing = false;
+      switchingConversation = false;
+      initialConversationResolved = true;
       return;
     }
 
     const requestId = beginConversationLoad();
     const previousConversationId = activeConversationId;
+    const isInitialLoad = !initialConversationResolved && !currentConversation;
 
     showAgentProfile = false;
-    loading = true;
+    switchingConversation = !isInitialLoad;
     error = '';
     historyError = '';
     sessionsError = '';
@@ -604,23 +611,27 @@
       sessionIds.clear();
     } finally {
       if (!isStaleConversationLoad(requestId)) {
-        loading = false;
+        initializing = false;
+        switchingConversation = false;
+        initialConversationResolved = true;
       }
     }
   }
 
   async function initialize(): Promise<void> {
-    loading = true;
+    initializing = true;
     error = '';
 
     try {
       await refreshSidebarData();
       if (!conversationIdFromRoute()) {
-        loading = false;
+        initializing = false;
+        initialConversationResolved = true;
       }
     } catch (caughtError) {
       error = asApiError(caughtError).message;
-      loading = false;
+      initializing = false;
+      initialConversationResolved = true;
     }
 
     if (notificationsSupported() && !notificationsGranted() && !hasAskedPermission()) {
@@ -1168,7 +1179,8 @@
     if (page.params.conversationId && page.params.conversationId !== activeConversationId) {
       void openConversation(page.params.conversationId);
     } else if (!page.params.conversationId) {
-      loading = false;
+      initializing = false;
+      initialConversationResolved = true;
     }
   });
 
@@ -1248,7 +1260,7 @@
   <title>{currentConversation ? `${conversationTitle(currentConversation)} · Chat · Cognis` : 'Chat · Cognis'}</title>
 </svelte:head>
 
-{#if loading}
+{#if initializing}
   <LoadingState label="Loading conversation" description="Fetching history, restoring workflow prompts, and preparing the live stream." />
 {:else}
   <div class={`relative flex h-full min-h-0 flex-col gap-3 overflow-hidden ${chatSidebarCollapsed ? '' : 'xl:grid xl:grid-cols-[320px_minmax(0,1fr)] xl:gap-4'}`}>
@@ -1266,9 +1278,8 @@
     <aside
       aria-label="Conversation list"
       aria-modal={mobileListOpen ? 'true' : undefined}
-      class={`${chatSidebarCollapsed ? 'hidden' : 'flex'} fixed inset-y-3 left-3 z-40 w-[min(22rem,calc(100vw-1.5rem))] min-h-0 flex-col rounded-[1.75rem] border border-slate-800/80 bg-slate-900/95 shadow-card backdrop-blur transition-transform duration-200 ease-out xl:static xl:z-auto xl:w-auto xl:translate-x-0 xl:rounded-3xl xl:bg-slate-900/70 ${mobileListOpen || !currentConversation ? 'translate-x-0' : '-translate-x-[120%] pointer-events-none xl:pointer-events-auto'}`}
+      class={`fixed inset-y-3 left-3 z-40 flex w-[min(22rem,calc(100vw-1.5rem))] min-h-0 flex-col rounded-[1.75rem] border border-slate-800/80 bg-slate-900/95 shadow-card backdrop-blur transition-transform duration-200 ease-out xl:static xl:z-auto xl:w-auto xl:translate-x-0 xl:rounded-3xl xl:bg-slate-900/70 ${chatSidebarCollapsed ? 'xl:hidden' : 'xl:flex'} ${mobileListOpen || !currentConversation ? 'translate-x-0' : '-translate-x-[120%] pointer-events-none xl:pointer-events-auto'}`}
       role={mobileListOpen ? 'dialog' : undefined}
-      transition:fly={{ x: -280, duration: 220, opacity: 1 }}
     >
       <!-- Static top: filters -->
       <div class="shrink-0 space-y-3 p-4 pb-2 sm:p-4">
@@ -1414,6 +1425,9 @@
       ondragover={handleDragOver}
       ondrop={(event) => void handleDrop(event)}
     >
+      {#if switchingConversation}
+        <div class="pointer-events-none absolute inset-0 z-20 bg-slate-950/35 backdrop-blur-[1px]"></div>
+      {/if}
       {#if showDropZone}
         <div class="pointer-events-none absolute inset-0 z-50 flex items-center justify-center rounded-3xl border-2 border-dashed border-sky-400 bg-sky-500/10 backdrop-blur-sm">
           <div class="rounded-2xl bg-slate-900/90 px-6 py-4 text-center">
