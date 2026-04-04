@@ -18,6 +18,7 @@ from prometheus_client import Counter, Gauge, Histogram
 
 from cognis.logging import get_logger
 from cognis.models.channel import (
+    AgentProfile,
     ChannelAccountConfig,
     ChannelAccountStatus,
     ChannelCapabilities,
@@ -131,6 +132,10 @@ class ChannelAdapter(Protocol):
 
     async def health(self) -> ProviderHealth:
         """Return health status for monitoring."""
+        ...
+
+    async def sync_profile(self, profile: AgentProfile) -> None:
+        """Sync agent identity (name, avatar) to the platform."""
         ...
 
     async def download_attachment(
@@ -254,6 +259,9 @@ class BaseChannelAdapter(ABC):
 
     async def mark_read(self, chat_id: str, message_id: str) -> None:  # noqa: B027
         """Default no-op. Override in adapters that support read receipts."""
+
+    async def sync_profile(self, profile: AgentProfile) -> None:  # noqa: B027
+        """Default no-op. Override in adapters that support profile sync."""
 
     async def verify_webhook(
         self,

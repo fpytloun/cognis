@@ -17,6 +17,7 @@ from cognis.channels.protocol import BaseChannelAdapter
 from cognis.channels.registry import SLACK_META
 from cognis.logging import get_logger
 from cognis.models.channel import (
+    AgentProfile,
     ChannelCapabilities,
     InboundMessage,
     MediaAttachment,
@@ -40,6 +41,8 @@ class SlackAdapter(BaseChannelAdapter):
         self._signing_secret = ""
         self._bot_user_id = ""
         self._use_socket_mode = True
+        self._agent_name: str | None = None
+        self._agent_avatar_url: str | None = None
 
     async def _connect(self) -> None:
         self._bot_token = self._credentials.get("bot_token", "")
@@ -128,6 +131,10 @@ class SlackAdapter(BaseChannelAdapter):
         if self._client is None:
             return None
         payload: dict[str, Any] = {"channel": message.chat_id, "text": message.content}
+        if self._agent_name:
+            payload["username"] = self._agent_name
+        if self._agent_avatar_url:
+            payload["icon_url"] = self._agent_avatar_url
         if message.thread_id:
             payload["thread_ts"] = message.thread_id
         if message.reply_to_id:
@@ -142,6 +149,14 @@ class SlackAdapter(BaseChannelAdapter):
             )
             return None
         return data.get("ts")
+
+    async def sync_profile(self, profile: AgentProfile) -> None:
+        self._agent_name = profile.effective_name
+        self._agent_avatar_url = profile.avatar_url
+        logger.info(
+            "slack adapter: agent profile synced (per-message identity)",
+            extra={"extra_data": {"account_id": self.account_id, "name": self._agent_name}},
+        )
 
     async def send_typing(self, chat_id: str) -> None:
         return None

@@ -200,6 +200,20 @@ class OutboundMessage(BaseModel):
     platform_data: dict[str, Any] = Field(default_factory=dict)
 
 
+class AgentProfile(BaseModel):
+    """Resolved agent identity for channel adapters."""
+
+    name: str
+    display_name: str | None = None
+    avatar_url: str | None = None
+    avatar_bytes: bytes | None = None
+    avatar_content_type: str | None = None
+
+    @property
+    def effective_name(self) -> str:
+        return self.display_name or self.name
+
+
 class PairingRequest(BaseModel):
     """A pending or completed external-channel pairing challenge."""
 

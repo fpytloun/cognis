@@ -8,7 +8,9 @@ session when Discord allows it.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
+import hashlib
 import json
 import platform
 import random
@@ -22,6 +24,7 @@ from cognis.channels.protocol import BaseChannelAdapter
 from cognis.channels.registry import DISCORD_META
 from cognis.logging import get_logger
 from cognis.models.channel import (
+    AgentProfile,
     ChannelCapabilities,
     InboundMessage,
     MediaAttachment,
@@ -63,6 +66,8 @@ class DiscordAdapter(BaseChannelAdapter):
         self._resume_url: str | None = None
         self._sequence: int | None = None
         self._decompressor = zlib.decompressobj()
+        self._last_synced_name: str | None = None
+        self._last_synced_avatar_hash: str | None = None
 
     async def _connect(self) -> None:
         self._bot_token = self._credentials.get("bot_token", "")
@@ -201,6 +206,41 @@ class DiscordAdapter(BaseChannelAdapter):
         resp = await self._rest_client.post(f"/channels/{message.chat_id}/messages", json=payload)
         resp.raise_for_status()
         return resp.json().get("id")
+
+    async def sync_profile(self, profile: AgentProfile) -> None:
+        if self._rest_client is None:
+            return
+        name_changed = profile.effective_name and profile.effective_name != self._last_synced_name
+        avatar_hash = (
+            hashlib.md5(profile.avatar_bytes).hexdigest() if profile.avatar_bytes else None
+        )  # noqa: S324
+        avatar_changed = avatar_hash is not None and avatar_hash != self._last_synced_avatar_hash
+
+        if not name_changed and not avatar_changed:
+            return
+
+        payload: dict[str, Any] = {}
+        if name_changed:
+            payload["global_name"] = profile.effective_name
+        if avatar_changed and profile.avatar_bytes and profile.avatar_content_type:
+            encoded = base64.b64encode(profile.avatar_bytes).decode("ascii")
+            payload["avatar"] = f"data:{profile.avatar_content_type};base64,{encoded}"
+        if payload:
+            try:
+                await self._rest_client.patch("/users/@me", json=payload)
+                self._last_synced_name = profile.effective_name
+                if avatar_hash:
+                    self._last_synced_avatar_hash = avatar_hash
+                logger.info(
+                    "discord adapter: agent profile synced",
+                    extra={"extra_data": {"account_id": self.account_id}},
+                )
+            except Exception:
+                logger.warning(
+                    "discord adapter: profile sync failed",
+                    extra={"extra_data": {"account_id": self.account_id}},
+                    exc_info=True,
+                )
 
     async def send_typing(self, chat_id: str) -> None:
         if self._rest_client is None:

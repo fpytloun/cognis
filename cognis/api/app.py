@@ -428,6 +428,7 @@ def create_app() -> FastAPI:
             inbound_pipeline=inbound_pipeline,
             secrets_provider=providers.secrets,
             artifact_store=artifact_store,
+            event_bus=event_bus,
             ws_provider=providers.executor.ws_provider
             if hasattr(providers.executor, "ws_provider")
             else None,

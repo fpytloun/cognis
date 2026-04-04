@@ -224,15 +224,31 @@ async def update_agent_route(
         if row is None:
             raise api_exception(404, "not_found", "Agent not found")
         require_owner_or_admin(request, row.owner_email)
+        updates = payload.model_dump(exclude_unset=True)
+        profile_fields = {"name", "display_name", "avatar_image_id"}
+        profile_changed = bool(profile_fields & updates.keys())
         ok = await update_agent(
             session,
             agent_id,
-            updates=payload.model_dump(exclude_none=True),
+            updates=updates,
         )
         if not ok:
             raise api_exception(400, "validation_error", "Agent update failed")
         await session.commit()
         await session.refresh(row)
+
+    if profile_changed:
+        from cognis.core.events import Event, EventType
+
+        event_bus = getattr(request.app.state, "event_bus", None)
+        if event_bus is not None:
+            await event_bus.publish(
+                Event(
+                    type=EventType.AGENT_PROFILE_UPDATED,
+                    data={"agent_id": agent_id},
+                )
+            )
+
     return agent_to_response(row)
 
 

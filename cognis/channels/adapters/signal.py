@@ -12,6 +12,7 @@ Required credentials:
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import json
 from datetime import UTC, datetime
@@ -24,6 +25,7 @@ from cognis.channels.protocol import BaseChannelAdapter
 from cognis.channels.registry import SIGNAL_META
 from cognis.logging import get_logger
 from cognis.models.channel import (
+    AgentProfile,
     ChannelCapabilities,
     InboundMessage,
     MediaAttachment,
@@ -126,6 +128,28 @@ class SignalAdapter(BaseChannelAdapter):
         resp.raise_for_status()
         result = resp.json()
         return result.get("timestamp")
+
+    async def sync_profile(self, profile: AgentProfile) -> None:
+        if self._client is None:
+            return
+        try:
+            payload: dict[str, Any] = {"name": profile.effective_name}
+            if profile.avatar_bytes:
+                payload["avatar"] = base64.b64encode(profile.avatar_bytes).decode("ascii")
+            await self._client.put(
+                f"/v1/profiles/{self._account_number}",
+                json=payload,
+            )
+            logger.info(
+                "signal adapter: agent profile synced",
+                extra={"extra_data": {"account_id": self.account_id}},
+            )
+        except Exception:
+            logger.warning(
+                "signal adapter: profile sync failed",
+                extra={"extra_data": {"account_id": self.account_id}},
+                exc_info=True,
+            )
 
     async def send_typing(self, chat_id: str) -> None:
         """Send typing indicator."""

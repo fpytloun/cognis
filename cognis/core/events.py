@@ -71,6 +71,9 @@ class EventType(StrEnum):
     TURN_COMPLETED = "turn_completed"
     TURN_ERROR = "turn_error"
 
+    # Agent lifecycle
+    AGENT_PROFILE_UPDATED = "agent_profile_updated"
+
     # Unified notifications
     NOTIFICATION_CREATED = "notification_created"
     NOTIFICATION_RESOLVED = "notification_resolved"

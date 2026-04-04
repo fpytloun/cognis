@@ -58,7 +58,8 @@
       steps: [
         'Create an application in the Discord Developer Portal and add a bot user.',
         'Enable Message Content Intent so Cognis can read messages.',
-        'Invite the bot to your server with bot permissions and paste the token below.'
+        'Invite the bot to your server with bot permissions and paste the token below.',
+        'Each Discord bot token should be used by one Cognis agent. The agent profile is synced to the bot globally.'
       ]
     },
     slack: {
@@ -68,6 +69,7 @@
       steps: [
         'Create a Slack app and enable Socket Mode for the simplest setup.',
         'Generate an App-Level Token (xapp-...) and a Bot Token (xoxb-...).',
+        'Add the chat:write.customize scope so the bot can display the agent name and avatar on messages.',
         'Subscribe to message events and install the app into your workspace.'
       ]
     },

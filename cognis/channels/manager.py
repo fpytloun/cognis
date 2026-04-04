@@ -19,8 +19,10 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from cognis.channels.inbound import InboundPipeline
 from cognis.channels.protocol import BaseChannelAdapter, InboundCallback
 from cognis.channels.registry import get_channel_meta
+from cognis.core.events import Event, EventBus, EventType
 from cognis.logging import get_logger
 from cognis.models.channel import (
+    AgentProfile,
     ChannelAccountConfig,
     ChannelAccountStatus,
     ChannelStatus,
@@ -52,18 +54,25 @@ class ChannelManager:
         inbound_pipeline: InboundPipeline,
         secrets_provider: Any,
         artifact_store: Any,
+        event_bus: EventBus,
         ws_provider: Any | None = None,  # WebSocketExecutorProvider (for executor-hosted channels)
     ) -> None:
         self._session_factory = session_factory
         self._inbound_pipeline = inbound_pipeline
         self._secrets_provider = secrets_provider
         self._artifact_store = artifact_store
+        self._event_bus = event_bus
         self._ws_provider = ws_provider
 
         # account_id → adapter instance (local BaseChannelAdapter or RemoteChannelAdapterProxy)
         self._adapters: dict[str, Any] = {}
         # account_id → config
         self._configs: dict[str, ChannelAccountConfig] = {}
+        # account_id → cached AgentProfile
+        self._agent_profiles: dict[str, AgentProfile] = {}
+
+        # Subscribe to agent profile updates
+        event_bus.subscribe(EventType.AGENT_PROFILE_UPDATED, self._handle_agent_profile_updated)
 
     # ------------------------------------------------------------------
     # Startup / shutdown
@@ -133,6 +142,19 @@ class ChannelManager:
         self._adapters[config.account_id] = adapter
         self._configs[config.account_id] = config
 
+        # Sync agent profile to the platform (best-effort)
+        try:
+            profile = await self._resolve_agent_profile(config.agent_id)
+            if profile is not None:
+                self._agent_profiles[config.account_id] = profile
+                await adapter.sync_profile(profile)
+        except Exception:
+            logger.warning(
+                "channel manager: agent profile sync failed on start",
+                extra={"extra_data": {"account_id": config.account_id}},
+                exc_info=True,
+            )
+
         logger.info(
             "channel manager: account started",
             extra={
@@ -148,6 +170,7 @@ class ChannelManager:
         """Stop a single channel account."""
         adapter = self._adapters.pop(account_id, None)
         config = self._configs.pop(account_id, None)
+        self._agent_profiles.pop(account_id, None)
         if adapter is not None:
             await adapter.stop()
             # Unregister channel callbacks if this was an executor-hosted adapter
@@ -406,6 +429,100 @@ class ChannelManager:
                         }
                     },
                 )
+
+    # ------------------------------------------------------------------
+    # Agent profile resolution and sync
+    # ------------------------------------------------------------------
+
+    async def _resolve_agent_profile(self, agent_id: str) -> AgentProfile | None:
+        """Load an agent definition and resolve its profile for channel use."""
+        from cognis.store.queries import get_agent
+
+        async with self._session_factory() as session:
+            row = await get_agent(session, agent_id)
+        if row is None:
+            return None
+
+        name = row.name
+        display_name = getattr(row, "display_name", None)
+        avatar_url: str | None = None
+        avatar_bytes: bytes | None = None
+        avatar_content_type: str | None = None
+
+        avatar_image_id = getattr(row, "avatar_image_id", None)
+        if avatar_image_id and self._artifact_store:
+            try:
+                avatar_url = await self._artifact_store.async_get_signed_url(
+                    "avatars",
+                    avatar_image_id,
+                    "avatar",
+                    ttl_seconds=6 * 3600,
+                )
+                content, ct = await self._artifact_store.async_load(
+                    "avatars",
+                    avatar_image_id,
+                    "avatar",
+                )
+                avatar_bytes = content
+                avatar_content_type = ct
+            except Exception:
+                logger.debug(
+                    "channel manager: avatar resolution failed",
+                    extra={"extra_data": {"agent_id": agent_id}},
+                    exc_info=True,
+                )
+
+        return AgentProfile(
+            name=name,
+            display_name=display_name,
+            avatar_url=avatar_url,
+            avatar_bytes=avatar_bytes,
+            avatar_content_type=avatar_content_type,
+        )
+
+    async def _handle_agent_profile_updated(self, event: Event) -> None:
+        """Re-sync profile on all active adapters bound to the updated agent."""
+        agent_id = event.data.get("agent_id")
+        if not isinstance(agent_id, str):
+            return
+
+        profile = await self._resolve_agent_profile(agent_id)
+        if profile is None:
+            return
+
+        for account_id, config in self._configs.items():
+            if config.agent_id != agent_id:
+                continue
+            adapter = self._adapters.get(account_id)
+            if adapter is None:
+                continue
+            try:
+                self._agent_profiles[account_id] = profile
+                await adapter.sync_profile(profile)
+                logger.info(
+                    "channel manager: agent profile re-synced",
+                    extra={
+                        "extra_data": {
+                            "account_id": account_id,
+                            "agent_id": agent_id,
+                        }
+                    },
+                )
+            except Exception:
+                logger.warning(
+                    "channel manager: agent profile re-sync failed",
+                    extra={
+                        "extra_data": {
+                            "account_id": account_id,
+                            "agent_id": agent_id,
+                        }
+                    },
+                    exc_info=True,
+                )
+
+    def get_agent_profile(self, account_id: str) -> AgentProfile | None:
+        """Return the cached agent profile for an account."""
+        return self._agent_profiles.get(account_id)
 
     async def stop_executor_channels(self, executor_id: str) -> None:
         """Stop all channel accounts hosted on a disconnected executor.

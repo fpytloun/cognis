@@ -20,6 +20,7 @@ from cognis.channels.protocol import BaseChannelAdapter
 from cognis.channels.registry import IRC_META
 from cognis.logging import get_logger
 from cognis.models.channel import (
+    AgentProfile,
     ChannelCapabilities,
     InboundMessage,
     OutboundMessage,
@@ -117,6 +118,28 @@ class IRCAdapter(BaseChannelAdapter):
                 continue
 
             await self._handle_line(line)
+
+    async def sync_profile(self, profile: AgentProfile) -> None:
+        import re
+
+        raw = (profile.effective_name or "")[:9]
+        sanitized = re.sub(r"[^A-Za-z0-9\-\[\]\\^{|}~]", "", raw)
+        if sanitized and sanitized[0].isdigit():
+            sanitized = f"_{sanitized}"[:9]
+        if not sanitized:
+            return
+        if sanitized != raw:
+            logger.warning(
+                "irc adapter: nickname sanitized",
+                extra={"extra_data": {"original": raw, "sanitized": sanitized}},
+            )
+        if sanitized != self._nickname and self._writer is not None:
+            self._send_raw(f"NICK {sanitized}")
+            self._nickname = sanitized
+            logger.info(
+                "irc adapter: nickname synced",
+                extra={"extra_data": {"account_id": self.account_id, "nickname": sanitized}},
+            )
 
     async def send_message(self, message: OutboundMessage) -> str | None:
         """Send a message to an IRC channel or user."""

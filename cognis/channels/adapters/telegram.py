@@ -22,6 +22,7 @@ from cognis.channels.protocol import BaseChannelAdapter
 from cognis.channels.registry import TELEGRAM_META
 from cognis.logging import get_logger
 from cognis.models.channel import (
+    AgentProfile,
     ChannelCapabilities,
     InboundMessage,
     MediaAttachment,
@@ -138,6 +139,22 @@ class TelegramAdapter(BaseChannelAdapter):
                 extra={"extra_data": {"account_id": self.account_id}},
             )
             return None
+
+    async def sync_profile(self, profile: AgentProfile) -> None:
+        if self._client is None:
+            return
+        try:
+            await self._client.post("/setMyName", json={"name": profile.effective_name})
+            logger.info(
+                "telegram adapter: agent name synced",
+                extra={"extra_data": {"account_id": self.account_id}},
+            )
+        except Exception:
+            logger.warning(
+                "telegram adapter: name sync failed",
+                extra={"extra_data": {"account_id": self.account_id}},
+                exc_info=True,
+            )
 
     async def send_typing(self, chat_id: str) -> None:
         """Send typing indicator."""
