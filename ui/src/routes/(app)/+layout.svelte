@@ -58,8 +58,10 @@
 
   function openMobileNav(): void {
     mobileNavPreviouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    mobileNavOpen = true;
-    document.body.style.overflow = 'hidden';
+    requestAnimationFrame(() => {
+      mobileNavOpen = true;
+      document.body.style.overflow = 'hidden';
+    });
   }
 
   function closeMobileNav(): void {
@@ -395,9 +397,9 @@
   </div>
 
   {#if mobileNavOpen}
-    <div class="fixed inset-0 z-[70] md:hidden" role="presentation">
-      <button class="absolute inset-0 bg-slate-950/80 backdrop-blur" onclick={closeMobileNav} type="button" aria-label="Close navigation" transition:fade={{ duration: 180 }}></button>
-      <div class="ml-auto flex h-full w-[min(22rem,100vw)] animate-slide-in-right flex-col border-l border-slate-800 bg-slate-950 px-5 py-5 shadow-card">
+    <div class="fixed inset-0 z-[70] isolate flex justify-end md:hidden" role="presentation">
+      <button class="absolute inset-0 z-0 bg-slate-950/75" onclick={closeMobileNav} type="button" aria-label="Close navigation" transition:fade={{ duration: 180 }}></button>
+      <aside class="relative z-10 flex h-full w-[min(22rem,100vw)] flex-col border-l border-slate-800 bg-slate-950 px-5 py-5 shadow-card" aria-label="Navigation menu">
         <div class="flex items-center justify-between gap-3 border-b border-slate-800 pb-5">
           <div>
             <p class="text-sm uppercase tracking-[0.25em] text-sky-300">Cognis</p>
@@ -427,24 +429,7 @@
           {/if}
           <Button class="w-full justify-center" variant="secondary" onclick={handleLogout}>Sign out</Button>
         </div>
-      </div>
+      </aside>
     </div>
   {/if}
 {/if}
-
-<style>
-  .animate-slide-in-right {
-    animation: slide-in-right 220ms ease-out;
-  }
-
-  @keyframes slide-in-right {
-    from {
-      opacity: 0;
-      transform: translateX(1.5rem);
-    }
-    to {
-      opacity: 1;
-      transform: translateX(0);
-    }
-  }
-</style>

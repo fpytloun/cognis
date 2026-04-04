@@ -128,11 +128,6 @@ GET /api/v1/conversations/conv_abc/messages?limit=50&after_seq=100
 
 The controller reads from Intaris event store and formats for the client.
 
-If the Cognis conversation/session exists but Intaris has not created an event
-stream yet, the history endpoints return `200 OK` with an empty `items` list
-instead of failing with `500`. This lets new or partially initialized sessions
-degrade safely in the UI.
-
 ### Channels
 
 ```
@@ -238,10 +233,6 @@ GET    /api/v1/sessions/:id/events            → Events (proxied from Intaris)
 POST   /api/v1/sessions/:id/cancel            → Cancel
 ```
 
-`GET /api/v1/sessions/:id/events` and
-`GET /api/v1/conversations/:id/sessions/:sid/events` follow the same degraded
-behavior as conversation history: if the owned session exists locally but the
-Intaris event stream is still missing, they return an empty `items` list.
 
 ### Tools
 

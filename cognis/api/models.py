@@ -583,6 +583,48 @@ class ToolResponse(BaseModel):
     non_bypassable: bool = False
 
 
+class EffectiveToolItemResponse(BaseModel):
+    tool_id: str
+    name: str
+    description: str
+    category: str = "general"
+    read_only: bool = False
+    source: dict[str, Any] = Field(default_factory=dict)
+    permission: str = "evaluate"
+    enabled: bool = True
+    disabled_reason: str | None = None
+    timeout_seconds: int = 30
+    non_bypassable: bool = False
+
+
+class EffectiveToolsStateResponse(BaseModel):
+    tools: list[EffectiveToolItemResponse] = Field(default_factory=list)
+    connected: bool = False
+    observed_at: datetime | None = None
+    stale_after: datetime | None = None
+
+
+class EffectiveToolsExecutorResponse(BaseModel):
+    executor_id: str | None = None
+    executor_type: str | None = None
+    selection_source: str = "unresolved"
+
+
+class EffectiveToolsResponse(BaseModel):
+    executor: EffectiveToolsExecutorResponse
+    configured_state: EffectiveToolsStateResponse
+    live_state: EffectiveToolsStateResponse
+    warnings: list[str] = Field(default_factory=list)
+
+
+class EffectiveToolsPreviewRequest(BaseModel):
+    tools: dict[str, Any] = Field(default_factory=dict)
+    permissions: dict[str, Any] = Field(default_factory=dict)
+    execution: dict[str, Any] = Field(default_factory=dict)
+    skills: dict[str, Any] = Field(default_factory=dict)
+    agent_id: str | None = None
+
+
 class MCPServerResponse(BaseModel):
     name: str
     type: str
