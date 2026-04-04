@@ -300,6 +300,20 @@ async def _resolve_effective_tools_response(
         else:
             warnings.append("Executor has assigned MCP servers but no observed manifest yet.")
 
+    # Resolve Intaris MCP tools assigned to this agent
+    from cognis.api.runtime_support import _resolve_intaris_mcp_tools
+
+    disabled_categories = set(
+        (agent.tools or {}).get("disabled_categories", []) if isinstance(agent.tools, dict) else []
+    )
+    disabled_tools_set = set(
+        (agent.tools or {}).get("disabled_tools", []) if isinstance(agent.tools, dict) else []
+    )
+    intaris_tools = await _resolve_intaris_mcp_tools(
+        request.app.state.providers, agent, disabled_categories, disabled_tools_set
+    )
+    configured_tools.extend(intaris_tools)
+
     configured_items = [
         EffectiveToolItemResponse(
             tool_id=_tool_identifier(tool),

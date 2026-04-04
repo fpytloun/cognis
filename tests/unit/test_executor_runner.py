@@ -50,8 +50,13 @@ async def test_handle_configure_filters_tools() -> None:
     )
 
     assert runner._configured is True
-    assert set(runner._tool_handlers) == {"read", "glob"}
-    assert ws.sent[-1]["result"]["capabilities"]["tools"] == ["read", "glob"]
+    # Native tools filtered to read + glob; web tools (web_fetch, web_search)
+    # are always added from the default "direct" backend.
+    assert {"read", "glob"}.issubset(set(runner._tool_handlers))
+    assert "bash" not in runner._tool_handlers  # not in enabled_tools
+    caps_tools = ws.sent[-1]["result"]["capabilities"]["tools"]
+    assert "read" in caps_tools
+    assert "glob" in caps_tools
 
 
 @pytest.mark.asyncio

@@ -100,6 +100,14 @@ async def handle_executor_websocket(
     try:
         desired_version = row.desired_config_version + 1
         mcp_servers, scoped_secrets = await _resolve_executor_mcp_payload(row, providers)
+
+        # Resolve web backend config so the executor can register web tools
+        from cognis.api.runtime_support import _resolve_web_config
+
+        web_config = await _resolve_web_config(providers, row.owner_email)
+        # Merge web API keys into scoped_secrets so the executor has them
+        scoped_secrets.update(web_config.get("web_secrets", {}))
+
         async with session_factory() as session:
             await update_executor_runtime_state(
                 session,
@@ -117,6 +125,10 @@ async def handle_executor_websocket(
                 "config": row.config or {},
                 "mcp_servers": [server.model_dump(mode="json") for server in mcp_servers],
                 "secrets": scoped_secrets,
+                "web_config": {
+                    "web_backend": web_config.get("web_backend", "direct"),
+                    "web_available_backends": web_config.get("web_available_backends", ["direct"]),
+                },
             },
             timeout=30.0,
         )

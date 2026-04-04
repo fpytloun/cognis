@@ -278,8 +278,11 @@ def build_step_runtime_factory(
             return registry, connection, cleanup
 
         if resolved_type in ("websocket", "subprocess"):
-            # Remote executor — get tools from the executor itself.
-            # The executor manages its own tool handlers and MCP servers.
+            # Remote executor — merge executor-advertised tools with
+            # controller-side builtin tools (memory, orchestration, etc.)
+            # and Intaris MCP tools.  Executor-native and web tools come
+            # from the executor; everything else is handled locally by
+            # the controller's ToolRouter.
             from cognis.providers.executor.websocket import WebSocketExecutorProvider
 
             ws_provider: WebSocketExecutorProvider = providers.executor.websocket
@@ -297,8 +300,11 @@ def build_step_runtime_factory(
                         if isinstance(agent.tools, dict)
                         else set()
                     )
+
+                    # 1. Executor-advertised tools (native + MCP + web)
                     remote_tools = await conn.list_tools()
                     remote_registry = ToolRegistry()
+                    remote_tool_names: set[str] = set()
                     for tool_data in remote_tools:
                         tool_def = ToolDefinition.model_validate(tool_data)
                         if (
@@ -308,6 +314,53 @@ def build_step_runtime_factory(
                         ):
                             continue
                         remote_registry.register(RegisteredTool(definition=tool_def))
+                        remote_tool_names.add(tool_def.name)
+
+                    # 2. Controller-side builtin tools (memory, orchestration,
+                    #    system, image, workflow, tool_output) — these are
+                    #    handled by the controller's ToolRouter, not the executor.
+                    for tool in agent_tools:
+                        if tool.source.type != "builtin":
+                            continue
+                        if tool.name in remote_tool_names:
+                            continue
+                        if (
+                            tool.category in disabled_categories
+                            or tool.name in disabled_tools
+                            or stable_tool_id(tool) in disabled_tools
+                        ):
+                            continue
+                        remote_registry.register(RegisteredTool(definition=tool))
+
+                    # 3. Intaris MCP tools assigned to this agent
+                    intaris_tools = await _resolve_intaris_mcp_tools(
+                        providers, agent, disabled_categories, disabled_tools
+                    )
+                    for tool in intaris_tools:
+                        if tool.name not in remote_tool_names:
+                            remote_registry.register(RegisteredTool(definition=tool))
+
+                    # Diagnostics
+                    all_tools = remote_registry.list_tools()
+                    categories = {t.category for t in all_tools}
+                    sources = {t.source.type for t in all_tools}
+                    logger.info(
+                        "Remote executor tool registry assembled",
+                        extra={
+                            "extra_data": {
+                                "executor_id": executor_id,
+                                "total_tools": len(all_tools),
+                                "categories": sorted(categories),
+                                "sources": sorted(sources),
+                                "remote_executor_tools": len(remote_tool_names),
+                                "builtin_tools": sum(
+                                    1 for t in all_tools if t.source.type == "builtin"
+                                ),
+                                "intaris_mcp_tools": len(intaris_tools),
+                            }
+                        },
+                    )
+
                     return remote_registry, conn, noop_cleanup
                 except Exception:
                     logger.warning(
@@ -502,3 +555,69 @@ def _parse_local_mcp_servers(agent: AgentDefinition) -> list[MCPServerConfig]:
             continue
         servers.append(MCPServerConfig.model_validate(item))
     return servers
+
+
+async def _resolve_intaris_mcp_tools(
+    providers: Any,
+    agent: AgentDefinition,
+    disabled_categories: set[str],
+    disabled_tools: set[str],
+) -> list[ToolDefinition]:
+    """Resolve Intaris MCP tools assigned to an agent.
+
+    Queries the Intaris guardrails provider for the aggregated tool list
+    from MCP servers named in ``agent.tools.intaris_mcp_servers``, then
+    converts them to ``ToolDefinition`` objects.
+    """
+    if not isinstance(agent.tools, dict):
+        return []
+    server_names = agent.tools.get("intaris_mcp_servers", [])
+    if not isinstance(server_names, list) or not server_names:
+        return []
+
+    allowed_names = set(server_names)
+    guardrails = getattr(providers, "guardrails", None)
+    if guardrails is None:
+        return []
+
+    try:
+        all_servers = await guardrails.list_mcp_servers(enabled_only=True)
+    except Exception:
+        logger.warning("Failed to list Intaris MCP servers", exc_info=True)
+        return []
+
+    tools: list[ToolDefinition] = []
+    for server in all_servers:
+        if not isinstance(server, dict):
+            continue
+        name = server.get("name", "")
+        if name not in allowed_names:
+            continue
+        tools_cache = server.get("tools_cache") or []
+        if not isinstance(tools_cache, list):
+            continue
+        for raw_tool in tools_cache:
+            if not isinstance(raw_tool, dict):
+                continue
+            tool_name = f"{name}/{raw_tool.get('name', '')}"
+            if "mcp" in disabled_categories or tool_name in disabled_tools:
+                continue
+            from cognis.models.tool import ToolSource
+
+            tools.append(
+                ToolDefinition(
+                    name=tool_name,
+                    description=str(raw_tool.get("description", f"Intaris MCP tool {tool_name}")),
+                    parameters=raw_tool.get("inputSchema") or raw_tool.get("parameters") or {},
+                    source=ToolSource(type="intaris_mcp", server_name=name),
+                    category="mcp",
+                    timeout_seconds=30,
+                )
+            )
+
+    if tools:
+        logger.debug(
+            "Resolved Intaris MCP tools",
+            extra={"extra_data": {"count": len(tools), "servers": list(allowed_names)}},
+        )
+    return tools

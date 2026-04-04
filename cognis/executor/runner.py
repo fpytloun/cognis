@@ -44,6 +44,7 @@ class ExecutorRunner:
         self._mcp_clients: dict[str, StdioMCPClient] = {}
         self._inference_handler: Any | None = None
         self._channel_handler: Any | None = None
+        self._runtime_metadata: dict[str, Any] = {}
         self._started_at = perf_counter()
 
     async def run(self) -> None:
@@ -192,12 +193,28 @@ class ExecutorRunner:
             enabled_tools,
             enabled_tool_groups,
         )
-        self._configured_tool_definitions = [*native_defs, *discovered_tools]
+
+        # Generate dynamic web tool definitions from controller-provided config
+        web_config_raw = params.get("web_config") or {}
+        web_backends = web_config_raw.get("web_available_backends", ["direct"])
+        from cognis.tools.executor.web.definitions import web_tool_definitions
+
+        web_defs = web_tool_definitions(web_backends)
+        # Store web runtime metadata for handler context
+        self._runtime_metadata = {
+            "web_backend": web_config_raw.get("web_backend", "direct"),
+            "web_available_backends": web_backends,
+            "web_secrets": secrets,
+        }
+
+        self._configured_tool_definitions = [*native_defs, *web_defs, *discovered_tools]
         native_handlers = executor_tool_handlers()
+        allowed_native = {t.name for t in native_defs}
+        allowed_web = {t.name for t in web_defs}
         self._tool_handlers = {
             name: handler
             for name, handler in native_handlers.items()
-            if name in {t.name for t in native_defs}
+            if name in allowed_native or name in allowed_web
         }
         for tool in discovered_tools:
             if tool.source.server_name is not None:
@@ -277,9 +294,19 @@ class ExecutorRunner:
                 )
             else:
                 tool_call = ToolCall(call_id=call_id, name=tool_name, arguments=arguments)
+                from cognis.models.tool import ExecutorHandle
+                from cognis.tools.registry import ToolExecutionContext
+
+                ctx = ToolExecutionContext(
+                    executor_handle=ExecutorHandle(
+                        executor_id=self.config.executor_id,
+                        executor_type="remote",
+                    ),
+                    runtime_metadata=self._runtime_metadata,
+                )
 
                 async def _invoke() -> Any:
-                    return await handler(tool_call.arguments, None)
+                    return await handler(tool_call.arguments, ctx)
 
                 raw = (
                     await asyncio.wait_for(_invoke(), timeout=timeout_seconds)
