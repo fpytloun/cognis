@@ -18,7 +18,7 @@
   <img
     {src}
     {alt}
-    class="max-h-[80vh] max-w-[90vw] rounded-2xl object-contain shadow-2xl"
+    class="max-h-[60vh] max-w-[400px] rounded-2xl object-contain shadow-2xl"
     onclick={(e) => e.stopPropagation()}
   />
 </div>

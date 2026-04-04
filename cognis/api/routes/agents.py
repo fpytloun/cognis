@@ -365,14 +365,17 @@ _FIELD_INSTRUCTIONS: dict[str, str] = {
         "Describe what it does and what makes it unique."
     ),
     "tone": (
-        "Suggest a communication tone for this agent as a short comma-separated list "
-        "of 2-4 adjectives (e.g. 'calm, direct, curious'). "
-        "Match the agent's purpose and personality."
+        "Suggest a communication tone — how the agent speaks and writes. "
+        "Output a short comma-separated list of 2-4 adjectives describing voice, "
+        "formality, and style (e.g. 'formal, precise', 'casual, witty, warm'). "
+        "Do NOT include behavioral traits like patience or caution — those belong in temperament."
     ),
     "temperament": (
-        "Suggest a temperament for this agent as a short comma-separated list "
-        "of 1-3 adjectives (e.g. 'patient, methodical'). "
-        "Match the agent's purpose and personality."
+        "Suggest a temperament — how the agent behaves and reacts. "
+        "Output a short comma-separated list of 1-3 adjectives describing disposition, "
+        "decision-making style, and emotional tendencies (e.g. 'patient, methodical', "
+        "'bold, decisive'). Do NOT include communication style traits like formality "
+        "or wit — those belong in tone."
     ),
     "purpose": (
         "Write a concise purpose statement for this agent in 3-8 words "
@@ -439,18 +442,29 @@ async def generate_agent_field(request: Request, payload: GenerateFieldRequest) 
         user_msg = (
             f"The agent's '{field}' field currently contains:\n\n"
             f"{current_value}\n\n"
-            f"Expand and refine this into a more complete version. "
-            f"Keep the original intent and meaning, but make it more detailed and professional.\n\n"
+            f"Expand and polish this text while strictly preserving the user's exact intent, "
+            f"terminology, and meaning. Do NOT replace their content with something different. "
+            f"If the text is brief notes or keywords, expand them into proper sentences "
+            f"while keeping every original concept.\n\n"
             f"Agent context:\n{ctx_summary}"
         )
+        system_msg = (
+            f"You are helping refine an AI agent's configuration. The user has already "
+            f"written content for the '{field}' field. Your job is to expand and polish "
+            f"their text while preserving their exact intent and terminology. "
+            f"Do NOT replace their content with something different — build on what they wrote. "
+            f"{field_instruction} "
+            f"Output ONLY the refined field value, nothing else."
+        )
+        temperature = 0.5
     else:
         user_msg = f"Generate the '{field}' field for this agent.\n\nAgent context:\n{ctx_summary}"
-
-    system_msg = (
-        f"You are helping configure an AI agent. {field_instruction} "
-        f"Output ONLY the field value, nothing else. No quotes, no field name prefix, "
-        f"no explanation."
-    )
+        system_msg = (
+            f"You are helping configure an AI agent. {field_instruction} "
+            f"Output ONLY the field value, nothing else. No quotes, no field name prefix, "
+            f"no explanation."
+        )
+        temperature = 0.8
 
     try:
         response = await llm.generate(
@@ -459,7 +473,7 @@ async def generate_agent_field(request: Request, payload: GenerateFieldRequest) 
                 {"role": "user", "content": user_msg},
             ],
             task_type="default",
-            temperature=0.8,
+            temperature=temperature,
             max_tokens=500,
         )
         choices = response.get("choices", [])

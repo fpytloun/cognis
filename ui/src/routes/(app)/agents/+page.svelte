@@ -3,6 +3,7 @@
   import { onMount } from 'svelte';
 
   import AgentAvatar from '$lib/components/AgentAvatar.svelte';
+  import ImageLightbox from '$lib/components/ImageLightbox.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import Card from '$lib/components/ui/Card.svelte';
@@ -16,6 +17,8 @@
   let workflows: Workflow[] = [];
   let primaryExpanded = true;
   let secondaryExpanded = true;
+  let lightboxUrl: string | null = null;
+  let lightboxAlt = '';
 
   $: primaryAgents = agents.filter((a) => a.agent_type === 'primary');
   $: secondaryAgents = agents.filter((a) => a.agent_type === 'secondary');
@@ -147,7 +150,13 @@
   <Card class="p-5">
     <div class="flex items-start justify-between gap-4">
       <div class="flex items-start gap-4">
-        <AgentAvatar name={agent.display_name ?? agent.name} avatarUrl={agent.avatar_url} />
+        {#if agent.avatar_url}
+          <button type="button" class="shrink-0 cursor-pointer" onclick={() => { lightboxUrl = agent.avatar_url; lightboxAlt = agent.display_name ?? agent.name; }}>
+            <AgentAvatar name={agent.display_name ?? agent.name} avatarUrl={agent.avatar_url} />
+          </button>
+        {:else}
+          <AgentAvatar name={agent.display_name ?? agent.name} avatarUrl={null} />
+        {/if}
         <div>
           <div class="flex items-center gap-2">
             <h2 class="text-lg font-semibold text-white">{agent.display_name ?? agent.name}</h2>
@@ -208,3 +217,7 @@
     </div>
   </Card>
 {/snippet}
+
+{#if lightboxUrl}
+  <ImageLightbox src={lightboxUrl} alt={lightboxAlt} onClose={() => { lightboxUrl = null; }} />
+{/if}

@@ -389,7 +389,8 @@
                   </button>
                 {/if}
               </div>
-              <Input bind:value={form.tone} placeholder="calm, direct, curious" disabled={readonly} />
+              <Input bind:value={form.tone} placeholder="e.g. formal, friendly, witty" disabled={readonly} />
+              <span class="block text-xs text-slate-500">How the agent communicates — voice and style.</span>
             </div>
             <div class="space-y-2 text-sm font-medium text-slate-200">
               <div class="flex items-center justify-between">
@@ -400,7 +401,8 @@
                   </button>
                 {/if}
               </div>
-              <Input bind:value={form.temperament} placeholder="patient" disabled={readonly} />
+              <Input bind:value={form.temperament} placeholder="e.g. patient, cautious, bold" disabled={readonly} />
+              <span class="block text-xs text-slate-500">How the agent behaves — disposition and reactions.</span>
             </div>
             <div class="space-y-2 text-sm font-medium text-slate-200">
               <div class="flex items-center justify-between">
