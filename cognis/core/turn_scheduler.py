@@ -465,6 +465,12 @@ class TurnScheduler:
             result_summary=event.data.get("result_summary")
             if isinstance(event.data.get("result_summary"), str)
             else None,
+            gate_message=event.data.get("gate_message")
+            if isinstance(event.data.get("gate_message"), str)
+            else None,
+            gate_options=event.data.get("gate_options")
+            if isinstance(event.data.get("gate_options"), list)
+            else None,
         )
 
         # Use submit_turn for unified serialization
@@ -1241,6 +1247,8 @@ def _build_follow_up_prompt(
     task_id: str | None = None,
     task_title: str | None = None,
     result_summary: str | None = None,
+    gate_message: str | None = None,
+    gate_options: list[dict[str, Any]] | None = None,
 ) -> str:
     """Build a system prompt for the follow-up turn after a task/delegation completes."""
     status_name = (status or "updated").lower()
@@ -1279,6 +1287,27 @@ def _build_follow_up_prompt(
                 f"Background task {title_str} (task_id: {task_id}) was cancelled. "
                 "Provide a brief follow-up to the user if warranted."
             )
+        if status_name == "paused":
+            lines = [
+                f"Background task {title_str} (task_id: {task_id}) needs your attention.",
+            ]
+            if gate_message:
+                lines.append(f"\nReason: {gate_message}")
+            if gate_options:
+                option_labels = [
+                    opt.get("label", opt.get("action", "?"))
+                    for opt in gate_options
+                    if isinstance(opt, dict)
+                ]
+                if option_labels:
+                    lines.append(f"Available actions: {', '.join(option_labels)}")
+            lines.append(
+                "\nExplain to the user why the task paused and what their options "
+                "are. If the task exhausted its retry attempts, explain what went "
+                "wrong. The user can retry the step (use `retry_task`), or cancel "
+                "the task. Do NOT retry automatically — let the user decide."
+            )
+            return "\n".join(lines)
         # Generic task update
         return (
             f"Background task {title_str} (task_id: {task_id}) status: {status_name}. "

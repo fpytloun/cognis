@@ -64,7 +64,7 @@ RESEARCH_WORKFLOW = Workflow(
                 "- Expected deliverables and format"
             ),
             input=StepInputConfig(type="null"),
-            completion=CompletionConfig(evaluate=True, max_attempts=2),
+            completion=CompletionConfig(evaluate=True, max_attempts=5),
         ),
         StepDefinition(
             name="research",
@@ -76,7 +76,7 @@ RESEARCH_WORKFLOW = Workflow(
                 "or conflicting information."
             ),
             input=StepInputConfig(type="last", source="plan"),
-            completion=CompletionConfig(evaluate=True, max_attempts=2),
+            completion=CompletionConfig(evaluate=True, max_attempts=5),
         ),
         StepDefinition(
             name="synthesize",
@@ -118,7 +118,7 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
                 "- Migration or compatibility concerns"
             ),
             input=StepInputConfig(type="null"),
-            completion=CompletionConfig(evaluate=True, max_attempts=2),
+            completion=CompletionConfig(evaluate=True, max_attempts=5),
             # Primary agent runs this — has memory, personality, project context
         ),
         StepDefinition(

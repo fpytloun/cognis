@@ -808,6 +808,24 @@ class WorkflowEngine:
             },
         )
 
+        # Trigger a follow-up turn in the source conversation so the agent
+        # can explain the pause to the user (why it paused, what the options are).
+        if task.source_type == "chat" and task.source_ref:
+            await self._event_bus.publish(
+                Event(
+                    type=EventType.FOLLOW_UP_TURN_REQUESTED,
+                    data={
+                        "conversation_id": task.source_ref,
+                        "task_id": task.task_id,
+                        "task_title": task.title,
+                        "status": "paused",
+                        "result_summary": gate.message,
+                        "gate_message": gate.message,
+                        "gate_options": gate_options,
+                    },
+                )
+            )
+
         # Wait for resolution
         try:
             resolution = await self._pause_waiter.wait(pause_id, timeout=3600.0)

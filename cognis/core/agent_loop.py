@@ -105,6 +105,22 @@ def _truncate_tool_data(text: str) -> str:
     return text[:_MAX_TOOL_DATA_BYTES] + f"\n... (truncated, {len(text)} bytes total)"
 
 
+def _find_gate_revise_action(pause: PendingPause) -> str | None:
+    """Extract the ``revise(step_name)`` action from a gate's options.
+
+    Gate options are stored as ``[{"label": "Retry step", "action": "revise(research)"}]``
+    in the PendingPause context. This returns the first ``revise(...)`` action
+    found, which contains the correct original step name (not the synthetic
+    gate name like ``research_exhausted``).
+    """
+    options = pause.options or []
+    for opt in options:
+        action = opt.get("action", "") if isinstance(opt, dict) else ""
+        if isinstance(action, str) and action.startswith("revise("):
+            return action
+    return None
+
+
 def _append_tool_call_event(
     events: list[SessionEvent],
     tc: ToolCall,
@@ -2546,24 +2562,103 @@ class AgentLoop:
                         is_error=True,
                     )
             try:
-                # If the task has a pending gate pause, resolve it with retry
+                # Check for pending pauses and handle by type
                 pauses = self.pause_waiter.list_pending(task_id=task_id)
                 if pauses:
                     pause = pauses[0]
-                    step_name = pause.step_name or ""
-                    self.pause_waiter.resolve(
-                        pause.pause_id,
-                        PauseResolution(decision=f"revise({step_name})", data={}),
-                    )
-                    return ToolResult(
-                        output=json.dumps(
-                            {
-                                "status": "retrying",
-                                "task_id": task_id,
-                                "message": f"Retrying step '{step_name}'.",
-                            }
-                        ),
-                    )
+
+                    if pause.pause_type == "gate":
+                        # For gates: use the gate's revise action if available
+                        # (contains the correct original step name, not the
+                        # synthetic gate name like "research_exhausted")
+                        gate_action = _find_gate_revise_action(pause)
+                        if gate_action:
+                            self.pause_waiter.resolve(
+                                pause.pause_id,
+                                PauseResolution(decision=gate_action, data={}),
+                            )
+                            return ToolResult(
+                                output=json.dumps(
+                                    {
+                                        "status": "retrying",
+                                        "task_id": task_id,
+                                        "message": f"Retrying: resolved gate with '{gate_action}'.",
+                                    }
+                                ),
+                            )
+                        # No revise option — resolve with "continue" (skip step)
+                        self.pause_waiter.resolve(
+                            pause.pause_id,
+                            PauseResolution(decision="continue", data={}),
+                        )
+                        return ToolResult(
+                            output=json.dumps(
+                                {
+                                    "status": "continuing",
+                                    "task_id": task_id,
+                                    "message": "Gate resolved with 'continue' (step skipped).",
+                                }
+                            ),
+                        )
+
+                    elif pause.pause_type in ("step_question", "step_input"):
+                        # Step questions need a response, not a retry
+                        question = pause.question or "No question text available"
+                        return ToolResult(
+                            output=json.dumps(
+                                {
+                                    "error": (
+                                        f"Task is waiting for input on step "
+                                        f"'{pause.step_name or 'unknown'}'. "
+                                        f"Question: {question}. "
+                                        "The user needs to answer this question "
+                                        "before the task can continue."
+                                    ),
+                                }
+                            ),
+                            is_error=True,
+                        )
+
+                    elif pause.pause_type == "escalation":
+                        # Escalations need approve/deny, not retry
+                        tool_name = (
+                            (pause.context or {}).get("tool_name", "a tool call")
+                            if pause.context
+                            else "a tool call"
+                        )
+                        return ToolResult(
+                            output=json.dumps(
+                                {
+                                    "error": (
+                                        f"Task is waiting for escalation approval "
+                                        f"on {tool_name}. Use /approve or /deny "
+                                        "to resolve the escalation first."
+                                    ),
+                                }
+                            ),
+                            is_error=True,
+                        )
+
+                    else:
+                        # Unknown pause type — try generic resolve
+                        step_name = pause.step_name or ""
+                        self.pause_waiter.resolve(
+                            pause.pause_id,
+                            PauseResolution(
+                                decision=f"revise({step_name})" if step_name else "continue",
+                                data={},
+                            ),
+                        )
+                        return ToolResult(
+                            output=json.dumps(
+                                {
+                                    "status": "retrying",
+                                    "task_id": task_id,
+                                    "message": f"Resolved pending pause on '{step_name or 'unknown'}'.",
+                                }
+                            ),
+                        )
+
                 # No active pause — retry from failed state directly
                 await task_queue.retry_failed_task(task_id)
                 return ToolResult(

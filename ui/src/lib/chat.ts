@@ -607,7 +607,13 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
   if (event.type === 'task_paused') {
     const taskId = event.task_id;
     const itemId = `delegation:${taskId}`;
-    const index = next.findIndex((item) => item.id === itemId && item.kind === 'delegation');
+    let index = next.findIndex((item) => item.id === itemId && item.kind === 'delegation');
+    // Fallback: search by taskId field (card may be keyed by child_session_id)
+    if (index < 0) {
+      index = next.findIndex(
+        (item) => item.kind === 'delegation' && (item as DelegationTimelineItem).taskId === taskId
+      );
+    }
     if (index >= 0) {
       const existing = next[index] as DelegationTimelineItem;
       next[index] = { ...existing, status: 'paused', result: 'Waiting for input' };
@@ -622,7 +628,13 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
   ) {
     const taskId = event.task_id;
     const itemId = `delegation:${taskId}`;
-    const index = next.findIndex((item) => item.id === itemId && item.kind === 'delegation');
+    let index = next.findIndex((item) => item.id === itemId && item.kind === 'delegation');
+    // Fallback: search by taskId field (card may be keyed by child_session_id)
+    if (index < 0) {
+      index = next.findIndex(
+        (item) => item.kind === 'delegation' && (item as DelegationTimelineItem).taskId === taskId
+      );
+    }
     const status =
       event.type === 'workflow_completed'
         ? 'completed'
