@@ -234,9 +234,9 @@
 {#if loading}
   <LoadingState label="Loading workflows" description="Fetching system templates and user-editable workflow definitions." />
 {:else}
-  <section class="space-y-5">
+  <section class="space-y-5 overflow-x-hidden">
     <div class="flex flex-wrap items-center justify-between gap-3">
-      <div>
+      <div class="min-w-0">
         <p class="text-sm uppercase tracking-[0.25em] text-slate-400">Workflow registry</p>
         <h1 class="mt-1 text-2xl font-semibold text-white">Workflows</h1>
       </div>
@@ -259,11 +259,11 @@
           <div class="space-y-2">
             {#each workflows as workflow}
               <button class={`w-full rounded-2xl border px-4 py-3 text-left transition ${workflow.workflow_id === selectedWorkflow?.workflow_id ? 'border-sky-400/40 bg-sky-500/10 text-white' : 'border-slate-800 bg-slate-950/70 text-slate-200 hover:border-slate-700'}`} onclick={() => selectWorkflow(workflow)}>
-                <div class="flex items-center justify-between gap-3">
-                  <span class="font-medium">{workflow.name}</span>
-                  <span class="rounded-full border border-slate-700 px-2.5 py-1 text-[11px] uppercase tracking-[0.2em] text-slate-400">{workflow.is_system ? 'system' : 'user'}</span>
+                <div class="flex flex-wrap items-center justify-between gap-3">
+                  <span class="min-w-0 flex-1 truncate font-medium">{workflow.name}</span>
+                  <span class="shrink-0 rounded-full border border-slate-700 px-2.5 py-1 text-[11px] uppercase tracking-[0.2em] text-slate-400">{workflow.is_system ? 'system' : 'user'}</span>
                 </div>
-                <p class="mt-2 text-xs leading-5 text-slate-400">{workflow.workflow_id}</p>
+                <p class="mt-2 break-all text-xs leading-5 text-slate-400">{workflow.workflow_id}</p>
               </button>
             {/each}
           </div>
@@ -400,12 +400,12 @@
             {#each form.steps as step, index}
               <article class="rounded-2xl border border-slate-800 bg-slate-950/70 p-4" draggable={!selectedWorkflow?.is_system} ondragstart={() => (dragIndex = index)} ondragover={(event) => event.preventDefault()} ondrop={() => moveStep(index)}>
                 <!-- Step header: name, type, step number badge -->
-                <div class="mb-3 flex items-center gap-3">
-                  <span class="flex h-6 w-6 items-center justify-center rounded-full bg-slate-800 text-[11px] font-medium text-slate-400">{index + 1}</span>
-                  <span class="text-sm font-medium text-slate-100">{step.name || `Step ${index + 1}`}</span>
-                  <span class="rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-widest {step.type === 'gate' ? 'border-amber-600/40 text-amber-400' : 'border-slate-700 text-slate-400'}">{step.type === 'gate' ? 'Gate' : 'Run'}</span>
+                <div class="mb-3 flex flex-wrap items-center gap-3">
+                  <span class="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-slate-800 text-[11px] font-medium text-slate-400">{index + 1}</span>
+                  <span class="min-w-0 flex-1 break-words text-sm font-medium text-slate-100">{step.name || `Step ${index + 1}`}</span>
+                  <span class="shrink-0 rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-widest {step.type === 'gate' ? 'border-amber-600/40 text-amber-400' : 'border-slate-700 text-slate-400'}">{step.type === 'gate' ? 'Gate' : 'Run'}</span>
                   {#if step.agentOverride && step.type === 'run'}
-                    <span class="rounded-full border border-sky-500/30 bg-sky-500/10 px-2 py-0.5 text-[10px] text-sky-300">{step.agentOverride}</span>
+                    <span class="break-all rounded-full border border-sky-500/30 bg-sky-500/10 px-2 py-0.5 text-[10px] text-sky-300">{step.agentOverride}</span>
                   {/if}
                 </div>
 

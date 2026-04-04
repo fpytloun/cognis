@@ -57,10 +57,13 @@ async def conversation_list(
     cursor: str | None = None,
     limit: int = Query(default=20, ge=1, le=100),
     context_type: str | None = Query(default=None),
+    agent_id: str | None = Query(default=None),
 ) -> CursorPage[ConversationResponse]:
     user = require_current_user(request)
     async with request.app.state.session_factory() as session:
         rows = await list_conversations(session, user.email, context_type=context_type)
+    if agent_id is not None:
+        rows = [row for row in rows if row.agent_id == agent_id]
     items = [conversation_to_response(row) for row in rows]
     page_items, next_cursor, has_more = paginate_items(
         items,

@@ -2,7 +2,8 @@
   import { goto } from '$app/navigation';
   import { page } from '$app/state';
   import { onMount } from 'svelte';
-  import { ArrowDown, ArrowLeft, ChevronsLeft, ChevronsRight, Search, Copy, Check, Info, Paperclip, X } from 'lucide-svelte';
+  import { fade, fly } from 'svelte/transition';
+  import { ArrowDown, ArrowLeft, Check, ChevronDown, ChevronUp, ChevronsLeft, ChevronsRight, Copy, Info, Paperclip, Search, X } from 'lucide-svelte';
 
   import AgentAvatar from '$lib/components/AgentAvatar.svelte';
   import AgentProfilePopover from '$lib/components/AgentProfilePopover.svelte';
@@ -38,6 +39,7 @@
   let historyError = $state('');
   let sessionsError = $state('');
   let conversations = $state<Conversation[]>([]);
+  let availableChannelTypes = $state<string[]>([]);
   let conversationCursor: string | null = null;
   let conversationsHasMore = $state(false);
   let conversationSearch = $state('');
@@ -54,6 +56,8 @@
   let archivingConversation = $state(false);
   let deletingConversation = $state(false);
   let mobileListOpen = $state(false);
+  let mobileFilterOpen = $state(false);
+  let mobileHeaderDetailsOpen = $state(false);
   let enterToSend = $state(true);
   let queuedCount = $state(0);
   let timeline = $state<TimelineItem[]>([]);
@@ -173,7 +177,11 @@
 
   async function loadConversationPage(reset = false): Promise<void> {
     const channelFilter = selectedChannel !== 'all' ? selectedChannel : null;
-    const response = await api.conversations.list(reset ? null : conversationCursor, channelFilter);
+    const agentFilter = selectedAgentId !== 'all' ? selectedAgentId : null;
+    const response = await api.conversations.list(reset ? null : conversationCursor, {
+      contextType: channelFilter,
+      agentId: agentFilter,
+    });
     conversations = reset ? response.items : [...conversations, ...response.items];
     conversationCursor = response.cursor;
     conversationsHasMore = response.has_more;
@@ -258,8 +266,21 @@
 
   async function refreshSidebarData(): Promise<void> {
     [agents] = await Promise.all([api.agents.listAll()]);
-    await loadConversationPage(true);
     restoreSelectedAgent();
+    await refreshAvailableChannelTypes();
+    await loadConversationPage(true);
+  }
+
+  async function refreshAvailableChannelTypes(): Promise<void> {
+    const agentFilter = selectedAgentId !== 'all' ? selectedAgentId : null;
+    const allConversations = await api.conversations.listAll({ agentId: agentFilter, contextType: null });
+    const types = new Set(
+      allConversations.map((conversation) => conversation.context?.type?.toLowerCase() ?? 'unknown')
+    );
+    if (selectedChannel && selectedChannel !== 'all') {
+      types.add(selectedChannel.toLowerCase());
+    }
+    availableChannelTypes = [...types].sort();
   }
 
   function resetSessionFilter(): void {
@@ -346,18 +367,13 @@
   }
 
   function channelTypes(): string[] {
-    const types = new Set<string>();
-    for (const c of conversations) {
-      types.add(c.context?.type?.toLowerCase() ?? 'unknown');
-    }
-    return [...types].sort();
+    return availableChannelTypes;
   }
 
-  function persistSelectedChannel(): void {
+  async function persistSelectedChannel(): Promise<void> {
     if (typeof window === 'undefined') return;
     window.localStorage.setItem('cognis-chat-selected-channel', selectedChannel);
-    // Re-fetch conversations so the filter applies to the full dataset
-    void loadConversationPage(true);
+    await loadConversationPage(true);
   }
 
   function restoreSelectedChannel(): void {
@@ -533,6 +549,7 @@
     historyError = '';
     sessionsError = '';
     escalationError = '';
+    mobileHeaderDetailsOpen = false;
     mobileListOpen = false;
     document.body.style.overflow = '';
 
@@ -1088,8 +1105,10 @@
     // No longer polling for escalations — they arrive via push events
   }
 
-  function handleAgentFilterChange(): void {
+  async function handleAgentFilterChange(): Promise<void> {
     persistSelectedAgent();
+    await refreshAvailableChannelTypes();
+    await loadConversationPage(true);
   }
 
   let subSessionPollTimer: number | null = null;
@@ -1173,9 +1192,6 @@
 
   let visibleConversationList = $derived.by(() => {
     let list = conversations;
-    if (selectedAgentId && selectedAgentId !== 'all') {
-      list = list.filter((c) => c.agent_id === selectedAgentId);
-    }
     const query = conversationSearch.trim().toLowerCase();
     if (query) {
       list = list.filter((c) => conversationTitle(c).toLowerCase().includes(query));
@@ -1242,6 +1258,7 @@
         class="fixed inset-0 z-30 bg-slate-950/80 backdrop-blur-sm xl:hidden"
         onclick={closeMobileList}
         type="button"
+        transition:fade={{ duration: 180 }}
       ></button>
     {/if}
 
@@ -1249,14 +1266,24 @@
     <aside
       aria-label="Conversation list"
       aria-modal={mobileListOpen ? 'true' : undefined}
-      class={`${chatSidebarCollapsed ? 'hidden' : `${mobileListOpen || !currentConversation ? 'flex' : 'hidden'} xl:flex`} fixed inset-y-3 left-3 z-40 w-[min(22rem,calc(100vw-1.5rem))] min-h-0 flex-col rounded-[1.75rem] border border-slate-800/80 bg-slate-900/95 shadow-card backdrop-blur xl:static xl:z-auto xl:w-auto xl:rounded-3xl xl:bg-slate-900/70`}
+      class={`${chatSidebarCollapsed ? 'hidden' : 'flex'} fixed inset-y-3 left-3 z-40 w-[min(22rem,calc(100vw-1.5rem))] min-h-0 flex-col rounded-[1.75rem] border border-slate-800/80 bg-slate-900/95 shadow-card backdrop-blur transition-transform duration-200 ease-out xl:static xl:z-auto xl:w-auto xl:translate-x-0 xl:rounded-3xl xl:bg-slate-900/70 ${mobileListOpen || !currentConversation ? 'translate-x-0' : '-translate-x-[120%] pointer-events-none xl:pointer-events-auto'}`}
       role={mobileListOpen ? 'dialog' : undefined}
+      transition:fly={{ x: -280, duration: 220, opacity: 1 }}
     >
       <!-- Static top: filters -->
       <div class="shrink-0 space-y-3 p-4 pb-2 sm:p-4">
         <div class="flex items-center justify-between xl:hidden">
           <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Conversations</p>
-          <Button aria-label="Close conversation list" size="sm" variant="secondary" onclick={closeMobileList}>Close</Button>
+          <div class="flex items-center gap-2">
+            <Button aria-label="Toggle filters" size="sm" variant="secondary" onclick={() => (mobileFilterOpen = !mobileFilterOpen)}>
+              {#if mobileFilterOpen}
+                <ChevronUp class="h-4 w-4" />
+              {:else}
+                <ChevronDown class="h-4 w-4" />
+              {/if}
+            </Button>
+            <Button aria-label="Close conversation list" size="sm" variant="secondary" onclick={closeMobileList}>Close</Button>
+          </div>
         </div>
 
         {#if agents.length === 0}
@@ -1272,6 +1299,7 @@
             <Button class="w-full justify-center" size="sm" onclick={() => goto('/settings?tab=providers')}>Open provider settings</Button>
           </div>
         {:else}
+          <div class={`space-y-3 ${mobileFilterOpen ? 'block' : 'hidden xl:block'}`}>
           <label class="block space-y-1">
             <span class="text-xs font-medium uppercase tracking-widest text-slate-500">Agent</span>
             <select
@@ -1299,6 +1327,7 @@
               {/each}
             </select>
           </label>
+          </div>
         {/if}
 
         <div class="flex items-center justify-between gap-3 border-t border-slate-800/60 pt-3">
@@ -1394,10 +1423,10 @@
         </div>
       {/if}
       <!-- Header -->
-      <div class="border-b border-slate-800/80 px-3 py-3 sm:px-5 sm:py-4">
+      <div class="border-b border-slate-800/80 px-3 py-2.5 sm:px-5 sm:py-4">
         <div class="flex flex-wrap items-start justify-between gap-3">
           <div class="min-w-0 flex-1">
-            <div class="mb-2 flex items-center gap-2">
+            <div class="flex items-center gap-2">
               {#if chatSidebarCollapsed}
                 <button
                   class="hidden rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-800 hover:text-white xl:inline-flex"
@@ -1409,36 +1438,34 @@
                 </button>
               {/if}
               <div class="xl:hidden">
-                <Button size="sm" variant="secondary" onclick={openMobileList}>
-                  <ArrowLeft class="mr-2 h-4 w-4" />
-                  Conversations
+                <Button aria-label="Open conversations" size="sm" variant="secondary" onclick={openMobileList}>
+                  <ArrowLeft class="h-4 w-4" />
                 </Button>
               </div>
+              <!-- Editable title -->
+              {#if editingTitle}
+                <!-- svelte-ignore a11y_autofocus -->
+                <input
+                  class="min-w-0 flex-1 rounded-lg border border-sky-500/50 bg-slate-950/80 px-2 py-1 text-lg font-semibold text-white focus:outline-none focus:ring-1 focus:ring-sky-400 sm:text-xl"
+                  bind:value={editTitleValue}
+                  onblur={saveTitle}
+                  onkeydown={handleTitleKeydown}
+                  autofocus
+                />
+              {:else}
+                <button
+                  class="min-w-0 flex-1 truncate text-left text-lg font-semibold text-white transition hover:text-sky-300 sm:text-xl"
+                  onclick={startEditTitle}
+                  type="button"
+                  title="Click to edit title"
+                >
+                  {currentConversation ? conversationTitle(currentConversation) : 'Conversation'}
+                </button>
+              {/if}
             </div>
 
-            <!-- Editable title -->
-            {#if editingTitle}
-              <!-- svelte-ignore a11y_autofocus -->
-              <input
-                class="w-full rounded-lg border border-sky-500/50 bg-slate-950/80 px-2 py-1 text-xl font-semibold text-white focus:outline-none focus:ring-1 focus:ring-sky-400"
-                bind:value={editTitleValue}
-                onblur={saveTitle}
-                onkeydown={handleTitleKeydown}
-                autofocus
-              />
-            {:else}
-              <button
-                class="text-left text-xl font-semibold text-white transition hover:text-sky-300"
-                onclick={startEditTitle}
-                type="button"
-                title="Click to edit title"
-              >
-                {currentConversation ? conversationTitle(currentConversation) : 'Conversation'}
-              </button>
-            {/if}
-
             <!-- Sub-header info row -->
-            <div class="mt-1.5 flex flex-wrap items-center gap-3 text-sm text-slate-400">
+            <div class="mt-1.5 hidden flex-wrap items-center gap-3 text-sm text-slate-400 sm:flex">
               {#if currentConversation}
                 {@const agent = conversationAgent(currentConversation)}
                 {#if agent}
@@ -1483,16 +1510,6 @@
                   </span>
                 {/if}
 
-                <!-- Session info button -->
-                <button
-                  class="flex items-center gap-1 text-xs text-slate-500 transition hover:text-sky-300"
-                  onclick={() => { sessionInfoOpen = !sessionInfoOpen; if (sessionInfoOpen && !sessionInfo) void loadSessionInfo(); }}
-                  type="button"
-                  title="Session details"
-                >
-                  <Info class="h-3.5 w-3.5" />
-                </button>
-
                 <!-- Context usage badge (right-aligned) -->
                 {#if contextUsage}
                   <span class="ml-auto flex items-center gap-1.5 text-[10px] font-medium {contextUsage.percentage > 85 ? 'text-rose-400' : contextUsage.percentage > 60 ? 'text-amber-400' : 'text-slate-400'}" title="Context: {contextUsage.prompt_tokens.toLocaleString()} / {contextUsage.max_context_tokens.toLocaleString()} tokens ({contextUsage.model}){contextUsage.reasoning_effort ? ` | reasoning: ${contextUsage.reasoning_effort}` : ''}">
@@ -1510,7 +1527,7 @@
 
             <!-- Session info popover -->
             {#if sessionInfoOpen}
-              <div class="mt-2 rounded-xl border border-slate-700 bg-slate-900/95 px-4 py-3 text-sm">
+              <div class={`mt-2 rounded-xl border border-slate-700 bg-slate-900/95 px-4 py-3 text-sm ${mobileHeaderDetailsOpen ? '' : 'hidden sm:block'}`}>
                 {#if sessionInfoLoading}
                   <p class="text-xs text-slate-500">Loading session details...</p>
                 {:else if sessionInfo}
@@ -1534,38 +1551,85 @@
             {/if}
           </div>
 
-          <div class="flex flex-wrap gap-2">
-            <Button size="sm" variant="secondary" disabled={!currentConversation || archivingConversation} onclick={archiveConversation}>
-              {archivingConversation ? 'Archiving...' : 'Archive'}
-            </Button>
-            <Button size="sm" variant="danger" disabled={!currentConversation || deletingConversation} onclick={deleteConversation}>
-              {deletingConversation ? 'Deleting...' : 'Delete'}
-            </Button>
+          <div class="flex items-center gap-2">
+            <button
+              class="inline-flex rounded-lg border border-slate-700 px-2 py-1.5 text-xs text-slate-300 transition hover:bg-slate-800 hover:text-white sm:hidden"
+              onclick={() => (mobileHeaderDetailsOpen = !mobileHeaderDetailsOpen)}
+              type="button"
+              aria-label="Toggle conversation details"
+            >
+              {#if mobileHeaderDetailsOpen}
+                <ChevronUp class="h-4 w-4" />
+              {:else}
+                <ChevronDown class="h-4 w-4" />
+              {/if}
+            </button>
+            <div class="hidden flex-wrap gap-2 sm:flex">
+              <button
+                class="flex items-center gap-1 text-xs text-slate-500 transition hover:text-sky-300"
+                onclick={() => { sessionInfoOpen = !sessionInfoOpen; if (sessionInfoOpen && !sessionInfo) void loadSessionInfo(); }}
+                type="button"
+                title="Session details"
+              >
+                <Info class="h-3.5 w-3.5" />
+              </button>
+              <Button size="sm" variant="secondary" disabled={!currentConversation || archivingConversation} onclick={archiveConversation}>
+                {archivingConversation ? 'Archiving...' : 'Archive'}
+              </Button>
+              <Button size="sm" variant="danger" disabled={!currentConversation || deletingConversation} onclick={deleteConversation}>
+                {deletingConversation ? 'Deleting...' : 'Delete'}
+              </Button>
+            </div>
           </div>
         </div>
 
-        {#if queuedCount > 0}
-          <p class="mt-3 rounded-2xl border border-sky-400/30 bg-sky-500/10 px-3 py-2 text-sm text-sky-100">
-            {queuedCount} additional message{queuedCount === 1 ? '' : 's'} queued for this conversation.
-          </p>
-        {/if}
-
-        {#if error}
-          <div class="mt-3 rounded-2xl border border-rose-500/30 bg-rose-500/10 px-3 py-3 text-sm text-rose-100">
-            <div class="flex flex-wrap items-center justify-between gap-3">
-              <p>{error}</p>
-              {#if lastRecoverableMessage}
-                <Button size="sm" variant="secondary" onclick={retryLastTurn}>Retry</Button>
+        {#if mobileHeaderDetailsOpen && currentConversation}
+          {@const agent = conversationAgent(currentConversation)}
+          <div class="mt-3 space-y-3 rounded-2xl border border-slate-800/80 bg-slate-950/50 px-3 py-3 sm:hidden">
+            <div class="flex flex-wrap items-center gap-2 text-sm text-slate-300">
+              {#if agent}
+                <div class="flex items-center gap-2 rounded-lg bg-slate-900/80 px-2 py-1">
+                  <AgentAvatar name={agent.display_name ?? agent.name} avatarUrl={agent.avatar_url ?? null} class="h-5 w-5" />
+                  <span>{agent.display_name ?? agent.name}</span>
+                </div>
+              {/if}
+              <span class="rounded-full border border-slate-700 bg-slate-800/60 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-widest text-slate-400">
+                {contextTypeBadge(currentConversation)}
+              </span>
+              {#if sessions.length > 1}
+                <span class="rounded-full border border-slate-700 bg-slate-800/60 px-2 py-0.5 text-[10px] font-medium text-slate-400">{sessions.length} sessions</span>
               {/if}
             </div>
-          </div>
-        {/if}
-
-        {#if sessionsError}
-          <div class="mt-3 rounded-2xl border border-amber-500/30 bg-amber-500/10 px-3 py-3 text-sm text-amber-100">
-            <div class="flex flex-wrap items-center justify-between gap-3">
-              <p>Session details are temporarily unavailable: {sessionsError}</p>
-              <Button size="sm" variant="secondary" onclick={retryConversationSubloads}>Retry</Button>
+            {#if currentConversation.active_session_id}
+              <button
+                class="flex items-center gap-1 font-mono text-xs text-slate-500 transition hover:text-slate-300"
+                onclick={copySessionId}
+                type="button"
+                title="Copy full session ID"
+              >
+                {currentConversation.active_session_id.slice(0, 12)}
+                {#if sessionIdCopied}
+                  <Check class="h-3 w-3 text-emerald-400" />
+                {:else}
+                  <Copy class="h-3 w-3" />
+                {/if}
+              </button>
+            {/if}
+            {#if contextUsage}
+              <div class="text-[10px] text-slate-400">
+                Context {contextUsage.prompt_tokens.toLocaleString()} / {contextUsage.max_context_tokens.toLocaleString()} ({contextUsage.percentage}%)
+              </div>
+            {/if}
+            <div class="flex flex-wrap gap-2">
+              <Button size="sm" variant="secondary" onclick={() => { sessionInfoOpen = !sessionInfoOpen; if (sessionInfoOpen && !sessionInfo) void loadSessionInfo(); }}>
+                Session details
+              </Button>
+              <Button size="sm" variant="secondary" disabled={!currentConversation || archivingConversation} onclick={archiveConversation}>
+                {archivingConversation ? 'Archiving...' : 'Archive'}
+              </Button>
+              <Button size="sm" variant="danger" disabled={!currentConversation || deletingConversation} onclick={deleteConversation}>
+                {deletingConversation ? 'Deleting...' : 'Delete'}
+              </Button>
             </div>
           </div>
         {/if}
@@ -1576,6 +1640,32 @@
         {#if isMemoryDegraded()}
           <div class="rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
             Memory is currently unavailable — this conversation won't have access to past context.
+          </div>
+        {/if}
+
+        {#if queuedCount > 0}
+          <p class="rounded-2xl border border-sky-400/30 bg-sky-500/10 px-3 py-2 text-sm text-sky-100">
+            {queuedCount} additional message{queuedCount === 1 ? '' : 's'} queued for this conversation.
+          </p>
+        {/if}
+
+        {#if error}
+          <div class="rounded-2xl border border-rose-500/30 bg-rose-500/10 px-3 py-3 text-sm text-rose-100">
+            <div class="flex flex-wrap items-center justify-between gap-3">
+              <p>{error}</p>
+              {#if lastRecoverableMessage}
+                <Button size="sm" variant="secondary" onclick={retryLastTurn}>Retry</Button>
+              {/if}
+            </div>
+          </div>
+        {/if}
+
+        {#if sessionsError}
+          <div class="rounded-2xl border border-amber-500/30 bg-amber-500/10 px-3 py-3 text-sm text-amber-100">
+            <div class="flex flex-wrap items-center justify-between gap-3">
+              <p>Session details are temporarily unavailable: {sessionsError}</p>
+              <Button size="sm" variant="secondary" onclick={retryConversationSubloads}>Retry</Button>
+            </div>
           </div>
         {/if}
 
@@ -1735,14 +1825,14 @@
               placeholder={isLlmUnavailableForSetup() ? 'Configure an LLM provider to start chatting.' : 'Send a message to Cognis...'}
             ></textarea>
             <div class="flex flex-wrap items-center justify-between gap-3">
-              <label class="flex items-center gap-2 text-xs text-slate-400">
+              <label class="hidden items-center gap-2 text-xs text-slate-400 sm:flex">
                 <input bind:checked={enterToSend} class="h-4 w-4 rounded border-slate-700 bg-slate-950" onchange={persistEnterToSendPreference} type="checkbox" />
                 <span>Press Enter to send</span>
               </label>
               <div class="flex flex-wrap justify-end gap-2">
                 <input bind:this={attachmentInput} class="hidden" type="file" multiple onchange={(event) => void handleAttachmentSelect(event)} />
                 <Button size="sm" variant="secondary" type="button" onclick={() => attachmentInput?.click()}>
-                  <Paperclip class="mr-2 h-4 w-4" /> Attach
+                  <Paperclip class="h-4 w-4 sm:mr-2" /> <span class="hidden sm:inline">Attach</span>
                 </Button>
                 {#if turnInProgress}
                   <Button size="sm" variant="secondary" type="button" onclick={() => currentConversation && wsClient.cancelTurn(currentConversation.conversation_id)}>

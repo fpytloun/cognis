@@ -296,12 +296,22 @@ export const api = {
   },
 
   conversations: {
-    list(cursor: string | null = null, contextType: string | null = null): Promise<CursorPage<Conversation>> {
-      return request<CursorPage<Conversation>>(`/api/v1/conversations${encodeQuery({ cursor, limit: 50, context_type: contextType })}`);
+    list(
+      cursor: string | null = null,
+      filters: { contextType?: string | null; agentId?: string | null } = {}
+    ): Promise<CursorPage<Conversation>> {
+      return request<CursorPage<Conversation>>(
+        `/api/v1/conversations${encodeQuery({
+          cursor,
+          limit: 50,
+          context_type: filters.contextType,
+          agent_id: filters.agentId
+        })}`
+      );
     },
 
-    async listAll(contextType: string | null = null): Promise<Conversation[]> {
-      return collectCursorPages((cursor) => this.list(cursor, contextType));
+    async listAll(filters: { contextType?: string | null; agentId?: string | null } = {}): Promise<Conversation[]> {
+      return collectCursorPages((cursor) => this.list(cursor, filters));
     },
 
     create(payload: { agent_id: string; title?: string | null; context?: Record<string, unknown> }): Promise<Conversation> {

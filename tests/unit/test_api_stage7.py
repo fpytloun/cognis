@@ -583,6 +583,64 @@ def test_session_events_are_proxied(monkeypatch: object, tmp_path: Path) -> None
         assert body["items"][0]["type"] == "assistant_message"
 
 
+def test_conversation_list_filters_by_agent(monkeypatch: object, tmp_path: Path) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> tuple[str, str]:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-2",
+                    owner_email="user@example.com",
+                    name="Agent 2",
+                    status="active",
+                )
+                first = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                    title="Agent one",
+                )
+                second = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-2",
+                    context_type="web",
+                    title="Agent two",
+                )
+                await session.commit()
+                return first.conversation_id, second.conversation_id
+
+        first_id, second_id = asyncio.run(_seed())
+
+        response = client.get(
+            "/api/v1/conversations?agent_id=agent-2",
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert [item["conversation_id"] for item in body["items"]] == [second_id]
+        assert body["items"][0]["agent_id"] == "agent-2"
+        assert first_id != second_id
+
+
 def test_conversation_messages_returns_empty_when_stream_missing(
     monkeypatch: object, tmp_path: Path
 ) -> None:

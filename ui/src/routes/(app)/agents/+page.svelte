@@ -85,7 +85,7 @@
 {#if loading}
   <LoadingState label="Loading agents" description="Fetching your agent definitions and workflow defaults." />
 {:else}
-  <section class="space-y-5">
+  <section class="space-y-5 overflow-x-hidden">
     <div class="flex flex-wrap items-center justify-between gap-3">
       <div>
         <p class="text-sm uppercase tracking-[0.25em] text-slate-400">Agent management</p>
@@ -155,9 +155,9 @@
 {/if}
 
 {#snippet agentCard(agent: Agent)}
-  <Card class="p-5">
-    <div class="flex items-start justify-between gap-4">
-      <div class="flex items-start gap-4">
+  <Card class="p-4 sm:p-5">
+    <div class="flex flex-wrap items-start justify-between gap-4">
+      <div class="flex min-w-0 flex-1 items-start gap-4">
         {#if agent.avatar_url}
           <button type="button" class="shrink-0 cursor-pointer" onclick={() => { lightboxUrl = agent.avatar_url; lightboxAlt = agent.display_name ?? agent.name; }}>
             <AgentAvatar name={agent.display_name ?? agent.name} avatarUrl={agent.avatar_url} />
@@ -165,18 +165,18 @@
         {:else}
           <AgentAvatar name={agent.display_name ?? agent.name} avatarUrl={null} />
         {/if}
-        <div>
-          <div class="flex items-center gap-2">
-            <h2 class="text-lg font-semibold text-white">{agent.display_name ?? agent.name}</h2>
+        <div class="min-w-0 flex-1">
+          <div class="flex flex-wrap items-center gap-2">
+            <h2 class="truncate text-lg font-semibold text-white">{agent.display_name ?? agent.name}</h2>
             {#if agent.is_system}
               <span class="rounded-full border border-sky-500/30 bg-sky-500/10 px-2 py-0.5 text-[10px] font-medium uppercase tracking-[0.15em] text-sky-300">System</span>
             {/if}
           </div>
-          <p class="text-sm text-slate-400">{agent.agent_id}</p>
+          <p class="break-all text-sm text-slate-400">{agent.agent_id}</p>
           <p class="mt-3 text-sm leading-6 text-slate-300">{agent.description ?? 'No description yet.'}</p>
         </div>
       </div>
-      <span class="rounded-full border border-slate-700 bg-slate-800 px-3 py-1 text-xs font-medium uppercase tracking-[0.2em] text-slate-200">
+      <span class="shrink-0 rounded-full border border-slate-700 bg-slate-800 px-3 py-1 text-xs font-medium uppercase tracking-[0.2em] text-slate-200">
         {agent.status}
       </span>
     </div>
