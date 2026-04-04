@@ -1,6 +1,6 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
-  import { page } from '$app/stores';
+  import { page } from '$app/state';
   import { onMount } from 'svelte';
   import { ArrowDown, ArrowLeft, ChevronsLeft, ChevronsRight, Search, Copy, Check, Info, Paperclip, X } from 'lucide-svelte';
 
@@ -32,54 +32,54 @@
   import type { Agent, AttachmentRef, ContextUsage, Conversation, Escalation, MessageEvent, Session } from '$lib/types/api';
   import { wsClient } from '$lib/ws/client';
 
-  let loading = true;
-  let error = '';
-  let conversations: Conversation[] = [];
+  let loading = $state(true);
+  let error = $state('');
+  let conversations = $state<Conversation[]>([]);
   let conversationCursor: string | null = null;
-  let conversationsHasMore = false;
-  let conversationSearch = '';
-  let agents: Agent[] = [];
-  let currentConversation: Conversation | null = null;
-  let sessions: Session[] = [];
-  let composer = '';
-  let composerElement: HTMLTextAreaElement | null = null;
-  let attachmentInput: HTMLInputElement | null = null;
-  let composerAttachments: AttachmentRef[] = [];
+  let conversationsHasMore = $state(false);
+  let conversationSearch = $state('');
+  let agents = $state<Agent[]>([]);
+  let currentConversation = $state<Conversation | null>(null);
+  let sessions = $state<Session[]>([]);
+  let composer = $state('');
+  let composerElement = $state<HTMLTextAreaElement | null>(null);
+  let attachmentInput = $state<HTMLInputElement | null>(null);
+  let composerAttachments = $state<AttachmentRef[]>([]);
   let showDropZone = $state(false);
   let dragCounter = 0;
-  let selectedAgentId = '';
-  let archivingConversation = false;
-  let deletingConversation = false;
-  let mobileListOpen = false;
-  let enterToSend = true;
-  let queuedCount = 0;
-  let timeline: TimelineItem[] = [];
+  let selectedAgentId = $state('');
+  let archivingConversation = $state(false);
+  let deletingConversation = $state(false);
+  let mobileListOpen = $state(false);
+  let enterToSend = $state(true);
+  let queuedCount = $state(0);
+  let timeline = $state<TimelineItem[]>([]);
 
-  let visibleStartIndex = 0;
+  let visibleStartIndex = $state(0);
   let activeConversationId = '';
-  let escalationTimeoutSeconds = 300;
-  let escalations: Escalation[] = [];
-  let escalationBusyCallId: string | null = null;
-  let escalationError = '';
+  const escalationTimeoutSeconds = 300;
+  let escalations = $state<Escalation[]>([]);
+  let escalationBusyCallId = $state<string | null>(null);
+  let escalationError = $state('');
   let escalationCountdownTimer: number | null = null;
-  let awaitingAssistantStart = false;
-  let turnInProgress = false;
+  let awaitingAssistantStart = $state(false);
+  let turnInProgress = $state(false);
   let lastSubmittedMessage = '';
-  let lastRecoverableMessage = '';
-  let editingTitle = false;
-  let editTitleValue = '';
-  let sessionIdCopied = false;
+  let lastRecoverableMessage = $state('');
+  let editingTitle = $state(false);
+  let editTitleValue = $state('');
+  let sessionIdCopied = $state(false);
   let showAgentProfile = $state(false);
-  let subSessionPanelOpen = false;
-  let subSessionClosing = false;
-  let subSessionId = '';
-  let subSessionTimeline: TimelineItem[] = [];
-  let subSessionLoading = false;
-  let subSessionError = '';
-  let timelineEl: HTMLDivElement | null = null;
-  let userScrolledUp = false;
-  let selectedChannel = 'all';
-  let chatSidebarCollapsed = false;
+  let subSessionPanelOpen = $state(false);
+  let subSessionClosing = $state(false);
+  let subSessionId = $state('');
+  let subSessionTimeline = $state<TimelineItem[]>([]);
+  let subSessionLoading = $state(false);
+  let subSessionError = $state('');
+  let timelineEl = $state<HTMLDivElement | null>(null);
+  let userScrolledUp = $state(false);
+  let selectedChannel = $state('all');
+  let chatSidebarCollapsed = $state(false);
   interface SessionInfoData {
     intention: string | null;
     status: string;
@@ -88,13 +88,13 @@
     denied_count: number;
     escalated_count: number;
   }
-  let sessionInfoOpen = false;
-  let sessionInfo: SessionInfoData | null = null;
-  let sessionInfoLoading = false;
-  let contextUsage: ContextUsage | null = null;
-  let subSessionInfoOpen = false;
-  let subSessionInfo: SessionInfoData | null = null;
-  let subSessionInfoLoading = false;
+  let sessionInfoOpen = $state(false);
+  let sessionInfo = $state<SessionInfoData | null>(null);
+  let sessionInfoLoading = $state(false);
+  let contextUsage = $state<ContextUsage | null>(null);
+  let subSessionInfoOpen = $state(false);
+  let subSessionInfo = $state<SessionInfoData | null>(null);
+  let subSessionInfoLoading = $state(false);
 
   const sessionIds = new Set<string>();
 
@@ -141,19 +141,6 @@
   function contextTypeBadge(conversation: Conversation): string {
     const t = conversation.context?.type ?? 'unknown';
     return t.charAt(0).toUpperCase() + t.slice(1).toLowerCase();
-  }
-
-  function filteredConversations(): Conversation[] {
-    let list = conversations;
-    if (selectedAgentId && selectedAgentId !== 'all') {
-      list = list.filter((c) => c.agent_id === selectedAgentId);
-    }
-    // Channel filtering is now server-side (passed to API in loadConversationPage)
-    const query = conversationSearch.trim().toLowerCase();
-    if (query) {
-      list = list.filter((c) => conversationTitle(c).toLowerCase().includes(query));
-    }
-    return list;
   }
 
   function socketErrorMessage(event: import('$lib/types/api').WebSocketErrorEvent): string {
@@ -217,7 +204,7 @@
   }
 
   function conversationIdFromRoute(): string {
-    return $page.params.conversationId ?? '';
+    return page.params.conversationId ?? '';
   }
 
   function conversationTitle(conversation: Conversation): string {
@@ -644,9 +631,9 @@
     { command: '/deny', description: 'Deny tool escalation' },
   ];
 
-  let slashSuggestionsVisible = false;
-  let slashFilteredSuggestions: typeof SLASH_SUGGESTIONS = [];
-  let slashSelectedIndex = 0;
+  let slashSuggestionsVisible = $state(false);
+  let slashFilteredSuggestions = $state<typeof SLASH_SUGGESTIONS>([]);
+  let slashSelectedIndex = $state(0);
 
   function updateSlashSuggestions(): void {
     const val = composer.trimStart();
@@ -1028,8 +1015,8 @@
   }
 
   $effect(() => {
-    if ($page.params.conversationId && $page.params.conversationId !== activeConversationId) {
-      void openConversation($page.params.conversationId);
+    if (page.params.conversationId && page.params.conversationId !== activeConversationId) {
+      void openConversation(page.params.conversationId);
     }
   });
 
