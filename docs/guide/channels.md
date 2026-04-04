@@ -2,6 +2,8 @@
 
 Channels connect Cognis agents to external messaging platforms such as Slack, Discord, Telegram, Signal, and similar adapters.
 
+![Channel pairing and verified sender flow](../assets/images/cognis-channel-pairing-flow.svg)
+
 ## What a channel account does
 
 A channel account binds:
@@ -25,6 +27,8 @@ Open `Channels` and choose an adapter type. Cognis shows:
 
 After the account is saved, Cognis uses the configured adapter to receive and send messages for that platform.
 
+The page also keeps the platform-specific manual setup steps next to the form so you can finish vendor-side configuration while filling in the Cognis settings.
+
 ## Controller vs executor placement
 
 Each channel account can run on:
@@ -39,6 +43,8 @@ Use executor placement when the integration depends on something that should sta
 Channel accounts can require sender verification before unknown remote users are allowed to interact with an agent.
 
 This pairing flow helps prevent an unverified external sender from immediately gaining access to a user-owned agent. The UI stores verified mappings between external contacts and Cognis users.
+
+In practice, the pairing tab becomes your operational view for pending verifications, while the contacts tab shows which remote senders have already been trusted.
 
 ## Platform-specific setup
 

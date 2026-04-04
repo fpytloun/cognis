@@ -2,6 +2,8 @@
 
 Workflows define how Cognis runs multi-step work. They are reusable templates that tasks and agents can use when a request should be broken into explicit stages instead of one direct response.
 
+![Workflow and task lifecycle](../assets/images/cognis-workflow-task-lifecycle.svg)
+
 ## Where workflows appear
 
 - `Workflows` in the main navigation opens the workflow editor.

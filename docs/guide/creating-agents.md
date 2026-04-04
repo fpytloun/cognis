@@ -2,6 +2,8 @@
 
 Open `Agents` to create or edit agents. An agent defines how Cognis should behave, what tools it can use, which model it prefers, and which workflows it may run.
 
+![Executor tool pool to effective tool set](../assets/images/cognis-agent-tool-inheritance.svg)
+
 ## Key sections
 
 ### Identity
@@ -63,6 +65,8 @@ Global MCP servers are managed from **Settings → Tools**, then assigned to
 executors from **Settings → Executors**. Agents do not own MCP server process
 config anymore — they inherit MCP tools from the executor they run on.
 
+The agent editor can also allow **Intaris MCP servers** directly for that agent. Use that path when the remote MCP capability is managed by Intaris rather than attached to the executor tool pool.
+
 Legacy inline MCP entries may still appear on older agents with:
 
 - name
@@ -93,3 +97,15 @@ Use overrides only when the agent really needs different behavior from the defau
 - step agent overrides
 
 Workflow settings matter most when the agent should do structured background work instead of only direct chat responses.
+
+## Practical create flow
+
+In the create form, the most useful order is:
+
+1. identity and display fields
+2. personality and behavior guidance
+3. executor and tool restrictions
+4. provider/model overrides only if necessary
+5. workflow defaults for structured execution
+
+Most agents should inherit as much as possible from system defaults and only override what truly makes them different.

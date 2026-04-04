@@ -78,6 +78,8 @@ There are two different credential layers in Cognis:
 - provider credentials used for model calls
 - encrypted secrets used by tools and executors
 
+Provider credentials can come either from environment variables or from Cognis-managed encrypted secrets, depending on how you choose to operate the deployment.
+
 For example:
 
 - `OPENAI_API_KEY` may power provider traffic

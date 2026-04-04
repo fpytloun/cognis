@@ -7,8 +7,10 @@ Cognis ships with embedded in-app docs under `/docs` and keeps the same guides i
 | Document | Description |
 |---|---|
 | Getting Started | First-run setup for Mnemory, Intaris, Cognis, your first provider, and your first agent |
+| Architecture | Understand how Cognis fits with Mnemory, Intaris, and executors |
 | Configuring Providers | Add LLM providers, test them, and set model routing |
 | Creating Agents | Define identity, tools, executor placement, and workflow behavior |
+| Settings | Configure providers, routing, secrets, executors, diagnostics, and users |
 
 ## Core Workflows
 
@@ -19,6 +21,7 @@ Cognis ships with embedded in-app docs under `/docs` and keeps the same guides i
 | Workflows | Build reusable workflows and understand step behavior |
 | Channels | Connect external messaging platforms and understand pairing |
 | Executors | Choose between local and remote executors and route tools safely |
+| Tools and Skills | Inspect the tool registry, skills, and MCP-backed capabilities |
 
 ## Operations
 
@@ -32,11 +35,14 @@ When Cognis serves the bundled UI, these guides are also available directly insi
 
 - `/docs`
 - `/docs/getting-started`
+- `/docs/architecture`
 - `/docs/configuring-providers`
 - `/docs/creating-agents`
+- `/docs/settings`
 - `/docs/using-chat`
 - `/docs/managing-tasks`
 - `/docs/workflows`
 - `/docs/channels`
 - `/docs/executors`
+- `/docs/tools-and-skills`
 - `/docs/troubleshooting`

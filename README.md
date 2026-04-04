@@ -100,24 +100,7 @@ cognis admin create-user admin@example.com --name "Admin"
 
 Cognis is a decoupled control plane. It orchestrates, but does not own, memory or guardrails:
 
-```
-                    ┌─────────────┐
-                    │  Web UI     │
-                    │  (SvelteKit)│
-                    └──────┬──────┘
-                           │ REST + WebSocket
-                    ┌──────▼──────┐
-                    │   Cognis    │
-                    │ Controller  │
-                    └──┬───┬───┬──┘
-                       │   │   │
-            ┌──────────┘   │   └──────────┐
-            ▼              ▼              ▼
-      ┌──────────┐  ┌──────────┐  ┌──────────┐
-      │ Mnemory  │  │ Intaris  │  │ Executor │
-      │ (memory) │  │ (guard)  │  │ (tools)  │
-      └──────────┘  └──────────┘  └──────────┘
-```
+![Cognis ecosystem overview](docs/assets/images/cognis-ecosystem-overview.svg)
 
 | Data | Owner | Storage |
 |------|-------|---------|
@@ -244,13 +227,16 @@ See [docs/specs/](docs/specs/) for the full specification set and [docs/specs/im
 
 - [Documentation Index](docs/README.md)
 - [Getting Started](docs/guide/getting-started.md)
+- [Architecture](docs/guide/architecture.md)
 - [Configuring Providers](docs/guide/configuring-providers.md)
 - [Creating Agents](docs/guide/creating-agents.md)
+- [Settings](docs/guide/settings.md)
 - [Using Chat](docs/guide/using-chat.md)
 - [Managing Tasks](docs/guide/managing-tasks.md)
 - [Workflows](docs/guide/workflows.md)
 - [Channels](docs/guide/channels.md)
 - [Executors](docs/guide/executors.md)
+- [Tools and Skills](docs/guide/tools-and-skills.md)
 - [Troubleshooting](docs/guide/troubleshooting.md)
 
 ## License

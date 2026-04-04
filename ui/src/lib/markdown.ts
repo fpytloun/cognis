@@ -1,5 +1,5 @@
 import DOMPurify from 'dompurify';
-import { marked } from 'marked';
+import { marked, Renderer } from 'marked';
 
 marked.setOptions({
   breaks: true,
@@ -19,5 +19,24 @@ export function sanitizeHtml(html: string): string {
 
 export function renderMarkdown(markdown: string): string {
   const parsed = marked.parse(markdown, { async: false });
+  return sanitizeHtml(typeof parsed === 'string' ? parsed : '');
+}
+
+function createDocsRenderer(): Renderer {
+  const renderer = new Renderer();
+  const baseCode = renderer.code.bind(renderer);
+  const baseTable = renderer.table.bind(renderer);
+
+  renderer.code = (...args) => `<div class="markdown-code-wrap">${baseCode(...args)}</div>`;
+  renderer.table = (...args) => `<div class="markdown-table-wrap">${baseTable(...args)}</div>`;
+
+  return renderer;
+}
+
+export function renderDocsMarkdown(markdown: string): string {
+  const parsed = marked.parse(markdown, {
+    async: false,
+    renderer: createDocsRenderer(),
+  });
   return sanitizeHtml(typeof parsed === 'string' ? parsed : '');
 }

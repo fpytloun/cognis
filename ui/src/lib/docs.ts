@@ -1,13 +1,21 @@
 import docsOverviewMarkdown from '../../../docs/README.md?raw';
+import architectureMarkdown from '../../../docs/guide/architecture.md?raw';
 import channelsMarkdown from '../../../docs/guide/channels.md?raw';
 import providersMarkdown from '../../../docs/guide/configuring-providers.md?raw';
 import agentsMarkdown from '../../../docs/guide/creating-agents.md?raw';
 import executorsMarkdown from '../../../docs/guide/executors.md?raw';
 import gettingStartedMarkdown from '../../../docs/guide/getting-started.md?raw';
 import tasksMarkdown from '../../../docs/guide/managing-tasks.md?raw';
+import settingsMarkdown from '../../../docs/guide/settings.md?raw';
 import troubleshootingMarkdown from '../../../docs/guide/troubleshooting.md?raw';
+import toolsAndSkillsMarkdown from '../../../docs/guide/tools-and-skills.md?raw';
 import chatMarkdown from '../../../docs/guide/using-chat.md?raw';
 import workflowsMarkdown from '../../../docs/guide/workflows.md?raw';
+import agentToolInheritanceSvg from '../../../docs/assets/images/cognis-agent-tool-inheritance.svg?url';
+import channelPairingFlowSvg from '../../../docs/assets/images/cognis-channel-pairing-flow.svg?url';
+import controllerExecutorSplitSvg from '../../../docs/assets/images/cognis-controller-executor-split.svg?url';
+import ecosystemOverviewSvg from '../../../docs/assets/images/cognis-ecosystem-overview.svg?url';
+import workflowLifecycleSvg from '../../../docs/assets/images/cognis-workflow-task-lifecycle.svg?url';
 
 export const DOC_CATEGORIES = ['getting-started', 'workspace', 'operations'] as const;
 
@@ -20,6 +28,7 @@ export interface EmbeddedDoc {
   category: DocCategory;
   sourcePath: string;
   content: string;
+  rawContent?: string;
   relatedSlugs?: string[];
 }
 
@@ -27,17 +36,21 @@ export interface DocsOverview {
   title: string;
   sourcePath: string;
   content: string;
+  rawContent?: string;
 }
 
 const ONBOARDING_DOC_SLUGS = [
   'getting-started',
+  'architecture',
   'configuring-providers',
   'creating-agents',
+  'settings',
   'using-chat',
   'managing-tasks',
   'workflows',
   'channels',
   'executors',
+  'tools-and-skills',
   'troubleshooting'
 ] as const;
 
@@ -45,10 +58,63 @@ const DOC_ROUTE_RE = /^\/docs\/([a-z0-9-]+)$/;
 const ALLOWED_APP_ROUTE_RE = /^\/(docs(\/[a-z0-9-]+)?|settings(\?.*)?|agents(\/.*)?|chat(\/.*)?|tasks(\/.*)?|workflows(\/.*)?|tools(\/.*)?|channels(\/.*)?)$/;
 const MARKDOWN_LINK_RE = /!??\[[^\]]*\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g;
 
+const DOC_ASSET_URLS: Record<string, string> = {
+  'docs/assets/images/cognis-agent-tool-inheritance.svg': agentToolInheritanceSvg,
+  'docs/assets/images/cognis-channel-pairing-flow.svg': channelPairingFlowSvg,
+  'docs/assets/images/cognis-controller-executor-split.svg': controllerExecutorSplitSvg,
+  'docs/assets/images/cognis-ecosystem-overview.svg': ecosystemOverviewSvg,
+  'docs/assets/images/cognis-workflow-task-lifecycle.svg': workflowLifecycleSvg
+};
+
+function normalizeDocPath(path: string): string {
+  const parts = path.split('/');
+  const normalized: string[] = [];
+
+  for (const part of parts) {
+    if (!part || part === '.') {
+      continue;
+    }
+    if (part === '..') {
+      normalized.pop();
+      continue;
+    }
+    normalized.push(part);
+  }
+
+  return normalized.join('/');
+}
+
+function dirname(path: string): string {
+  const parts = path.split('/');
+  parts.pop();
+  return parts.join('/');
+}
+
+function resolveDocRelativePath(sourcePath: string, target: string): string {
+  return normalizeDocPath(`${dirname(sourcePath)}/${target}`);
+}
+
+function rewriteMarkdownAssets(sourcePath: string, markdown: string): string {
+  return markdown.replace(MARKDOWN_LINK_RE, (fullMatch, rawTarget: string) => {
+    if (!(rawTarget.startsWith('./') || rawTarget.startsWith('../'))) {
+      return fullMatch;
+    }
+
+    const resolvedTarget = resolveDocRelativePath(sourcePath, rawTarget);
+    const rewrittenTarget = DOC_ASSET_URLS[resolvedTarget];
+    if (!rewrittenTarget) {
+      return fullMatch;
+    }
+
+    return fullMatch.replace(rawTarget, rewrittenTarget);
+  });
+}
+
 export const docsOverview: DocsOverview = {
   title: 'Documentation',
   sourcePath: 'docs/README.md',
-  content: docsOverviewMarkdown
+  rawContent: docsOverviewMarkdown,
+  content: rewriteMarkdownAssets('docs/README.md', docsOverviewMarkdown)
 };
 
 export const embeddedDocs: EmbeddedDoc[] = [
@@ -58,8 +124,19 @@ export const embeddedDocs: EmbeddedDoc[] = [
     description: 'Set up Mnemory, Intaris, Cognis, a provider, and your first agent.',
     category: 'getting-started',
     sourcePath: 'docs/guide/getting-started.md',
-    content: gettingStartedMarkdown,
-    relatedSlugs: ['configuring-providers', 'creating-agents', 'using-chat']
+    rawContent: gettingStartedMarkdown,
+    content: rewriteMarkdownAssets('docs/guide/getting-started.md', gettingStartedMarkdown),
+    relatedSlugs: ['architecture', 'configuring-providers', 'creating-agents', 'using-chat']
+  },
+  {
+    slug: 'architecture',
+    title: 'Architecture',
+    description: 'See how Cognis works with Mnemory, Intaris, and executors.',
+    category: 'getting-started',
+    sourcePath: 'docs/guide/architecture.md',
+    rawContent: architectureMarkdown,
+    content: rewriteMarkdownAssets('docs/guide/architecture.md', architectureMarkdown),
+    relatedSlugs: ['executors', 'channels', 'workflows']
   },
   {
     slug: 'configuring-providers',
@@ -67,8 +144,9 @@ export const embeddedDocs: EmbeddedDoc[] = [
     description: 'Add LLM providers, test connectivity, and tune routing decisions.',
     category: 'getting-started',
     sourcePath: 'docs/guide/configuring-providers.md',
-    content: providersMarkdown,
-    relatedSlugs: ['getting-started', 'executors', 'creating-agents']
+    rawContent: providersMarkdown,
+    content: rewriteMarkdownAssets('docs/guide/configuring-providers.md', providersMarkdown),
+    relatedSlugs: ['getting-started', 'settings', 'executors', 'creating-agents']
   },
   {
     slug: 'creating-agents',
@@ -76,8 +154,19 @@ export const embeddedDocs: EmbeddedDoc[] = [
     description: 'Define identity, personality, tools, executors, and workflow options.',
     category: 'workspace',
     sourcePath: 'docs/guide/creating-agents.md',
-    content: agentsMarkdown,
-    relatedSlugs: ['configuring-providers', 'using-chat', 'executors']
+    rawContent: agentsMarkdown,
+    content: rewriteMarkdownAssets('docs/guide/creating-agents.md', agentsMarkdown),
+    relatedSlugs: ['configuring-providers', 'using-chat', 'executors', 'tools-and-skills']
+  },
+  {
+    slug: 'settings',
+    title: 'Settings',
+    description: 'Configure providers, routing, secrets, executors, diagnostics, and users.',
+    category: 'workspace',
+    sourcePath: 'docs/guide/settings.md',
+    rawContent: settingsMarkdown,
+    content: rewriteMarkdownAssets('docs/guide/settings.md', settingsMarkdown),
+    relatedSlugs: ['configuring-providers', 'executors', 'tools-and-skills', 'troubleshooting']
   },
   {
     slug: 'using-chat',
@@ -85,7 +174,8 @@ export const embeddedDocs: EmbeddedDoc[] = [
     description: 'Understand streaming replies, tool activity, approvals, and delegation.',
     category: 'workspace',
     sourcePath: 'docs/guide/using-chat.md',
-    content: chatMarkdown,
+    rawContent: chatMarkdown,
+    content: rewriteMarkdownAssets('docs/guide/using-chat.md', chatMarkdown),
     relatedSlugs: ['getting-started', 'managing-tasks', 'creating-agents']
   },
   {
@@ -94,7 +184,8 @@ export const embeddedDocs: EmbeddedDoc[] = [
     description: 'Track queued or running work, workflow progress, and delivery back to chat.',
     category: 'workspace',
     sourcePath: 'docs/guide/managing-tasks.md',
-    content: tasksMarkdown,
+    rawContent: tasksMarkdown,
+    content: rewriteMarkdownAssets('docs/guide/managing-tasks.md', tasksMarkdown),
     relatedSlugs: ['workflows', 'using-chat']
   },
   {
@@ -103,8 +194,19 @@ export const embeddedDocs: EmbeddedDoc[] = [
     description: 'Create reusable execution templates with steps, gates, and revision loops.',
     category: 'workspace',
     sourcePath: 'docs/guide/workflows.md',
-    content: workflowsMarkdown,
+    rawContent: workflowsMarkdown,
+    content: rewriteMarkdownAssets('docs/guide/workflows.md', workflowsMarkdown),
     relatedSlugs: ['managing-tasks', 'creating-agents']
+  },
+  {
+    slug: 'tools-and-skills',
+    title: 'Tools and Skills',
+    description: 'Inspect the tool registry, MCP-backed capabilities, and reusable skills.',
+    category: 'workspace',
+    sourcePath: 'docs/guide/tools-and-skills.md',
+    rawContent: toolsAndSkillsMarkdown,
+    content: rewriteMarkdownAssets('docs/guide/tools-and-skills.md', toolsAndSkillsMarkdown),
+    relatedSlugs: ['settings', 'creating-agents', 'executors']
   },
   {
     slug: 'channels',
@@ -112,7 +214,8 @@ export const embeddedDocs: EmbeddedDoc[] = [
     description: 'Connect agents to external platforms and understand pairing and trust.',
     category: 'operations',
     sourcePath: 'docs/guide/channels.md',
-    content: channelsMarkdown,
+    rawContent: channelsMarkdown,
+    content: rewriteMarkdownAssets('docs/guide/channels.md', channelsMarkdown),
     relatedSlugs: ['executors', 'troubleshooting']
   },
   {
@@ -121,7 +224,8 @@ export const embeddedDocs: EmbeddedDoc[] = [
     description: 'Choose where tools run and how remote executor placement affects agents.',
     category: 'operations',
     sourcePath: 'docs/guide/executors.md',
-    content: executorsMarkdown,
+    rawContent: executorsMarkdown,
+    content: rewriteMarkdownAssets('docs/guide/executors.md', executorsMarkdown),
     relatedSlugs: ['channels', 'configuring-providers', 'creating-agents']
   },
   {
@@ -130,7 +234,8 @@ export const embeddedDocs: EmbeddedDoc[] = [
     description: 'Resolve common setup, provider, executor, and UI problems.',
     category: 'operations',
     sourcePath: 'docs/guide/troubleshooting.md',
-    content: troubleshootingMarkdown,
+    rawContent: troubleshootingMarkdown,
+    content: rewriteMarkdownAssets('docs/guide/troubleshooting.md', troubleshootingMarkdown),
     relatedSlugs: ['getting-started', 'configuring-providers', 'executors']
   }
 ];
@@ -190,7 +295,10 @@ export function validateEmbeddedDocs(): string[] {
   const slugSet = new Set<string>();
   const sourcePathSet = new Set<string>();
   const allowedSlugs = new Set(embeddedDocs.map((doc) => doc.slug));
-  const allMarkdownSources: Array<{ title: string; sourcePath: string; content: string }> = [docsOverview, ...embeddedDocs];
+  const allMarkdownSources: Array<{ title: string; sourcePath: string; content: string }> = [
+    { title: docsOverview.title, sourcePath: docsOverview.sourcePath, content: docsOverview.rawContent ?? docsOverview.content },
+    ...embeddedDocs.map((doc) => ({ title: doc.title, sourcePath: doc.sourcePath, content: doc.rawContent ?? doc.content }))
+  ];
 
   for (const doc of embeddedDocs) {
     if (slugSet.has(doc.slug)) {
@@ -256,6 +364,14 @@ export function validateEmbeddedDocs(): string[] {
 
         if (!ALLOWED_APP_ROUTE_RE.test(target)) {
           errors.push(`Unsupported app route in ${doc.sourcePath}: ${target}`);
+        }
+        continue;
+      }
+
+      if (target.startsWith('./') || target.startsWith('../')) {
+        const resolvedTarget = resolveDocRelativePath(doc.sourcePath, target);
+        if (!DOC_ASSET_URLS[resolvedTarget]) {
+          errors.push(`Relative link or asset is not allowlisted in ${doc.sourcePath}: ${target}`);
         }
         continue;
       }

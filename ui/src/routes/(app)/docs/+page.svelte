@@ -1,10 +1,10 @@
 <script lang="ts">
-  import { renderMarkdown } from '$lib/markdown';
+  import { renderDocsMarkdown } from '$lib/markdown';
   import Card from '$lib/components/ui/Card.svelte';
   import { docsOverview, getCategoryLabel, getDocsByCategory } from '$lib/docs';
 
   const groups = getDocsByCategory();
-  const overviewHtml = renderMarkdown(docsOverview.content);
+  const overviewHtml = renderDocsMarkdown(docsOverview.content);
 </script>
 
 <svelte:head>
@@ -12,7 +12,7 @@
 </svelte:head>
 
 <section class="space-y-6">
-  <Card class="p-6">
+  <Card class="p-4 sm:p-6">
     <p class="text-sm uppercase tracking-[0.25em] text-sky-300">Docs</p>
     <h1 class="mt-2 text-2xl font-semibold text-white">Embedded user guides</h1>
     <p class="mt-3 max-w-3xl text-sm leading-6 text-slate-400">
@@ -20,8 +20,8 @@
     </p>
   </Card>
 
-  <Card class="p-6">
-    <div class="chat-markdown prose prose-invert max-w-none prose-headings:text-white prose-p:text-slate-300 prose-strong:text-white prose-li:text-slate-300 prose-code:text-sky-200 prose-pre:border prose-pre:border-slate-800 prose-pre:bg-slate-950/80 prose-table:text-slate-200" >{@html overviewHtml}</div>
+  <Card class="p-4 sm:p-6">
+    <div class="docs-markdown chat-markdown min-w-0 max-w-full overflow-x-hidden break-words prose prose-invert max-w-none prose-headings:text-white prose-p:text-slate-300 prose-strong:text-white prose-li:text-slate-300 prose-code:text-sky-200 prose-pre:border prose-pre:border-slate-800 prose-pre:bg-slate-950/80 prose-table:text-slate-200">{@html overviewHtml}</div>
   </Card>
 
   {#each groups as group}

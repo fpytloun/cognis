@@ -72,6 +72,26 @@ textarea:focus-visible,
   padding-top: 3rem;
 }
 
+.docs-markdown {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.docs-markdown :is(p, li, a, code, strong, em) {
+  overflow-wrap: anywhere;
+}
+
+.docs-markdown .markdown-code-wrap,
+.docs-markdown .markdown-table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.docs-markdown .markdown-code-wrap pre,
+.docs-markdown .markdown-table-wrap table {
+  min-width: max-content;
+}
+
 .chat-code-copy-button {
   position: absolute;
   top: 0.75rem;

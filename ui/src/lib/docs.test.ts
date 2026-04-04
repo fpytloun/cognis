@@ -43,6 +43,9 @@ describe('embedded docs registry', () => {
 
   it('resolves known slugs and validates link policy', () => {
     expect(getEmbeddedDoc('getting-started')?.title).toBe('Getting Started');
+    expect(getEmbeddedDoc('architecture')?.title).toBe('Architecture');
+    expect(getEmbeddedDoc('settings')?.title).toBe('Settings');
+    expect(getEmbeddedDoc('tools-and-skills')?.title).toBe('Tools and Skills');
     expect(validateEmbeddedDocs()).toEqual([]);
   });
 
@@ -52,5 +55,12 @@ describe('embedded docs registry', () => {
     expect(docs.length).toBeGreaterThan(0);
     expect(docs.every((doc) => getDocHref(doc.slug).startsWith('/docs/'))).toBe(true);
     expect(docs.some((doc) => getDocHref(doc.slug).includes('github.com'))).toBe(false);
+  });
+
+  it('rewrites allowlisted relative svg assets into bundled URLs', () => {
+    const architecture = getEmbeddedDoc('architecture');
+
+    expect(architecture?.content).toContain('cognis-ecosystem-overview');
+    expect(architecture?.content).not.toContain('../assets/images/');
   });
 });

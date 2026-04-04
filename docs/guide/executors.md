@@ -2,6 +2,8 @@
 
 Executors are the part of Cognis that perform tool execution. The controller decides what should happen; executors are the hands that actually run tools.
 
+![Controller and executor split](../assets/images/cognis-controller-executor-split.svg)
+
 ## Why executors exist
 
 This separation lets Cognis:

@@ -13,7 +13,7 @@ This guide walks through the shortest path to a working Cognis system with the w
 ## 1. Start Cognis once to generate local state
 
 ```bash
-OPENAI_API_KEY=sk-... uvx cognis
+uvx cognis
 ```
 
 On first start, Cognis creates `~/.cognis/` with:
@@ -23,6 +23,8 @@ On first start, Cognis creates `~/.cognis/` with:
 - a local SQLite database unless you configure another database
 
 When bundled UI assets are available, Cognis serves the workspace on `http://localhost:8080` and prints a one-time setup URL if no users exist yet.
+
+If you already know which model backend you want to use, you can also start Cognis with that credential in place, but it is not required just to bootstrap the installation.
 
 ## 2. Start the companion services
 
