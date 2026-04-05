@@ -399,6 +399,60 @@ GOOGLE_CHAT_META = ChannelMeta(
 )
 
 
+BLUEBUBBLES_META = ChannelMeta(
+    channel_type="bluebubbles",
+    label="iMessage (BlueBubbles)",
+    description=(
+        "iMessage via BlueBubbles server on macOS. "
+        "Outbound messages use the BlueBubbles REST API; "
+        "inbound messages arrive via webhooks."
+    ),
+    icon="imessage",
+    docs_url="https://bluebubbles.app",
+    capabilities=ChannelCapabilities(
+        chat_types=["direct", "group"],
+        supports_typing=True,
+        supports_read_receipts=True,
+        supports_media=True,
+        supports_reactions=False,
+        max_message_length=20000,
+    ),
+    credential_fields=[
+        CredentialField(
+            name="server_url",
+            label="BlueBubbles server URL",
+            description=(
+                "URL of the BlueBubbles server "
+                "(e.g., http://192.168.1.100:1234 or https://your-bb.ngrok.io)"
+            ),
+            secret=False,
+        ),
+        CredentialField(
+            name="password",
+            label="API password",
+            description="BlueBubbles server API password",
+        ),
+    ],
+    setting_fields=[
+        SettingField(
+            name="send_read_receipts",
+            label="Send read receipts",
+            description="Send read receipts when messages are processed",
+            field_type="boolean",
+            default=True,
+        ),
+        SettingField(
+            name="enable_typing",
+            label="Typing indicators",
+            description="Send typing indicators while generating responses",
+            field_type="boolean",
+            default=True,
+        ),
+    ],
+    connection_mode="webhook",
+)
+
+
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
@@ -412,6 +466,7 @@ CHANNEL_REGISTRY: dict[str, ChannelMeta] = {
     "matrix": MATRIX_META,
     "irc": IRC_META,
     "google_chat": GOOGLE_CHAT_META,
+    "bluebubbles": BLUEBUBBLES_META,
 }
 
 

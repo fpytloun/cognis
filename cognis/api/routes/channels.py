@@ -93,6 +93,24 @@ async def _validate_signal_account(request: Request, body: dict[str, Any]) -> An
     return None
 
 
+async def _validate_bluebubbles_account(request: Request, body: dict[str, Any]) -> Any | None:
+    """Validate BlueBubbles-specific account configuration.
+
+    Returns an error response if validation fails, or ``None`` if valid.
+    """
+    credential_refs = body.get("credential_refs", {})
+
+    server_url = credential_refs.get("server_url", "")
+    if not server_url:
+        return error_response(400, "validation_error", "BlueBubbles requires server_url credential")
+
+    password = credential_refs.get("password", "")
+    if not password:
+        return error_response(400, "validation_error", "BlueBubbles requires password credential")
+
+    return None
+
+
 async def _pairing_response(
     request: Request,
     row: Any,
@@ -230,16 +248,25 @@ async def create_account(request: Request) -> Any:
 
     display_name = body.get("display_name", f"{meta.label} Account")
 
-    # --- Signal-specific validation ---
+    # --- Channel-specific validation ---
     if channel_type == "signal":
         err = await _validate_signal_account(request, body)
+        if err is not None:
+            return err
+    elif channel_type == "bluebubbles":
+        err = await _validate_bluebubbles_account(request, body)
         if err is not None:
             return err
 
     # Generate webhook secret for webhook-based channels
     webhook_secret = None
     if meta.connection_mode == "webhook":
-        webhook_secret = uuid.uuid4().hex
+        if channel_type == "bluebubbles":
+            # BlueBubbles uses the API password for webhook auth;
+            # sync the webhook secret to the configured password.
+            webhook_secret = body.get("credential_refs", {}).get("password", uuid.uuid4().hex)
+        else:
+            webhook_secret = uuid.uuid4().hex
 
     from cognis.store.queries import create_channel_account
 
@@ -344,6 +371,19 @@ async def update_account(request: Request, account_id: str) -> Any:
         err = await _validate_signal_account(request, merged)
         if err is not None:
             return err
+
+    if existing_row.channel_type == "bluebubbles":
+        merged = dict(body)
+        existing_creds = existing_row.credential_refs or {}
+        incoming_creds = body.get("credential_refs", {})
+        merged["credential_refs"] = {**existing_creds, **incoming_creds}
+        err = await _validate_bluebubbles_account(request, merged)
+        if err is not None:
+            return err
+        # Auto-sync webhook_secret when BlueBubbles password changes
+        new_password = incoming_creds.get("password")
+        if new_password:
+            body["webhook_secret"] = new_password
 
     # Only allow updating specific fields
     allowed_fields = {
@@ -466,6 +506,13 @@ async def handle_webhook(
 
     body = await request.body()
     headers = dict(request.headers)
+
+    # Include query parameters so adapters that authenticate via query
+    # string (e.g., BlueBubbles ?password=...) can verify them.
+    for key, value in request.query_params.items():
+        qp_key = f"x-query-{key}"
+        if qp_key not in headers:
+            headers[qp_key] = value
 
     result = await channel_manager.handle_webhook(
         channel_type=channel_type,

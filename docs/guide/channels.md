@@ -212,6 +212,43 @@ If the local `signal-cli` does not support one of these operations, Cognis degra
 - Direct mode does not currently provide UI-driven account linking or registration.
 - Executor migration is manual because the Signal state is still local to the executor machine.
 
+## iMessage via BlueBubbles
+
+iMessage is supported through the [BlueBubbles](https://bluebubbles.app) server, which runs on macOS and bridges iMessage to external clients via REST API and webhooks.
+
+### Prerequisites
+
+1. A macOS machine (physical or VM) with an Apple ID signed into Messages.
+2. BlueBubbles server installed and running on that Mac.
+3. The BlueBubbles web API enabled with an API password set.
+4. The BlueBubbles server reachable from Cognis (via Ngrok, Cloudflare tunnel, LAN, or similar).
+
+### Setup
+
+1. In `Channels -> Accounts -> New account`, choose `iMessage (BlueBubbles)`.
+2. Select the target agent.
+3. Fill in credentials:
+   - `BlueBubbles server URL` — the URL where BlueBubbles is reachable (e.g., `http://192.168.1.100:1234` or `https://your-bb.ngrok.io`)
+   - `API password` — the password configured in BlueBubbles server settings
+4. Save the account. Cognis uses the API password as the webhook authentication secret and displays the webhook URL.
+5. In BlueBubbles server settings, go to `Webhooks` and add a new webhook pointing to the Cognis webhook URL.
+6. BlueBubbles will include the API password in webhook requests automatically. Cognis verifies it on every inbound webhook.
+7. Start the account from the Channels page.
+
+### Features
+
+- Send and receive iMessages (DM and group)
+- Typing indicators (enabled by default)
+- Read receipts (enabled by default)
+- Inbound attachment download
+- Webhook-based inbound with duplicate message filtering
+
+### Limitations
+
+- Requires a macOS machine running BlueBubbles server.
+- Advanced iMessage actions (tapbacks, edit, unsend, group management) are not yet supported.
+- BlueBubbles must be reachable from the Cognis controller for webhook delivery.
+
 ## Operational notes
 
 - One bot or channel identity should map to one agent unless the platform explicitly supports a different pattern.

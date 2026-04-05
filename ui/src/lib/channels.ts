@@ -113,6 +113,19 @@ export const guides: Record<string, SetupGuide> = {
       'After saving, configure the Chat app HTTP endpoint to use the Cognis webhook URL.',
     ],
   },
+  bluebubbles: {
+    title: 'iMessage via BlueBubbles',
+    service: 'Requires a macOS machine running the BlueBubbles server app.',
+    publicUrlNeeded: true,
+    steps: [
+      'Install the BlueBubbles server on a macOS machine (bluebubbles.app/install).',
+      'In BlueBubbles settings, enable the web API and set an API password.',
+      'Make the BlueBubbles server reachable from Cognis (e.g. via Ngrok, Cloudflare tunnel, or LAN).',
+      'Enter the BlueBubbles server URL and API password below.',
+      'After saving, copy the Cognis webhook URL and register it in BlueBubbles (Settings → Webhooks → Add).',
+      'Use the same API password as the webhook password so BlueBubbles authenticates webhook requests.',
+    ],
+  },
 };
 
 export const policyOptions = [

@@ -44,5 +44,9 @@ def create_adapter(channel_type: str) -> BaseChannelAdapter:
         from cognis.channels.adapters.google_chat import GoogleChatAdapter
 
         return GoogleChatAdapter()
+    if channel_type == "bluebubbles":
+        from cognis.channels.adapters.bluebubbles import BlueBubblesAdapter
+
+        return BlueBubblesAdapter()
     msg = f"Unknown channel type: {channel_type}"
     raise ValueError(msg)

@@ -22,6 +22,7 @@ KNOWN_CHANNEL_TYPES: frozenset[str] = frozenset(
         "matrix",
         "irc",
         "google_chat",
+        "bluebubbles",
     }
 )
 
