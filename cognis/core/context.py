@@ -882,6 +882,7 @@ def events_to_messages(events: list[Any]) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = []
     # Buffer for consecutive tool_call events (flushed on non-tool_call)
     pending_tool_calls: list[dict[str, Any]] = []
+    open_tool_call_ids: list[str] = []
 
     def _flush_tool_calls() -> None:
         """Flush buffered tool_call events into an assistant message."""
@@ -889,6 +890,9 @@ def events_to_messages(events: list[Any]) -> list[dict[str, Any]]:
             return
         tc_array = list(pending_tool_calls)
         pending_tool_calls.clear()
+        open_tool_call_ids.extend(
+            tc.get("id", "") for tc in tc_array if isinstance(tc.get("id", ""), str)
+        )
         # Merge onto preceding assistant message if it has no tool_calls yet
         if (
             messages
@@ -901,6 +905,21 @@ def events_to_messages(events: list[Any]) -> list[dict[str, Any]]:
                 messages[-1]["content"] = None
         else:
             messages.append({"role": "assistant", "content": None, "tool_calls": tc_array})
+
+    def _append_orphan_placeholders() -> None:
+        """Close unresolved tool calls with synthetic tool messages."""
+
+        while open_tool_call_ids:
+            tc_id = open_tool_call_ids.pop(0)
+            if not tc_id:
+                continue
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tc_id,
+                    "content": "[No result recorded - step may have been interrupted]",
+                }
+            )
 
     for event in events:
         if isinstance(event, dict):
@@ -935,6 +954,7 @@ def events_to_messages(events: list[Any]) -> list[dict[str, Any]]:
         _flush_tool_calls()
 
         if event_type == "user_message":
+            _append_orphan_placeholders()
             content = event_data.get("content")
             if isinstance(content, str):
                 attachments = event_data.get("attachments")
@@ -942,6 +962,7 @@ def events_to_messages(events: list[Any]) -> list[dict[str, Any]]:
                     content = f"{content}\n\n{_attachment_note([a for a in attachments if isinstance(a, dict)])}"
                 messages.append({"role": "user", "content": content})
         elif event_type == "assistant_message":
+            _append_orphan_placeholders()
             content = event_data.get("content")
             if isinstance(content, str):
                 attachments = event_data.get("attachments")
@@ -953,7 +974,8 @@ def events_to_messages(events: list[Any]) -> list[dict[str, Any]]:
             # fall back to "output" for forward-compatibility.
             output = event_data.get("result") or event_data.get("output")
             call_id = event_data.get("call_id", "")
-            if isinstance(output, str):
+            if isinstance(output, str) and call_id in open_tool_call_ids:
+                open_tool_call_ids.remove(call_id)
                 messages.append(
                     {
                         "role": "tool",
@@ -962,6 +984,7 @@ def events_to_messages(events: list[Any]) -> list[dict[str, Any]]:
                     }
                 )
         elif event_type == "delegation":
+            _append_orphan_placeholders()
             status = event_data.get("status")
             if status == "completed":
                 child_id = event_data.get("child_session_id", "unknown")
@@ -1003,6 +1026,7 @@ def events_to_messages(events: list[Any]) -> list[dict[str, Any]]:
                     }
                 )
         elif event_type == "lifecycle":
+            _append_orphan_placeholders()
             lifecycle_event = event_data.get("event", "")
             if lifecycle_event in {"task_result", "task_failed", "task_cancelled"}:
                 messages.append(
@@ -1026,6 +1050,7 @@ def events_to_messages(events: list[Any]) -> list[dict[str, Any]]:
                     messages.append({"role": "system", "content": notice_msg})
             # Other lifecycle events (task_status, etc.) are informational — skip
         elif event_type == "evaluation":
+            _append_orphan_placeholders()
             eval_event = event_data.get("event", "")
             if eval_event == "evaluation_feedback":
                 attempt = event_data.get("attempt", "?")
@@ -1049,26 +1074,7 @@ def events_to_messages(events: list[Any]) -> list[dict[str, Any]]:
     # the message sequence is valid.
     if pending_tool_calls:
         _flush_tool_calls()
-        # The flushed assistant message is now the last (or near-last) in
-        # messages.  Check if any of its tool_call IDs lack a subsequent
-        # tool response and add placeholders.
-        for tc in (
-            messages[-1].get("tool_calls", [])
-            if messages and messages[-1].get("tool_calls")
-            else []
-        ):
-            tc_id = tc.get("id", "")
-            has_response = any(
-                m.get("role") == "tool" and m.get("tool_call_id") == tc_id for m in messages
-            )
-            if not has_response:
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tc_id,
-                        "content": "[No result recorded — step may have been interrupted]",
-                    }
-                )
+    _append_orphan_placeholders()
     return messages
 
 

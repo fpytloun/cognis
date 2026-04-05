@@ -385,3 +385,32 @@ def test_events_to_messages_orphaned_tool_calls_get_placeholder() -> None:
     assert messages[1]["role"] == "tool"
     assert messages[1]["tool_call_id"] == "c1"
     assert "interrupted" in messages[1]["content"].lower()
+
+
+def test_events_to_messages_repairs_orphaned_tool_calls_before_next_message() -> None:
+    events = [
+        {"type": "tool_call", "data": {"name": "search", "call_id": "c1"}},
+        {"type": "user_message", "data": {"content": "continue"}},
+    ]
+
+    messages = events_to_messages(events)
+
+    assert messages[0]["role"] == "assistant"
+    assert messages[1]["role"] == "tool"
+    assert messages[1]["tool_call_id"] == "c1"
+    assert messages[2] == {"role": "user", "content": "continue"}
+
+
+def test_events_to_messages_ignores_late_tool_result_after_placeholder_repair() -> None:
+    events = [
+        {"type": "tool_call", "data": {"name": "search", "call_id": "c1"}},
+        {"type": "assistant_message", "data": {"content": "moving on"}},
+        {"type": "tool_result", "data": {"call_id": "c1", "result": "late result"}},
+    ]
+
+    messages = events_to_messages(events)
+
+    assert messages[0]["role"] == "assistant"
+    assert messages[1]["role"] == "tool"
+    assert "late result" not in [message.get("content") for message in messages]
+    assert messages[2] == {"role": "assistant", "content": "moving on"}

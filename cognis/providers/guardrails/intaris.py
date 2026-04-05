@@ -432,8 +432,8 @@ class IntarisProvider:
                 "/api/v1/mcp/call",
                 json={
                     "session_id": session_id,
-                    "server_name": server_name,
-                    "tool_name": tool_name,
+                    "server": server_name,
+                    "tool": tool_name,
                     "arguments": arguments,
                 },
                 headers=self._headers(user_email=current_user_email.get()),
