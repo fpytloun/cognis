@@ -27,6 +27,7 @@ from cognis.models.config import (
 from cognis.providers.llm.responses_bridge import (
     messages_to_responses_input,
     normalize_openai_model_name,
+    responses_request_kwargs,
     responses_stream_to_chat_chunks,
     responses_to_chat_response,
     should_use_openai_responses,
@@ -395,7 +396,7 @@ class LiteLLMProvider:
                 input=messages_to_responses_input(prepared_messages),
                 stream=False,
                 operation=f"generate.responses({prefixed_model})",
-                **self._responses_request_kwargs(request_kwargs),
+                **responses_request_kwargs(request_kwargs),
             )
             return responses_to_chat_response(_model_dump(response))
         response = await with_llm_retry(
@@ -486,7 +487,7 @@ class LiteLLMProvider:
                 input=messages_to_responses_input(prepared_messages),
                 stream=True,
                 operation=f"stream_generate.responses({prefixed_model})",
-                **self._responses_request_kwargs(request_kwargs),
+                **responses_request_kwargs(request_kwargs),
             )
             try:
                 async for chunk in responses_stream_to_chat_chunks(stream):
@@ -990,20 +991,6 @@ class LiteLLMProvider:
             request_kwargs=request_kwargs,
         ):
             yield chunk
-
-    def _responses_request_kwargs(self, request_kwargs: dict[str, Any]) -> dict[str, Any]:
-        filtered = dict(request_kwargs)
-        filtered.pop("cognis_llm_api", None)
-        response_format = filtered.pop("response_format", None)
-        if response_format is not None and "text" not in filtered and "text_format" not in filtered:
-            filtered["text"] = {
-                "format": response_format
-                if isinstance(response_format, dict)
-                else {"type": str(response_format)}
-            }
-        if "max_tokens" in filtered and "max_output_tokens" not in filtered:
-            filtered["max_output_tokens"] = filtered.pop("max_tokens")
-        return filtered
 
     # ------------------------------------------------------------------
     # Image generation (ImageGenerationProvider)

@@ -9,6 +9,7 @@ import litellm
 
 from cognis.providers.llm.responses_bridge import (
     messages_to_responses_input,
+    responses_request_kwargs,
     responses_stream_to_chat_chunks,
     responses_to_chat_response,
 )
@@ -45,7 +46,7 @@ class InferenceHandler:
 
         try:
             if llm_api == "responses":
-                request_kwargs = _responses_request_kwargs(request_kwargs)
+                request_kwargs = responses_request_kwargs(request_kwargs)
                 stream = await litellm.aresponses(
                     model=model,
                     input=messages_to_responses_input(messages),
@@ -137,7 +138,7 @@ class InferenceHandler:
                 model=model,
                 input=messages_to_responses_input(messages),
                 stream=False,
-                **_responses_request_kwargs(request_kwargs),
+                **responses_request_kwargs(request_kwargs),
             )
             return responses_to_chat_response(response.model_dump())
         response = await litellm.acompletion(
@@ -201,17 +202,3 @@ class InferenceHandler:
         )
         dumped = response.model_dump()
         return dumped if isinstance(dumped, dict) else {}
-
-
-def _responses_request_kwargs(request_kwargs: dict[str, Any]) -> dict[str, Any]:
-    filtered = dict(request_kwargs)
-    response_format = filtered.pop("response_format", None)
-    if response_format is not None and "text" not in filtered and "text_format" not in filtered:
-        filtered["text"] = {
-            "format": response_format
-            if isinstance(response_format, dict)
-            else {"type": str(response_format)}
-        }
-    if "max_tokens" in filtered and "max_output_tokens" not in filtered:
-        filtered["max_output_tokens"] = filtered.pop("max_tokens")
-    return filtered

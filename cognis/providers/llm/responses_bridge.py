@@ -12,9 +12,12 @@ import json
 from collections.abc import AsyncIterator
 from typing import Any
 
+from cognis.logging import get_logger
 from cognis.models.config import ModelInfo
 
 RESPONSES_MODE_ENV = "COGNIS_OPENAI_RESPONSES_MODE"
+
+logger = get_logger(__name__)
 
 
 def should_use_openai_responses(
@@ -87,6 +90,26 @@ def messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str
     return items
 
 
+def responses_request_kwargs(request_kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Translate chat-completions-style kwargs into Responses-compatible kwargs."""
+
+    filtered = dict(request_kwargs)
+    filtered.pop("cognis_llm_api", None)
+    response_format = filtered.pop("response_format", None)
+    if response_format is not None and "text" not in filtered and "text_format" not in filtered:
+        filtered["text"] = {
+            "format": response_format
+            if isinstance(response_format, dict)
+            else {"type": str(response_format)}
+        }
+    if "max_tokens" in filtered and "max_output_tokens" not in filtered:
+        filtered["max_output_tokens"] = filtered.pop("max_tokens")
+    tools = filtered.get("tools")
+    if isinstance(tools, list):
+        filtered["tools"] = [_tool_to_responses_tool(tool) for tool in tools]
+    return filtered
+
+
 def normalize_tool_call_id(
     call_id: str | None, item_id: str | None, fallback_seed: str | int
 ) -> str:
@@ -126,54 +149,113 @@ async def responses_stream_to_chat_chunks(
     """Normalize Responses streaming events into chat-like delta chunks."""
 
     state = _ResponsesStreamState()
-    async for raw_event in stream:
-        event = _to_dict(raw_event)
-        event_type = str(event.get("type", ""))
-        if event_type == "response.output_text.delta":
-            delta = event.get("delta")
-            if isinstance(delta, str) and delta:
-                yield {"choices": [{"delta": {"content": delta}}]}
-            continue
-        if event_type == "response.output_item.added":
-            item = _get_output_item(event)
-            if item is None:
+    try:
+        async for raw_event in stream:
+            event = _to_dict(raw_event)
+            event_type = _normalize_event_type(str(event.get("type", "")).strip())
+            if not event_type:
+                event_type = _detect_synthetic_event_type(event, raw_event)
+            state.note_event(event_type)
+            if event_type == "response.output_text.delta":
+                delta = event.get("delta")
+                if isinstance(delta, str) and delta:
+                    state.note_text_emitted(delta)
+                    yield {"choices": [{"delta": {"content": delta}}]}
                 continue
-            state.register_item(item)
-            initial_chunk = state.initial_tool_delta(item)
-            if initial_chunk is not None:
-                yield initial_chunk
-            continue
-        if event_type == "response.function_call_arguments.delta":
-            chunk = state.arguments_delta(event)
-            if chunk is not None:
-                yield chunk
-            continue
-        if event_type == "response.output_item.done":
-            item = _get_output_item(event)
-            if item is None:
+            if event_type == "response.output_text.done":
+                text = event.get("text")
+                if isinstance(text, str) and text:
+                    final_text_chunk = state.final_text_delta(text)
+                    if final_text_chunk is not None:
+                        yield final_text_chunk
                 continue
-            final_chunk = state.finalize_item(item)
-            if final_chunk is not None:
-                yield final_chunk
-            continue
-        if event_type == "response.completed":
-            response_payload = _to_dict(event.get("response") or {})
-            yield {
-                "choices": [
-                    {"delta": {}, "finish_reason": _extract_finish_reason(response_payload)}
-                ],
-                "usage": _extract_usage(response_payload),
-            }
-            continue
-        if event_type == "response.failed":
-            error = event.get("error") or {}
-            message = error.get("message") if isinstance(error, dict) else str(error)
-            yield {"error": str(message or "Responses stream failed"), "mid_stream_failure": True}
+            if event_type in {"response.content_part.added", "response.content_part.done"}:
+                part = event.get("part")
+                part_text = _extract_part_text(part)
+                if part_text:
+                    part_chunk = state.final_text_delta(part_text)
+                    if part_chunk is not None:
+                        yield part_chunk
+                continue
+            if event_type == "response.output_item.added":
+                item = _get_output_item(event)
+                if item is None:
+                    continue
+                state.register_item(item)
+                message_chunk = state.message_delta(item)
+                if message_chunk is not None:
+                    yield message_chunk
+                initial_chunk = state.initial_tool_delta(item)
+                if initial_chunk is not None:
+                    yield initial_chunk
+                continue
+            if event_type == "response.function_call_arguments.delta":
+                chunk = state.arguments_delta(event)
+                if chunk is not None:
+                    yield chunk
+                continue
+            if event_type == "response.output_item.done":
+                item = _get_output_item(event)
+                if item is None:
+                    continue
+                message_chunk = state.finalize_message_item(item)
+                if message_chunk is not None:
+                    yield message_chunk
+                final_chunk = state.finalize_item(item)
+                if final_chunk is not None:
+                    yield final_chunk
+                continue
+            if event_type in {"response.completed", "response.completed.synthetic"}:
+                response_payload = _to_dict(event.get("response") or event)
+                fallback_text = state.final_message_fallback(response_payload)
+                if fallback_text is not None:
+                    yield fallback_text
+                state.completed_seen = True
+                yield {
+                    "choices": [
+                        {"delta": {}, "finish_reason": _extract_finish_reason(response_payload)}
+                    ],
+                    "usage": _extract_usage(response_payload),
+                }
+                continue
+            if event_type == "response.failed":
+                error = event.get("error") or {}
+                message = error.get("message") if isinstance(error, dict) else str(error)
+                yield {
+                    "error": str(message or "Responses stream failed"),
+                    "mid_stream_failure": True,
+                }
+    finally:
+        logger.debug(
+            "Responses bridge stream summary",
+            extra={
+                "extra_data": {
+                    "event_counts": dict(sorted(state.event_counts.items())),
+                    "text_emissions": state.text_emissions,
+                    "tool_call_emissions": state.tool_call_emissions,
+                    "completed_fallback_used": state.completed_fallback_used,
+                    "completed_seen": state.completed_seen,
+                }
+            },
+        )
 
 
 class _ResponsesStreamState:
     def __init__(self) -> None:
         self._items: dict[str, dict[str, Any]] = {}
+        self._emitted_text = ""
+        self.event_counts: dict[str, int] = {}
+        self.text_emissions = 0
+        self.tool_call_emissions = 0
+        self.completed_fallback_used = False
+        self.completed_seen = False
+
+    def note_event(self, event_type: str) -> None:
+        self.event_counts[event_type] = self.event_counts.get(event_type, 0) + 1
+
+    def note_text_emitted(self, text: str) -> None:
+        self._emitted_text += text
+        self.text_emissions += 1
 
     def register_item(self, item: dict[str, Any]) -> None:
         item_id = str(item.get("id") or item.get("call_id") or "")
@@ -185,6 +267,63 @@ class _ResponsesStreamState:
             "arguments": str(item.get("arguments") or ""),
             "emitted": 0,
         }
+
+    def message_delta(self, item: dict[str, Any]) -> dict[str, Any] | None:
+        if str(item.get("type")) != "message":
+            return None
+        text = _extract_message_item_text(item)
+        if not text:
+            return None
+        self.note_text_emitted(text)
+        return {"choices": [{"delta": {"content": text}}]}
+
+    def finalize_message_item(self, item: dict[str, Any]) -> dict[str, Any] | None:
+        if str(item.get("type")) != "message":
+            return None
+        text = _extract_message_item_text(item)
+        if not text:
+            return None
+        if self._emitted_text.endswith(text) or text == self._emitted_text:
+            return None
+        if text.startswith(self._emitted_text):
+            delta = text[len(self._emitted_text) :]
+            if not delta:
+                return None
+            self.note_text_emitted(delta)
+            return {"choices": [{"delta": {"content": delta}}]}
+        self.note_text_emitted(text)
+        return {"choices": [{"delta": {"content": text}}]}
+
+    def final_message_fallback(self, response_payload: dict[str, Any]) -> dict[str, Any] | None:
+        fallback_text, _ = _extract_response_output(response_payload)
+        if not fallback_text:
+            return None
+        if fallback_text == self._emitted_text:
+            return None
+        if fallback_text.startswith(self._emitted_text):
+            delta = fallback_text[len(self._emitted_text) :]
+            if not delta:
+                return None
+            self.note_text_emitted(delta)
+            self.completed_fallback_used = True
+            return {"choices": [{"delta": {"content": delta}}]}
+        self.note_text_emitted(fallback_text)
+        self.completed_fallback_used = True
+        return {"choices": [{"delta": {"content": fallback_text}}]}
+
+    def final_text_delta(self, text: str) -> dict[str, Any] | None:
+        if not text:
+            return None
+        if text == self._emitted_text:
+            return None
+        if text.startswith(self._emitted_text):
+            delta = text[len(self._emitted_text) :]
+            if not delta:
+                return None
+            self.note_text_emitted(delta)
+            return {"choices": [{"delta": {"content": delta}}]}
+        self.note_text_emitted(text)
+        return {"choices": [{"delta": {"content": text}}]}
 
     def initial_tool_delta(self, item: dict[str, Any]) -> dict[str, Any] | None:
         if str(item.get("type")) != "function_call":
@@ -213,6 +352,7 @@ class _ResponsesStreamState:
                 "arguments"
             ]
             state["emitted"] = len(state["arguments"])
+        self.tool_call_emissions += 1
         return chunk
 
     def arguments_delta(self, event: dict[str, Any]) -> dict[str, Any] | None:
@@ -277,11 +417,9 @@ def _extract_response_output(payload: dict[str, Any]) -> tuple[str, list[dict[st
             continue
         item_type = str(item.get("type", ""))
         if item_type == "message":
-            for part in item.get("content") or []:
-                if isinstance(part, dict) and part.get("type") in {"output_text", "text"}:
-                    text = part.get("text")
-                    if isinstance(text, str) and text:
-                        content_parts.append(text)
+            text = _extract_message_item_text(item)
+            if text:
+                content_parts.append(text)
         elif item_type == "function_call":
             tool_calls.append(
                 {
@@ -312,6 +450,24 @@ def _extract_usage(payload: dict[str, Any]) -> dict[str, Any]:
     return usage if isinstance(usage, dict) else {}
 
 
+def _extract_message_item_text(item: dict[str, Any]) -> str:
+    text_parts: list[str] = []
+    for part in item.get("content") or []:
+        part_text = _extract_part_text(part)
+        if part_text:
+            text_parts.append(part_text)
+    return "".join(text_parts)
+
+
+def _extract_part_text(part: Any) -> str:
+    if not isinstance(part, dict):
+        return ""
+    if part.get("type") not in {"output_text", "text", "input_text"}:
+        return ""
+    text = part.get("text")
+    return text if isinstance(text, str) else ""
+
+
 def _normalize_message_content(content: Any) -> Any:
     if isinstance(content, list):
         return content
@@ -335,3 +491,64 @@ def _to_dict(value: Any) -> dict[str, Any]:
     if hasattr(value, "__dict__"):
         return dict(value.__dict__)
     return {}
+
+
+def _detect_synthetic_event_type(event: dict[str, Any], raw_event: Any) -> str:
+    if "response" in event and isinstance(event.get("response"), dict):
+        response = event["response"]
+        if isinstance(response, dict) and response.get("status") in {
+            "completed",
+            "failed",
+            "incomplete",
+        }:
+            return "response.completed.synthetic"
+    if event.get("status") in {"completed", "failed", "incomplete"} and (
+        "output" in event or "usage" in event
+    ):
+        return "response.completed.synthetic"
+    return f"unknown:{type(raw_event).__name__}"
+
+
+def _normalize_event_type(event_type: str) -> str:
+    if not event_type:
+        return ""
+    if event_type.startswith("ResponsesAPIStreamEvents."):
+        suffix = event_type.split(".", 1)[1].lower()
+        for prefix in (
+            "output_text_",
+            "content_part_",
+            "output_item_",
+            "function_call_arguments_",
+            "reasoning_summary_text_",
+            "reasoning_summary_part_",
+            "reasoning_text_",
+            "refusal_",
+        ):
+            if suffix.startswith(prefix):
+                head = prefix.rstrip("_")
+                tail = suffix[len(prefix) :]
+                return f"response.{head}.{tail.replace('_', '.')}"
+        if suffix.startswith("response_"):
+            return f"response.{suffix[len('response_') :].replace('_', '.')}"
+        return f"response.{suffix.replace('_', '.')}"
+    return event_type
+
+
+def _tool_to_responses_tool(tool: Any) -> dict[str, Any]:
+    if isinstance(tool, dict):
+        function = tool.get("function") if isinstance(tool.get("function"), dict) else None
+        if function is not None:
+            converted = {
+                "type": str(tool.get("type") or "function"),
+                "name": str(function.get("name") or ""),
+                "description": str(function.get("description") or ""),
+                "parameters": function.get("parameters")
+                if isinstance(function.get("parameters"), dict)
+                else {},
+            }
+            if "defer_loading" in function:
+                converted["defer_loading"] = bool(function.get("defer_loading"))
+            if "strict" in function:
+                converted["strict"] = bool(function.get("strict"))
+            return converted
+    return dict(tool) if isinstance(tool, dict) else {"type": "function", "name": str(tool)}

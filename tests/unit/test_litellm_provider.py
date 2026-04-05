@@ -351,6 +351,65 @@ async def test_litellm_provider_generate_uses_responses_bridge_for_supported_mod
 
 
 @pytest.mark.asyncio
+async def test_litellm_provider_responses_bridge_translates_tools_shape(
+    tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="proxy",
+                display_name="LiteLLM Proxy",
+                location="controller",
+                backend="litellm",
+                config={"preset": "litellm_proxy", "default_model": "gpt-5.4"},
+                status="active",
+            )
+        )
+        await session.commit()
+
+    captured: dict[str, object] = {}
+
+    class _Response:
+        def model_dump(self) -> dict[str, object]:
+            return {"status": "completed", "output": []}
+
+    async def _fake_aresponses(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return _Response()
+
+    monkeypatch.setenv("COGNIS_OPENAI_RESPONSES_MODE", "on")
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.aresponses", _fake_aresponses)
+
+    provider = LiteLLMProvider(session_factory)
+    await provider.generate(
+        messages=[{"role": "user", "content": "hi"}],
+        model="gpt-5.4",
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "search_tools",
+                    "description": "Search tools",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+    )
+
+    assert captured["tools"] == [
+        {
+            "type": "function",
+            "name": "search_tools",
+            "description": "Search tools",
+            "parameters": {"type": "object", "properties": {}},
+        }
+    ]
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_litellm_provider_stream_generate_normalizes_responses_events(
     tmp_path: object,
     monkeypatch: pytest.MonkeyPatch,
@@ -412,6 +471,267 @@ async def test_litellm_provider_stream_generate_normalizes_responses_events(
         == '{"query":"docs"}'
     )
     assert chunks[-1]["usage"]["total_tokens"] == 7
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_litellm_provider_stream_generate_emits_message_item_text_without_output_delta(
+    tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="proxy",
+                display_name="LiteLLM Proxy",
+                location="controller",
+                backend="litellm",
+                config={"preset": "litellm_proxy", "default_model": "gpt-5.4"},
+                status="active",
+            )
+        )
+        await session.commit()
+
+    async def _fake_stream() -> object:
+        yield {
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "Hello from item"}],
+            },
+        }
+        yield {
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "Hello from item"}],
+                    }
+                ],
+                "usage": {"total_tokens": 5},
+            },
+        }
+
+    async def _fake_aresponses(**_: object) -> object:
+        return _fake_stream()
+
+    monkeypatch.setenv("COGNIS_OPENAI_RESPONSES_MODE", "on")
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.aresponses", _fake_aresponses)
+
+    provider = LiteLLMProvider(session_factory)
+    chunks = [
+        chunk
+        async for chunk in provider.stream_generate(
+            messages=[{"role": "user", "content": "hi"}],
+            model="gpt-5.4",
+        )
+    ]
+
+    assert chunks[0]["choices"][0]["delta"]["content"] == "Hello from item"
+    assert chunks[-1]["usage"]["total_tokens"] == 5
+    assert len([chunk for chunk in chunks if chunk.get("choices")]) == 2
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_litellm_provider_stream_generate_emits_output_text_done_without_delta(
+    tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="proxy",
+                display_name="LiteLLM Proxy",
+                location="controller",
+                backend="litellm",
+                config={"preset": "litellm_proxy", "default_model": "gpt-5.4"},
+                status="active",
+            )
+        )
+        await session.commit()
+
+    async def _fake_stream() -> object:
+        yield {"type": "response.output_text.done", "text": "Hello from done"}
+        yield {
+            "type": "response.completed",
+            "response": {"status": "completed", "usage": {"total_tokens": 4}},
+        }
+
+    async def _fake_aresponses(**_: object) -> object:
+        return _fake_stream()
+
+    monkeypatch.setenv("COGNIS_OPENAI_RESPONSES_MODE", "on")
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.aresponses", _fake_aresponses)
+
+    provider = LiteLLMProvider(session_factory)
+    chunks = [
+        chunk
+        async for chunk in provider.stream_generate(
+            messages=[{"role": "user", "content": "hi"}],
+            model="gpt-5.4",
+        )
+    ]
+
+    assert chunks[0]["choices"][0]["delta"]["content"] == "Hello from done"
+    assert chunks[-1]["usage"]["total_tokens"] == 4
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_litellm_provider_stream_generate_normalizes_enum_style_event_types(
+    tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="proxy",
+                display_name="LiteLLM Proxy",
+                location="controller",
+                backend="litellm",
+                config={"preset": "litellm_proxy", "default_model": "gpt-5.4"},
+                status="active",
+            )
+        )
+        await session.commit()
+
+    async def _fake_stream() -> object:
+        yield {"type": "ResponsesAPIStreamEvents.OUTPUT_TEXT_DELTA", "delta": "Hello"}
+        yield {"type": "ResponsesAPIStreamEvents.OUTPUT_TEXT_DONE", "text": "Hello"}
+        yield {
+            "type": "ResponsesAPIStreamEvents.RESPONSE_COMPLETED",
+            "response": {"status": "completed", "usage": {"total_tokens": 4}},
+        }
+
+    async def _fake_aresponses(**_: object) -> object:
+        return _fake_stream()
+
+    monkeypatch.setenv("COGNIS_OPENAI_RESPONSES_MODE", "on")
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.aresponses", _fake_aresponses)
+
+    provider = LiteLLMProvider(session_factory)
+    chunks = [
+        chunk
+        async for chunk in provider.stream_generate(
+            messages=[{"role": "user", "content": "hi"}],
+            model="gpt-5.4",
+        )
+    ]
+
+    text_chunks = [
+        chunk
+        for chunk in chunks
+        if chunk.get("choices") and chunk["choices"][0]["delta"].get("content")
+    ]
+    assert len(text_chunks) == 1
+    assert text_chunks[0]["choices"][0]["delta"]["content"] == "Hello"
+    assert chunks[-1]["usage"]["total_tokens"] == 4
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_litellm_provider_stream_generate_does_not_duplicate_output_text_done(
+    tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="proxy",
+                display_name="LiteLLM Proxy",
+                location="controller",
+                backend="litellm",
+                config={"preset": "litellm_proxy", "default_model": "gpt-5.4"},
+                status="active",
+            )
+        )
+        await session.commit()
+
+    async def _fake_stream() -> object:
+        yield {"type": "response.output_text.delta", "delta": "Hello"}
+        yield {"type": "response.output_text.done", "text": "Hello"}
+        yield {
+            "type": "response.completed",
+            "response": {"status": "completed", "usage": {"total_tokens": 4}},
+        }
+
+    async def _fake_aresponses(**_: object) -> object:
+        return _fake_stream()
+
+    monkeypatch.setenv("COGNIS_OPENAI_RESPONSES_MODE", "on")
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.aresponses", _fake_aresponses)
+
+    provider = LiteLLMProvider(session_factory)
+    chunks = [
+        chunk
+        async for chunk in provider.stream_generate(
+            messages=[{"role": "user", "content": "hi"}],
+            model="gpt-5.4",
+        )
+    ]
+
+    text_chunks = [
+        chunk
+        for chunk in chunks
+        if chunk.get("choices") and chunk["choices"][0]["delta"].get("content")
+    ]
+    assert len(text_chunks) == 1
+    assert text_chunks[0]["choices"][0]["delta"]["content"] == "Hello"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_litellm_provider_stream_generate_emits_content_part_done_text(
+    tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="proxy",
+                display_name="LiteLLM Proxy",
+                location="controller",
+                backend="litellm",
+                config={"preset": "litellm_proxy", "default_model": "gpt-5.4"},
+                status="active",
+            )
+        )
+        await session.commit()
+
+    async def _fake_stream() -> object:
+        yield {
+            "type": "response.content_part.done",
+            "part": {"type": "output_text", "text": "Hello from content part"},
+        }
+        yield {
+            "type": "response.completed",
+            "response": {"status": "completed", "usage": {"total_tokens": 4}},
+        }
+
+    async def _fake_aresponses(**_: object) -> object:
+        return _fake_stream()
+
+    monkeypatch.setenv("COGNIS_OPENAI_RESPONSES_MODE", "on")
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.aresponses", _fake_aresponses)
+
+    provider = LiteLLMProvider(session_factory)
+    chunks = [
+        chunk
+        async for chunk in provider.stream_generate(
+            messages=[{"role": "user", "content": "hi"}],
+            model="gpt-5.4",
+        )
+    ]
+
+    assert chunks[0]["choices"][0]["delta"]["content"] == "Hello from content part"
     await engine.dispose()
 
 
