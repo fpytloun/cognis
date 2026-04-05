@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+from types import SimpleNamespace
+
 import pytest
 
 from cognis.core.agent_loop import (
+    AgentLoop,
     PauseResolution,
     PauseWaiter,
     SessionLock,
@@ -14,6 +18,7 @@ from cognis.core.agent_loop import (
 )
 from cognis.models.agent import AgentDefinition, AgentPermissions
 from cognis.models.tool import Permission, ToolDefinition, ToolSource
+from cognis.models.workflow import StepOutput
 from cognis.tools.builtin.tool_search import SEARCH_TOOLS_TOOL
 
 # ---------------------------------------------------------------------------
@@ -253,3 +258,100 @@ def test_controller_builtin_enabled_honors_disabled_tools() -> None:
     )
 
     assert _controller_builtin_enabled(agent, SEARCH_TOOLS_TOOL) is False
+
+
+@pytest.mark.asyncio
+async def test_run_child_session_resolves_fresh_runtime() -> None:
+    runtime_calls: list[tuple[str, str]] = []
+    cleanup_called = False
+    captured_tool_registry: list[object] = []
+
+    async def _runtime_factory(
+        *, agent: AgentDefinition, user_email: str
+    ) -> tuple[object, object, object]:
+        runtime_calls.append((agent.agent_id, user_email))
+
+        async def _cleanup() -> None:
+            nonlocal cleanup_called
+            cleanup_called = True
+
+        return "child-registry", "child-executor", _cleanup
+
+    class _SessionContextManager:
+        async def __aenter__(self) -> SimpleNamespace:
+            return SimpleNamespace()
+
+        async def __aexit__(self, exc_type: object, exc: object, tb: object) -> bool:
+            return False
+
+    class _SessionManager:
+        def session_factory(self) -> _SessionContextManager:
+            return _SessionContextManager()
+
+    class _Guardrails:
+        async def record_events(self, **_: object) -> None:
+            return None
+
+    class _EventBus:
+        async def publish(self, _: object) -> None:
+            return None
+
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(guardrails=_Guardrails()),
+        session_manager=_SessionManager(),
+        session_cache=SimpleNamespace(),
+        context_assembler=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=SimpleNamespace(),
+        event_bus=_EventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+        step_runtime_factory=_runtime_factory,
+    )
+
+    async def _fake_run_step(ctx: object, **_: object) -> StepOutput:
+        assert hasattr(ctx, "tool_registry")
+        captured_tool_registry.append(ctx.tool_registry)
+        return StepOutput(
+            summary="done",
+            content="done",
+            outputs={},
+            claims=[],
+            session_id="child",
+            intaris_session_id="child",
+            completed_at=datetime.now(UTC),
+        )
+
+    async def _fake_set_session_status(*args: object, **kwargs: object) -> None:
+        return None
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(agent_loop, "run_step", _fake_run_step)
+    monkeypatch.setattr("cognis.store.queries.set_session_status", _fake_set_session_status)
+    try:
+        output = await agent_loop._run_child_session(
+            child_session=SimpleNamespace(
+                session_id="child",
+                user_email="user@example.com",
+                agent_id="agent-a",
+                intaris_session_id="child",
+            ),
+            conversation=SimpleNamespace(conversation_id="conv-1"),
+            agent=AgentDefinition(
+                agent_id="agent-a",
+                owner_email="user@example.com",
+                name="Agent A",
+            ),
+            task_description="Do the thing",
+            parent_intaris_session_id="parent-intaris",
+            tool_registry="parent-registry",
+            executor_connection="parent-executor",
+        )
+    finally:
+        monkeypatch.undo()
+
+    assert output is not None
+    assert runtime_calls == [("agent-a", "user@example.com")]
+    assert captured_tool_registry == ["child-registry"]
+    assert cleanup_called is True

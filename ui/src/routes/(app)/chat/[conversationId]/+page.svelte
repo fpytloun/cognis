@@ -1036,6 +1036,20 @@
       }
     }
 
+    if (
+      currentConversation &&
+      (event.type === 'delegation_started' ||
+        event.type === 'delegation_completed' ||
+        event.type === 'delegation_failed')
+    ) {
+      api.conversations
+        .sessions(currentConversation.conversation_id)
+        .then((s) => {
+          sessions = s;
+        })
+        .catch(() => {});
+    }
+
     // Escalation push events
     if (event.type === 'escalation') {
       const existing = escalations.find((e) => e.call_id === event.call_id);

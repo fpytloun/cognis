@@ -651,6 +651,7 @@ class AgentLoop:
         pause_waiter: PauseWaiter,
         tool_output_store: Any = None,
         step_context_assembler: Any = None,  # DEPRECATED — kept for backward compat
+        step_runtime_factory: Any = None,
     ) -> None:
         self.providers = providers
         self.session_manager = session_manager
@@ -665,6 +666,7 @@ class AgentLoop:
         self.tool_output_store = tool_output_store
         self.notification_service: Any = None
         self._task_queue: Any = None
+        self._step_runtime_factory = step_runtime_factory
         # Emergency event flush support — tracks pending events across
         # _execute_step and run_step for exception-path persistence.
         self._pending_events: list[SessionEvent] | None = None
@@ -680,6 +682,11 @@ class AgentLoop:
         ``create_task`` and ``cancel_task`` can submit/cancel via the queue.
         """
         self._task_queue = task_queue
+
+    def set_step_runtime_factory(self, step_runtime_factory: Any) -> None:
+        """Wire the step runtime factory after construction when needed."""
+
+        self._step_runtime_factory = step_runtime_factory
 
     async def run_step(
         self,
@@ -776,6 +783,24 @@ class AgentLoop:
             )
         return parent_agent
 
+    async def _resolve_child_runtime(
+        self,
+        *,
+        agent: AgentDefinition,
+        user_email: str,
+        fallback_tool_registry: Any,
+        fallback_executor_connection: Any,
+    ) -> tuple[Any, Any, Any]:
+        """Resolve a fresh runtime for delegated child sessions when possible."""
+
+        if callable(self._step_runtime_factory):
+            return await self._step_runtime_factory(agent=agent, user_email=user_email)
+
+        async def _noop_cleanup() -> None:
+            return None
+
+        return fallback_tool_registry, fallback_executor_connection, _noop_cleanup
+
     # ------------------------------------------------------------------
     # Child session tracking (for /stop cancellation)
     # ------------------------------------------------------------------
@@ -844,6 +869,16 @@ class AgentLoop:
 
         # Resolve the correct agent if the child uses a different one
         resolved_agent = await self._resolve_child_agent(child_session.agent_id, agent)
+        (
+            child_tool_registry,
+            child_executor_connection,
+            child_runtime_cleanup,
+        ) = await self._resolve_child_runtime(
+            agent=resolved_agent,
+            user_email=child_session.user_email,
+            fallback_tool_registry=tool_registry,
+            fallback_executor_connection=executor_connection,
+        )
 
         child_step = StepDefinition(name="delegation", type="run", prompt=task_description)
         child_ctx = StepContext(
@@ -855,8 +890,8 @@ class AgentLoop:
             user_message=task_description,
             system_initiated=True,
             interaction_mode="explicit_gates",
-            tool_registry=tool_registry,
-            executor_connection=executor_connection,
+            tool_registry=child_tool_registry,
+            executor_connection=child_executor_connection,
             orchestration_mode=OrchestrationMode.NONE,  # Sub-sessions cannot delegate
         )
 
@@ -1011,6 +1046,8 @@ class AgentLoop:
                     )
                 )
                 DELEGATIONS_TOTAL.labels(status="failed").inc()
+            finally:
+                await child_runtime_cleanup()
 
         return output
 

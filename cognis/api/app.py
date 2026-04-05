@@ -300,6 +300,7 @@ def create_app() -> FastAPI:
             session_lock=session_lock,
             pause_waiter=pause_waiter,
             tool_output_store=tool_output_store,
+            step_runtime_factory=step_runtime_factory,
         )
         workflow_engine = WorkflowEngine(
             session_factory=session_factory,
