@@ -142,6 +142,32 @@ def test_prepare_tool_exposure_uses_openai_responses_full_inventory() -> None:
     assert result.request_kwargs["parallel_tool_calls"] is True
 
 
+def test_prepare_tool_exposure_strips_controller_search_tool_for_responses() -> None:
+    controller_search_schema = {
+        "type": "function",
+        "function": {
+            "name": SEARCH_TOOLS_TOOL.name,
+            "description": SEARCH_TOOLS_TOOL.description,
+            "parameters": SEARCH_TOOLS_TOOL.parameters,
+        },
+    }
+
+    result = prepare_tool_exposure(
+        inventory_tools=[_tool("read", source_type="executor", category="filesystem")],
+        controller_tool_schemas=[controller_search_schema],
+        model="gpt-5.4",
+        model_info=ModelInfo(
+            model_id="gpt-5.4",
+            supports_tool_search=True,
+            supports_responses_api=True,
+            max_tools=128,
+        ),
+        discovered_tool_ids=set(),
+    )
+
+    assert all(tool["function"]["name"] != "search_tools" for tool in result.tools)
+
+
 def test_prepare_tool_exposure_respects_responses_rollout_off(monkeypatch) -> None:
     monkeypatch.setenv("COGNIS_OPENAI_RESPONSES_MODE", "off")
     mcp_tool = ToolDefinition(

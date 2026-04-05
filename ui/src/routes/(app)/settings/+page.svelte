@@ -1166,6 +1166,16 @@
               </label>
             {/if}
 
+            {#if ['openai', 'openai_compatible', 'litellm_proxy'].includes(providerForm.preset)}
+              <label class="flex items-start gap-3 rounded-2xl border border-slate-800 bg-slate-900/60 p-4 text-sm text-slate-200">
+                <input bind:checked={providerForm.use_responses_api} type="checkbox" class="mt-1 rounded border-slate-600 bg-slate-950 text-sky-400 focus:ring-sky-400" />
+                <span class="space-y-1">
+                  <span class="block font-medium">Use OpenAI Responses transport when supported</span>
+                  <span class="block text-xs text-slate-400">Recommended for `gpt-5*` models. Disable this if your provider or LiteLLM proxy behaves better on the legacy chat-completions path.</span>
+                </span>
+              </label>
+            {/if}
+
             <!-- Models -->
             <div class="rounded-2xl border border-slate-800 bg-slate-900/60 p-4">
               <div class="flex items-center justify-between gap-3">

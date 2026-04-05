@@ -37,13 +37,25 @@ def prepare_tool_exposure(
 ) -> ToolExposureResult:
     """Prepare provider-specific model-facing tool schemas."""
 
+    filtered_controller_tool_schemas = list(controller_tool_schemas)
+    if use_openai_responses := should_use_openai_responses(
+        model=model,
+        model_info=model_info,
+        rollout_mode=os.getenv("COGNIS_OPENAI_RESPONSES_MODE", "auto").strip().lower(),
+    ):
+        filtered_controller_tool_schemas = [
+            schema
+            for schema in controller_tool_schemas
+            if schema.get("function", {}).get("name") != SEARCH_TOOLS_TOOL.name
+        ]
+
     alias_map = {
         schema.get("function", {}).get("name", ""): schema.get("function", {}).get("name", "")
-        for schema in controller_tool_schemas
+        for schema in filtered_controller_tool_schemas
         if isinstance(schema.get("function", {}).get("name"), str)
     }
     request_kwargs: dict[str, Any] = {}
-    controller_count = len(controller_tool_schemas)
+    controller_count = len(filtered_controller_tool_schemas)
     sorted_inventory = sorted(inventory_tools, key=_tool_sort_key)
     core_tools = [tool for tool in sorted_inventory if not _is_deferred_tool(tool)]
     deferred_tools = [tool for tool in sorted_inventory if _is_deferred_tool(tool)]
@@ -57,12 +69,6 @@ def prepare_tool_exposure(
     use_anthropic_defer = bool(
         model_info.supports_defer_loading or _ANTHROPIC_MODEL_PATTERNS.search(model)
     )
-    use_openai_responses = should_use_openai_responses(
-        model=model,
-        model_info=model_info,
-        rollout_mode=os.getenv("COGNIS_OPENAI_RESPONSES_MODE", "auto").strip().lower(),
-    )
-
     if use_anthropic_defer:
         strategy = "anthropic_defer_loading"
         visible_tools = core_without_search + deferred_tools
@@ -96,7 +102,7 @@ def prepare_tool_exposure(
 
     visible_tool_ids = {stable_tool_id(tool) for tool in visible_tools}
     return ToolExposureResult(
-        tools=[*controller_tool_schemas, *tool_schemas],
+        tools=[*filtered_controller_tool_schemas, *tool_schemas],
         alias_map=alias_map,
         request_kwargs=request_kwargs,
         visible_tool_ids=visible_tool_ids,

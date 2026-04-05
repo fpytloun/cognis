@@ -20,6 +20,7 @@ export interface ProviderFormState {
   auth_env_var: string;
   auth_secret_name: string;
   auth_secret_value: string;
+  use_responses_api: boolean;
   discovered_models: Array<{ model_id: string; name: string }>;
 }
 
@@ -144,6 +145,7 @@ export function createProviderForm(provider: LLMProvider | null = null): Provide
     auth_env_var: authInfo.auth_env_var || defaultEnvVar,
     auth_secret_name: authInfo.auth_secret_name || `${preset}_api_key`,
     auth_secret_value: '',
+    use_responses_api: config.use_responses_api !== false,
     discovered_models: []
   };
 }
@@ -202,6 +204,7 @@ export function providerFormToPayload(form: ProviderFormState): Record<string, u
         default_model: form.default_model,
         models: normalizeModelRows([...new Set(modelIds)]),
         auth_config: authConfig,
+        use_responses_api: form.use_responses_api,
         ...(form.location === 'executor' && Object.keys(executorLabels).length > 0
           ? { executor_labels: executorLabels }
           : {}),

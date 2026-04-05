@@ -35,6 +35,24 @@ describe('provider presets', () => {
     expect(config.default_model).toBe('gpt-4o-mini');
     expect(config.auth_config).toEqual({ mode: 'env', env_var: 'OPENAI_API_KEY' });
     expect(config.models).toEqual([{ model_id: 'gpt-4o-mini' }, { model_id: 'gpt-4o' }]);
+    expect(config.use_responses_api).toBe(true);
+  });
+
+  it('preserves disabled Responses transport in provider form state and payload', () => {
+    const disabledResponsesProvider: LLMProvider = {
+      ...provider,
+      config: {
+        ...provider.config,
+        use_responses_api: false
+      }
+    };
+
+    const form = createProviderForm(disabledResponsesProvider);
+    expect(form.use_responses_api).toBe(false);
+
+    const payload = providerFormToPayload(form);
+    const config = payload.config as Record<string, unknown>;
+    expect(config.use_responses_api).toBe(false);
   });
 
   it('maps secret auth mode to payload', () => {

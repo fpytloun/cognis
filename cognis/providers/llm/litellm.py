@@ -340,6 +340,8 @@ class LiteLLMProvider:
     def _should_use_responses_api(
         self, model_id: str, model_info: ModelInfo, provider: LLMProviderRow | None
     ) -> bool:
+        if provider is not None and dict(provider.config).get("use_responses_api") is False:
+            return False
         return should_use_openai_responses(
             model=self._apply_model_prefix(model_id, provider),
             model_info=model_info,
