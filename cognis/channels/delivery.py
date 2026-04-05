@@ -152,9 +152,29 @@ class ChannelDeliveryService:
             return
 
         notification_type = event.data.get("notification_type", "notification")
-        message = event.data.get("message", "You have a new notification.")
-        content = f"[{notification_type}] {message}"
+        payload = event.data.get("payload", {})
+
+        if notification_type == "escalation" and isinstance(payload, dict):
+            content = self._render_escalation_notification(payload)
+        else:
+            message = event.data.get("message", "You have a new notification.")
+            content = f"[{notification_type}] {message}"
         await self.send_to_conversation(conversation_id, content)
+
+    def _render_escalation_notification(self, payload: dict[str, Any]) -> str:
+        """Render a rich escalation prompt for channel integrations."""
+        tool_name = str(payload.get("tool_name") or "tool call")
+        risk = payload.get("risk")
+        reasoning = payload.get("reasoning")
+
+        lines = [f'[escalation] Approval required for tool "{tool_name}".']
+        if risk:
+            lines.append(f"Risk: {risk}")
+        if reasoning:
+            lines.append(f"Reason: {reasoning}")
+        lines.append("Reply /approve to allow it or /deny to block it.")
+        lines.append("You can optionally add a note, for example: /approve safe to continue")
+        return "\n\n".join(lines)
 
     # ------------------------------------------------------------------
     # Channel resolution
