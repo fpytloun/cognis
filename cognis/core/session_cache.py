@@ -56,6 +56,7 @@ class CachedSessionState:
     last_compaction_seq: int = 0
     last_compaction_summary: str | None = None
     intention: str | None = None
+    intention_updated_at: str | None = None
     touched_at: float = field(default_factory=monotonic)
     initialized: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -100,6 +101,7 @@ def _serialize_entry(entry: CachedSessionState) -> str:
             "last_compaction_seq": entry.last_compaction_seq,
             "last_compaction_summary": entry.last_compaction_summary,
             "intention": entry.intention,
+            "intention_updated_at": entry.intention_updated_at,
             "initialized": entry.initialized,
             "memory_instructions": entry.memory_instructions,
             "core_memories": entry.core_memories,
@@ -123,6 +125,7 @@ def _deserialize_entry(raw: str) -> CachedSessionState:
         last_compaction_seq=data.get("last_compaction_seq", 0),
         last_compaction_summary=data.get("last_compaction_summary"),
         intention=data.get("intention"),
+        intention_updated_at=data.get("intention_updated_at"),
         initialized=data.get("initialized", False),
         memory_instructions=data.get("memory_instructions"),
         core_memories=data.get("core_memories"),
@@ -350,16 +353,29 @@ class SessionCache:
         await self._redis_set(entry)
         return entry
 
-    async def update_intention(self, session_id: str, intention: str | None) -> None:
+    async def update_intention(
+        self,
+        session_id: str,
+        intention: str | None,
+        *,
+        updated_at: str | None = None,
+        force: bool = False,
+    ) -> bool:
         """Update cached intention for an existing session entry."""
 
         entry = self.get_entry(session_id)
         if entry is None:
-            return
+            return False
         async with entry.lock:
+            if not force and updated_at is not None and entry.intention_updated_at is not None:
+                if updated_at < entry.intention_updated_at:
+                    return False
             entry.intention = intention
+            if updated_at is not None:
+                entry.intention_updated_at = updated_at
             entry.touched_at = monotonic()
         await self._redis_set(entry)
+        return True
 
     async def evict(self, session_id: str) -> bool:
         """Evict a cache entry if present."""

@@ -136,6 +136,7 @@ class WorkflowEngine:
         on_tool_call: ToolCallCallback | None = None,
         on_tool_result: ToolResultCallback | None = None,
         cancel_event: asyncio.Event | None = None,
+        bootstrap_wait_for_intention: bool = False,
     ) -> StepOutput | None:
         """Run the hot-path direct workflow through a workflow-engine entrypoint.
 
@@ -163,6 +164,7 @@ class WorkflowEngine:
             tool_registry=tool_registry,
             executor_connection=executor_connection,
             cancel_event=cancel_event,
+            bootstrap_wait_for_intention=bootstrap_wait_for_intention,
             orchestration_mode=OrchestrationMode.FULL,
         )
 

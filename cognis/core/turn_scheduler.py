@@ -227,7 +227,7 @@ class TurnScheduler:
         # Per-conversation observers (multiple allowed — e.g. multiple browser tabs)
         self._observers: dict[str, list[TurnObserver]] = defaultdict(list)
 
-        # Deferred session creation locks (compaction recovery)
+        # Per-conversation session creation locks (bootstrap + compaction recovery)
         self._deferred_creation_locks: dict[str, asyncio.Lock] = {}
 
         # Register for follow-up turn events
@@ -301,7 +301,7 @@ class TurnScheduler:
                 recoverable=False,
             )
 
-        conversation, session, agent = runtime
+        conversation, session, agent, bootstrap_wait = runtime
 
         # Authorization check
         if not system_initiated and conversation.user_email != user_email:
@@ -730,6 +730,7 @@ class TurnScheduler:
                 on_tool_call=on_tool_call,
                 on_tool_result=on_tool_result,
                 cancel_event=cancel_event,
+                bootstrap_wait_for_intention=bootstrap_wait,
             )
 
             # Post-turn housekeeping
@@ -990,7 +991,7 @@ class TurnScheduler:
         conversation_id: str,
         *,
         user_message: str | None = None,
-    ) -> tuple[ConversationModel, SessionModel, AgentDefinition] | None:
+    ) -> tuple[ConversationModel, SessionModel, AgentDefinition, bool] | None:
         """Load conversation, session, and agent for a turn.
 
         Handles deferred session creation after compaction and brand-new
@@ -1011,23 +1012,42 @@ class TurnScheduler:
             conversation_model = _to_conversation_model(conversation_row)
 
             if conversation_row.active_session_id is None:
-                # No session at all — create one
-                intention = (
-                    conversation_row.title
-                    or agent_row.description
-                    or f"Conversation with {agent_row.name}"
-                )
-                try:
-                    root_session = await self._session_manager.create_root_session(
-                        conversation_id=conversation_row.conversation_id,
-                        user_email=conversation_row.user_email,
-                        agent_id=conversation_row.agent_id,
-                        intention=intention,
+                lock = self._deferred_creation_locks.setdefault(conversation_id, asyncio.Lock())
+                async with lock:
+                    async with self._session_factory() as db_session_check:
+                        conv_row_check = await get_conversation(db_session_check, conversation_id)
+                        if conv_row_check is None:
+                            return None
+                        if conv_row_check.active_session_id is not None:
+                            new_row = await get_session_row(
+                                db_session_check, conv_row_check.active_session_id
+                            )
+                            if new_row is None:
+                                return None
+                            conversation_model.active_session_id = conv_row_check.active_session_id
+                            return (
+                                conversation_model,
+                                _to_session_model(new_row),
+                                agent_model,
+                                False,
+                            )
+
+                    intention = (
+                        user_message
+                        or conversation_row.title
+                        or f"Conversation with {agent_row.name}"
                     )
-                except Exception as exc:
-                    raise SessionCreationFailedError("Could not create a session") from exc
-                conversation_model.active_session_id = root_session.session_id
-                return conversation_model, root_session, agent_model
+                    try:
+                        root_session = await self._session_manager.ensure_root_session(
+                            conversation_id=conversation_row.conversation_id,
+                            user_email=conversation_row.user_email,
+                            agent_id=conversation_row.agent_id,
+                            intention=intention,
+                        )
+                    except Exception as exc:
+                        raise SessionCreationFailedError("Could not create a session") from exc
+                    conversation_model.active_session_id = root_session.session_id
+                    return conversation_model, root_session, agent_model, True
 
             session_row = await get_session_row(session, conversation_row.active_session_id)
 
@@ -1061,6 +1081,7 @@ class TurnScheduler:
                             conversation_model,
                             _to_session_model(new_row),
                             agent_model,
+                            False,
                         )
 
                 compaction_summary = await self._read_compaction_summary(session_model)
@@ -1101,7 +1122,7 @@ class TurnScheduler:
                         }
                     },
                 )
-                return conversation_model, new_session, agent_model
+                return conversation_model, new_session, agent_model, False
 
         # Periodic cleanup of deferred creation locks (outside the lock block)
         if len(self._deferred_creation_locks) > _MAX_DEFERRED_LOCKS:
@@ -1111,7 +1132,7 @@ class TurnScheduler:
             for cid in to_remove:
                 self._deferred_creation_locks.pop(cid, None)
 
-        return conversation_model, session_model, agent_model
+        return conversation_model, session_model, agent_model, False
 
     async def _read_compaction_summary(self, session: SessionModel) -> str | None:
         """Read the last compaction_summary event from a completed session."""

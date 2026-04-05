@@ -122,3 +122,13 @@ class IntarisSession(BaseModel):
     parent_session_id: str | None = None
     created_at: str
     updated_at: str
+
+
+class ReasoningReportResult(BaseModel):
+    """Optional enriched result from Intaris reasoning submission."""
+
+    ok: bool = True
+    call_id: str = ""
+    intention: str | None = None
+    title: str | None = None
+    updated_at: str | None = None

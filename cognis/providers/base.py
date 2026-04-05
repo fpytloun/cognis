@@ -13,7 +13,13 @@ from cognis.models.config import (
     ProviderHealth,
     TokenUsage,
 )
-from cognis.models.session import EventAppendResult, EventReadResult, IntarisSession, SessionEvent
+from cognis.models.session import (
+    EventAppendResult,
+    EventReadResult,
+    IntarisSession,
+    ReasoningReportResult,
+    SessionEvent,
+)
 from cognis.models.tool import (
     EscalationRecord,
     EvaluationResult,
@@ -102,7 +108,9 @@ class GuardrailsProvider(Protocol):
         context: str | None = None,
         *,
         from_events: bool = False,
-    ) -> None: ...
+        wait_for_intention: bool = False,
+        wait_timeout_ms: int | None = None,
+    ) -> ReasoningReportResult: ...
     async def checkpoint(self, session_id: str, content: str) -> None: ...
     async def get_session(self, session_id: str) -> IntarisSession: ...
     async def submit_decision(

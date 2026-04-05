@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+import re
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -20,6 +21,19 @@ from cognis.runtime_context import scoped_runtime_context
 from cognis.store import queries
 
 logger = get_logger(__name__)
+
+_WHITESPACE_RE = re.compile(r"\s+")
+_MAX_INTENTION_LENGTH = 500
+
+
+def _normalize_intention(value: str | None, fallback: str = "Conversation") -> str:
+    """Normalize a session intention to Intaris-safe length and whitespace."""
+
+    collapsed = _WHITESPACE_RE.sub(" ", (value or "").strip())
+    resolved = collapsed or fallback
+    if len(resolved) <= _MAX_INTENTION_LENGTH:
+        return resolved
+    return resolved[: _MAX_INTENTION_LENGTH - 3].rstrip() + "..."
 
 
 class SessionManager:
@@ -78,6 +92,8 @@ class SessionManager:
     ) -> SessionModel:
         """Create a root session and corresponding Intaris session."""
 
+        normalized_intention = _normalize_intention(intention)
+
         logger.info(
             "session: creating root session",
             extra={
@@ -100,7 +116,7 @@ class SessionManager:
                 with scoped_runtime_context(user_email=user_email, agent_id=agent_id):
                     await self.providers.guardrails.create_session(
                         session_id=session_row.session_id,
-                        intention=intention,
+                        intention=normalized_intention,
                         agent_id=agent_id,
                         user_id=user_email,
                     )
@@ -125,6 +141,60 @@ class SessionManager:
                 }
             },
         )
+        return _to_session_model(session_row)
+
+    async def ensure_root_session(
+        self,
+        *,
+        conversation_id: str,
+        user_email: str,
+        agent_id: str,
+        intention: str,
+    ) -> SessionModel:
+        """Create exactly one active root session for a conversation."""
+
+        normalized_intention = _normalize_intention(intention)
+        async with self.session_factory() as db_session:
+            session_row = None
+            try:
+                session_row = await queries.create_session(
+                    db_session,
+                    conversation_id=conversation_id,
+                    user_email=user_email,
+                    agent_id=agent_id,
+                )
+                with scoped_runtime_context(user_email=user_email, agent_id=agent_id):
+                    await self.providers.guardrails.create_session(
+                        session_id=session_row.session_id,
+                        intention=normalized_intention,
+                        agent_id=agent_id,
+                        user_id=user_email,
+                    )
+                await queries.set_session_intaris_session_id(
+                    db_session, session_row.session_id, session_row.session_id
+                )
+                claimed = await queries.update_conversation_active_session_if_unset(
+                    db_session, conversation_id, session_row.session_id
+                )
+                if not claimed:
+                    winner = await queries.get_conversation(db_session, conversation_id)
+                    active_session_id = winner.active_session_id if winner is not None else None
+                    await db_session.delete(session_row)
+                    await db_session.commit()
+                    if active_session_id is None:
+                        raise RuntimeError("Lost root-session bootstrap race without winner")
+                    winner_row = await queries.get_session_row(db_session, active_session_id)
+                    if winner_row is None:
+                        raise RuntimeError("Active root session missing after bootstrap race")
+                    return _to_session_model(winner_row)
+                await db_session.commit()
+            except Exception:
+                await db_session.rollback()
+                raise
+
+        if session_row is None:
+            raise RuntimeError("Root session bootstrap failed")
+        session_row.intaris_session_id = session_row.session_id
         return _to_session_model(session_row)
 
     async def create_conversation_with_root_session(
@@ -157,7 +227,9 @@ class SessionManager:
                     user_email=user_email,
                     agent_id=agent_id,
                 )
-                resolved_intention = intention or self._build_root_intention(agent, title)
+                resolved_intention = _normalize_intention(
+                    intention or self._build_root_intention(agent, title)
+                )
                 with scoped_runtime_context(user_email=user_email, agent_id=agent_id):
                     await self.providers.guardrails.create_session(
                         session_id=session_row.session_id,
@@ -206,8 +278,8 @@ class SessionManager:
                     delegation_mode=mode,
                     delegation_task=task_description,
                 )
-                resolved_intention = intention or self._build_child_intention(
-                    child_agent, task_description
+                resolved_intention = _normalize_intention(
+                    intention or self._build_child_intention(child_agent, task_description)
                 )
                 details = {
                     "delegated_by_agent": parent_session.agent_id,
@@ -408,7 +480,7 @@ class SessionManager:
                 ):
                     await self.providers.guardrails.create_session(
                         session_id=new_session_row.session_id,
-                        intention=intention,
+                        intention=_normalize_intention(intention),
                         agent_id=current_session.agent_id,
                         user_id=current_session.user_email,
                     )
@@ -597,8 +669,6 @@ class SessionManager:
     def _build_root_intention(self, agent: AgentDefinition, title: str | None) -> str:
         if title:
             return title
-        if agent.description:
-            return agent.description
         return f"Conversation with {agent.name}"
 
     def _build_child_intention(self, agent: AgentDefinition, task_description: str) -> str:

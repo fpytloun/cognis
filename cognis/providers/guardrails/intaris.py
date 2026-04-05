@@ -10,7 +10,13 @@ import httpx
 
 from cognis.logging import get_logger
 from cognis.models.config import ProviderHealth
-from cognis.models.session import EventAppendResult, EventReadResult, IntarisSession, SessionEvent
+from cognis.models.session import (
+    EventAppendResult,
+    EventReadResult,
+    IntarisSession,
+    ReasoningReportResult,
+    SessionEvent,
+)
 from cognis.models.tool import EscalationRecord, EvaluationResult, ToolResult
 from cognis.providers.circuit_breaker import CircuitBreaker
 from cognis.providers.retry import with_retry
@@ -181,22 +187,40 @@ class IntarisProvider:
         context: str | None = None,
         *,
         from_events: bool = False,
-    ) -> None:
+        wait_for_intention: bool = False,
+        wait_timeout_ms: int | None = None,
+    ) -> ReasoningReportResult:
         body: dict[str, Any] = {"session_id": session_id, "content": content}
         if context is not None:
             body["context"] = context
         if from_events:
             body["from_events"] = True
+        if wait_for_intention:
+            body["wait_for_intention"] = True
+        if wait_timeout_ms is not None:
+            body["wait_timeout_ms"] = wait_timeout_ms
 
-        async def _do() -> None:
+        async def _do() -> ReasoningReportResult:
             response = await self.client.post(
                 "/api/v1/reasoning",
                 json=body,
                 headers=self._headers(user_email=current_user_email.get()),
             )
+            if wait_for_intention and response.status_code in {400, 422}:
+                fallback_body = dict(body)
+                fallback_body.pop("wait_for_intention", None)
+                fallback_body.pop("wait_timeout_ms", None)
+                fallback = await self.client.post(
+                    "/api/v1/reasoning",
+                    json=fallback_body,
+                    headers=self._headers(user_email=current_user_email.get()),
+                )
+                fallback.raise_for_status()
+                return ReasoningReportResult.model_validate(fallback.json())
             response.raise_for_status()
+            return ReasoningReportResult.model_validate(response.json())
 
-        await self._call_with_retry(
+        return await self._call_with_retry(
             _do,
             max_retries=2,
             operation="intaris report_reasoning",

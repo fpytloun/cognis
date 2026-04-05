@@ -38,6 +38,25 @@ EVENT_TYPES_FOR_CONTEXT = [
 ]
 
 
+def _is_newer_timestamp(candidate: str | None, current: str | None) -> bool:
+    """Return True when *candidate* is newer than *current*.
+
+    Missing candidates are never newer. Missing current values are always older.
+    Falls back to lexical comparison for malformed timestamps.
+    """
+
+    if not candidate:
+        return False
+    if not current:
+        return True
+    try:
+        return datetime.datetime.fromisoformat(candidate) >= datetime.datetime.fromisoformat(
+            current
+        )
+    except ValueError:
+        return candidate >= current
+
+
 class ContextAssemblyResult(BaseModel):
     """Fully assembled LLM context and metadata."""
 
@@ -318,16 +337,21 @@ class ContextAssembler:
             )
             degraded_sources.append("intention")
         else:
-            await self.session_cache.update_intention(
-                session.session_id, intention_result.intention
-            )
-            cache_entry.intention = intention_result.intention
+            cached_updated_at = getattr(cache_entry, "intention_updated_at", None)
+            if _is_newer_timestamp(intention_result.updated_at, cached_updated_at):
+                await self.session_cache.update_intention(
+                    session.session_id,
+                    intention_result.intention,
+                    updated_at=intention_result.updated_at,
+                )
+                cache_entry.intention = intention_result.intention
+                cache_entry.intention_updated_at = intention_result.updated_at
 
             # Sync Intaris-generated title to conversation. Only writes
             # to DB when the title has actually changed to avoid churn.
             if (
                 intention_result.title
-                and conversation.title != intention_result.title
+                and not conversation.title
                 and self.session_factory is not None
             ):
                 try:

@@ -757,6 +757,27 @@ async def update_conversation_active_session(
     return True
 
 
+async def update_conversation_active_session_if_unset(
+    session: AsyncSession,
+    conversation_id: str,
+    active_session_id: str,
+) -> bool:
+    """Set the active session only when it is currently unset."""
+
+    result = await session.execute(
+        update(Conversation)
+        .where(
+            Conversation.conversation_id == conversation_id,
+            Conversation.active_session_id.is_(None),
+        )
+        .values(
+            active_session_id=active_session_id,
+            updated_at=datetime.now(UTC),
+        )
+    )
+    return bool(result.rowcount)
+
+
 async def touch_conversation(
     session: AsyncSession, conversation_id: str, when: datetime | None = None
 ) -> bool:
