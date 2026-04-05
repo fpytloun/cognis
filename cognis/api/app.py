@@ -277,15 +277,11 @@ def create_app() -> FastAPI:
             session_factory=session_factory,
             llm=providers.llm,
         )
-        (
-            shared_tool_registry,
-            shared_executor_connection,
-            shared_runtime_cleanup,
-        ) = await build_shared_runtime(providers)
+        shared_runtime = await build_shared_runtime(providers)
         step_runtime_factory = build_step_runtime_factory(
             providers=providers,
-            shared_registry=shared_tool_registry,
-            shared_connection=shared_executor_connection,
+            shared_registry=shared_runtime.tool_registry,
+            shared_connection=shared_runtime.executor_connection,
             session_factory=session_factory,
         )
         agent_loop = AgentLoop(
@@ -312,8 +308,8 @@ def create_app() -> FastAPI:
             event_bus=event_bus,
             pause_waiter=pause_waiter,
             step_runtime_factory=step_runtime_factory,
-            shared_tool_registry=shared_tool_registry,
-            shared_executor_connection=shared_executor_connection,
+            shared_tool_registry=shared_runtime.tool_registry,
+            shared_executor_connection=shared_runtime.executor_connection,
             session_cache=session_cache,
         )
         task_queue = await TaskQueue.from_session_factory(
@@ -416,8 +412,8 @@ def create_app() -> FastAPI:
         app.state.agent_loop = agent_loop
         app.state.workflow_engine = workflow_engine
         app.state.task_queue = task_queue
-        app.state.tool_registry = shared_tool_registry
-        app.state.executor_connection = shared_executor_connection
+        app.state.tool_registry = shared_runtime.tool_registry
+        app.state.executor_connection = shared_runtime.executor_connection
         # Store as frozensets for O(1) lookup; these are written once at
         # startup and never grow.
         app.state.recovered_session_ids = frozenset(recovered_sessions)
@@ -486,7 +482,7 @@ def create_app() -> FastAPI:
         await artifact_maintenance.stop()
         await channel_manager.stop_all()
         await task_queue.stop()
-        await shared_runtime_cleanup()
+        await shared_runtime.cleanup()
         await remember_queue.stop()
         await providers.executor.cleanup()
         await session_cache.aclose()

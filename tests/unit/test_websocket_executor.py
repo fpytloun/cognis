@@ -165,6 +165,73 @@ async def test_provider_register_and_get_executor() -> None:
 
 
 @pytest.mark.asyncio
+async def test_provider_stores_executor_environment_metadata() -> None:
+    provider = WebSocketExecutorProvider()
+    ws = FakeWebSocket()
+    provider.register_connection(
+        "exec-1",
+        ws,
+        ExecutorCapabilities(),
+        ready=False,
+        metadata={
+            "environment": {"home": "/remote/home", "cwd": "/remote/cwd"},
+            "platform": {"os": "linux"},
+        },
+    )
+    provider.mark_ready(
+        "exec-1",
+        ExecutorCapabilities(),
+        metadata={
+            "environment": {"home": "/remote/home-2", "cwd": "/remote/cwd-2"},
+            "platform": {"os": "linux"},
+        },
+    )
+
+    metadata = provider.get_handle_metadata("exec-1")
+
+    assert metadata is not None
+    assert metadata["environment"]["home"] == "/remote/home-2"
+
+
+@pytest.mark.asyncio
+async def test_provider_reconnect_replaces_metadata() -> None:
+    provider = WebSocketExecutorProvider()
+    provider.register_connection(
+        "exec-1",
+        FakeWebSocket(),
+        ExecutorCapabilities(),
+        metadata={"environment": {"home": "/old/home"}},
+    )
+    provider.register_connection(
+        "exec-1",
+        FakeWebSocket(),
+        ExecutorCapabilities(),
+        metadata={"environment": {"home": "/new/home"}},
+    )
+
+    metadata = provider.get_handle_metadata("exec-1")
+
+    assert metadata is not None
+    assert metadata["environment"]["home"] == "/new/home"
+
+
+@pytest.mark.asyncio
+async def test_provider_metadata_absent_environment_is_supported() -> None:
+    provider = WebSocketExecutorProvider()
+    provider.register_connection(
+        "exec-1",
+        FakeWebSocket(),
+        ExecutorCapabilities(),
+        metadata={"platform": {"os": "linux"}},
+    )
+
+    metadata = provider.get_handle_metadata("exec-1")
+
+    assert metadata is not None
+    assert "environment" not in metadata
+
+
+@pytest.mark.asyncio
 async def test_provider_unregister_marks_disconnected() -> None:
     """Unregistering a connection marks the handle as disconnected."""
     provider = WebSocketExecutorProvider()

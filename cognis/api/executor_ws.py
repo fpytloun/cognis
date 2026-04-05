@@ -79,11 +79,12 @@ async def handle_executor_websocket(
         ws,
         ExecutorCapabilities(),
         ready=False,
-        metadata={
-            "labels": row.labels or {},
-            "platform": params.get("platform") or {},
-            "status": row.status,
-        },
+        metadata=_executor_connection_metadata(
+            labels=row.labels or {},
+            environment=params.get("environment"),
+            platform=params.get("platform") or {},
+            status=row.status,
+        ),
     )
 
     # Acknowledge executor.ready before sending executor.configure.
@@ -159,11 +160,16 @@ async def handle_executor_websocket(
     ws_provider.mark_ready(
         executor_id,
         capabilities,
-        metadata={
-            "labels": row.labels or {},
-            "platform": params.get("platform") or {},
-            "status": row.status,
-        },
+        metadata=_executor_connection_metadata(
+            labels=row.labels or {},
+            environment=(
+                configure_result.get("environment")
+                if configure_result.get("environment") is not None
+                else params.get("environment")
+            ),
+            platform=params.get("platform") or {},
+            status=row.status,
+        ),
     )
 
     async with session_factory() as session:
@@ -256,6 +262,23 @@ async def _resolve_executor_mcp_payload(
 async def _close_ws(ws: WebSocket, code: int, reason: str) -> None:
     with contextlib.suppress(Exception):
         await ws.close(code=code, reason=reason)
+
+
+def _executor_connection_metadata(
+    *,
+    labels: dict[str, Any],
+    environment: Any,
+    platform: dict[str, Any],
+    status: str,
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "labels": labels,
+        "platform": platform,
+        "status": status,
+    }
+    if isinstance(environment, dict):
+        metadata["environment"] = environment
+    return metadata
 
 
 async def _send_error(ws: WebSocket, msg_id: Any, code: int, message: str) -> None:

@@ -159,7 +159,7 @@ LIST_DIRECTORY_TOOL = ToolDefinition(
         "properties": {
             "path": {
                 "type": "string",
-                "description": "Absolute path to the directory. Use ~ for home directory.",
+                "description": "Absolute path to the directory. Use ~ for home directory. Defaults to the executor home directory if omitted.",
             },
             "ignore": {
                 "type": "array",
@@ -185,7 +185,7 @@ GLOB_TOOL = ToolDefinition(
             "pattern": {"type": "string", "description": "Glob pattern (e.g. '**/*.py')"},
             "path": {
                 "type": "string",
-                "description": "Directory to search in. Use ~ for home directory.",
+                "description": "Directory to search in. Use ~ for home directory. Defaults to the executor home directory if omitted.",
             },
         },
         "required": ["pattern"],
@@ -205,7 +205,7 @@ GREP_TOOL = ToolDefinition(
             "pattern": {"type": "string", "description": "Regex pattern to search for"},
             "path": {
                 "type": "string",
-                "description": "Directory to search in. Use ~ for home directory.",
+                "description": "Directory to search in. Use ~ for home directory. Defaults to the executor home directory if omitted.",
             },
             "include": {
                 "type": "string",
@@ -236,7 +236,7 @@ BASH_TOOL = ToolDefinition(
             "timeout": {"type": "integer", "description": "Timeout in milliseconds"},
             "workdir": {
                 "type": "string",
-                "description": "Working directory for the command. Use ~ for home directory.",
+                "description": "Working directory for the command. Use ~ for home directory. Defaults to the executor home directory if omitted.",
             },
         },
         "required": ["command"],

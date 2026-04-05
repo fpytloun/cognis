@@ -363,10 +363,10 @@ async def handle_list_directory(
     arguments: dict[str, Any], context: ToolExecutionContext
 ) -> ToolResult:
     """List directory contents with optional ignore patterns."""
-    dir_path = arguments.get("path", ".")
+    dir_path = arguments.get("path")
     ignore_patterns = arguments.get("ignore") or []
 
-    path = _resolve_path(dir_path)
+    path = resolve_path(dir_path, default_to_home=True)
     if not path.is_dir():
         return ToolResult(output=f"Not a directory: {dir_path}", is_error=True)
 

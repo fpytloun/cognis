@@ -530,6 +530,14 @@ class WebSocketExecutorProvider:
             extra={"extra_data": {"executor_id": executor_id}},
         )
 
+    def get_handle_metadata(self, executor_id: str) -> dict[str, Any] | None:
+        """Return the current metadata for a connected executor handle."""
+
+        handle = self._handles.get(executor_id)
+        if handle is None:
+            return None
+        return dict(handle.metadata)
+
     # ------------------------------------------------------------------
     # ExecutorProvider protocol
     # ------------------------------------------------------------------

@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import getpass
 import json
 import logging
+import os
 import platform
 import uuid
 from datetime import UTC, datetime
+from pathlib import Path
 from time import perf_counter
 from typing import Any
 
@@ -27,6 +30,23 @@ logger = logging.getLogger("cognis.executor.runner")
 _HEARTBEAT_INTERVAL = 15
 _RECONNECT_BASE = 1.0
 _RECONNECT_MAX = 60.0
+
+
+def _build_environment_payload() -> dict[str, str]:
+    """Capture executor-local environment metadata for controller guidance."""
+
+    try:
+        user = getpass.getuser()
+    except Exception:
+        user = "unknown"
+    return {
+        "user": user,
+        "home": str(Path.home()),
+        "cwd": os.getcwd(),
+        "hostname": platform.node(),
+        "source": "executor_runtime",
+        "observed_at": datetime.now(UTC).isoformat(),
+    }
 
 
 class ExecutorRunner:
@@ -97,6 +117,7 @@ class ExecutorRunner:
                         "method": "executor.ready",
                         "params": {
                             "token": self.config.controller_token,
+                            "environment": _build_environment_payload(),
                             "platform": {
                                 "os": platform.system().lower(),
                                 "arch": platform.machine().lower(),
@@ -211,6 +232,7 @@ class ExecutorRunner:
             "web_backend": web_config_raw.get("web_backend", "direct"),
             "web_available_backends": web_backends,
             "web_secrets": secrets,
+            "environment": _build_environment_payload(),
         }
 
         self._configured_tool_definitions = [*native_defs, *web_defs, *discovered_tools]
@@ -260,6 +282,8 @@ class ExecutorRunner:
                         tool.model_dump(mode="json") for tool in self._configured_tool_definitions
                     ],
                     "config_keys": sorted(config.keys()) if isinstance(config, dict) else [],
+                    "environment": self._runtime_metadata.get("environment")
+                    or _build_environment_payload(),
                 },
             )
 

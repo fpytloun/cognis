@@ -179,11 +179,11 @@ Bidirectional JSON-RPC 2.0 over WebSocket between controller and executor.
 2. Admin generates a JWT token (POST /api/v1/executors/{id}/token)
 3. Executor process starts: cognis executor run --controller-url wss://... --token <jwt>
 4. Executor connects to WS /api/executor/ws (permessage-deflate)
-5. Executor sends executor.ready with JWT token + platform info
+5. Executor sends executor.ready with JWT token + platform info + optional environment snapshot
 6. Controller validates JWT (aud=cognis-executor, sub=executor_id)
 7. Controller looks up executor config from DB
 8. Controller increments desired config version and sends executor.configure with enabled tools/groups, executor-assigned MCP servers, and scoped secrets
-9. Executor applies the config, starts/refreshes MCP clients, discovers tools, and ACKs with applied version + observed tool manifest
+9. Executor applies the config, starts/refreshes MCP clients, discovers tools, and ACKs with applied version + observed tool manifest + refreshed environment snapshot
 10. Controller persists the observed manifest and marks executor as ready
 11. Controller dispatches tool.execute / llm.complete as needed
 12. Executor sends executor.heartbeat every 15 seconds
@@ -207,7 +207,7 @@ For subprocess executors, steps 1-3 are automated: the controller spawns
 }
 # → {"status": "configured", "applied_version": int, "ready": bool,
 #    "observed_at": str, "observed_tools": [...], "capabilities": {...},
-#    "config_keys": [...]}
+#    "config_keys": [...], "environment": {...}}
 
 # List available tools on the executor
 "tool.list" → {}
@@ -251,6 +251,14 @@ For subprocess executors, steps 1-3 are automated: the controller spawns
 # Authentication on connect (first message, before any other exchange)
 "executor.ready" → {
     "token": str,                  # JWT (aud=cognis-executor, sub=executor_id)
+    "environment": {               # Optional for backward compatibility
+        "user": str,
+        "home": str,
+        "cwd": str,
+        "hostname": str,
+        "source": str,
+        "observed_at": str         # UTC ISO-8601 snapshot time
+    },
     "platform": {
         "os": str,                 # e.g. "darwin", "linux"
         "arch": str,               # e.g. "arm64", "x86_64"
@@ -260,6 +268,10 @@ For subprocess executors, steps 1-3 are automated: the controller spawns
 # Controller validates JWT, looks up executor in DB, then sends
 # executor.configure.  After configuration, controller responds:
 # → {"status": "registered", "executor_id": str}
+
+# executor.configure result also includes the normalized environment
+# snapshot when available so the controller can refresh prompt/runtime
+# guidance after configuration or reconnect.
 
 # Tool execution result (response to tool.execute)
 # Returned as JSON-RPC response to the tool.execute request

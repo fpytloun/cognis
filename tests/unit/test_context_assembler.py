@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-import sys
 from pathlib import Path
 from time import monotonic
 
 import pytest
 
 from cognis.core.context import ContextAssembler, _build_environment_info
+from cognis.core.runtime import ExecutorEnvironmentSnapshot
 from cognis.models.agent import AgentDefinition, AgentLLMConfig
 from cognis.models.config import ModelInfo
 from cognis.models.session import ConversationContext, ConversationModel, SessionModel
@@ -103,7 +103,11 @@ class _Guardrails:
     async def get_session(self, session_id: str) -> object:
         del session_id
         await asyncio.sleep(0.1)
-        return type("IntarisSession", (), {"intention": "fresh intention", "title": None})()
+        return type(
+            "IntarisSession",
+            (),
+            {"intention": "fresh intention", "title": None, "updated_at": None},
+        )()
 
 
 class _LLM:
@@ -334,6 +338,39 @@ def test_build_environment_info_contains_required_fields() -> None:
     assert "~" in info
 
 
+def test_build_environment_info_uses_executor_snapshot() -> None:
+    info = _build_environment_info(
+        ExecutorEnvironmentSnapshot(
+            available=True,
+            executor_id="exec-1",
+            executor_type="websocket",
+            user="remote-user",
+            home="/remote/home",
+            cwd="/remote/work",
+            hostname="remote-host",
+            platform_os="linux",
+            platform_arch="x86_64",
+        )
+    )
+    assert "exec-1" in info
+    assert "/remote/home" in info
+    assert "/remote/work" in info
+    assert "defaults to its home directory" in info
+
+
+def test_build_environment_info_marks_unavailable_remote_environment() -> None:
+    info = _build_environment_info(
+        ExecutorEnvironmentSnapshot(
+            available=False,
+            executor_id="exec-2",
+            executor_type="websocket",
+        )
+    )
+    assert "exec-2" in info
+    assert "unavailable" in info
+    assert "Do not guess controller paths" in info
+
+
 @pytest.mark.asyncio
 async def test_context_assembler_includes_environment_info() -> None:
     """Assembled context must contain an environment info system message."""
@@ -353,6 +390,17 @@ async def test_context_assembler_includes_environment_info() -> None:
         agent=_agent(),
         user_message="hello",
         tool_definitions=[],
+        executor_environment=ExecutorEnvironmentSnapshot(
+            available=True,
+            executor_id="exec-1",
+            executor_type="websocket",
+            user="remote-user",
+            home="/remote/home",
+            cwd="/remote/cwd",
+            hostname="remote-host",
+            platform_os="linux",
+            platform_arch="arm64",
+        ),
     )
 
     env_messages = [
@@ -362,8 +410,64 @@ async def test_context_assembler_includes_environment_info() -> None:
     ]
     assert len(env_messages) == 1, "Expected exactly one environment info message"
     content = env_messages[0]["content"]
-    assert str(Path.home()) in content
-    assert sys.platform in content
+    assert "/remote/home" in content
+    assert "/remote/cwd" in content
+    assert "linux" in content
+
+
+@pytest.mark.asyncio
+async def test_context_assembler_refreshes_environment_between_turns() -> None:
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=_SessionCache(),
+        session_manager=_SessionManager(),
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+
+    first = await assembler.assemble(
+        session=_session(),
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="hello",
+        tool_definitions=[],
+        executor_environment=ExecutorEnvironmentSnapshot(
+            available=True,
+            executor_id="exec-a",
+            executor_type="websocket",
+            home="/home/a",
+            cwd="/cwd/a",
+        ),
+    )
+    second = await assembler.assemble(
+        session=_session(),
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="hello",
+        tool_definitions=[],
+        executor_environment=ExecutorEnvironmentSnapshot(
+            available=True,
+            executor_id="exec-b",
+            executor_type="websocket",
+            home="/home/b",
+            cwd="/cwd/b",
+        ),
+    )
+
+    first_env = [
+        m
+        for m in first.messages
+        if m.get("role") == "system" and "Home directory:" in str(m.get("content", ""))
+    ][0]
+    second_env = [
+        m
+        for m in second.messages
+        if m.get("role") == "system" and "Home directory:" in str(m.get("content", ""))
+    ][0]
+    assert "/home/a" in str(first_env["content"])
+    assert "/home/b" in str(second_env["content"])
 
 
 @pytest.mark.asyncio

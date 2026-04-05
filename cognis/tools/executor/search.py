@@ -17,12 +17,12 @@ _MAX_LINE_LENGTH = 2000
 async def handle_glob(arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
     """Find files matching a glob pattern, sorted by modification time."""
     pattern = arguments.get("pattern", "")
-    search_path = arguments.get("path", ".")
+    search_path = arguments.get("path")
 
     if not pattern:
         return ToolResult(output="No pattern provided.", is_error=True)
 
-    base = resolve_path(search_path)
+    base = resolve_path(search_path, default_to_home=True)
     if not base.is_dir():
         return ToolResult(output=f"Not a directory: {search_path}", is_error=True)
 
@@ -57,7 +57,7 @@ async def handle_glob(arguments: dict[str, Any], context: ToolExecutionContext) 
 async def handle_grep(arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
     """Search file contents using regex patterns."""
     pattern = arguments.get("pattern", "")
-    search_path = arguments.get("path", ".")
+    search_path = arguments.get("path")
     include = arguments.get("include")
 
     if not pattern:
@@ -68,7 +68,7 @@ async def handle_grep(arguments: dict[str, Any], context: ToolExecutionContext) 
     except re.error as exc:
         return ToolResult(output=f"Invalid regex: {exc}", is_error=True)
 
-    base = resolve_path(search_path)
+    base = resolve_path(search_path, default_to_home=True)
     if not base.is_dir():
         return ToolResult(output=f"Not a directory: {search_path}", is_error=True)
 

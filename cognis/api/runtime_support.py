@@ -8,6 +8,11 @@ from typing import Any, cast
 
 from cognis.core.executor_policy import load_executor_policy
 from cognis.core.executor_resolution import select_executor_for_agent
+from cognis.core.runtime import (
+    ResolvedStepRuntime,
+    build_local_executor_environment,
+    environment_from_metadata,
+)
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.tool import (
@@ -31,9 +36,7 @@ from cognis.tools.skills import load_skill_tool_names
 
 logger = get_logger(__name__)
 
-RuntimeFactory = Callable[
-    [AgentDefinition, str], Awaitable[tuple[ToolRegistry, Any, Callable[[], Awaitable[None]]]]
-]
+RuntimeFactory = Callable[[AgentDefinition, str], Awaitable[ResolvedStepRuntime]]
 
 
 async def noop_cleanup() -> None:
@@ -142,14 +145,22 @@ def build_static_registry(agent: AgentDefinition | None = None) -> ToolRegistry:
 
 async def build_shared_runtime(
     providers: Any,
-) -> tuple[ToolRegistry, Any, Callable[[], Awaitable[None]]]:
+) -> ResolvedStepRuntime:
     """Build the shared builtin runtime used as the template for step runtimes."""
     session_factory = getattr(providers, "_session_factory", None)
     if session_factory is not None:
         policy = await load_executor_policy(session_factory)
         if not policy.allow_in_process:
             logger.info("Shared in-process executor disabled by policy; using static-only template")
-            return build_static_registry(), None, noop_cleanup
+            return ResolvedStepRuntime(
+                tool_registry=build_static_registry(),
+                executor_connection=None,
+                cleanup=noop_cleanup,
+                executor_environment=build_local_executor_environment(
+                    executor_type="in_process",
+                    source="shared_runtime_disabled",
+                ),
+            )
     tools = static_tool_definitions()
     handle = await providers.executor.spawn(
         ExecutorConfig(
@@ -164,7 +175,16 @@ async def build_shared_runtime(
     async def cleanup() -> None:
         await providers.executor.cancel(handle)
 
-    return registry, connection, cleanup
+    return ResolvedStepRuntime(
+        tool_registry=registry,
+        executor_connection=connection,
+        cleanup=cleanup,
+        executor_environment=build_local_executor_environment(
+            executor_id=handle.executor_id,
+            executor_type=handle.executor_type,
+            source="shared_runtime",
+        ),
+    )
 
 
 def build_step_runtime_factory(
@@ -186,7 +206,7 @@ def build_step_runtime_factory(
     async def factory(
         agent: AgentDefinition,
         user_email: str,
-    ) -> tuple[ToolRegistry, Any, Callable[[], Awaitable[None]]]:
+    ) -> ResolvedStepRuntime:
         session_factory_for_policy = getattr(providers, "_session_factory", None)
         policy = (
             await load_executor_policy(session_factory_for_policy)
@@ -276,7 +296,16 @@ def build_step_runtime_factory(
             async def cleanup() -> None:
                 await providers.executor.cancel(handle)
 
-            return registry, connection, cleanup
+            return ResolvedStepRuntime(
+                tool_registry=registry,
+                executor_connection=connection,
+                cleanup=cleanup,
+                executor_environment=build_local_executor_environment(
+                    executor_id=handle.executor_id,
+                    executor_type=handle.executor_type,
+                    source="in_process_mcp_runtime",
+                ),
+            )
 
         if resolved_type in ("websocket", "subprocess"):
             # Remote executor — merge executor-advertised tools with
@@ -361,8 +390,18 @@ def build_step_runtime_factory(
                             }
                         },
                     )
-
-                    return remote_registry, conn, noop_cleanup
+                    env_snapshot = environment_from_metadata(
+                        ws_provider.get_handle_metadata(executor_id),
+                        executor_id=executor_id,
+                        executor_type=resolved_type,
+                        fallback_source="remote_executor_metadata",
+                    )
+                    return ResolvedStepRuntime(
+                        tool_registry=remote_registry,
+                        executor_connection=conn,
+                        cleanup=noop_cleanup,
+                        executor_environment=env_snapshot,
+                    )
                 except Exception:
                     logger.warning(
                         "Failed to get tools from remote executor, falling back to in-process",
@@ -384,11 +423,33 @@ def build_step_runtime_factory(
                 shared_connection.breaker,
                 runtime_metadata,
             )
-            return registry, connection, noop_cleanup
+            return ResolvedStepRuntime(
+                tool_registry=registry,
+                executor_connection=connection,
+                cleanup=noop_cleanup,
+                executor_environment=build_local_executor_environment(
+                    executor_id=getattr(shared_connection.handle, "executor_id", None),
+                    executor_type=getattr(shared_connection.handle, "executor_type", "in_process"),
+                    source="shared_in_process_runtime",
+                ),
+            )
 
         if shared_connection is None:
             raise RuntimeError("No eligible executor is available for this agent")
-        return shared_registry, shared_connection, noop_cleanup
+        return ResolvedStepRuntime(
+            tool_registry=shared_registry,
+            executor_connection=shared_connection,
+            cleanup=noop_cleanup,
+            executor_environment=build_local_executor_environment(
+                executor_id=getattr(
+                    getattr(shared_connection, "handle", None), "executor_id", None
+                ),
+                executor_type=getattr(
+                    getattr(shared_connection, "handle", None), "executor_type", "in_process"
+                ),
+                source="shared_runtime_fallback",
+            ),
+        )
 
     return factory
 

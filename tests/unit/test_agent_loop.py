@@ -16,6 +16,7 @@ from cognis.core.agent_loop import (
     _controller_builtin_enabled,
     _filter_model_inventory_tools,
 )
+from cognis.core.runtime import ResolvedStepRuntime, build_local_executor_environment
 from cognis.models.agent import AgentDefinition, AgentPermissions
 from cognis.models.tool import Permission, ToolDefinition, ToolSource
 from cognis.models.workflow import StepOutput
@@ -266,16 +267,19 @@ async def test_run_child_session_resolves_fresh_runtime() -> None:
     cleanup_called = False
     captured_tool_registry: list[object] = []
 
-    async def _runtime_factory(
-        *, agent: AgentDefinition, user_email: str
-    ) -> tuple[object, object, object]:
+    async def _runtime_factory(*, agent: AgentDefinition, user_email: str) -> ResolvedStepRuntime:
         runtime_calls.append((agent.agent_id, user_email))
 
         async def _cleanup() -> None:
             nonlocal cleanup_called
             cleanup_called = True
 
-        return "child-registry", "child-executor", _cleanup
+        return ResolvedStepRuntime(
+            tool_registry="child-registry",
+            executor_connection="child-executor",
+            cleanup=_cleanup,
+            executor_environment=build_local_executor_environment(),
+        )
 
     class _SessionContextManager:
         async def __aenter__(self) -> SimpleNamespace:

@@ -4,19 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import datetime
-import getpass
 import json
-import os
-import platform
 import re
-import sys
-from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cognis.core.prompts import PromptContext, build_system_instructions
+from cognis.core.runtime import ExecutorEnvironmentSnapshot, build_local_executor_environment
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.artifact import ArtifactKind
@@ -123,28 +119,57 @@ def _native_attachment_blocks(
     return blocks, unsupported
 
 
-def _build_environment_info() -> str:
+def _build_environment_info(
+    executor_environment: ExecutorEnvironmentSnapshot | None = None,
+) -> str:
     """Build environment information for the LLM context.
 
-    Provides the LLM with the actual home directory, working directory,
-    hostname, and platform so it generates correct absolute paths in tool
-    calls instead of guessing (e.g. ``/home/user`` on macOS).
+    Provides the LLM with the selected tool executor environment so it
+    generates correct absolute paths in tool calls instead of guessing.
     """
-    try:
-        user = getpass.getuser()
-    except Exception:
-        user = "unknown"
+
+    env = executor_environment or _local_environment_snapshot()
+    if not env.available:
+        executor_label = env.executor_id or "selected remote executor"
+        executor_type = env.executor_type or "remote"
+        return (
+            "Environment:\n"
+            f"- Executor: {executor_label} ({executor_type})\n"
+            "- Environment details: unavailable from this executor\n"
+            f"- Date: {datetime.date.today().isoformat()}\n"
+            "If you omit a filesystem path or shell workdir, the executor still defaults "
+            "to its own local home directory. Do not guess controller paths."
+        )
 
     return (
         "Environment:\n"
-        f"- Platform: {sys.platform} ({platform.machine()})\n"
-        f"- Hostname: {platform.node()}\n"
-        f"- System user: {user}\n"
-        f"- Home directory: {Path.home()}\n"
-        f"- Working directory: {os.getcwd()}\n"
+        + (_format_executor_label(env))
+        + f"- Platform: {env.platform_os or 'unknown'} ({env.platform_arch or 'unknown'})\n"
+        + f"- Hostname: {env.hostname or 'unknown'}\n"
+        + f"- System user: {env.user or 'unknown'}\n"
+        + f"- Home directory: {env.home or 'unknown'}\n"
+        + f"- Working directory: {env.cwd or 'unknown'}\n"
         f"- Date: {datetime.date.today().isoformat()}\n"
-        "When the user references ~ or $HOME, use the home directory above."
+        "When the user references ~ or $HOME, use the home directory above. "
+        "If a filesystem path or shell workdir is omitted, the executor defaults to its "
+        "home directory; the working directory above is informational only."
     )
+
+
+def _local_environment_snapshot() -> ExecutorEnvironmentSnapshot:
+    """Build a local environment snapshot for controller/in-process usage."""
+
+    return build_local_executor_environment(source="context_local_fallback")
+
+
+def _format_executor_label(env: ExecutorEnvironmentSnapshot) -> str:
+    if env.executor_id and env.executor_type:
+        return f"- Executor: {env.executor_id} ({env.executor_type})\n"
+    if env.executor_id:
+        return f"- Executor: {env.executor_id}\n"
+    if env.executor_type:
+        return f"- Executor type: {env.executor_type}\n"
+    return ""
 
 
 def _compose_identity_prompt(agent: AgentDefinition) -> str | None:
@@ -228,6 +253,7 @@ class ContextAssembler:
         skip_user_message: bool = False,
         skip_memory: bool = False,
         prompt_context: PromptContext = PromptContext.CHAT,
+        executor_environment: ExecutorEnvironmentSnapshot | None = None,
     ) -> ContextAssemblyResult:
         """Build the LLM message list for a single turn.
 
@@ -262,6 +288,7 @@ class ContextAssembler:
                 prior_context=prior_context,
                 skip_user_message=skip_user_message,
                 prompt_context=prompt_context,
+                executor_environment=executor_environment,
             )
 
         cached_intention = self.session_cache.get_intention(session.session_id)
@@ -463,9 +490,6 @@ class ContextAssembler:
         if system_instructions:
             messages.append({"role": "system", "content": system_instructions})
 
-        # Immutable prefix block 3: environment info (home dir, cwd, platform)
-        messages.append({"role": "system", "content": _build_environment_info()})
-
         # Immutable prefix block 3: memory instructions (behavioral guidance)
         if immutable_instructions:
             messages.append(
@@ -504,6 +528,13 @@ class ContextAssembler:
             )
 
         # ----- Mutable suffix -----
+
+        messages.append(
+            {
+                "role": "system",
+                "content": _build_environment_info(executor_environment),
+            }
+        )
 
         # History messages (append-only)
         history_messages = self._events_to_messages(
@@ -634,6 +665,7 @@ class ContextAssembler:
         prior_context: list[dict[str, Any]] | None = None,
         skip_user_message: bool = False,
         prompt_context: PromptContext = PromptContext.TASK_STEP,
+        executor_environment: ExecutorEnvironmentSnapshot | None = None,
     ) -> ContextAssemblyResult:
         """Assemble context without Mnemory calls — for secondary agents.
 
@@ -691,9 +723,6 @@ class ContextAssembler:
         if system_instructions:
             messages.append({"role": "system", "content": system_instructions})
 
-        # Environment info (same as primary assembly)
-        messages.append({"role": "system", "content": _build_environment_info()})
-
         # No memory instructions, no core memories (skip_memory)
 
         compaction_summary = cache_entry.last_compaction_summary
@@ -709,6 +738,13 @@ class ContextAssembler:
                     ),
                 }
             )
+
+        messages.append(
+            {
+                "role": "system",
+                "content": _build_environment_info(executor_environment),
+            }
+        )
 
         history_messages = self._events_to_messages(
             self.session_cache.get_events_since_compaction(

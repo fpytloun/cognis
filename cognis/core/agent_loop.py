@@ -25,6 +25,7 @@ from cognis.core.compaction import ROTATION_TOTAL
 from cognis.core.events import Event, EventBus, EventType
 from cognis.core.prompts import PromptContext
 from cognis.core.pruning import prune_tool_outputs
+from cognis.core.runtime import ExecutorEnvironmentSnapshot, ResolvedStepRuntime
 from cognis.core.tool_exposure import prepare_tool_exposure
 from cognis.core.truncation import middle_truncate
 from cognis.logging import get_logger
@@ -619,6 +620,7 @@ class StepContext:
     interaction_mode: str = "explicit_gates"
     tool_registry: Any = None  # ToolRegistry instance for this step
     executor_connection: Any = None  # ExecutorConnection for this step
+    executor_environment: ExecutorEnvironmentSnapshot | None = None
     workflow_state: WorkflowState | None = None
     workflow_steps: list[StepDefinition] | None = None  # All steps for source resolution
     step_index: int = 0  # Index of current step in workflow
@@ -790,7 +792,7 @@ class AgentLoop:
         user_email: str,
         fallback_tool_registry: Any,
         fallback_executor_connection: Any,
-    ) -> tuple[Any, Any, Any]:
+    ) -> ResolvedStepRuntime:
         """Resolve a fresh runtime for delegated child sessions when possible."""
 
         if callable(self._step_runtime_factory):
@@ -799,7 +801,12 @@ class AgentLoop:
         async def _noop_cleanup() -> None:
             return None
 
-        return fallback_tool_registry, fallback_executor_connection, _noop_cleanup
+        return ResolvedStepRuntime(
+            tool_registry=fallback_tool_registry,
+            executor_connection=fallback_executor_connection,
+            cleanup=_noop_cleanup,
+            executor_environment=None,
+        )
 
     # ------------------------------------------------------------------
     # Child session tracking (for /stop cancellation)
@@ -869,11 +876,7 @@ class AgentLoop:
 
         # Resolve the correct agent if the child uses a different one
         resolved_agent = await self._resolve_child_agent(child_session.agent_id, agent)
-        (
-            child_tool_registry,
-            child_executor_connection,
-            child_runtime_cleanup,
-        ) = await self._resolve_child_runtime(
+        child_runtime = await self._resolve_child_runtime(
             agent=resolved_agent,
             user_email=child_session.user_email,
             fallback_tool_registry=tool_registry,
@@ -890,8 +893,9 @@ class AgentLoop:
             user_message=task_description,
             system_initiated=True,
             interaction_mode="explicit_gates",
-            tool_registry=child_tool_registry,
-            executor_connection=child_executor_connection,
+            tool_registry=child_runtime.tool_registry,
+            executor_connection=child_runtime.executor_connection,
+            executor_environment=child_runtime.executor_environment,
             orchestration_mode=OrchestrationMode.NONE,  # Sub-sessions cannot delegate
         )
 
@@ -1047,7 +1051,7 @@ class AgentLoop:
                 )
                 DELEGATIONS_TOTAL.labels(status="failed").inc()
             finally:
-                await child_runtime_cleanup()
+                await child_runtime.cleanup()
 
         return output
 
@@ -1279,6 +1283,7 @@ class AgentLoop:
             prior_context=ctx.prior_context,
             skip_memory=ctx.policy.skip_memory,
             prompt_context=_prompt_ctx,
+            executor_environment=ctx.executor_environment,
         )
         messages = context_result.messages
 
@@ -1485,9 +1490,11 @@ class AgentLoop:
                                 "content": (
                                     f"You have {len(incomplete_todos)} incomplete todos:\n"
                                     f"{todo_list}\n\n"
-                                    "Continue working on them, delegate to sub-sessions "
-                                    "or tasks for longer work, or cancel remaining todos "
-                                    "via step_todo_write if they are no longer needed."
+                                    "These todos should represent only current-turn "
+                                    "execution work that you still own. Continue working "
+                                    "on that work, ask for input if needed, or cancel any "
+                                    "todos that no longer apply to this turn via "
+                                    "step_todo_write."
                                 ),
                             }
                         )
@@ -1773,6 +1780,11 @@ class AgentLoop:
                             )
                     except TimeoutError:
                         await self._clear_interactive_pause_state(ctx)
+                        if self.notification_service is not None:
+                            await self.notification_service.mark_orphaned(
+                                pause_id,
+                                reason="timeout",
+                            )
                         timeout_content = json.dumps({"error": "Input request timed out."})
                         messages.append(
                             {"role": "tool", "tool_call_id": tc.call_id, "content": timeout_content}
@@ -1780,8 +1792,10 @@ class AgentLoop:
                         _append_tool_result_event(
                             events_to_record, tc, timeout_content, True, tool_id=tool_id
                         )
-                    if on_tool_result:
-                        await on_tool_result(tc.call_id, tc.name, timeout_content, True, None, None)
+                        if on_tool_result:
+                            await on_tool_result(
+                                tc.call_id, tc.name, timeout_content, True, None, None
+                            )
                     continue
 
                 elif tc.name == SEARCH_TOOLS_TOOL.name:
@@ -3613,7 +3627,11 @@ class AgentLoop:
                     "type": "function",
                     "function": {
                         "name": STEP_REQUEST_INPUT,
-                        "description": "Request input from the caller while staying in the same step.",
+                        "description": (
+                            "Request input from the caller while staying in the same "
+                            "step or direct-chat turn. Use this when you are blocked on "
+                            "missing information and need the answer before continuing."
+                        ),
                         "parameters": {
                             "type": "object",
                             "properties": {
@@ -3645,8 +3663,13 @@ class AgentLoop:
                     "function": {
                         "name": STEP_TODO_WRITE,
                         "description": (
-                            "Track progress within this step. Use status 'cancelled' "
-                            "to mark todos that are no longer needed."
+                            "Track progress within this execution context. In chat, use "
+                            "todos only for concrete work you are actively continuing in "
+                            "the current turn, not for plans or background-owned work. In "
+                            "workflow steps and delegated sub-sessions, create and update "
+                            "todos before substantial work and keep them accurate until "
+                            "they are done or cancelled. Use status 'cancelled' for work "
+                            "that no longer applies."
                         ),
                         "parameters": {
                             "type": "object",
@@ -3679,7 +3702,7 @@ class AgentLoop:
                     "type": "function",
                     "function": {
                         "name": STEP_TODO_LIST,
-                        "description": "Read current step todos.",
+                        "description": "Read current execution-context todos.",
                         "parameters": {"type": "object", "properties": {}},
                     },
                 },

@@ -57,6 +57,7 @@ async def test_handle_configure_filters_tools() -> None:
     caps_tools = ws.sent[-1]["result"]["capabilities"]["tools"]
     assert "read" in caps_tools
     assert "glob" in caps_tools
+    assert "environment" in ws.sent[-1]["result"]
 
 
 @pytest.mark.asyncio

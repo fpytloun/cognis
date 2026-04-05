@@ -25,7 +25,7 @@ async def handle_bash(arguments: dict[str, Any], context: ToolExecutionContext) 
     timeout_seconds = max(1, timeout_ms // 1000)
 
     try:
-        resolved_cwd = str(resolve_path(workdir)) if workdir else None
+        resolved_cwd = str(resolve_path(workdir, default_to_home=True))
         process = await asyncio.create_subprocess_shell(
             command,
             stdout=asyncio.subprocess.PIPE,

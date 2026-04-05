@@ -29,6 +29,7 @@ from cognis.core.agent_loop import (
     ToolResultCallback,
 )
 from cognis.core.events import Event, EventBus, EventType
+from cognis.core.runtime import ResolvedStepRuntime
 from cognis.core.step_evaluator import StepEvaluator
 from cognis.core.workflow_registry import WorkflowRegistry
 from cognis.logging import get_logger
@@ -144,12 +145,17 @@ class WorkflowEngine:
         but the engine remains the owner of the orchestration entrypoint so
         metrics, runtime resolution, and future hooks stay centralized.
         """
-        tool_registry, executor_connection, cleanup = await self._resolve_step_runtime(
+        runtime = await self._resolve_step_runtime(
             agent=agent,
             user_email=session.user_email,
         )
 
-        direct_step = StepDefinition(name="direct", type="run", prompt=user_message)
+        direct_step = StepDefinition(
+            name="direct",
+            type="run",
+            prompt=user_message,
+            allow_questions=True,
+        )
         ctx = StepContext(
             step_definition=direct_step,
             session=session,
@@ -160,9 +166,10 @@ class WorkflowEngine:
             user_attachments=user_attachments or [],
             attachment_notice=attachment_notice,
             system_initiated=system_initiated,
-            interaction_mode="explicit_gates",
-            tool_registry=tool_registry,
-            executor_connection=executor_connection,
+            interaction_mode="step_requests",
+            tool_registry=runtime.tool_registry,
+            executor_connection=runtime.executor_connection,
+            executor_environment=runtime.executor_environment,
             cancel_event=cancel_event,
             bootstrap_wait_for_intention=bootstrap_wait_for_intention,
             orchestration_mode=OrchestrationMode.FULL,
@@ -176,7 +183,7 @@ class WorkflowEngine:
                 on_tool_result=on_tool_result,
             )
         finally:
-            await cleanup()
+            await runtime.cleanup()
 
     async def execute_workflow(
         self,
@@ -602,7 +609,7 @@ class WorkflowEngine:
         )
 
         # Resolve tool registry and executor for this step
-        tool_registry, executor_connection, cleanup = await self._resolve_step_runtime(
+        runtime = await self._resolve_step_runtime(
             agent=agent,
             user_email=task.created_by,
         )
@@ -649,8 +656,9 @@ class WorkflowEngine:
             user_message=step_def.prompt.replace("{user_message}", task.description or task.title),
             prior_context=prior_context,
             interaction_mode=workflow.interaction.mode,
-            tool_registry=tool_registry,
-            executor_connection=executor_connection,
+            tool_registry=runtime.tool_registry,
+            executor_connection=runtime.executor_connection,
+            executor_environment=runtime.executor_environment,
             workflow_state=state,
             workflow_steps=workflow.steps,
             step_index=step_index,
@@ -673,7 +681,7 @@ class WorkflowEngine:
                 await db_session.commit()
             raise
         finally:
-            await cleanup()
+            await runtime.cleanup()
 
         # Enrich output with session metadata
         if output is not None:
@@ -1506,18 +1514,19 @@ class WorkflowEngine:
         *,
         agent: AgentDefinition,
         user_email: str,
-    ) -> tuple[Any, Any, Any]:
+    ) -> ResolvedStepRuntime:
         """Resolve the tool registry and executor connection for one step/turn."""
         if callable(self._step_runtime_factory):
             return cast(
-                tuple[Any, Any, Any],
+                ResolvedStepRuntime,
                 await self._step_runtime_factory(agent=agent, user_email=user_email),
             )
 
-        return (
-            self._shared_tool_registry,
-            self._shared_executor_connection,
-            _noop_cleanup,
+        return ResolvedStepRuntime(
+            tool_registry=self._shared_tool_registry,
+            executor_connection=self._shared_executor_connection,
+            cleanup=_noop_cleanup,
+            executor_environment=None,
         )
 
     async def _resolve_step_agent(

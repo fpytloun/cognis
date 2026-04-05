@@ -222,6 +222,25 @@ class TestGlobTool:
         assert not result.is_error
         assert "No files found" in result.output
 
+    @pytest.mark.asyncio()
+    async def test_glob_defaults_to_home_when_path_omitted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        home_dir = tmp_path / "home"
+        cwd_dir = tmp_path / "cwd"
+        home_dir.mkdir()
+        cwd_dir.mkdir()
+        (home_dir / "home.py").touch()
+        (cwd_dir / "cwd.py").touch()
+        monkeypatch.setenv("HOME", str(home_dir))
+        monkeypatch.chdir(cwd_dir)
+
+        result = await handle_glob({"pattern": "*.py"}, _DUMMY_CONTEXT)
+
+        assert not result.is_error
+        assert "home.py" in result.output
+        assert "cwd.py" not in result.output
+
 
 class TestGrepTool:
     """Test the grep search tool."""
@@ -243,6 +262,25 @@ class TestGrepTool:
         )
         assert not result.is_error
         assert "No matches" in result.output
+
+    @pytest.mark.asyncio()
+    async def test_grep_defaults_to_home_when_path_omitted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        home_dir = tmp_path / "home"
+        cwd_dir = tmp_path / "cwd"
+        home_dir.mkdir()
+        cwd_dir.mkdir()
+        (home_dir / "home.py").write_text("needle\n")
+        (cwd_dir / "cwd.py").write_text("needle\n")
+        monkeypatch.setenv("HOME", str(home_dir))
+        monkeypatch.chdir(cwd_dir)
+
+        result = await handle_grep({"pattern": "needle"}, _DUMMY_CONTEXT)
+
+        assert not result.is_error
+        assert "home.py" in result.output
+        assert "cwd.py" not in result.output
 
 
 class TestBashTool:
@@ -271,6 +309,22 @@ class TestBashTool:
         result = await handle_bash({"command": ""}, _DUMMY_CONTEXT)
         assert result.is_error
 
+    @pytest.mark.asyncio()
+    async def test_bash_defaults_to_home_when_workdir_omitted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        home_dir = tmp_path / "home"
+        cwd_dir = tmp_path / "cwd"
+        home_dir.mkdir()
+        cwd_dir.mkdir()
+        monkeypatch.setenv("HOME", str(home_dir))
+        monkeypatch.chdir(cwd_dir)
+
+        result = await handle_bash({"command": "pwd"}, _DUMMY_CONTEXT)
+
+        assert not result.is_error
+        assert str(home_dir) in result.output
+
 
 class TestListDirectoryTool:
     """Test the list_directory tool."""
@@ -292,6 +346,25 @@ class TestListDirectoryTool:
         assert not result.is_error
         assert "file.txt" in result.output
         assert "node_modules" not in result.output
+
+    @pytest.mark.asyncio()
+    async def test_list_directory_defaults_to_home_when_path_omitted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        home_dir = tmp_path / "home"
+        cwd_dir = tmp_path / "cwd"
+        home_dir.mkdir()
+        cwd_dir.mkdir()
+        (home_dir / "file.txt").touch()
+        (cwd_dir / "other.txt").touch()
+        monkeypatch.setenv("HOME", str(home_dir))
+        monkeypatch.chdir(cwd_dir)
+
+        result = await handle_list_directory({}, _DUMMY_CONTEXT)
+
+        assert not result.is_error
+        assert "file.txt" in result.output
+        assert "other.txt" not in result.output
 
 
 class TestResolvePath:
@@ -330,6 +403,13 @@ class TestResolvePath:
 
         result = resolve_path("relative/path")
         assert str(result) == "relative/path"
+
+    def test_omitted_path_defaults_to_home(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from cognis.tools.executor.paths import resolve_path
+
+        monkeypatch.setenv("HOME", "/tmp/home-default")
+        result = resolve_path(None, default_to_home=True)
+        assert str(result) == "/tmp/home-default"
 
 
 class TestRegistryIntegration:
