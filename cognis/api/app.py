@@ -451,6 +451,7 @@ def create_app() -> FastAPI:
             session_manager=session_manager,
             pairing_service=pairing_service,
             channel_manager_ref=_get_channel_manager,
+            command_dispatcher=command_dispatcher,
         )
         channel_manager = ChannelManager(
             session_factory=session_factory,

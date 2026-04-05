@@ -46,12 +46,14 @@ class InboundPipeline:
         session_manager: Any,  # SessionManager
         pairing_service: Any,
         channel_manager_ref: Any,  # Callable[[], ChannelManager] — lazy ref
+        command_dispatcher: Any = None,
     ) -> None:
         self._session_factory = session_factory
         self._turn_scheduler = turn_scheduler
         self._session_manager = session_manager
         self._pairing_service = pairing_service
         self._channel_manager_ref = channel_manager_ref
+        self._command_dispatcher = command_dispatcher
 
     async def process(
         self,
@@ -97,6 +99,26 @@ class InboundPipeline:
                     "extra_data": {
                         "channel_type": message.channel_type,
                         "account_id": message.account_id,
+                    }
+                },
+            )
+            return
+
+        cmd_result = await self._try_command_dispatch(
+            conversation_id=conversation_id,
+            content=message.content,
+            user_email=user_email,
+        )
+        if cmd_result is not None:
+            if cmd_result.text:
+                await self._send_system_message(message, config, cmd_result.text)
+            logger.info(
+                "channel inbound: slash command handled",
+                extra={
+                    "extra_data": {
+                        "channel_type": message.channel_type,
+                        "conversation_id": conversation_id,
+                        "command_type": cmd_result.type,
                     }
                 },
             )
@@ -307,6 +329,73 @@ class InboundPipeline:
                     reply_to_id=message.message_id,
                 )
             )
+
+    async def _send_system_message(
+        self,
+        message: InboundMessage,
+        config: ChannelAccountConfig,
+        text: str,
+    ) -> None:
+        """Send a command/system response back to the channel."""
+        manager = self._channel_manager_ref()
+        if manager is None:
+            return
+        adapter = manager.get_adapter(config.account_id)
+        if adapter is None:
+            return
+        with contextlib.suppress(Exception):
+            await adapter.send_message(
+                OutboundMessage(
+                    channel_type=message.channel_type,
+                    account_id=message.account_id,
+                    chat_id=message.chat_id,
+                    content=text,
+                    reply_to_id=message.message_id,
+                )
+            )
+
+    async def _try_command_dispatch(
+        self,
+        *,
+        conversation_id: str,
+        content: str,
+        user_email: str,
+    ) -> Any | None:
+        """Try to handle slash commands for channel integrations before turn submission."""
+        if self._command_dispatcher is None:
+            return None
+        if not content.strip().startswith("/"):
+            return None
+
+        from cognis.api.serializers import agent_to_response
+        from cognis.core.session import _to_conversation_model, _to_session_model
+        from cognis.models.agent import AgentDefinition
+        from cognis.store.queries import get_agent, get_conversation, get_session_row
+
+        async with self._session_factory() as session:
+            conversation_row = await get_conversation(session, conversation_id)
+            if conversation_row is None or conversation_row.active_session_id is None:
+                return None
+            agent_row = await get_agent(session, conversation_row.agent_id)
+            if agent_row is None:
+                return None
+            session_row = await get_session_row(session, conversation_row.active_session_id)
+            if session_row is None:
+                return None
+
+        agent_model = AgentDefinition.model_validate(agent_to_response(agent_row).model_dump())
+        conversation_model = _to_conversation_model(conversation_row)
+        session_model = _to_session_model(session_row)
+        has_active = self._turn_scheduler.has_active_turn(conversation_id)
+
+        return await self._command_dispatcher.dispatch(
+            content,
+            conversation=conversation_model,
+            session=session_model,
+            agent=agent_model,
+            user_email=user_email,
+            has_active_turn=has_active,
+        )
 
     async def _normalize_media_attachments(
         self,
