@@ -197,7 +197,7 @@ class IntarisProvider:
             body["from_events"] = True
         if wait_for_intention:
             body["wait_for_intention"] = True
-        if wait_timeout_ms is not None:
+        if wait_for_intention and wait_timeout_ms is not None:
             body["wait_timeout_ms"] = wait_timeout_ms
 
         async def _do() -> ReasoningReportResult:

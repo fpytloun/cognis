@@ -181,3 +181,47 @@ async def test_intaris_report_reasoning_falls_back_for_older_intaris_nodes() -> 
     assert calls[0]["wait_timeout_ms"] == 1500
     assert "wait_for_intention" not in calls[1]
     assert "wait_timeout_ms" not in calls[1]
+
+
+@pytest.mark.asyncio
+async def test_intaris_report_reasoning_omits_wait_timeout_without_bootstrap_wait() -> None:
+    auth = _AuthProvider()
+    intaris = IntarisProvider("http://localhost:8060", auth)
+    captured: dict[str, object] = {}
+
+    class _Response:
+        status_code = 200
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {"ok": True, "call_id": "call-2"}
+
+    async def _fake_post(
+        path: str,
+        *,
+        json: dict[str, object],
+        headers: dict[str, str],
+    ) -> _Response:
+        del path, headers
+        captured.update(json)
+        return _Response()
+
+    token = current_user_email.set("user@example.com")
+    try:
+        intaris.client.post = _fake_post  # type: ignore[method-assign]
+        result = await intaris.report_reasoning(
+            session_id="sess-2",
+            from_events=True,
+            wait_for_intention=False,
+            wait_timeout_ms=1500,
+        )
+    finally:
+        current_user_email.reset(token)
+        await intaris.client.aclose()
+
+    assert result.call_id == "call-2"
+    assert captured["from_events"] is True
+    assert "wait_for_intention" not in captured
+    assert "wait_timeout_ms" not in captured
