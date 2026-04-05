@@ -9,7 +9,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from cognis.channels.adapters.signal import SignalAdapter, _SignalConfig
+from cognis.channels.adapters.signal import (
+    SignalAdapter,
+    _normalize_signal_cli_trust_mode,
+    _SignalConfig,
+)
 from cognis.channels.adapters.signal_cli_runtime import (
     SignalCliRuntime,
     SignalCliRuntimeError,
@@ -69,6 +73,23 @@ class TestSignalConfig:
     def test_missing_account_number(self) -> None:
         config = _SignalConfig({}, {})
         assert config.account_number == ""
+
+    def test_trust_mode_normalizes_for_signal_cli(self) -> None:
+        config = _SignalConfig(
+            {"trust_mode": "trust-all-known"},
+            {"account_number": "+1"},
+        )
+        assert config.signal_cli_trust_mode == "on-first-use"
+
+
+class TestSignalTrustModeNormalization:
+    def test_maps_legacy_values(self) -> None:
+        assert _normalize_signal_cli_trust_mode("trust-all-known") == "on-first-use"
+        assert _normalize_signal_cli_trust_mode("always-trust") == "always"
+        assert _normalize_signal_cli_trust_mode("on-first-use") == "on-first-use"
+
+    def test_unknown_value_falls_back_safely(self) -> None:
+        assert _normalize_signal_cli_trust_mode("weird-value") == "on-first-use"
 
 
 # ---------------------------------------------------------------------------

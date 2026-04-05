@@ -64,6 +64,7 @@ class _SignalConfig:
         self.ignore_stories: bool = _bool(settings.get("ignore_stories", True))
         # Executor-provided signal-cli command (direct mode only)
         self.signal_cli_command: str = str(settings.get("_signal_cli_command", "signal-cli"))
+        self.signal_cli_trust_mode: str = _normalize_signal_cli_trust_mode(self.trust_mode)
 
     @property
     def is_direct(self) -> bool:
@@ -77,6 +78,23 @@ def _bool(value: Any) -> bool:
     if isinstance(value, str):
         return value.lower() in ("true", "1", "yes")
     return bool(value)
+
+
+def _normalize_signal_cli_trust_mode(value: str) -> str:
+    """Map Cognis/UI trust mode values to signal-cli CLI values.
+
+    The existing channel metadata historically exposed values aligned with the
+    REST wrapper (`trust-all-known`, `always-trust`, `on-first-use`).
+    Direct `signal-cli` expects CLI values (`always`, `on-first-use`, `never`).
+    """
+    mapping = {
+        "trust-all-known": "on-first-use",
+        "always-trust": "always",
+        "on-first-use": "on-first-use",
+        "always": "always",
+        "never": "never",
+    }
+    return mapping.get(value, "on-first-use")
 
 
 # ---------------------------------------------------------------------------
@@ -149,7 +167,7 @@ class SignalAdapter(BaseChannelAdapter):
         self._runtime = SignalCliRuntime(
             account_number=self._account_number,
             command=self._signal_config.signal_cli_command,
-            trust_mode=self._signal_config.trust_mode,
+            trust_mode=self._signal_config.signal_cli_trust_mode,
             on_notification=self._handle_direct_notification,
         )
         try:
