@@ -87,6 +87,7 @@
   let subSessionError = $state('');
   let timelineEl = $state<HTMLDivElement | null>(null);
   let userScrolledUp = $state(false);
+  let programmaticScroll = false;
   let selectedChannel = $state('all');
   let chatSidebarCollapsed = $state(false);
   interface SessionInfoData {
@@ -348,24 +349,28 @@
 
   function scrollToBottom(): void {
     if (!timelineEl || userScrolledUp) return;
+    programmaticScroll = true;
     requestAnimationFrame(() => {
       if (timelineEl) {
         timelineEl.scrollTop = timelineEl.scrollHeight;
       }
+      programmaticScroll = false;
     });
   }
 
   function handleTimelineScroll(): void {
-    if (!timelineEl) return;
+    if (!timelineEl || programmaticScroll) return;
     const distanceFromBottom = timelineEl.scrollHeight - timelineEl.scrollTop - timelineEl.clientHeight;
     userScrolledUp = distanceFromBottom > 80;
   }
 
   function jumpToBottom(): void {
     userScrolledUp = false;
+    programmaticScroll = true;
     if (timelineEl) {
       timelineEl.scrollTop = timelineEl.scrollHeight;
     }
+    programmaticScroll = false;
   }
 
   function channelTypes(): string[] {

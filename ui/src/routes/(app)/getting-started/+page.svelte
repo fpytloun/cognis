@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { goto } from '$app/navigation';
   import { onMount } from 'svelte';
 
   import { api, asApiError } from '$lib/api/client';
@@ -34,6 +35,7 @@
 
   function dismissGuide(): void {
     setGettingStartedDismissed(true);
+    void goto('/chat');
   }
 
   onMount(() => {

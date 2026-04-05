@@ -304,6 +304,11 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
       continue;
     }
 
+    if (event.type === 'session_recovered') {
+      items.push(createNotice('Session recovered', 'The controller recovered this conversation after a restart.'));
+      continue;
+    }
+
     if (event.type === 'compaction_summary') {
       const summary = typeof event.data.summary === 'string' ? event.data.summary : '';
       const method = typeof event.data.method === 'string' ? event.data.method : 'unknown';

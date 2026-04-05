@@ -64,18 +64,13 @@ async def diagnostics(request: Request) -> SystemDiagnosticsResponse:
     async with request.app.state.session_factory() as session:
         agents = await list_agents(session)
         providers = await list_llm_providers(session)
-        from cognis.store.queries import get_default_executor
+        from cognis.store.queries import list_executors
 
-        default_executor = await get_default_executor(session)
-        executor_has_tools = bool(
-            default_executor
-            and (
-                (default_executor.enabled_tools and len(default_executor.enabled_tools) > 0)
-                or (
-                    default_executor.enabled_tool_groups
-                    and len(default_executor.enabled_tool_groups) > 0
-                )
-            )
+        all_executors = await list_executors(session)
+        executor_has_tools = any(
+            (executor.enabled_tools and len(executor.enabled_tools) > 0)
+            or (executor.enabled_tool_groups and len(executor.enabled_tool_groups) > 0)
+            for executor in all_executors
         )
 
     provider_test_results: dict[str, Any] = getattr(request.app.state, "provider_test_results", {})
