@@ -1006,7 +1006,10 @@ def test_websocket_queues_second_message_while_turn_active(
 
         conversation_id = asyncio.run(_seed())
 
-        async def _fake_direct_turn(**_: object) -> None:
+        captured_direct_turn_kwargs: dict[str, object] = {}
+
+        async def _fake_direct_turn(**kwargs: object) -> None:
+            captured_direct_turn_kwargs.update(kwargs)
             await asyncio.sleep(0.2)
             return None
 
@@ -1057,4 +1060,5 @@ def test_websocket_queues_second_message_while_turn_active(
             for _ in range(5):
                 payload = ws.receive_json()
                 if payload["type"] == "message_complete":
+                    assert captured_direct_turn_kwargs["bootstrap_wait_for_intention"] is False
                     break

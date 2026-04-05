@@ -301,7 +301,7 @@ class TurnScheduler:
                 recoverable=False,
             )
 
-        conversation, session, agent, bootstrap_wait = runtime
+        conversation, session, agent, bootstrap_wait_for_intention = runtime
 
         # Authorization check
         if not system_initiated and conversation.user_email != user_email:
@@ -414,6 +414,7 @@ class TurnScheduler:
             attachments=normalized_attachments,
             attachment_notice=attachment_notice,
             system_initiated=system_initiated,
+            bootstrap_wait_for_intention=bootstrap_wait_for_intention,
         )
         return None
 
@@ -595,6 +596,7 @@ class TurnScheduler:
         attachments: list[AttachmentRef] | None = None,
         attachment_notice: str | None = None,
         system_initiated: bool = False,
+        bootstrap_wait_for_intention: bool = False,
     ) -> None:
         """Launch a turn as a background asyncio.Task."""
         conversation_id = conversation.conversation_id
@@ -613,6 +615,7 @@ class TurnScheduler:
                 attachments=attachments,
                 attachment_notice=attachment_notice,
                 system_initiated=system_initiated,
+                bootstrap_wait_for_intention=bootstrap_wait_for_intention,
                 cancel_event=control,
             )
         )
@@ -628,6 +631,7 @@ class TurnScheduler:
         attachments: list[AttachmentRef] | None,
         attachment_notice: str | None,
         system_initiated: bool,
+        bootstrap_wait_for_intention: bool,
         cancel_event: asyncio.Event,
     ) -> None:
         """Execute a single chat turn."""
@@ -730,7 +734,7 @@ class TurnScheduler:
                 on_tool_call=on_tool_call,
                 on_tool_result=on_tool_result,
                 cancel_event=cancel_event,
-                bootstrap_wait_for_intention=bootstrap_wait,
+                bootstrap_wait_for_intention=bootstrap_wait_for_intention,
             )
 
             # Post-turn housekeeping
