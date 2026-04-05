@@ -153,6 +153,12 @@ class ExecutorRunner:
                 asyncio.create_task(self._handle_channel_send(ws, msg_id, params))
             elif method == "channel.fetch_media":
                 asyncio.create_task(self._handle_channel_fetch_media(ws, msg_id, params))
+            elif method == "channel.typing":
+                asyncio.create_task(self._handle_channel_typing(ws, msg_id, params))
+            elif method == "channel.mark_read":
+                asyncio.create_task(self._handle_channel_mark_read(ws, msg_id, params))
+            elif method == "channel.sync_profile":
+                asyncio.create_task(self._handle_channel_sync_profile(ws, msg_id, params))
             elif method == "executor.cancel":
                 self._running = False
                 break
@@ -229,6 +235,7 @@ class ExecutorRunner:
 
             self._channel_handler = ChannelHandler()
         self._channel_handler.set_ws(ws)
+        self._channel_handler.set_executor_config(config)
 
         self._config_version = requested_version
         self._configured = True
@@ -450,6 +457,52 @@ class ExecutorRunner:
                 account_id=params.get("account_id", ""),
                 message=params.get("message", {}),
                 attachment=params.get("attachment", {}),
+            )
+            await self._send_rpc_result(ws, msg_id, result)
+        except Exception as exc:
+            await self._send_rpc_error(ws, msg_id, -32000, str(exc)[:500])
+
+    async def _handle_channel_typing(
+        self, ws: Any, msg_id: str | None, params: dict[str, Any]
+    ) -> None:
+        if self._channel_handler is None:
+            await self._send_rpc_error(ws, msg_id, -32601, "Channel handler unavailable")
+            return
+        try:
+            result = await self._channel_handler.send_typing(
+                account_id=params.get("account_id", ""),
+                chat_id=params.get("chat_id", ""),
+            )
+            await self._send_rpc_result(ws, msg_id, result)
+        except Exception as exc:
+            await self._send_rpc_error(ws, msg_id, -32000, str(exc)[:500])
+
+    async def _handle_channel_mark_read(
+        self, ws: Any, msg_id: str | None, params: dict[str, Any]
+    ) -> None:
+        if self._channel_handler is None:
+            await self._send_rpc_error(ws, msg_id, -32601, "Channel handler unavailable")
+            return
+        try:
+            result = await self._channel_handler.mark_read(
+                account_id=params.get("account_id", ""),
+                chat_id=params.get("chat_id", ""),
+                message_id=params.get("message_id", ""),
+            )
+            await self._send_rpc_result(ws, msg_id, result)
+        except Exception as exc:
+            await self._send_rpc_error(ws, msg_id, -32000, str(exc)[:500])
+
+    async def _handle_channel_sync_profile(
+        self, ws: Any, msg_id: str | None, params: dict[str, Any]
+    ) -> None:
+        if self._channel_handler is None:
+            await self._send_rpc_error(ws, msg_id, -32601, "Channel handler unavailable")
+            return
+        try:
+            result = await self._channel_handler.sync_profile(
+                account_id=params.get("account_id", ""),
+                profile_data=params,
             )
             await self._send_rpc_result(ws, msg_id, result)
         except Exception as exc:

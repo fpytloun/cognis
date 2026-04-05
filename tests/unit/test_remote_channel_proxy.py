@@ -114,6 +114,63 @@ async def test_update_status() -> None:
 
 
 @pytest.mark.asyncio
+async def test_send_typing_sends_rpc() -> None:
+    conn = FakeConnection({"status": "ok"})
+    proxy = RemoteChannelAdapterProxy(
+        connection=conn,
+        channel_type="signal",
+        capabilities=ChannelCapabilities(),
+        account_id="acct-1",
+    )
+    await proxy.send_typing("+420111222333")
+    assert conn.calls[0][0] == "channel.typing"
+    assert conn.calls[0][1]["chat_id"] == "+420111222333"
+
+
+@pytest.mark.asyncio
+async def test_mark_read_sends_rpc() -> None:
+    conn = FakeConnection({"status": "ok"})
+    proxy = RemoteChannelAdapterProxy(
+        connection=conn,
+        channel_type="signal",
+        capabilities=ChannelCapabilities(),
+        account_id="acct-1",
+    )
+    await proxy.mark_read("+420111222333", "12345")
+    assert conn.calls[0][0] == "channel.mark_read"
+    assert conn.calls[0][1]["message_id"] == "12345"
+
+
+@pytest.mark.asyncio
+async def test_sync_profile_sends_rpc() -> None:
+    from cognis.models.channel import AgentProfile
+
+    conn = FakeConnection({"status": "ok"})
+    proxy = RemoteChannelAdapterProxy(
+        connection=conn,
+        channel_type="signal",
+        capabilities=ChannelCapabilities(),
+        account_id="acct-1",
+    )
+    await proxy.sync_profile(AgentProfile(name="TestBot"))
+    assert conn.calls[0][0] == "channel.sync_profile"
+    assert conn.calls[0][1]["name"] == "TestBot"
+
+
+@pytest.mark.asyncio
+async def test_send_typing_failure_does_not_raise() -> None:
+    conn = FakeConnection(error=RuntimeError("boom"))
+    proxy = RemoteChannelAdapterProxy(
+        connection=conn,
+        channel_type="signal",
+        capabilities=ChannelCapabilities(),
+        account_id="acct-1",
+    )
+    # Should not raise
+    await proxy.send_typing("+420111222333")
+
+
+@pytest.mark.asyncio
 async def test_get_status_returns_current_state() -> None:
     conn = FakeConnection()
     proxy = RemoteChannelAdapterProxy(

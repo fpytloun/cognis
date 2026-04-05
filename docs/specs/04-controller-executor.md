@@ -335,6 +335,24 @@ channel_account = {
     "message": dict,
 }
 
+"channel.typing" → {
+    "account_id": str,
+    "chat_id": str,
+}
+
+"channel.mark_read" → {
+    "account_id": str,
+    "chat_id": str,
+    "message_id": str,
+}
+
+"channel.sync_profile" → {
+    "account_id": str,
+    "name": str,
+    "avatar_b64": str | None,
+    "avatar_content_type": str | None,
+}
+
 # Executor → Controller (notifications)
 "channel.message" → {
     "account_id": str,
@@ -349,15 +367,33 @@ channel_account = {
 
 #### Signal Example
 
+Signal supports two transport modes on the executor:
+
+**REST API mode** — the executor talks to an external signal-cli REST API:
+
 ```text
 1. User runs Cognis controller in the cloud.
 2. User runs Cognis executor on a machine they control.
 3. User runs signal-cli REST API on that executor machine.
 4. Channel account is configured with adapter_location="executor".
 5. Controller sends channel.start to the executor.
-6. Executor starts the Signal adapter locally and talks to signal-cli.
+6. Executor starts the Signal adapter locally and talks to signal-cli REST API.
 7. Inbound Signal messages flow back to controller via channel.message.
 8. Controller orchestrates the turn and sends outbound replies via channel.send.
+```
+
+**Direct JSON-RPC mode** — the executor runs signal-cli directly:
+
+```text
+1. User runs Cognis controller in the cloud.
+2. User runs Cognis executor on a machine with signal-cli installed.
+3. Executor config has signal.direct_enabled=true and optionally signal.command.
+4. Channel account is configured with transport="direct_jsonrpc" and adapter_location="executor".
+5. Controller sends channel.start to the executor.
+6. Executor spawns a signal-cli jsonRpc subprocess and communicates via stdio.
+7. Inbound Signal messages flow back to controller via channel.message.
+8. Controller orchestrates the turn and sends outbound replies via channel.send.
+9. Typing, read receipts, and profile sync flow via channel.typing, channel.mark_read, channel.sync_profile.
 ```
 
 This keeps the controller free of platform-side connection state while

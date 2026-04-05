@@ -22,9 +22,13 @@ from cognis.models.channel import (
 SIGNAL_META = ChannelMeta(
     channel_type="signal",
     label="Signal",
-    description="Signal Messenger via signal-cli REST API. Requires a linked device.",
+    description=(
+        "Signal Messenger via signal-cli. Supports two transports: "
+        "REST API (external signal-cli-rest-api) or direct JSON-RPC "
+        "(executor-managed signal-cli process)."
+    ),
     icon="signal",
-    docs_url="https://github.com/bbernhard/signal-cli-rest-api",
+    docs_url="https://github.com/AsamK/signal-cli",
     capabilities=ChannelCapabilities(
         chat_types=["direct", "group"],
         supports_typing=True,
@@ -37,8 +41,12 @@ SIGNAL_META = ChannelMeta(
         CredentialField(
             name="api_url",
             label="signal-cli REST API URL",
-            description="URL of the signal-cli REST API (e.g., http://localhost:8080)",
+            description=(
+                "URL of the signal-cli REST API (e.g., http://localhost:8080). "
+                "Required for REST API transport; ignored for direct JSON-RPC."
+            ),
             secret=False,
+            required=False,
         ),
         CredentialField(
             name="account_number",
@@ -49,12 +57,52 @@ SIGNAL_META = ChannelMeta(
     ],
     setting_fields=[
         SettingField(
+            name="transport",
+            label="Transport",
+            description=(
+                "How to connect to signal-cli. 'rest_api' uses an external "
+                "signal-cli REST API; 'direct_jsonrpc' runs signal-cli directly "
+                "on the executor via JSON-RPC (executor-only)."
+            ),
+            field_type="select",
+            default="rest_api",
+            options=["rest_api", "direct_jsonrpc"],
+        ),
+        SettingField(
             name="trust_mode",
             label="Trust mode",
             description="How to handle untrusted identities",
             field_type="select",
             default="trust-all-known",
             options=["trust-all-known", "always-trust", "on-first-use"],
+        ),
+        SettingField(
+            name="send_read_receipts",
+            label="Send read receipts",
+            description="Send read receipts when messages are processed",
+            field_type="boolean",
+            default=True,
+        ),
+        SettingField(
+            name="enable_typing",
+            label="Typing indicators",
+            description="Send typing indicators while generating responses",
+            field_type="boolean",
+            default=True,
+        ),
+        SettingField(
+            name="sync_profile",
+            label="Sync profile",
+            description="Sync agent name and avatar to Signal profile",
+            field_type="boolean",
+            default=True,
+        ),
+        SettingField(
+            name="ignore_stories",
+            label="Ignore stories",
+            description="Ignore Signal story messages",
+            field_type="boolean",
+            default=True,
         ),
     ],
     connection_mode="sse",

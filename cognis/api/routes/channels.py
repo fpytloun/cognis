@@ -22,6 +22,77 @@ logger = get_logger(__name__)
 router = APIRouter(prefix="/api/v1/channels", tags=["channels"])
 
 
+async def _validate_signal_account(request: Request, body: dict[str, Any]) -> Any | None:
+    """Validate Signal-specific account configuration.
+
+    Returns an error response if validation fails, or ``None`` if valid.
+    """
+    settings = body.get("settings", {})
+    transport = settings.get("transport", "rest_api")
+    credential_refs = body.get("credential_refs", {})
+    adapter_location = body.get("adapter_location", "controller")
+    executor_id = body.get("executor_id")
+
+    # account_number is required for both transports
+    account_number = credential_refs.get("account_number", "")
+    if not account_number:
+        return error_response(400, "validation_error", "Signal requires account_number credential")
+
+    if transport == "direct_jsonrpc":
+        if adapter_location != "executor":
+            return error_response(
+                400,
+                "validation_error",
+                "Signal direct_jsonrpc transport requires adapter_location='executor'",
+            )
+        if not executor_id:
+            return error_response(
+                400,
+                "validation_error",
+                "Signal direct_jsonrpc transport requires an explicit executor_id",
+            )
+        # Verify executor exists for the same owner and has direct Signal enabled
+        from cognis.store.queries import get_executor_row
+
+        user_email = require_current_user(request).email
+        async with request.app.state.session_factory() as session:
+            executor_row = await get_executor_row(session, executor_id, owner_email=user_email)
+        if executor_row is None:
+            return error_response(
+                400,
+                "validation_error",
+                f"Executor '{executor_id}' not found or not owned by current user",
+            )
+        executor_config = executor_row.config or {}
+        signal_config = executor_config.get("signal", {})
+        if not signal_config.get("direct_enabled", False):
+            return error_response(
+                400,
+                "validation_error",
+                (
+                    f"Executor '{executor_id}' does not have Signal direct mode enabled. "
+                    "Set config.signal.direct_enabled=true on the executor."
+                ),
+            )
+
+    elif transport == "rest_api":
+        api_url = credential_refs.get("api_url", "")
+        if not api_url:
+            return error_response(
+                400,
+                "validation_error",
+                "Signal REST API transport requires api_url credential",
+            )
+    else:
+        return error_response(
+            400,
+            "validation_error",
+            f"Unknown Signal transport: {transport}. Use 'rest_api' or 'direct_jsonrpc'.",
+        )
+
+    return None
+
+
 async def _pairing_response(
     request: Request,
     row: Any,
@@ -159,6 +230,12 @@ async def create_account(request: Request) -> Any:
 
     display_name = body.get("display_name", f"{meta.label} Account")
 
+    # --- Signal-specific validation ---
+    if channel_type == "signal":
+        err = await _validate_signal_account(request, body)
+        if err is not None:
+            return err
+
     # Generate webhook secret for webhook-based channels
     webhook_secret = None
     if meta.connection_mode == "webhook":
@@ -241,7 +318,32 @@ async def update_account(request: Request, account_id: str) -> Any:
     body = await request.json()
     session_factory = request.app.state.session_factory
 
+    # --- Signal-specific validation on update ---
+    from cognis.store.queries import get_channel_account as _get_account
     from cognis.store.queries import update_channel_account
+
+    async with session_factory() as session:
+        existing_row = await _get_account(session, account_id)
+    if existing_row is None:
+        return error_response(404, "not_found", "Channel account not found")
+
+    if existing_row.channel_type == "signal":
+        # Merge existing settings and credentials with incoming for validation
+        merged = dict(body)
+        merged.setdefault(
+            "adapter_location", getattr(existing_row, "adapter_location", "controller")
+        )
+        merged.setdefault("executor_id", getattr(existing_row, "executor_id", None))
+        existing_settings = existing_row.config or {}
+        merged_settings = {**existing_settings, **(body.get("config", {}))}
+        merged["settings"] = merged_settings
+        # Merge credential_refs: existing values + incoming overrides
+        existing_creds = existing_row.credential_refs or {}
+        incoming_creds = body.get("credential_refs", {})
+        merged["credential_refs"] = {**existing_creds, **incoming_creds}
+        err = await _validate_signal_account(request, merged)
+        if err is not None:
+            return err
 
     # Only allow updating specific fields
     allowed_fields = {

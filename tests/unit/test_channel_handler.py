@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -137,6 +138,55 @@ async def test_inbound_message_sends_notification(monkeypatch: pytest.MonkeyPatc
 
     assert ws.messages[0]["method"] == "channel.message"
     assert ws.messages[0]["params"]["account_id"] == "acct-1"
+
+
+@pytest.mark.asyncio
+async def test_send_typing(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter = FakeAdapter()
+    adapter.send_typing = AsyncMock()  # type: ignore[assignment]
+    monkeypatch.setattr("cognis.executor.channel_handler._create_adapter", lambda _: adapter)
+    handler = ChannelHandler()
+    handler.set_ws(FakeWS())
+    await handler.start("acct-1", "signal", {"agent_id": "a", "user_email": "u@example.com"}, {})
+
+    result = await handler.send_typing("acct-1", "+420111222333")
+    assert result == {"status": "ok"}
+    adapter.send_typing.assert_called_once_with("+420111222333")
+
+
+@pytest.mark.asyncio
+async def test_send_typing_unknown_account() -> None:
+    handler = ChannelHandler()
+    result = await handler.send_typing("missing", "+420111222333")
+    assert "error" in result
+
+
+@pytest.mark.asyncio
+async def test_mark_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter = FakeAdapter()
+    adapter.mark_read = AsyncMock()  # type: ignore[assignment]
+    monkeypatch.setattr("cognis.executor.channel_handler._create_adapter", lambda _: adapter)
+    handler = ChannelHandler()
+    handler.set_ws(FakeWS())
+    await handler.start("acct-1", "signal", {"agent_id": "a", "user_email": "u@example.com"}, {})
+
+    result = await handler.mark_read("acct-1", "+420111222333", "12345")
+    assert result == {"status": "ok"}
+    adapter.mark_read.assert_called_once_with("+420111222333", "12345")
+
+
+@pytest.mark.asyncio
+async def test_sync_profile(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter = FakeAdapter()
+    adapter.sync_profile = AsyncMock()  # type: ignore[assignment]
+    monkeypatch.setattr("cognis.executor.channel_handler._create_adapter", lambda _: adapter)
+    handler = ChannelHandler()
+    handler.set_ws(FakeWS())
+    await handler.start("acct-1", "signal", {"agent_id": "a", "user_email": "u@example.com"}, {})
+
+    result = await handler.sync_profile("acct-1", {"name": "TestBot"})
+    assert result == {"status": "ok"}
+    adapter.sync_profile.assert_called_once()
 
 
 @pytest.mark.asyncio

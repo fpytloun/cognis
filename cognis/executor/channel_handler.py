@@ -30,10 +30,15 @@ class ChannelHandler:
     def __init__(self) -> None:
         self._adapters: dict[str, Any] = {}  # account_id → BaseChannelAdapter
         self._ws: Any | None = None
+        self._executor_config: dict[str, Any] = {}
 
     def set_ws(self, ws: Any) -> None:
         """Set the WebSocket for sending notifications back to the controller."""
         self._ws = ws
+
+    def set_executor_config(self, config: dict[str, Any]) -> None:
+        """Set executor-level config (used for per-user runtime settings)."""
+        self._executor_config = config or {}
 
     async def start(
         self,
@@ -54,6 +59,12 @@ class ChannelHandler:
 
         adapter = _create_adapter(channel_type)
 
+        # Inject executor-level config into adapter settings
+        settings = dict(config.get("settings", {}))
+        if channel_type == "signal" and settings.get("transport") == "direct_jsonrpc":
+            signal_exec_config = self._executor_config.get("signal", {})
+            settings["_signal_cli_command"] = signal_exec_config.get("command", "signal-cli")
+
         # Build a ChannelAccountConfig from the provided config dict
         account_config = ChannelAccountConfig(
             account_id=account_id,
@@ -62,7 +73,7 @@ class ChannelHandler:
             credential_refs={},
             agent_id=config.get("agent_id", ""),
             user_email=config.get("user_email", ""),
-            settings=config.get("settings", {}),
+            settings=settings,
             default_conversation_id=config.get("default_conversation_id"),
             allow_new_conversations=config.get("allow_new_conversations", True),
             allowed_senders=config.get("allowed_senders", []),
@@ -127,6 +138,51 @@ class ChannelHandler:
             "content_type": content_type,
             "filename": filename,
         }
+
+    async def send_typing(self, account_id: str, chat_id: str) -> dict[str, Any]:
+        """Send a typing indicator through a local adapter."""
+        adapter = self._adapters.get(account_id)
+        if adapter is None:
+            return {"error": f"No adapter for account {account_id}"}
+        try:
+            await adapter.send_typing(chat_id)
+            return {"status": "ok"}
+        except Exception as exc:
+            return {"error": str(exc)[:200]}
+
+    async def mark_read(self, account_id: str, chat_id: str, message_id: str) -> dict[str, Any]:
+        """Mark a message as read through a local adapter."""
+        adapter = self._adapters.get(account_id)
+        if adapter is None:
+            return {"error": f"No adapter for account {account_id}"}
+        try:
+            await adapter.mark_read(chat_id, message_id)
+            return {"status": "ok"}
+        except Exception as exc:
+            return {"error": str(exc)[:200]}
+
+    async def sync_profile(self, account_id: str, profile_data: dict[str, Any]) -> dict[str, Any]:
+        """Sync agent profile through a local adapter."""
+        from cognis.models.channel import AgentProfile
+
+        adapter = self._adapters.get(account_id)
+        if adapter is None:
+            return {"error": f"No adapter for account {account_id}"}
+
+        avatar_bytes: bytes | None = None
+        if profile_data.get("avatar_b64"):
+            avatar_bytes = base64.b64decode(profile_data["avatar_b64"])
+
+        profile = AgentProfile(
+            name=profile_data.get("name", ""),
+            avatar_bytes=avatar_bytes,
+            avatar_content_type=profile_data.get("avatar_content_type"),
+        )
+        try:
+            await adapter.sync_profile(profile)
+            return {"status": "ok"}
+        except Exception as exc:
+            return {"error": str(exc)[:200]}
 
     async def stop_all(self) -> None:
         """Stop all running adapters (called on executor shutdown)."""

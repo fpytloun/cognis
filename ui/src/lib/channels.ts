@@ -31,13 +31,13 @@ export interface SummaryCardItem {
 
 export const guides: Record<string, SetupGuide> = {
   signal: {
-    title: 'Signal via signal-cli REST API',
-    service: 'Run a local or remote signal-cli REST API first.',
+    title: 'Signal via signal-cli',
+    service: 'Two transport modes: REST API (external signal-cli-rest-api) or direct JSON-RPC (executor-managed signal-cli).',
     publicUrlNeeded: false,
     steps: [
-      'Start signal-cli REST API, for example with Docker exposing port 8080.',
-      'Link or register your Signal number through signal-cli, usually by scanning a QR code from the Signal mobile app.',
-      'Paste the API URL and linked phone number below.',
+      'REST API mode: Start signal-cli REST API (e.g. via Docker), link your number, and paste the API URL and phone number below.',
+      'Direct JSON-RPC mode: Set transport to "direct_jsonrpc", assign an executor with signal.direct_enabled=true in its config, and provide the linked phone number. The executor runs signal-cli directly.',
+      'For both modes, link or register your Signal number through signal-cli first (e.g. by scanning a QR code from the Signal mobile app).',
     ],
   },
   whatsapp: {

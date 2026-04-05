@@ -150,10 +150,66 @@ class RemoteChannelAdapterProxy:
             return None
 
     async def send_typing(self, chat_id: str) -> None:
-        """Typing indicators are not proxied (too latency-sensitive)."""
+        """Send typing indicator to the executor."""
+        try:
+            await self._connection.rpc_call(
+                "channel.typing",
+                {"account_id": self._account_id, "chat_id": chat_id},
+                timeout=5.0,
+            )
+        except Exception:
+            logger.debug(
+                "remote channel proxy: typing failed",
+                extra={"extra_data": {"account_id": self._account_id}},
+                exc_info=True,
+            )
 
     async def mark_read(self, chat_id: str, message_id: str) -> None:
-        """Read receipts are not proxied."""
+        """Send read receipt to the executor."""
+        try:
+            await self._connection.rpc_call(
+                "channel.mark_read",
+                {
+                    "account_id": self._account_id,
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                },
+                timeout=5.0,
+            )
+        except Exception:
+            logger.debug(
+                "remote channel proxy: mark_read failed",
+                extra={"extra_data": {"account_id": self._account_id}},
+                exc_info=True,
+            )
+
+    async def sync_profile(self, profile: Any) -> None:
+        """Sync agent profile to the executor."""
+        from cognis.models.channel import AgentProfile
+
+        if not isinstance(profile, AgentProfile):
+            return
+        try:
+            payload: dict[str, Any] = {
+                "account_id": self._account_id,
+                "name": profile.effective_name,
+            }
+            if profile.avatar_bytes:
+                import base64 as b64mod
+
+                payload["avatar_b64"] = b64mod.b64encode(profile.avatar_bytes).decode("ascii")
+                payload["avatar_content_type"] = profile.avatar_content_type or "image/png"
+            await self._connection.rpc_call(
+                "channel.sync_profile",
+                payload,
+                timeout=15.0,
+            )
+        except Exception:
+            logger.debug(
+                "remote channel proxy: sync_profile failed",
+                extra={"extra_data": {"account_id": self._account_id}},
+                exc_info=True,
+            )
 
     async def download_attachment(
         self,
