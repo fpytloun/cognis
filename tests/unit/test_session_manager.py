@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -8,6 +9,7 @@ from cognis.core.session import SessionManager
 from cognis.models.session import ConversationContext
 from cognis.store.database import create_engine, create_session_factory
 from cognis.store.models import Agent, Conversation, Session, User
+from cognis.store.queries import list_conversation_sessions
 
 
 class _Guardrails:
@@ -29,6 +31,28 @@ class _Guardrails:
         if self.fail:
             raise RuntimeError("intaris unavailable")
         self.calls.append((session_id, agent_id, parent_session_id))
+
+
+class _SlowGuardrails(_Guardrails):
+    def __init__(self) -> None:
+        super().__init__(fail=False)
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def create_session(
+        self,
+        session_id: str,
+        intention: str,
+        agent_id: str,
+        user_id: str | None = None,
+        parent_session_id: str | None = None,
+        policy: dict | None = None,
+        details: dict | None = None,
+    ) -> None:
+        del intention, user_id, policy, details
+        self.calls.append((session_id, agent_id, parent_session_id))
+        self.entered.set()
+        await self.release.wait()
 
 
 class _Providers:
@@ -279,5 +303,52 @@ async def test_rotate_session_carries_forward_mnemory_session_id(tmp_path) -> No
         new_row = await db.get(Session, new_session.session_id)
         assert new_row is not None
         assert new_row.mnemory_session_id == "mnemory-abc-123"
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_ensure_root_session_is_single_winner(tmp_path) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    providers = _Providers()
+    providers.guardrails = _SlowGuardrails()
+    manager = SessionManager(session_factory, providers, _Cache())
+
+    conversation = await manager.create_conversation(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context=ConversationContext(type="web"),
+        title="Race conversation",
+    )
+
+    first = asyncio.create_task(
+        manager.ensure_root_session(
+            conversation_id=conversation.conversation_id,
+            user_email="user@example.com",
+            agent_id="agent-1",
+            intention="first bootstrap",
+        )
+    )
+    await providers.guardrails.entered.wait()
+    second = asyncio.create_task(
+        manager.ensure_root_session(
+            conversation_id=conversation.conversation_id,
+            user_email="user@example.com",
+            agent_id="agent-1",
+            intention="second bootstrap",
+        )
+    )
+    providers.guardrails.release.set()
+
+    first_session, second_session = await asyncio.gather(first, second)
+
+    assert first_session.session_id == second_session.session_id
+
+    async with session_factory() as db:
+        stored_conversation = await db.get(Conversation, conversation.conversation_id)
+        stored_sessions = await list_conversation_sessions(db, conversation.conversation_id)
+        assert stored_conversation is not None
+        assert stored_conversation.active_session_id == first_session.session_id
+        assert [row.session_id for row in stored_sessions] == [first_session.session_id]
 
     await engine.dispose()

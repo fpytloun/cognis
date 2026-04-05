@@ -433,11 +433,12 @@ Cognis Session ────── Mnemory Session ────── Intaris Ses
 
 ### Creation Flow
 
-1. **Conversation created** → root session created in Cognis DB
-2. **First turn** → controller calls Mnemory recall (session_id=null) → gets
-   `mnemory_session_id`, stores in session
-3. **First turn** → controller creates Intaris session (POST /intention) →
-   stores `intaris_session_id` in session
+1. **Conversation created** → conversation metadata row created in Cognis DB
+   (no root session yet for web conversations)
+2. **First turn** → controller creates the root Cognis session lazily,
+   then creates the matching Intaris session (POST /intention)
+3. **First turn** → controller calls Mnemory recall (session_id=null on the
+   first recall) → gets `mnemory_session_id`, stores in session
 4. **Delegation** → controller creates child session in Cognis DB →
    pre-creates both Mnemory session (first recall) and Intaris session
    (POST /intention with parent_session_id)

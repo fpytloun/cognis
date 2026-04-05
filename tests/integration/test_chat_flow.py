@@ -25,6 +25,7 @@ def test_send_message_and_receive_response(live_stack: LiveStack, run_id: str) -
     live_create_agent(live_stack, agent_id)
     conv = live_create_conversation(live_stack, agent_id)
     cid = conv["conversation_id"]
+    assert conv["active_session_id"] is None
 
     events = live_chat_ws(live_stack, cid, "What is 2 + 2? Answer with just the number.")
     assert any(e["type"] == "message_complete" for e in events), (
@@ -63,6 +64,7 @@ def test_conversation_sessions_created(live_stack: LiveStack, run_id: str) -> No
     live_create_agent(live_stack, agent_id)
     conv = live_create_conversation(live_stack, agent_id)
     cid = conv["conversation_id"]
+    assert conv["active_session_id"] is None
 
     events = live_chat_ws(live_stack, cid, "Hello")
     assert any(e["type"] == "message_complete" for e in events)

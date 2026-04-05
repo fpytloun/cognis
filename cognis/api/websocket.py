@@ -808,22 +808,6 @@ async def _handle_message(
 
     # Not a command — submit to TurnScheduler
     if turn_scheduler is not None:
-        async with app.state.session_factory() as db_session:
-            from cognis.store.queries import get_conversation
-
-            conversation_row = await get_conversation(db_session, conversation_id)
-            await mark_artifacts_attached(
-                db_session,
-                [
-                    str(item.get("artifact_id"))
-                    for item in attachments
-                    if isinstance(item, dict) and item.get("artifact_id")
-                ],
-                owner_email=connection.user_email,
-                conversation_id=conversation_id,
-                session_id=conversation_row.active_session_id if conversation_row else None,
-            )
-            await db_session.commit()
         error = await turn_scheduler.submit_turn(
             conversation_id,
             content,
@@ -841,6 +825,30 @@ async def _handle_message(
                     detail=error.detail,
                 ).model_dump(),
             )
+        else:
+            try:
+                async with app.state.session_factory() as db_session:
+                    from cognis.store.queries import get_conversation
+
+                    conversation_row = await get_conversation(db_session, conversation_id)
+                    await mark_artifacts_attached(
+                        db_session,
+                        [
+                            str(item.get("artifact_id"))
+                            for item in attachments
+                            if isinstance(item, dict) and item.get("artifact_id")
+                        ],
+                        owner_email=connection.user_email,
+                        conversation_id=conversation_id,
+                        session_id=conversation_row.active_session_id if conversation_row else None,
+                    )
+                    await db_session.commit()
+            except Exception:
+                logger.warning(
+                    "websocket: failed to persist post-submit attachment association",
+                    extra={"extra_data": {"conversation_id": conversation_id}},
+                    exc_info=True,
+                )
     else:
         await manager.send_error(
             connection,

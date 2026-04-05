@@ -100,10 +100,7 @@ async def resolve_conversation(
     if existing is not None:
         return conversation_to_response(existing)
     context_ref = f"{payload.context_type}:user:{user.email}:default"
-    (
-        conversation,
-        _root_session,
-    ) = await request.app.state.session_manager.create_conversation_with_root_session(
+    conversation = await request.app.state.session_manager.create_conversation(
         user_email=user.email,
         agent_id=payload.agent_id,
         context=ConversationContext(
@@ -129,10 +126,7 @@ async def create_conversation(
         if agent is None:
             raise api_exception(404, "not_found", "Agent not found")
         require_owner_or_admin(request, agent.owner_email)
-    (
-        conversation,
-        _root_session,
-    ) = await request.app.state.session_manager.create_conversation_with_root_session(
+    conversation = await request.app.state.session_manager.create_conversation(
         user_email=user.email,
         agent_id=payload.agent_id,
         context=ConversationContext(
@@ -366,15 +360,6 @@ async def send_message(
 
         observer = SSETurnObserver(conversation_id)
         turn_scheduler.add_observer(conversation_id, observer)
-        async with request.app.state.session_factory() as session:
-            await mark_artifacts_attached(
-                session,
-                [item.artifact_id for item in payload.attachments],
-                owner_email=user.email,
-                conversation_id=conversation_id,
-                session_id=row.active_session_id,
-            )
-            await session.commit()
         error = await turn_scheduler.submit_turn(
             conversation_id,
             payload.content,
@@ -384,6 +369,23 @@ async def send_message(
         if error is not None:
             turn_scheduler.remove_observer(conversation_id, observer)
             raise _turn_error_to_http(error)
+        try:
+            async with request.app.state.session_factory() as session:
+                latest_row = await get_conversation(session, conversation_id)
+                await mark_artifacts_attached(
+                    session,
+                    [item.artifact_id for item in payload.attachments],
+                    owner_email=user.email,
+                    conversation_id=conversation_id,
+                    session_id=latest_row.active_session_id if latest_row else None,
+                )
+                await session.commit()
+        except Exception:
+            logger.warning(
+                "Failed to persist post-submit attachment association",
+                extra={"extra_data": {"conversation_id": conversation_id}},
+                exc_info=True,
+            )
 
         async def _cleanup_generator():  # type: ignore[return]
             try:
@@ -398,15 +400,6 @@ async def send_message(
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
     else:
-        async with request.app.state.session_factory() as session:
-            await mark_artifacts_attached(
-                session,
-                [item.artifact_id for item in payload.attachments],
-                owner_email=user.email,
-                conversation_id=conversation_id,
-                session_id=row.active_session_id,
-            )
-            await session.commit()
         error = await turn_scheduler.submit_turn(
             conversation_id,
             payload.content,
@@ -415,6 +408,23 @@ async def send_message(
         )
         if error is not None:
             raise _turn_error_to_http(error)
+        try:
+            async with request.app.state.session_factory() as session:
+                latest_row = await get_conversation(session, conversation_id)
+                await mark_artifacts_attached(
+                    session,
+                    [item.artifact_id for item in payload.attachments],
+                    owner_email=user.email,
+                    conversation_id=conversation_id,
+                    session_id=latest_row.active_session_id if latest_row else None,
+                )
+                await session.commit()
+        except Exception:
+            logger.warning(
+                "Failed to persist post-submit attachment association",
+                extra={"extra_data": {"conversation_id": conversation_id}},
+                exc_info=True,
+            )
         return JSONResponse(
             status_code=202,
             content=SendMessageResponse(status="accepted").model_dump(),

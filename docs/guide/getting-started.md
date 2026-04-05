@@ -94,6 +94,7 @@ For a first setup, keep the agent simple and enable only the tools you expect to
 ## 7. Start a conversation
 
 Open `Chat`, create a new conversation, choose your agent, and send a first message.
+The conversation appears immediately, but the active session is created lazily from that first user message.
 
 The chat view will show streaming responses, tool activity, and any approval prompts that need human input.
 

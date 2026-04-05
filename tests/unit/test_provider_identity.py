@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import httpx
 import pytest
 
 from cognis.providers.guardrails.intaris import IntarisProvider
@@ -128,3 +129,55 @@ async def test_intaris_call_mcp_tool_normalizes_rest_content_blocks() -> None:
         "call_id": "call-1",
         "latency_ms": 1088,
     }
+
+
+@pytest.mark.asyncio
+async def test_intaris_report_reasoning_falls_back_for_older_intaris_nodes() -> None:
+    auth = _AuthProvider()
+    intaris = IntarisProvider("http://localhost:8060", auth)
+    calls: list[dict[str, object]] = []
+
+    class _Response:
+        def __init__(self, status_code: int, payload: dict[str, object]) -> None:
+            self.status_code = status_code
+            self._payload = payload
+
+        def raise_for_status(self) -> None:
+            if self.status_code >= 400:
+                request = httpx.Request("POST", "http://localhost:8060/api/v1/reasoning")
+                response = httpx.Response(self.status_code, request=request)
+                raise httpx.HTTPStatusError("boom", request=request, response=response)
+
+        def json(self) -> dict[str, object]:
+            return self._payload
+
+    async def _fake_post(
+        path: str,
+        *,
+        json: dict[str, object],
+        headers: dict[str, str],
+    ) -> _Response:
+        del path, headers
+        calls.append(json)
+        if len(calls) == 1:
+            return _Response(422, {"detail": "extra fields not permitted"})
+        return _Response(200, {"ok": True, "call_id": "call-1"})
+
+    token = current_user_email.set("user@example.com")
+    try:
+        intaris.client.post = _fake_post  # type: ignore[method-assign]
+        result = await intaris.report_reasoning(
+            session_id="sess-1",
+            from_events=True,
+            wait_for_intention=True,
+            wait_timeout_ms=1500,
+        )
+    finally:
+        current_user_email.reset(token)
+        await intaris.client.aclose()
+
+    assert result.call_id == "call-1"
+    assert calls[0]["wait_for_intention"] is True
+    assert calls[0]["wait_timeout_ms"] == 1500
+    assert "wait_for_intention" not in calls[1]
+    assert "wait_timeout_ms" not in calls[1]

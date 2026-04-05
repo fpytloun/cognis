@@ -100,6 +100,9 @@ each agent. If an active conversation matching the (user, agent, context_type)
 triple exists, it is returned. Otherwise a new one is created with
 `context_ref=web:user:<email>:default`.
 
+For web conversations, `active_session_id` may be `null` until the first user
+message is sent. Sending the first message lazily creates the root session.
+
 #### Get Messages (proxied from Intaris events)
 ```http
 GET /api/v1/conversations/conv_abc/messages?limit=50&after_seq=100
@@ -301,9 +304,9 @@ POST   /api/v1/tasks/:id/resume                   → Resume paused task
 POST   /api/v1/tasks/:id/cancel                   → Cancel task (any state)
 POST   /api/v1/tasks/:id/gate-response            → Respond to a gate step
 POST   /api/v1/tasks/:id/step-response            → Respond to `step_request_input` for the current step
-POST   /api/v1/tasks/batch-submit                 → Submit multiple draft tasks at once
 GET    /api/v1/notifications                      → List pending notifications (escalations, gates, step questions)
 POST   /api/v1/notifications/:id/resolve         → Resolve a notification directly
+POST   /api/v1/tasks/batch-submit                 → Submit multiple draft tasks at once
 GET    /api/v1/tasks/:id/steps                    → List step runs with status and output
 GET    /api/v1/step-runs/:id                      → Step run detail (output, evaluation, attempts)
 POST   /api/v1/tasks/:id/dependencies             → Add dependency (depends_on task_id, required bool)

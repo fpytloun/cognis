@@ -285,7 +285,15 @@ class TurnScheduler:
         Turns are serialized per conversation. If a turn is already active,
         the message is queued (up to ``MAX_QUEUED_MESSAGES``).
         """
-        # Load conversation runtime
+        normalized_attachments, attachment_error = await self._resolve_attachments_for_turn(
+            user_email=user_email,
+            attachments=attachments or [],
+        )
+        if attachment_error is not None:
+            return attachment_error
+
+        # Load conversation runtime only after validating attachments so
+        # failed first sends do not bootstrap a session unnecessarily.
         try:
             runtime = await self._load_conversation_runtime(conversation_id, user_message=content)
         except SessionCreationFailedError:
@@ -310,13 +318,6 @@ class TurnScheduler:
                 message="Conversation access denied",
                 recoverable=False,
             )
-
-        normalized_attachments, attachment_error = await self._resolve_attachments_for_turn(
-            user_email=user_email,
-            attachments=attachments or [],
-        )
-        if attachment_error is not None:
-            return attachment_error
 
         attachment_notice = await self._build_attachment_notice(
             session=session,
@@ -369,6 +370,7 @@ class TurnScheduler:
                     "Use /approve or /deny, or use the buttons above.",
                 )
                 return None
+
             pending_questions = self._pause_waiter.list_pending(
                 conversation_id=conversation_id,
                 pause_type="step_question",
@@ -379,7 +381,6 @@ class TurnScheduler:
                     message="Answer the pending question before sending a new message.",
                     recoverable=True,
                 )
-
 
         # Per-user concurrent turn limit
         if not system_initiated:

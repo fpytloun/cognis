@@ -13,6 +13,7 @@ Intaris load.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from dataclasses import dataclass, field
 from time import monotonic
@@ -188,10 +189,8 @@ class SessionCache:
     async def aclose(self) -> None:
         """Close Redis connection if active."""
         if self._redis is not None:
-            try:
+            with contextlib.suppress(Exception):
                 await self._redis.aclose()
-            except Exception:
-                pass
             self._redis = None
 
     # ------------------------------------------------------------------
@@ -367,9 +366,13 @@ class SessionCache:
         if entry is None:
             return False
         async with entry.lock:
-            if not force and updated_at is not None and entry.intention_updated_at is not None:
-                if updated_at < entry.intention_updated_at:
-                    return False
+            if (
+                not force
+                and updated_at is not None
+                and entry.intention_updated_at is not None
+                and updated_at < entry.intention_updated_at
+            ):
+                return False
             entry.intention = intention
             if updated_at is not None:
                 entry.intention_updated_at = updated_at

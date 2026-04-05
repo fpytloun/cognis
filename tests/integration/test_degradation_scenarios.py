@@ -89,6 +89,14 @@ def test_conversation_creation_without_intaris_session(
     body = response.json()
     assert body["conversation_id"] is not None
     assert body["agent_id"] == agent_id
+    assert body["active_session_id"] is None
+
+    sessions_response = stack.client.get(
+        f"/api/v1/conversations/{body['conversation_id']}/sessions",
+        headers=stack.admin_headers(),
+    )
+    assert sessions_response.status_code == 200
+    assert sessions_response.json() == []
 
 
 @pytest.mark.integration

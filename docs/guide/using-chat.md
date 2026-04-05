@@ -5,6 +5,9 @@ The chat workspace is where you talk to an agent, watch responses stream in real
 ## Starting a conversation
 
 Open `Chat`, create a new conversation, and select an agent.
+Web conversations can exist before they have an active session; Cognis creates the root session when you send the first real message.
+
+That first message is also used to bootstrap Intaris intention generation right away, so the session purpose is available from the first turn instead of waiting for a follow-up turn.
 
 ## What the chat UI shows
 
