@@ -300,6 +300,16 @@ export function formStateToPayload(form: AgentFormState): Record<string, unknown
   return payload;
 }
 
+export function formStateToEffectiveToolsPreviewPayload(form: AgentFormState): Record<string, unknown> {
+  const payload = formStateToPayload(form);
+  return {
+    agent_id: payload.agent_id ?? null,
+    tools: payload.tools,
+    permissions: payload.permissions,
+    execution: payload.execution
+  };
+}
+
 /**
  * Build a preview of the composed system prompt that the LLM will receive.
  * Mirrors the backend `AgentDefinition.compose_personality()` + system_prompt

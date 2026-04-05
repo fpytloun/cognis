@@ -4,6 +4,7 @@ import {
   agentToFormState,
   buildSystemPromptPreview,
   createEmptyAgentForm,
+  formStateToEffectiveToolsPreviewPayload,
   formStateToPayload
 } from '$lib/agents';
 
@@ -87,5 +88,58 @@ describe('agent payload mapping', () => {
   it('returns empty preview when no identity is configured', () => {
     const form = createEmptyAgentForm();
     expect(buildSystemPromptPreview(form)).toBe('');
+  });
+
+  it('builds effective-tools preview payload with intaris and local MCP selections', () => {
+    const form = createEmptyAgentForm();
+    form.agentId = 'agent-1';
+    form.name = 'Agent';
+    form.intarisMcpServers = ['remote-audit'];
+    form.mcpServers = [
+      {
+        name: 'filesystem',
+        command: 'npx',
+        argsText: '@modelcontextprotocol/server-filesystem\n/tmp/project',
+        envVars: [],
+        timeoutSeconds: 30
+      }
+    ];
+    form.executorSelector = 'region=eu\ngpu=true';
+
+    const payload = formStateToEffectiveToolsPreviewPayload(form);
+
+    expect(payload).toEqual({
+      agent_id: 'agent-1',
+      tools: {
+        delegation_tools: true,
+        mcp_servers: [
+          {
+            name: 'filesystem',
+            command: 'npx',
+            args: ['@modelcontextprotocol/server-filesystem', '/tmp/project'],
+            env: {},
+            timeout_seconds: 30
+          }
+        ],
+        intaris_mcp_servers: ['remote-audit']
+      },
+      permissions: {
+        tool_permissions: {},
+        allowed_secrets: [],
+        can_delegate: true,
+        max_delegation_depth: 3
+      },
+      execution: {
+        executor_id: undefined,
+        executor_selector: {
+          region: 'eu',
+          gpu: 'true'
+        },
+        available_workflow_ids: [],
+        default_workflow_id: 'system:direct',
+        workflow_selection_mode: 'automatic',
+        step_agent_overrides: {}
+      }
+    });
   });
 });

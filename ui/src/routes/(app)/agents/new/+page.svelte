@@ -2,7 +2,12 @@
   import { beforeNavigate, goto } from '$app/navigation';
   import { onMount } from 'svelte';
 
-  import { createEmptyAgentForm, defaultSystemPrompt, type AgentFormState } from '$lib/agents';
+  import {
+    createEmptyAgentForm,
+    defaultSystemPrompt,
+    formStateToEffectiveToolsPreviewPayload,
+    type AgentFormState
+  } from '$lib/agents';
   import { api, asApiError } from '$lib/api/client';
   import { auth } from '$lib/stores/auth';
   import AgentForm from '$lib/components/agents/AgentForm.svelte';
@@ -58,16 +63,7 @@
       form.availableWorkflowIds = systemWorkflowIds;
       form.defaultWorkflowId = 'system:direct';
       form.systemPrompt = defaultSystemPrompt('');
-      const preview = await api.agents.previewEffectiveTools({
-        tools: form.originalTools,
-        permissions: {
-          tool_permissions: form.toolPermissions,
-          allowed_secrets: form.allowedSecrets,
-          max_delegation_depth: form.maxDelegationDepth,
-          can_delegate: form.canDelegate,
-        },
-        execution: { executor_id: form.executorId || undefined },
-      });
+      const preview = await api.agents.previewEffectiveTools(formStateToEffectiveToolsPreviewPayload(form));
       tools = preview.configured_state.tools;
       initialSnapshot = JSON.stringify($state.snapshot(form));
     } catch (caughtError) {
@@ -100,36 +96,7 @@
 
   $effect(() => {
     if (loading) return;
-    const payload = {
-      tools: {
-        ...form.originalTools,
-        disabled_categories: form.disabledCategories,
-        disabled_tools: form.disabledTools,
-        delegation_tools: form.canDelegate,
-      },
-      permissions: {
-        tool_permissions: form.toolPermissions,
-        allowed_secrets: form.allowedSecrets,
-        max_delegation_depth: form.maxDelegationDepth,
-        can_delegate: form.canDelegate,
-      },
-      execution: {
-        executor_id: form.executorId || undefined,
-        executor_selector: form.executorSelector
-          ? Object.fromEntries(
-              form.executorSelector
-                .split('\n')
-                .map((entry) => entry.trim())
-                .filter(Boolean)
-                .map((entry) => {
-                  const [key, ...rest] = entry.split('=');
-                  return [key.trim(), rest.join('=').trim()];
-                })
-            )
-          : undefined,
-      },
-      agent_id: form.agentId || null,
-    };
+    const payload = formStateToEffectiveToolsPreviewPayload(form);
     if (previewTimer) clearTimeout(previewTimer);
     previewTimer = setTimeout(async () => {
       try {
