@@ -457,8 +457,8 @@ def create_app() -> FastAPI:
             secrets_provider=providers.secrets,
             artifact_store=artifact_store,
             event_bus=event_bus,
-            ws_provider=providers.executor.ws_provider
-            if hasattr(providers.executor, "ws_provider")
+            ws_provider=providers.executor.websocket
+            if hasattr(providers.executor, "websocket")
             else None,
         )
         _channel_manager_holder[0] = channel_manager

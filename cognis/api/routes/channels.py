@@ -486,6 +486,11 @@ async def start_account(request: Request, account_id: str) -> Any:
         status = await channel_manager.get_account_status(account_id)
         return {"status": status.model_dump() if status else "starting"}
     except Exception as exc:
+        logger.warning(
+            "channel route: failed to start account",
+            extra={"extra_data": {"account_id": account_id}},
+            exc_info=True,
+        )
         return error_response(500, "start_failed", str(exc))
 
 
