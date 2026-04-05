@@ -51,83 +51,83 @@
     system: 'system',
     account: 'account'
   };
-  let activeTab: SettingsTab = 'providers';
-  let loading = true;
-  let busy = false;
-  let error = '';
-  let notice = '';
-  let settings: SettingsCategory[] = [];
-  let providers: LLMProvider[] = [];
-  let modelRouting: ModelRouting = { default: null, classifier: null, compaction: null, simple_inline: null, image_generation: null, items: {} };
-  let secrets: SecretMetadata[] = [];
-  let health: HealthResponse | null = null;
-  let diagnostics: SystemDiagnostics | null = null;
-  let executorConfigs: ExecutorConfig[] = [];
-  let executorTools: ToolDefinitionSummary[] = [];
-  let editingExecutor: ExecutorConfig | null = null;
-  let webConfig: WebConfigStatus = { backend: 'direct', tavily_configured: false, brave_configured: false, available_backends: ['direct'] };
-  let webBackendForm = 'direct';
-  let webKeySetup: { backend: string; value: string } | null = null;
-  let showExecutorForm = false;
-  let executorForm = { executor_id: '', name: '', executor_type: 'in_process', labels: '', status: 'active' };
-  let executorToken: ExecutorTokenResponse | null = null;
-  let mcpServerConfigs: MCPServerConfigResponse[] = [];
-  let showMcpForm = false;
-  let editingMcpServer: MCPServerConfigResponse | null = null;
-  let mcpForm = { name: '', transport: 'stdio', command: '', url: '', args: '', envVars: [] as MCPEnvVar[], timeout_seconds: 30, description: '' };
-  let isAdmin = false;
+  let activeTab = $state<SettingsTab>('providers');
+  let loading = $state(true);
+  let busy = $state(false);
+  let error = $state('');
+  let notice = $state('');
+  let settings = $state<SettingsCategory[]>([]);
+  let providers = $state<LLMProvider[]>([]);
+  let modelRouting = $state<ModelRouting>({ default: null, classifier: null, compaction: null, simple_inline: null, image_generation: null, items: {} });
+  let secrets = $state<SecretMetadata[]>([]);
+  let health = $state<HealthResponse | null>(null);
+  let diagnostics = $state<SystemDiagnostics | null>(null);
+  let executorConfigs = $state<ExecutorConfig[]>([]);
+  let executorTools = $state<ToolDefinitionSummary[]>([]);
+  let editingExecutor = $state<ExecutorConfig | null>(null);
+  let webConfig = $state<WebConfigStatus>({ backend: 'direct', tavily_configured: false, brave_configured: false, available_backends: ['direct'] });
+  let webBackendForm = $state('direct');
+  let webKeySetup = $state<{ backend: string; value: string } | null>(null);
+  let showExecutorForm = $state(false);
+  let executorForm = $state({ executor_id: '', name: '', executor_type: 'in_process', labels: '', status: 'active' });
+  let executorToken = $state<ExecutorTokenResponse | null>(null);
+  let mcpServerConfigs = $state<MCPServerConfigResponse[]>([]);
+  let showMcpForm = $state(false);
+  let editingMcpServer = $state<MCPServerConfigResponse | null>(null);
+  let mcpForm = $state({ name: '', transport: 'stdio', command: '', url: '', args: '', envVars: [] as MCPEnvVar[], timeout_seconds: 30, description: '' });
+  let isAdmin = $state(false);
   let tabs = $derived(isAdmin ? ALL_TABS : ALL_TABS.filter((t) => t !== 'users' && t !== 'system'));
-  let selectedProviderId = '';
-  let selectedSettingKey = '';
-  let settingValueText = '';
-  let providerForm: ProviderFormState = createProviderForm();
-  let providerTestResult: ProviderTestResult | null = null;
-  let showSecretModal = false;
-  let secretModalTarget: 'provider' | 'mcp' = 'provider';
-  let mcpSecretTargetKey = '';
-  let secretModalName = '';
-  let secretModalValue = '';
-  let agents: Array<{ agent_id: string; name: string; is_system?: boolean }> = [];
-  let apiKeys: ApiKeyMetadata[] = [];
-  let createdApiKey: ApiKeyCreateResponse | null = null;
-  let newApiKeyName = '';
-  let newApiKeyExpiresInDays = '';
-  let initialSnapshot = '';
+  let selectedProviderId = $state('');
+  let selectedSettingKey = $state('');
+  let settingValueText = $state('');
+  let providerForm = $state<ProviderFormState>(createProviderForm());
+  let providerTestResult = $state<ProviderTestResult | null>(null);
+  let showSecretModal = $state(false);
+  let secretModalTarget = $state<'provider' | 'mcp'>('provider');
+  let mcpSecretTargetKey = $state('');
+  let secretModalName = $state('');
+  let secretModalValue = $state('');
+  let agents = $state<Array<{ agent_id: string; name: string; is_system?: boolean }>>([]);
+  let apiKeys = $state<ApiKeyMetadata[]>([]);
+  let createdApiKey = $state<ApiKeyCreateResponse | null>(null);
+  let newApiKeyName = $state('');
+  let newApiKeyExpiresInDays = $state('');
+  let initialSnapshot = $state('');
 
   // User management state
-  let userList: UserDetail[] = [];
-  let showUserCreateModal = false;
-  let showUserEditModal = false;
-  let showDisabledUsers = false;
-  let editingUser: UserDetail | null = null;
-  let userCreateForm = { email: '', name: '', password: '', confirm_password: '', role: 'user' as UserRole };
-  let userEditForm = { name: '', role: 'user' as UserRole };
-  let accountNameForm = '';
-  let accountNameDirty = false;
-  let executorPollTimer: ReturnType<typeof setInterval> | null = null;
+  let userList = $state<UserDetail[]>([]);
+  let showUserCreateModal = $state(false);
+  let showUserEditModal = $state(false);
+  let showDisabledUsers = $state(false);
+  let editingUser = $state<UserDetail | null>(null);
+  let userCreateForm = $state({ email: '', name: '', password: '', confirm_password: '', role: 'user' as UserRole });
+  let userEditForm = $state({ name: '', role: 'user' as UserRole });
+  let accountNameForm = $state('');
+  let accountNameDirty = $state(false);
+  let executorPollTimer = $state<ReturnType<typeof setInterval> | null>(null);
 
-  let routingForm = {
+  let routingForm = $state({
     default: '',
     classifier: '',
     compaction: '',
     simple_inline: '',
     image_generation: '',
     extraJson: '{}'
-  };
+  });
 
-  let secretForm = {
+  let secretForm = $state({
     name: '',
     value: '',
     scope: 'user',
     agent_id: '',
     description: ''
-  };
+  });
 
-  let passwordForm = {
+  let passwordForm = $state({
     current_password: '',
     new_password: '',
     confirm_password: ''
-  };
+  });
 
   function snapshotState(): string {
     return JSON.stringify({

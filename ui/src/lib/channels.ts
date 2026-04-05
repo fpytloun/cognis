@@ -181,9 +181,10 @@ export function normalizeSettingValue(meta: ChannelMeta, fieldName: string, valu
 }
 
 export function createChannelDraft(meta: ChannelMeta, agents: Agent[], account?: ChannelAccount | null): ChannelEditorDraft {
+  const primaryAgents = agents.filter((agent) => agent.agent_type === 'primary');
   return {
     display_name: account?.display_name ?? `${meta.label} Account`,
-    agent_id: account?.agent_id ?? agents[0]?.agent_id ?? '',
+    agent_id: account?.agent_id ?? primaryAgents[0]?.agent_id ?? '',
     adapter_location: account?.adapter_location ?? 'controller',
     executor_id: account?.executor_id ?? '',
     dm_policy: account?.dm_policy ?? 'pairing',

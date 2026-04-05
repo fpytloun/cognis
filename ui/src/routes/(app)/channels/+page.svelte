@@ -18,7 +18,7 @@
   import Card from '$lib/components/ui/Card.svelte';
   import { confirmAction } from '$lib/stores/confirm';
   import { addToast } from '$lib/stores/toasts';
-  import type { Agent, ChannelAccount, ChannelContact, ChannelMeta, PairingRequest } from '$lib/types/api';
+  import type { Agent, ChannelAccount, ChannelContact, ChannelMeta, ExecutorConfig, PairingRequest } from '$lib/types/api';
 
   import ChannelAccountEditor from './ChannelAccountEditor.svelte';
   import ChannelAccountsView from './ChannelAccountsView.svelte';
@@ -37,7 +37,7 @@
   let contacts = $state<ChannelContact[]>([]);
   let pairingRequests = $state<PairingRequest[]>([]);
   let agents = $state<Agent[]>([]);
-  let executors = $state<{ executor_id: string; name: string; status: string }[]>([]);
+  let executors = $state<ExecutorConfig[]>([]);
 
   let selectedAccountId = $state<string | null>(null);
   let editorMode = $state<ChannelEditorMode>('closed');
@@ -194,7 +194,7 @@
       contacts = contactsResult;
       pairingRequests = pairingResult;
       agents = agentsResult.filter((agent) => agent.status !== 'archived');
-      executors = (executorsResult as { executor_id: string; name: string; status: string }[]) ?? [];
+      executors = (executorsResult as ExecutorConfig[]) ?? [];
       if (!selectedType && types.length > 0) {
         selectedType = types[0];
       }

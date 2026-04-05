@@ -248,6 +248,19 @@ async def create_account(request: Request) -> Any:
     if not agent_id:
         return error_response(400, "validation_error", "agent_id is required")
 
+    from cognis.store.queries import get_agent
+
+    async with session_factory() as session:
+        agent_row = await get_agent(session, agent_id)
+    if agent_row is None:
+        return error_response(404, "not_found", "Agent not found")
+    if getattr(agent_row, "agent_type", "primary") != "primary":
+        return error_response(
+            400,
+            "validation_error",
+            "Channel accounts support primary agents only",
+        )
+
     display_name = body.get("display_name", f"{meta.label} Account")
 
     # --- Channel-specific validation ---
@@ -355,6 +368,21 @@ async def update_account(request: Request, account_id: str) -> Any:
         existing_row = await _get_account(session, account_id)
     if existing_row is None:
         return error_response(404, "not_found", "Channel account not found")
+
+    agent_id = body.get("agent_id")
+    if agent_id:
+        from cognis.store.queries import get_agent
+
+        async with session_factory() as session:
+            agent_row = await get_agent(session, agent_id)
+        if agent_row is None:
+            return error_response(404, "not_found", "Agent not found")
+        if getattr(agent_row, "agent_type", "primary") != "primary":
+            return error_response(
+                400,
+                "validation_error",
+                "Channel accounts support primary agents only",
+            )
 
     if existing_row.channel_type == "signal":
         # Merge existing settings and credentials with incoming for validation

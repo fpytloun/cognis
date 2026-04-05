@@ -5,7 +5,7 @@
   import Button from '$lib/components/ui/Button.svelte';
   import Card from '$lib/components/ui/Card.svelte';
   import Input from '$lib/components/ui/Input.svelte';
-  import type { Agent, ChannelMeta } from '$lib/types/api';
+  import type { Agent, ChannelMeta, ExecutorConfig } from '$lib/types/api';
 
   import ChannelDynamicFields from './ChannelDynamicFields.svelte';
   import ChannelSetupGuide from './ChannelSetupGuide.svelte';
@@ -17,7 +17,7 @@
   export let draft: ChannelEditorDraft;
   export let credentialOverrides: Record<string, string> = {};
   export let agents: Agent[] = [];
-  export let executors: { executor_id: string; name: string; status: string }[] = [];
+  export let executors: ExecutorConfig[] = [];
   export let guide: SetupGuide | null = null;
   export let busy = false;
   export let mobile = false;
@@ -25,6 +25,23 @@
   export let onClose: () => void;
   export let onSelectType: (meta: ChannelMeta) => void;
   export let onSave: () => void;
+
+  function isSignalDirectMode(): boolean {
+    return selectedType?.channel_type === 'signal' && draft.settingValues.transport === 'direct_jsonrpc';
+  }
+
+  function primaryAgents(): Agent[] {
+    return agents.filter((agent) => agent.agent_type === 'primary');
+  }
+
+  function compatibleExecutors(): ExecutorConfig[] {
+    return executors.filter((executor) => {
+      if (executor.status !== 'active') return false;
+      if (!isSignalDirectMode()) return true;
+      const signalConfig = (executor.config?.signal ?? {}) as Record<string, unknown>;
+      return signalConfig.direct_enabled === true;
+    });
+  }
 </script>
 
 <div class="space-y-4" data-testid="channels-editor">
@@ -66,10 +83,11 @@
           Agent
           <select bind:value={draft.agent_id} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
             <option value="">Select an agent</option>
-            {#each agents as agent}
+            {#each primaryAgents() as agent}
               <option value={agent.agent_id}>{agent.display_name ?? agent.name}</option>
             {/each}
           </select>
+          <span class="text-xs text-slate-500">Only primary agents can own channel accounts.</span>
         </label>
 
         <label class="grid gap-2 text-sm text-slate-300">
@@ -84,11 +102,16 @@
           <label class="grid gap-2 text-sm text-slate-300">
             Executor
             <select bind:value={draft.executor_id} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
-              <option value="">Any connected executor</option>
-              {#each executors as executor}
+              <option value="">Any compatible executor</option>
+              {#each compatibleExecutors() as executor}
                 <option value={executor.executor_id}>{executor.name} ({executor.status})</option>
               {/each}
             </select>
+            {#if isSignalDirectMode()}
+              <span class="text-xs text-slate-500">
+                Only executors with Signal direct mode enabled are shown here.
+              </span>
+            {/if}
           </label>
         {/if}
 

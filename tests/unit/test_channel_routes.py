@@ -286,6 +286,51 @@ def test_update_signal_account_accepts_partial_non_secret_updates(
         assert response.status_code == 200, response.text
 
 
+def test_create_channel_account_rejects_secondary_agent(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> None:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-secondary",
+                    owner_email="user@example.com",
+                    name="Secondary Agent",
+                    agent_type="secondary",
+                    status="active",
+                )
+                await session.commit()
+
+        asyncio.run(_seed())
+
+        response = client.post(
+            "/api/v1/channels/accounts",
+            headers=_auth_headers(app, email="user@example.com"),
+            json={
+                "channel_type": "signal",
+                "agent_id": "agent-secondary",
+                "display_name": "Signal",
+                "settings": {
+                    "transport": "rest_api",
+                    "account_number": "+420111222333",
+                    "api_url": "http://localhost:8080",
+                },
+            },
+        )
+        assert response.status_code == 400, response.text
+        assert "primary agents only" in response.text
+
+
 def test_pairing_endpoints(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
         app = client.app
