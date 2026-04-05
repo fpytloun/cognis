@@ -63,37 +63,154 @@ Different adapters have different requirements. Examples include:
 
 The `Channels` page includes platform-specific manual setup steps next to the form so operators can complete the vendor-side configuration without leaving the app flow.
 
-## Signal: REST API vs direct JSON-RPC
+## Signal: end-to-end setup
 
 Signal supports two transport modes:
 
-### REST API (default)
+- `rest_api` — Cognis talks to an already running `signal-cli-rest-api`
+- `direct_jsonrpc` — Cognis starts `signal-cli` directly on the executor
 
-Uses an external [signal-cli-rest-api](https://github.com/bbernhard/signal-cli-rest-api) service. You run the REST API yourself (e.g. via Docker), link your Signal number, and provide the API URL and phone number in the channel account credentials.
+Both modes require the Signal account to be linked or registered outside the Cognis UI first.
 
-- Works with both controller and executor placement.
-- Requires a running signal-cli REST API instance.
+### Choose the right mode
 
-### Direct JSON-RPC (executor-only)
+Use `REST API` when:
 
-Runs `signal-cli` directly on the executor as a managed subprocess using JSON-RPC over stdio. No external REST API service is needed.
+- you already run `signal-cli-rest-api`
+- you want a simpler, externally managed setup
+- you may run the adapter on either the controller or an executor
 
-**Requirements:**
+Use `direct JSON-RPC` when:
 
-- `adapter_location` must be set to `executor` with an explicit `executor_id`.
-- The executor must have `signal.direct_enabled: true` in its config.
-- The executor must have `signal-cli` installed and accessible. The command path can be customized via `signal.command` in the executor config (default: `signal-cli`).
-- The Signal account must already be linked/registered on the executor machine. Onboarding through the Cognis UI is not yet supported.
+- you want Cognis to manage the `signal-cli` process for you
+- the Signal state should stay on the same machine as the executor
+- you want executor-hosted Signal with typing, read receipts, profile sync, and attachments enabled by default
 
-**Features:**
+### Common prerequisites
 
-All Signal features are enabled by default in direct mode: typing indicators, read receipts, profile sync, and attachment handling. If a feature is unsupported by the installed `signal-cli` version, it degrades gracefully without breaking message send/receive.
+Before creating the channel account in Cognis:
 
-**Limitations:**
+1. Install and prepare Signal on the target machine.
+2. Link or register the Signal account with `signal-cli`.
+3. Confirm you can send or receive messages with that account outside Cognis.
+4. Decide whether Cognis should use `REST API` or `direct JSON-RPC`.
 
-- Signal account state lives on the executor machine. Moving an account to a different executor requires manually migrating the signal-cli data directory.
-- The adapter uses the standard reconnection loop with exponential backoff. If the signal-cli subprocess crashes, the adapter will attempt to restart it automatically.
-- No UI-driven onboarding (linking/registration) yet.
+Important:
+
+- Cognis does not yet provide Signal onboarding in the UI.
+- The Signal account state stays on the machine that runs `signal-cli`.
+- If you move a direct-mode account to another executor, you must migrate the `signal-cli` state directory yourself.
+
+### REST API mode
+
+REST mode uses an external [signal-cli-rest-api](https://github.com/bbernhard/signal-cli-rest-api) service.
+
+#### 1. Prepare Signal
+
+On the machine that will host Signal:
+
+1. Install `signal-cli` and `signal-cli-rest-api`.
+2. Link or register the Signal account.
+3. Start the REST API service and make sure it can access the prepared `signal-cli` account state.
+4. Verify the REST API is reachable, for example by checking its `about` endpoint.
+
+#### 2. Create the Cognis account
+
+In `Channels -> Accounts -> New account`:
+
+1. Choose `Signal`.
+2. Select the target agent.
+3. Set `Transport` to `rest_api`.
+4. Choose `Controller` or `Executor` placement.
+5. If using executor placement, optionally choose a specific executor.
+6. Fill in credentials:
+   - `signal-cli REST API URL`
+   - `Phone number` in E.164 format
+7. Save the account.
+
+#### 3. Start and verify
+
+1. Start the account from the `Channels` page.
+2. Send a test message to the Signal number.
+3. Confirm the account reaches `connected` state and the agent replies.
+
+### Direct JSON-RPC mode
+
+Direct mode runs `signal-cli` as a managed subprocess on the executor using JSON-RPC over stdio.
+
+#### 1. Prepare the executor machine
+
+On the machine that runs the Cognis executor:
+
+1. Install `signal-cli`.
+2. Link or register the Signal account with `signal-cli` on that same machine.
+3. Confirm the linked account works from the command line.
+4. Keep the Signal state on that machine; direct mode expects local access to it.
+
+#### 2. Configure the executor in Cognis
+
+In `Settings -> Executors`, edit the target executor and set Signal support in the executor config.
+
+Example config fragment:
+
+```json
+{
+  "signal": {
+    "direct_enabled": true,
+    "command": "signal-cli"
+  }
+}
+```
+
+Notes:
+
+- `direct_enabled` must be `true` or Cognis will reject direct-mode Signal accounts.
+- `command` is optional. Use it when `signal-cli` is not on the default `PATH`.
+- The command is executor-scoped and user-scoped through the executor config. It is not stored on individual channel accounts.
+
+#### 3. Create the Cognis account
+
+In `Channels -> Accounts -> New account`:
+
+1. Choose `Signal`.
+2. Select the target agent.
+3. Set `Transport` to `direct_jsonrpc`.
+4. Set `Adapter placement` to `Executor`.
+5. Choose an explicit `executor_id`.
+6. Fill in the Signal `Phone number` credential.
+7. Save the account.
+
+Cognis validates all of the following before saving:
+
+- direct mode must use executor placement
+- an explicit executor must be selected
+- the executor must belong to the same user
+- the executor config must enable direct Signal support
+
+#### 4. Start and verify
+
+1. Start the account from the `Channels` page.
+2. Cognis asks the executor to spawn `signal-cli ... jsonRpc` for that account.
+3. Verify the account reaches `connected` state.
+4. Send a test Signal message and confirm the agent replies.
+
+#### Default behavior in direct mode
+
+Direct mode enables these features by default when supported by the installed `signal-cli` version:
+
+- typing indicators
+- read receipts
+- agent profile sync
+- inbound attachment download
+
+If the local `signal-cli` does not support one of these operations, Cognis degrades that feature gracefully without breaking normal send/receive.
+
+#### Operational notes for direct mode
+
+- The adapter uses the normal reconnection loop with exponential backoff.
+- If the managed `signal-cli` subprocess exits unexpectedly, the adapter will retry through that reconnect path.
+- Direct mode does not currently provide UI-driven account linking or registration.
+- Executor migration is manual because the Signal state is still local to the executor machine.
 
 ## Operational notes
 

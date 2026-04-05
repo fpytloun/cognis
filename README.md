@@ -209,11 +209,11 @@ For multi-user production deployments, disable local executor modes with the DB-
 
 **Subprocess mode:** When using `python -m cognis.executor`, the token can also be piped via stdin (used internally by the subprocess executor to avoid exposing the token in process listings).
 
-The same split is the planned deployment model for stateful channel adapters.
-For example, a user can run Signal's `signal-cli` REST API next to a Cognis
-executor they control, while the cloud controller continues to orchestrate
-pairing, turns, and outbound delivery without owning the Signal session state
-itself.
+The same split is the deployment model for stateful channel adapters.
+For example, a user can either run Signal's `signal-cli` REST API next to a
+Cognis executor they control or let the executor run `signal-cli` directly via
+JSON-RPC, while the cloud controller continues to orchestrate pairing, turns,
+and outbound delivery without owning the Signal session state itself.
 
 ## Roadmap
 

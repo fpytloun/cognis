@@ -56,3 +56,50 @@ Open `Settings` and use the executors section to inspect:
 - confirm the required tools are enabled on the executor
 - confirm the agent is bound to the expected executor or label selector
 - confirm any required secrets or MCP servers are assigned correctly
+
+## Signal on executors
+
+Signal direct mode is an example of why executor-hosted adapters exist.
+
+When a Signal account uses `transport=direct_jsonrpc`, Cognis does not talk to an external REST bridge. Instead, the selected executor starts `signal-cli` directly as a subprocess.
+
+### Minimum executor config for direct Signal
+
+Add Signal support to the executor config in `Settings -> Executors`:
+
+```json
+{
+  "signal": {
+    "direct_enabled": true,
+    "command": "signal-cli"
+  }
+}
+```
+
+Use an absolute path for `command` when `signal-cli` is not on the default `PATH`, for example:
+
+```json
+{
+  "signal": {
+    "direct_enabled": true,
+    "command": "/opt/homebrew/bin/signal-cli"
+  }
+}
+```
+
+### Signal executor checklist
+
+Before assigning a Signal direct-mode account to an executor:
+
+1. `signal-cli` is installed on the executor machine.
+2. The Signal account is already linked or registered on that machine.
+3. The executor is connected in Cognis.
+4. The executor config has `signal.direct_enabled=true`.
+5. If needed, the executor config points to the correct `signal-cli` binary path.
+
+### Important behavior
+
+- The `signal-cli` command is executor-scoped and therefore user-scoped through executor ownership.
+- Channel accounts do not store the executable path.
+- Signal account state remains local to the executor machine.
+- Moving a direct-mode Signal account to another executor requires migrating the local `signal-cli` state first.
