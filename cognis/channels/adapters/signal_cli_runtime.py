@@ -12,7 +12,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import shutil
+from collections import deque
 from typing import Any
 
 from cognis.logging import get_logger
@@ -28,6 +30,14 @@ _REQUEST_TIMEOUT_S = 30.0
 _ATTACHMENT_TIMEOUT_S = 60.0
 _MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024  # 50 MB
 _STDERR_MAX_LINE = 500  # max chars to log from stderr (redaction safety)
+_STDERR_DEBUG_TAIL_LINES = 10
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 class SignalCliRuntimeError(Exception):
@@ -68,6 +78,8 @@ class SignalCliRuntime:
         self._capabilities: set[str] = set()
         self._stderr_line_count = 0
         self._last_returncode: int | None = None
+        self._stderr_debug_enabled = _env_flag("COGNIS_SIGNAL_STDIO_DEBUG", False)
+        self._stderr_tail: deque[str] = deque(maxlen=_STDERR_DEBUG_TAIL_LINES)
 
     @property
     def version(self) -> str | None:
@@ -125,6 +137,7 @@ class SignalCliRuntime:
         self._running = True
         self._stderr_line_count = 0
         self._last_returncode = None
+        self._stderr_tail.clear()
         self._reader_task = asyncio.create_task(self._read_stdout(), name="signal-cli-stdout")
         self._stderr_task = asyncio.create_task(self._drain_stderr(), name="signal-cli-stderr")
 
@@ -340,8 +353,18 @@ class SignalCliRuntime:
                 if not line_bytes:
                     break
                 self._stderr_line_count += 1
-                # Never log raw stderr content — it may contain message
-                # content, phone numbers, or other sensitive data.
+                text = line_bytes.decode(errors="replace").strip()[:_STDERR_MAX_LINE]
+                if self._stderr_debug_enabled and text:
+                    self._stderr_tail.append(text)
+                    logger.warning(
+                        "signal-cli stderr",
+                        extra={
+                            "extra_data": {
+                                "account": self._account_number,
+                                "stderr": text,
+                            }
+                        },
+                    )
             if self._stderr_line_count > 0:
                 logger.debug(
                     "signal-cli stderr: drained lines",
@@ -365,6 +388,8 @@ class SignalCliRuntime:
         detail = f"returncode={returncode}" if returncode is not None else "returncode=unknown"
         if self._stderr_line_count > 0:
             detail += f", stderr_lines={self._stderr_line_count}"
+        if self._stderr_debug_enabled and self._stderr_tail:
+            detail += f", stderr_tail={list(self._stderr_tail)}"
         return f"signal-cli process exited unexpectedly ({detail})"
 
     async def _refresh_returncode(self) -> None:

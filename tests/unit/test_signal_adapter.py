@@ -314,6 +314,24 @@ class TestSignalCliRuntime:
         assert "returncode=7" in message
         assert "stderr_lines=3" in message
 
+    def test_exit_message_includes_stderr_tail_when_debug_enabled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("COGNIS_SIGNAL_STDIO_DEBUG", "true")
+        runtime = SignalCliRuntime(account_number="+1234567890")
+        process = FakeProcess()
+        process.returncode = 9
+        runtime._process = process
+        runtime._stderr_line_count = 2
+        runtime._stderr_tail.append("first failure line")
+        runtime._stderr_tail.append("second failure line")
+
+        message = runtime._process_exit_message()
+
+        assert "stderr_tail=[" in message
+        assert "first failure line" in message
+        assert "second failure line" in message
+
 
 # ---------------------------------------------------------------------------
 # SignalAdapter transport selection tests
