@@ -415,8 +415,9 @@ Gate prompts appear:
 ### In-step questions
 
 When a run step has `allow_questions=true`, the step may pause and ask for
-clarification without advancing the workflow. The UI should show this as a
-question on the current step, distinct from a workflow gate:
+clarification without advancing the workflow. Direct chat may also use the
+same mechanism for a transient question that resumes the same turn. The UI
+should show this as a question card distinct from a workflow gate:
 
 ```
 ┌────────────────────────────────────────────┐
@@ -432,6 +433,8 @@ question on the current step, distinct from a workflow gate:
 Difference from gates:
 - step question resumes the SAME step session
 - gate advances or rewinds workflow-level execution
+- direct-chat questions are transient and should block only new user turns in
+  the same conversation while the question is still live
 
 ### Workflow editor
 

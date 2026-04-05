@@ -324,7 +324,10 @@ class NotificationService:
         safe_decision = decision if decision in _KNOWN_DECISIONS else "other"
         NOTIFICATIONS_RESOLVED.labels(type=notification_type, decision=safe_decision).inc()
         if created_at:
-            duration = (now - created_at).total_seconds()
+            created_dt = (
+                created_at if created_at.tzinfo is not None else created_at.replace(tzinfo=UTC)
+            )
+            duration = (now - created_dt).total_seconds()
             NOTIFICATION_RESOLUTION_DURATION.labels(type=notification_type).observe(duration)
 
         logger.info(
@@ -393,6 +396,42 @@ class NotificationService:
                 return None
             return _row_to_notification(row)
 
+    async def mark_orphaned(self, notification_id: str, *, reason: str) -> bool:
+        """Mark a pending notification as terminal without resuming a waiter."""
+        now = datetime.now(UTC)
+        async with self._session_factory() as db:
+            row = await db.get(NotificationRow, notification_id)
+            if row is None or row.status != "pending":
+                return False
+            await db.execute(
+                update(NotificationRow)
+                .where(NotificationRow.notification_id == notification_id)
+                .values(
+                    status="resolved",
+                    resolution={"decision": "cancel", "reason": reason},
+                    resolved_at=now,
+                )
+            )
+            await db.commit()
+        NOTIFICATIONS_RESOLVED.labels(type=row.notification_type, decision="cancel").inc()
+        if row.created_at:
+            created_at = row.created_at
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=UTC)
+            duration = (now - created_at).total_seconds()
+            NOTIFICATION_RESOLUTION_DURATION.labels(type=row.notification_type).observe(duration)
+        logger.info(
+            "notification: orphaned",
+            extra={
+                "extra_data": {
+                    "notification_id": notification_id,
+                    "type": row.notification_type,
+                    "reason": reason,
+                }
+            },
+        )
+        return True
+
     # ------------------------------------------------------------------
     # Startup reconciliation
     # ------------------------------------------------------------------
@@ -414,7 +453,15 @@ class NotificationService:
             rows = result.scalars().all()
 
         count = 0
+        orphaned_count = 0
         for row in rows:
+            if row.notification_type == NotificationType.STEP_QUESTION and row.task_id is None:
+                await self.mark_orphaned(
+                    row.notification_id,
+                    reason="controller_restart",
+                )
+                orphaned_count += 1
+                continue
             # Only re-register if not already present (idempotent)
             existing = self._pause_waiter.find_pending(pause_type=row.notification_type)
             if existing and existing.pause_id == row.notification_id:
@@ -441,6 +488,11 @@ class NotificationService:
             logger.info(
                 "notification: reconciled %d pending notifications after restart",
                 count,
+            )
+        if orphaned_count:
+            logger.info(
+                "notification: marked %d direct-chat step questions orphaned after restart",
+                orphaned_count,
             )
         return count
 

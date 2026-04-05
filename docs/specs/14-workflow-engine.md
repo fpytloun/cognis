@@ -498,14 +498,14 @@ Agent runs step (full agentic loop)
 
 ### The `step_request_input` tool (optional)
 
-Only available when BOTH conditions are met:
-1. workflow interaction mode is `step_requests`
+Available when BOTH conditions are met:
+1. the current execution context uses interaction mode `step_requests`
 2. the current step has `allow_questions=true`
 
 ```json
 {
   "name": "step_request_input",
-  "description": "Request input from the caller while staying within the same workflow step.",
+    "description": "Request input from the caller while staying within the same workflow step or direct-chat turn.",
   "parameters": {
     "question": "What you need to know",
     "options": "Optional list of structured options",
@@ -516,12 +516,16 @@ Only available when BOTH conditions are met:
 ```
 
 When called:
-1. Current StepRun transitions to `paused`
+1. If task-backed, the current StepRun transitions to `paused`
 2. Caller (main chat, user, API) receives the question
-3. Workflow does NOT advance — this is not a gate step
+3. Execution does NOT advance — this is not a gate step
 4. Caller responds
-5. Response is injected into the SAME step session as a user message
+5. Response is injected into the SAME step session or direct-chat turn
 6. Agent loop continues
+
+For direct chat, the pause is transient: it blocks only new user turns in the
+same conversation while the question is live. If the controller restarts, the
+pending direct-chat question is marked orphaned rather than being resumed.
 
 This is intended mainly for planning and research steps where ambiguity may
 appear during execution. Formal approvals should still be modeled as gate
@@ -538,11 +542,14 @@ Inside a step, the agent also has access to step-scoped task/todo tools:
 }
 ```
 
-These survive compaction (stored in step metadata, re-injected into context).
-They are NOT controller truth — just cognitive aids for the agent.
+These survive compaction for task/delegation steps (stored in step metadata,
+re-injected into context). In direct chat, todos are turn-local and should be
+used only for concrete execution work that the agent is actively continuing in
+the current turn.
 
-The controller never infers completion from todo state. Only
-`step_complete` may advance a run step.
+The controller never infers workflow advancement from todo state alone. Only
+`step_complete` may advance a run step, and task/delegation steps reject
+`step_complete` while todos remain incomplete.
 
 ## Step Input Context Assembly
 

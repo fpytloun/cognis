@@ -107,6 +107,11 @@ async def resolve_notification(
     if notification is None or notification.user_email != user.email:
         raise HTTPException(status_code=404, detail="Notification not found")
 
+    if notification.notification_type == "step_question" and notification.task_id is None:
+        pause = request.app.state.pause_waiter.get(notification_id)
+        if pause is None or pause.pause_type != "step_question" or pause.task_id is not None:
+            raise HTTPException(status_code=409, detail="Step question can no longer be resumed")
+
     # Build resolution data from the request
     data: dict[str, object] = {}
     if payload.note:

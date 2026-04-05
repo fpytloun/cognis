@@ -6,6 +6,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from cognis.api.app import create_app
+from cognis.api.websocket import AuthenticatedWebSocket, _handle_step_response
 from cognis.core.agent_loop import PendingPause
 from cognis.core.decision import DecisionResult
 from cognis.models.session import EventReadResult
@@ -507,6 +508,273 @@ def test_websocket_step_response_surfaces_resume_conflict(
             payload = ws.receive_json()
             assert payload["type"] == "error"
             assert payload["code"] == "conflict"
+
+
+def test_websocket_direct_chat_step_response_resolves_notification(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> tuple[str, str]:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                conversation = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                    title="Conversation",
+                )
+                session_row = await create_session(
+                    session,
+                    conversation_id=conversation.conversation_id,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                )
+                await session.commit()
+                return conversation.conversation_id, session_row.session_id
+
+        conversation_id, session_id = asyncio.run(_seed())
+        notification = asyncio.run(
+            app.state.notification_service.create(
+                notification_type="step_question",
+                user_email="user@example.com",
+                conversation_id=conversation_id,
+                session_id=session_id,
+                notification_id="notif_direct_ok",
+                payload={"question": "Need input"},
+            )
+        )
+
+        class _Manager:
+            def __init__(self) -> None:
+                self.errors: list[dict[str, object]] = []
+
+            async def send_error(self, _: object, **kwargs: object) -> None:
+                self.errors.append(kwargs)
+
+        manager = _Manager()
+        connection = AuthenticatedWebSocket(
+            connection_id="conn-1",
+            websocket=object(),
+            user_email="user@example.com",
+            role="user",
+        )
+
+        asyncio.run(
+            _handle_step_response(
+                app,
+                manager,
+                connection,
+                {
+                    "type": "step_response",
+                    "notification_id": notification.notification_id,
+                    "response": "A",
+                },
+            )
+        )
+        asyncio.run(
+            _handle_step_response(
+                app,
+                manager,
+                connection,
+                {
+                    "type": "step_response",
+                    "notification_id": notification.notification_id,
+                    "response": "B",
+                },
+            )
+        )
+        assert manager.errors[-1]["code"] == "conflict"
+
+        resolved = asyncio.run(app.state.notification_service.get(notification.notification_id))
+        assert resolved is not None
+        assert resolved.status == "resolved"
+        assert resolved.resolution == {"decision": "continue", "response": "A"}
+
+
+def test_websocket_direct_chat_step_response_conflicts_without_live_pause(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> tuple[str, str]:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                conversation = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                    title="Conversation",
+                )
+                session_row = await create_session(
+                    session,
+                    conversation_id=conversation.conversation_id,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                )
+                await session.commit()
+                return conversation.conversation_id, session_row.session_id
+
+        conversation_id, session_id = asyncio.run(_seed())
+        notification = asyncio.run(
+            app.state.notification_service.create(
+                notification_type="step_question",
+                user_email="user@example.com",
+                conversation_id=conversation_id,
+                session_id=session_id,
+                notification_id="notif_direct_orphan",
+                payload={"question": "Need input"},
+            )
+        )
+        app.state.pause_waiter.clear(notification.notification_id)
+
+        class _Manager:
+            def __init__(self) -> None:
+                self.errors: list[dict[str, object]] = []
+
+            async def send_error(self, _: object, **kwargs: object) -> None:
+                self.errors.append(kwargs)
+
+        manager = _Manager()
+        connection = AuthenticatedWebSocket(
+            connection_id="conn-1",
+            websocket=object(),
+            user_email="user@example.com",
+            role="user",
+        )
+
+        asyncio.run(
+            _handle_step_response(
+                app,
+                manager,
+                connection,
+                {
+                    "type": "step_response",
+                    "notification_id": notification.notification_id,
+                    "response": "A",
+                },
+            )
+        )
+        assert manager.errors[-1]["code"] == "conflict"
+
+
+def test_websocket_step_response_rejects_mismatched_task_and_notification(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> tuple[str, str, str]:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                conversation = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                    title="Conversation",
+                )
+                session_row = await create_session(
+                    session,
+                    conversation_id=conversation.conversation_id,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                )
+                task = await create_task(
+                    session,
+                    created_by="user@example.com",
+                    agent_id="agent-1",
+                    title="Task question",
+                    status="paused",
+                )
+                await session.commit()
+                return conversation.conversation_id, session_row.session_id, task.task_id
+
+        conversation_id, session_id, task_id = asyncio.run(_seed())
+        notification = asyncio.run(
+            app.state.notification_service.create(
+                notification_type="step_question",
+                user_email="user@example.com",
+                conversation_id=conversation_id,
+                task_id=task_id,
+                session_id=session_id,
+                notification_id="notif_task_match",
+                payload={"question": "Need input"},
+            )
+        )
+
+        class _Manager:
+            def __init__(self) -> None:
+                self.errors: list[dict[str, object]] = []
+
+            async def send_error(self, _: object, **kwargs: object) -> None:
+                self.errors.append(kwargs)
+
+        manager = _Manager()
+        connection = AuthenticatedWebSocket(
+            connection_id="conn-1",
+            websocket=object(),
+            user_email="user@example.com",
+            role="user",
+        )
+
+        asyncio.run(
+            _handle_step_response(
+                app,
+                manager,
+                connection,
+                {
+                    "type": "step_response",
+                    "notification_id": notification.notification_id,
+                    "task_id": "task-other",
+                    "response": "A",
+                },
+            )
+        )
+        assert manager.errors[-1]["code"] == "conflict"
 
 
 def test_session_events_are_proxied(monkeypatch: object, tmp_path: Path) -> None:

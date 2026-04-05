@@ -369,6 +369,17 @@ class TurnScheduler:
                     "Use /approve or /deny, or use the buttons above.",
                 )
                 return None
+            pending_questions = self._pause_waiter.list_pending(
+                conversation_id=conversation_id,
+                pause_type="step_question",
+            )
+            if any(pause.task_id is None for pause in pending_questions):
+                return TurnError(
+                    code="pending_question",
+                    message="Answer the pending question before sending a new message.",
+                    recoverable=True,
+                )
+
 
         # Per-user concurrent turn limit
         if not system_initiated:

@@ -302,6 +302,8 @@ POST   /api/v1/tasks/:id/cancel                   → Cancel task (any state)
 POST   /api/v1/tasks/:id/gate-response            → Respond to a gate step
 POST   /api/v1/tasks/:id/step-response            → Respond to `step_request_input` for the current step
 POST   /api/v1/tasks/batch-submit                 → Submit multiple draft tasks at once
+GET    /api/v1/notifications                      → List pending notifications (escalations, gates, step questions)
+POST   /api/v1/notifications/:id/resolve         → Resolve a notification directly
 GET    /api/v1/tasks/:id/steps                    → List step runs with status and output
 GET    /api/v1/step-runs/:id                      → Step run detail (output, evaluation, attempts)
 POST   /api/v1/tasks/:id/dependencies             → Add dependency (depends_on task_id, required bool)
@@ -421,7 +423,7 @@ Connections that do not send a valid auth message within the timeout are closed.
 {type: "cancel", conversation_id, session_id?}     // Cancel
 {type: "resolve_escalation", call_id, decision, note?}
 {type: "gate_response", task_id, step_name, action, feedback?}  // Respond to workflow gate
-{type: "step_response", task_id, step_name, action, feedback?}  // Respond to step_request_input
+{type: "step_response", task_id?, notification_id?, step_name?, response}  // Respond to step_request_input
 {type: "reconnect", conversation_id, last_seq}     // Reconnect and replay missed events
 {type: "ping"}
 ```
@@ -464,7 +466,7 @@ socket authenticates so stalled connections are detected proactively.
 {type: "workflow_step_rejected", task_id, step_name, attempt, feedback}
 {type: "workflow_step_failed", task_id, step_name, attempt, reason}
 {type: "workflow_gate", task_id, step_name, message, options, context}
-{type: "workflow_step_question", task_id, step_name, question, options, context}
+{type: "workflow_step_question", notification_id, task_id?, step_name, question, options, context}
 {type: "workflow_completed", task_id, result}
 {type: "workflow_failed", task_id, reason}
 

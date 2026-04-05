@@ -1037,16 +1037,62 @@ async def _handle_step_response(
     ``POST /api/v1/tasks/{task_id}/step-response``.
     """
     task_id = message.get("task_id")
+    notification_id = message.get("notification_id")
     response = message.get("response", "")
-    if not isinstance(task_id, str):
+    if notification_id is not None and not isinstance(notification_id, str):
         await manager.send_error(
             connection,
             code="validation_error",
-            message="task_id is required",
+            message="notification_id must be a string",
             recoverable=True,
         )
         return
-    if await _load_task_for_user(app, connection, task_id) is None:
+    if task_id is not None and not isinstance(task_id, str):
+        await manager.send_error(
+            connection,
+            code="validation_error",
+            message="task_id must be a string",
+            recoverable=True,
+        )
+        return
+    if not isinstance(task_id, str) and not isinstance(notification_id, str):
+        await manager.send_error(
+            connection,
+            code="validation_error",
+            message="task_id or notification_id is required",
+            recoverable=True,
+        )
+        return
+
+    current_user_email.set(connection.user_email)
+    svc = app.state.notification_service
+
+    notification = None
+    if isinstance(notification_id, str):
+        notification = await svc.get(notification_id)
+        if (
+            notification is None
+            or notification.notification_type != "step_question"
+            or not _can_access_owner(connection, notification.user_email)
+        ):
+            await manager.send_error(
+                connection,
+                code="not_found",
+                message="Step question not found",
+                recoverable=True,
+            )
+            return
+        if task_id is not None and notification.task_id != task_id:
+            await manager.send_error(
+                connection,
+                code="conflict",
+                message="task_id does not match the referenced step question",
+                recoverable=True,
+            )
+            return
+        task_id = notification.task_id
+
+    if isinstance(task_id, str) and await _load_task_for_user(app, connection, task_id) is None:
         await manager.send_error(
             connection,
             code="not_found",
@@ -1055,10 +1101,40 @@ async def _handle_step_response(
         )
         return
 
-    current_user_email.set(connection.user_email)
-    svc = app.state.notification_service
+    if notification is not None and notification.task_id is None:
+        pause = app.state.pause_waiter.get(notification.notification_id)
+        if (
+            pause is None
+            or pause.pause_type != "step_question"
+            or pause.task_id is not None
+            or pause.conversation_id != notification.conversation_id
+            or pause.session_id != notification.session_id
+        ):
+            await manager.send_error(
+                connection,
+                code="conflict",
+                message="Step question can no longer be resumed",
+                recoverable=True,
+            )
+            return
+        resolved = await svc.resolve(
+            notification.notification_id,
+            "continue",
+            {"response": str(response)},
+        )
+        if not resolved:
+            await manager.send_error(
+                connection,
+                code="conflict",
+                message="Step question already resolved",
+                recoverable=True,
+            )
+        return
+
     resolved = False
-    notif = await svc.find_by_task(task_id, notification_type="step_question", status="pending")
+    notif = notification
+    if notif is None and isinstance(task_id, str):
+        notif = await svc.find_by_task(task_id, notification_type="step_question", status="pending")
     if notif is not None:
         resolved = await svc.resolve(
             notif.notification_id,
