@@ -66,6 +66,8 @@ class SignalCliRuntime:
         self._running = False
         self._version: str | None = None
         self._capabilities: set[str] = set()
+        self._stderr_line_count = 0
+        self._last_returncode: int | None = None
 
     @property
     def version(self) -> str | None:
@@ -78,6 +80,10 @@ class SignalCliRuntime:
     @property
     def is_running(self) -> bool:
         return self._running and self._process is not None and self._process.returncode is None
+
+    @property
+    def single_account_mode(self) -> bool:
+        return True
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -117,6 +123,8 @@ class SignalCliRuntime:
             raise SignalCliRuntimeError(f"Failed to start signal-cli: {exc}") from exc
 
         self._running = True
+        self._stderr_line_count = 0
+        self._last_returncode = None
         self._reader_task = asyncio.create_task(self._read_stdout(), name="signal-cli-stdout")
         self._stderr_task = asyncio.create_task(self._drain_stderr(), name="signal-cli-stderr")
 
@@ -305,9 +313,7 @@ class SignalCliRuntime:
                 # Fail all pending requests
                 for future in self._pending.values():
                     if not future.done():
-                        future.set_exception(
-                            SignalCliRuntimeError("signal-cli process exited unexpectedly")
-                        )
+                        future.set_exception(SignalCliRuntimeError(self._process_exit_message()))
                 self._pending.clear()
 
     # ------------------------------------------------------------------
@@ -323,21 +329,20 @@ class SignalCliRuntime:
         assert self._process.stderr is not None
 
         try:
-            stderr_lines = 0
             while self._running:
                 line_bytes = await self._process.stderr.readline()
                 if not line_bytes:
                     break
-                stderr_lines += 1
+                self._stderr_line_count += 1
                 # Never log raw stderr content — it may contain message
                 # content, phone numbers, or other sensitive data.
-            if stderr_lines > 0:
+            if self._stderr_line_count > 0:
                 logger.debug(
                     "signal-cli stderr: drained lines",
                     extra={
                         "extra_data": {
                             "account": self._account_number,
-                            "stderr_line_count": stderr_lines,
+                            "stderr_line_count": self._stderr_line_count,
                         }
                     },
                 )
@@ -345,3 +350,13 @@ class SignalCliRuntime:
             return
         except Exception:
             pass
+
+    def _process_exit_message(self) -> str:
+        returncode = None
+        if self._process is not None:
+            returncode = self._process.returncode
+        self._last_returncode = returncode
+        detail = f"returncode={returncode}" if returncode is not None else "returncode=unknown"
+        if self._stderr_line_count > 0:
+            detail += f", stderr_lines={self._stderr_line_count}"
+        return f"signal-cli process exited unexpectedly ({detail})"

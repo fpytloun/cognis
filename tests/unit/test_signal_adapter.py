@@ -264,6 +264,23 @@ class TestSignalCliRuntime:
         runtime._process.returncode = 1
         assert not runtime.is_running
 
+    def test_single_account_mode_property(self) -> None:
+        runtime = SignalCliRuntime(account_number="+1234567890")
+        assert runtime.single_account_mode is True
+
+    @pytest.mark.asyncio
+    async def test_exit_message_includes_returncode_and_stderr_count(self) -> None:
+        runtime = SignalCliRuntime(account_number="+1234567890")
+        process = FakeProcess()
+        process.returncode = 7
+        runtime._process = process
+        runtime._stderr_line_count = 3
+
+        message = runtime._process_exit_message()
+
+        assert "returncode=7" in message
+        assert "stderr_lines=3" in message
+
 
 # ---------------------------------------------------------------------------
 # SignalAdapter transport selection tests
@@ -483,3 +500,23 @@ class TestCapabilityDegradation:
         mock_runtime.request.reset_mock()
         await adapter._send_typing_direct("+420111222333")
         mock_runtime.request.assert_not_called()
+
+
+class TestDirectParamNormalization:
+    def test_direct_params_strip_account_in_single_account_mode(self) -> None:
+        adapter = SignalAdapter()
+        runtime = MagicMock()
+        runtime.single_account_mode = True
+        adapter._runtime = runtime
+
+        params = adapter._direct_params({"account": "+1234567890", "recipient": ["+420111222333"]})
+
+        assert "account" not in params
+        assert params["recipient"] == ["+420111222333"]
+
+    def test_direct_params_keep_account_without_runtime(self) -> None:
+        adapter = SignalAdapter()
+
+        params = adapter._direct_params({"account": "+1234567890", "recipient": ["+420111222333"]})
+
+        assert params["account"] == "+1234567890"

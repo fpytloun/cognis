@@ -268,6 +268,18 @@ class SignalAdapter(BaseChannelAdapter):
     # Outbound — send message
     # ------------------------------------------------------------------
 
+    def _direct_params(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Normalize params for the current direct signal-cli runtime mode.
+
+        The current runtime starts signal-cli in single-account mode using
+        ``signal-cli -a ACCOUNT jsonRpc``. In that mode upstream JSON-RPC does
+        not require an ``account`` param, and some commands appear to behave
+        poorly when it is sent explicitly.
+        """
+        if self._runtime is not None and self._runtime.single_account_mode:
+            params.pop("account", None)
+        return params
+
     async def send_message(self, message: OutboundMessage) -> str | None:
         """Send a message via the active transport."""
         if self._signal_config and self._signal_config.is_direct:
@@ -313,11 +325,13 @@ class SignalAdapter(BaseChannelAdapter):
         if self._runtime is None or not self._runtime.is_running:
             return None
 
-        params: dict[str, Any] = {
-            "message": message.content,
-            "account": self._account_number,
-            "recipient": [message.chat_id],
-        }
+        params = self._direct_params(
+            {
+                "message": message.content,
+                "account": self._account_number,
+                "recipient": [message.chat_id],
+            }
+        )
 
         if message.reply_to_id:
             with contextlib.suppress(ValueError):
@@ -405,10 +419,12 @@ class SignalAdapter(BaseChannelAdapter):
             return
         avatar_path: Path | None = None
         try:
-            params: dict[str, Any] = {
-                "account": self._account_number,
-                "givenName": profile.effective_name,
-            }
+            params = self._direct_params(
+                {
+                    "account": self._account_number,
+                    "givenName": profile.effective_name,
+                }
+            )
             if profile.avatar_bytes and self._temp_dir:
                 import uuid
 
@@ -460,7 +476,7 @@ class SignalAdapter(BaseChannelAdapter):
         try:
             await self._runtime.request(
                 "sendTyping",
-                {"account": self._account_number, "recipient": [chat_id]},
+                self._direct_params({"account": self._account_number, "recipient": [chat_id]}),
             )
         except SignalCliRuntimeError:
             self._degraded_capabilities.add("sendTyping")
@@ -500,12 +516,14 @@ class SignalAdapter(BaseChannelAdapter):
         try:
             await self._runtime.request(
                 "sendReceipt",
-                {
-                    "account": self._account_number,
-                    "recipient": chat_id,
-                    "type": "read",
-                    "targetTimestamp": [int(message_id)],
-                },
+                self._direct_params(
+                    {
+                        "account": self._account_number,
+                        "recipient": chat_id,
+                        "type": "read",
+                        "targetTimestamp": [int(message_id)],
+                    }
+                ),
             )
         except (SignalCliRuntimeError, ValueError):
             self._degraded_capabilities.add("sendReceipt")
@@ -663,7 +681,7 @@ class SignalAdapter(BaseChannelAdapter):
         try:
             result = await self._runtime.request(
                 "getAttachment",
-                {"account": self._account_number, "id": attachment_id},
+                self._direct_params({"account": self._account_number, "id": attachment_id}),
                 timeout=_ATTACHMENT_TIMEOUT_S,
             )
             # signal-cli may return the attachment path
