@@ -180,6 +180,10 @@ class CognisWebSocketClient {
     this.sendRaw({ type: 'step_response', task_id: taskId, response, step_name: stepName });
   }
 
+  respondStepQuestion(notificationId: string, response: string, stepName?: string): void {
+    this.sendRaw({ type: 'step_response', notification_id: notificationId, response, step_name: stepName });
+  }
+
   ping(): void {
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN || !this.authenticated) {
       return;

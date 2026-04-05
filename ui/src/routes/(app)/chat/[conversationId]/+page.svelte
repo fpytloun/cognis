@@ -105,6 +105,14 @@
   let subSessionInfoOpen = $state(false);
   let subSessionInfo = $state<SessionInfoData | null>(null);
   let subSessionInfoLoading = $state(false);
+  interface PendingDirectQuestion {
+    notificationId: string;
+    stepName?: string;
+    question: string;
+    options: string[];
+    context: string;
+  }
+  let pendingDirectQuestion = $state<PendingDirectQuestion | null>(null);
 
   const sessionIds = new Set<string>();
 
@@ -174,6 +182,9 @@
     }
     if (event.code === 'turn_cancelled') {
       return 'The current turn was cancelled.';
+    }
+    if (event.code === 'pending_question') {
+      return 'Answer the pending clarification request to continue.';
     }
     return event.message;
   }
@@ -583,6 +594,7 @@
       queuedCount = 0;
       turnInProgress = false;
       awaitingAssistantStart = false;
+      pendingDirectQuestion = null;
       lastRecoverableMessage = '';
       editingTitle = false;
       contextUsage = null;
@@ -613,6 +625,7 @@
       sessions = [];
       timeline = [];
       escalations = [];
+      pendingDirectQuestion = null;
       sessionIds.clear();
     } finally {
       if (!isStaleConversationLoad(requestId)) {
@@ -771,7 +784,7 @@
   }
 
   /** Slash commands that are handled as system actions, not chat messages. */
-  const SYSTEM_SLASH_COMMANDS = ['/approve', '/deny', '/compact', '/summarize', '/new', '/reset', '/clear', '/context', '/info', '/lsp', '/model', '/thinking', '/help'];
+  const SYSTEM_SLASH_COMMANDS = ['/approve', '/deny', '/compact', '/summarize', '/new', '/reset', '/clear', '/stop', '/cancel', '/context', '/info', '/lsp', '/model', '/thinking', '/help'];
 
   /** Slash command suggestions shown when user types /. */
   const SLASH_SUGGESTIONS = [
@@ -783,6 +796,8 @@
     { command: '/lsp', description: 'Show LSP diagnostics status' },
     { command: '/compact', description: 'Compact conversation' },
     { command: '/new', description: 'Start new conversation' },
+    { command: '/stop', description: 'Stop current work' },
+    { command: '/cancel', description: 'Alias for /stop' },
     { command: '/approve', description: 'Approve tool escalation' },
     { command: '/deny', description: 'Deny tool escalation' },
   ];
@@ -819,6 +834,11 @@
 
     const isSlashCommand = SYSTEM_SLASH_COMMANDS.some((cmd) => content.startsWith(cmd));
 
+    if (pendingDirectQuestion && !isSlashCommand && composerAttachments.length > 0) {
+      addToast('Attachments are not supported for clarification responses.', 'error');
+      return;
+    }
+
     if (!isSlashCommand) {
       timeline = appendOptimisticUserMessage(timeline, content, composerAttachments);
       lastSubmittedMessage = content;
@@ -834,6 +854,15 @@
     syncVisibleWindow();
     userScrolledUp = false;
     scrollToBottom();
+    if (pendingDirectQuestion && !isSlashCommand) {
+      wsClient.respondStepQuestion(
+        pendingDirectQuestion.notificationId,
+        content,
+        pendingDirectQuestion.stepName
+      );
+      pendingDirectQuestion = null;
+      return;
+    }
     wsClient.sendMessage(currentConversation.conversation_id, content, attachments);
   }
 
@@ -1012,6 +1041,9 @@
       error = socketErrorMessage(event);
       awaitingAssistantStart = false;
       turnInProgress = false;
+      if (event.code === 'turn_cancelled') {
+        pendingDirectQuestion = null;
+      }
       if (event.recoverable) {
         lastRecoverableMessage = lastSubmittedMessage;
       }
@@ -1025,6 +1057,7 @@
     if (event.type === 'message_complete' || event.type === 'workflow_completed' || event.type === 'workflow_failed' || event.type === 'workflow_cancelled') {
       awaitingAssistantStart = false;
       turnInProgress = false;
+      pendingDirectQuestion = null;
       timeline = finalizeReasoningItems(timeline);
       // Update context usage from message_complete
       if (event.type === 'message_complete' && event.context_usage) {
@@ -1120,6 +1153,32 @@
     if (event.type === 'conversation_created') {
       void goto(`/chat/${event.conversation_id}`);
       return;
+    }
+
+    if (event.type === 'workflow_step_question' && !event.task_id && event.notification_id) {
+      pendingDirectQuestion = {
+        notificationId: event.notification_id,
+        stepName: event.step_name,
+        question: event.question?.trim() || 'The assistant needs more input to continue.',
+        options: Array.isArray(event.options)
+          ? event.options
+              .map((option) => {
+                if (typeof option === 'string') return option;
+                if (option && typeof option === 'object') {
+                  const label = (option as Record<string, unknown>).label;
+                  if (typeof label === 'string') return label;
+                }
+                return '';
+              })
+              .filter((value) => value.length > 0)
+          : [],
+        context:
+          typeof event.context === 'string'
+            ? event.context
+            : event.context && typeof event.context === 'object' && typeof event.context.context === 'string'
+              ? event.context.context
+              : ''
+      };
     }
 
     timeline = applyWebSocketEvent(timeline, event);
@@ -1835,6 +1894,29 @@
                 {/each}
               </div>
             {/if}
+
+            {#if pendingDirectQuestion}
+              <div class="rounded-2xl border border-sky-500/30 bg-sky-500/10 px-4 py-3 text-sm text-sky-50">
+                <p class="font-semibold">Assistant requested more input</p>
+                <p class="mt-1 leading-6">{pendingDirectQuestion.question}</p>
+                {#if pendingDirectQuestion.context}
+                  <p class="mt-2 text-xs text-sky-100/80">{pendingDirectQuestion.context}</p>
+                {/if}
+                {#if pendingDirectQuestion.options.length > 0}
+                  <div class="mt-3 flex flex-wrap gap-2">
+                    {#each pendingDirectQuestion.options as option}
+                      <button
+                        class="rounded-full border border-sky-400/30 bg-sky-400/10 px-3 py-1 text-xs text-sky-100 transition hover:bg-sky-400/20"
+                        type="button"
+                        onclick={() => { composer = option; syncComposerHeight(); composerElement?.focus(); }}
+                      >
+                        {option}
+                      </button>
+                    {/each}
+                  </div>
+                {/if}
+              </div>
+            {/if}
             {#if composerAttachments.length > 0}
               <div class="flex flex-wrap gap-2">
                 {#each composerAttachments as attachment}
@@ -1855,7 +1937,7 @@
               onkeydown={handleComposerKeydown}
               oninput={() => { updateSlashSuggestions(); syncComposerHeight(); }}
               onpaste={(event) => void handlePaste(event)}
-              placeholder={isLlmUnavailableForSetup() ? 'Configure an LLM provider to start chatting.' : 'Send a message to Cognis...'}
+              placeholder={isLlmUnavailableForSetup() ? 'Configure an LLM provider to start chatting.' : pendingDirectQuestion ? 'Answer the pending clarification request...' : 'Send a message to Cognis...'}
             ></textarea>
             <div class="flex flex-wrap items-center justify-between gap-3">
               <label class="hidden items-center gap-2 text-xs text-slate-400 sm:flex">
@@ -1872,8 +1954,13 @@
                     Cancel turn
                   </Button>
                 {/if}
+                {#if pendingDirectQuestion}
+                  <Button size="sm" variant="secondary" type="button" onclick={() => { composer = '/stop'; void handleSend(); }}>
+                    Stop
+                  </Button>
+                {/if}
                 <Button size="sm" type="submit" disabled={(!composer.trim() && composerAttachments.length === 0) || !currentConversation || isReadOnly(currentConversation) || isLlmUnavailableForSetup()}>
-                  Send
+                  {pendingDirectQuestion ? 'Answer' : 'Send'}
                 </Button>
               </div>
             </div>

@@ -844,7 +844,8 @@ export interface WebSocketWorkflowGateEvent {
 export interface WebSocketWorkflowQuestionEvent {
   type: 'workflow_step_question';
   conversation_id?: string;
-  task_id: string;
+  notification_id?: string;
+  task_id?: string;
   step_name?: string;
   question?: string;
   options?: Array<Record<string, unknown>>;

@@ -46,4 +46,18 @@ describe('chat timeline helpers', () => {
 
     expect(items[0]).toMatchObject({ kind: 'delegation', taskId: 'task_1', status: 'failed' });
   });
+
+  it('renders direct-chat clarification notices without task wording', () => {
+    const items = applyWebSocketEvent([], {
+      type: 'workflow_step_question',
+      notification_id: 'notif_1',
+      question: 'Which repository should I use?'
+    });
+
+    expect(items[0]).toMatchObject({
+      kind: 'notice',
+      title: 'Assistant requested more input',
+      description: 'Which repository should I use?'
+    });
+  });
 });

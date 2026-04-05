@@ -433,8 +433,13 @@ class TurnScheduler:
     async def cancel_turn(self, conversation_id: str) -> bool:
         """Cancel the active turn and all its child sub-sessions."""
         control = self._turn_controls.get(conversation_id)
+        queue = self._queued_messages.get(conversation_id)
+        cleared_queue = False
+        if queue is not None:
+            cleared_queue = bool(queue)
+            queue.clear()
         if control is None:
-            return False
+            return cleared_queue
         control.set()
         # Also cancel child sub-sessions via the agent loop
         session_id = self._turn_sessions.get(conversation_id)

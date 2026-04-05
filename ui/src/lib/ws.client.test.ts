@@ -101,4 +101,20 @@ describe('ws client heartbeat', () => {
     expect(['stalled', 'reconnecting']).toContain(getWebSocketState().status);
     wsClient.disconnect();
   });
+
+  it('sends direct step responses with notification_id', async () => {
+    const { wsClient } = await import('./ws/client');
+
+    wsClient.connect();
+    await Promise.resolve();
+    const socket = FakeWebSocket.instances[0];
+    socket.onopen?.();
+    socket.onmessage?.({ data: JSON.stringify({ type: 'authenticated' }) } as MessageEvent<string>);
+
+    wsClient.respondStepQuestion('notif-1', 'Use the main repo', 'direct');
+
+    expect(socket.sent.some((payload) => payload.includes('"notification_id":"notif-1"'))).toBe(true);
+    expect(socket.sent.some((payload) => payload.includes('"type":"step_response"'))).toBe(true);
+    wsClient.disconnect();
+  });
 });

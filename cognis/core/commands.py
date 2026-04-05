@@ -69,6 +69,7 @@ class CommandDispatcher:
         providers: Any,
         pause_waiter: Any,
         notification_service: Any,
+        turn_scheduler: Any | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._session_manager = session_manager
@@ -77,6 +78,7 @@ class CommandDispatcher:
         self._providers = providers
         self._pause_waiter = pause_waiter
         self._notification_service = notification_service
+        self._turn_scheduler = turn_scheduler
 
     async def dispatch(
         self,
@@ -145,6 +147,10 @@ class CommandDispatcher:
             cmd_word = "/approve" if is_approve else "/deny"
             note = stripped[len(cmd_word) :].strip() or None
             return await self._handle_approve_deny(conversation, is_approve, note, user_email)
+
+        # /stop or /cancel
+        if stripped in ("/stop", "/cancel"):
+            return await self._handle_stop(conversation)
 
         # Not a recognized command
         return None
@@ -575,6 +581,54 @@ class CommandDispatcher:
             text=f"User {verb} {tool_name}{note_suffix}",
         )
 
+    async def _handle_stop(self, conversation: ConversationModel) -> CommandResult:
+        """Handle /stop or /cancel by aborting active work immediately."""
+        conversation_id = conversation.conversation_id
+        stopped_anything = False
+
+        if self._turn_scheduler is not None:
+            stopped_anything = await self._turn_scheduler.cancel_turn(conversation_id)
+
+        pending_pauses = self._pause_waiter.list_pending(conversation_id=conversation_id)
+        for pause in pending_pauses:
+            if pause.pause_type == "step_question" and pause.task_id is None:
+                if self._notification_service is not None:
+                    await self._notification_service.resolve(
+                        pause.pause_id,
+                        "cancel",
+                        {"reason": "user_stop"},
+                    )
+                else:
+                    self._pause_waiter.resolve(
+                        pause.pause_id,
+                        PauseResolution(decision="cancel", data={"reason": "user_stop"}),
+                    )
+                stopped_anything = True
+            elif pause.pause_type == "escalation":
+                if self._notification_service is not None:
+                    await self._notification_service.resolve(
+                        pause.pause_id,
+                        "deny",
+                        {"note": "Stopped by user"},
+                    )
+                else:
+                    self._pause_waiter.resolve(
+                        pause.pause_id,
+                        PauseResolution(decision="deny", data={"note": "Stopped by user"}),
+                    )
+                stopped_anything = True
+
+        if not stopped_anything:
+            return CommandResult(
+                type="system_message",
+                text="No active work to stop.",
+            )
+
+        return CommandResult(
+            type="system_message",
+            text="Stopped the current work and cleared any live clarification wait.",
+        )
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -589,7 +643,12 @@ Available commands:
   /context           Show context window usage
   /info              Show session details and statistics
   /compact           Compact conversation history
+  /summarize         Alias for /compact
   /new               Start a new conversation
+  /reset             Alias for /new
+  /clear             Alias for /new
+  /stop              Stop the current work immediately
+  /cancel            Alias for /stop
   /approve [note]    Approve pending tool escalation
   /deny [note]       Deny pending tool escalation"""
 

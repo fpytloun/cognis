@@ -370,6 +370,7 @@ def create_app() -> FastAPI:
             providers=providers,
             pause_waiter=pause_waiter,
             notification_service=notification_service,
+            turn_scheduler=turn_scheduler,
         )
 
         recovered_sessions = await session_manager.recover_stale_sessions()

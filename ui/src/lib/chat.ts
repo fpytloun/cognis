@@ -733,10 +733,21 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
   }
 
   if (event.type === 'workflow_gate' || event.type === 'workflow_step_question') {
+    const isDirectQuestion = event.type === 'workflow_step_question' && !event.task_id;
+    const title = event.type === 'workflow_gate'
+      ? 'Task waiting for approval'
+      : isDirectQuestion
+        ? 'Assistant requested more input'
+        : 'Task requested more input';
+    const description = event.type === 'workflow_gate'
+      ? `Task ${event.task_id} paused at ${event.step_name ?? 'a workflow step'}.`
+      : isDirectQuestion
+        ? event.question?.trim() || 'Conversation paused until you answer the clarification request.'
+        : `Task ${event.task_id} paused at ${event.step_name ?? 'a workflow step'}.`;
     next.push(
       createNotice(
-        event.type === 'workflow_gate' ? 'Task waiting for approval' : 'Task requested more input',
-        `Task ${event.task_id} paused at ${event.step_name ?? 'a workflow step'}.`,
+        title,
+        description,
         'info'
       )
     );
