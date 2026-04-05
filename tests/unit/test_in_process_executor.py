@@ -15,6 +15,7 @@ from cognis.models.tool import (
     ToolCall,
     ToolDefinition,
     ToolSource,
+    sanitize_mcp_tool_name,
 )
 from cognis.providers.circuit_breaker import CircuitBreaker
 from cognis.providers.executor.in_process import (
@@ -266,11 +267,15 @@ async def test_in_process_executor_discovers_local_mcp_tools(
     connection = await provider.get_executor(handle)
     tools = await connection.list_tools()
     result = await connection.tool_execute(
-        ToolCall(call_id="call-mcp", name="filesystem/inspect", arguments={})
+        ToolCall(
+            call_id="call-mcp",
+            name=sanitize_mcp_tool_name("filesystem", "inspect"),
+            arguments={},
+        )
     )
 
     await provider.cleanup()
     await engine.dispose()
 
-    assert any(tool["name"] == "filesystem/inspect" for tool in tools)
+    assert any(tool["name"] == sanitize_mcp_tool_name("filesystem", "inspect") for tool in tools)
     assert result.output == "inspected"

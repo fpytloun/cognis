@@ -15,6 +15,7 @@ from cognis.models.tool import (
     ExecutorConfig,
     MCPServerConfig,
     ToolDefinition,
+    sanitize_mcp_tool_name,
     stable_tool_id,
 )
 from cognis.providers.executor.in_process import InProcessExecutorConnection
@@ -599,7 +600,8 @@ async def _resolve_intaris_mcp_tools(
         for raw_tool in tools_cache:
             if not isinstance(raw_tool, dict):
                 continue
-            tool_name = f"{name}/{raw_tool.get('name', '')}"
+            raw_tool_name = str(raw_tool.get("name", ""))
+            tool_name = sanitize_mcp_tool_name(name, raw_tool_name)
             if "mcp" in disabled_categories or tool_name in disabled_tools:
                 continue
             from cognis.models.tool import ToolSource
@@ -609,7 +611,11 @@ async def _resolve_intaris_mcp_tools(
                     name=tool_name,
                     description=str(raw_tool.get("description", f"Intaris MCP tool {tool_name}")),
                     parameters=raw_tool.get("inputSchema") or raw_tool.get("parameters") or {},
-                    source=ToolSource(type="intaris_mcp", server_name=name),
+                    source=ToolSource(
+                        type="intaris_mcp",
+                        server_name=name,
+                        raw_tool_name=raw_tool_name,
+                    ),
                     category="mcp",
                     timeout_seconds=30,
                 )

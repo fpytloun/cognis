@@ -106,6 +106,30 @@ async def test_litellm_provider_returns_model_info_from_provider_config(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_litellm_provider_infers_anthropic_capabilities(tmp_path: object) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="anthropic",
+                display_name="Anthropic",
+                location="controller",
+                backend="litellm",
+                config={"default_model": "claude-sonnet-4-20250514"},
+                status="active",
+            )
+        )
+        await session.commit()
+
+    provider = LiteLLMProvider(session_factory)
+    model_info = await provider.get_model_info("claude-sonnet-4-20250514")
+
+    assert model_info.supports_defer_loading is True
+    assert model_info.supports_prompt_caching is True
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_litellm_provider_returns_default_model_info_when_missing(tmp_path: object) -> None:
     engine, session_factory = await _session_factory(tmp_path)
     provider = LiteLLMProvider(session_factory)
@@ -197,6 +221,99 @@ async def test_litellm_provider_routes_executor_location_via_inference_router(
         model="gpt-4o-mini",
     )
     assert result["choices"][0]["message"]["content"] == "hello"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_litellm_provider_merges_extra_headers(tmp_path: object) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="default",
+                display_name="Anthropic",
+                location="controller",
+                backend="litellm",
+                config={
+                    "default_model": "claude-sonnet-4-20250514",
+                    "extra_headers": {"x-provider": "configured"},
+                },
+                status="active",
+            )
+        )
+        await session.commit()
+
+    captured: dict[str, object] = {}
+
+    async def _fake_completion(**kwargs: object) -> object:
+        captured.update(kwargs)
+
+        class _Response:
+            def model_dump(self) -> dict[str, object]:
+                return {"choices": [{"message": {"content": "ok"}}]}
+
+        return _Response()
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.acompletion", _fake_completion)
+    try:
+        provider = LiteLLMProvider(session_factory)
+        await provider.generate(
+            messages=[{"role": "user", "content": "hi"}],
+            model="claude-sonnet-4-20250514",
+            extra_headers={"anthropic-beta": "tool-search-tool-2025-10-19"},
+        )
+    finally:
+        monkeypatch.undo()
+
+    assert captured["extra_headers"] == {
+        "x-provider": "configured",
+        "anthropic-beta": "tool-search-tool-2025-10-19",
+    }
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_litellm_provider_logs_do_not_include_header_values(
+    tmp_path: object, caplog: pytest.LogCaptureFixture
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="default",
+                display_name="Anthropic",
+                location="controller",
+                backend="litellm",
+                config={
+                    "default_model": "claude-sonnet-4-20250514",
+                    "extra_headers": {"x-provider": "secret-header-value"},
+                },
+                status="active",
+            )
+        )
+        await session.commit()
+
+    async def _fake_completion(**_: object) -> object:
+        class _Response:
+            def model_dump(self) -> dict[str, object]:
+                return {"choices": [{"message": {"content": "ok"}}]}
+
+        return _Response()
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.acompletion", _fake_completion)
+    caplog.set_level("DEBUG")
+    try:
+        provider = LiteLLMProvider(session_factory)
+        await provider.generate(
+            messages=[{"role": "user", "content": "hi"}],
+            model="claude-sonnet-4-20250514",
+        )
+    finally:
+        monkeypatch.undo()
+
+    assert "secret-header-value" not in caplog.text
     await engine.dispose()
 
 

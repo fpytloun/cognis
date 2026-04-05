@@ -25,15 +25,23 @@ from cognis.core.compaction import ROTATION_TOTAL
 from cognis.core.events import Event, EventBus, EventType
 from cognis.core.prompts import PromptContext
 from cognis.core.pruning import prune_tool_outputs
+from cognis.core.tool_exposure import prepare_tool_exposure
 from cognis.core.truncation import middle_truncate
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.artifact import AttachmentRef
 from cognis.models.session import ConversationModel, SessionEvent, SessionModel
-from cognis.models.tool import ToolCall, ToolResult
+from cognis.models.tool import (
+    Permission,
+    ToolCall,
+    ToolDefinition,
+    ToolResult,
+    ToolSource,
+    stable_tool_id,
+)
 from cognis.models.workflow import StepDefinition, StepOutput, WorkflowState
 from cognis.runtime_context import scoped_runtime_context  # noqa: F401 — used in delegation
-from cognis.store.queries import get_setting_value
+from cognis.store.queries import get_setting_value, update_conversation
 from cognis.tools.builtin.orchestration import (
     OrchestrationMode,
     handle_delegate_tool_call,
@@ -41,8 +49,11 @@ from cognis.tools.builtin.orchestration import (
     is_subsession_tool,
     is_task_tool,
 )
+from cognis.tools.builtin.tool_search import SEARCH_TOOLS_TOOL, search_inventory
 
 logger = get_logger(__name__)
+
+_BOOTSTRAP_INTENTION_WAIT_MS = 1500
 
 # Prometheus metrics
 STEPS_TOTAL = Counter(
@@ -80,7 +91,13 @@ STEP_COMPLETE = "step_complete"
 STEP_REQUEST_INPUT = "step_request_input"
 STEP_TODO_WRITE = "step_todo_write"
 STEP_TODO_LIST = "step_todo_list"
-CONTROLLER_TOOLS = {STEP_COMPLETE, STEP_REQUEST_INPUT, STEP_TODO_WRITE, STEP_TODO_LIST}
+CONTROLLER_TOOLS = {
+    STEP_COMPLETE,
+    STEP_REQUEST_INPUT,
+    STEP_TODO_WRITE,
+    STEP_TODO_LIST,
+    SEARCH_TOOLS_TOOL.name,
+}
 
 # Callback types
 TokenCallback = Callable[[str], Coroutine[Any, Any, None]]
@@ -124,6 +141,7 @@ def _find_gate_revise_action(pause: PendingPause) -> str | None:
 def _append_tool_call_event(
     events: list[SessionEvent],
     tc: ToolCall,
+    tool_id: str | None = None,
 ) -> None:
     """Record a tool_call event to the Intaris event batch."""
     events.append(
@@ -131,6 +149,7 @@ def _append_tool_call_event(
             type="tool_call",
             data={
                 "name": tc.name,
+                "tool_id": tool_id,
                 "call_id": tc.call_id,
                 "arguments": _truncate_tool_data(json.dumps(tc.arguments, default=str)),
             },
@@ -144,6 +163,7 @@ def _append_tool_result_event(
     output: str,
     is_error: bool,
     duration_ms: int | None = None,
+    tool_id: str | None = None,
 ) -> None:
     """Record a tool_result event to the Intaris event batch.
 
@@ -160,6 +180,7 @@ def _append_tool_result_event(
             data={
                 "call_id": tc.call_id,
                 "name": tc.name,
+                "tool_id": tool_id,
                 "is_error": is_error,
                 "duration_ms": duration_ms,
                 "result": truncated,
@@ -168,6 +189,60 @@ def _append_tool_result_event(
             },
         )
     )
+
+
+def _controller_tool_definition(tool_name: str) -> ToolDefinition:
+    return ToolDefinition(
+        name=tool_name,
+        description="Controller-managed tool",
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(type="builtin"),
+        category="system",
+        read_only=True,
+    )
+
+
+def _tool_id_for_call(tool_name: str, registry: Any | None) -> str:
+    if registry is not None:
+        registered = registry.get(tool_name)
+        if registered is not None:
+            return stable_tool_id(registered.definition)
+    return stable_tool_id(_controller_tool_definition(tool_name))
+
+
+def _filter_model_inventory_tools(
+    agent: AgentDefinition, tools: list[ToolDefinition]
+) -> list[ToolDefinition]:
+    filtered: list[ToolDefinition] = []
+    permissions = agent.permissions
+    for tool in tools:
+        if tool.name in CONTROLLER_TOOLS or is_orchestration_tool(tool.name):
+            continue
+        if (
+            permissions is not None
+            and permissions.resolve_permission(tool.name, tool_id=stable_tool_id(tool))
+            is Permission.DENY
+        ):
+            continue
+        filtered.append(tool)
+    return filtered
+
+
+def _controller_builtin_enabled(agent: AgentDefinition, tool: ToolDefinition) -> bool:
+    if not isinstance(agent.tools, dict):
+        return True
+    disabled_categories = set(agent.tools.get("disabled_categories") or [])
+    disabled_tools = set(agent.tools.get("disabled_tools") or [])
+    if (
+        tool.category in disabled_categories
+        or tool.name in disabled_tools
+        or stable_tool_id(tool) in disabled_tools
+    ):
+        return False
+    builtin_allow = agent.tools.get("builtin_tools")
+    if not isinstance(builtin_allow, list):
+        return True
+    return "*" in builtin_allow or tool.name in builtin_allow
 
 
 # ---------------------------------------------------------------------------
@@ -549,6 +624,7 @@ class StepContext:
     step_index: int = 0  # Index of current step in workflow
     cancel_event: asyncio.Event | None = None
     system_initiated: bool = False
+    bootstrap_wait_for_intention: bool = False
     orchestration_mode: OrchestrationMode = OrchestrationMode.FULL
 
 
@@ -1094,16 +1170,49 @@ class AgentLoop:
             # successfully, use from_events to avoid re-sending content.
             # Fall back to sending content directly if recording failed.
             try:
+                reasoning_result = None
                 if _user_msg_recorded_early:
-                    await self.providers.guardrails.report_reasoning(
+                    reasoning_result = await self.providers.guardrails.report_reasoning(
                         session_id=intaris_id,
                         from_events=True,
+                        wait_for_intention=ctx.bootstrap_wait_for_intention,
+                        wait_timeout_ms=_BOOTSTRAP_INTENTION_WAIT_MS,
                     )
                 else:
-                    await self.providers.guardrails.report_reasoning(
+                    reasoning_result = await self.providers.guardrails.report_reasoning(
                         session_id=intaris_id,
                         content=f"User message: {effective_user_message[:500]}",
+                        wait_for_intention=ctx.bootstrap_wait_for_intention,
+                        wait_timeout_ms=_BOOTSTRAP_INTENTION_WAIT_MS,
                     )
+
+                if reasoning_result and reasoning_result.updated_at:
+                    updated = await self.session_cache.update_intention(
+                        ctx.session.session_id,
+                        reasoning_result.intention,
+                        updated_at=reasoning_result.updated_at,
+                    )
+                    if updated and reasoning_result.title and not ctx.conversation.title:
+                        try:
+                            async with self.session_manager.session_factory() as db_session:
+                                ok = await update_conversation(
+                                    db_session,
+                                    ctx.conversation.conversation_id,
+                                    title=reasoning_result.title[:200],
+                                )
+                                if ok:
+                                    await db_session.commit()
+                                    ctx.conversation.title = reasoning_result.title[:200]
+                        except Exception:
+                            logger.debug(
+                                "agent: failed to sync bootstrap title from Intaris",
+                                extra={
+                                    "extra_data": {
+                                        "conversation_id": ctx.conversation.conversation_id,
+                                    }
+                                },
+                                exc_info=True,
+                            )
             except Exception:
                 logger.warning(
                     "agent: failed to trigger intention update",
@@ -1170,6 +1279,7 @@ class AgentLoop:
         reprompted = False
         mid_stream_retries = 0
         _MAX_MID_STREAM_RETRIES = 2
+        discovered_tool_ids: set[str] = set()
         while True:
             self._raise_if_cancelled(ctx)
 
@@ -1198,6 +1308,34 @@ class AgentLoop:
             if reasoning_effort:
                 llm_kwargs["reasoning_effort"] = reasoning_effort
 
+            model_info = await self.providers.llm.get_model_info(model_for_llm or resolved_model)
+            registry = self._get_tool_registry(ctx)
+            inventory_tools = (
+                _filter_model_inventory_tools(ctx.agent, registry.list_tools())
+                if registry is not None
+                else []
+            )
+            exposure = prepare_tool_exposure(
+                inventory_tools=inventory_tools,
+                controller_tool_schemas=controller_tool_schemas,
+                model=model_for_llm or resolved_model,
+                model_info=model_info,
+                discovered_tool_ids=discovered_tool_ids,
+            )
+            logger.debug(
+                "Prepared tool exposure",
+                extra={
+                    "extra_data": {
+                        "session_id": ctx.session.session_id,
+                        **exposure.debug_metadata,
+                        "extra_header_keys": sorted(
+                            (exposure.request_kwargs.get("extra_headers") or {}).keys()
+                        ),
+                    }
+                },
+            )
+            llm_kwargs.update(exposure.request_kwargs)
+
             # Stream LLM response
             accumulator = StreamAccumulator()
             mid_stream_error: str | None = None
@@ -1205,7 +1343,7 @@ class AgentLoop:
                 messages,
                 model=model_for_llm,
                 task_type="default",
-                tools=controller_tool_schemas + self._get_executor_tool_schemas(ctx),
+                tools=exposure.tools,
                 cache_breakpoint_index=cache_breakpoint,
                 **llm_kwargs,
             ):
@@ -1269,6 +1407,20 @@ class AgentLoop:
 
             content = accumulator.get_content()
             tool_calls = accumulator.get_tool_calls()
+            for tc in tool_calls:
+                mapped_name = exposure.alias_map.get(tc.name, tc.name)
+                if mapped_name != tc.name:
+                    logger.debug(
+                        "Resolved tool alias",
+                        extra={
+                            "extra_data": {
+                                "session_id": ctx.session.session_id,
+                                "visible_name": tc.name,
+                                "internal_name": mapped_name,
+                            }
+                        },
+                    )
+                    tc.name = mapped_name
 
             # Record assistant message
             if content:
@@ -1371,14 +1523,15 @@ class AgentLoop:
             for tc in tool_calls:
                 self._raise_if_cancelled(ctx)
                 tool_call_count += 1
-                STEP_TOOL_CALLS.labels(tool_name=tc.name).inc()
+                tool_id = _tool_id_for_call(tc.name, registry)
+                STEP_TOOL_CALLS.labels(tool_name=tool_id).inc()
 
                 if on_tool_call:
                     await on_tool_call(tc.name, tc.call_id, tc.arguments)
 
                 # Controller tool interception
                 if tc.name == STEP_COMPLETE:
-                    _append_tool_call_event(events_to_record, tc)
+                    _append_tool_call_event(events_to_record, tc, tool_id)
                     # Reject step_complete when it's not available (e.g. direct chat)
                     if not ctx.policy.step_complete_available:
                         err_content = json.dumps(
@@ -1393,7 +1546,9 @@ class AgentLoop:
                         messages.append(
                             {"role": "tool", "tool_call_id": tc.call_id, "content": err_content}
                         )
-                        _append_tool_result_event(events_to_record, tc, err_content, True)
+                        _append_tool_result_event(
+                            events_to_record, tc, err_content, True, tool_id=tool_id
+                        )
                         if on_tool_result:
                             await on_tool_result(tc.call_id, tc.name, err_content, True, None, None)
                         continue
@@ -1416,7 +1571,9 @@ class AgentLoop:
                         messages.append(
                             {"role": "tool", "tool_call_id": tc.call_id, "content": err_content}
                         )
-                        _append_tool_result_event(events_to_record, tc, err_content, True)
+                        _append_tool_result_event(
+                            events_to_record, tc, err_content, True, tool_id=tool_id
+                        )
                         if on_tool_result:
                             await on_tool_result(tc.call_id, tc.name, err_content, True, None, None)
                         continue
@@ -1444,36 +1601,42 @@ class AgentLoop:
                     messages.append(
                         {"role": "tool", "tool_call_id": tc.call_id, "content": result_content}
                     )
-                    _append_tool_result_event(events_to_record, tc, result_content, False)
+                    _append_tool_result_event(
+                        events_to_record, tc, result_content, False, tool_id=tool_id
+                    )
                     if on_tool_result:
                         await on_tool_result(tc.call_id, tc.name, result_content, False, None, None)
                     break
 
                 elif tc.name == STEP_TODO_WRITE:
-                    _append_tool_call_event(events_to_record, tc)
+                    _append_tool_call_event(events_to_record, tc, tool_id)
                     ctx.todos = tc.arguments.get("todos", [])
                     result_content = json.dumps({"status": "updated", "count": len(ctx.todos)})
                     messages.append(
                         {"role": "tool", "tool_call_id": tc.call_id, "content": result_content}
                     )
-                    _append_tool_result_event(events_to_record, tc, result_content, False)
+                    _append_tool_result_event(
+                        events_to_record, tc, result_content, False, tool_id=tool_id
+                    )
                     if on_tool_result:
                         await on_tool_result(tc.call_id, tc.name, result_content, False, None, None)
                     continue
 
                 elif tc.name == STEP_TODO_LIST:
-                    _append_tool_call_event(events_to_record, tc)
+                    _append_tool_call_event(events_to_record, tc, tool_id)
                     result_content = json.dumps({"todos": ctx.todos})
                     messages.append(
                         {"role": "tool", "tool_call_id": tc.call_id, "content": result_content}
                     )
-                    _append_tool_result_event(events_to_record, tc, result_content, False)
+                    _append_tool_result_event(
+                        events_to_record, tc, result_content, False, tool_id=tool_id
+                    )
                     if on_tool_result:
                         await on_tool_result(tc.call_id, tc.name, result_content, False, None, None)
                     continue
 
                 elif tc.name == STEP_REQUEST_INPUT:
-                    _append_tool_call_event(events_to_record, tc)
+                    _append_tool_call_event(events_to_record, tc, tool_id)
                     if (
                         ctx.interaction_mode != "step_requests"
                         or not ctx.step_definition.allow_questions
@@ -1484,7 +1647,9 @@ class AgentLoop:
                         messages.append(
                             {"role": "tool", "tool_call_id": tc.call_id, "content": err_content}
                         )
-                        _append_tool_result_event(events_to_record, tc, err_content, True)
+                        _append_tool_result_event(
+                            events_to_record, tc, err_content, True, tool_id=tool_id
+                        )
                         if on_tool_result:
                             await on_tool_result(tc.call_id, tc.name, err_content, True, None, None)
                         continue
@@ -1496,7 +1661,9 @@ class AgentLoop:
                         messages.append(
                             {"role": "tool", "tool_call_id": tc.call_id, "content": rec_content}
                         )
-                        _append_tool_result_event(events_to_record, tc, rec_content, False)
+                        _append_tool_result_event(
+                            events_to_record, tc, rec_content, False, tool_id=tool_id
+                        )
                         if on_tool_result:
                             await on_tool_result(
                                 tc.call_id, tc.name, rec_content, False, None, None
@@ -1560,7 +1727,9 @@ class AgentLoop:
                         messages.append(
                             {"role": "tool", "tool_call_id": tc.call_id, "content": resp_content}
                         )
-                        _append_tool_result_event(events_to_record, tc, resp_content, False)
+                        _append_tool_result_event(
+                            events_to_record, tc, resp_content, False, tool_id=tool_id
+                        )
                         if on_tool_result:
                             await on_tool_result(
                                 tc.call_id, tc.name, resp_content, False, None, None
@@ -1571,16 +1740,57 @@ class AgentLoop:
                         messages.append(
                             {"role": "tool", "tool_call_id": tc.call_id, "content": timeout_content}
                         )
-                        _append_tool_result_event(events_to_record, tc, timeout_content, True)
-                        if on_tool_result:
-                            await on_tool_result(
-                                tc.call_id, tc.name, timeout_content, True, None, None
-                            )
+                        _append_tool_result_event(
+                            events_to_record, tc, timeout_content, True, tool_id=tool_id
+                        )
+                    if on_tool_result:
+                        await on_tool_result(tc.call_id, tc.name, timeout_content, True, None, None)
+                    continue
+
+                elif tc.name == SEARCH_TOOLS_TOOL.name:
+                    _append_tool_call_event(events_to_record, tc, tool_id)
+                    matches = search_inventory(
+                        inventory_tools,
+                        str(tc.arguments.get("query", "")),
+                        category=(
+                            str(tc.arguments.get("category"))
+                            if tc.arguments.get("category") is not None
+                            else None
+                        ),
+                        limit=int(tc.arguments.get("limit", 10) or 10),
+                    )
+                    discovered_tool_ids.update(
+                        {
+                            str(match["tool_id"])
+                            for match in matches
+                            if isinstance(match.get("tool_id"), str)
+                        }
+                    )
+                    logger.debug(
+                        "Tool discovery updated",
+                        extra={
+                            "extra_data": {
+                                "session_id": ctx.session.session_id,
+                                "query_length": len(str(tc.arguments.get("query", ""))),
+                                "match_count": len(matches),
+                                "discovered_tool_count": len(discovered_tool_ids),
+                            }
+                        },
+                    )
+                    result_content = json.dumps({"matches": matches})
+                    messages.append(
+                        {"role": "tool", "tool_call_id": tc.call_id, "content": result_content}
+                    )
+                    _append_tool_result_event(
+                        events_to_record, tc, result_content, False, tool_id=tool_id
+                    )
+                    if on_tool_result:
+                        await on_tool_result(tc.call_id, tc.name, result_content, False, None, None)
                     continue
 
                 elif is_orchestration_tool(tc.name):
                     # Orchestration tool — intercept as controller directive
-                    _append_tool_call_event(events_to_record, tc)
+                    _append_tool_call_event(events_to_record, tc, tool_id)
                     orch_result = await self._handle_orchestration_tool(
                         tc,
                         ctx=ctx,
@@ -1597,7 +1807,11 @@ class AgentLoop:
                         }
                     )
                     _append_tool_result_event(
-                        events_to_record, tc, orch_result.output, orch_result.is_error
+                        events_to_record,
+                        tc,
+                        orch_result.output,
+                        orch_result.is_error,
+                        tool_id=tool_id,
                     )
                     if on_tool_result:
                         await on_tool_result(
@@ -1626,6 +1840,7 @@ class AgentLoop:
                                 "step_run_id": ctx.step_run_id,
                                 "call_id": tc.call_id,
                                 "tool_name": tc.name,
+                                "tool_id": tool_id,
                             },
                         )
                     )
@@ -1634,6 +1849,7 @@ class AgentLoop:
                             type="tool_call",
                             data={
                                 "name": tc.name,
+                                "tool_id": tool_id,
                                 "call_id": tc.call_id,
                                 "arguments": _truncate_tool_data(
                                     json.dumps(tc.arguments, default=str)
@@ -1679,6 +1895,7 @@ class AgentLoop:
                             data={
                                 "call_id": tc.call_id,
                                 "name": tc.name,
+                                "tool_id": tool_id,
                                 "is_error": result.is_error,
                                 "duration_ms": result.duration_ms,
                                 "result": intaris_preview,
@@ -1716,6 +1933,7 @@ class AgentLoop:
                                 "step_run_id": ctx.step_run_id,
                                 "call_id": tc.call_id,
                                 "tool_name": tc.name,
+                                "tool_id": tool_id,
                                 "is_error": result.is_error,
                             },
                         )
@@ -3430,6 +3648,18 @@ class AgentLoop:
                 },
             ]
         )
+
+        if _controller_builtin_enabled(ctx.agent, SEARCH_TOOLS_TOOL):
+            tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": SEARCH_TOOLS_TOOL.name,
+                        "description": SEARCH_TOOLS_TOOL.description,
+                        "parameters": SEARCH_TOOLS_TOOL.parameters,
+                    },
+                }
+            )
 
         # Orchestration tools — based on orchestration_mode
         for tool_def in orchestration_tools(ctx.orchestration_mode):

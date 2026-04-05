@@ -610,6 +610,8 @@ names to match ``^[a-zA-Z0-9_-]+$`` — no slashes, dots, or spaces.
 - Replace ``/`` with ``__`` (double underscore)
 - Replace any character not in ``[a-zA-Z0-9_-]`` with ``_``
 - Prefix MCP tools with ``mcp_``
+- If sanitization would create a collision, append a deterministic short suffix
+  derived from the stable MCP identity so the visible tool names stay unique
 - Store original server name and tool name in ``ToolSource.server_name``
   and ``ToolSource.raw_tool_name`` for dispatch
 
@@ -850,6 +852,10 @@ The handler searches the full effective inventory (including deferred tools)
 and returns matching tool definitions.  The agent loop then injects discovered
 tools into the next turn's ``tools`` array.
 
+``search_tools`` is a controller-managed, read-only system builtin.  It does
+not execute arbitrary tools itself; it only reveals the already effective,
+permission-filtered inventory for the current step.
+
 ### Tool Exposure Flow
 
 ```
@@ -876,7 +882,7 @@ tools into the next turn's ``tools`` array.
    - Dispatch via ToolRouter using internal identity + source metadata
 
 6. On search_tools call:
-   - Search full effective inventory
+   - Search full effective permission-filtered inventory
    - Return matching tool schemas
    - Inject discovered tools into next turn
 ```

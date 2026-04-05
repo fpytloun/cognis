@@ -9,7 +9,12 @@ from cognis.core.agent_loop import (
     PauseWaiter,
     SessionLock,
     StreamAccumulator,
+    _controller_builtin_enabled,
+    _filter_model_inventory_tools,
 )
+from cognis.models.agent import AgentDefinition, AgentPermissions
+from cognis.models.tool import Permission, ToolDefinition, ToolSource
+from cognis.tools.builtin.tool_search import SEARCH_TOOLS_TOOL
 
 # ---------------------------------------------------------------------------
 # StreamAccumulator tests
@@ -190,3 +195,61 @@ async def test_pause_waiter_resolve_unknown() -> None:
 def test_pause_waiter_pending_count() -> None:
     waiter = PauseWaiter()
     assert waiter.pending_count() == 0
+
+
+def test_filter_model_inventory_tools_excludes_controller_and_denied_tools() -> None:
+    agent = AgentDefinition(
+        agent_id="agent-a",
+        owner_email="user@example.com",
+        name="Agent A",
+        tools={},
+        permissions=AgentPermissions(
+            tool_permissions={"*": Permission.EVALUATE, "builtin:bash": Permission.DENY}
+        ),
+    )
+    tools = [
+        ToolDefinition(
+            name="step_complete",
+            description="controller",
+            parameters={"type": "object", "properties": {}},
+            source=ToolSource(type="builtin"),
+            category="workflow",
+        ),
+        ToolDefinition(
+            name="delegate",
+            description="orchestration",
+            parameters={"type": "object", "properties": {}},
+            source=ToolSource(type="builtin"),
+            category="orchestration",
+        ),
+        ToolDefinition(
+            name="bash",
+            description="shell",
+            parameters={"type": "object", "properties": {}},
+            source=ToolSource(type="executor"),
+            category="shell",
+        ),
+        ToolDefinition(
+            name="read",
+            description="filesystem",
+            parameters={"type": "object", "properties": {}},
+            source=ToolSource(type="executor"),
+            category="filesystem",
+        ),
+    ]
+
+    filtered = _filter_model_inventory_tools(agent, tools)
+
+    assert [tool.name for tool in filtered] == ["read"]
+
+
+def test_controller_builtin_enabled_honors_disabled_tools() -> None:
+    agent = AgentDefinition(
+        agent_id="agent-a",
+        owner_email="user@example.com",
+        name="Agent A",
+        tools={"disabled_tools": [SEARCH_TOOLS_TOOL.name]},
+        permissions=AgentPermissions(tool_permissions={"*": Permission.EVALUATE}),
+    )
+
+    assert _controller_builtin_enabled(agent, SEARCH_TOOLS_TOOL) is False

@@ -348,7 +348,7 @@ def _build_runtime_handler(
         ) -> str:
             del context
             client = mcp_clients[tool.source.server_name]
-            _, raw_tool_name = tool.name.split("/", 1)
+            raw_tool_name = tool.source.raw_tool_name or tool.name
             return await client.call_tool(raw_tool_name, arguments)
 
         return local_mcp_handler

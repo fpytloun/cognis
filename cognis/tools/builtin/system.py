@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cognis.models.tool import ToolDefinition, ToolSource
 from cognis.store.queries import list_active_agents_summary
+from cognis.tools.builtin.tool_search import SEARCH_TOOLS_TOOL
 from cognis.tools.registry import ToolExecutionContext
 
 
@@ -39,7 +40,7 @@ GET_STATUS_TOOL = ToolDefinition(
 def system_tools() -> list[ToolDefinition]:
     """Return built-in system tool definitions."""
 
-    return [LIST_AGENTS_TOOL, GET_STATUS_TOOL]
+    return [LIST_AGENTS_TOOL, GET_STATUS_TOOL, SEARCH_TOOLS_TOOL]
 
 
 def build_system_tool_handlers(

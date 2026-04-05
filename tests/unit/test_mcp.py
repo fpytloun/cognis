@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from cognis.models.tool import MCPServerConfig
+from cognis.models.tool import MCPServerConfig, sanitize_mcp_tool_name
 from cognis.tools.mcp import StdioMCPClient, mcp_tools_to_definitions
 
 
@@ -105,4 +105,5 @@ async def test_mcp_client_lists_and_calls_tools(tmp_path: Path) -> None:
     assert output == "hello\n[image content omitted]"
 
     definitions = mcp_tools_to_definitions("filesystem", tools, timeout_seconds=2)
-    assert definitions[0].name == "filesystem/inspect"
+    assert definitions[0].name == sanitize_mcp_tool_name("filesystem", "inspect")
+    assert definitions[0].source.raw_tool_name == "inspect"

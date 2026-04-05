@@ -12,6 +12,7 @@ from prometheus_client import Counter
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cognis.core.truncation import middle_truncate
+from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.session import SessionModel
 from cognis.models.tool import Permission, ToolCall, ToolResult, stable_tool_id
@@ -37,6 +38,8 @@ IMAGE_GENERATION_TOTAL = Counter(
     "Image generation operations",
     labelnames=("model", "status"),
 )
+
+logger = get_logger(__name__)
 
 
 class ToolRoute(StrEnum):
@@ -196,6 +199,26 @@ class ToolRouter:
 
         cid = tool_call.call_id
         route = self.classify(tool_call.name, registry)
+        registered_tool = registry.get(tool_call.name)
+        tool_id = (
+            stable_tool_id(registered_tool.definition) if registered_tool is not None else None
+        )
+        logger.debug(
+            "Tool route selected",
+            extra={
+                "extra_data": {
+                    "call_id": cid,
+                    "tool_name": tool_call.name,
+                    "tool_id": tool_id,
+                    "route": str(route),
+                    "source_type": (
+                        registered_tool.definition.source.type
+                        if registered_tool is not None
+                        else None
+                    ),
+                }
+            },
+        )
         TOOL_ROUTE_DECISIONS.labels(route=str(route)).inc()
         if route is ToolRoute.UNKNOWN:
             TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome="unknown").inc()
@@ -357,12 +380,13 @@ class ToolRouter:
         registry: ToolRegistry,
     ) -> ToolResult:
         registered_tool = registry.get(tool_call.name)
-        if registered_tool is None or registered_tool.definition.source.server_name is None:
+        source = registered_tool.definition.source if registered_tool is not None else None
+        if registered_tool is None or source is None or source.server_name is None:
             return ToolResult(output="Unknown Intaris MCP tool.", is_error=True)
-        _, raw_tool_name = tool_call.name.split("/", 1)
+        raw_tool_name = source.raw_tool_name or tool_call.name
         result = await self.guardrails.call_mcp_tool(
             session_id=_guardrails_session_id(session),
-            server_name=registered_tool.definition.source.server_name,
+            server_name=source.server_name,
             tool_name=raw_tool_name,
             arguments=tool_call.arguments,
         )

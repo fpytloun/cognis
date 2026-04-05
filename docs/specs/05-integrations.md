@@ -239,13 +239,17 @@ class GuardrailsProvider(Protocol):
     async def report_reasoning(
         self,
         session_id: str,
-        content: str,
+        content: str = "",
         context: str | None = None,
-    ) -> None:
+        *,
+        from_events: bool = False,
+        wait_for_intention: bool = False,
+        wait_timeout_ms: int | None = None,
+    ) -> ReasoningReportResult:
         """
         Forward user/agent content for intention tracking.
         IMPORTANT: content must be prefixed with "User message: " for
-        Intaris to trigger intention regeneration.
+        Intaris to trigger intention regeneration when not using `from_events`.
         """
         ...
 
@@ -861,7 +865,7 @@ LLM request to maximize cache hits.
 
 **Implementation in Cognis:**
 
-- ``_apply_cache_hints()`` in ``LiteLLMProvider`` marks Anthropic messages
+- ``_apply_message_cache_hints()`` in ``LiteLLMProvider`` marks Anthropic messages
   with ``cache_control``.  It should also mark the last tool definition.
 - For OpenAI, automatic prefix caching works without code changes as long as
   the ``tools`` array and message prefix remain stable.

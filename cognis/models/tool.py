@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import re
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
@@ -24,6 +26,7 @@ class ToolSource(BaseModel):
     type: str
     server_name: str | None = None
     server_id: str | None = None
+    raw_tool_name: str | None = None
     skill_id: str | None = None
 
 
@@ -45,11 +48,46 @@ class ToolDefinition(BaseModel):
 
 def stable_tool_id(tool: ToolDefinition) -> str:
     """Return a stable identifier for a tool definition."""
-    if tool.source.type == "local_mcp":
+    if tool.source.type in {"local_mcp", "intaris_mcp"}:
         server_id = tool.source.server_id or tool.source.server_name or "unknown"
-        raw_name = tool.name.split("/", 1)[1] if "/" in tool.name else tool.name
+        raw_name = tool.source.raw_tool_name or tool.name
         return f"mcp:{server_id}:{raw_name}"
+    if tool.source.type == "skill":
+        skill_id = tool.source.skill_id or "unknown"
+        return f"skill:{skill_id}:{tool.name}"
     return f"builtin:{tool.name}"
+
+
+_SAFE_TOOL_NAME_PATTERN = re.compile(r"[^a-zA-Z0-9_-]+")
+_MAX_TOOL_NAME_LENGTH = 64
+
+
+def sanitize_mcp_tool_name(server_name: str, raw_tool_name: str) -> str:
+    """Return a provider-safe MCP tool name.
+
+    The base shape follows the spec (`mcp_<server>__<tool>`). When the raw
+    values need normalization or the result would be too long, append a stable
+    short hash to keep names deterministic and collision-resistant.
+    """
+
+    safe_server = _sanitize_tool_segment(server_name)
+    safe_tool = _sanitize_tool_segment(raw_tool_name)
+    base_name = f"mcp_{safe_server}__{safe_tool}"
+    needs_suffix = (
+        safe_server != server_name
+        or safe_tool != raw_tool_name
+        or len(base_name) > _MAX_TOOL_NAME_LENGTH
+    )
+    if not needs_suffix:
+        return base_name
+    suffix = hashlib.sha1(f"{server_name}:{raw_tool_name}".encode()).hexdigest()[:8]
+    trimmed = base_name[: _MAX_TOOL_NAME_LENGTH - len(suffix) - 1].rstrip("_")
+    return f"{trimmed}_{suffix}"
+
+
+def _sanitize_tool_segment(value: str) -> str:
+    cleaned = _SAFE_TOOL_NAME_PATTERN.sub("_", value).strip("_")
+    return cleaned or "tool"
 
 
 class ToolCall(BaseModel):

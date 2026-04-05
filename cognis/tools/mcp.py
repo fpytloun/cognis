@@ -10,7 +10,7 @@ from contextlib import suppress
 from typing import Any
 
 from cognis.logging import get_logger
-from cognis.models.tool import MCPServerConfig, ToolDefinition, ToolSource
+from cognis.models.tool import MCPServerConfig, ToolDefinition, ToolSource, sanitize_mcp_tool_name
 
 logger = get_logger(__name__)
 
@@ -29,6 +29,8 @@ class StdioMCPClient:
     async def start(self) -> None:
         """Start the subprocess and perform the initialize handshake."""
 
+        if self.config.command is None:
+            raise RuntimeError("MCP stdio command is required")
         self.process = await asyncio.create_subprocess_exec(
             self.config.command,
             *self.config.args,
@@ -211,10 +213,15 @@ def mcp_tools_to_definitions(
             parameters = {"type": "object", "properties": {}}
         definitions.append(
             ToolDefinition(
-                name=f"{server_name}/{name}",
+                name=sanitize_mcp_tool_name(server_name, name),
                 description=str(tool.get("description") or f"MCP tool {name}"),
                 parameters=parameters,
-                source=ToolSource(type="local_mcp", server_name=server_name, server_id=server_id),
+                source=ToolSource(
+                    type="local_mcp",
+                    server_name=server_name,
+                    server_id=server_id,
+                    raw_tool_name=name,
+                ),
                 category="mcp",
                 timeout_seconds=timeout_seconds,
             )

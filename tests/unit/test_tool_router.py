@@ -7,7 +7,14 @@ import pytest
 from cognis.core.tool_router import ToolRoute, ToolRouter
 from cognis.models.agent import AgentDefinition, AgentPermissions
 from cognis.models.session import SessionModel
-from cognis.models.tool import Permission, ToolCall, ToolDefinition, ToolResult, ToolSource
+from cognis.models.tool import (
+    Permission,
+    ToolCall,
+    ToolDefinition,
+    ToolResult,
+    ToolSource,
+    sanitize_mcp_tool_name,
+)
 from cognis.tools.registry import RegisteredTool, ToolRegistry
 
 
@@ -15,6 +22,7 @@ class _Guardrails:
     def __init__(self) -> None:
         self.evaluate_calls = 0
         self.mcp_calls = 0
+        self.last_mcp_call: tuple[str, str] | None = None
 
     async def evaluate(
         self, session_id: str, tool_name: str, arguments: dict, context: dict
@@ -37,8 +45,9 @@ class _Guardrails:
     async def call_mcp_tool(
         self, session_id: str, server_name: str, tool_name: str, arguments: dict
     ) -> ToolResult:
-        del session_id, server_name, tool_name, arguments
+        del session_id, arguments
         self.mcp_calls += 1
+        self.last_mcp_call = (server_name, tool_name)
         return ToolResult(output="remote result")
 
 
@@ -73,10 +82,12 @@ def _registry_with_result_limit(max_result_size: int = 20) -> ToolRegistry:
     registry.register(
         RegisteredTool(
             definition=ToolDefinition(
-                name="filesystem/read_file",
+                name=sanitize_mcp_tool_name("filesystem", "read_file"),
                 description="local",
                 parameters={"type": "object", "properties": {}},
-                source=ToolSource(type="local_mcp", server_name="filesystem"),
+                source=ToolSource(
+                    type="local_mcp", server_name="filesystem", raw_tool_name="read_file"
+                ),
                 timeout_seconds=1,
                 max_result_size=max_result_size,
             )
@@ -101,20 +112,22 @@ def _registry() -> ToolRegistry:
     registry.register(
         RegisteredTool(
             definition=ToolDefinition(
-                name="github/search",
+                name=sanitize_mcp_tool_name("github", "search"),
                 description="remote",
                 parameters={"type": "object", "properties": {}},
-                source=ToolSource(type="intaris_mcp", server_name="github"),
+                source=ToolSource(type="intaris_mcp", server_name="github", raw_tool_name="search"),
             )
         )
     )
     registry.register(
         RegisteredTool(
             definition=ToolDefinition(
-                name="filesystem/read_file",
+                name=sanitize_mcp_tool_name("filesystem", "read_file"),
                 description="local",
                 parameters={"type": "object", "properties": {}},
-                source=ToolSource(type="local_mcp", server_name="filesystem"),
+                source=ToolSource(
+                    type="local_mcp", server_name="filesystem", raw_tool_name="read_file"
+                ),
                 timeout_seconds=1,
                 max_result_size=20,
             )
@@ -158,8 +171,14 @@ def test_tool_router_classifies_routes() -> None:
     registry = _registry()
 
     assert router.classify("delegate", registry) is ToolRoute.ORCHESTRATION
-    assert router.classify("github/search", registry) is ToolRoute.INTARIS_MCP
-    assert router.classify("filesystem/read_file", registry) is ToolRoute.LOCAL
+    assert (
+        router.classify(sanitize_mcp_tool_name("github", "search"), registry)
+        is ToolRoute.INTARIS_MCP
+    )
+    assert (
+        router.classify(sanitize_mcp_tool_name("filesystem", "read_file"), registry)
+        is ToolRoute.LOCAL
+    )
     assert router.classify("missing", registry) is ToolRoute.UNKNOWN
 
 
@@ -169,7 +188,7 @@ async def test_tool_router_dispatches_intaris_mcp() -> None:
     router = ToolRouter(guardrails=guardrails, non_bypassable_patterns=["shell"])
 
     result = await router.execute(
-        ToolCall(call_id="1", name="github/search", arguments={}),
+        ToolCall(call_id="1", name=sanitize_mcp_tool_name("github", "search"), arguments={}),
         _session(),
         _agent(),
         _registry(),
@@ -177,7 +196,41 @@ async def test_tool_router_dispatches_intaris_mcp() -> None:
     )
 
     assert guardrails.mcp_calls == 1
+    assert guardrails.last_mcp_call == ("github", "search")
     assert 'trust="untrusted"' in result.output
+
+
+@pytest.mark.asyncio
+async def test_tool_router_dispatches_intaris_mcp_using_raw_tool_name() -> None:
+    guardrails = _Guardrails()
+    router = ToolRouter(guardrails=guardrails, non_bypassable_patterns=[])
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name=sanitize_mcp_tool_name("github", "search/issues"),
+                description="remote",
+                parameters={"type": "object", "properties": {}},
+                source=ToolSource(
+                    type="intaris_mcp",
+                    server_name="github",
+                    raw_tool_name="search/issues",
+                ),
+            )
+        )
+    )
+
+    await router.execute(
+        ToolCall(
+            call_id="raw", name=sanitize_mcp_tool_name("github", "search/issues"), arguments={}
+        ),
+        _session(),
+        _agent(),
+        registry,
+        _Executor(),
+    )
+
+    assert guardrails.last_mcp_call == ("github", "search/issues")
 
 
 @pytest.mark.asyncio
@@ -205,7 +258,7 @@ async def test_tool_router_truncates_and_wraps_local_results() -> None:
     executor = _Executor(result=ToolResult(output="x" * 2000))
 
     result = await router.execute(
-        ToolCall(call_id="3", name="filesystem/read_file", arguments={}),
+        ToolCall(call_id="3", name=sanitize_mcp_tool_name("filesystem", "read_file"), arguments={}),
         _session(),
         _agent(),
         _registry_with_result_limit(600),
@@ -225,10 +278,10 @@ async def test_tool_router_times_out_and_cancels() -> None:
     router = ToolRouter(guardrails=_Guardrails(), non_bypassable_patterns=[])
     executor = _SlowExecutor()
     registry = _registry()
-    registry.get("filesystem/read_file").definition.timeout_seconds = 0  # type: ignore[union-attr]
+    registry.get(sanitize_mcp_tool_name("filesystem", "read_file")).definition.timeout_seconds = 0  # type: ignore[union-attr]
 
     result = await router.execute(
-        ToolCall(call_id="4", name="filesystem/read_file", arguments={}),
+        ToolCall(call_id="4", name=sanitize_mcp_tool_name("filesystem", "read_file"), arguments={}),
         _session(),
         _agent(),
         registry,
@@ -237,3 +290,25 @@ async def test_tool_router_times_out_and_cancels() -> None:
 
     assert executor.cancelled == ["4"]
     assert "Tool execution timed" in result.output
+
+
+@pytest.mark.asyncio
+async def test_tool_router_logs_do_not_include_tool_arguments(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("DEBUG")
+    router = ToolRouter(guardrails=_Guardrails(), non_bypassable_patterns=[])
+
+    await router.execute(
+        ToolCall(
+            call_id="5",
+            name=sanitize_mcp_tool_name("filesystem", "read_file"),
+            arguments={"secret": "top-secret-value"},
+        ),
+        _session(),
+        _agent(),
+        _registry_with_result_limit(600),
+        _Executor(),
+    )
+
+    assert "top-secret-value" not in caplog.text

@@ -55,7 +55,7 @@ _IMAGE_GEN_STRATEGY: dict[str, str] = {
 _ANTHROPIC_MODEL_PATTERNS = re.compile(r"(claude|anthropic)", re.IGNORECASE)
 
 
-def _apply_cache_hints(
+def _apply_message_cache_hints(
     messages: list[dict[str, Any]],
     model: str,
     cache_breakpoint_index: int | None,
@@ -103,6 +103,20 @@ def _apply_cache_hints(
 
     result[cache_breakpoint_index] = breakpoint_msg
     return result
+
+
+def _merge_request_kwargs(
+    base_kwargs: dict[str, Any], override_kwargs: dict[str, Any]
+) -> dict[str, Any]:
+    merged = dict(base_kwargs)
+    for key, value in override_kwargs.items():
+        if key == "extra_headers":
+            base_headers = merged.get("extra_headers") or {}
+            if isinstance(base_headers, dict) and isinstance(value, dict):
+                merged["extra_headers"] = {**base_headers, **value}
+                continue
+        merged[key] = value
+    return merged
 
 
 class LiteLLMProvider:
@@ -210,6 +224,7 @@ class LiteLLMProvider:
         merged: dict[str, Any] = dict(DEFAULT_MODEL_INFO.model_dump())
         try:
             provider_kwargs = await self._resolve_provider_kwargs(provider)
+            capability_defaults = self._infer_model_capabilities(model_id, provider)
             live = litellm.get_model_info(
                 model=self._apply_model_prefix(model_id, provider),
                 custom_llm_provider=(
@@ -217,6 +232,7 @@ class LiteLLMProvider:
                 ),
                 api_base=provider_kwargs.get("api_base"),
             )
+            merged.update(capability_defaults)
             if isinstance(live, dict):
                 merged.update(
                     {
@@ -238,7 +254,21 @@ class LiteLLMProvider:
                         "supports_file_input": bool(live.get("supports_file_input", False)),
                         "supports_reasoning": bool(live.get("supports_reasoning")),
                         "supports_prompt_caching": bool(live.get("supports_prompt_caching")),
+                        "supports_tool_search": bool(
+                            live.get("supports_tool_search")
+                            or live.get("supports_builtin_tool_search")
+                            or merged.get("supports_tool_search")
+                        ),
+                        "supports_defer_loading": bool(
+                            live.get("supports_defer_loading")
+                            or merged.get("supports_defer_loading")
+                        ),
+                        "supports_responses_api": bool(
+                            live.get("supports_responses_api")
+                            or merged.get("supports_responses_api")
+                        ),
                         "supported_openai_params": list(live.get("supported_openai_params") or []),
+                        "max_tools": live.get("max_tools") or merged.get("max_tools"),
                     }
                 )
         except Exception:
@@ -250,6 +280,38 @@ class LiteLLMProvider:
         merged.update(configured)
         merged["model_id"] = model_id
         return ModelInfo.model_validate(merged)
+
+    def _infer_model_capabilities(
+        self, model_id: str, provider: LLMProviderRow | None
+    ) -> dict[str, Any]:
+        model_name = self._apply_model_prefix(model_id, provider).lower()
+        preset = (
+            str(dict(provider.config).get("preset", "")).lower() if provider is not None else ""
+        )
+        is_anthropic = bool(_ANTHROPIC_MODEL_PATTERNS.search(model_name)) or preset == "anthropic"
+        is_openai_like = (
+            model_name.startswith("gpt-")
+            or model_name.startswith("openai/")
+            or preset in {"openai", "litellm_proxy", "openai_compatible"}
+        )
+        supports_responses_api = bool(
+            is_openai_like
+            and (
+                model_name.startswith("gpt-5")
+                or model_name.startswith("openai/gpt-5")
+                or model_name.startswith("gpt-4.1")
+                or model_name.startswith("openai/gpt-4.1")
+                or model_name.startswith("gpt-4o")
+                or model_name.startswith("openai/gpt-4o")
+            )
+        )
+        return {
+            "supports_defer_loading": is_anthropic,
+            "supports_prompt_caching": is_anthropic,
+            "supports_tool_search": supports_responses_api,
+            "supports_responses_api": supports_responses_api,
+            "max_tools": 128 if is_openai_like else None,
+        }
 
     async def generate(
         self,
@@ -264,8 +326,12 @@ class LiteLLMProvider:
         resolved_model, provider = await self._resolve_model_target(model, task_type=task_type)
 
         prefixed_model = self._apply_model_prefix(resolved_model, provider)
-        request_kwargs = {**await self._resolve_provider_kwargs(provider), **kwargs}
-        prepared_messages = _apply_cache_hints(messages, resolved_model, cache_breakpoint_index)
+        request_kwargs = _merge_request_kwargs(
+            await self._resolve_provider_kwargs(provider), kwargs
+        )
+        prepared_messages = _apply_message_cache_hints(
+            messages, resolved_model, cache_breakpoint_index
+        )
         if self._should_route_to_executor(provider):
             return await self._executor_generate(
                 prefixed_model,
@@ -275,7 +341,14 @@ class LiteLLMProvider:
             )
         logger.debug(
             "LLM generate",
-            extra={"extra_data": {"model": prefixed_model, "task_type": task_type}},
+            extra={
+                "extra_data": {
+                    "model": prefixed_model,
+                    "task_type": task_type,
+                    "tool_count": len(request_kwargs.get("tools") or []),
+                    "extra_header_keys": sorted((request_kwargs.get("extra_headers") or {}).keys()),
+                }
+            },
         )
         response = await with_llm_retry(
             litellm.acompletion,
@@ -326,8 +399,12 @@ class LiteLLMProvider:
         resolved_model, provider = await self._resolve_model_target(model, task_type=task_type)
 
         prefixed_model = self._apply_model_prefix(resolved_model, provider)
-        request_kwargs = {**await self._resolve_provider_kwargs(provider), **kwargs}
-        prepared_messages = _apply_cache_hints(messages, resolved_model, cache_breakpoint_index)
+        request_kwargs = _merge_request_kwargs(
+            await self._resolve_provider_kwargs(provider), kwargs
+        )
+        prepared_messages = _apply_message_cache_hints(
+            messages, resolved_model, cache_breakpoint_index
+        )
         if self._should_route_to_executor(provider):
             async for chunk in self._executor_stream_generate(
                 prefixed_model,
@@ -339,7 +416,14 @@ class LiteLLMProvider:
             return
         logger.debug(
             "LLM stream_generate",
-            extra={"extra_data": {"model": prefixed_model, "task_type": task_type}},
+            extra={
+                "extra_data": {
+                    "model": prefixed_model,
+                    "task_type": task_type,
+                    "tool_count": len(request_kwargs.get("tools") or []),
+                    "extra_header_keys": sorted((request_kwargs.get("extra_headers") or {}).keys()),
+                }
+            },
         )
         # Retry pre-stream errors (connection refused, rate limit, etc.)
         # with exponential backoff.  Once the stream is established,
@@ -632,6 +716,11 @@ class LiteLLMProvider:
                 request_kwargs[key] = value
         if "base_url" in request_kwargs and "api_base" not in request_kwargs:
             request_kwargs["api_base"] = request_kwargs["base_url"]
+        extra_headers = config.get("extra_headers")
+        if isinstance(extra_headers, dict):
+            request_kwargs["extra_headers"] = {
+                str(key): str(value) for key, value in extra_headers.items()
+            }
 
         # Resolve API key from auth_config
         api_key = self._resolve_api_key(config)
@@ -707,6 +796,11 @@ class LiteLLMProvider:
                 request_kwargs[key] = value
         if "base_url" in request_kwargs and "api_base" not in request_kwargs:
             request_kwargs["api_base"] = request_kwargs["base_url"]
+        extra_headers = config.get("extra_headers")
+        if isinstance(extra_headers, dict):
+            request_kwargs["extra_headers"] = {
+                str(key): str(value) for key, value in extra_headers.items()
+            }
         api_key = await self._resolve_api_key_async(config)
         if api_key:
             request_kwargs["api_key"] = api_key

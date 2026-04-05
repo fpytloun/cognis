@@ -37,7 +37,13 @@ from cognis.api.serializers import agent_to_response, mcp_server_to_response, to
 from cognis.core.executor_policy import load_executor_policy
 from cognis.core.executor_resolution import is_tool_enabled, select_executor_for_agent
 from cognis.models.agent import AgentDefinition, AgentPermissions
-from cognis.models.tool import MCP_SERVER_IDS_KEY, ExecutorConfig, MCPServerConfig, ToolDefinition
+from cognis.models.tool import (
+    MCP_SERVER_IDS_KEY,
+    ExecutorConfig,
+    MCPServerConfig,
+    ToolDefinition,
+    stable_tool_id,
+)
 from cognis.store.queries import (
     create_mcp_server,
     delete_mcp_server,
@@ -163,11 +169,7 @@ async def executor_status(request: Request) -> ExecutorStatusResponse:
 
 
 def _tool_identifier(tool: ToolDefinition) -> str:
-    if tool.source.type == "local_mcp":
-        server_id = tool.source.server_id or tool.source.server_name or "unknown"
-        raw_name = tool.name.split("/", 1)[1] if "/" in tool.name else tool.name
-        return f"mcp:{server_id}:{raw_name}"
-    return f"builtin:{tool.name}"
+    return stable_tool_id(tool)
 
 
 def _tool_permission(agent: AgentDefinition, tool: ToolDefinition) -> str:
@@ -178,7 +180,7 @@ def _tool_permission(agent: AgentDefinition, tool: ToolDefinition) -> str:
     tool_id = _tool_identifier(tool)
     if agent.permissions.tool_permissions and tool_id in agent.permissions.tool_permissions:
         return str(agent.permissions.tool_permissions[tool_id])
-    return str(agent.permissions.resolve_permission(tool.name))
+    return str(agent.permissions.resolve_permission(tool.name, tool_id=tool_id))
 
 
 async def _discover_temp_mcp_tools(
@@ -625,7 +627,9 @@ async def update_mcp_server_route(
         if isinstance(updates.get("env"), dict) and isinstance(existing.env, dict):
             preserved_env: dict[str, str] = {}
             for key, value in updates["env"].items():
-                preserved_env[key] = existing.env.get(key) if value == "***" else value
+                preserved_env[key] = (
+                    str(existing.env.get(key, "")) if value == "***" else str(value)
+                )
             updates["env"] = preserved_env
         merged = {
             "name": updates.get("name", existing.name),
