@@ -501,6 +501,28 @@ class TestCapabilityDegradation:
         await adapter._send_typing_direct("+420111222333")
         mock_runtime.request.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_direct_profile_sync_skips_when_runtime_version_unknown(self) -> None:
+        adapter = SignalAdapter()
+        adapter._signal_config = _SignalConfig(
+            {"transport": "direct_jsonrpc", "sync_profile": "true"},
+            {"account_number": "+1"},
+        )
+        adapter._account_number = "+1"
+
+        mock_runtime = MagicMock()
+        mock_runtime.is_running = True
+        mock_runtime.version = None
+        mock_runtime.request = AsyncMock()
+        adapter._runtime = mock_runtime
+
+        from cognis.models.channel import AgentProfile
+
+        await adapter._sync_profile_direct(AgentProfile(name="Test"))
+
+        assert "updateProfile" in adapter._degraded_capabilities
+        mock_runtime.request.assert_not_called()
+
 
 class TestDirectParamNormalization:
     def test_direct_params_strip_account_in_single_account_mode(self) -> None:

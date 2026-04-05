@@ -417,6 +417,13 @@ class SignalAdapter(BaseChannelAdapter):
             return
         if "updateProfile" in self._degraded_capabilities:
             return
+        if self._runtime.version is None:
+            self._degraded_capabilities.add("updateProfile")
+            logger.info(
+                "signal adapter: skipping direct profile sync because runtime version could not be probed",
+                extra={"extra_data": {"account_id": self.account_id}},
+            )
+            return
         avatar_path: Path | None = None
         try:
             params = self._direct_params(

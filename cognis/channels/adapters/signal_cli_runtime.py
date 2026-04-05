@@ -142,9 +142,10 @@ class SignalCliRuntime:
                 },
             )
         except Exception:
-            logger.warning(
+            logger.debug(
                 "signal-cli runtime: version probe failed, continuing",
                 extra={"extra_data": {"account": self._account_number}},
+                exc_info=True,
             )
 
         # Discover capabilities by probing known methods
