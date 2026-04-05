@@ -36,7 +36,7 @@ export const guides: Record<string, SetupGuide> = {
     publicUrlNeeded: false,
     steps: [
       'REST API mode: Start signal-cli REST API (e.g. via Docker), link your number, and paste the API URL and phone number below.',
-      'Direct JSON-RPC mode: Set transport to "direct_jsonrpc", assign an executor with signal.direct_enabled=true in its config, and provide the linked phone number. The executor runs signal-cli directly.',
+      'Direct JSON-RPC mode: Set transport to "direct_jsonrpc", assign an executor with signal.direct_enabled=true in its config, and provide the linked phone number. If signal-cli is not on PATH, set signal.command on that executor.',
       'For both modes, link or register your Signal number through signal-cli first (e.g. by scanning a QR code from the Signal mobile app).',
     ],
   },

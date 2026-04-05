@@ -10,6 +10,7 @@ from cognis.api.app import create_app
 from cognis.store.queries import (
     create_agent,
     create_channel_account,
+    create_executor,
     create_pairing_request,
     create_user,
     get_channel_account,
@@ -134,6 +135,155 @@ def test_create_webhook_channel_generates_secret(monkeypatch: object, tmp_path: 
         assert response.status_code == 200
         assert isinstance(response.json()["webhook_secret"], str)
         assert response.json()["webhook_secret"]
+
+
+def test_create_signal_account_accepts_non_secret_fields_in_settings(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> None:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                await session.commit()
+
+        asyncio.run(_seed())
+
+        response = client.post(
+            "/api/v1/channels/accounts",
+            headers=_auth_headers(app, email="user@example.com"),
+            json={
+                "channel_type": "signal",
+                "agent_id": "agent-1",
+                "display_name": "Signal",
+                "settings": {
+                    "transport": "rest_api",
+                    "account_number": "+420111222333",
+                    "api_url": "http://localhost:8080",
+                },
+                "credential_refs": {},
+            },
+        )
+        assert response.status_code == 200, response.text
+
+
+def test_create_signal_direct_account_requires_executor_opt_in(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> None:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                await create_executor(
+                    session,
+                    executor_id="exec-signal",
+                    name="Signal Exec",
+                    executor_type="websocket",
+                    config={"signal": {"direct_enabled": True}},
+                    owner_email="user@example.com",
+                )
+                await session.commit()
+
+        asyncio.run(_seed())
+
+        response = client.post(
+            "/api/v1/channels/accounts",
+            headers=_auth_headers(app, email="user@example.com"),
+            json={
+                "channel_type": "signal",
+                "agent_id": "agent-1",
+                "display_name": "Signal Direct",
+                "adapter_location": "executor",
+                "executor_id": "exec-signal",
+                "settings": {
+                    "transport": "direct_jsonrpc",
+                    "account_number": "+420111222333",
+                },
+                "credential_refs": {},
+            },
+        )
+        assert response.status_code == 200, response.text
+
+
+def test_update_signal_account_accepts_partial_non_secret_updates(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> None:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                await create_channel_account(
+                    session,
+                    account_id="signal-1",
+                    channel_type="signal",
+                    display_name="Signal",
+                    agent_id="agent-1",
+                    user_email="user@example.com",
+                    config={
+                        "transport": "rest_api",
+                        "account_number": "+420111222333",
+                        "api_url": "http://localhost:8080",
+                    },
+                )
+                await session.commit()
+
+        asyncio.run(_seed())
+
+        response = client.patch(
+            "/api/v1/channels/accounts/signal-1",
+            headers=_auth_headers(app, email="user@example.com"),
+            json={
+                "config": {
+                    "transport": "rest_api",
+                    "api_url": "http://localhost:9090",
+                }
+            },
+        )
+        assert response.status_code == 200, response.text
 
 
 def test_pairing_endpoints(monkeypatch: object, tmp_path: Path) -> None:

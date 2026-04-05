@@ -33,8 +33,10 @@ async def _validate_signal_account(request: Request, body: dict[str, Any]) -> An
     adapter_location = body.get("adapter_location", "controller")
     executor_id = body.get("executor_id")
 
-    # account_number is required for both transports
-    account_number = credential_refs.get("account_number", "")
+    # The channel UI stores non-secret credential fields in settings/config,
+    # while secret fields go through credential_refs. Support both so
+    # validation matches the actual runtime credential resolution path.
+    account_number = credential_refs.get("account_number") or settings.get("account_number", "")
     if not account_number:
         return error_response(400, "validation_error", "Signal requires account_number credential")
 
@@ -76,7 +78,7 @@ async def _validate_signal_account(request: Request, body: dict[str, Any]) -> An
             )
 
     elif transport == "rest_api":
-        api_url = credential_refs.get("api_url", "")
+        api_url = credential_refs.get("api_url") or settings.get("api_url", "")
         if not api_url:
             return error_response(
                 400,

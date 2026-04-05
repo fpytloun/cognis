@@ -123,7 +123,7 @@ In `Channels -> Accounts -> New account`:
 3. Set `Transport` to `rest_api`.
 4. Choose `Controller` or `Executor` placement.
 5. If using executor placement, optionally choose a specific executor.
-6. Fill in credentials:
+6. Fill in the non-secret connection fields:
    - `signal-cli REST API URL`
    - `Phone number` in E.164 format
 7. Save the account.
@@ -167,6 +167,7 @@ Notes:
 - `direct_enabled` must be `true` or Cognis will reject direct-mode Signal accounts.
 - `command` is optional. Use it when `signal-cli` is not on the default `PATH`.
 - The command is executor-scoped and user-scoped through the executor config. It is not stored on individual channel accounts.
+- You can configure these values directly in `Settings -> Executors -> Signal Direct Mode`; manual JSON editing is not required.
 
 #### 3. Create the Cognis account
 

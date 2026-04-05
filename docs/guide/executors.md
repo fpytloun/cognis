@@ -65,7 +65,7 @@ When a Signal account uses `transport=direct_jsonrpc`, Cognis does not talk to a
 
 ### Minimum executor config for direct Signal
 
-Add Signal support to the executor config in `Settings -> Executors`:
+In `Settings -> Executors`, open the executor card and expand `Signal Direct Mode`. Cognis exposes a toggle for direct mode and a field for the `signal-cli` command/path. Under the hood it stores the following executor config:
 
 ```json
 {

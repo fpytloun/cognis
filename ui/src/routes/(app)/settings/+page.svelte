@@ -1781,6 +1781,64 @@
               </div>
             </details>
 
+            <!-- Signal direct-mode settings -->
+            {@const signalConfig = ((exec.config || {}).signal || {}) as Record<string, unknown>}
+            {@const signalDirectEnabled = signalConfig.direct_enabled === true}
+            {@const signalCommand = typeof signalConfig.command === 'string' ? signalConfig.command : ''}
+            <details class="group">
+              <summary class="cursor-pointer text-xs uppercase tracking-wider text-slate-400 hover:text-slate-300 select-none">
+                Signal Direct Mode
+                <span class="ml-1 text-slate-500">{signalDirectEnabled ? '(enabled)' : '(disabled)'}</span>
+              </summary>
+              <div class="mt-3 space-y-3 pl-1">
+                <label class="flex items-center gap-2 text-sm text-slate-300">
+                  <input
+                    type="checkbox"
+                    checked={signalDirectEnabled}
+                    class="rounded border-slate-600 bg-slate-800 text-emerald-500 focus:ring-emerald-500/30"
+                    onchange={async (e) => {
+                      const checked = e.currentTarget.checked;
+                      const cfg = {
+                        ...(exec.config || {}),
+                        signal: {
+                          ...signalConfig,
+                          direct_enabled: checked,
+                        },
+                      };
+                      await api.executor.update(exec.executor_id, { config: cfg });
+                      await refreshPageState();
+                      addToast(`Signal direct mode ${checked ? 'enabled' : 'disabled'}.`, 'success');
+                    }}
+                  />
+                  Enable Signal direct JSON-RPC on this executor
+                </label>
+
+                <label class="space-y-1 text-sm text-slate-300">
+                  <span class="text-xs text-slate-400">signal-cli command or absolute path</span>
+                  <Input
+                    value={signalCommand}
+                    placeholder="signal-cli or /opt/homebrew/bin/signal-cli"
+                    onchange={async (e) => {
+                      const value = e.currentTarget.value.trim();
+                      const cfg = {
+                        ...(exec.config || {}),
+                        signal: {
+                          ...signalConfig,
+                          command: value || 'signal-cli',
+                        },
+                      };
+                      await api.executor.update(exec.executor_id, { config: cfg });
+                      await refreshPageState();
+                      addToast('Signal command updated.', 'success');
+                    }}
+                  />
+                  <p class="text-xs text-slate-500">
+                    Use this when <code>signal-cli</code> is not on the default PATH for the executor process.
+                  </p>
+                </label>
+              </div>
+            </details>
+
             <!-- MCP Server Assignment -->
             {#if mcpServerConfigs.length > 0}
               {@const assignedIds = ((exec.config || {}).mcp_server_ids || []) as string[]}
