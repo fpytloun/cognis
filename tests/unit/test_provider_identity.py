@@ -81,3 +81,50 @@ async def test_intaris_call_mcp_tool_uses_server_and_tool_fields() -> None:
         "tool": "search/issues",
         "arguments": {"q": "bug"},
     }
+
+
+@pytest.mark.asyncio
+async def test_intaris_call_mcp_tool_normalizes_rest_content_blocks() -> None:
+    auth = _AuthProvider()
+    intaris = IntarisProvider("http://localhost:8060", auth)
+
+    class _Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {
+                "content": [
+                    {"type": "text", "text": "Issue created"},
+                    {"type": "text", "text": "#42"},
+                ],
+                "isError": False,
+                "decision": "approve",
+                "call_id": "call-1",
+                "latency_ms": 1088,
+            }
+
+    async def _fake_post(*_: object, **__: object) -> _Response:
+        return _Response()
+
+    token = current_user_email.set("user@example.com")
+    try:
+        intaris.client.post = _fake_post  # type: ignore[method-assign]
+        result = await intaris.call_mcp_tool(
+            session_id="sess-1",
+            server_name="github",
+            tool_name="create_issue",
+            arguments={"title": "Bug"},
+        )
+    finally:
+        current_user_email.reset(token)
+        await intaris.client.aclose()
+
+    assert result.output == "Issue created\n#42"
+    assert result.is_error is False
+    assert result.duration_ms == 1088
+    assert result.metadata == {
+        "decision": "approve",
+        "call_id": "call-1",
+        "latency_ms": 1088,
+    }

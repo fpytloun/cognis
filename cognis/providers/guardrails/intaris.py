@@ -440,13 +440,57 @@ class IntarisProvider:
                 timeout=60.0,
             )
             response.raise_for_status()
-            return ToolResult.model_validate(response.json())
+            return self._normalize_mcp_tool_result(response.json())
 
         return await self._call_with_retry(
             _do,
             max_retries=2,
             operation=f"intaris call_mcp_tool({tool_name})",
             breaker=self.data_breaker,
+        )
+
+    def _normalize_mcp_tool_result(self, payload: Any) -> ToolResult:
+        """Normalize Intaris MCP REST responses into Cognis ToolResult."""
+
+        if isinstance(payload, dict) and "output" in payload:
+            return ToolResult.model_validate(payload)
+
+        if not isinstance(payload, dict):
+            return ToolResult(output=str(payload), is_error=True)
+
+        content = payload.get("content")
+        text_chunks: list[str] = []
+        if isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    text_chunks.append(str(block))
+                    continue
+                block_type = block.get("type")
+                if block_type == "text":
+                    text = block.get("text")
+                    if isinstance(text, str) and text:
+                        text_chunks.append(text)
+                else:
+                    text_chunks.append(str(block))
+        elif isinstance(content, str):
+            text_chunks.append(content)
+
+        output = "\n".join(chunk for chunk in text_chunks if chunk).strip()
+        if not output:
+            output = "[No content returned from Intaris MCP proxy]"
+
+        metadata = {
+            key: value for key, value in payload.items() if key not in {"content", "isError"}
+        }
+        return ToolResult(
+            output=output,
+            is_error=bool(payload.get("isError", False)),
+            duration_ms=(
+                int(payload["latency_ms"])
+                if isinstance(payload.get("latency_ms"), (int, float))
+                else None
+            ),
+            metadata=metadata or None,
         )
 
     async def list_mcp_servers(self, enabled_only: bool = True) -> list[dict[str, Any]]:
