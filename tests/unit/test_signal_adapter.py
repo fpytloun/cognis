@@ -84,7 +84,12 @@ class FakeProcess:
     tests to control timing between requests and responses.
     """
 
-    def __init__(self, responses: list[dict[str, Any]] | None = None) -> None:
+    def __init__(
+        self,
+        responses: list[dict[str, Any]] | None = None,
+        *,
+        eof_when_empty: bool = False,
+    ) -> None:
         self.stdin = MagicMock()
         self.stdin.write = MagicMock()
         self.stdin.drain = AsyncMock()
@@ -92,6 +97,7 @@ class FakeProcess:
         self.stderr = MagicMock()
         self.returncode = None
         self._queue: asyncio.Queue[bytes] = asyncio.Queue()
+        self._eof_when_empty = eof_when_empty
         for resp in responses or []:
             self._queue.put_nowait(json.dumps(resp).encode() + b"\n")
 
@@ -104,6 +110,8 @@ class FakeProcess:
         self._queue.put_nowait(json.dumps(response).encode() + b"\n")
 
     async def _read_stdout_line(self) -> bytes:
+        if self._eof_when_empty and self._queue.empty():
+            return b""
         try:
             return await asyncio.wait_for(self._queue.get(), timeout=30.0)
         except (TimeoutError, asyncio.CancelledError):
@@ -127,6 +135,31 @@ class TestSignalCliRuntime:
             command="/nonexistent/signal-cli",
         )
         with pytest.raises(SignalCliRuntimeError, match="not found"):
+            await runtime.start()
+
+    @pytest.mark.asyncio
+    async def test_start_fails_when_process_exits_during_version_probe(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        process = FakeProcess(eof_when_empty=True)
+        process.returncode = 9
+
+        monkeypatch.setattr(
+            "cognis.channels.adapters.signal_cli_runtime.shutil.which",
+            lambda command: "/usr/bin/signal-cli",
+        )
+
+        async def fake_create_subprocess_exec(*args: Any, **kwargs: Any) -> FakeProcess:
+            return process
+
+        monkeypatch.setattr(
+            "cognis.channels.adapters.signal_cli_runtime.asyncio.create_subprocess_exec",
+            fake_create_subprocess_exec,
+        )
+
+        runtime = SignalCliRuntime(account_number="+1234567890")
+
+        with pytest.raises(SignalCliRuntimeError, match=r"returncode=9"):
             await runtime.start()
 
     @pytest.mark.asyncio

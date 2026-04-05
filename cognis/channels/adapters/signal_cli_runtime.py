@@ -141,12 +141,17 @@ class SignalCliRuntime:
                     }
                 },
             )
-        except Exception:
+        except Exception as exc:
             logger.debug(
                 "signal-cli runtime: version probe failed, continuing",
                 extra={"extra_data": {"account": self._account_number}},
                 exc_info=True,
             )
+            await self._refresh_returncode()
+            if not self.is_running:
+                message = self._process_exit_message()
+                await self.stop()
+                raise SignalCliRuntimeError(message) from exc
 
         # Discover capabilities by probing known methods
         self._capabilities = {"send", "receive"}
@@ -361,3 +366,9 @@ class SignalCliRuntime:
         if self._stderr_line_count > 0:
             detail += f", stderr_lines={self._stderr_line_count}"
         return f"signal-cli process exited unexpectedly ({detail})"
+
+    async def _refresh_returncode(self) -> None:
+        if self._process is None or self._process.returncode is not None:
+            return
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(self._process.wait(), timeout=0.1)
