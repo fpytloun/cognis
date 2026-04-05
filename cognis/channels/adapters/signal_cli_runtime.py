@@ -357,7 +357,8 @@ class SignalCliRuntime:
                 if self._stderr_debug_enabled and text:
                     self._stderr_tail.append(text)
                     logger.warning(
-                        "signal-cli stderr",
+                        "signal-cli stderr: %s",
+                        text,
                         extra={
                             "extra_data": {
                                 "account": self._account_number,

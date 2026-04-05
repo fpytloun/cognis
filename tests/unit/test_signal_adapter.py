@@ -332,6 +332,27 @@ class TestSignalCliRuntime:
         assert "first failure line" in message
         assert "second failure line" in message
 
+    @pytest.mark.asyncio
+    async def test_stderr_debug_logs_text_in_message(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("COGNIS_SIGNAL_STDIO_DEBUG", "true")
+        runtime = SignalCliRuntime(account_number="+1234567890")
+        process = FakeProcess()
+        process.stderr.readline = AsyncMock(side_effect=[b"java failure line\n", b""])
+        runtime._process = process
+        runtime._running = True
+
+        warning = MagicMock()
+        monkeypatch.setattr("cognis.channels.adapters.signal_cli_runtime.logger.warning", warning)
+
+        await runtime._drain_stderr()
+
+        assert any(
+            call.args
+            and call.args[0] == "signal-cli stderr: %s"
+            and call.args[1] == "java failure line"
+            for call in warning.call_args_list
+        )
+
 
 # ---------------------------------------------------------------------------
 # SignalAdapter transport selection tests
