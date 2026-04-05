@@ -63,7 +63,9 @@ class ToolDefinition(BaseModel):
 
 class ToolSource(BaseModel):
     type: str                          # "builtin", "executor", "local_mcp", "intaris_mcp", "skill"
-    server_name: str | None = None
+    server_name: str | None = None     # MCP server display name
+    server_id: str | None = None       # MCP server stable ID (for stable_tool_id)
+    raw_tool_name: str | None = None   # Original MCP tool name (for dispatch)
     skill_id: str | None = None
 ```
 
@@ -445,64 +447,108 @@ query the queue and answer naturally, instead of relying only on pushed events.
 
 ## MCP Integration
 
-### Local MCP (Executor-Managed)
+### Global MCP Servers (DB-Managed)
 
-Local MCP servers run on the executor. The executor starts and manages these
-processes.
+MCP servers are configured globally in the ``mcp_servers`` DB table and
+assigned to executors via ``config.mcp_server_ids``.  Agents inherit MCP
+tools from their assigned executor.
 
-```yaml
-# In agent definition
-tools:
-  mcp_servers:
-    - name: "postgres"
-      transport: "stdio"
-      command: "npx"
-      args: ["@modelcontextprotocol/server-postgres"]
-      env:
-        DATABASE_URL: "${secret:postgres_url}"
+```sql
+CREATE TABLE mcp_servers (
+    server_id         TEXT PRIMARY KEY,
+    name              TEXT NOT NULL,
+    transport         TEXT NOT NULL DEFAULT 'stdio',
+    command           TEXT,              -- Required for stdio
+    url               TEXT,              -- Required for sse/streamable_http
+    args              JSON,
+    env               JSON,              -- {"KEY": "value"} or {"KEY": "$secret:name"}
+    timeout_seconds   INTEGER NOT NULL DEFAULT 30,
+    description       TEXT,
+    owner_email       TEXT REFERENCES users(email),
+    status            TEXT NOT NULL DEFAULT 'active',
+    UNIQUE(name, owner_email)
+);
 ```
+
+MCP servers are **user-scoped** — each user manages their own servers.
+Assignment to executors is validated: ``config.mcp_server_ids`` may only
+reference servers owned by the same user as the executor.
+
+### Local MCP (Executor-Hosted)
+
+Local MCP servers run on the executor.  During ``executor.configure``, the
+controller resolves assigned MCP servers from the DB, resolves secrets, and
+sends the configs to the executor.  The executor starts stdio MCP clients,
+discovers tools, and includes them in ``tool.list``.
 
 Flow: Controller evaluates via Intaris → approved → tool.execute to Executor →
 Executor calls local MCP server → result back to Controller.
 
-Note: Common developer tools (filesystem, shell, search) are now executor-
-native and do not require MCP server configuration. Local MCP is for
-specialized servers (databases, custom APIs, etc.).
+**Supported transports for executor-hosted MCP:** stdio only (current phase).
+Non-stdio transports (sse, streamable_http) are rejected during
+``executor.configure`` with a structured error.
+
+Note: Common developer tools (filesystem, shell, search) are executor-native
+and do not require MCP server configuration.  Local MCP is for specialized
+servers (databases, custom APIs, etc.).
 
 ### Intaris-Managed MCP (Remote)
 
-Remote MCP servers registered in Intaris. Intaris acts as MCP proxy,
+Remote MCP servers registered in Intaris.  Intaris acts as MCP proxy,
 evaluating safety AND executing in one call.
 
 ```yaml
+# In agent definition (agent-level, not executor-dependent)
 tools:
   intaris_mcp_servers: ["github", "slack"]
 ```
 
-Available Intaris MCP servers are auto-discovered via `GET /api/v1/mcp/servers`
-on Intaris. The agent form shows a multi-select dropdown of discovered servers.
+Available Intaris MCP servers are auto-discovered via ``GET /api/v1/mcp/servers``
+on Intaris.  The agent form shows a multi-select dropdown of discovered servers.
 Server configuration (credentials, endpoints) is managed on the Intaris side.
 
-Flow: Controller calls Intaris `POST /api/v1/mcp/call` → Intaris evaluates +
-proxies to remote MCP server → result back to Controller. Executor not
+Flow: Controller calls Intaris ``POST /api/v1/mcp/call`` → Intaris evaluates +
+proxies to remote MCP server → result back to Controller.  Executor not
 involved.
 
-### Tool Discovery
+Intaris MCP tools are resolved at session setup and injected into the tool
+registry alongside executor-provided tools.  They are included in the
+effective-tools API response and the tool exposure layer.
 
-At session setup, the controller merges tools from all sources:
+### Tool Discovery and Inventory Assembly
+
+At session setup, the controller assembles the **full effective inventory**
+from all sources.  This is the internal source of truth — the LLM does NOT
+see all of these directly.
 
 ```python
-available_tools = (
+full_effective_inventory = (
     executor_native_tools           # Always available (opt-out per agent)
     + builtin_orchestration_tools   # delegate, spawn_worker, fork
-    + builtin_system_tools          # list_agents, get_status
-    + local_mcp_tools(from executor capabilities)
-    + intaris_mcp_tools(from Intaris /mcp/tools)
-    + skill_tools(from active skills)
+    + builtin_system_tools          # list_agents, get_status, search_tools
+    + builtin_memory_tools          # memory_search, memory_add, etc.
+    + builtin_workflow_tools        # step_complete, step_todo_write, etc.
+    + web_tools                     # web_fetch, web_search (from executor)
+    + local_mcp_tools               # From executor's assigned MCP servers
+    + intaris_mcp_tools             # From Intaris /mcp/tools (agent-assigned)
+    + skill_tools                   # From active skills
 )
 ```
 
-The LLM sees a flat list. It doesn't know where tools execute.
+The **tool exposure layer** then derives the model-facing tool set:
+
+```python
+model_facing_tools = tool_exposure.prepare(
+    full_inventory=full_effective_inventory,
+    provider=resolved_provider,
+    model=resolved_model,
+)
+# Returns: core tools (always loaded) + deferred tools (provider-specific)
+```
+
+The LLM sees a flat list of core tools.  It can discover deferred tools via
+provider-native tool search or the generic ``search_tools`` builtin.  See
+the "Tool Exposure Architecture" section for details.
 
 ## Tool Permission Evaluation
 
@@ -548,18 +594,51 @@ destructive operations.
 
 ### MCP Tool Naming
 
-Local MCP tools are namespaced: `{server_name}/{tool_name}`. Permission
-matching supports both exact names and glob patterns:
+MCP tool names must be safe for all LLM providers.  OpenAI requires tool
+names to match ``^[a-zA-Z0-9_-]+$`` — no slashes, dots, or spaces.
+
+**Model-visible name format:**
+
+| Source | Internal routing | Model-visible name |
+|--------|------------------|--------------------|
+| Executor-native | ``ToolSource(type="executor")`` | ``read``, ``bash``, ``glob`` |
+| Local MCP | ``ToolSource(type="local_mcp", server_name="postgres", raw_tool_name="query")`` | ``mcp_postgres__query`` |
+| Intaris MCP | ``ToolSource(type="intaris_mcp", server_name="github", raw_tool_name="create_issue")`` | ``mcp_github__create_issue`` |
+
+**Sanitization rules:**
+
+- Replace ``/`` with ``__`` (double underscore)
+- Replace any character not in ``[a-zA-Z0-9_-]`` with ``_``
+- Prefix MCP tools with ``mcp_``
+- Store original server name and tool name in ``ToolSource.server_name``
+  and ``ToolSource.raw_tool_name`` for dispatch
+
+**Dispatch uses source metadata, not name parsing:**
+
+```python
+# Old (broken for OpenAI):
+_, raw_tool_name = tool_call.name.split("/", 1)
+
+# New (provider-safe):
+server_name = registered_tool.definition.source.server_name
+raw_tool_name = registered_tool.definition.source.raw_tool_name
+```
+
+**Stable tool IDs** for permission matching and UI:
+
+- Builtin/native: ``builtin:<tool_name>``
+- MCP: ``mcp:<server_id>:<raw_tool_name>``
+
+Permission matching supports both stable IDs and plain names:
 
 ```yaml
 permissions:
   tool_permissions:
-    "*": "evaluate"                    # Default
-    "read": "allow"                    # Executor-native read
-    "glob": "allow"                    # Executor-native glob
-    "grep": "allow"                    # Executor-native grep
-    "postgres/query": "evaluate"       # MCP tool
-    "bash": "evaluate"                 # Always evaluate
+    "*": "evaluate"                              # Default
+    "read": "allow"                              # Executor-native read
+    "builtin:glob": "allow"                      # Stable ID form
+    "mcp_postgres__query": "evaluate"            # Model-visible name
+    "mcp:mcp_postgres:query": "evaluate"         # Stable ID form
 ```
 
 ## Tool Router
@@ -586,7 +665,7 @@ class ToolRouter:
             return await self.guardrails.call_mcp_tool(
                 session_id=session.intaris_session_id,
                 server_name=tool.source.server_name,
-                tool_name=tool_call.name.split("/", 1)[1],
+                tool_name=tool.source.raw_tool_name,  # Use metadata, not name parsing
                 arguments=tool_call.arguments,
             )
 
@@ -604,6 +683,247 @@ class ToolRouter:
                 return await executor.tool_execute(tool_call)
             return ToolResult(denied=True, reasoning="User denied")
 ```
+
+## Tool Exposure Architecture
+
+### Problem: Large Tool Inventories
+
+Agents may have access to many tools from multiple sources (executor-native,
+MCP, Intaris MCP, skills).  Sending all tool schemas to the LLM on every
+request creates three problems:
+
+1. **Provider limits** — OpenAI enforces a hard cap of 128 tools per request.
+2. **Token cost** — 50+ tools can consume 10K-55K+ tokens before the
+   conversation even starts.  Anthropic has measured 134K tokens for tool
+   definitions alone in real deployments.
+3. **Accuracy degradation** — models make worse tool selections with large,
+   similar-looking tool sets.  Anthropic's testing showed accuracy improving
+   from 49% to 74% (Opus 4) when using deferred loading instead of
+   loading all tools upfront.
+
+### Solution: Two-Tier Tool Exposure
+
+The full effective tool inventory is the internal source of truth.  A
+separate **tool exposure layer** derives the model-facing tool set before
+each LLM call.
+
+```
+┌─────────────────────────────────────────────────────┐
+│  Full Effective Inventory (internal)                  │
+│  - All tools from all sources                        │
+│  - Stable internal IDs                               │
+│  - Used for: effective-tools API, agent editor,      │
+│    permission resolution, runtime dispatch            │
+│  - NOT sent to the model directly                    │
+└──────────────────────┬──────────────────────────────┘
+                       │
+          ┌────────────┴────────────┐
+          │                         │
+┌─────────▼──────────┐  ┌──────────▼──────────────────┐
+│  Core Tools         │  │  Deferred / Discoverable    │
+│  (always loaded)    │  │  Tools                      │
+│                     │  │                             │
+│  - memory           │  │  - Executor MCP tools       │
+│  - orchestration    │  │  - Intaris MCP tools        │
+│  - step/task/wf     │  │  - Overflow tools           │
+│  - filesystem       │  │  - Low-frequency tools      │
+│  - shell            │  │                             │
+│  - web              │  │  Loaded on demand via       │
+│  - system/image     │  │  provider-specific mechanism │
+│                     │  │  or generic tool search      │
+│  Stable across      │  │                             │
+│  turns → cached     │  │  Does NOT break cache       │
+└─────────────────────┘  └─────────────────────────────┘
+```
+
+### Provider-Specific Mechanisms
+
+Each LLM provider has a different optimal approach for handling deferred
+tools while preserving prompt caching:
+
+#### OpenAI
+
+**For gpt-5.4+ models (Responses API):**
+
+- Use ``tool_search`` — the model dynamically searches for and loads tools
+  into context as needed.
+- Deferred tools are marked with ``defer_loading: true``.
+- Discovered tools are injected **at the end of the context window**,
+  preserving the cached prefix.
+- OpenAI reports 47% token reduction on benchmarks with tool search enabled.
+
+**For older models (Chat Completions API):**
+
+- Hard limit of **128 tools** per request.
+- Use ``allowed_tools`` in ``tool_choice`` to restrict which tools the model
+  can call **without changing the ``tools`` array**:
+
+  ```python
+  tool_choice = {
+      "type": "allowed_tools",
+      "mode": "auto",
+      "tools": [
+          {"type": "function", "name": "read"},
+          {"type": "function", "name": "bash"},
+          # ... only core tools listed here
+      ]
+  }
+  ```
+
+  The full toolkit stays in the cached prefix; per-turn restrictions live
+  in request metadata only.  Cache is preserved.
+
+- If total tools exceed 128, use a generic controller-side tool search
+  fallback (see below).
+
+#### Anthropic Claude
+
+- Use ``defer_loading: true`` on MCP/overflow tools.
+- Include a **Tool Search Tool** (regex or BM25 variant) in the tools array.
+- Deferred tools are excluded from the system-prompt prefix entirely.
+- When Claude discovers a deferred tool through search, the definition is
+  appended inline as a ``tool_reference`` block in conversation history.
+- **The prefix is untouched, so prompt caching is preserved.**
+- Anthropic reports 85% token reduction and significant accuracy improvements.
+- LiteLLM supports ``defer_loading`` for Anthropic via the
+  ``tool-search-tool-2025-10-19`` beta header.
+
+**Cache breakpoints for tools:**
+
+Place ``cache_control: {"type": "ephemeral"}`` on the last tool in the
+``tools`` array.  This caches the entire tool-definitions prefix.  Anthropic
+supports up to 4 cache breakpoints; Cognis should use at least 2:
+
+1. Last tool definition (caches all tools)
+2. Last immutable system message (caches system prompt + memory instructions)
+
+Cache hierarchy: ``tools → system → messages``.  A change at one level
+invalidates that level and everything after it.
+
+#### Google Gemini
+
+- Supports **context caching** (explicit and implicit).
+- Minimum cacheable content: 1024-4096 tokens depending on model.
+- No equivalent of ``defer_loading`` or ``tool_search``.
+- Use the generic controller-side tool search fallback for large inventories.
+
+#### Other Providers
+
+- Use the generic controller-side tool search fallback.
+- Keep core tools in the ``tools`` array.
+- Add a ``search_tools`` builtin tool for discovering overflow tools.
+
+### Generic Tool Search Fallback
+
+For providers without native tool search (or as a universal fallback), Cognis
+provides a controller-side ``search_tools`` builtin tool:
+
+```python
+search_tools = ToolDefinition(
+    name="search_tools",
+    description=(
+        "Search for additional tools available in this session. "
+        "Use when you need a capability not in your current tool set. "
+        "Returns matching tool names and descriptions."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Natural language search query"
+            },
+            "category": {
+                "type": "string",
+                "description": "Filter by tool category (e.g. 'mcp', 'filesystem')"
+            },
+        },
+        "required": ["query"],
+    },
+    source=ToolSource(type="builtin"),
+    category="system",
+    read_only=True,
+)
+```
+
+The handler searches the full effective inventory (including deferred tools)
+and returns matching tool definitions.  The agent loop then injects discovered
+tools into the next turn's ``tools`` array.
+
+### Tool Exposure Flow
+
+```
+1. Build full effective inventory (all sources, all tools)
+
+2. Classify tools:
+   - Core: builtin, executor-native, web → always loaded
+   - Deferred: MCP, Intaris MCP, overflow → loaded on demand
+
+3. Detect provider capabilities:
+   - OpenAI gpt-5.4+: use Responses API tool_search
+   - Anthropic: use defer_loading + Tool Search Tool
+   - OpenAI older: use allowed_tools + generic fallback
+   - Other: use generic search_tools fallback
+
+4. Build model-facing tool set:
+   - Sanitize all names for provider compatibility
+   - Apply provider-specific deferred loading flags
+   - Build alias map (model-visible name → internal identity)
+   - Apply cache hints (tool-level cache_control for Anthropic)
+
+5. On tool call from model:
+   - Reverse-map model-visible name to internal identity
+   - Dispatch via ToolRouter using internal identity + source metadata
+
+6. On search_tools call:
+   - Search full effective inventory
+   - Return matching tool schemas
+   - Inject discovered tools into next turn
+```
+
+### Prompt Caching Strategy
+
+Prompt caching is critical for cost efficiency.  The architecture must
+preserve cache hits across turns within a session.
+
+**Current provider caching behavior:**
+
+| Provider | Mechanism | Granularity | Tool caching |
+|----------|-----------|-------------|--------------|
+| OpenAI | Automatic prefix matching | 128-token increments from 1024+ | Tools are part of cacheable prefix |
+| Anthropic | Explicit ``cache_control`` breakpoints (up to 4) | Per-block | Tools cacheable with ``cache_control`` |
+| Gemini | Implicit + explicit context caching | 1024-4096 token minimum | Part of cached content |
+
+**Cache-preserving design rules:**
+
+1. **Keep the ``tools`` array stable across turns.**  Do not add/remove tools
+   between turns within a session.  Use ``allowed_tools`` (OpenAI) or
+   ``defer_loading`` (Anthropic) to vary visibility without changing the array.
+
+2. **Place static content first.**  Order: tools → system prompt → memory
+   instructions → core memories → compaction summary → history → user message.
+
+3. **Use multiple cache breakpoints for Anthropic.**  Mark the last tool
+   definition and the last immutable system message with ``cache_control``.
+
+4. **Use ``prompt_cache_key`` for OpenAI** when available, to improve routing
+   stickiness across requests with shared prefixes.
+
+5. **Deferred tools do not break cache.**  On both OpenAI (tool_search) and
+   Anthropic (defer_loading), discovered tools are injected at the end of
+   context or inline in conversation, not in the cached prefix.
+
+6. **The generic ``search_tools`` fallback may break cache** if it injects
+   new tools into the ``tools`` array on subsequent turns.  Mitigate by
+   keeping injected tools in a separate "discovered" section at the end of
+   the array, and using ``allowed_tools`` to restrict without array changes.
+
+**Token budget accounting:**
+
+Tool schemas consume tokens from the static budget.  The ``ContextAssembler``
+must account for tool schema tokens when computing the dynamic budget for
+messages and memory.  Core tools are a fixed cost; deferred tools are zero
+cost until discovered.
 
 ## Skill System
 
@@ -667,15 +987,28 @@ skills/
 ## Complete Tool Call Flow
 
 ```
+0. Tool exposure layer prepares model-facing tool set:
+   - Assemble full effective inventory
+   - Classify into core (always loaded) and deferred (discoverable)
+   - Apply provider-specific mechanisms (tool_search, defer_loading, allowed_tools)
+   - Sanitize names for provider compatibility
+   - Build alias map (model-visible name → internal identity)
+
 1. LLM generates tool_call(name, arguments)
+
+1a. Reverse-map model-visible name to internal identity via alias map
 
 2. Tool Router categorizes:
    a. Orchestration → handle as session op (step 2a)
-   b. Intaris MCP → Intaris proxy (step 2b)
-   c. Executor-native or Local MCP → evaluate and dispatch (steps 3-6)
+   b. search_tools → search full inventory, return matches (step 2b)
+   c. Intaris MCP → Intaris proxy (step 2c)
+   d. Executor-native or Local MCP → evaluate and dispatch (steps 3-6)
 
    2a. Decision Engine approves/modifies → create session, start agent loop
-   2b. Intaris evaluates + executes → return result to LLM
+   2b. Controller searches effective inventory → returns tool schemas to LLM
+       → LLM may call discovered tools on next turn
+   2c. Intaris evaluates + executes → return result to LLM
+       (uses source.server_name + source.raw_tool_name for dispatch)
 
 3. Permission evaluation:
    a. Non-bypassable → always Intaris

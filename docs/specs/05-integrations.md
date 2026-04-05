@@ -742,6 +742,11 @@ class ModelInfo(BaseModel):
     # Model tier for dynamic routing
     tier: str = "standard"               # "nano", "mini", "standard", "large", "reasoning"
 
+    # Tool exposure capabilities (used by tool exposure layer)
+    supports_tool_search: bool = False   # OpenAI tool_search (gpt-5.4+)
+    supports_defer_loading: bool = False # Anthropic defer_loading
+    max_tools: int | None = None         # Hard tool count limit (128 for OpenAI)
+
 
 class OAuthProviderConfig(BaseModel):
     """OAuth 2.0 configuration for providers like ChatGPT subscription."""
@@ -829,6 +834,49 @@ class InferenceRouter:
     # Streams llm.chunk / llm.done back to the agent loop
     ...
 ```
+
+### Prompt Caching
+
+Prompt caching reduces latency (up to 80%) and input token costs (up to 90%)
+by reusing previously computed prompt prefixes.  Cognis must structure every
+LLM request to maximize cache hits.
+
+**Provider caching mechanisms:**
+
+| Provider | Type | Min tokens | TTL | Control |
+|----------|------|-----------|-----|---------|
+| OpenAI | Automatic prefix | 1024 | 5-10 min (up to 1h off-peak) | ``prompt_cache_key`` for routing |
+| Anthropic | Explicit breakpoints | 1024-2048 | 5 min (refreshed on hit) | ``cache_control`` (up to 4 breakpoints) |
+| Gemini | Implicit + explicit | 1024-4096 | Configurable TTL | ``cache_control`` or ``cachedContents`` API |
+
+**What Cognis caches (ordered by stability):**
+
+1. **Tool definitions** — stable across turns within a session.  For Anthropic,
+   mark the last tool with ``cache_control: {"type": "ephemeral"}``.
+2. **System prompt** — stable across the entire session.
+3. **Memory instructions + core memories** — stable within the session cache
+   TTL (30 min refresh).
+4. **Compaction summary** — stable after compaction until next compaction.
+5. **Conversation history** — grows each turn (only the prefix is cacheable).
+
+**Implementation in Cognis:**
+
+- ``_apply_cache_hints()`` in ``LiteLLMProvider`` marks Anthropic messages
+  with ``cache_control``.  It should also mark the last tool definition.
+- For OpenAI, automatic prefix caching works without code changes as long as
+  the ``tools`` array and message prefix remain stable.
+- Tool schemas are part of the static token budget in ``ContextAssembler``.
+- The tool exposure layer (see 06-tool-system.md) ensures the ``tools`` array
+  is stable across turns by using ``allowed_tools`` / ``defer_loading``
+  instead of adding/removing tools.
+
+**Cost impact:**
+
+- Cached input tokens cost 50% less on OpenAI, 90% less on Anthropic.
+- Cache writes cost 25% more on Anthropic (amortized after 2+ hits).
+- A typical agent session with 30+ tools and a long system prompt benefits
+  significantly from caching — the static prefix (tools + system + memory)
+  can be 10K-50K tokens that are cached on every turn.
 
 ### Provider Configuration Examples
 
