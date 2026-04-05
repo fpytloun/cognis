@@ -7,6 +7,12 @@ from typing import Any
 
 import litellm
 
+from cognis.providers.llm.responses_bridge import (
+    messages_to_responses_input,
+    responses_stream_to_chat_chunks,
+    responses_to_chat_response,
+)
+
 
 class InferenceHandler:
     """Proxy LLM requests from the controller through LiteLLM.
@@ -31,40 +37,81 @@ class InferenceHandler:
         request_kwargs: dict[str, Any],
     ) -> AsyncIterator[dict[str, Any]]:
         """Stream a completion through LiteLLM using controller-provided args."""
+        request_kwargs = dict(request_kwargs)
+        llm_api = str(request_kwargs.pop("cognis_llm_api", "chat_completions"))
         usage: dict[str, Any] = {}
         finish_reason = "stop"
         index = 0
 
         try:
-            stream = await litellm.acompletion(
-                model=model,
-                messages=messages,
-                stream=True,
-                **request_kwargs,
-            )
-            async for chunk in stream:
-                payload = dict(chunk)
-                if payload.get("usage"):
-                    usage = payload["usage"]
-                choices = payload.get("choices") or []
-                if not choices:
-                    continue
-                choice = choices[0]
-                delta = choice.get("delta") or {}
-                if choice.get("finish_reason"):
-                    finish_reason = choice["finish_reason"]
-                content = delta.get("content")
-                tool_calls = delta.get("tool_calls")
-                reasoning_content = delta.get("reasoning_content")
-                if content is None and tool_calls is None and reasoning_content is None:
-                    continue
-                yield {
-                    "content": content,
-                    "tool_calls": tool_calls,
-                    "reasoning_content": reasoning_content,
-                    "index": index,
-                }
-                index += 1
+            if llm_api == "responses":
+                request_kwargs = _responses_request_kwargs(request_kwargs)
+                stream = await litellm.aresponses(
+                    model=model,
+                    input=messages_to_responses_input(messages),
+                    stream=True,
+                    **request_kwargs,
+                )
+                async for chunk in responses_stream_to_chat_chunks(stream):
+                    payload = dict(chunk)
+                    if payload.get("mid_stream_failure") or payload.get("error"):
+                        yield {
+                            "done": True,
+                            "error": str(payload.get("error") or "Responses stream failed"),
+                            "finish_reason": "error",
+                        }
+                        return
+                    if payload.get("usage"):
+                        usage = payload["usage"]
+                    choices = payload.get("choices") or []
+                    if not choices:
+                        continue
+                    choice = choices[0]
+                    delta = choice.get("delta") or {}
+                    if choice.get("finish_reason"):
+                        finish_reason = choice["finish_reason"]
+                    content = delta.get("content")
+                    tool_calls = delta.get("tool_calls")
+                    reasoning_content = delta.get("reasoning_content")
+                    if content is None and tool_calls is None and reasoning_content is None:
+                        continue
+                    yield {
+                        "content": content,
+                        "tool_calls": tool_calls,
+                        "reasoning_content": reasoning_content,
+                        "index": index,
+                    }
+                    index += 1
+            else:
+                stream = await litellm.acompletion(
+                    model=model,
+                    messages=messages,
+                    stream=True,
+                    **request_kwargs,
+                )
+                async for chunk in stream:
+                    payload = dict(chunk)
+                    if payload.get("usage"):
+                        usage = payload["usage"]
+                    choices = payload.get("choices") or []
+                    if not choices:
+                        continue
+                    choice = choices[0]
+                    delta = choice.get("delta") or {}
+                    if choice.get("finish_reason"):
+                        finish_reason = choice["finish_reason"]
+                    content = delta.get("content")
+                    tool_calls = delta.get("tool_calls")
+                    reasoning_content = delta.get("reasoning_content")
+                    if content is None and tool_calls is None and reasoning_content is None:
+                        continue
+                    yield {
+                        "content": content,
+                        "tool_calls": tool_calls,
+                        "reasoning_content": reasoning_content,
+                        "index": index,
+                    }
+                    index += 1
         except Exception as exc:
             yield {
                 "done": True,
@@ -83,13 +130,24 @@ class InferenceHandler:
         request_kwargs: dict[str, Any],
     ) -> dict[str, Any]:
         """Run a non-streaming completion through LiteLLM."""
+        request_kwargs = dict(request_kwargs)
+        llm_api = str(request_kwargs.pop("cognis_llm_api", "chat_completions"))
+        if llm_api == "responses":
+            response = await litellm.aresponses(
+                model=model,
+                input=messages_to_responses_input(messages),
+                stream=False,
+                **_responses_request_kwargs(request_kwargs),
+            )
+            return responses_to_chat_response(response.model_dump())
         response = await litellm.acompletion(
             model=model,
             messages=messages,
             stream=False,
             **request_kwargs,
         )
-        return response.model_dump()
+        dumped = response.model_dump()
+        return dumped if isinstance(dumped, dict) else {}
 
     async def image_generate(
         self,
@@ -112,7 +170,6 @@ class InferenceHandler:
             gen_kwargs["api_base"] = request_kwargs["api_base"]
 
         if strategy == "acompletion_modalities":
-            # Gemini path
             content: list[dict[str, Any]] | str
             if image is not None:
                 content = [
@@ -130,16 +187,31 @@ class InferenceHandler:
                 n=n,
                 **gen_kwargs,
             )
-            return response.model_dump()
-        else:
-            # OpenAI path
-            response = await litellm.aimage_generation(
-                prompt=prompt,
-                model=model,
-                n=n,
-                size=size,
-                quality=quality,
-                response_format=response_format,
-                **gen_kwargs,
-            )
-            return response.model_dump()
+            dumped = response.model_dump()
+            return dumped if isinstance(dumped, dict) else {}
+
+        response = await litellm.aimage_generation(
+            prompt=prompt,
+            model=model,
+            n=n,
+            size=size,
+            quality=quality,
+            response_format=response_format,
+            **gen_kwargs,
+        )
+        dumped = response.model_dump()
+        return dumped if isinstance(dumped, dict) else {}
+
+
+def _responses_request_kwargs(request_kwargs: dict[str, Any]) -> dict[str, Any]:
+    filtered = dict(request_kwargs)
+    response_format = filtered.pop("response_format", None)
+    if response_format is not None and "text" not in filtered and "text_format" not in filtered:
+        filtered["text"] = {
+            "format": response_format
+            if isinstance(response_format, dict)
+            else {"type": str(response_format)}
+        }
+    if "max_tokens" in filtered and "max_output_tokens" not in filtered:
+        filtered["max_output_tokens"] = filtered.pop("max_tokens")
+    return filtered

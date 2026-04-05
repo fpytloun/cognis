@@ -130,6 +130,32 @@ async def test_litellm_provider_infers_anthropic_capabilities(tmp_path: object) 
 
 
 @pytest.mark.asyncio
+async def test_litellm_provider_infers_openai_responses_capabilities_for_proxy_model(
+    tmp_path: object,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="proxy",
+                display_name="LiteLLM Proxy",
+                location="controller",
+                backend="litellm",
+                config={"preset": "litellm_proxy", "default_model": "gpt-5.4"},
+                status="active",
+            )
+        )
+        await session.commit()
+
+    provider = LiteLLMProvider(session_factory)
+    model_info = await provider.get_model_info("gpt-5.4")
+
+    assert model_info.supports_responses_api is True
+    assert model_info.supports_tool_search is True
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_litellm_provider_returns_default_model_info_when_missing(tmp_path: object) -> None:
     engine, session_factory = await _session_factory(tmp_path)
     provider = LiteLLMProvider(session_factory)
@@ -270,6 +296,165 @@ async def test_litellm_provider_merges_extra_headers(tmp_path: object) -> None:
         "x-provider": "configured",
         "anthropic-beta": "tool-search-tool-2025-10-19",
     }
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_litellm_provider_generate_uses_responses_bridge_for_supported_model(
+    tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="proxy",
+                display_name="LiteLLM Proxy",
+                location="controller",
+                backend="litellm",
+                config={"preset": "litellm_proxy", "default_model": "gpt-5.4"},
+                status="active",
+            )
+        )
+        await session.commit()
+
+    captured: dict[str, object] = {}
+
+    class _Response:
+        def model_dump(self) -> dict[str, object]:
+            return {
+                "status": "completed",
+                "output": [
+                    {"type": "message", "content": [{"type": "output_text", "text": "hello"}]}
+                ],
+                "usage": {"total_tokens": 3},
+            }
+
+    async def _fake_aresponses(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return _Response()
+
+    monkeypatch.setenv("COGNIS_OPENAI_RESPONSES_MODE", "on")
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.aresponses", _fake_aresponses)
+
+    provider = LiteLLMProvider(session_factory)
+    result = await provider.generate(
+        messages=[{"role": "user", "content": "hi"}],
+        model="gpt-5.4",
+        max_tokens=123,
+    )
+
+    assert captured["input"] == [{"role": "user", "content": "hi"}]
+    assert captured["max_output_tokens"] == 123
+    assert result["choices"][0]["message"]["content"] == "hello"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_litellm_provider_stream_generate_normalizes_responses_events(
+    tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="proxy",
+                display_name="LiteLLM Proxy",
+                location="controller",
+                backend="litellm",
+                config={"preset": "litellm_proxy", "default_model": "gpt-5.4"},
+                status="active",
+            )
+        )
+        await session.commit()
+
+    async def _fake_stream() -> object:
+        yield {"type": "response.output_text.delta", "delta": "Hello"}
+        yield {
+            "type": "response.output_item.added",
+            "item": {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "search_tools",
+            },
+        }
+        yield {
+            "type": "response.function_call_arguments.delta",
+            "item_id": "fc_1",
+            "delta": '{"query":"docs"}',
+        }
+        yield {
+            "type": "response.completed",
+            "response": {"status": "completed", "usage": {"total_tokens": 7}},
+        }
+
+    async def _fake_aresponses(**_: object) -> object:
+        return _fake_stream()
+
+    monkeypatch.setenv("COGNIS_OPENAI_RESPONSES_MODE", "on")
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.aresponses", _fake_aresponses)
+
+    provider = LiteLLMProvider(session_factory)
+    chunks = [
+        chunk
+        async for chunk in provider.stream_generate(
+            messages=[{"role": "user", "content": "hi"}],
+            model="gpt-5.4",
+        )
+    ]
+
+    assert chunks[0]["choices"][0]["delta"]["content"] == "Hello"
+    assert chunks[1]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"] == "search_tools"
+    assert (
+        chunks[2]["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"]
+        == '{"query":"docs"}'
+    )
+    assert chunks[-1]["usage"]["total_tokens"] == 7
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_litellm_provider_responses_bridge_maps_response_format_to_text_format(
+    tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="proxy",
+                display_name="LiteLLM Proxy",
+                location="controller",
+                backend="litellm",
+                config={"preset": "litellm_proxy", "default_model": "gpt-5.4"},
+                status="active",
+            )
+        )
+        await session.commit()
+
+    captured: dict[str, object] = {}
+
+    class _Response:
+        def model_dump(self) -> dict[str, object]:
+            return {"status": "completed", "output": []}
+
+    async def _fake_aresponses(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return _Response()
+
+    monkeypatch.setenv("COGNIS_OPENAI_RESPONSES_MODE", "on")
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.aresponses", _fake_aresponses)
+
+    provider = LiteLLMProvider(session_factory)
+    await provider.generate(
+        messages=[{"role": "user", "content": "hi"}],
+        model="gpt-5.4",
+        response_format={"type": "json_object"},
+    )
+
+    assert captured["text"] == {"format": {"type": "json_object"}}
     await engine.dispose()
 
 

@@ -107,3 +107,68 @@ def test_prepare_tool_exposure_dedupes_visible_names() -> None:
 
     visible_names = [tool["function"]["name"] for tool in result.tools]
     assert len(visible_names) == len(set(visible_names))
+
+
+def test_prepare_tool_exposure_uses_openai_responses_full_inventory() -> None:
+    mcp_tool = ToolDefinition(
+        name=sanitize_mcp_tool_name("github", "search/issues"),
+        description="search",
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(type="intaris_mcp", server_name="github", raw_tool_name="search/issues"),
+        category="mcp",
+    )
+    inventory = [
+        _tool("read", source_type="executor", category="filesystem"),
+        mcp_tool,
+    ]
+
+    result = prepare_tool_exposure(
+        inventory_tools=inventory,
+        controller_tool_schemas=[],
+        model="gpt-5.4",
+        model_info=ModelInfo(
+            model_id="gpt-5.4",
+            supports_tool_search=True,
+            supports_responses_api=True,
+            max_tools=128,
+        ),
+        discovered_tool_ids=set(),
+    )
+
+    tool_names = [tool["function"]["name"] for tool in result.tools]
+    assert result.debug_metadata["strategy"] == "openai_responses_full_inventory"
+    assert "search_tools" not in tool_names
+    assert sanitize_mcp_tool_name("github", "search/issues") in tool_names
+    assert result.request_kwargs["parallel_tool_calls"] is True
+
+
+def test_prepare_tool_exposure_respects_responses_rollout_off(monkeypatch) -> None:
+    monkeypatch.setenv("COGNIS_OPENAI_RESPONSES_MODE", "off")
+    mcp_tool = ToolDefinition(
+        name=sanitize_mcp_tool_name("github", "search/issues"),
+        description="search",
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(type="intaris_mcp", server_name="github", raw_tool_name="search/issues"),
+        category="mcp",
+    )
+    controller_search_schema = {
+        "type": "function",
+        "function": {
+            "name": SEARCH_TOOLS_TOOL.name,
+            "description": SEARCH_TOOLS_TOOL.description,
+            "parameters": SEARCH_TOOLS_TOOL.parameters,
+        },
+    }
+
+    result = prepare_tool_exposure(
+        inventory_tools=[_tool("read", source_type="executor", category="filesystem"), mcp_tool],
+        controller_tool_schemas=[controller_search_schema],
+        model="gpt-5.4",
+        model_info=ModelInfo(
+            model_id="gpt-5.4", supports_tool_search=True, supports_responses_api=True, max_tools=3
+        ),
+        discovered_tool_ids={stable_tool_id(mcp_tool)},
+    )
+
+    assert result.debug_metadata["strategy"] == "generic_search_tools"
+    assert any(tool["function"]["name"] == "search_tools" for tool in result.tools)

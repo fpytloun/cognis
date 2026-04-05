@@ -73,3 +73,133 @@ async def test_generate_returns_model_dump(monkeypatch: pytest.MonkeyPatch) -> N
         request_kwargs={},
     )
     assert result["choices"][0]["message"]["content"] == "hello"
+
+
+@pytest.mark.asyncio
+async def test_stream_complete_normalizes_responses_events(monkeypatch: pytest.MonkeyPatch) -> None:
+    handler = InferenceHandler()
+
+    async def fake_stream():
+        yield {"type": "response.output_text.delta", "delta": "Hello"}
+        yield {
+            "type": "response.output_item.added",
+            "item": {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "search_tools",
+            },
+        }
+        yield {
+            "type": "response.function_call_arguments.delta",
+            "item_id": "fc_1",
+            "delta": '{"query":"docs"}',
+        }
+        yield {
+            "type": "response.completed",
+            "response": {"status": "completed", "usage": {"total_tokens": 8}},
+        }
+
+    async def fake_aresponses(**_: object):
+        return fake_stream()
+
+    monkeypatch.setattr("cognis.executor.inference.litellm.aresponses", fake_aresponses)
+
+    chunks = [
+        chunk
+        async for chunk in handler.stream_complete(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "hi"}],
+            request_kwargs={"cognis_llm_api": "responses"},
+        )
+    ]
+
+    assert chunks[0]["content"] == "Hello"
+    assert chunks[1]["tool_calls"][0]["function"]["name"] == "search_tools"
+    assert chunks[2]["tool_calls"][0]["function"]["arguments"] == '{"query":"docs"}'
+    assert chunks[-1]["usage"]["total_tokens"] == 8
+
+
+@pytest.mark.asyncio
+async def test_generate_normalizes_responses_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+    handler = InferenceHandler()
+
+    class Response:
+        def model_dump(self) -> dict[str, object]:
+            return {
+                "status": "completed",
+                "output": [
+                    {"type": "message", "content": [{"type": "output_text", "text": "hello"}]},
+                    {
+                        "type": "function_call",
+                        "id": "fc_1",
+                        "call_id": "call_1",
+                        "name": "search_tools",
+                        "arguments": '{"query":"docs"}',
+                    },
+                ],
+            }
+
+    async def fake_aresponses(**_: object):
+        return Response()
+
+    monkeypatch.setattr("cognis.executor.inference.litellm.aresponses", fake_aresponses)
+
+    result = await handler.generate(
+        model="gpt-5.4",
+        messages=[{"role": "user", "content": "hi"}],
+        request_kwargs={"cognis_llm_api": "responses"},
+    )
+
+    assert result["choices"][0]["message"]["content"] == "hello"
+    assert result["choices"][0]["message"]["tool_calls"][0]["id"] == "call_1"
+
+
+@pytest.mark.asyncio
+async def test_stream_complete_returns_error_for_failed_responses_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handler = InferenceHandler()
+
+    async def fake_stream():
+        yield {"type": "response.failed", "error": {"message": "bridge failed"}}
+
+    async def fake_aresponses(**_: object):
+        return fake_stream()
+
+    monkeypatch.setattr("cognis.executor.inference.litellm.aresponses", fake_aresponses)
+
+    chunks = [
+        chunk
+        async for chunk in handler.stream_complete(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "hi"}],
+            request_kwargs={"cognis_llm_api": "responses"},
+        )
+    ]
+
+    assert chunks == [{"done": True, "error": "bridge failed", "finish_reason": "error"}]
+
+
+@pytest.mark.asyncio
+async def test_image_generate_method_still_available(monkeypatch: pytest.MonkeyPatch) -> None:
+    handler = InferenceHandler()
+
+    class _Response:
+        def model_dump(self) -> dict[str, object]:
+            return {"data": [{"b64_json": "abc"}]}
+
+    async def fake_aimage_generation(**_: object):
+        return _Response()
+
+    monkeypatch.setattr(
+        "cognis.executor.inference.litellm.aimage_generation", fake_aimage_generation
+    )
+
+    result = await handler.image_generate(
+        prompt="draw",
+        model="gpt-image-1",
+        request_kwargs={},
+    )
+
+    assert result["data"][0]["b64_json"] == "abc"

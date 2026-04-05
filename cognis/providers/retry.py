@@ -38,7 +38,7 @@ def compute_delay(attempt: int, base_delay: float, max_delay: float, jitter: boo
     """
     delay = min(base_delay * (2**attempt), max_delay)
     if jitter:
-        delay *= 0.75 + random.random() * 0.5  # noqa: S311
+        delay *= 0.75 + float(random.random()) * 0.5  # noqa: S311
     return delay
 
 

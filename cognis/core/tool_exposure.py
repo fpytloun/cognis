@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any
 
 from cognis.models.config import ModelInfo
 from cognis.models.tool import ToolDefinition, stable_tool_id
+from cognis.providers.llm.responses_bridge import should_use_openai_responses
 from cognis.tools.builtin.tool_search import SEARCH_TOOLS_TOOL
 
 _ANTHROPIC_MODEL_PATTERNS = re.compile(r"(claude|anthropic)", re.IGNORECASE)
@@ -55,6 +57,11 @@ def prepare_tool_exposure(
     use_anthropic_defer = bool(
         model_info.supports_defer_loading or _ANTHROPIC_MODEL_PATTERNS.search(model)
     )
+    use_openai_responses = should_use_openai_responses(
+        model=model,
+        model_info=model_info,
+        rollout_mode=os.getenv("COGNIS_OPENAI_RESPONSES_MODE", "auto").strip().lower(),
+    )
 
     if use_anthropic_defer:
         strategy = "anthropic_defer_loading"
@@ -67,6 +74,11 @@ def prepare_tool_exposure(
         if tool_schemas:
             tool_schemas[-1]["function"]["cache_control"] = {"type": "ephemeral"}
         request_kwargs = {"extra_headers": {"anthropic-beta": "tool-search-tool-2025-10-19"}}
+    elif use_openai_responses:
+        strategy = "openai_responses_full_inventory"
+        visible_tools = core_without_search + deferred_tools
+        tool_schemas = _build_inventory_schemas(visible_tools, alias_map)
+        request_kwargs = {"tool_choice": "auto", "parallel_tool_calls": True}
     else:
         strategy = "generic_search_tools"
         base_tools, overflowed = _select_generic_visible_tools(
@@ -79,8 +91,6 @@ def prepare_tool_exposure(
         visible_tools = base_tools
         tool_schemas = _build_inventory_schemas(visible_tools, alias_map)
         request_kwargs = {}
-        if model_info.supports_tool_search and model_info.supports_responses_api:
-            strategy = "generic_search_tools_gated_openai"
         if overflowed and tool_schemas and max_tools is not None:
             tool_schemas = tool_schemas[:available_slots]
 

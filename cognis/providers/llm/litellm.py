@@ -24,6 +24,13 @@ from cognis.models.config import (
     ProviderHealth,
     TokenUsage,
 )
+from cognis.providers.llm.responses_bridge import (
+    messages_to_responses_input,
+    normalize_openai_model_name,
+    responses_stream_to_chat_chunks,
+    responses_to_chat_response,
+    should_use_openai_responses,
+)
 from cognis.store.models import LLMProvider as LLMProviderRow
 from cognis.store.models import ModelRouting
 
@@ -117,6 +124,16 @@ def _merge_request_kwargs(
                 continue
         merged[key] = value
     return merged
+
+
+def _model_dump(value: Any) -> dict[str, Any]:
+    if hasattr(value, "model_dump"):
+        dumped = value.model_dump()
+        if isinstance(dumped, dict):
+            return dumped
+    if isinstance(value, dict):
+        return value
+    return {}
 
 
 class LiteLLMProvider:
@@ -284,7 +301,7 @@ class LiteLLMProvider:
     def _infer_model_capabilities(
         self, model_id: str, provider: LLMProviderRow | None
     ) -> dict[str, Any]:
-        model_name = self._apply_model_prefix(model_id, provider).lower()
+        model_name = normalize_openai_model_name(self._apply_model_prefix(model_id, provider))
         preset = (
             str(dict(provider.config).get("preset", "")).lower() if provider is not None else ""
         )
@@ -313,6 +330,21 @@ class LiteLLMProvider:
             "max_tools": 128 if is_openai_like else None,
         }
 
+    def _responses_rollout_mode(self) -> str:
+        value = os.getenv("COGNIS_OPENAI_RESPONSES_MODE", "auto").strip().lower()
+        if value in {"on", "off", "auto"}:
+            return value
+        return "auto"
+
+    def _should_use_responses_api(
+        self, model_id: str, model_info: ModelInfo, provider: LLMProviderRow | None
+    ) -> bool:
+        return should_use_openai_responses(
+            model=self._apply_model_prefix(model_id, provider),
+            model_info=model_info,
+            rollout_mode=self._responses_rollout_mode(),
+        )
+
     async def generate(
         self,
         messages: list[dict[str, Any]],
@@ -326,12 +358,17 @@ class LiteLLMProvider:
         resolved_model, provider = await self._resolve_model_target(model, task_type=task_type)
 
         prefixed_model = self._apply_model_prefix(resolved_model, provider)
+        model_info = await self.get_model_info(resolved_model)
         request_kwargs = _merge_request_kwargs(
             await self._resolve_provider_kwargs(provider), kwargs
         )
         prepared_messages = _apply_message_cache_hints(
             messages, resolved_model, cache_breakpoint_index
         )
+        use_responses_api = self._should_use_responses_api(resolved_model, model_info, provider)
+        if use_responses_api:
+            request_kwargs = dict(request_kwargs)
+            request_kwargs["cognis_llm_api"] = "responses"
         if self._should_route_to_executor(provider):
             return await self._executor_generate(
                 prefixed_model,
@@ -345,11 +382,22 @@ class LiteLLMProvider:
                 "extra_data": {
                     "model": prefixed_model,
                     "task_type": task_type,
+                    "llm_api": "responses" if use_responses_api else "chat_completions",
                     "tool_count": len(request_kwargs.get("tools") or []),
                     "extra_header_keys": sorted((request_kwargs.get("extra_headers") or {}).keys()),
                 }
             },
         )
+        if use_responses_api:
+            response = await with_llm_retry(
+                litellm.aresponses,
+                model=prefixed_model,
+                input=messages_to_responses_input(prepared_messages),
+                stream=False,
+                operation=f"generate.responses({prefixed_model})",
+                **self._responses_request_kwargs(request_kwargs),
+            )
+            return responses_to_chat_response(_model_dump(response))
         response = await with_llm_retry(
             litellm.acompletion,
             model=prefixed_model,
@@ -384,7 +432,7 @@ class LiteLLMProvider:
                     },
                 )
 
-        return response_dict
+        return cast(dict[str, Any], response_dict)
 
     async def stream_generate(
         self,
@@ -399,12 +447,17 @@ class LiteLLMProvider:
         resolved_model, provider = await self._resolve_model_target(model, task_type=task_type)
 
         prefixed_model = self._apply_model_prefix(resolved_model, provider)
+        model_info = await self.get_model_info(resolved_model)
         request_kwargs = _merge_request_kwargs(
             await self._resolve_provider_kwargs(provider), kwargs
         )
         prepared_messages = _apply_message_cache_hints(
             messages, resolved_model, cache_breakpoint_index
         )
+        use_responses_api = self._should_use_responses_api(resolved_model, model_info, provider)
+        if use_responses_api:
+            request_kwargs = dict(request_kwargs)
+            request_kwargs["cognis_llm_api"] = "responses"
         if self._should_route_to_executor(provider):
             async for chunk in self._executor_stream_generate(
                 prefixed_model,
@@ -420,11 +473,32 @@ class LiteLLMProvider:
                 "extra_data": {
                     "model": prefixed_model,
                     "task_type": task_type,
+                    "llm_api": "responses" if use_responses_api else "chat_completions",
                     "tool_count": len(request_kwargs.get("tools") or []),
                     "extra_header_keys": sorted((request_kwargs.get("extra_headers") or {}).keys()),
                 }
             },
         )
+        if use_responses_api:
+            stream = await with_llm_retry(
+                litellm.aresponses,
+                model=prefixed_model,
+                input=messages_to_responses_input(prepared_messages),
+                stream=True,
+                operation=f"stream_generate.responses({prefixed_model})",
+                **self._responses_request_kwargs(request_kwargs),
+            )
+            try:
+                async for chunk in responses_stream_to_chat_chunks(stream):
+                    yield chunk
+            except Exception as exc:
+                logger.warning(
+                    "LLM Responses stream failed mid-generation",
+                    extra={"extra_data": {"model": prefixed_model}},
+                    exc_info=True,
+                )
+                yield {"error": str(exc), "mid_stream_failure": True}
+            return
         # Retry pre-stream errors (connection refused, rate limit, etc.)
         # with exponential backoff.  Once the stream is established,
         # mid-stream failures are caught and yielded as error markers.
@@ -624,6 +698,8 @@ class LiteLLMProvider:
         try:
             test_messages = [{"role": "user", "content": "Say hello."}]
             if self._should_route_to_executor(provider):
+                if self._inference_router is None:
+                    raise RuntimeError("Inference router is not configured")
                 await self._inference_router.route_generate(
                     messages=test_messages,
                     model=prefixed_model,
@@ -774,7 +850,8 @@ class LiteLLMProvider:
             if self._secrets is None:
                 return None
             try:
-                return await self._secrets.get_secret(secret_name, "system", None)
+                value = await self._secrets.get_secret(secret_name, "system", None)
+                return str(value)
             except Exception:
                 logger.warning("Failed to read secret for LLM provider auth")
                 return None
@@ -883,12 +960,15 @@ class LiteLLMProvider:
         """Route a non-streaming request to executor-side inference."""
         config = provider.config if hasattr(provider, "config") else {}
         executor_labels = config.get("executor_labels") if isinstance(config, dict) else None
-        return await self._inference_router.route_generate(
+        if self._inference_router is None:
+            raise RuntimeError("Inference router is not configured")
+        result = await self._inference_router.route_generate(
             messages=messages,
             model=model,
             executor_labels=executor_labels,
             request_kwargs=request_kwargs,
         )
+        return cast(dict[str, Any], result)
 
     async def _executor_stream_generate(
         self,
@@ -901,6 +981,8 @@ class LiteLLMProvider:
         """Route a streaming request to executor-side inference."""
         config = provider.config if hasattr(provider, "config") else {}
         executor_labels = config.get("executor_labels") if isinstance(config, dict) else None
+        if self._inference_router is None:
+            raise RuntimeError("Inference router is not configured")
         async for chunk in self._inference_router.route_stream(
             messages=messages,
             model=model,
@@ -908,6 +990,20 @@ class LiteLLMProvider:
             request_kwargs=request_kwargs,
         ):
             yield chunk
+
+    def _responses_request_kwargs(self, request_kwargs: dict[str, Any]) -> dict[str, Any]:
+        filtered = dict(request_kwargs)
+        filtered.pop("cognis_llm_api", None)
+        response_format = filtered.pop("response_format", None)
+        if response_format is not None and "text" not in filtered and "text_format" not in filtered:
+            filtered["text"] = {
+                "format": response_format
+                if isinstance(response_format, dict)
+                else {"type": str(response_format)}
+            }
+        if "max_tokens" in filtered and "max_output_tokens" not in filtered:
+            filtered["max_output_tokens"] = filtered.pop("max_tokens")
+        return filtered
 
     # ------------------------------------------------------------------
     # Image generation (ImageGenerationProvider)
@@ -1213,7 +1309,9 @@ class LiteLLMProvider:
         """Route image generation to executor-side inference."""
         config = provider.config if hasattr(provider, "config") else {}
         executor_labels = config.get("executor_labels") if isinstance(config, dict) else None
-        return await self._inference_router.route_image_generate(
+        if self._inference_router is None:
+            raise RuntimeError("Inference router is not configured")
+        result = await self._inference_router.route_image_generate(
             prompt=prompt,
             model=model,
             strategy=strategy,
@@ -1225,3 +1323,4 @@ class LiteLLMProvider:
             image=image,
             request_kwargs=request_kwargs,
         )
+        return cast(ImageGenerationResult, result)

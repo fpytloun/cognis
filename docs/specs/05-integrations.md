@@ -782,13 +782,25 @@ class LiteLLMProvider:
         prefixed_model = self._apply_model_prefix(resolved_model, provider)
         request_kwargs = await self._resolve_provider_kwargs(provider)
 
-        # 3. Route based on location
+        # 3. Route based on location and transport
         if provider.location == "executor":
             # Route through matching remote executor (LiteLLM proxy)
             async for chunk in self._inference_router.route_stream(
                 messages=messages, model=prefixed_model,
                 executor_labels=provider.config.get("executor_labels"),
                 request_kwargs=request_kwargs,
+            ):
+                yield chunk
+        elif should_use_responses_api(prefixed_model, model_info):
+            # OpenAI Responses transport, normalized back into Cognis'
+            # canonical chat-like chunk shape before the agent loop sees it.
+            async for chunk in responses_stream_to_chat_chunks(
+                litellm.aresponses(
+                    model=prefixed_model,
+                    input=messages_to_responses_input(messages),
+                    stream=True,
+                    **request_kwargs,
+                )
             ):
                 yield chunk
         else:
@@ -869,9 +881,16 @@ LLM request to maximize cache hits.
   with ``cache_control``.  It should also mark the last tool definition.
 - For OpenAI, automatic prefix caching works without code changes as long as
   the ``tools`` array and message prefix remain stable.
+- Responses-capable OpenAI models use a provider-boundary bridge: Cognis keeps
+  its canonical assistant/tool transcript internally, translates requests into
+  Responses ``input`` at the edge, then normalizes Responses output back into
+  the existing chat-like chunk/result shape expected by the agent loop.
+- Rollout is controlled by ``COGNIS_OPENAI_RESPONSES_MODE`` with values
+  ``auto`` (default), ``on``, or ``off``.  ``auto`` enables the bridge only
+  for OpenAI-family models whose ``ModelInfo.supports_responses_api`` is true.
 - Tool schemas are part of the static token budget in ``ContextAssembler``.
 - The tool exposure layer (see 06-tool-system.md) ensures the ``tools`` array
-  is stable across turns by using ``allowed_tools`` / ``defer_loading``
+  is stable across turns by using provider-specific deferred-loading strategies
   instead of adding/removing tools.
 
 **Cost impact:**

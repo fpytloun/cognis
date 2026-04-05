@@ -129,7 +129,15 @@ Note: ``InferenceConfig`` is no longer used by the executor.  LLM inference
 configuration lives on the ``LLMProviderConfig`` (see 05-integrations.md).
 When a provider has ``location="executor"``, the controller sends the fully
 resolved model string and LiteLLM kwargs in each ``llm.complete`` call.  The
-executor runs ``litellm.acompletion()`` locally as a transparent proxy.
+executor runs the matching LiteLLM transport locally as a transparent proxy:
+
+- ``litellm.acompletion()`` for canonical chat-completions models
+- ``litellm.aresponses()`` for OpenAI Responses-capable models when the
+  controller-side rollout flag enables the bridge
+
+The executor normalizes all inference output back into Cognis' canonical
+chat-like chunk/result shape before it crosses the WebSocket boundary, so the
+controller and executor paths remain behaviorally aligned.
 
 ### Secret Lifecycle
 

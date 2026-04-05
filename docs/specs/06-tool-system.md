@@ -747,12 +747,20 @@ tools while preserving prompt caching:
 
 **For gpt-5.4+ models (Responses API):**
 
-- Use ``tool_search`` — the model dynamically searches for and loads tools
-  into context as needed.
-- Deferred tools are marked with ``defer_loading: true``.
-- Discovered tools are injected **at the end of the context window**,
-  preserving the cached prefix.
-- OpenAI reports 47% token reduction on benchmarks with tool search enabled.
+- Use the OpenAI Responses transport, but keep Cognis' internal transcript
+  canonical.  A provider-boundary bridge translates canonical chat/tool
+  messages into Responses ``input`` and normalizes Responses output back into
+  the existing assistant/tool-call delta shape used by the agent loop.
+- Responses-capable OpenAI models use a **stable full inventory** instead of
+  falling back to generic slot-based trimming.  This keeps same-turn tool
+  visibility aligned with the effective runtime.
+- Tool exposure invariants remain unchanged:
+  - stable ``stable_tool_id()`` values
+  - deterministic ordering by category/source/stable ID
+  - alias preservation from visible names back to internal names
+  - cache-stable schema ordering/bytes across turns
+- ``search_tools`` remains the fallback for non-Responses or unsupported
+  models/providers.
 
 **For older models (Chat Completions API):**
 
