@@ -21,6 +21,7 @@ from cognis.channels.adapters.signal_cli_runtime import (
 from cognis.models.channel import (
     ChannelAccountConfig,
     InboundMessage,
+    OutboundMessage,
 )
 
 # ---------------------------------------------------------------------------
@@ -635,3 +636,34 @@ class TestDirectParamNormalization:
         params = adapter._direct_params({"account": "+1234567890", "recipient": ["+420111222333"]})
 
         assert params["account"] == "+1234567890"
+
+
+class TestDirectSendBehavior:
+    @pytest.mark.asyncio
+    async def test_direct_send_ignores_reply_without_quote_author(self) -> None:
+        adapter = SignalAdapter()
+        adapter._signal_config = _SignalConfig(
+            {"transport": "direct_jsonrpc"},
+            {"account_number": "+1"},
+        )
+        adapter._account_number = "+1"
+
+        mock_runtime = MagicMock()
+        mock_runtime.is_running = True
+        mock_runtime.single_account_mode = True
+        mock_runtime.request = AsyncMock(return_value={"timestamp": 12345})
+        adapter._runtime = mock_runtime
+
+        message = OutboundMessage(
+            channel_type="signal",
+            account_id="acct-1",
+            chat_id="+420111222333",
+            content="hello",
+            reply_to_id="1700000000000",
+        )
+
+        result = await adapter._send_direct(message)
+
+        assert result == "12345"
+        called_params = mock_runtime.request.await_args.args[1]
+        assert "quoteTimestamp" not in called_params

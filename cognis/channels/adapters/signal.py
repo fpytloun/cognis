@@ -352,8 +352,10 @@ class SignalAdapter(BaseChannelAdapter):
         )
 
         if message.reply_to_id:
-            with contextlib.suppress(ValueError):
-                params["quoteTimestamp"] = int(message.reply_to_id)
+            logger.debug(
+                "signal adapter: direct reply context ignored because signal-cli requires quote author metadata",
+                extra={"extra_data": {"account_id": self.account_id}},
+            )
 
         temp_files: list[Path] = []
         if message.media:
