@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from time import perf_counter
 from typing import Any, cast
+
+from prometheus_client import Counter, Histogram
 
 from cognis.core.executor_policy import load_executor_policy
 from cognis.core.executor_resolution import select_executor_for_agent
@@ -37,7 +41,48 @@ from cognis.tools.skills import load_skill_tool_names
 
 logger = get_logger(__name__)
 
+INTARIS_MCP_FALLBACKS = Counter(
+    "cognis_intaris_mcp_fallbacks_total",
+    "Assigned Intaris MCP servers targeted by fallback to cached server manifests.",
+)
+INTARIS_MCP_COLLISIONS = Counter(
+    "cognis_intaris_mcp_collision_prunes_total",
+    "Intaris MCP tools skipped due to runtime name collisions.",
+)
+INTARIS_MCP_SKIPPED_ROWS = Counter(
+    "cognis_intaris_mcp_skipped_rows_total",
+    "Malformed or unusable aggregated Intaris MCP rows skipped during resolution.",
+)
+INTARIS_MCP_LIST_FAILURES = Counter(
+    "cognis_intaris_mcp_list_failures_total",
+    "Failures while listing aggregated Intaris MCP tools.",
+)
+INTARIS_MCP_SERVER_LIST_FAILURES = Counter(
+    "cognis_intaris_mcp_server_list_failures_total",
+    "Failures while listing Intaris MCP server manifests for compatibility fallback.",
+)
+INTARIS_MCP_RESOLUTION_LATENCY = Histogram(
+    "cognis_intaris_mcp_resolution_latency_seconds",
+    "Latency of Intaris MCP inventory resolution.",
+)
+
 RuntimeFactory = Callable[[AgentDefinition, str], Awaitable[ResolvedStepRuntime]]
+
+
+@dataclass(slots=True)
+class IntarisMCPResolutionResult:
+    tools: list[ToolDefinition] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    fallback_used: bool = False
+    collision_count: int = 0
+
+
+@dataclass(slots=True)
+class RemoteInventoryMergeResult:
+    tools: list[ToolDefinition] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    collision_count: int = 0
+    intaris_fallback_used: bool = False
 
 
 async def noop_cleanup() -> None:
@@ -333,44 +378,28 @@ def build_step_runtime_factory(
                         else set()
                     )
 
-                    # 1. Executor-advertised tools (native + MCP + web)
                     remote_tools = await conn.list_tools()
-                    remote_registry = ToolRegistry()
-                    remote_tool_names: set[str] = set()
-                    for tool_data in remote_tools:
-                        tool_def = ToolDefinition.model_validate(tool_data)
-                        if (
-                            tool_def.category in disabled_categories
-                            or tool_def.name in disabled_tools
-                            or stable_tool_id(tool_def) in disabled_tools
-                        ):
-                            continue
-                        remote_registry.register(RegisteredTool(definition=tool_def))
-                        remote_tool_names.add(tool_def.name)
-
-                    # 2. Controller-side builtin tools (memory, orchestration,
-                    #    system, image, workflow, tool_output) — these are
-                    #    handled by the controller's ToolRouter, not the executor.
-                    for tool in agent_tools:
-                        if tool.source.type != "builtin":
-                            continue
-                        if tool.name in remote_tool_names:
-                            continue
-                        if (
-                            tool.category in disabled_categories
-                            or tool.name in disabled_tools
-                            or stable_tool_id(tool) in disabled_tools
-                        ):
-                            continue
-                        remote_registry.register(RegisteredTool(definition=tool))
-
-                    # 3. Intaris MCP tools assigned to this agent
-                    intaris_tools = await _resolve_intaris_mcp_tools(
-                        providers, agent, disabled_categories, disabled_tools
+                    merge_result = await _merge_remote_runtime_inventory(
+                        remote_tools_data=remote_tools,
+                        agent_tools=agent_tools,
+                        providers=providers,
+                        agent=agent,
+                        disabled_categories=disabled_categories,
+                        disabled_tools=disabled_tools,
                     )
-                    for tool in intaris_tools:
-                        if tool.name not in remote_tool_names:
-                            remote_registry.register(RegisteredTool(definition=tool))
+                    remote_registry = ToolRegistry()
+                    for tool in merge_result.tools:
+                        remote_registry.register(RegisteredTool(definition=tool))
+                    for warning in merge_result.warnings:
+                        logger.warning(
+                            "Remote runtime inventory warning",
+                            extra={
+                                "extra_data": {
+                                    "executor_id": executor_id,
+                                    "warning": warning,
+                                }
+                            },
+                        )
 
                     # Diagnostics
                     all_tools = remote_registry.list_tools()
@@ -384,11 +413,17 @@ def build_step_runtime_factory(
                                 "total_tools": len(all_tools),
                                 "categories": sorted(categories),
                                 "sources": sorted(sources),
-                                "remote_executor_tools": len(remote_tool_names),
+                                "remote_executor_tools": sum(
+                                    1 for t in all_tools if t.source.type == "executor"
+                                ),
                                 "builtin_tools": sum(
                                     1 for t in all_tools if t.source.type == "builtin"
                                 ),
-                                "intaris_mcp_tools": len(intaris_tools),
+                                "intaris_mcp_tools": sum(
+                                    1 for t in all_tools if t.source.type == "intaris_mcp"
+                                ),
+                                "collision_count": merge_result.collision_count,
+                                "intaris_fallback_used": merge_result.intaris_fallback_used,
                             }
                         },
                     )
@@ -621,41 +656,176 @@ def _parse_local_mcp_servers(agent: AgentDefinition) -> list[MCPServerConfig]:
     return servers
 
 
-async def _resolve_intaris_mcp_tools(
+async def _merge_remote_runtime_inventory(
+    *,
+    remote_tools_data: list[dict[str, Any]],
+    agent_tools: list[ToolDefinition],
     providers: Any,
     agent: AgentDefinition,
     disabled_categories: set[str],
     disabled_tools: set[str],
-) -> list[ToolDefinition]:
-    """Resolve Intaris MCP tools assigned to an agent.
+    intaris_result: IntarisMCPResolutionResult | None = None,
+) -> RemoteInventoryMergeResult:
+    """Build merged runtime-visible inventory for remote executors."""
+    warnings: list[str] = []
+    merged: list[ToolDefinition] = []
+    merged_names: set[str] = set()
+    collision_count = 0
 
-    Queries the Intaris guardrails provider for the aggregated tool list
-    from MCP servers named in ``agent.tools.intaris_mcp_servers``, then
-    converts them to ``ToolDefinition`` objects.
-    """
-    if not isinstance(agent.tools, dict):
-        return []
-    server_names = agent.tools.get("intaris_mcp_servers", [])
-    if not isinstance(server_names, list) or not server_names:
-        return []
+    remote_defs: list[ToolDefinition] = []
+    for tool_data in remote_tools_data:
+        tool_def = ToolDefinition.model_validate(tool_data)
+        if (
+            tool_def.category in disabled_categories
+            or tool_def.name in disabled_tools
+            or stable_tool_id(tool_def) in disabled_tools
+        ):
+            continue
+        remote_defs.append(tool_def)
+    remote_defs.sort(
+        key=lambda tool: (
+            _tool_collision_identity(tool),
+            tool.source.type,
+            tool.source.server_name or "",
+            tool.source.raw_tool_name or tool.name,
+        )
+    )
+    for tool in remote_defs:
+        if tool.name in merged_names:
+            collision_count += 1
+            _append_warning(
+                warnings,
+                "Remote executor reported duplicate tool names; later duplicates were ignored.",
+            )
+            continue
+        merged.append(tool)
+        merged_names.add(tool.name)
 
-    allowed_names = set(server_names)
-    guardrails = getattr(providers, "guardrails", None)
-    if guardrails is None:
-        return []
+    builtin_defs = sorted(
+        [tool for tool in agent_tools if tool.source.type == "builtin"],
+        key=_tool_collision_identity,
+    )
+    for tool in builtin_defs:
+        if tool.name in merged_names:
+            collision_count += 1
+            _append_warning(
+                warnings,
+                "Some controller tools were shadowed because the remote executor already exposes the same runtime name.",
+            )
+            continue
+        merged.append(tool)
+        merged_names.add(tool.name)
 
+    if intaris_result is None:
+        intaris_result = await _resolve_intaris_mcp_tools(
+            providers,
+            agent,
+            disabled_categories,
+            disabled_tools,
+        )
+    for warning in intaris_result.warnings:
+        _append_warning(warnings, warning)
+    collision_count += intaris_result.collision_count
+    for tool in intaris_result.tools:
+        if tool.name in merged_names:
+            collision_count += 1
+            INTARIS_MCP_COLLISIONS.inc()
+            _append_warning(
+                warnings,
+                "Some Intaris MCP tools were hidden because another runtime tool already uses the same name.",
+            )
+            continue
+        merged.append(tool)
+        merged_names.add(tool.name)
+
+    return RemoteInventoryMergeResult(
+        tools=merged,
+        warnings=warnings,
+        collision_count=collision_count,
+        intaris_fallback_used=intaris_result.fallback_used,
+    )
+
+
+def _append_warning(warnings: list[str], warning: str) -> None:
+    """Append a stable warning string once."""
+    if warning not in warnings:
+        warnings.append(warning)
+
+
+def _tool_collision_identity(tool: ToolDefinition) -> str:
+    """Return the runtime-visible identity used for merge deduplication."""
+    return tool.name
+
+
+def _extract_intaris_aggregated_server_name(row: dict[str, Any]) -> str | None:
+    """Extract the canonical Intaris server name from an aggregated row."""
+    source = row.get("source")
+    if isinstance(source, dict):
+        server_name = source.get("server_name") or source.get("server")
+    else:
+        server_name = row.get("server_name") or row.get("server")
+    resolved_server = str(server_name).strip() if isinstance(server_name, str) else None
+    return resolved_server or None
+
+
+def _extract_intaris_aggregated_raw_tool_name(row: dict[str, Any]) -> str | None:
+    """Extract the canonical raw Intaris MCP tool name from an aggregated row."""
+    source = row.get("source")
+    if isinstance(source, dict):
+        raw_tool_name = source.get("raw_tool_name") or source.get("tool")
+    else:
+        raw_tool_name = row.get("raw_tool_name") or row.get("tool")
+    resolved_tool = str(raw_tool_name).strip() if isinstance(raw_tool_name, str) else None
+    return resolved_tool or None
+
+
+def _build_intaris_tool_definition(
+    *,
+    server_name: str,
+    raw_tool_name: str,
+    payload: dict[str, Any],
+) -> ToolDefinition:
+    from cognis.models.tool import ToolSource
+
+    tool_name = sanitize_mcp_tool_name(server_name, raw_tool_name)
+    return ToolDefinition(
+        name=tool_name,
+        description=str(payload.get("description", f"Intaris MCP tool {tool_name}")),
+        parameters=payload.get("inputSchema") or payload.get("parameters") or {},
+        source=ToolSource(
+            type="intaris_mcp",
+            server_name=server_name,
+            raw_tool_name=raw_tool_name,
+        ),
+        category="mcp",
+        timeout_seconds=30,
+    )
+
+
+async def _resolve_intaris_mcp_tools_from_server_cache(
+    providers: Any,
+    *,
+    server_names: set[str],
+    disabled_categories: set[str],
+    disabled_tools: set[str],
+) -> IntarisMCPResolutionResult:
+    result = IntarisMCPResolutionResult()
+    if not server_names:
+        return result
     try:
-        all_servers = await guardrails.list_mcp_servers(enabled_only=True)
+        all_servers = await providers.guardrails.list_mcp_servers(enabled_only=True)
     except Exception:
+        INTARIS_MCP_SERVER_LIST_FAILURES.inc()
         logger.warning("Failed to list Intaris MCP servers", exc_info=True)
-        return []
+        _append_warning(result.warnings, "Unable to load fallback Intaris MCP server manifests.")
+        return result
 
-    tools: list[ToolDefinition] = []
+    by_server: dict[str, list[ToolDefinition]] = {name: [] for name in server_names}
     for server in all_servers:
         if not isinstance(server, dict):
             continue
-        name = server.get("name", "")
-        if name not in allowed_names:
+        name = server.get("name")
+        if not isinstance(name, str) or name not in server_names:
             continue
         tools_cache = server.get("tools_cache") or []
         if not isinstance(tools_cache, list):
@@ -663,30 +833,201 @@ async def _resolve_intaris_mcp_tools(
         for raw_tool in tools_cache:
             if not isinstance(raw_tool, dict):
                 continue
-            raw_tool_name = str(raw_tool.get("name", ""))
-            tool_name = sanitize_mcp_tool_name(name, raw_tool_name)
-            if "mcp" in disabled_categories or tool_name in disabled_tools:
+            raw_tool_name = raw_tool.get("name")
+            if not isinstance(raw_tool_name, str) or not raw_tool_name:
                 continue
-            from cognis.models.tool import ToolSource
+            tool = _build_intaris_tool_definition(
+                server_name=name,
+                raw_tool_name=raw_tool_name,
+                payload=raw_tool,
+            )
+            if "mcp" in disabled_categories:
+                continue
+            if tool.name in disabled_tools or stable_tool_id(tool) in disabled_tools:
+                continue
+            by_server[name].append(tool)
 
-            tools.append(
-                ToolDefinition(
-                    name=tool_name,
-                    description=str(raw_tool.get("description", f"Intaris MCP tool {tool_name}")),
-                    parameters=raw_tool.get("inputSchema") or raw_tool.get("parameters") or {},
-                    source=ToolSource(
-                        type="intaris_mcp",
-                        server_name=name,
-                        raw_tool_name=raw_tool_name,
-                    ),
-                    category="mcp",
-                    timeout_seconds=30,
-                )
+    for server_name in sorted(by_server):
+        deduped = _dedupe_intaris_tools(by_server[server_name], result.warnings)
+        result.collision_count += len(by_server[server_name]) - len(deduped)
+        result.tools.extend(deduped)
+    if result.tools:
+        result.fallback_used = True
+        INTARIS_MCP_FALLBACKS.inc(len(server_names))
+        _append_warning(
+            result.warnings,
+            "Fell back to cached Intaris MCP server manifests for some assigned servers.",
+        )
+    return result
+
+
+def _dedupe_intaris_tools(
+    tools: list[ToolDefinition],
+    warnings: list[str],
+) -> list[ToolDefinition]:
+    deduped: list[ToolDefinition] = []
+    seen: set[str] = set()
+    for tool in sorted(
+        tools,
+        key=lambda item: (
+            item.source.server_name or "",
+            item.source.raw_tool_name or item.name,
+            item.name,
+        ),
+    ):
+        identity = _tool_collision_identity(tool)
+        if identity in seen:
+            INTARIS_MCP_COLLISIONS.inc()
+            _append_warning(
+                warnings,
+                "Some Intaris MCP tools were skipped because multiple tools resolved to the same runtime name.",
+            )
+            continue
+        seen.add(identity)
+        deduped.append(tool)
+    return deduped
+
+
+async def _resolve_intaris_mcp_tools(
+    providers: Any,
+    agent: AgentDefinition,
+    disabled_categories: set[str],
+    disabled_tools: set[str],
+) -> IntarisMCPResolutionResult:
+    """Resolve Intaris MCP tools assigned to an agent.
+
+    Uses the aggregated Intaris MCP tool listing as the primary source of
+    truth. If assigned servers cannot be reconstructed from aggregated rows
+    because canonical source metadata is missing, falls back to the server
+    cache manifest for only those affected servers.
+    """
+    if not isinstance(agent.tools, dict):
+        return IntarisMCPResolutionResult()
+    server_names = agent.tools.get("intaris_mcp_servers", [])
+    if not isinstance(server_names, list) or not server_names:
+        return IntarisMCPResolutionResult()
+
+    allowed_names = set(server_names)
+    guardrails = getattr(providers, "guardrails", None)
+    if guardrails is None:
+        return IntarisMCPResolutionResult()
+
+    start = perf_counter()
+    try:
+        aggregated_tools = await guardrails.list_mcp_tools()
+    except Exception:
+        INTARIS_MCP_LIST_FAILURES.inc()
+        logger.warning("Failed to list Intaris MCP tools", exc_info=True)
+        result = await _resolve_intaris_mcp_tools_from_server_cache(
+            providers,
+            server_names=allowed_names,
+            disabled_categories=disabled_categories,
+            disabled_tools=disabled_tools,
+        )
+        _append_warning(result.warnings, "Unable to load aggregated Intaris MCP tools.")
+        INTARIS_MCP_RESOLUTION_LATENCY.observe(perf_counter() - start)
+        return result
+
+    result = IntarisMCPResolutionResult()
+    if not isinstance(aggregated_tools, list):
+        aggregated_tools = []
+
+    if not aggregated_tools:
+        fallback = await _resolve_intaris_mcp_tools_from_server_cache(
+            providers,
+            server_names=allowed_names,
+            disabled_categories=disabled_categories,
+            disabled_tools=disabled_tools,
+        )
+        if fallback.tools:
+            _append_warning(
+                fallback.warnings,
+                "Aggregated Intaris MCP listing was empty; used cached server manifests where available.",
+            )
+            INTARIS_MCP_RESOLUTION_LATENCY.observe(perf_counter() - start)
+            return fallback
+        _append_warning(
+            fallback.warnings,
+            "Aggregated Intaris MCP listing was empty and no cached server manifests provided replacement tools.",
+        )
+        INTARIS_MCP_RESOLUTION_LATENCY.observe(perf_counter() - start)
+        return fallback
+
+    by_server: dict[str, list[ToolDefinition]] = {name: [] for name in allowed_names}
+    malformed_servers: set[str] = set()
+    seen_servers: set[str] = set()
+    for row in aggregated_tools:
+        if not isinstance(row, dict):
+            INTARIS_MCP_SKIPPED_ROWS.inc()
+            continue
+        server_name = _extract_intaris_aggregated_server_name(row)
+        raw_tool_name = _extract_intaris_aggregated_raw_tool_name(row)
+        if server_name in allowed_names:
+            seen_servers.add(server_name)
+        if server_name in allowed_names and not raw_tool_name:
+            malformed_servers.add(server_name)
+        if not server_name or not raw_tool_name:
+            INTARIS_MCP_SKIPPED_ROWS.inc()
+            continue
+        if server_name not in allowed_names:
+            continue
+        tool = _build_intaris_tool_definition(
+            server_name=server_name,
+            raw_tool_name=raw_tool_name,
+            payload=row,
+        )
+        if "mcp" in disabled_categories:
+            continue
+        if tool.name in disabled_tools or stable_tool_id(tool) in disabled_tools:
+            continue
+        by_server[server_name].append(tool)
+
+    unresolved_servers = {
+        name
+        for name in allowed_names
+        if name in malformed_servers or (not by_server.get(name) and name not in seen_servers)
+    }
+    if unresolved_servers:
+        fallback = await _resolve_intaris_mcp_tools_from_server_cache(
+            providers,
+            server_names=unresolved_servers,
+            disabled_categories=disabled_categories,
+            disabled_tools=disabled_tools,
+        )
+        result.fallback_used = fallback.fallback_used
+        result.collision_count += fallback.collision_count
+        result.warnings.extend(fallback.warnings)
+        for tool in fallback.tools:
+            server_name = tool.source.server_name or ""
+            if server_name in unresolved_servers:
+                by_server.setdefault(server_name, []).append(tool)
+        if fallback.fallback_used:
+            _append_warning(
+                result.warnings,
+                "Some assigned Intaris MCP servers required cache fallback because aggregated tool metadata was incomplete.",
+            )
+        else:
+            _append_warning(
+                result.warnings,
+                "Some assigned Intaris MCP servers could not be reconstructed from aggregated metadata and had no cached manifest fallback.",
             )
 
-    if tools:
+    for server_name in sorted(by_server):
+        deduped = _dedupe_intaris_tools(by_server[server_name], result.warnings)
+        result.collision_count += len(by_server[server_name]) - len(deduped)
+        result.tools.extend(deduped)
+
+    if result.tools:
         logger.debug(
             "Resolved Intaris MCP tools",
-            extra={"extra_data": {"count": len(tools), "servers": list(allowed_names)}},
+            extra={
+                "extra_data": {
+                    "count": len(result.tools),
+                    "servers": sorted(allowed_names),
+                    "fallback_used": result.fallback_used,
+                    "collision_count": result.collision_count,
+                }
+            },
         )
-    return tools
+    INTARIS_MCP_RESOLUTION_LATENCY.observe(perf_counter() - start)
+    return result

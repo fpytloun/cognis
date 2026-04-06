@@ -140,6 +140,32 @@ def test_reasoning_response_shape(
     assert isinstance(data["call_id"], str)
 
 
+def test_mcp_tools_response_shape(
+    http_client: httpx.Client,
+    intaris_url: str,
+    make_service_jwt: Callable[..., str],
+    contract_agent_id: str,
+) -> None:
+    token = make_service_jwt("intaris", agent_id=contract_agent_id)
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "X-Agent-Id": contract_agent_id,
+    }
+
+    response = http_client.get(f"{intaris_url}/api/v1/mcp/tools", headers=headers)
+
+    assert response.status_code == 200
+    data = response.json()
+    tools = data.get("tools", []) if isinstance(data, dict) else data
+    assert isinstance(tools, list)
+    for tool in tools:
+        assert isinstance(tool, dict)
+        assert isinstance(tool.get("description", ""), str)
+        assert isinstance(tool.get("inputSchema") or tool.get("parameters") or {}, dict)
+        assert isinstance(tool.get("server") or tool.get("server_name"), str)
+        assert isinstance(tool.get("tool") or tool.get("raw_tool_name"), str)
+
+
 def test_events_last_n_and_last_seq_shape(
     http_client: httpx.Client,
     intaris_url: str,

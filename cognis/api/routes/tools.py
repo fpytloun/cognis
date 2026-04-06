@@ -32,7 +32,11 @@ from cognis.api.models import (
     MCPServerUpdateRequest,
     ToolResponse,
 )
-from cognis.api.runtime_support import select_static_tools
+from cognis.api.runtime_support import (
+    _merge_remote_runtime_inventory,
+    _resolve_intaris_mcp_tools,
+    select_static_tools,
+)
 from cognis.api.serializers import agent_to_response, mcp_server_to_response, tool_to_response
 from cognis.core.executor_policy import load_executor_policy
 from cognis.core.executor_resolution import is_tool_enabled, select_executor_for_agent
@@ -302,19 +306,19 @@ async def _resolve_effective_tools_response(
         else:
             warnings.append("Executor has assigned MCP servers but no observed manifest yet.")
 
-    # Resolve Intaris MCP tools assigned to this agent
-    from cognis.api.runtime_support import _resolve_intaris_mcp_tools
-
     disabled_categories = set(
         (agent.tools or {}).get("disabled_categories", []) if isinstance(agent.tools, dict) else []
     )
     disabled_tools_set = set(
         (agent.tools or {}).get("disabled_tools", []) if isinstance(agent.tools, dict) else []
     )
-    intaris_tools = await _resolve_intaris_mcp_tools(
+    intaris_result = await _resolve_intaris_mcp_tools(
         request.app.state.providers, agent, disabled_categories, disabled_tools_set
     )
-    configured_tools.extend(intaris_tools)
+    configured_tools.extend(intaris_result.tools)
+    for warning in intaris_result.warnings:
+        if warning not in warnings:
+            warnings.append(warning)
 
     configured_items = [
         EffectiveToolItemResponse(
@@ -340,8 +344,20 @@ async def _resolve_effective_tools_response(
         conn = request.app.state.providers.executor.websocket.get_connection(selected.executor_id)
         if conn is not None and selected.runtime_state == "active":
             connected = True
-            for item in await conn.list_tools():
-                tool = ToolDefinition.model_validate(item)
+            remote_tools = await conn.list_tools()
+            merged_result = await _merge_remote_runtime_inventory(
+                remote_tools_data=remote_tools,
+                agent_tools=configured_tools,
+                providers=request.app.state.providers,
+                agent=agent,
+                disabled_categories=disabled_categories,
+                disabled_tools=disabled_tools_set,
+                intaris_result=intaris_result,
+            )
+            for warning in merged_result.warnings:
+                if warning not in warnings:
+                    warnings.append(warning)
+            for tool in merged_result.tools:
                 live_items.append(
                     EffectiveToolItemResponse(
                         tool_id=_tool_identifier(tool),

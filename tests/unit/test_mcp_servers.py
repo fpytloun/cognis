@@ -8,7 +8,12 @@ from fastapi.testclient import TestClient
 
 from cognis.api.app import create_app
 from cognis.api.runtime_support import select_static_tools
-from cognis.models.tool import MCP_SERVER_IDS_KEY, MCPServerConfig, ToolSource
+from cognis.models.tool import (
+    MCP_SERVER_IDS_KEY,
+    MCPServerConfig,
+    ToolSource,
+    sanitize_mcp_tool_name,
+)
 from cognis.store.queries import (
     create_executor,
     create_mcp_server,
@@ -217,6 +222,79 @@ def test_effective_tools_preview_respects_executor_owner_scope(
         payload = response.json()
         assert payload["executor"]["executor_id"] is None
         assert payload["warnings"]
+
+
+def test_effective_tools_live_state_includes_merged_intaris_tools_for_websocket(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        import asyncio
+
+        async def _seed() -> None:
+            async with client.app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="alice@example.com",
+                    name="Alice",
+                    password_hash=client.app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                executor = await create_executor(
+                    session,
+                    executor_id="alice_exec",
+                    name="Alice exec",
+                    executor_type="websocket",
+                    owner_email="alice@example.com",
+                )
+                executor.runtime_state = "active"
+                await session.commit()
+
+        asyncio.run(_seed())
+
+        class _Conn:
+            async def list_tools(self) -> list[dict[str, object]]:
+                return [
+                    {
+                        "name": "read",
+                        "description": "Read file",
+                        "parameters": {},
+                        "source": ToolSource(type="executor").model_dump(mode="json"),
+                        "category": "filesystem",
+                        "read_only": True,
+                        "timeout_seconds": 30,
+                        "non_bypassable": False,
+                    }
+                ]
+
+        client.app.state.providers.executor.websocket.get_connection = lambda executor_id: (  # type: ignore[method-assign]
+            _Conn() if executor_id == "alice_exec" else None
+        )
+
+        async def _list_mcp_tools() -> list[dict[str, object]]:
+            return [
+                {
+                    "server": "github",
+                    "tool": "search/issues",
+                    "description": "Search issues",
+                    "inputSchema": {"type": "object", "properties": {}},
+                }
+            ]
+
+        client.app.state.providers.guardrails.list_mcp_tools = _list_mcp_tools  # type: ignore[method-assign]
+
+        response = client.post(
+            "/api/v1/agents/effective-tools/preview",
+            headers=_auth_headers(client.app, email="alice@example.com", role="user"),
+            json={
+                "execution": {"executor_id": "alice_exec"},
+                "tools": {"intaris_mcp_servers": ["github"]},
+            },
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        live_names = {tool["name"] for tool in payload["live_state"]["tools"]}
+        assert "read" in live_names
+        assert sanitize_mcp_tool_name("github", "search/issues") in live_names
 
 
 def test_delete_referenced_mcp_server_returns_409(monkeypatch: object, tmp_path: Path) -> None:
