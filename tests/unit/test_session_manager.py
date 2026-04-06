@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from cognis.core.session import SessionManager
+from cognis.core.session import SessionManager, _map_cognis_to_intaris_status
 from cognis.models.session import ConversationContext
 from cognis.store.database import create_engine, create_session_factory
 from cognis.store.models import Agent, Conversation, Session, User
@@ -16,6 +16,7 @@ class _Guardrails:
     def __init__(self, fail: bool = False) -> None:
         self.fail = fail
         self.calls: list[tuple[str, str, str | None]] = []
+        self.status_calls: list[tuple[str, str, str | None]] = []
 
     async def create_session(
         self,
@@ -31,6 +32,18 @@ class _Guardrails:
         if self.fail:
             raise RuntimeError("intaris unavailable")
         self.calls.append((session_id, agent_id, parent_session_id))
+
+    async def update_session_status(
+        self,
+        session_id: str,
+        status: str,
+        status_reason: str | None = None,
+        user_email: str | None = None,
+    ) -> None:
+        del user_email
+        if self.fail:
+            raise RuntimeError("intaris unavailable")
+        self.status_calls.append((session_id, status, status_reason))
 
 
 class _SlowGuardrails(_Guardrails):
@@ -350,5 +363,165 @@ async def test_ensure_root_session_is_single_winner(tmp_path) -> None:
         assert stored_conversation is not None
         assert stored_conversation.active_session_id == first_session.session_id
         assert [row.session_id for row in stored_sessions] == [first_session.session_id]
+
+    await engine.dispose()
+
+
+# ------------------------------------------------------------------
+# Status mapping tests
+# ------------------------------------------------------------------
+
+
+def test_map_cognis_to_intaris_status_direct_mappings() -> None:
+    for status in ("active", "idle", "completed", "suspended", "terminated"):
+        intaris_status, _ = _map_cognis_to_intaris_status(status)
+        assert intaris_status == status
+
+
+def test_map_cognis_to_intaris_status_failed_maps_to_terminated() -> None:
+    intaris_status, reason = _map_cognis_to_intaris_status("failed")
+    assert intaris_status == "terminated"
+    assert reason == "source_status=failed"
+
+
+def test_map_cognis_to_intaris_status_cancelled_maps_to_terminated() -> None:
+    intaris_status, reason = _map_cognis_to_intaris_status("cancelled")
+    assert intaris_status == "terminated"
+    assert reason == "source_status=cancelled"
+
+
+def test_map_cognis_to_intaris_status_completed_with_reason() -> None:
+    intaris_status, reason = _map_cognis_to_intaris_status(
+        "completed", completion_reason="compacted"
+    )
+    assert intaris_status == "completed"
+    assert reason == "completion_reason=compacted"
+
+
+def test_map_cognis_to_intaris_status_reason_truncated() -> None:
+    _, reason = _map_cognis_to_intaris_status("suspended", reason="x" * 600)
+    assert reason is not None
+    assert len(reason) <= 500
+
+
+# ------------------------------------------------------------------
+# SessionManager Intaris sync tests
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_mark_completed_syncs_to_intaris(tmp_path) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    providers = _Providers()
+    manager = SessionManager(session_factory, providers, _Cache())
+
+    conversation = await manager.create_conversation(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context=ConversationContext(type="web"),
+        title="Sync test",
+    )
+    root = await manager.create_root_session(
+        conversation_id=conversation.conversation_id,
+        user_email="user@example.com",
+        agent_id="agent-1",
+        intention="test",
+    )
+
+    await manager.mark_completed(root.session_id, completion_reason="compacted")
+
+    assert len(providers.guardrails.status_calls) == 1
+    sid, status, reason = providers.guardrails.status_calls[0]
+    assert sid == root.session_id
+    assert status == "completed"
+    assert reason == "completion_reason=compacted"
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_mark_failed_syncs_terminated_to_intaris(tmp_path) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    providers = _Providers()
+    manager = SessionManager(session_factory, providers, _Cache())
+
+    conversation = await manager.create_conversation(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context=ConversationContext(type="web"),
+        title="Fail test",
+    )
+    root = await manager.create_root_session(
+        conversation_id=conversation.conversation_id,
+        user_email="user@example.com",
+        agent_id="agent-1",
+        intention="test",
+    )
+
+    await manager.mark_failed(root.session_id, result_summary="boom")
+
+    assert len(providers.guardrails.status_calls) == 1
+    sid, status, reason = providers.guardrails.status_calls[0]
+    assert sid == root.session_id
+    assert status == "terminated"
+    assert reason == "source_status=failed"
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_mark_cancelled_syncs_terminated_to_intaris(tmp_path) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    providers = _Providers()
+    manager = SessionManager(session_factory, providers, _Cache())
+
+    conversation = await manager.create_conversation(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context=ConversationContext(type="web"),
+        title="Cancel test",
+    )
+    root = await manager.create_root_session(
+        conversation_id=conversation.conversation_id,
+        user_email="user@example.com",
+        agent_id="agent-1",
+        intention="test",
+    )
+
+    await manager.mark_cancelled(root.session_id, result_summary="user cancelled")
+
+    assert len(providers.guardrails.status_calls) == 1
+    sid, status, reason = providers.guardrails.status_calls[0]
+    assert sid == root.session_id
+    assert status == "terminated"
+    assert reason == "source_status=cancelled"
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_intaris_sync_failure_does_not_block_mark(tmp_path) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    providers_ok = _Providers(fail=False)
+    manager_ok = SessionManager(session_factory, providers_ok, _Cache())
+
+    conversation = await manager_ok.create_conversation(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context=ConversationContext(type="web"),
+        title="Degraded test",
+    )
+    root = await manager_ok.create_root_session(
+        conversation_id=conversation.conversation_id,
+        user_email="user@example.com",
+        agent_id="agent-1",
+        intention="test",
+    )
+
+    # Now use a failing provider for mark_idle
+    providers_fail = _Providers(fail=True)
+    manager_fail = SessionManager(session_factory, providers_fail, _Cache())
+    updated = await manager_fail.mark_idle(root.session_id)
+    assert updated  # DB update succeeded despite Intaris failure
 
     await engine.dispose()

@@ -24,6 +24,50 @@ logger = get_logger(__name__)
 
 _WHITESPACE_RE = re.compile(r"\s+")
 _MAX_INTENTION_LENGTH = 500
+_MAX_STATUS_REASON_LENGTH = 500
+
+# Cognis → Intaris session status mapping.  Intaris does not have
+# ``failed`` or ``cancelled``; both map to ``terminated`` with a
+# machine-readable ``status_reason`` prefix.
+_INTARIS_STATUS_MAP: dict[str, str] = {
+    "active": "active",
+    "idle": "idle",
+    "completed": "completed",
+    "suspended": "suspended",
+    "terminated": "terminated",
+    "failed": "terminated",
+    "cancelled": "terminated",
+}
+
+
+def _map_cognis_to_intaris_status(
+    cognis_status: str,
+    *,
+    completion_reason: str | None = None,
+    result_summary: str | None = None,
+    reason: str | None = None,
+) -> tuple[str, str | None]:
+    """Map a Cognis session status to an Intaris status + status_reason.
+
+    Returns ``(intaris_status, status_reason)``.  The ``status_reason``
+    is always bounded to ``_MAX_STATUS_REASON_LENGTH`` characters and
+    uses machine-readable prefixes — never raw user/model content.
+    """
+
+    intaris_status = _INTARIS_STATUS_MAP.get(cognis_status, cognis_status)
+
+    status_reason: str | None = None
+    if cognis_status in ("failed", "cancelled"):
+        status_reason = f"source_status={cognis_status}"
+    elif cognis_status == "completed" and completion_reason:
+        status_reason = f"completion_reason={completion_reason}"
+    elif reason:
+        status_reason = reason
+
+    if status_reason and len(status_reason) > _MAX_STATUS_REASON_LENGTH:
+        status_reason = status_reason[:_MAX_STATUS_REASON_LENGTH]
+
+    return intaris_status, status_reason
 
 
 def _normalize_intention(value: str | None, fallback: str = "Conversation") -> str:
@@ -328,6 +372,60 @@ class SessionManager:
                 await db_session.rollback()
                 raise
 
+    async def _sync_intaris_status(
+        self,
+        session_id: str,
+        cognis_status: str,
+        *,
+        user_email: str | None = None,
+        completion_reason: str | None = None,
+        result_summary: str | None = None,
+        reason: str | None = None,
+    ) -> None:
+        """Best-effort sync of session status to Intaris.
+
+        This is the ONLY place that calls the Intaris status-update
+        provider method.  Failures are logged at warning level and
+        never raised — Intaris unavailability must not block Cognis
+        session transitions.
+        """
+
+        intaris_status, status_reason = _map_cognis_to_intaris_status(
+            cognis_status,
+            completion_reason=completion_reason,
+            result_summary=result_summary,
+            reason=reason,
+        )
+
+        resolved_user_email = user_email
+        target_session_id = session_id
+        if resolved_user_email is None:
+            async with self.session_factory() as db_session:
+                session_row = await queries.get_session_row(db_session, session_id)
+                if session_row is not None:
+                    resolved_user_email = session_row.user_email
+                    target_session_id = session_row.intaris_session_id or session_row.session_id
+
+        try:
+            await self.providers.guardrails.update_session_status(
+                target_session_id,
+                intaris_status,
+                status_reason,
+                user_email=resolved_user_email,
+            )
+        except Exception:
+            logger.warning(
+                "session: failed to sync status to Intaris",
+                extra={
+                    "extra_data": {
+                        "session_id": session_id,
+                        "cognis_status": cognis_status,
+                        "intaris_status": intaris_status,
+                    }
+                },
+                exc_info=True,
+            )
+
     async def mark_idle(self, session_id: str) -> bool:
         """Mark a session idle and evict any warm cache entry."""
 
@@ -339,6 +437,8 @@ class SessionManager:
                 await db_session.rollback()
                 raise
         await self.session_cache.evict(session_id)
+        if updated:
+            await self._sync_intaris_status(session_id, "idle")
         return updated
 
     async def mark_completed(
@@ -364,6 +464,13 @@ class SessionManager:
                 await db_session.rollback()
                 raise
         await self.session_cache.evict(session_id)
+        if updated:
+            await self._sync_intaris_status(
+                session_id,
+                "completed",
+                completion_reason=completion_reason,
+                result_summary=result_summary,
+            )
         return updated
 
     async def mark_failed(self, session_id: str, result_summary: str | None = None) -> bool:
@@ -383,6 +490,29 @@ class SessionManager:
                 await db_session.rollback()
                 raise
         await self.session_cache.evict(session_id)
+        if updated:
+            await self._sync_intaris_status(session_id, "failed")
+        return updated
+
+    async def mark_cancelled(self, session_id: str, result_summary: str | None = None) -> bool:
+        """Mark a session cancelled and evict cache state."""
+
+        async with self.session_factory() as db_session:
+            try:
+                updated = await queries.set_session_status(
+                    db_session,
+                    session_id,
+                    SessionStatus.CANCELLED,
+                    completed_at=datetime.now(UTC),
+                    result_summary=result_summary,
+                )
+                await db_session.commit()
+            except Exception:
+                await db_session.rollback()
+                raise
+        await self.session_cache.evict(session_id)
+        if updated:
+            await self._sync_intaris_status(session_id, "cancelled")
         return updated
 
     async def mark_suspended(self, session_id: str, reason: str | None = None) -> bool:
@@ -400,6 +530,8 @@ class SessionManager:
             except Exception:
                 await db_session.rollback()
                 raise
+        if updated:
+            await self._sync_intaris_status(session_id, "suspended", reason=reason)
         return updated
 
     async def mark_terminated(self, session_id: str, reason: str | None = None) -> bool:
@@ -419,6 +551,8 @@ class SessionManager:
                 await db_session.rollback()
                 raise
         await self.session_cache.evict(session_id)
+        if updated:
+            await self._sync_intaris_status(session_id, "terminated", reason=reason)
         return updated
 
     async def rotate_session(
@@ -502,6 +636,13 @@ class SessionManager:
         # Evict old session cache
         await self.session_cache.evict(current_session.session_id)
 
+        # Sync old session status to Intaris (best-effort)
+        await self._sync_intaris_status(
+            current_session.intaris_session_id or current_session.session_id,
+            "completed",
+            completion_reason=completion_reason,
+        )
+
         new_session_row.intaris_session_id = new_session_row.session_id
         new_session = _to_session_model(new_session_row)
 
@@ -551,6 +692,20 @@ class SessionManager:
 
         for recovered_id in recovered_ids:
             await self.session_cache.evict(recovered_id)
+        # Best-effort sync to Intaris for all recovered sessions (after commit)
+        for stale_session in stale_sessions:
+            if stale_session.session_id not in recovered_ids:
+                continue
+            if stale_session.parent_session_id is None:
+                await self._sync_intaris_status(
+                    stale_session.intaris_session_id or stale_session.session_id,
+                    "idle",
+                )
+            else:
+                await self._sync_intaris_status(
+                    stale_session.intaris_session_id or stale_session.session_id,
+                    "failed",
+                )
         if recovered_ids:
             logger.info(
                 "Recovered stale sessions",
@@ -634,6 +789,17 @@ class SessionManager:
 
         for session_row in sessions:
             await self.session_cache.evict(session_row.session_id)
+            if session_row.status not in {
+                SessionStatus.COMPLETED,
+                SessionStatus.FAILED,
+                SessionStatus.CANCELLED,
+                SessionStatus.TERMINATED,
+            }:
+                await self._sync_intaris_status(
+                    session_row.intaris_session_id or session_row.session_id,
+                    "completed",
+                    completion_reason=f"conversation_{conversation_status}",
+                )
         return True
 
     async def _require_agent(self, db_session: AsyncSession, agent_id: str) -> AgentDefinition:

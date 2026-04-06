@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, Query, Request
@@ -11,7 +10,7 @@ from fastapi import APIRouter, Query, Request
 from cognis.api.common import api_exception, forbid_mutation_for_viewer, require_owner_or_admin
 from cognis.api.models import SessionCancelResponse, SessionEventsResponse, SessionResponse
 from cognis.api.serializers import serialize_event_rows, session_to_response
-from cognis.store.queries import get_session_row, set_session_status
+from cognis.store.queries import get_session_row
 
 logger = logging.getLogger(__name__)
 
@@ -104,13 +103,8 @@ async def cancel_session(request: Request, session_id: str) -> SessionCancelResp
         if row is None:
             raise api_exception(404, "not_found", "Session not found")
         require_owner_or_admin(request, row.user_email)
-        ok = await set_session_status(
-            session,
-            session_id,
-            "cancelled",
-            completed_at=datetime.now(UTC),
-            result_summary="cancelled via API",
-        )
-        await session.commit()
-    await request.app.state.session_cache.evict(session_id)
+    ok = await request.app.state.session_manager.mark_cancelled(
+        session_id,
+        result_summary="cancelled via API",
+    )
     return SessionCancelResponse(ok=ok, session_id=session_id)

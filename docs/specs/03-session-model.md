@@ -443,6 +443,35 @@ Cognis Session ────── Mnemory Session ────── Intaris Ses
    pre-creates both Mnemory session (first recall) and Intaris session
    (POST /intention with parent_session_id)
 
+### Status Synchronization
+
+Cognis session status transitions (idle, completed, failed, cancelled,
+suspended, terminated) are synced to Intaris via
+`PATCH /api/v1/session/{id}/status`.  The sync is best-effort:
+Intaris unavailability does not block Cognis
+transitions.
+
+Cognis states that Intaris does not natively support are mapped:
+
+| Cognis status | Intaris status | `status_reason` |
+|---|---|---|
+| `failed` | `terminated` | `source_status=failed` |
+| `cancelled` | `terminated` | `source_status=cancelled` |
+
+All other states map 1:1.  The mapping and sync live in
+`SessionManager._sync_intaris_status()` — the single code path for
+all status transitions.
+
+### Conversation History Across Sessions
+
+After compaction or session rotation, conversation history spans
+multiple root sessions linked by `previous_session_id`.  The
+`GET /conversations/{id}/messages` endpoint walks this lineage on
+full loads (`after_seq=0`) and merges events from all root sessions
+oldest-first.  Incremental fetches (`after_seq > 0`) read only the
+active session.  Missing or truncated lineage segments are surfaced as
+explicit `history_gap` events instead of being silently dropped.
+
 ## Workflow Session Mapping
 
 Workflow execution creates sessions at the step level, not the workflow level.

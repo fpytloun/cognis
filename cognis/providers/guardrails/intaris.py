@@ -227,6 +227,32 @@ class IntarisProvider:
             breaker=self.data_breaker,
         )
 
+    async def update_session_status(
+        self,
+        session_id: str,
+        status: str,
+        status_reason: str | None = None,
+        user_email: str | None = None,
+    ) -> None:
+        body: dict[str, Any] = {"status": status}
+        if status_reason is not None:
+            body["status_reason"] = status_reason
+
+        async def _do() -> None:
+            response = await self.client.patch(
+                f"/api/v1/session/{session_id}/status",
+                json=body,
+                headers=self._headers(user_email=user_email or current_user_email.get()),
+            )
+            response.raise_for_status()
+
+        await self._call_with_retry(
+            _do,
+            max_retries=2,
+            operation=f"intaris update_session_status({session_id})",
+            breaker=self.data_breaker,
+        )
+
     async def checkpoint(self, session_id: str, content: str) -> None:
         async def _do() -> None:
             response = await self.client.post(

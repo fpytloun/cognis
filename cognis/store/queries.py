@@ -27,7 +27,9 @@ from cognis.store.models import (
     Secret,
     Session,
     Setting,
+    SkillAssetRow,
     SkillRow,
+    SkillVersionRow,
     StepRun,
     Task,
     TaskDependency,
@@ -814,6 +816,49 @@ async def list_conversation_sessions(session: AsyncSession, conversation_id: str
         .order_by(Session.started_at, Session.session_id)
     )
     return list(result.scalars().all())
+
+
+async def get_root_session_chain(
+    session: AsyncSession,
+    conversation_id: str,
+    active_session_id: str,
+    *,
+    max_depth: int = 1000,
+) -> tuple[list[Session], bool]:
+    """Walk the root-session lineage backwards via ``previous_session_id``.
+
+    Returns ``(chain, truncated)`` where *chain* is a list of session
+    rows ordered oldest-first (the active session is last) and
+    *truncated* is ``True`` when the lineage exceeded *max_depth*.
+    Only follows root sessions (``parent_session_id IS NULL``).
+    Uses a visited set for cycle detection.
+    """
+
+    chain: list[Session] = []
+    visited: set[str] = set()
+    current_id: str | None = active_session_id
+    truncated = False
+
+    while current_id and len(chain) < max_depth:
+        if current_id in visited:
+            break
+        visited.add(current_id)
+        row = await get_session_row(session, current_id)
+        if row is None:
+            break
+        if row.conversation_id != conversation_id:
+            break
+        # Only follow root sessions (skip delegation sub-sessions)
+        if row.parent_session_id is not None:
+            break
+        chain.append(row)
+        current_id = row.previous_session_id
+
+    if current_id and current_id not in visited:
+        truncated = True
+
+    chain.reverse()
+    return chain, truncated
 
 
 async def delete_conversation(session: AsyncSession, conversation_id: str) -> int:
@@ -1809,10 +1854,150 @@ async def delete_skill(session: AsyncSession, skill_id: str) -> bool:
     row = await get_skill(session, skill_id)
     if row is None:
         return False
-    if row.source != "db":
+    if row.source not in ("db", "imported"):
         raise ValueError("Cannot delete file-sourced skills")
     await session.execute(delete(SkillRow).where(SkillRow.skill_id == skill_id))
     return True
+
+
+async def get_skill_scoped(
+    session: AsyncSession, skill_id: str, *, owner_email: str | None = None
+) -> SkillRow | None:
+    """Get a skill by ID with owner scoping.
+
+    Returns the skill only if it belongs to the given owner or is global
+    (owner_email is None).  This fixes the original unscoped get_skill.
+    """
+    stmt = select(SkillRow).where(SkillRow.skill_id == skill_id)
+    if owner_email is not None:
+        stmt = stmt.where(
+            sa.or_(SkillRow.owner_email == owner_email, SkillRow.owner_email.is_(None))
+        )
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
+
+
+# --- Skill Versions ---
+
+
+async def create_skill_version(
+    session: AsyncSession,
+    *,
+    version_id: str | None = None,
+    skill_id: str,
+    version_number: int,
+    content_hash: str,
+    instructions: str,
+    tools: list[dict[str, Any]] | None = None,
+    prompt_templates: dict[str, Any] | None = None,
+    secret_placeholders: list[str] | None = None,
+    source_url: str | None = None,
+    resolved_url: str | None = None,
+    commit_sha: str | None = None,
+    import_checksum: str | None = None,
+    imported_at: Any | None = None,
+    import_format: str | None = None,
+    asset_manifest: list[dict[str, Any]] | None = None,
+    schema_version: int = 1,
+) -> SkillVersionRow:
+    """Create an immutable skill version record."""
+    row = SkillVersionRow(
+        version_id=version_id or f"sv_{uuid.uuid4().hex[:12]}",
+        skill_id=skill_id,
+        version_number=version_number,
+        content_hash=content_hash,
+        schema_version=schema_version,
+        instructions=instructions,
+        tools=tools,
+        prompt_templates=prompt_templates,
+        secret_placeholders=secret_placeholders,
+        source_url=source_url,
+        resolved_url=resolved_url,
+        commit_sha=commit_sha,
+        import_checksum=import_checksum,
+        imported_at=imported_at,
+        import_format=import_format,
+        asset_manifest=asset_manifest,
+    )
+    session.add(row)
+    await session.flush()
+    return row
+
+
+async def get_skill_version(session: AsyncSession, version_id: str) -> SkillVersionRow | None:
+    """Get a skill version by ID."""
+    result = await session.execute(
+        select(SkillVersionRow).where(SkillVersionRow.version_id == version_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def list_skill_versions(session: AsyncSession, skill_id: str) -> list[SkillVersionRow]:
+    """List all versions of a skill, ordered by version number descending."""
+    result = await session.execute(
+        select(SkillVersionRow)
+        .where(SkillVersionRow.skill_id == skill_id)
+        .order_by(SkillVersionRow.version_number.desc())
+    )
+    return list(result.scalars().all())
+
+
+async def get_next_version_number(session: AsyncSession, skill_id: str) -> int:
+    """Get the next version number for a skill."""
+    result = await session.execute(
+        select(sa.func.max(SkillVersionRow.version_number)).where(
+            SkillVersionRow.skill_id == skill_id
+        )
+    )
+    current_max = result.scalar_one_or_none()
+    return (current_max or 0) + 1
+
+
+async def set_current_version(session: AsyncSession, skill_id: str, version_id: str) -> bool:
+    """Set the current version of a skill (atomic publish)."""
+    result = await session.execute(
+        update(SkillRow).where(SkillRow.skill_id == skill_id).values(current_version_id=version_id)
+    )
+    return result.rowcount > 0
+
+
+# --- Skill Assets ---
+
+
+async def create_skill_asset(
+    session: AsyncSession,
+    *,
+    asset_id: str | None = None,
+    skill_version_id: str,
+    filename: str,
+    artifact_namespace: str = "skills",
+    artifact_object_id: str,
+    content_hash: str,
+    size_bytes: int = 0,
+    content_type: str = "application/octet-stream",
+) -> SkillAssetRow:
+    """Create a skill asset record linked to the artifact store."""
+    row = SkillAssetRow(
+        asset_id=asset_id or f"sa_{uuid.uuid4().hex[:12]}",
+        skill_version_id=skill_version_id,
+        filename=filename,
+        artifact_namespace=artifact_namespace,
+        artifact_object_id=artifact_object_id,
+        content_hash=content_hash,
+        size_bytes=size_bytes,
+        content_type=content_type,
+    )
+    session.add(row)
+    await session.flush()
+    return row
+
+
+async def list_skill_assets(session: AsyncSession, skill_version_id: str) -> list[SkillAssetRow]:
+    """List all assets for a skill version."""
+    result = await session.execute(
+        select(SkillAssetRow).where(SkillAssetRow.skill_version_id == skill_version_id)
+    )
+    return list(result.scalars().all())
 
 
 # --- Executors ---

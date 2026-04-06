@@ -39,6 +39,7 @@ from cognis.store.queries import (
     get_artifact_record,
     get_conversation,
     get_latest_active_conversation_for_agent,
+    get_root_session_chain,
     get_session_row,
     list_conversation_sessions,
     list_conversations,
@@ -249,30 +250,133 @@ async def conversation_messages(
         require_owner_or_admin(request, row.user_email)
         if row.active_session_id is None:
             return MessageHistoryResponse(items=[], last_seq=0, has_more=False)
-        session_row = await get_session_row(session, row.active_session_id)
-    if session_row is None:
-        return MessageHistoryResponse(items=[], last_seq=0, has_more=False)
-    event_result = await request.app.state.providers.guardrails.read_events(
-        session_id=session_row.intaris_session_id or session_row.session_id,
-        after_seq=after_seq,
-        limit=limit,
-        allow_missing_stream=True,
-    )
-    if event_result.missing_stream_fallback_used:
-        logger.warning(
-            "Conversation history missing in Intaris; returning empty history",
-            extra={
-                "extra_data": {
-                    "conversation_id": conversation_id,
-                    "session_id": session_row.session_id,
-                    "intaris_session_id": session_row.intaris_session_id or session_row.session_id,
-                }
-            },
-        )
 
+        # Incremental fetch (after_seq > 0): read only the active session.
+        # Full load (after_seq == 0): walk the root-session lineage and
+        # merge events from all root sessions (oldest first).
+        lineage_truncated = False
+        if after_seq > 0:
+            session_row = await get_session_row(session, row.active_session_id)
+            session_rows = [session_row] if session_row is not None else []
+        else:
+            session_rows, lineage_truncated = await get_root_session_chain(
+                session, conversation_id, row.active_session_id
+            )
+
+    if not session_rows:
+        return MessageHistoryResponse(items=[], last_seq=0, has_more=False)
+
+    guardrails = request.app.state.providers.guardrails
+
+    # Read events from each session in the chain (parallel for full load)
+    all_events: list[dict[str, Any]] = []
+    last_seq_value = 0
+    has_more = False
+
+    if after_seq > 0:
+        # Incremental: single session read
+        sr = session_rows[0]
+        event_result = await guardrails.read_events(
+            session_id=sr.intaris_session_id or sr.session_id,
+            after_seq=after_seq,
+            limit=limit,
+            allow_missing_stream=True,
+        )
+        if event_result.missing_stream_fallback_used:
+            logger.warning(
+                "Conversation history missing in Intaris; returning empty history",
+                extra={
+                    "extra_data": {
+                        "conversation_id": conversation_id,
+                        "session_id": sr.session_id,
+                        "intaris_session_id": sr.intaris_session_id or sr.session_id,
+                    }
+                },
+            )
+        all_events = list(event_result.events)
+        last_seq_value = event_result.last_seq
+        has_more = event_result.has_more
+    else:
+        # Full load: read all sessions in parallel
+        import asyncio as _asyncio
+
+        async def _read_session(sr: Any) -> tuple[Any, list[dict[str, Any]]]:
+            try:
+                result = await guardrails.read_events(
+                    session_id=sr.intaris_session_id or sr.session_id,
+                    after_seq=0,
+                    limit=0,
+                    allow_missing_stream=True,
+                )
+                if result.missing_stream_fallback_used:
+                    logger.warning(
+                        "Session stream missing in Intaris during lineage read",
+                        extra={
+                            "extra_data": {
+                                "conversation_id": conversation_id,
+                                "session_id": sr.session_id,
+                            }
+                        },
+                    )
+                    return sr, [
+                        {
+                            "type": "history_gap",
+                            "data": {
+                                "reason": "stream_missing",
+                                "session_id": sr.session_id,
+                            },
+                            "seq": 0,
+                            "ts": None,
+                        }
+                    ]
+                return sr, list(result.events)
+            except Exception:
+                logger.warning(
+                    "Failed to read session events during lineage walk",
+                    extra={
+                        "extra_data": {
+                            "conversation_id": conversation_id,
+                            "session_id": sr.session_id,
+                        }
+                    },
+                    exc_info=True,
+                )
+                return sr, [
+                    {
+                        "type": "history_gap",
+                        "data": {
+                            "reason": "read_failed",
+                            "session_id": sr.session_id,
+                        },
+                        "seq": 0,
+                        "ts": None,
+                    }
+                ]
+
+        results = await _asyncio.gather(*[_read_session(sr) for sr in session_rows])
+
+        if lineage_truncated:
+            all_events.append(
+                {
+                    "type": "history_gap",
+                    "data": {"reason": "lineage_truncated"},
+                    "seq": 0,
+                    "ts": None,
+                }
+            )
+
+        for _sr, events in results:
+            all_events.extend(events)
+
+        # For full loads, return the full lineage history and let the
+        # client switch to incremental mode afterward using the active
+        # session's seq space. Avoid single-session cursor semantics here.
+        has_more = False
+
+    # Enrich attachment URLs
     artifact_store = request.app.state.artifact_store
     async with request.app.state.session_factory() as artifact_session:
-        for event in event_result.events:
+        for event in all_events:
             data = event.get("data") if isinstance(event, dict) else None
             attachments = data.get("attachments") if isinstance(data, dict) else None
             if not isinstance(attachments, list):
@@ -284,34 +388,35 @@ async def conversation_messages(
                 artifact_id = attachment.get("artifact_id")
                 if not isinstance(artifact_id, str):
                     continue
-                row = await get_artifact_record(artifact_session, artifact_id)
-                if row is None or row.status == "deleted":
+                artifact_row = await get_artifact_record(artifact_session, artifact_id)
+                if artifact_row is None or artifact_row.status == "deleted":
                     continue
                 refreshed.append(
                     {
                         **attachment,
-                        "filename": row.filename,
-                        "mime_type": row.mime_type,
-                        "size_bytes": row.size_bytes,
+                        "filename": artifact_row.filename,
+                        "mime_type": artifact_row.mime_type,
+                        "size_bytes": artifact_row.size_bytes,
                         "url": await artifact_store.async_get_signed_url(
-                            row.namespace,
-                            row.object_id,
-                            row.filename,
+                            artifact_row.namespace,
+                            artifact_row.object_id,
+                            artifact_row.filename,
                         ),
                     }
                 )
             data["attachments"] = refreshed
+
     return MessageHistoryResponse(
         items=serialize_event_rows(
-            event_result.events,
+            all_events,
             log_label="conversation_messages",
             log_context={
                 "conversation_id": conversation_id,
-                "session_id": session_row.session_id,
+                "session_id": session_rows[-1].session_id if session_rows else "",
             },
         ),
-        last_seq=event_result.last_seq,
-        has_more=event_result.has_more,
+        last_seq=last_seq_value,
+        has_more=has_more,
     )
 
 

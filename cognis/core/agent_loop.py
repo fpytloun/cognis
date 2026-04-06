@@ -918,17 +918,10 @@ class AgentLoop:
 
                 # Update child session status — guarded
                 try:
-                    async with self.session_manager.session_factory() as db:
-                        from cognis.store.queries import set_session_status
-
-                        await set_session_status(
-                            db,
-                            child_session_id,
-                            "completed",
-                            completed_at=datetime.now(UTC),
-                            result_summary=result_summary,
-                        )
-                        await db.commit()
+                    await self.session_manager.mark_completed(
+                        child_session_id,
+                        result_summary=result_summary,
+                    )
                 except Exception:
                     logger.warning(
                         "delegation: failed to update child session status",
@@ -997,17 +990,10 @@ class AgentLoop:
                 )
                 # Each operation guarded independently
                 try:
-                    async with self.session_manager.session_factory() as db:
-                        from cognis.store.queries import set_session_status
-
-                        await set_session_status(
-                            db,
-                            child_session_id,
-                            "failed",
-                            completed_at=datetime.now(UTC),
-                            result_summary="Delegation failed",
-                        )
-                        await db.commit()
+                    await self.session_manager.mark_failed(
+                        child_session_id,
+                        result_summary="Delegation failed",
+                    )
                 except Exception:
                     logger.warning(
                         "delegation: failed to mark child session as failed", exc_info=True
@@ -2442,7 +2428,7 @@ class AgentLoop:
 
     async def _handle_subsession_management(self, tc: ToolCall, *, ctx: StepContext) -> ToolResult:
         """Handle list_subsessions, get_subsession, cancel_subsession."""
-        from cognis.store.queries import get_session_row, list_child_sessions, set_session_status
+        from cognis.store.queries import get_session_row, list_child_sessions
 
         parent_session_id = ctx.session.session_id
 
@@ -2531,16 +2517,11 @@ class AgentLoop:
                 child_task = active_children.pop(cancel_id, None)
             if child_task and not child_task.done():
                 child_task.cancel()
-            # Mark as failed in DB
-            async with self.session_manager.session_factory() as db:
-                await set_session_status(
-                    db,
-                    cancel_id,
-                    "failed",
-                    completed_at=datetime.now(UTC),
-                    result_summary="Cancelled by parent session",
-                )
-                await db.commit()
+            # Mark as failed in DB + sync to Intaris
+            await self.session_manager.mark_failed(
+                cancel_id,
+                result_summary="Cancelled by parent session",
+            )
             return ToolResult(
                 output=json.dumps({"status": "cancelled", "session_id": cancel_id}),
             )
