@@ -361,12 +361,14 @@ class BaseChannelAdapter(ABC):
                 if self._reconnect_attempts > _MAX_RECONNECT_ATTEMPTS:
                     self._set_status(ChannelStatus.ERROR)
                     logger.error(
-                        "channel adapter max reconnect attempts exceeded",
+                        "channel adapter max reconnect attempts exceeded: %s",
+                        self._last_error,
                         extra={
                             "extra_data": {
                                 "channel_type": self.channel_type,
                                 "account_id": self.account_id,
                                 "attempts": self._reconnect_attempts,
+                                "last_error": self._last_error,
                             }
                         },
                     )
@@ -379,13 +381,17 @@ class BaseChannelAdapter(ABC):
                 )
                 self._set_status(ChannelStatus.RECONNECTING)
                 logger.warning(
-                    "channel adapter reconnecting",
+                    "channel adapter reconnecting: %s (attempt %d, backoff %.1fs)",
+                    self._last_error,
+                    self._reconnect_attempts,
+                    backoff,
                     extra={
                         "extra_data": {
                             "channel_type": self.channel_type,
                             "account_id": self.account_id,
                             "attempt": self._reconnect_attempts,
                             "backoff_seconds": backoff,
+                            "last_error": self._last_error,
                         }
                     },
                 )
