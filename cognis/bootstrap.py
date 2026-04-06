@@ -167,6 +167,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_conversation_last_read_at)
         await conn.run_sync(_ensure_avatar_image_id_column)
         await conn.run_sync(_ensure_executor_runtime_state_columns)
+        await conn.run_sync(_ensure_skill_versioning_columns)
 
 
 def _ensure_session_lifecycle_columns(sync_conn: object) -> None:
@@ -361,6 +362,19 @@ def _ensure_avatar_image_id_column(sync_conn: object) -> None:
 
     if "avatar_image_id" not in columns:
         execute(text("ALTER TABLE agents ADD COLUMN avatar_image_id VARCHAR"))
+
+
+def _ensure_skill_versioning_columns(sync_conn: object) -> None:
+    """Add skill versioning columns for existing databases."""
+    inspector = cast(Any, inspect(sync_conn))
+    try:
+        columns = {column["name"] for column in inspector.get_columns("skills")}
+    except Exception:
+        return  # table doesn't exist yet (create_all will handle it)
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+
+    if "current_version_id" not in columns:
+        execute(text("ALTER TABLE skills ADD COLUMN current_version_id VARCHAR"))
 
 
 _SYSTEM_USER_EMAIL = "system@cognis.local"
