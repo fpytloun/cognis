@@ -512,7 +512,19 @@ class ContextAssembler:
                 }
             )
 
-        # Immutable prefix block 5: compaction summary (stable within session)
+        # Immutable prefix block 5: active skill instructions (stable within session)
+        # Skill instructions are injected in canonical order (agent-specified
+        # then auto_load alphabetical) to preserve prompt caching stability.
+        skill_instructions = self._get_skill_instructions(agent)
+        if skill_instructions:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": ("<active_skills>\n" + skill_instructions + "\n</active_skills>"),
+                }
+            )
+
+        # Immutable prefix block 6: compaction summary (stable within session)
         compaction_summary = cache_entry.last_compaction_summary
         if compaction_summary:
             messages.append(
@@ -832,6 +844,30 @@ class ContextAssembler:
             recommend_compaction=recommend_compaction,
             cache_breakpoint_index=cache_breakpoint_index,
         )
+
+    def _get_skill_instructions(self, agent: AgentDefinition) -> str | None:
+        """Get concatenated skill instructions from the session cache.
+
+        Returns ``None`` if no active skills have instructions.
+        The resolved skill set is cached in the session cache by the
+        runtime assembly layer.
+        """
+        if not isinstance(agent.skills, dict):
+            return None
+
+        # Check for cached resolved skill instructions
+        items = agent.skills.get("items")
+        if not isinstance(items, list):
+            return None
+
+        # Collect instructions from agent skill refs that have instructions
+        # embedded (set by runtime assembly before context assembly).
+        resolved_instructions = agent.skills.get("_resolved_instructions")
+        if isinstance(resolved_instructions, list) and resolved_instructions:
+            blocks = [s for s in resolved_instructions if isinstance(s, str) and s.strip()]
+            if blocks:
+                return "\n\n---\n\n".join(blocks)
+        return None
 
     def _count_static_tokens(
         self,

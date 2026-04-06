@@ -4,7 +4,9 @@
     BrainCircuit,
     ChevronDown,
     ChevronRight,
+    Download,
     GitBranch,
+    Import,
     ListChecks,
     Plus,
     Search,
@@ -39,8 +41,10 @@
 
   // Skill form state
   let showSkillForm = false;
+  let showImportForm = false;
   let editingSkill: Skill | null = null;
-  let skillForm = { name: '', description: '', instructions: '', tags: '' };
+  let skillForm = { name: '', description: '', instructions: '', tags: '', autoLoad: false };
+  let importForm = { url: '', name: '', tags: '', autoLoad: false };
 
   onMount(async () => {
     await loadData();
@@ -150,17 +154,26 @@
   function openSkillForm(skill?: Skill) {
     if (skill) {
       editingSkill = skill;
+      const ver = skill.current_version;
       skillForm = {
         name: skill.name,
         description: skill.description || '',
-        instructions: skill.instructions,
-        tags: (skill.tags || []).join(', ')
+        instructions: ver?.instructions || skill.instructions,
+        tags: (skill.tags || []).join(', '),
+        autoLoad: skill.auto_load
       };
     } else {
       editingSkill = null;
-      skillForm = { name: '', description: '', instructions: '', tags: '' };
+      skillForm = { name: '', description: '', instructions: '', tags: '', autoLoad: false };
     }
     showSkillForm = true;
+    showImportForm = false;
+  }
+
+  function openImportForm() {
+    importForm = { url: '', name: '', tags: '', autoLoad: false };
+    showImportForm = true;
+    showSkillForm = false;
   }
 
   async function saveSkill() {
@@ -171,7 +184,8 @@
           name: skillForm.name,
           description: skillForm.description || undefined,
           instructions: skillForm.instructions,
-          tags: tags.length ? tags : undefined
+          tags: tags.length ? tags : undefined,
+          auto_load: skillForm.autoLoad
         });
         addToast('Skill updated', 'success');
       } else {
@@ -179,7 +193,8 @@
           name: skillForm.name,
           description: skillForm.description || undefined,
           instructions: skillForm.instructions,
-          tags: tags.length ? tags : undefined
+          tags: tags.length ? tags : undefined,
+          auto_load: skillForm.autoLoad
         });
         addToast('Skill created', 'success');
       }
@@ -190,8 +205,47 @@
     }
   }
 
+  async function importSkill() {
+    if (!importForm.url.trim()) {
+      addToast('URL is required', 'error');
+      return;
+    }
+    const tags = importForm.tags.split(',').map(t => t.trim()).filter(Boolean);
+    try {
+      await api.skills.import({
+        url: importForm.url.trim(),
+        name: importForm.name.trim() || undefined,
+        tags: tags.length ? tags : undefined,
+        auto_load: importForm.autoLoad
+      });
+      addToast('Skill imported successfully', 'success');
+      showImportForm = false;
+      await loadData();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Failed to import skill';
+      addToast(msg, 'error');
+    }
+  }
+
+  async function exportSkill(skill: Skill, format: string = 'skill_md') {
+    try {
+      const result = await api.skills.export(skill.skill_id, format);
+      // Create download
+      const blob = new Blob([result.content], { type: 'text/plain' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = result.filename;
+      a.click();
+      URL.revokeObjectURL(url);
+      addToast('Skill exported', 'success');
+    } catch (err) {
+      addToast('Failed to export skill', 'error');
+    }
+  }
+
   async function deleteSkill(skill: Skill) {
-    if (skill.source !== 'db') {
+    if (skill.source !== 'db' && skill.source !== 'imported') {
       addToast('Cannot delete file-sourced skills', 'error');
       return;
     }
@@ -386,12 +440,65 @@
     <div class="space-y-4">
       <div class="flex justify-between items-center">
         <p class="text-sm text-zinc-400">
-          Skills are instruction + tool bundles that agents can load on demand.
+          Skills are versioned instruction + tool bundles that agents can load on demand.
         </p>
-        <Button variant="primary" size="sm" onclick={() => openSkillForm()}>
-          <Plus class="w-4 h-4 mr-1" /> New Skill
-        </Button>
+        <div class="flex gap-2">
+          <Button variant="ghost" size="sm" onclick={openImportForm}>
+            <Import class="w-4 h-4 mr-1" /> Import from URL
+          </Button>
+          <Button variant="primary" size="sm" onclick={() => openSkillForm()}>
+            <Plus class="w-4 h-4 mr-1" /> New Skill
+          </Button>
+        </div>
       </div>
+
+      {#if showImportForm}
+        <div class="bg-zinc-800 border border-zinc-700 rounded-lg p-4 space-y-4">
+          <h3 class="text-lg font-medium text-zinc-100">Import Skill from URL</h3>
+          <p class="text-sm text-zinc-400">
+            Import a SKILL.md file from GitHub or any URL. Supports Claude Code / Agent Skills format and Cognis YAML.
+          </p>
+          <label class="block text-sm text-zinc-400 space-y-1">
+            <span>URL</span>
+            <input
+              type="url"
+              bind:value={importForm.url}
+              class="w-full px-3 py-2 bg-zinc-900 border border-zinc-700 rounded-lg text-sm text-zinc-200 focus:outline-none focus:border-blue-500"
+              placeholder="https://github.com/user/repo/blob/main/skills/my-skill/SKILL.md"
+            />
+          </label>
+          <div class="grid grid-cols-2 gap-4">
+            <label class="block text-sm text-zinc-400 space-y-1">
+              <span>Name override (optional)</span>
+              <input
+                type="text"
+                bind:value={importForm.name}
+                class="w-full px-3 py-2 bg-zinc-900 border border-zinc-700 rounded-lg text-sm text-zinc-200 focus:outline-none focus:border-blue-500"
+                placeholder="Leave empty to use imported name"
+              />
+            </label>
+            <label class="block text-sm text-zinc-400 space-y-1">
+              <span>Tags (comma-separated)</span>
+              <input
+                type="text"
+                bind:value={importForm.tags}
+                class="w-full px-3 py-2 bg-zinc-900 border border-zinc-700 rounded-lg text-sm text-zinc-200 focus:outline-none focus:border-blue-500"
+                placeholder="e.g. imported, claude"
+              />
+            </label>
+          </div>
+          <label class="flex items-center gap-2 text-sm text-zinc-400">
+            <input type="checkbox" bind:checked={importForm.autoLoad} class="rounded border-zinc-600" />
+            Auto-load for all agents
+          </label>
+          <div class="flex gap-2 justify-end">
+            <Button variant="ghost" size="sm" onclick={() => showImportForm = false}>Cancel</Button>
+            <Button variant="primary" size="sm" onclick={importSkill} disabled={!importForm.url.trim()}>
+              Import
+            </Button>
+          </div>
+        </div>
+      {/if}
 
       {#if showSkillForm}
         <div class="bg-zinc-800 border border-zinc-700 rounded-lg p-4 space-y-4">
@@ -436,6 +543,10 @@
               placeholder="# Skill Instructions&#10;&#10;Detailed instructions for the agent..."
             ></textarea>
           </label>
+          <label class="flex items-center gap-2 text-sm text-zinc-400">
+            <input type="checkbox" bind:checked={skillForm.autoLoad} class="rounded border-zinc-600" />
+            Auto-load for all agents
+          </label>
           <div class="flex gap-2 justify-end">
             <Button variant="ghost" size="sm" onclick={() => showSkillForm = false}>Cancel</Button>
             <Button variant="primary" size="sm" onclick={saveSkill} disabled={!skillForm.name || !skillForm.instructions}>
@@ -477,7 +588,14 @@
                   {/if}
                 </div>
                 <div class="flex gap-1">
-                  {#if skill.source === 'db'}
+                  <button
+                    class="p-1.5 text-zinc-400 hover:text-zinc-200 rounded"
+                    onclick={() => exportSkill(skill)}
+                    title="Export as SKILL.md"
+                  >
+                    <Download class="w-4 h-4" />
+                  </button>
+                  {#if skill.source === 'db' || skill.source === 'imported'}
                     <button
                       class="p-1.5 text-zinc-400 hover:text-zinc-200 rounded"
                       onclick={() => openSkillForm(skill)}
@@ -497,6 +615,22 @@
                   {/if}
                 </div>
               </div>
+              <!-- Version and provenance info -->
+              {#if skill.current_version}
+                <div class="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-zinc-500">
+                  <span>Version: <span class="text-zinc-400">v{skill.current_version.version_number}</span></span>
+                  <span>Hash: <span class="font-mono text-zinc-400">{skill.current_version.content_hash.slice(0, 8)}</span></span>
+                  {#if skill.current_version.tools && skill.current_version.tools.length > 0}
+                    <span>Tools: <span class="text-zinc-400">{skill.current_version.tools.length}</span></span>
+                  {/if}
+                  {#if skill.current_version.source_url}
+                    <span>Imported from: <span class="text-zinc-400 truncate max-w-[200px] inline-block align-bottom" title={skill.current_version.source_url}>{skill.current_version.source_url}</span></span>
+                  {/if}
+                  {#if skill.current_version.asset_manifest && skill.current_version.asset_manifest.length > 0}
+                    <span>Assets: <span class="text-zinc-400">{skill.current_version.asset_manifest.length}</span></span>
+                  {/if}
+                </div>
+              {/if}
             </div>
           {/each}
         </div>

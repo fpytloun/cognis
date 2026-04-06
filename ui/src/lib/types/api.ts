@@ -486,6 +486,26 @@ export interface ExecutorTokenResponse {
   expires_in: number;
 }
 
+export interface SkillVersion {
+  version_id: string;
+  skill_id: string;
+  version_number: number;
+  content_hash: string;
+  schema_version: number;
+  instructions: string;
+  tools: Record<string, unknown>[] | null;
+  prompt_templates: Record<string, unknown> | null;
+  secret_placeholders: string[] | null;
+  source_url: string | null;
+  resolved_url: string | null;
+  commit_sha: string | null;
+  import_checksum: string | null;
+  imported_at: string | null;
+  import_format: string | null;
+  asset_manifest: Record<string, unknown>[] | null;
+  created_at: string | null;
+}
+
 export interface Skill {
   skill_id: string;
   name: string;
@@ -496,6 +516,8 @@ export interface Skill {
   tags: string[] | null;
   auto_load: boolean;
   source: string;
+  current_version_id: string | null;
+  current_version: SkillVersion | null;
   owner_email: string | null;
   created_at: string | null;
   updated_at: string | null;
@@ -509,6 +531,7 @@ export interface SkillCreate {
   prompt_templates?: Record<string, unknown>;
   tags?: string[];
   auto_load?: boolean;
+  secret_placeholders?: string[];
 }
 
 export interface SkillUpdate {
@@ -519,6 +542,22 @@ export interface SkillUpdate {
   prompt_templates?: Record<string, unknown>;
   tags?: string[];
   auto_load?: boolean;
+  secret_placeholders?: string[];
+}
+
+export interface SkillImportRequest {
+  url?: string;
+  content?: string;
+  format?: string;
+  name?: string;
+  tags?: string[];
+  auto_load?: boolean;
+}
+
+export interface SkillExportResponse {
+  format: string;
+  content: string;
+  filename: string;
 }
 
 export interface TaskDelivery {

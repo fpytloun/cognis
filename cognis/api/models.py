@@ -665,6 +665,26 @@ class MCPServerTestResponse(BaseModel):
     items: list[MCPServerTestItemResponse] = Field(default_factory=list)
 
 
+class SkillVersionResponse(BaseModel):
+    version_id: str
+    skill_id: str
+    version_number: int
+    content_hash: str
+    schema_version: int = 1
+    instructions: str
+    tools: list[dict[str, Any]] | None = None
+    prompt_templates: dict[str, Any] | None = None
+    secret_placeholders: list[str] | None = None
+    source_url: str | None = None
+    resolved_url: str | None = None
+    commit_sha: str | None = None
+    import_checksum: str | None = None
+    imported_at: datetime | None = None
+    import_format: str | None = None
+    asset_manifest: list[dict[str, Any]] | None = None
+    created_at: datetime | None = None
+
+
 class SkillResponse(BaseModel):
     skill_id: str
     name: str
@@ -675,6 +695,8 @@ class SkillResponse(BaseModel):
     tags: list[str] | None = None
     auto_load: bool = False
     source: str = "db"
+    current_version_id: str | None = None
+    current_version: SkillVersionResponse | None = None
     owner_email: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
@@ -688,6 +710,7 @@ class SkillCreateRequest(BaseModel):
     prompt_templates: dict[str, Any] | None = None
     tags: list[str] | None = None
     auto_load: bool = False
+    secret_placeholders: list[str] | None = None
 
 
 class SkillUpdateRequest(BaseModel):
@@ -698,6 +721,22 @@ class SkillUpdateRequest(BaseModel):
     prompt_templates: dict[str, Any] | None = None
     tags: list[str] | None = None
     auto_load: bool | None = None
+    secret_placeholders: list[str] | None = None
+
+
+class SkillImportRequest(BaseModel):
+    url: str | None = None
+    content: str | None = None
+    format: str | None = None
+    name: str | None = None
+    tags: list[str] | None = None
+    auto_load: bool = False
+
+
+class SkillExportResponse(BaseModel):
+    format: str
+    content: str
+    filename: str
 
 
 class ExecutorStatusResponse(BaseModel):

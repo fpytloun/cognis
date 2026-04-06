@@ -1,4 +1,4 @@
-import type { Agent, LLMProvider, SecretMetadata, ToolDefinitionSummary, Workflow } from '$lib/types/api';
+import type { Agent, LLMProvider, SecretMetadata, Skill, ToolDefinitionSummary, Workflow } from '$lib/types/api';
 
 export interface MCPEnvVar {
   key: string;
@@ -47,6 +47,7 @@ export interface AgentFormState {
   executorSelector: string;
   disabledCategories: string[];
   disabledTools: string[];
+  selectedSkillIds: string[];
 }
 
 const DEFAULT_SYSTEM_PROMPT = `You are {name}, an AI assistant.
@@ -106,7 +107,8 @@ export function createEmptyAgentForm(workflows: Workflow[] = []): AgentFormState
     executorId: '',
     executorSelector: '',
     disabledCategories: [],
-    disabledTools: []
+    disabledTools: [],
+    selectedSkillIds: []
   };
 }
 
@@ -198,8 +200,21 @@ export function agentToFormState(agent: Agent): AgentFormState {
     disabledTools: Array.isArray(tools.disabled_tools)
       ? tools.disabled_tools.filter((value): value is string => typeof value === 'string')
       : [],
+    selectedSkillIds: extractSkillIds(agent.skills),
     originalTools: tools
   };
+}
+
+function extractSkillIds(skills: Record<string, unknown> | null): string[] {
+  if (!skills || typeof skills !== 'object') return [];
+  const items = (skills as Record<string, unknown>).items;
+  if (!Array.isArray(items)) return [];
+  return items
+    .filter((item): item is Record<string, unknown> =>
+      typeof item === 'object' && item !== null && typeof (item as Record<string, unknown>).skill_id === 'string' && !('tool_names' in (item as Record<string, unknown>))
+    )
+    .filter((item) => item.enabled !== false)
+    .map((item) => String(item.skill_id));
 }
 
 function nonEmptyLines(value: string): string[] {
@@ -279,6 +294,11 @@ export function formStateToPayload(form: AgentFormState): Record<string, unknown
         ? { intaris_mcp_servers: form.intarisMcpServers }
         : {})
     },
+    skills: form.selectedSkillIds.length > 0
+      ? {
+          items: form.selectedSkillIds.map((id) => ({ skill_id: id, enabled: true }))
+        }
+      : null,
     llm_config: {
       provider_id: form.providerId || undefined,
       model: form.model || undefined,
@@ -306,7 +326,8 @@ export function formStateToEffectiveToolsPreviewPayload(form: AgentFormState): R
     agent_id: payload.agent_id ?? null,
     tools: payload.tools,
     permissions: payload.permissions,
-    execution: payload.execution
+    execution: payload.execution,
+    skills: payload.skills ?? {}
   };
 }
 

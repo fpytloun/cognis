@@ -20,6 +20,10 @@ from cognis.store.queries import get_setting_value
 from cognis.tools.builtin.image import handle_image_tool, is_image_tool
 from cognis.tools.builtin.memory import handle_memory_tool, is_memory_tool
 from cognis.tools.builtin.orchestration import handle_delegate_tool_call, is_orchestration_tool
+from cognis.tools.builtin.skill_management import (
+    handle_skill_management_tool,
+    is_skill_management_tool,
+)
 from cognis.tools.builtin.tool_output import handle_tool_output_tool, is_tool_output_tool
 from cognis.tools.registry import ToolRegistry
 
@@ -49,6 +53,7 @@ class ToolRoute(StrEnum):
     MEMORY = "memory"
     TOOL_OUTPUT = "tool_output"
     IMAGE = "image"
+    SKILL_MANAGEMENT = "skill_management"
     INTARIS_MCP = "intaris_mcp"
     LOCAL = "local"
     UNKNOWN = "unknown"
@@ -78,12 +83,14 @@ class ToolRouter:
         tool_output_store: Any | None = None,
         image_generation_provider: Any | None = None,
         artifact_store: Any | None = None,
+        session_factory: Any | None = None,
     ) -> None:
         self.guardrails = guardrails
         self.memory = memory
         self.tool_output_store = tool_output_store
         self.image_generation_provider = image_generation_provider
         self.artifact_store = artifact_store
+        self._session_factory = session_factory
         self.non_bypassable_patterns = non_bypassable_patterns or []
 
     @classmethod
@@ -107,6 +114,7 @@ class ToolRouter:
             tool_output_store=tool_output_store,
             image_generation_provider=image_generation_provider,
             artifact_store=artifact_store,
+            session_factory=session_factory,
         )
 
     def classify(self, tool_name: str, registry: ToolRegistry) -> ToolRoute:
@@ -120,6 +128,8 @@ class ToolRouter:
             return ToolRoute.TOOL_OUTPUT
         if is_image_tool(tool_name):
             return ToolRoute.IMAGE
+        if is_skill_management_tool(tool_name):
+            return ToolRoute.SKILL_MANAGEMENT
         registered_tool = registry.get(tool_name)
         if registered_tool is None:
             return ToolRoute.UNKNOWN
@@ -280,6 +290,63 @@ class ToolRouter:
             ).inc()
             TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome=outcome).inc()
             return self._sanitize_result(tool_call.name, result, 100_000, call_id=cid)
+        if route is ToolRoute.SKILL_MANAGEMENT:
+            # Skill management mutations go through guardrails evaluation
+            # (non-bypassable tools are always evaluated).
+            decision = await self.evaluate_tool_call(tool_call, agent, session, registry)
+            eval_meta: dict[str, Any] = {
+                "decision": decision.decision,
+                "reasoning": decision.reasoning,
+                "source": decision.source,
+                "risk": decision.risk,
+                "path": decision.path,
+                "latency_ms": decision.latency_ms,
+                "call_id": decision.call_id,
+            }
+            if decision.decision == "deny":
+                TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome="denied").inc()
+                return self._sanitize_result(
+                    tool_call.name,
+                    ToolResult(
+                        output=decision.reasoning or "Skill operation denied.",
+                        is_error=True,
+                        metadata={"evaluation": eval_meta},
+                    ),
+                    50_000,
+                    call_id=cid,
+                )
+            if decision.decision == "escalate":
+                TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome="escalated").inc()
+                return self._sanitize_result(
+                    tool_call.name,
+                    ToolResult(
+                        output=decision.reasoning or "Skill operation requires user approval.",
+                        is_error=True,
+                        metadata={"evaluation": eval_meta},
+                    ),
+                    50_000,
+                    call_id=cid,
+                )
+            if self._session_factory is None:
+                result = ToolResult(output="Skill management not available.", is_error=True)
+            else:
+                from cognis.runtime_context import current_user_email
+
+                result = await handle_skill_management_tool(
+                    tool_name=tool_call.name,
+                    arguments=dict(tool_call.arguments),
+                    session_factory=self._session_factory,
+                    user_email=current_user_email.get(),
+                )
+            if result.metadata is None:
+                result = result.model_copy(update={"metadata": {"evaluation": eval_meta}})
+            else:
+                result = result.model_copy(
+                    update={"metadata": {**result.metadata, "evaluation": eval_meta}}
+                )
+            outcome = "success" if not result.is_error else "failure"
+            TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome=outcome).inc()
+            return self._sanitize_result(tool_call.name, result, 50_000, call_id=cid)
         if route is ToolRoute.INTARIS_MCP:
             result = await self._call_intaris_mcp(tool_call, session, registry)
             TOOL_ROUTE_OUTCOMES.labels(

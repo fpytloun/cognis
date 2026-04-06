@@ -445,7 +445,16 @@ class MCPServerRow(Base):
 
 
 class SkillRow(Base):
-    """DB-managed skill definitions (instruction + tool bundles)."""
+    """DB-managed skill definitions (logical skill record).
+
+    The ``skills`` table is the logical skill record.  Versioned content
+    (instructions, tools, templates, assets) lives in ``skill_versions``.
+    The ``current_version_id`` points to the active published version.
+
+    Legacy fields (instructions, tools, prompt_templates) are kept for
+    backward compatibility with existing data but new content should be
+    stored via ``SkillVersionRow``.
+    """
 
     __tablename__ = "skills"
 
@@ -458,6 +467,7 @@ class SkillRow(Base):
     tags: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
     auto_load: Mapped[bool] = mapped_column(nullable=False, default=False, server_default="0")
     source: Mapped[str] = mapped_column(String, nullable=False, default="db")
+    current_version_id: Mapped[str | None] = mapped_column(String, nullable=True)
     owner_email: Mapped[str | None] = mapped_column(
         String, ForeignKey("users.email"), nullable=True
     )
@@ -467,6 +477,76 @@ class SkillRow(Base):
     updated_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
     )
+
+
+class SkillVersionRow(Base):
+    """Immutable skill version record.
+
+    Each version captures a snapshot of instructions, tool definitions,
+    prompt templates, import provenance, and an asset manifest.  The
+    ``content_hash`` is a SHA-256 of the canonical content for
+    deduplication and integrity verification.
+    """
+
+    __tablename__ = "skill_versions"
+
+    version_id: Mapped[str] = mapped_column(String, primary_key=True)
+    skill_id: Mapped[str] = mapped_column(
+        String, ForeignKey("skills.skill_id", ondelete="CASCADE"), nullable=False
+    )
+    version_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    content_hash: Mapped[str] = mapped_column(String, nullable=False)
+    schema_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    instructions: Mapped[str] = mapped_column(Text, nullable=False)
+    tools: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
+    prompt_templates: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    secret_placeholders: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    # Import provenance
+    source_url: Mapped[str | None] = mapped_column(String, nullable=True)
+    resolved_url: Mapped[str | None] = mapped_column(String, nullable=True)
+    commit_sha: Mapped[str | None] = mapped_column(String, nullable=True)
+    import_checksum: Mapped[str | None] = mapped_column(String, nullable=True)
+    imported_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    import_format: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Asset manifest (list of {filename, asset_id, content_hash, size_bytes, content_type})
+    asset_manifest: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+
+    __table_args__ = (
+        UniqueConstraint("skill_id", "version_number", name="uq_skill_version_number"),
+        Index("ix_skill_versions_skill_id", "skill_id"),
+    )
+
+
+class SkillAssetRow(Base):
+    """Skill asset linked to artifact store.
+
+    Each asset belongs to a specific skill version and references an
+    object in the Cognis artifact store.  Assets are staged to executor
+    temp storage only when needed for active skill tools.
+    """
+
+    __tablename__ = "skill_assets"
+
+    asset_id: Mapped[str] = mapped_column(String, primary_key=True)
+    skill_version_id: Mapped[str] = mapped_column(
+        String, ForeignKey("skill_versions.version_id", ondelete="CASCADE"), nullable=False
+    )
+    filename: Mapped[str] = mapped_column(String, nullable=False)
+    artifact_namespace: Mapped[str] = mapped_column(String, nullable=False, default="skills")
+    artifact_object_id: Mapped[str] = mapped_column(String, nullable=False)
+    content_hash: Mapped[str] = mapped_column(String, nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    content_type: Mapped[str] = mapped_column(
+        String, nullable=False, default="application/octet-stream"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+
+    __table_args__ = (Index("ix_skill_assets_version_id", "skill_version_id"),)
 
 
 class NotificationRow(Base):

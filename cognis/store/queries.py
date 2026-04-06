@@ -1834,28 +1834,53 @@ async def create_skill(
 async def update_skill(
     session: AsyncSession,
     skill_id: str,
+    *,
+    owner_email: str | None = None,
     **kwargs: Any,
 ) -> SkillRow | None:
-    """Update a skill by ID."""
-    row = await get_skill(session, skill_id)
+    """Update a skill by ID.
+
+    When ``owner_email`` is provided, only skills owned by that user or
+    with ``source='db'``/``source='imported'`` can be updated.  Global
+    skills (owner_email is None) cannot be mutated by non-owners.
+    """
+    if owner_email is not None:
+        row = await get_skill_scoped(session, skill_id, owner_email=owner_email)
+    else:
+        row = await get_skill(session, skill_id)
     if row is None:
         return None
-    if row.source != "db":
+    if row.source not in ("db", "imported"):
         raise ValueError("Cannot update file-sourced skills")
+    # Prevent non-owners from mutating global skills
+    if owner_email is not None and row.owner_email is None:
+        raise ValueError("Cannot modify global skills")
     for key, value in kwargs.items():
-        if hasattr(row, key):
+        if hasattr(row, key) and key != "owner_email":
             setattr(row, key, value)
     await session.flush()
     return row
 
 
-async def delete_skill(session: AsyncSession, skill_id: str) -> bool:
-    """Delete a skill by ID. Only DB-managed skills can be deleted."""
-    row = await get_skill(session, skill_id)
+async def delete_skill(
+    session: AsyncSession, skill_id: str, *, owner_email: str | None = None
+) -> bool:
+    """Delete a skill by ID.
+
+    Only DB-managed or imported skills can be deleted.  When
+    ``owner_email`` is provided, global skills (owner_email is None)
+    cannot be deleted by non-owners.
+    """
+    if owner_email is not None:
+        row = await get_skill_scoped(session, skill_id, owner_email=owner_email)
+    else:
+        row = await get_skill(session, skill_id)
     if row is None:
         return False
     if row.source not in ("db", "imported"):
         raise ValueError("Cannot delete file-sourced skills")
+    if owner_email is not None and row.owner_email is None:
+        raise ValueError("Cannot delete global skills")
     await session.execute(delete(SkillRow).where(SkillRow.skill_id == skill_id))
     return True
 
@@ -1943,7 +1968,14 @@ async def list_skill_versions(session: AsyncSession, skill_id: str) -> list[Skil
 
 
 async def get_next_version_number(session: AsyncSession, skill_id: str) -> int:
-    """Get the next version number for a skill."""
+    """Get the next version number for a skill.
+
+    Locks the parent skill row (FOR UPDATE) to serialize concurrent
+    version creation.  This works on both SQLite (no-op lock) and
+    PostgreSQL (row-level lock).
+    """
+    # Lock the parent skill row to serialize concurrent version writes
+    await session.execute(select(SkillRow).where(SkillRow.skill_id == skill_id).with_for_update())
     result = await session.execute(
         select(sa.func.max(SkillVersionRow.version_number)).where(
             SkillVersionRow.skill_id == skill_id

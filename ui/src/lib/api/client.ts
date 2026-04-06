@@ -43,7 +43,10 @@ import type {
   SettingsCategory,
   Skill,
   SkillCreate,
+  SkillExportResponse,
+  SkillImportRequest,
   SkillUpdate,
+  SkillVersion,
   SystemDiagnostics,
   StepRun,
   Task,
@@ -686,6 +689,18 @@ export const api = {
 
     delete(skillId: string): Promise<void> {
       return request<void>(`/api/v1/skills/${skillId}`, { method: 'DELETE' });
+    },
+
+    versions(skillId: string): Promise<SkillVersion[]> {
+      return request<SkillVersion[]>(`/api/v1/skills/${skillId}/versions`);
+    },
+
+    import(data: SkillImportRequest): Promise<Skill> {
+      return request<Skill>('/api/v1/skills/import', { method: 'POST', body: JSON.stringify(data) });
+    },
+
+    export(skillId: string, format: string = 'skill_md'): Promise<SkillExportResponse> {
+      return request<SkillExportResponse>(`/api/v1/skills/${skillId}/export?format=${format}`, { method: 'POST' });
     }
   },
 
