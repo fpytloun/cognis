@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 from prometheus_client import Counter, Histogram
@@ -849,6 +849,7 @@ class WorkflowEngine:
                             chat_id=chat_id,
                             thread_id=thread_id,
                             fallback_text=delivery_fallback_text,
+                            next_attempt_at=datetime.now(UTC) + timedelta(minutes=2),
                         )
                         await db_session.commit()
                         channel_deliverable = True
@@ -1357,6 +1358,7 @@ class WorkflowEngine:
                         chat_id=chat_id,
                         thread_id=thread_id,
                         fallback_text=delivery_fallback_text,
+                        next_attempt_at=datetime.now(UTC) + timedelta(minutes=2),
                     )
                     await db_session.commit()
                     channel_deliverable = True

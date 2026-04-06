@@ -2834,6 +2834,7 @@ async def create_channel_delivery_outbox(
     chat_id: str,
     thread_id: str | None,
     fallback_text: str | None,
+    next_attempt_at: datetime | None = None,
 ) -> ChannelDeliveryOutboxRow:
     row = ChannelDeliveryOutboxRow(
         delivery_id=delivery_id,
@@ -2848,6 +2849,7 @@ async def create_channel_delivery_outbox(
         thread_id=thread_id,
         fallback_text=fallback_text,
         status="pending",
+        next_attempt_at=next_attempt_at,
     )
     session.add(row)
     await session.flush()
