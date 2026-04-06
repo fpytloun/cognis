@@ -449,6 +449,7 @@ def create_app() -> FastAPI:
             pairing_service=pairing_service,
             channel_manager_ref=_get_channel_manager,
             command_dispatcher=command_dispatcher,
+            notification_service=notification_service,
         )
         channel_manager = ChannelManager(
             session_factory=session_factory,

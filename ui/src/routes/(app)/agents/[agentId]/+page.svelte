@@ -95,8 +95,15 @@
         }
       }
       Object.assign(form, agentToFormState(agent));
-      const preview = await api.agents.effectiveTools(agentIdFromRoute());
-      tools = preview.configured_state.tools;
+      // Load the full tool catalog without disabled filters so unchecked
+      // tools remain visible and can be re-enabled.
+      const fullCatalogPayload = formStateToEffectiveToolsPreviewPayload({
+        ...form,
+        disabledTools: [],
+        disabledCategories: [],
+      });
+      const fullCatalog = await api.agents.previewEffectiveTools(fullCatalogPayload);
+      tools = fullCatalog.configured_state.tools;
       loading = false;
       await tick(); // Let AgentForm mount and settle select bindings before capturing snapshot
       initialSnapshot = JSON.stringify($state.snapshot(form));
@@ -148,11 +155,18 @@
 
   $effect(() => {
     if (loading || !agent) return;
-    const payload = formStateToEffectiveToolsPreviewPayload(form);
+    // Load the full tool catalog without disabled filters so unchecked
+    // tools remain visible and can be re-enabled. Only executor/skills
+    // changes should refresh the catalog.
+    const catalogPayload = formStateToEffectiveToolsPreviewPayload({
+      ...form,
+      disabledTools: [],
+      disabledCategories: [],
+    });
     if (previewTimer) clearTimeout(previewTimer);
     previewTimer = setTimeout(async () => {
       try {
-        const preview = await api.agents.previewEffectiveTools(payload);
+        const preview = await api.agents.previewEffectiveTools(catalogPayload);
         tools = preview.configured_state.tools;
       } catch {
         // best-effort preview only

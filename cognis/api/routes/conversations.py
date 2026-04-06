@@ -365,7 +365,15 @@ async def conversation_messages(
                 }
             )
 
-        for _sr, events in results:
+        for sr, events in results:
+            # Tag each event with session_id so the UI can build
+            # lineage-safe timeline item IDs (seq is session-local).
+            sid = sr.session_id
+            for event in events:
+                if isinstance(event, dict):
+                    data = event.get("data")
+                    if isinstance(data, dict) and "session_id" not in data:
+                        data["session_id"] = sid
             all_events.extend(events)
 
         # For full loads, return the full lineage history and let the

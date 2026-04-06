@@ -65,7 +65,12 @@
       form.availableWorkflowIds = systemWorkflowIds;
       form.defaultWorkflowId = 'system:direct';
       form.systemPrompt = defaultSystemPrompt('');
-      const preview = await api.agents.previewEffectiveTools(formStateToEffectiveToolsPreviewPayload(form));
+      const fullCatalogPayload = formStateToEffectiveToolsPreviewPayload({
+        ...form,
+        disabledTools: [],
+        disabledCategories: [],
+      });
+      const preview = await api.agents.previewEffectiveTools(fullCatalogPayload);
       tools = preview.configured_state.tools;
       initialSnapshot = JSON.stringify($state.snapshot(form));
     } catch (caughtError) {
@@ -98,11 +103,17 @@
 
   $effect(() => {
     if (loading) return;
-    const payload = formStateToEffectiveToolsPreviewPayload(form);
+    // Load the full tool catalog without disabled filters so unchecked
+    // tools remain visible and can be re-enabled.
+    const catalogPayload = formStateToEffectiveToolsPreviewPayload({
+      ...form,
+      disabledTools: [],
+      disabledCategories: [],
+    });
     if (previewTimer) clearTimeout(previewTimer);
     previewTimer = setTimeout(async () => {
       try {
-        const preview = await api.agents.previewEffectiveTools(payload);
+        const preview = await api.agents.previewEffectiveTools(catalogPayload);
         tools = preview.configured_state.tools;
       } catch {
         // best-effort preview only

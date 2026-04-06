@@ -47,6 +47,7 @@ class InboundPipeline:
         pairing_service: Any,
         channel_manager_ref: Any,  # Callable[[], ChannelManager] — lazy ref
         command_dispatcher: Any = None,
+        notification_service: Any = None,
     ) -> None:
         self._session_factory = session_factory
         self._turn_scheduler = turn_scheduler
@@ -54,6 +55,7 @@ class InboundPipeline:
         self._pairing_service = pairing_service
         self._channel_manager_ref = channel_manager_ref
         self._command_dispatcher = command_dispatcher
+        self._notification_service = notification_service
 
     async def process(
         self,
@@ -122,6 +124,31 @@ class InboundPipeline:
                     }
                 },
             )
+            return
+
+        # Check for pending direct-chat step questions and auto-resolve
+        resolved_question = await self._try_resolve_pending_question(
+            conversation_id=conversation_id,
+            user_email=user_email,
+            content=message.content,
+        )
+        if resolved_question is not None:
+            if resolved_question:
+                logger.info(
+                    "channel inbound: auto-resolved pending step question",
+                    extra={
+                        "extra_data": {
+                            "channel_type": message.channel_type,
+                            "conversation_id": conversation_id,
+                        }
+                    },
+                )
+            else:
+                await self._send_system_message(
+                    message,
+                    config,
+                    "Could not resolve the pending question. Please try again or use /stop to cancel it.",
+                )
             return
 
         attachments = await self._normalize_media_attachments(
@@ -320,13 +347,16 @@ class InboundPipeline:
         adapter = manager.get_adapter(config.account_id)
         if adapter is None:
             return
+        content = error_text.strip() if error_text else ""
+        if not content:
+            content = "Sorry, I couldn't process your message right now. Please try again."
         with contextlib.suppress(Exception):
             await adapter.send_message(
                 OutboundMessage(
                     channel_type=message.channel_type,
                     account_id=message.account_id,
                     chat_id=message.chat_id,
-                    content="Sorry, I couldn't process your message right now. Please try again.",
+                    content=content,
                     reply_to_id=message.message_id,
                 )
             )
@@ -397,6 +427,43 @@ class InboundPipeline:
             user_email=user_email,
             has_active_turn=has_active,
         )
+
+    async def _try_resolve_pending_question(
+        self,
+        *,
+        conversation_id: str,
+        user_email: str,
+        content: str,
+    ) -> bool | None:
+        """Auto-resolve a pending direct-chat step question with the user's reply.
+
+        Returns:
+            ``True`` if a question was resolved successfully.
+            ``False`` if a question was found but resolution failed.
+            ``None`` if no pending direct-chat question exists.
+        """
+        if self._notification_service is None:
+            return None
+
+        pending = await self._notification_service.list_pending(
+            user_email, conversation_id=conversation_id
+        )
+        direct_questions = [
+            notif
+            for notif in pending
+            if notif.notification_type == "step_question" and notif.task_id is None
+        ]
+        if not direct_questions:
+            return None
+
+        # Resolve the most recent pending direct-chat question
+        target = direct_questions[0]
+        resolved = await self._notification_service.resolve(
+            target.notification_id,
+            "continue",
+            {"response": content},
+        )
+        return resolved
 
     async def _normalize_media_attachments(
         self,

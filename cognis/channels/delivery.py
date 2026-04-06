@@ -258,10 +258,57 @@ class ChannelDeliveryService:
 
         if notification_type == "escalation" and isinstance(payload, dict):
             content = self._render_escalation_notification(payload)
+        elif notification_type == "step_question" and isinstance(payload, dict):
+            content = self._render_step_question_notification(payload)
+        elif notification_type == "gate" and isinstance(payload, dict):
+            content = self._render_gate_notification(payload)
         else:
             message = event.data.get("message", "You have a new notification.")
             content = f"[{notification_type}] {message}"
         await self.send_to_conversation(conversation_id, content)
+
+    def _render_step_question_notification(self, payload: dict[str, Any]) -> str:
+        """Render a step question prompt for channel integrations."""
+        question = str(payload.get("question") or "The assistant needs more input to continue.")
+        lines = [question]
+        options = payload.get("options")
+        if isinstance(options, list) and options:
+            option_labels: list[str] = []
+            for option in options:
+                if isinstance(option, str):
+                    option_labels.append(option)
+                elif isinstance(option, dict) and isinstance(option.get("label"), str):
+                    option_labels.append(option["label"])
+            if option_labels:
+                lines.append("Options: " + ", ".join(option_labels))
+        context = payload.get("context")
+        if isinstance(context, str) and context.strip():
+            lines.append(context.strip())
+        elif isinstance(context, dict) and isinstance(context.get("context"), str):
+            lines.append(context["context"].strip())
+        lines.append("Reply with your answer to continue.")
+        return "\n\n".join(lines)
+
+    def _render_gate_notification(self, payload: dict[str, Any]) -> str:
+        """Render a workflow gate prompt for channel integrations."""
+        message = str(
+            payload.get("message")
+            or payload.get("question")
+            or "A workflow step needs your decision."
+        )
+        lines = [f"[gate] {message}"]
+        options = payload.get("options")
+        if isinstance(options, list) and options:
+            option_labels: list[str] = []
+            for option in options:
+                if isinstance(option, str):
+                    option_labels.append(option)
+                elif isinstance(option, dict) and isinstance(option.get("label"), str):
+                    option_labels.append(option["label"])
+            if option_labels:
+                lines.append("Options: " + ", ".join(option_labels))
+        lines.append("Reply /approve or /deny to continue.")
+        return "\n\n".join(lines)
 
     def _render_escalation_notification(self, payload: dict[str, Any]) -> str:
         """Render a rich escalation prompt for channel integrations."""

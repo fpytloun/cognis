@@ -136,15 +136,18 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
     const attachments = Array.isArray(event.data.attachments)
       ? event.data.attachments.filter((item): item is AttachmentRef => typeof item === 'object' && item !== null && typeof (item as Record<string, unknown>).artifact_id === 'string')
       : [];
+    // Use session_id from event data to build lineage-safe IDs (seq is session-local).
+    const sid = typeof event.data.session_id === 'string' ? event.data.session_id : '';
+    const eid = sid ? `${sid}:${event.seq}` : `${event.seq}`;
     if (event.type === 'user_message') {
-      items.push(createMessageItem(`event:${event.seq}:user`, 'user', content, event.timestamp, event.seq, undefined, false, attachments));
+      items.push(createMessageItem(`event:${eid}:user`, 'user', content, event.timestamp, event.seq, undefined, false, attachments));
       continue;
     }
 
     if (event.type === 'assistant_message') {
       if (content.trim()) {
         items.push(
-          createMessageItem(`event:${event.seq}:assistant`, 'assistant', content, event.timestamp, event.seq, undefined, false, attachments)
+          createMessageItem(`event:${eid}:assistant`, 'assistant', content, event.timestamp, event.seq, undefined, false, attachments)
         );
       }
       continue;
@@ -154,7 +157,7 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
       const toolName = String(event.data.name ?? event.data.tool_name ?? 'unknown');
       // Orchestration tools are displayed as delegation cards, not tool blocks
       if (['delegate', 'fork'].includes(toolName)) continue;
-      const callId = String(event.data.call_id ?? `tc-${event.seq}`);
+      const callId = String(event.data.call_id ?? `tc-${eid}`);
       let args: Record<string, unknown> | undefined;
       if (typeof event.data.arguments === 'object' && event.data.arguments !== null) {
         args = event.data.arguments as Record<string, unknown>;
@@ -176,7 +179,7 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
     }
 
     if (event.type === 'delegation') {
-      const childSessionId = String(event.data.child_session_id ?? event.data.call_id ?? `del-${event.seq}`);
+      const childSessionId = String(event.data.child_session_id ?? event.data.call_id ?? `del-${eid}`);
       const itemId = `delegation:${childSessionId}`;
       const delegationStatus = typeof event.data.status === 'string' ? event.data.status : 'started';
       const rawTask = event.data.task;
@@ -240,9 +243,9 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
     }
 
     if (event.type === 'reasoning') {
-      const messageId = String(event.data.message_id ?? `reasoning-${event.seq}`);
+      const messageId = String(event.data.message_id ?? `reasoning-${eid}`);
       items.push({
-        id: `reasoning:${messageId}:${event.seq}`,
+        id: `reasoning:${messageId}:${eid}`,
         kind: 'reasoning',
         messageId,
         content,
@@ -255,7 +258,7 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
     // Delegation events from Intaris use type="delegation" with data.status
     // (started, completed, failed). These are the actual recorded events.
     if (event.type === 'delegation') {
-      const childSessionId = String(event.data?.child_session_id ?? event.seq);
+      const childSessionId = String(event.data?.child_session_id ?? eid);
       const itemId = `delegation:${childSessionId}`;
       const existingIdx = items.findIndex((i) => i.id === itemId && i.kind === 'delegation');
       const dataStatus = String(event.data?.status ?? 'started');
@@ -283,7 +286,7 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
     }
 
     if (event.type === 'task_result') {
-      const taskId = String(event.data.task_id ?? event.seq);
+      const taskId = String(event.data.task_id ?? eid);
       const itemId = `delegation:${taskId}`;
       const existingIdx = items.findIndex((i) => i.id === itemId && i.kind === 'delegation');
       const delegation: DelegationTimelineItem = {
@@ -314,7 +317,7 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
       const method = typeof event.data.method === 'string' ? event.data.method : 'unknown';
       const turnsCompacted = typeof event.data.turns_compacted === 'number' ? event.data.turns_compacted : 0;
       items.push({
-        id: `compaction:${event.seq}`,
+        id: `compaction:${eid}`,
         kind: 'compaction',
         previousSessionId: '',  // Not available from Intaris event data
         summaryPreview: summary.slice(0, 500),
@@ -326,7 +329,7 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
     }
 
     if (event.type === 'task_failed' || event.type === 'task_cancelled') {
-      const taskId = String(event.data.task_id ?? event.seq);
+      const taskId = String(event.data.task_id ?? eid);
       const itemId = `delegation:${taskId}`;
       const existingIdx = items.findIndex((i) => i.id === itemId && i.kind === 'delegation');
       const delegation: DelegationTimelineItem = {
@@ -352,7 +355,7 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
     if (event.type === 'lifecycle') {
       const lifecycleEvent = String(event.data?.event ?? '');
       if (['task_result', 'task_failed', 'task_cancelled'].includes(lifecycleEvent)) {
-        const taskId = String(event.data.task_id ?? event.seq);
+        const taskId = String(event.data.task_id ?? eid);
         const itemId = `delegation:${taskId}`;
         const existingIdx = items.findIndex((i) => i.id === itemId && i.kind === 'delegation');
         const statusMap: Record<string, DelegationTimelineItem['status']> = {
@@ -379,7 +382,7 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
         const message = String(event.data?.message ?? '');
         if (message) {
           items.push({
-            id: `system:${event.seq}`,
+            id: `system:${eid}`,
             kind: 'system_message',
             text: message,
             timestamp: event.timestamp
@@ -403,7 +406,7 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
               ? 'error'
               : 'warning';
         items.push({
-          id: `eval:${event.seq}`,
+          id: `eval:${eid}`,
           kind: 'notice',
           title: `Step Evaluation (attempt ${attempt})`,
           description: `${decision} — ${feedback}`,
