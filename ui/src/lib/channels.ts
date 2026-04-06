@@ -182,6 +182,13 @@ export function normalizeSettingValue(meta: ChannelMeta, fieldName: string, valu
 
 export function createChannelDraft(meta: ChannelMeta, agents: Agent[], account?: ChannelAccount | null): ChannelEditorDraft {
   const primaryAgents = agents.filter((agent) => agent.agent_type === 'primary');
+  const credentialValues = Object.fromEntries(
+    meta.credential_fields.map((field) => {
+      const configured = account?.config?.[field.name];
+      const value = field.secret ? '' : String(configured ?? '');
+      return [field.name, value];
+    }),
+  );
   return {
     display_name: account?.display_name ?? `${meta.label} Account`,
     agent_id: account?.agent_id ?? primaryAgents[0]?.agent_id ?? '',
@@ -190,7 +197,7 @@ export function createChannelDraft(meta: ChannelMeta, agents: Agent[], account?:
     dm_policy: account?.dm_policy ?? 'pairing',
     group_policy: account?.group_policy ?? 'pairing',
     allow_new_conversations: account?.allow_new_conversations ?? true,
-    credentialValues: Object.fromEntries(meta.credential_fields.map((field) => [field.name, ''])),
+    credentialValues,
     settingValues: Object.fromEntries(
       meta.setting_fields.map((field) => [field.name, String(account?.config?.[field.name] ?? field.default ?? '')]),
     ),

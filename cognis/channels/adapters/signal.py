@@ -32,6 +32,7 @@ from cognis.channels.adapters.signal_cli_runtime import (
     SignalCliRuntimeError,
 )
 from cognis.channels.protocol import BaseChannelAdapter
+from cognis.channels.protocol import NonRetryableChannelError
 from cognis.channels.registry import SIGNAL_META
 from cognis.logging import get_logger
 from cognis.models.channel import (
@@ -43,6 +44,17 @@ from cognis.models.channel import (
 )
 
 logger = get_logger(__name__)
+
+
+def _is_fatal_signal_error(message: str) -> bool:
+    lowered = message.lower()
+    fatal_markers = (
+        "is not registered",
+        "unregistered user",
+        "unknown account",
+        "account is not registered",
+    )
+    return any(marker in lowered for marker in fatal_markers)
 
 
 # ---------------------------------------------------------------------------
@@ -172,12 +184,15 @@ class SignalAdapter(BaseChannelAdapter):
         )
         try:
             await self._runtime.start()
-        except Exception:
+        except Exception as exc:
             # Clean up temp dir on startup failure
             with contextlib.suppress(Exception):
                 self._temp_dir.cleanup()
             self._temp_dir = None
             self._runtime = None
+            message = str(exc)
+            if _is_fatal_signal_error(message):
+                raise NonRetryableChannelError(message) from exc
             raise
 
     async def _disconnect(self) -> None:
@@ -260,7 +275,10 @@ class SignalAdapter(BaseChannelAdapter):
             await asyncio.sleep(1.0)
 
         if not self._stop_event.is_set() and not self._runtime.is_running:
-            raise SignalCliRuntimeError("signal-cli process exited unexpectedly")
+            message = self._runtime._process_exit_message()
+            if _is_fatal_signal_error(message):
+                raise NonRetryableChannelError(message)
+            raise SignalCliRuntimeError(message)
 
     async def _handle_direct_notification(self, params: dict[str, Any]) -> None:
         """Handle a ``receive`` notification from signal-cli JSON-RPC."""

@@ -31,6 +31,11 @@ from cognis.models.config import ProviderHealth
 
 logger = get_logger(__name__)
 
+
+class NonRetryableChannelError(Exception):
+    """Fatal channel error that should not enter the reconnect loop."""
+
+
 # ---------------------------------------------------------------------------
 # Prometheus metrics
 # ---------------------------------------------------------------------------
@@ -350,6 +355,21 @@ class BaseChannelAdapter(ABC):
                     CHANNEL_CONNECTIONS_ACTIVE.labels(channel_type=self.channel_type).dec()
 
                 if self._stop_event.is_set():
+                    break
+
+                if isinstance(exc, NonRetryableChannelError):
+                    self._set_status(ChannelStatus.ERROR)
+                    logger.error(
+                        "channel adapter fatal error: %s",
+                        self._last_error,
+                        extra={
+                            "extra_data": {
+                                "channel_type": self.channel_type,
+                                "account_id": self.account_id,
+                                "last_error": self._last_error,
+                            }
+                        },
+                    )
                     break
 
                 self._reconnect_attempts += 1

@@ -11,6 +11,7 @@ import pytest
 
 from cognis.channels.adapters.signal import (
     SignalAdapter,
+    _is_fatal_signal_error,
     _normalize_signal_cli_trust_mode,
     _SignalConfig,
 )
@@ -18,6 +19,7 @@ from cognis.channels.adapters.signal_cli_runtime import (
     SignalCliRuntime,
     SignalCliRuntimeError,
 )
+from cognis.channels.protocol import NonRetryableChannelError
 from cognis.models.channel import (
     ChannelAccountConfig,
     InboundMessage,
@@ -91,6 +93,14 @@ class TestSignalTrustModeNormalization:
 
     def test_unknown_value_falls_back_safely(self) -> None:
         assert _normalize_signal_cli_trust_mode("weird-value") == "on-first-use"
+
+
+class TestSignalFatalErrorClassification:
+    def test_registered_error_is_fatal(self) -> None:
+        assert _is_fatal_signal_error("User +447727940997 is not registered.") is True
+
+    def test_generic_error_is_not_fatal(self) -> None:
+        assert _is_fatal_signal_error("signal-cli process exited unexpectedly") is False
 
 
 # ---------------------------------------------------------------------------
@@ -667,3 +677,17 @@ class TestDirectSendBehavior:
         assert result == "12345"
         called_params = mock_runtime.request.await_args.args[1]
         assert "quoteTimestamp" not in called_params
+
+
+class TestDirectRuntimeFatalFailures:
+    @pytest.mark.asyncio
+    async def test_run_direct_raises_non_retryable_on_unregistered_user(self) -> None:
+        adapter = SignalAdapter()
+        runtime = MagicMock()
+        runtime.is_running = False
+        runtime._process_exit_message.return_value = "signal-cli process exited unexpectedly (returncode=1, stderr_lines=1, stderr_tail=['User +447727940997 is not registered.'])"
+        adapter._runtime = runtime
+        adapter._stop_event.clear()
+
+        with pytest.raises(NonRetryableChannelError, match="not registered"):
+            await adapter._run_direct()
