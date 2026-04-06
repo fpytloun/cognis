@@ -31,7 +31,7 @@ Whether an agent can actually use a tool depends on:
 
 Skills are versioned, reusable instruction and tool bundles stored in the database. Each skill can contain:
 
-- **Instructions** -- markdown guidance injected into the agent's context when the skill is active
+- **Instructions** -- markdown guidance loaded on demand via `skill_load` when the agent decides a skill is relevant
 - **Tool definitions** -- first-class tools with execution recipes that appear in the agent's effective tool set
 - **Prompt templates** -- reusable templates for common patterns
 - **Assets** -- scripts, configuration files, and other resources stored in the Cognis artifact store
@@ -58,9 +58,23 @@ Every content change creates a new immutable version with a content hash. The lo
 - version history is preserved for auditability
 - imported skills record provenance (source URL, commit SHA, checksum)
 
+### How skills work at runtime
+
+Skills use a hybrid lazy-loading model for token efficiency:
+
+1. **Compact metadata in the system prompt** -- only skill names, descriptions, and tool summaries are included in the immutable prompt prefix. This keeps the cached prefix stable and small.
+2. **On-demand loading via `skill_load`** -- the agent uses the `skill_load` tool to read full instructions when a skill is relevant to the current task. Instructions are loaded into the mutable context, not the cached prefix.
+3. **Executable skill tools** -- skill-defined tools are registered in the runtime tool inventory and can be called directly by the agent.
+
+This means:
+- adding or removing skills does not invalidate the entire prompt cache
+- the agent only pays token costs for skills it actually uses
+- skill edits are visible on the next turn without restarting the session
+- after `skill_write` or `skill_import_url`, the updated skill is available in the same turn
+
 ### Agent skill selection
 
-In the agent editor, you can select which skills an agent should use. Selected skills contribute their instructions to the agent's context and their tools to the agent's effective tool set.
+In the agent editor, you can select which skills an agent should use. Selected skills contribute their tools to the agent's effective tool set and their metadata to the prompt.
 
 Skills are resolved in order: agent-specified skills first, then auto-load skills alphabetically. This ordering is deterministic to preserve prompt caching stability.
 
@@ -69,13 +83,14 @@ Skills are resolved in order: agent-specified skills first, then auto-load skill
 Agents can manage skills through built-in tools:
 
 - `skill_list` -- list available skills
-- `skill_get` -- get skill details including version info
+- `skill_load` -- load a skill's full instructions, templates, and tool summaries (read-only, always returns latest version)
+- `skill_get` -- get skill details including version history and provenance
 - `skill_write` -- create or update a skill (creates a new version)
 - `skill_delete` -- delete a skill
 - `skill_import_url` -- import a skill from a URL
 - `skill_export` -- export a skill as SKILL.md or YAML
 
-All mutation tools are non-bypassable and evaluated by Intaris guardrails.
+All mutation tools are non-bypassable and evaluated by Intaris guardrails. After a successful mutation, the updated skill is immediately available for the rest of the turn.
 
 ### Importing skills
 

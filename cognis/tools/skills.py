@@ -248,6 +248,41 @@ def _parse_asset_manifest(
 
 
 # ---------------------------------------------------------------------------
+# Compact prompt metadata for <available_skills>
+# ---------------------------------------------------------------------------
+
+
+def build_available_skills_metadata(resolved: ResolvedSkillSet) -> str:
+    """Build compact XML metadata for the immutable prompt prefix.
+
+    This is token-efficient: only stable identifiers and summaries are
+    included.  Full instructions are loaded on demand via ``skill_load``.
+    Version ids and content hashes are intentionally excluded to keep
+    the immutable prefix stable for prompt caching.
+    """
+    if not resolved.skills:
+        return ""
+
+    lines: list[str] = []
+    for skill in resolved.skills:
+        tool_names = ", ".join(t.name for t in skill.tools) if skill.tools else ""
+        lines.append("  <skill>")
+        lines.append(f"    <name>{skill.name}</name>")
+        lines.append(f"    <skill_id>{skill.skill_id}</skill_id>")
+        # Use a stable description for prompt caching — avoid instruction
+        # snippets that change on every edit.
+        desc = f"Use skill_load to read full instructions for {skill.name}."
+        lines.append(f"    <description>{desc}</description>")
+        if tool_names:
+            lines.append(f"    <tools>{tool_names}</tools>")
+        if skill.auto_load:
+            lines.append("    <auto_load>true</auto_load>")
+        lines.append("  </skill>")
+
+    return "<available_skills>\n" + "\n".join(lines) + "\n</available_skills>"
+
+
+# ---------------------------------------------------------------------------
 # Convert resolved skills to ToolDefinitions
 # ---------------------------------------------------------------------------
 
@@ -258,11 +293,23 @@ def skill_tools_to_definitions(
     """Convert resolved skill tool specs into ToolDefinition objects.
 
     These are registered in the runtime tool registry alongside
-    builtin/executor/MCP tools.
+    builtin/executor/MCP tools.  Execution metadata (recipe, assets,
+    secret placeholders) is carried forward for executor handlers.
     """
     definitions: list[ToolDefinition] = []
     for skill in resolved.skills:
         for tool_spec in skill.tools:
+            # Build execution metadata for the executor handler
+            exec_meta: dict[str, Any] = {}
+            if tool_spec.recipe:
+                exec_meta["recipe"] = tool_spec.recipe.model_dump(mode="json")
+            if skill.asset_manifest:
+                exec_meta["asset_manifest"] = [
+                    a.model_dump(mode="json") for a in skill.asset_manifest
+                ]
+            if skill.secret_placeholders:
+                exec_meta["secret_placeholders"] = skill.secret_placeholders
+
             definition = ToolDefinition(
                 name=tool_spec.name,
                 description=tool_spec.description,
@@ -270,12 +317,15 @@ def skill_tools_to_definitions(
                 source=ToolSource(
                     type="skill",
                     skill_id=skill.skill_id,
+                    skill_version_id=skill.version_id or None,
+                    skill_content_hash=skill.content_hash or None,
                 ),
                 category="skill",
                 read_only=tool_spec.read_only,
                 non_bypassable=tool_spec.non_bypassable,
                 timeout_seconds=tool_spec.timeout_seconds,
                 max_result_size=tool_spec.max_result_size,
+                execution_metadata=exec_meta if exec_meta else None,
             )
             definitions.append(definition)
     return definitions

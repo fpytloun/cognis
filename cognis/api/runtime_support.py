@@ -37,7 +37,12 @@ from cognis.tools.builtin.tool_output import tool_output_tools
 from cognis.tools.builtin.workflow import workflow_tools
 from cognis.tools.executor.definitions import executor_tool_definitions, executor_tool_handlers
 from cognis.tools.registry import RegisteredTool, ToolRegistry
-from cognis.tools.skills import load_skill_tool_names
+from cognis.tools.skills import (
+    build_available_skills_metadata,
+    load_skill_tool_names,
+    resolve_skills_for_agent,
+    skill_tools_to_definitions,
+)
 
 logger = get_logger(__name__)
 
@@ -173,6 +178,11 @@ def build_registry_with_handlers(
         handler = None
         if tool.source.type in ("builtin", "executor"):
             handler = handler_map.get(tool.name)
+        elif tool.source.type == "skill" and getattr(tool, "execution_metadata", None):
+            # Build skill handler dynamically from execution metadata
+            from cognis.providers.executor.in_process import _build_skill_handler
+
+            handler = _build_skill_handler(tool)
         registry.register(RegisteredTool(definition=tool, handler=cast(Any, handler)))
     return registry
 
@@ -282,6 +292,33 @@ def build_step_runtime_factory(
         from cognis.tools.executor.web.definitions import web_tool_definitions
 
         agent_tools.extend(web_tool_definitions(web_config["web_available_backends"]))
+
+        # Resolve DB-backed skills for this agent and inject:
+        # 1. Compact metadata into agent.skills for context assembly
+        # 2. Executable skill tool definitions into agent_tools
+        try:
+            async with session_factory() as db_session:
+                resolved_skills = await resolve_skills_for_agent(
+                    db_session, agent, owner_email=user_email
+                )
+            if resolved_skills.skills:
+                # Build compact metadata for the immutable prompt prefix
+                metadata = build_available_skills_metadata(resolved_skills)
+                if metadata:
+                    if not isinstance(agent.skills, dict):
+                        agent.skills = {}
+                    agent.skills["_available_skills_metadata"] = metadata
+
+                # Add executable skill tools to the agent tool set
+                skill_tool_defs = skill_tools_to_definitions(resolved_skills)
+                agent_tools.extend(skill_tool_defs)
+        except Exception:
+            logger.warning(
+                "Failed to resolve DB-backed skills for agent",
+                extra={"extra_data": {"agent_id": agent.agent_id}},
+                exc_info=True,
+            )
+
         if executor_config is not None:
             # Only include executor-native tools that are enabled on this executor.
             # Controller-side tools (builtin) are always available regardless.
@@ -702,7 +739,7 @@ async def _merge_remote_runtime_inventory(
         merged_names.add(tool.name)
 
     builtin_defs = sorted(
-        [tool for tool in agent_tools if tool.source.type == "builtin"],
+        [tool for tool in agent_tools if tool.source.type in ("builtin", "skill")],
         key=_tool_collision_identity,
     )
     for tool in builtin_defs:

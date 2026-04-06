@@ -512,15 +512,22 @@ class ContextAssembler:
                 }
             )
 
-        # Immutable prefix block 5: active skill instructions (stable within session)
-        # Skill instructions are injected in canonical order (agent-specified
-        # then auto_load alphabetical) to preserve prompt caching stability.
-        skill_instructions = self._get_skill_instructions(agent)
-        if skill_instructions:
+        # Immutable prefix block 5: available skills metadata (stable, token-light)
+        # Only compact metadata is included here for prompt caching stability.
+        # Full instructions are loaded on demand via the skill_load tool.
+        # Version ids and content hashes are intentionally excluded to keep
+        # the immutable prefix stable across skill edits.
+        skill_metadata = self._get_available_skills_metadata(agent)
+        if skill_metadata:
             messages.append(
                 {
                     "role": "system",
-                    "content": ("<active_skills>\n" + skill_instructions + "\n</active_skills>"),
+                    "content": (
+                        skill_metadata
+                        + "\n\nWhen a skill is relevant to the current task, use the "
+                        "skill_load tool to read its full instructions before proceeding. "
+                        "Do not guess skill behavior from the summary alone."
+                    ),
                 }
             )
 
@@ -845,28 +852,20 @@ class ContextAssembler:
             cache_breakpoint_index=cache_breakpoint_index,
         )
 
-    def _get_skill_instructions(self, agent: AgentDefinition) -> str | None:
-        """Get concatenated skill instructions from the session cache.
+    def _get_available_skills_metadata(self, agent: AgentDefinition) -> str | None:
+        """Get compact available-skills metadata for the immutable prompt prefix.
 
-        Returns ``None`` if no active skills have instructions.
-        The resolved skill set is cached in the session cache by the
-        runtime assembly layer.
+        Returns pre-built XML metadata if set by the runtime assembly layer,
+        or ``None`` if no skills are available.  This is intentionally
+        token-light — full instructions are loaded via ``skill_load``.
         """
         if not isinstance(agent.skills, dict):
             return None
 
-        # Check for cached resolved skill instructions
-        items = agent.skills.get("items")
-        if not isinstance(items, list):
-            return None
-
-        # Collect instructions from agent skill refs that have instructions
-        # embedded (set by runtime assembly before context assembly).
-        resolved_instructions = agent.skills.get("_resolved_instructions")
-        if isinstance(resolved_instructions, list) and resolved_instructions:
-            blocks = [s for s in resolved_instructions if isinstance(s, str) and s.strip()]
-            if blocks:
-                return "\n\n---\n\n".join(blocks)
+        # Check for pre-built metadata from runtime assembly
+        metadata = agent.skills.get("_available_skills_metadata")
+        if isinstance(metadata, str) and metadata.strip():
+            return metadata
         return None
 
     def _count_static_tokens(

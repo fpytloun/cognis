@@ -26,6 +26,7 @@ def skill_management_tools() -> list[ToolDefinition]:
     """Return all skill management tool definitions."""
     return [
         SKILL_LIST_TOOL,
+        SKILL_LOAD_TOOL,
         SKILL_GET_TOOL,
         SKILL_WRITE_TOOL,
         SKILL_DELETE_TOOL,
@@ -44,9 +45,30 @@ SKILL_LIST_TOOL = ToolDefinition(
     timeout_seconds=15,
 )
 
+SKILL_LOAD_TOOL = ToolDefinition(
+    name="skill_load",
+    description=(
+        "Load a skill's full instructions, prompt templates, and tool summaries. "
+        "Use this when you need to follow a skill's guidance. Always returns the "
+        "latest published version. This is the primary way to access skill content "
+        "— the available_skills metadata in the system prompt only contains summaries."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "skill_id": {"type": "string", "description": "The skill ID to load"},
+        },
+        "required": ["skill_id"],
+    },
+    source=_SKILL_SOURCE,
+    category="skill",
+    read_only=True,
+    timeout_seconds=15,
+)
+
 SKILL_GET_TOOL = ToolDefinition(
     name="skill_get",
-    description="Get detailed information about a skill including instructions, tools, templates, and version history.",
+    description="Get detailed information about a skill including version history, provenance, and asset manifest.",
     parameters={
         "type": "object",
         "properties": {
@@ -186,6 +208,7 @@ SKILL_EXPORT_TOOL = ToolDefinition(
 
 _SKILL_TOOL_NAMES = {
     "skill_list",
+    "skill_load",
     "skill_get",
     "skill_write",
     "skill_delete",
@@ -214,6 +237,8 @@ async def handle_skill_management_tool(
     try:
         if tool_name == "skill_list":
             return await _handle_skill_list(session_factory, user_email)
+        if tool_name == "skill_load":
+            return await _handle_skill_load(session_factory, user_email, arguments)
         if tool_name == "skill_get":
             return await _handle_skill_get(session_factory, user_email, arguments)
         if tool_name == "skill_write":
@@ -256,6 +281,50 @@ async def _handle_skill_list(session_factory: Any, user_email: str) -> ToolResul
             }
         )
     return ToolResult(output=json.dumps(skills, indent=2))
+
+
+async def _handle_skill_load(
+    session_factory: Any, user_email: str, arguments: dict[str, Any]
+) -> ToolResult:
+    """Load a skill's full instructions, templates, and tool summaries.
+
+    This is the primary way the model accesses skill content.  Always
+    returns the latest published version.
+    """
+    import json
+
+    from cognis.store.queries import get_skill_scoped, get_skill_version
+
+    skill_id = str(arguments.get("skill_id", "")).strip()
+    if not skill_id:
+        return ToolResult(output="skill_id is required", is_error=True)
+
+    async with session_factory() as session:
+        row = await get_skill_scoped(session, skill_id, owner_email=user_email)
+        if row is None:
+            return ToolResult(output=f"Skill '{skill_id}' not found", is_error=True)
+
+        instructions = row.instructions
+        tools = row.tools
+        templates = row.prompt_templates
+
+        if row.current_version_id:
+            ver = await get_skill_version(session, row.current_version_id)
+            if ver:
+                instructions = ver.instructions
+                tools = ver.tools
+                templates = ver.prompt_templates
+
+    result = {
+        "skill_id": row.skill_id,
+        "name": row.name,
+        "description": row.description,
+        "instructions": instructions,
+        "tools": tools,
+        "prompt_templates": templates,
+        "tags": row.tags or [],
+    }
+    return ToolResult(output=json.dumps(result, indent=2, default=str))
 
 
 async def _handle_skill_get(

@@ -117,6 +117,54 @@ async def handle_executor_websocket(
                 runtime_state="reconfiguring",
             )
             await session.commit()
+        # Resolve skill manifests for executable skill tools on this executor
+        skill_manifests: list[dict[str, Any]] = []
+        try:
+            # Resolve skills visible to the executor owner
+            # Note: at executor connect time we don't know which agent will use it,
+            # so we resolve all visible skills for the owner. Per-agent filtering
+            # happens at step runtime.
+            from cognis.models.agent import AgentDefinition
+            from cognis.tools.skills import resolve_skills_for_agent
+
+            dummy_agent = AgentDefinition(
+                agent_id="executor_configure",
+                owner_email=row.owner_email,
+                name="executor_configure",
+            )
+            async with session_factory() as db_session:
+                resolved = await resolve_skills_for_agent(
+                    db_session, dummy_agent, owner_email=row.owner_email
+                )
+            for skill in resolved.skills:
+                if skill.tools:
+                    manifest: dict[str, Any] = {
+                        "skill_id": skill.skill_id,
+                        "version_id": skill.version_id,
+                        "content_hash": skill.content_hash,
+                        "tools": [t.model_dump(mode="json") for t in skill.tools],
+                        "asset_manifest": [a.model_dump(mode="json") for a in skill.asset_manifest],
+                    }
+                    # Generate signed URLs for assets
+                    artifact_store = getattr(providers, "artifact_store", None)
+                    if artifact_store and skill.asset_manifest:
+                        for asset_entry in manifest["asset_manifest"]:
+                            ns = asset_entry.get("artifact_namespace", "skills")
+                            oid = asset_entry.get("artifact_object_id", "")
+                            if oid:
+                                try:
+                                    url = await artifact_store.async_get_signed_url(ns, oid)
+                                    asset_entry["signed_url"] = url
+                                except Exception:
+                                    pass
+                    skill_manifests.append(manifest)
+        except Exception:
+            _logger.warning(
+                "executor_ws: failed to resolve skill manifests",
+                extra={"extra_data": {"executor_id": executor_id}},
+                exc_info=True,
+            )
+
         configure_result = await conn.rpc_call(
             "executor.configure",
             {
@@ -130,6 +178,7 @@ async def handle_executor_websocket(
                     "web_backend": web_config.get("web_backend", "direct"),
                     "web_available_backends": web_config.get("web_available_backends", ["direct"]),
                 },
+                "skill_manifests": skill_manifests,
             },
             timeout=30.0,
         )

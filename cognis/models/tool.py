@@ -28,6 +28,8 @@ class ToolSource(BaseModel):
     server_id: str | None = None
     raw_tool_name: str | None = None
     skill_id: str | None = None
+    skill_version_id: str | None = None
+    skill_content_hash: str | None = None
 
 
 class ToolDefinition(BaseModel):
@@ -44,6 +46,9 @@ class ToolDefinition(BaseModel):
     non_bypassable: bool = False
     max_result_size: int = 50_000
     risk_level: str | None = None
+    # Runtime-only metadata for executable skill tools (recipe, assets, etc.)
+    # Not sent to the LLM — used by executor handlers for execution.
+    execution_metadata: dict[str, Any] | None = None
 
 
 def stable_tool_id(tool: ToolDefinition) -> str:

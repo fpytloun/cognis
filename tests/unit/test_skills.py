@@ -352,7 +352,10 @@ def test_resolved_skill_set_all_tools() -> None:
 
 
 def test_skill_tools_to_definitions() -> None:
-    tool = SkillToolSpec(name="my_tool", description="test tool", read_only=True)
+    from cognis.models.skill import SkillToolRecipe
+
+    recipe = SkillToolRecipe(mode="script", entry="run.sh")
+    tool = SkillToolSpec(name="my_tool", description="test tool", read_only=True, recipe=recipe)
     skill_set = ResolvedSkillSet(
         skills=[
             ResolvedSkill(
@@ -371,8 +374,97 @@ def test_skill_tools_to_definitions() -> None:
     assert definitions[0].name == "my_tool"
     assert definitions[0].source.type == "skill"
     assert definitions[0].source.skill_id == "skill-a"
+    assert definitions[0].source.skill_version_id == "v1"
+    assert definitions[0].source.skill_content_hash == "h1"
     assert definitions[0].read_only is True
     assert definitions[0].category == "skill"
+    # Execution metadata should carry the recipe
+    assert definitions[0].execution_metadata is not None
+    assert definitions[0].execution_metadata["recipe"]["mode"] == "script"
+    assert definitions[0].execution_metadata["recipe"]["entry"] == "run.sh"
+
+
+# ---------------------------------------------------------------------------
+# Available skills metadata (compact prompt block)
+# ---------------------------------------------------------------------------
+
+
+def test_build_available_skills_metadata_empty() -> None:
+    from cognis.tools.skills import build_available_skills_metadata
+
+    skill_set = ResolvedSkillSet(skills=[])
+    assert build_available_skills_metadata(skill_set) == ""
+
+
+def test_build_available_skills_metadata_basic() -> None:
+    from cognis.tools.skills import build_available_skills_metadata
+
+    skill_set = ResolvedSkillSet(
+        skills=[
+            ResolvedSkill(
+                skill_id="git-release",
+                name="Git Release",
+                version_id="v1",
+                version_number=1,
+                content_hash="h1",
+                instructions="Automate git release workflows with tagging and changelog generation.",
+                tools=[SkillToolSpec(name="tag_release", description="Tag a release")],
+            ),
+        ]
+    )
+    metadata = build_available_skills_metadata(skill_set)
+    assert "<available_skills>" in metadata
+    assert "<name>Git Release</name>" in metadata
+    assert "<skill_id>git-release</skill_id>" in metadata
+    assert "<tools>tag_release</tools>" in metadata
+    # Description should be stable (not instruction snippet)
+    assert "skill_load" in metadata
+    # Should NOT contain version ids (for prompt caching stability)
+    assert "v1" not in metadata
+    assert "h1" not in metadata
+
+
+def test_build_available_skills_metadata_auto_load() -> None:
+    from cognis.tools.skills import build_available_skills_metadata
+
+    skill_set = ResolvedSkillSet(
+        skills=[
+            ResolvedSkill(
+                skill_id="always-on",
+                name="Always On",
+                version_id="v1",
+                version_number=1,
+                content_hash="h1",
+                instructions="Always active skill.",
+                auto_load=True,
+            ),
+        ]
+    )
+    metadata = build_available_skills_metadata(skill_set)
+    assert "<auto_load>true</auto_load>" in metadata
+
+
+# ---------------------------------------------------------------------------
+# skill_load tool
+# ---------------------------------------------------------------------------
+
+
+def test_skill_load_tool_exists() -> None:
+    from cognis.tools.builtin.skill_management import skill_management_tools
+
+    tools = skill_management_tools()
+    names = {t.name for t in tools}
+    assert "skill_load" in names
+    # skill_load should be read-only
+    skill_load = next(t for t in tools if t.name == "skill_load")
+    assert skill_load.read_only is True
+
+
+def test_skill_management_tool_count() -> None:
+    from cognis.tools.builtin.skill_management import skill_management_tools
+
+    tools = skill_management_tools()
+    assert len(tools) == 7  # list, load, get, write, delete, import_url, export
 
 
 # ---------------------------------------------------------------------------

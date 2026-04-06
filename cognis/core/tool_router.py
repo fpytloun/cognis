@@ -338,12 +338,16 @@ class ToolRouter:
                     session_factory=self._session_factory,
                     user_email=current_user_email.get(),
                 )
-            if result.metadata is None:
-                result = result.model_copy(update={"metadata": {"evaluation": eval_meta}})
-            else:
-                result = result.model_copy(
-                    update={"metadata": {**result.metadata, "evaluation": eval_meta}}
-                )
+            # Signal same-turn refresh for mutation tools so the agent loop
+            # can re-resolve skills before the next model call.
+            _SKILL_MUTATION_TOOLS = {"skill_write", "skill_delete", "skill_import_url"}
+            needs_refresh = tool_call.name in _SKILL_MUTATION_TOOLS and not result.is_error
+            combined_meta: dict[str, Any] = {"evaluation": eval_meta}
+            if needs_refresh:
+                combined_meta["skill_epoch_stale"] = True
+            if result.metadata is not None:
+                combined_meta.update(result.metadata)
+            result = result.model_copy(update={"metadata": combined_meta})
             outcome = "success" if not result.is_error else "failure"
             TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome=outcome).inc()
             return self._sanitize_result(tool_call.name, result, 50_000, call_id=cid)

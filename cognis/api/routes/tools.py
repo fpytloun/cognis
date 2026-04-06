@@ -275,6 +275,20 @@ async def _resolve_effective_tools_response(
         ):
             configured_tools.append(tool)
 
+    # Resolve DB-backed skills and add executable skill tools to preview
+    try:
+        from cognis.tools.skills import resolve_skills_for_agent, skill_tools_to_definitions
+
+        async with session_factory() as db_session:
+            resolved_skills = await resolve_skills_for_agent(
+                db_session, agent, owner_email=user_email
+            )
+        if resolved_skills.skills:
+            skill_tool_defs = skill_tools_to_definitions(resolved_skills)
+            configured_tools.extend(skill_tool_defs)
+    except Exception:
+        warnings.append("Failed to resolve DB-backed skills for preview.")
+
     config_ids = (selected.config or {}).get(MCP_SERVER_IDS_KEY, [])
     if isinstance(config_ids, list) and config_ids:
         if selected.executor_type == "in_process":

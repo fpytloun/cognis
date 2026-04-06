@@ -16,7 +16,14 @@ from time import perf_counter
 from typing import Any
 
 from cognis.core.executor_resolution import filter_tools_by_executor
-from cognis.models.tool import ExecutorConfig, MCPServerConfig, ToolCall, ToolDefinition, ToolResult
+from cognis.models.tool import (
+    ExecutorConfig,
+    MCPServerConfig,
+    ToolCall,
+    ToolDefinition,
+    ToolResult,
+    ToolSource,
+)
 from cognis.tools.executor.definitions import executor_tool_definitions, executor_tool_handlers
 from cognis.tools.mcp import (
     StdioMCPClient,
@@ -248,6 +255,10 @@ class ExecutorRunner:
             if tool.source.server_name is not None:
                 self._tool_handlers[tool.name] = self._build_mcp_handler(tool)
 
+        # Register skill tool handlers from controller-provided manifests
+        skill_manifests_raw = params.get("skill_manifests") or []
+        await self._register_skill_handlers(skill_manifests_raw, secrets)
+
         if self._inference_handler is None:
             from cognis.executor.inference import InferenceHandler
 
@@ -286,6 +297,168 @@ class ExecutorRunner:
                     or _build_environment_payload(),
                 },
             )
+
+    async def _register_skill_handlers(
+        self, skill_manifests_raw: list[dict[str, Any]], secrets: dict[str, str]
+    ) -> None:
+        """Register executable skill tool handlers from controller-provided manifests.
+
+        Each manifest contains skill metadata, tool specs with recipes,
+        and asset references with signed URLs for staging.
+        """
+        import hashlib
+        import shutil
+        import tempfile
+        from pathlib import Path
+
+        import httpx
+
+        for manifest in skill_manifests_raw:
+            skill_id = manifest.get("skill_id", "")
+            skill_tools = manifest.get("tools", [])
+            asset_manifest = manifest.get("asset_manifest", [])
+
+            # Stage assets for this skill
+            staging_dir = Path(tempfile.mkdtemp(prefix=f"cognis_skill_{skill_id[:8]}_"))
+            staged_ok = True
+            for asset in asset_manifest:
+                filename = asset.get("filename", "")
+                signed_url = asset.get("signed_url", "")
+                expected_hash = asset.get("content_hash", "")
+                if not filename or not signed_url:
+                    continue
+                # Path traversal protection
+                asset_path = (staging_dir / filename).resolve()
+                if not str(asset_path).startswith(str(staging_dir.resolve())):
+                    logger.warning(
+                        "Unsafe skill asset path rejected",
+                        extra={"extra_data": {"skill_id": skill_id, "filename": filename}},
+                    )
+                    staged_ok = False
+                    break
+                asset_path.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    async with httpx.AsyncClient(timeout=30) as client:
+                        resp = await client.get(signed_url)
+                        resp.raise_for_status()
+                    content = resp.content
+                    if expected_hash:
+                        actual_hash = hashlib.sha256(content).hexdigest()
+                        if actual_hash != expected_hash:
+                            logger.warning(
+                                "Skill asset hash mismatch",
+                                extra={"extra_data": {"skill_id": skill_id, "filename": filename}},
+                            )
+                            staged_ok = False
+                            break
+                    asset_path.write_bytes(content)
+                except Exception:
+                    logger.warning(
+                        "Failed to stage skill asset",
+                        extra={"extra_data": {"skill_id": skill_id, "filename": filename}},
+                        exc_info=True,
+                    )
+                    staged_ok = False
+                    break
+
+            if not staged_ok:
+                shutil.rmtree(staging_dir, ignore_errors=True)
+                continue
+
+            # Register handlers for each tool in this skill
+            for tool_spec in skill_tools:
+                tool_name = tool_spec.get("name", "")
+                recipe = tool_spec.get("recipe")
+                if not tool_name or not recipe:
+                    continue
+
+                tool_def = ToolDefinition(
+                    name=tool_name,
+                    description=tool_spec.get("description", ""),
+                    parameters=tool_spec.get("parameters", {"type": "object", "properties": {}}),
+                    source=ToolSource(
+                        type="skill",
+                        skill_id=skill_id,
+                        skill_version_id=manifest.get("version_id"),
+                    ),
+                    category="skill",
+                    read_only=bool(tool_spec.get("read_only", False)),
+                    non_bypassable=True,
+                    timeout_seconds=int(tool_spec.get("timeout_seconds", 60)),
+                )
+                self._configured_tool_definitions.append(tool_def)
+                self._tool_handlers[tool_name] = self._build_skill_recipe_handler(
+                    recipe, staging_dir, secrets
+                )
+
+            # Track staging dir for cleanup
+            if not hasattr(self, "_skill_staging_dirs"):
+                self._skill_staging_dirs: list[Path] = []
+            self._skill_staging_dirs.append(staging_dir)
+
+    def _build_skill_recipe_handler(
+        self,
+        recipe: dict[str, Any],
+        staging_dir: Any,
+        secrets: dict[str, str],
+    ) -> Any:
+        """Build a handler closure for a skill tool recipe."""
+        import asyncio
+        from pathlib import Path
+
+        mode = recipe.get("mode", "command")
+        entry = recipe.get("entry", "")
+        recipe_args = recipe.get("args", [])
+        recipe_env = recipe.get("env", {})
+        recipe_timeout = recipe.get("timeout_seconds", 60)
+        working_dir = recipe.get("working_dir")
+        secret_placeholders = recipe.get("secret_placeholders", [])
+
+        async def handler(arguments: dict[str, Any], context: Any) -> str:
+            env = dict(os.environ)
+            env.update(recipe_env)
+            for placeholder in secret_placeholders:
+                if placeholder in secrets:
+                    env[placeholder] = secrets[placeholder]
+            env["SKILL_STAGING_DIR"] = str(staging_dir)
+
+            cwd = Path(staging_dir) / working_dir if working_dir else staging_dir
+
+            if mode == "script":
+                script_path = Path(staging_dir) / entry
+                if not script_path.exists():
+                    return f"Script not found: {entry}"
+                script_path.chmod(0o755)
+                cmd = [str(script_path), *recipe_args]
+            elif mode == "command":
+                cmd = [entry, *recipe_args]
+            else:
+                return f"Unsupported recipe mode: {mode}"
+
+            for key, value in arguments.items():
+                cmd = [c.replace(f"{{{key}}}", str(value)) for c in cmd]
+                env[f"SKILL_ARG_{key.upper()}"] = str(value)
+
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=str(cwd),
+                env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=recipe_timeout)
+            except TimeoutError:
+                proc.kill()
+                return f"Skill tool execution timed out after {recipe_timeout}s"
+
+            output = stdout.decode(errors="replace")
+            if proc.returncode != 0:
+                err = stderr.decode(errors="replace")
+                return f"Exit code {proc.returncode}\n{output}\n{err}".strip()
+            return output
+
+        return handler
 
     async def _handle_tool_list(self, ws: Any, msg_id: str | None) -> None:
         if msg_id is None:

@@ -14,7 +14,7 @@
     slugify,
     type AgentFormState
   } from '$lib/agents';
-  import type { Agent, EffectiveToolItem, ExecutorConfig, IntarisMCPServer, LLMProvider, SecretMetadata, ToolDefinitionSummary, Workflow } from '$lib/types/api';
+  import type { Agent, EffectiveToolItem, ExecutorConfig, IntarisMCPServer, LLMProvider, SecretMetadata, Skill, ToolDefinitionSummary, Workflow } from '$lib/types/api';
 
   type AgentToolOption = (ToolDefinitionSummary & { tool_id?: string; permission?: string }) | EffectiveToolItem;
 
@@ -26,6 +26,7 @@
     providers,
     executors = [],
     secrets = [],
+    skills = [],
     intarisMcpServers = [],
     secondaryAgents = [],
     secondaryBindings = [],
@@ -42,6 +43,7 @@
     providers: LLMProvider[];
     executors?: ExecutorConfig[];
     secrets?: SecretMetadata[];
+    skills?: Skill[];
     intarisMcpServers?: IntarisMCPServer[];
     secondaryAgents?: Agent[];
     secondaryBindings?: string[];
@@ -212,6 +214,17 @@
       form.allowedSecrets = [...form.allowedSecrets, secretName];
     }
   }
+
+  function toggleSkill(skillId: string): void {
+    if (form.selectedSkillIds.includes(skillId)) {
+      form.selectedSkillIds = form.selectedSkillIds.filter((v: string) => v !== skillId);
+    } else {
+      form.selectedSkillIds = [...form.selectedSkillIds, skillId];
+    }
+  }
+
+  const autoLoadSkills = $derived(skills.filter((s: Skill) => s.auto_load && !form.selectedSkillIds.includes(s.skill_id)));
+  const selectableSkills = $derived(skills.filter((s: Skill) => !s.auto_load));
 
   async function handleSubmit(event: SubmitEvent): Promise<void> {
     event.preventDefault();
@@ -522,6 +535,43 @@
                 </label>
               {/each}
             </div>
+          </div>
+        {/if}
+
+        <!-- Skills -->
+        {#if skills.length > 0}
+          <div class="mt-4 space-y-3">
+            <p class="text-sm font-medium text-slate-200">Skills</p>
+            <p class="text-xs text-slate-400">Select skills for this agent. Auto-loaded skills are always active.</p>
+            {#if selectableSkills.length > 0}
+              <div class="grid gap-2 md:grid-cols-2">
+                {#each selectableSkills as skill}
+                  <label class="flex items-center gap-2 text-sm text-slate-200">
+                    <input
+                      checked={form.selectedSkillIds.includes(skill.skill_id)}
+                      class="h-4 w-4 rounded border-slate-600 bg-slate-950"
+                      type="checkbox"
+                      onchange={() => toggleSkill(skill.skill_id)}
+                      disabled={readonly}
+                    />
+                    <span>{skill.name}</span>
+                    {#if skill.current_version?.tools && skill.current_version.tools.length > 0}
+                      <span class="text-xs text-slate-500">({skill.current_version.tools.length} tools)</span>
+                    {/if}
+                  </label>
+                {/each}
+              </div>
+            {/if}
+            {#if autoLoadSkills.length > 0}
+              <div class="mt-2">
+                <p class="mb-1 text-xs text-slate-500">Auto-loaded (always active):</p>
+                <div class="flex flex-wrap gap-1">
+                  {#each autoLoadSkills as skill}
+                    <span class="rounded bg-slate-700 px-2 py-0.5 text-xs text-slate-300">{skill.name}</span>
+                  {/each}
+                </div>
+              </div>
+            {/if}
           </div>
         {/if}
 
