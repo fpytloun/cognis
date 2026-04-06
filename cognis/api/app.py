@@ -467,6 +467,7 @@ def create_app() -> FastAPI:
             session_factory=session_factory,
             event_bus=event_bus,
             channel_manager_ref=_get_channel_manager,
+            turn_scheduler=turn_scheduler,
         )
 
         app.state.channel_manager = channel_manager

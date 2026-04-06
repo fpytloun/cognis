@@ -623,6 +623,7 @@ class ChannelTurnObserver:
         self._channel_manager_ref = channel_manager_ref
         self._accumulated_text = ""
         self._typing_sent = False
+        self._turn_active = False
         self._assistant_delivery_mode = assistant_delivery_mode
 
     async def on_token(
@@ -633,6 +634,7 @@ class ChannelTurnObserver:
         delta: str,
     ) -> None:
         """Accumulate tokens and send typing indicator."""
+        self._turn_active = True
         self._accumulated_text += delta
 
         # Send typing indicator on first token
@@ -655,6 +657,7 @@ class ChannelTurnObserver:
         arguments: dict[str, Any] | None,
     ) -> None:
         """Send typing indicator during tool execution."""
+        self._turn_active = True
         adapter = self._get_adapter()
         if adapter is not None:
             with contextlib.suppress(Exception):
@@ -673,8 +676,26 @@ class ChannelTurnObserver:
     ) -> None:
         """No-op for tool results."""
 
+    async def flush_buffered_text(self) -> None:
+        """Flush accumulated text to the channel without ending the turn.
+
+        Called by the delivery service before sending a step_question
+        notification so the assistant's preceding message arrives first.
+        """
+        if not self._accumulated_text:
+            return
+        adapter = self._get_adapter()
+        if adapter is None:
+            return
+        await self._send_text(self._accumulated_text, adapter=adapter)
+        self._accumulated_text = ""
+
     async def on_turn_complete(self, result: Any) -> None:
         """Send the accumulated response to the channel."""
+        if not self._turn_active:
+            # This observer was registered for a queued message that hasn't
+            # started yet. Keep it alive for the next turn.
+            return
         # Remove self from observers
         self._turn_scheduler_remove()
 
@@ -724,6 +745,8 @@ class ChannelTurnObserver:
 
     async def on_turn_error(self, conversation_id: str, error: Any) -> None:
         """Send error message to the channel."""
+        if not self._turn_active:
+            return
         self._turn_scheduler_remove()
 
         adapter = self._get_adapter()

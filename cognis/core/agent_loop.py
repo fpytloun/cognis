@@ -317,6 +317,36 @@ class StreamAccumulator:
             try:
                 args = json.loads(tc["arguments"]) if tc["arguments"] else {}
             except json.JSONDecodeError:
+                # Attempt to recover concatenated JSON objects (e.g. from
+                # bridge bugs that merge multiple tool calls into one index).
+                split_args = _try_split_concatenated_json(tc["arguments"])
+                if split_args is not None:
+                    for i, parsed in enumerate(split_args):
+                        result.append(
+                            ToolCall(
+                                call_id=tc["id"] or f"call_{uuid.uuid4().hex[:12]}",
+                                name=tc["name"],
+                                arguments=parsed,
+                            )
+                        )
+                        if i == 0:
+                            continue
+                        # Generate unique call IDs for split-out tool calls
+                        result[-1] = ToolCall(
+                            call_id=f"call_{uuid.uuid4().hex[:12]}",
+                            name=tc["name"],
+                            arguments=parsed,
+                        )
+                    continue
+                logger.warning(
+                    "Malformed tool call arguments; passing as _raw",
+                    extra={
+                        "extra_data": {
+                            "tool_name": tc["name"],
+                            "args_length": len(tc["arguments"]),
+                        }
+                    },
+                )
                 args = {"_raw": tc["arguments"]}
             result.append(
                 ToolCall(
@@ -335,6 +365,35 @@ class StreamAccumulator:
         """Reset for the next LLM turn."""
         self.content_parts.clear()
         self.tool_calls.clear()
+
+
+def _try_split_concatenated_json(raw: str) -> list[dict[str, Any]] | None:
+    """Try to split a string containing multiple concatenated JSON objects.
+
+    Returns a list of parsed dicts if successful, or ``None`` if the string
+    does not look like concatenated JSON objects.
+    """
+    raw = raw.strip()
+    if not raw.startswith("{"):
+        return None
+    decoder = json.JSONDecoder()
+    results: list[dict[str, Any]] = []
+    pos = 0
+    while pos < len(raw):
+        # Skip whitespace between objects
+        while pos < len(raw) and raw[pos] in " \t\n\r":
+            pos += 1
+        if pos >= len(raw):
+            break
+        try:
+            obj, end = decoder.raw_decode(raw, pos)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(obj, dict):
+            return None
+        results.append(obj)
+        pos = end
+    return results if len(results) > 1 else None
 
 
 # ---------------------------------------------------------------------------

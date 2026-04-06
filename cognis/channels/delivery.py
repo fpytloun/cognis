@@ -40,10 +40,12 @@ class ChannelDeliveryService:
         session_factory: async_sessionmaker[Any],
         event_bus: EventBus,
         channel_manager_ref: Any,  # Callable[[], ChannelManager]
+        turn_scheduler: Any | None = None,  # TurnScheduler (for observer flush)
     ) -> None:
         self._session_factory = session_factory
         self._event_bus = event_bus
         self._channel_manager_ref = channel_manager_ref
+        self._turn_scheduler = turn_scheduler
         self._retry_task: asyncio.Task[None] | None = None
 
         # Subscribe to relevant events
@@ -166,8 +168,11 @@ class ChannelDeliveryService:
         if not isinstance(conversation_id, str):
             return
 
+        # Skip direct notification if a follow-up delivery turn is expected.
+        # The follow-up turn will deliver the result through the normal
+        # outbox path, so sending a direct notification here would duplicate.
         delivery_id = event.data.get("channel_follow_up_delivery_id")
-        if isinstance(delivery_id, str) and await self._has_active_follow_up_delivery(delivery_id):
+        if isinstance(delivery_id, str):
             return
 
         # Only deliver to channel conversations (not web)
@@ -256,6 +261,11 @@ class ChannelDeliveryService:
         notification_type = event.data.get("notification_type", "notification")
         payload = event.data.get("payload", {})
 
+        # Flush any buffered observer text before sending the notification
+        # so the assistant's preceding message arrives before the question.
+        if notification_type == "step_question" and self._turn_scheduler is not None:
+            await self._flush_observer_buffers(conversation_id)
+
         if notification_type == "escalation" and isinstance(payload, dict):
             content = self._render_escalation_notification(payload)
         elif notification_type == "step_question" and isinstance(payload, dict):
@@ -324,6 +334,17 @@ class ChannelDeliveryService:
         lines.append("Reply /approve to allow it or /deny to block it.")
         lines.append("You can optionally add a note, for example: /approve safe to continue")
         return "\n\n".join(lines)
+
+    async def _flush_observer_buffers(self, conversation_id: str) -> None:
+        """Flush accumulated text from channel observers before a notification."""
+        if self._turn_scheduler is None:
+            return
+        observers = list(self._turn_scheduler._observers.get(conversation_id, []))
+        for observer in observers:
+            flush = getattr(observer, "flush_buffered_text", None)
+            if callable(flush):
+                with contextlib.suppress(Exception):
+                    await flush()
 
     async def recover_pending_deliveries(self) -> None:
         """Best-effort startup recovery for pending channel deliveries."""

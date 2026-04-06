@@ -243,6 +243,7 @@ async def responses_stream_to_chat_chunks(
 class _ResponsesStreamState:
     def __init__(self) -> None:
         self._items: dict[str, dict[str, Any]] = {}
+        self._next_tool_index = 0
         self._emitted_text = ""
         self.event_counts: dict[str, int] = {}
         self.text_emissions = 0
@@ -261,11 +262,14 @@ class _ResponsesStreamState:
         item_id = str(item.get("id") or item.get("call_id") or "")
         if not item_id:
             return
+        index = self._next_tool_index
+        self._next_tool_index += 1
         self._items[item_id] = {
             "call_id": normalize_tool_call_id(item.get("call_id"), item.get("id"), item_id),
             "name": str(item.get("name") or "unknown_tool"),
             "arguments": str(item.get("arguments") or ""),
             "emitted": 0,
+            "index": index,
         }
 
     def message_delta(self, item: dict[str, Any]) -> dict[str, Any] | None:
@@ -338,7 +342,7 @@ class _ResponsesStreamState:
                     "delta": {
                         "tool_calls": [
                             {
-                                "index": 0,
+                                "index": state["index"],
                                 "id": state["call_id"],
                                 "function": {"name": state["name"]},
                             }
@@ -369,7 +373,7 @@ class _ResponsesStreamState:
                     "delta": {
                         "tool_calls": [
                             {
-                                "index": 0,
+                                "index": state["index"],
                                 "id": state["call_id"],
                                 "function": {"arguments": delta},
                             }
@@ -398,7 +402,7 @@ class _ResponsesStreamState:
                     "delta": {
                         "tool_calls": [
                             {
-                                "index": 0,
+                                "index": state["index"],
                                 "id": state["call_id"],
                                 "function": {"arguments": delta},
                             }
