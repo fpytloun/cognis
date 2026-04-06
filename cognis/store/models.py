@@ -582,6 +582,51 @@ class NotificationRow(Base):
     )
 
 
+class ChannelDeliveryOutboxRow(Base):
+    """Durable outbox for background/system channel follow-up sends.
+
+    Stores only metadata and deterministic fallback text. Assistant/user
+    content is never persisted here.
+    """
+
+    __tablename__ = "channel_delivery_outbox"
+
+    delivery_id: Mapped[str] = mapped_column(String, primary_key=True)
+    user_email: Mapped[str] = mapped_column(String, ForeignKey("users.email"), nullable=False)
+    conversation_id: Mapped[str] = mapped_column(String, nullable=False)
+    session_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    source_type: Mapped[str] = mapped_column(String, nullable=False)
+    source_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    channel_type: Mapped[str] = mapped_column(String, nullable=False)
+    account_id: Mapped[str] = mapped_column(String, nullable=False)
+    chat_id: Mapped[str] = mapped_column(String, nullable=False)
+    thread_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    status: Mapped[str] = mapped_column(String, nullable=False, default="pending")
+    fallback_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    lease_token: Mapped[str | None] = mapped_column(String, nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    sent_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__ = (
+        Index("ix_channel_delivery_status_due", "status", "next_attempt_at"),
+        Index("ix_channel_delivery_conversation_created", "conversation_id", "created_at"),
+        Index("ix_channel_delivery_source", "source_type", "source_id"),
+    )
+
+
 class AuditLog(Base):
     """System-level audit events (NOT session content)."""
 

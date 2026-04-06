@@ -478,9 +478,17 @@ def create_app() -> FastAPI:
         except Exception:
             logger.exception("Failed to start channel adapters")
 
+        try:
+            await channel_delivery.recover_pending_deliveries()
+        except Exception:
+            logger.exception("Failed to recover pending channel deliveries")
+
+        await channel_delivery.start()
+
         yield
 
         await artifact_maintenance.stop()
+        await channel_delivery.stop()
         await channel_manager.stop_all()
         await task_queue.stop()
         await shared_runtime.cleanup()

@@ -1073,10 +1073,58 @@ class AgentLoop:
                 executor_connection=executor_connection,
             )
             status = "completed" if output else "failed"
+            result_summary = output.summary if output else None
         except Exception:
             status = "failed"
+            result_summary = None
         finally:
             await self._untrack_child(parent_session_id, child_session_id)
+
+        delivery_id: str | None = None
+        channel_deliverable = False
+        delivery_fallback_text: str | None = None
+        try:
+            async with self.session_manager.session_factory() as db_session:
+                from cognis.store.queries import (
+                    create_channel_delivery_outbox,
+                    get_conversation_channel_route,
+                )
+
+                route = await get_conversation_channel_route(db_session, conversation_id)
+                if route is not None:
+                    channel_type, account_id, chat_id, thread_id, user_email = route
+                    delivery_id = f"cdel_{uuid.uuid4().hex[:12]}"
+                    delivery_fallback_text = {
+                        "completed": "Background work completed. I could not deliver the detailed reply, so please open the conversation for the full result.",
+                        "failed": "Background work failed. I could not deliver the detailed reply, so please open the conversation for details.",
+                    }[status]
+                    await create_channel_delivery_outbox(
+                        db_session,
+                        delivery_id=delivery_id,
+                        user_email=user_email,
+                        conversation_id=conversation_id,
+                        session_id=child_session_id,
+                        source_type="delegation",
+                        source_id=child_session_id,
+                        channel_type=channel_type,
+                        account_id=account_id,
+                        chat_id=chat_id,
+                        thread_id=thread_id,
+                        fallback_text=delivery_fallback_text,
+                    )
+                    await db_session.commit()
+                    channel_deliverable = True
+        except Exception:
+            logger.warning(
+                "delegation: failed to persist channel follow-up delivery intent",
+                extra={
+                    "extra_data": {
+                        "conversation_id": conversation_id,
+                        "child_session_id": child_session_id,
+                    }
+                },
+                exc_info=True,
+            )
 
         # Trigger a follow-up turn in the parent conversation
         await self.event_bus.publish(
@@ -1085,6 +1133,10 @@ class AgentLoop:
                 data={
                     "conversation_id": conversation_id,
                     "status": status,
+                    "result_summary": result_summary,
+                    "delivery_id": delivery_id,
+                    "channel_deliverable": channel_deliverable,
+                    "delivery_fallback_text": delivery_fallback_text,
                 },
             )
         )

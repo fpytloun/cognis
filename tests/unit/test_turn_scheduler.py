@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -127,3 +128,124 @@ async def test_submit_turn_ignores_task_backed_step_questions() -> None:
     )
 
     assert error is None
+
+
+@pytest.mark.asyncio
+async def test_follow_up_event_threads_channel_delivery_metadata() -> None:
+    session_factory = SimpleNamespace()
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    session_factory.__call__ = lambda self=None: _Session()  # type: ignore[attr-defined]
+
+    scheduler = TurnScheduler(
+        session_factory=lambda: _Session(),
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+
+    scheduler.submit_turn = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+    async def _get_conversation(_session, conversation_id: str):
+        return SimpleNamespace(conversation_id=conversation_id, user_email="user@example.com")
+
+    import cognis.store.queries as queries
+
+    original = queries.get_conversation
+    queries.get_conversation = _get_conversation  # type: ignore[assignment]
+    try:
+        await scheduler._handle_follow_up_event(
+            SimpleNamespace(
+                data={
+                    "conversation_id": "conv-1",
+                    "status": "completed",
+                    "delivery_id": "cdel_1",
+                    "channel_deliverable": True,
+                    "delivery_fallback_text": "fallback",
+                }
+            )
+        )
+    finally:
+        queries.get_conversation = original  # type: ignore[assignment]
+
+    scheduler.submit_turn.assert_awaited_once()
+    assert scheduler.submit_turn.await_args.kwargs["system_initiated"] is True
+    assert scheduler.submit_turn.await_args.kwargs["channel_deliverable"] is True
+    assert scheduler.submit_turn.await_args.kwargs["delivery_id"] == "cdel_1"
+    assert scheduler.submit_turn.await_args.kwargs["delivery_fallback_text"] == "fallback"
+
+
+@pytest.mark.asyncio
+async def test_follow_up_event_publishes_turn_error_on_immediate_rejection() -> None:
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    scheduler = TurnScheduler(
+        session_factory=lambda: _Session(),
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+
+    scheduler.submit_turn = AsyncMock(
+        return_value=SimpleNamespace(code="session_ended", message="ended", recoverable=False)
+    )  # type: ignore[method-assign]
+    scheduler._publish_turn_error = AsyncMock()  # type: ignore[method-assign]
+
+    async def _get_conversation(_session, conversation_id: str):
+        return SimpleNamespace(
+            conversation_id=conversation_id,
+            user_email="user@example.com",
+            active_session_id="sess-1",
+        )
+
+    import cognis.store.queries as queries
+
+    original = queries.get_conversation
+    queries.get_conversation = _get_conversation  # type: ignore[assignment]
+    try:
+        await scheduler._handle_follow_up_event(
+            SimpleNamespace(
+                data={
+                    "conversation_id": "conv-1",
+                    "status": "completed",
+                    "delivery_id": "cdel_1",
+                    "channel_deliverable": True,
+                    "delivery_fallback_text": "fallback",
+                }
+            )
+        )
+    finally:
+        queries.get_conversation = original  # type: ignore[assignment]
+
+    scheduler._publish_turn_error.assert_awaited_once()

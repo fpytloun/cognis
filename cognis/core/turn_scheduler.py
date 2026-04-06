@@ -97,6 +97,11 @@ class TurnResult:
     error: TurnError | None = None
     title_changed: bool = False
     new_title: str | None = None
+    final_content: str | None = None
+    system_initiated: bool = False
+    channel_deliverable: bool = False
+    delivery_id: str | None = None
+    delivery_fallback_text: str | None = None
 
 
 @dataclass(slots=True)
@@ -107,6 +112,9 @@ class _QueuedMessage:
     user_email: str
     attachments: list[dict[str, Any]] | None = None
     system_initiated: bool = False
+    channel_deliverable: bool = False
+    delivery_id: str | None = None
+    delivery_fallback_text: str | None = None
 
 
 class SessionCreationFailedError(Exception):
@@ -274,6 +282,9 @@ class TurnScheduler:
         user_email: str,
         attachments: list[dict[str, Any]] | None = None,
         system_initiated: bool = False,
+        channel_deliverable: bool = False,
+        delivery_id: str | None = None,
+        delivery_fallback_text: str | None = None,
     ) -> TurnError | None:
         """Submit a chat turn for execution.
 
@@ -362,6 +373,9 @@ class TurnScheduler:
                         attachments=[
                             item.model_dump(mode="json") for item in normalized_attachments
                         ],
+                        channel_deliverable=channel_deliverable,
+                        delivery_id=delivery_id,
+                        delivery_fallback_text=delivery_fallback_text,
                     )
                 )
                 await self._notify_observers_system_message(
@@ -408,6 +422,9 @@ class TurnScheduler:
                     user_email=user_email,
                     attachments=[item.model_dump(mode="json") for item in normalized_attachments],
                     system_initiated=system_initiated,
+                    channel_deliverable=channel_deliverable,
+                    delivery_id=delivery_id,
+                    delivery_fallback_text=delivery_fallback_text,
                 )
             )
             # Notify observers that the message was queued
@@ -426,6 +443,9 @@ class TurnScheduler:
             attachments=normalized_attachments,
             attachment_notice=attachment_notice,
             system_initiated=system_initiated,
+            channel_deliverable=channel_deliverable,
+            delivery_id=delivery_id,
+            delivery_fallback_text=delivery_fallback_text,
             bootstrap_wait_for_intention=bootstrap_wait_for_intention,
         )
         return None
@@ -504,12 +524,33 @@ class TurnScheduler:
             )
             return
 
-        await self.submit_turn(
+        error = await self.submit_turn(
             conversation_id,
             prompt,
             user_email=row.user_email,
             system_initiated=True,
+            channel_deliverable=bool(event.data.get("channel_deliverable")),
+            delivery_id=event.data.get("delivery_id")
+            if isinstance(event.data.get("delivery_id"), str)
+            else None,
+            delivery_fallback_text=event.data.get("delivery_fallback_text")
+            if isinstance(event.data.get("delivery_fallback_text"), str)
+            else None,
         )
+        if error is not None:
+            await self._publish_turn_error(
+                conversation_id,
+                row.active_session_id or "",
+                error,
+                system_initiated=True,
+                channel_deliverable=bool(event.data.get("channel_deliverable")),
+                delivery_id=event.data.get("delivery_id")
+                if isinstance(event.data.get("delivery_id"), str)
+                else None,
+                delivery_fallback_text=event.data.get("delivery_fallback_text")
+                if isinstance(event.data.get("delivery_fallback_text"), str)
+                else None,
+            )
 
     # ------------------------------------------------------------------
     # Turn execution
@@ -613,6 +654,9 @@ class TurnScheduler:
         attachments: list[AttachmentRef] | None = None,
         attachment_notice: str | None = None,
         system_initiated: bool = False,
+        channel_deliverable: bool = False,
+        delivery_id: str | None = None,
+        delivery_fallback_text: str | None = None,
         bootstrap_wait_for_intention: bool = False,
     ) -> None:
         """Launch a turn as a background asyncio.Task."""
@@ -632,6 +676,9 @@ class TurnScheduler:
                 attachments=attachments,
                 attachment_notice=attachment_notice,
                 system_initiated=system_initiated,
+                channel_deliverable=channel_deliverable,
+                delivery_id=delivery_id,
+                delivery_fallback_text=delivery_fallback_text,
                 bootstrap_wait_for_intention=bootstrap_wait_for_intention,
                 cancel_event=control,
             )
@@ -648,6 +695,9 @@ class TurnScheduler:
         attachments: list[AttachmentRef] | None,
         attachment_notice: str | None,
         system_initiated: bool,
+        channel_deliverable: bool,
+        delivery_id: str | None,
+        delivery_fallback_text: str | None,
         bootstrap_wait_for_intention: bool,
         cancel_event: asyncio.Event,
     ) -> None:
@@ -728,6 +778,10 @@ class TurnScheduler:
                     message_id=message_id,
                     delegated=True,
                     task_id=task.task_id,
+                    system_initiated=system_initiated,
+                    channel_deliverable=channel_deliverable,
+                    delivery_id=delivery_id,
+                    delivery_fallback_text=delivery_fallback_text,
                 )
                 await self._publish_turn_completed(result)
                 TURNS_TOTAL.labels(outcome="delegated").inc()
@@ -739,7 +793,7 @@ class TurnScheduler:
             )
 
             # Execute the turn
-            await self._workflow_engine.run_direct_turn(
+            step_output = await self._workflow_engine.run_direct_turn(
                 conversation=conversation,
                 session=session,
                 agent=agent,
@@ -788,6 +842,15 @@ class TurnScheduler:
                 context_usage=context_usage,
                 title_changed=title_changed,
                 new_title=conversation.title if title_changed else None,
+                final_content=(
+                    step_output.content.strip()
+                    if step_output and step_output.content.strip()
+                    else None
+                ),
+                system_initiated=system_initiated,
+                channel_deliverable=channel_deliverable,
+                delivery_id=delivery_id,
+                delivery_fallback_text=delivery_fallback_text,
             )
             await self._publish_turn_completed(result)
             TURNS_TOTAL.labels(outcome="completed").inc()
@@ -809,7 +872,15 @@ class TurnScheduler:
                 message="The current turn was cancelled.",
                 recoverable=True,
             )
-            await self._publish_turn_error(conversation_id, session.session_id, error)
+            await self._publish_turn_error(
+                conversation_id,
+                session.session_id,
+                error,
+                system_initiated=system_initiated,
+                channel_deliverable=channel_deliverable,
+                delivery_id=delivery_id,
+                delivery_fallback_text=delivery_fallback_text,
+            )
             TURNS_TOTAL.labels(outcome="cancelled").inc()
 
         except Exception as exc:
@@ -818,7 +889,15 @@ class TurnScheduler:
                 extra={"extra_data": {"conversation_id": conversation_id}},
             )
             error = await self._classify_turn_error(exc)
-            await self._publish_turn_error(conversation_id, session.session_id, error)
+            await self._publish_turn_error(
+                conversation_id,
+                session.session_id,
+                error,
+                system_initiated=system_initiated,
+                channel_deliverable=channel_deliverable,
+                delivery_id=delivery_id,
+                delivery_fallback_text=delivery_fallback_text,
+            )
             TURNS_TOTAL.labels(outcome="error").inc()
 
         finally:
@@ -846,6 +925,9 @@ class TurnScheduler:
                         user_email=queued.user_email,
                         attachments=queued.attachments,
                         system_initiated=queued.system_initiated,
+                        channel_deliverable=queued.channel_deliverable,
+                        delivery_id=queued.delivery_id,
+                        delivery_fallback_text=queued.delivery_fallback_text,
                     )
                 except Exception:
                     logger.exception(
@@ -934,12 +1016,25 @@ class TurnScheduler:
                     "title_changed": result.title_changed,
                     "new_title": result.new_title,
                     "queued_count": self.queued_count(result.conversation_id),
+                    "system_initiated": result.system_initiated,
+                    "channel_deliverable": result.channel_deliverable,
+                    "delivery_id": result.delivery_id,
+                    "delivery_fallback_text": result.delivery_fallback_text,
+                    "final_content": result.final_content,
                 },
             )
         )
 
     async def _publish_turn_error(
-        self, conversation_id: str, session_id: str, error: TurnError
+        self,
+        conversation_id: str,
+        session_id: str,
+        error: TurnError,
+        *,
+        system_initiated: bool = False,
+        channel_deliverable: bool = False,
+        delivery_id: str | None = None,
+        delivery_fallback_text: str | None = None,
     ) -> None:
         """Notify observers and publish lifecycle event."""
         for observer in list(self._observers.get(conversation_id, [])):
@@ -955,6 +1050,10 @@ class TurnScheduler:
                     "error_code": error.code,
                     "error_message": error.message,
                     "recoverable": error.recoverable,
+                    "system_initiated": system_initiated,
+                    "channel_deliverable": channel_deliverable,
+                    "delivery_id": delivery_id,
+                    "delivery_fallback_text": delivery_fallback_text,
                 },
             )
         )

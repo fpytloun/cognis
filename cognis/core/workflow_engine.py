@@ -821,6 +821,46 @@ class WorkflowEngine:
         # Trigger a follow-up turn in the source conversation so the agent
         # can explain the pause to the user (why it paused, what the options are).
         if task.source_type == "chat" and task.source_ref:
+            delivery_id: str | None = None
+            channel_deliverable = False
+            delivery_fallback_text: str | None = None
+            try:
+                async with self._session_factory() as db_session:
+                    from cognis.store.queries import (
+                        create_channel_delivery_outbox,
+                        get_conversation_channel_route,
+                    )
+
+                    route = await get_conversation_channel_route(db_session, task.source_ref)
+                    if route is not None:
+                        channel_type, account_id, chat_id, thread_id, user_email = route
+                        delivery_id = f"cdel_{uuid.uuid4().hex[:12]}"
+                        delivery_fallback_text = "Background work paused and needs your attention. Please open the conversation for details."
+                        await create_channel_delivery_outbox(
+                            db_session,
+                            delivery_id=delivery_id,
+                            user_email=user_email,
+                            conversation_id=task.source_ref,
+                            session_id=None,
+                            source_type="task",
+                            source_id=task.task_id,
+                            channel_type=channel_type,
+                            account_id=account_id,
+                            chat_id=chat_id,
+                            thread_id=thread_id,
+                            fallback_text=delivery_fallback_text,
+                        )
+                        await db_session.commit()
+                        channel_deliverable = True
+            except Exception:
+                logger.warning(
+                    "gate_follow_up: failed to persist channel follow-up delivery intent",
+                    extra={
+                        "extra_data": {"task_id": task.task_id, "conversation_id": task.source_ref}
+                    },
+                    exc_info=True,
+                )
+
             await self._event_bus.publish(
                 Event(
                     type=EventType.FOLLOW_UP_TURN_REQUESTED,
@@ -832,6 +872,9 @@ class WorkflowEngine:
                         "result_summary": gate.message,
                         "gate_message": gate.message,
                         "gate_options": gate_options,
+                        "delivery_id": delivery_id,
+                        "channel_deliverable": channel_deliverable,
+                        "delivery_fallback_text": delivery_fallback_text,
                     },
                 )
             )
@@ -1223,6 +1266,7 @@ class WorkflowEngine:
         # The Intaris provider already retries internally (exponential
         # backoff), so a failure here means retries were exhausted.
         # We do one additional delayed attempt before giving up.
+        delivery_session_id: str | None = None
         for attempt in range(2):
             try:
                 async with self._session_factory() as db_session:
@@ -1241,6 +1285,7 @@ class WorkflowEngine:
                             sess = await get_session_row(db_session, conv.active_session_id)
 
                     if sess and sess.intaris_session_id:
+                        delivery_session_id = sess.session_id
                         await self._providers.guardrails.record_events(
                             session_id=sess.intaris_session_id,
                             events=[event],
@@ -1276,6 +1321,57 @@ class WorkflowEngine:
             event_type = EventType.TASK_COMPLETED
         elif task.status == TaskStatus.CANCELLED:
             event_type = EventType.TASK_CANCELLED
+
+        delivery_id: str | None = None
+        channel_deliverable = False
+        delivery_fallback_text: str | None = None
+        try:
+            async with self._session_factory() as db_session:
+                from cognis.store.queries import (
+                    create_channel_delivery_outbox,
+                    get_conversation_channel_route,
+                )
+
+                route = await get_conversation_channel_route(db_session, target_conversation_id)
+                if route is not None:
+                    channel_type, account_id, chat_id, thread_id, user_email = route
+                    delivery_id = f"cdel_{uuid.uuid4().hex[:12]}"
+                    delivery_fallback_text = {
+                        TaskStatus.COMPLETED: "Background work completed. I could not deliver the detailed reply, so please open the conversation for the full result.",
+                        TaskStatus.FAILED: "Background work failed. I could not deliver the detailed reply, so please open the conversation for details.",
+                        TaskStatus.CANCELLED: "Background work was cancelled. I could not deliver the detailed reply, so please open the conversation for details.",
+                    }.get(
+                        task.status,
+                        "Background work status changed. Please open the conversation for details.",
+                    )
+                    await create_channel_delivery_outbox(
+                        db_session,
+                        delivery_id=delivery_id,
+                        user_email=user_email,
+                        conversation_id=target_conversation_id,
+                        session_id=delivery_session_id,
+                        source_type="task",
+                        source_id=task.task_id,
+                        channel_type=channel_type,
+                        account_id=account_id,
+                        chat_id=chat_id,
+                        thread_id=thread_id,
+                        fallback_text=delivery_fallback_text,
+                    )
+                    await db_session.commit()
+                    channel_deliverable = True
+        except Exception:
+            logger.warning(
+                "task_delivery: failed to persist channel follow-up delivery intent",
+                extra={
+                    "extra_data": {
+                        "task_id": task.task_id,
+                        "conversation_id": target_conversation_id,
+                    }
+                },
+                exc_info=True,
+            )
+
         await self._event_bus.publish(
             Event(
                 type=event_type,
@@ -1285,6 +1381,7 @@ class WorkflowEngine:
                     "title": task.title,
                     "conversation_id": target_conversation_id,
                     "result_summary": task.result_summary,
+                    "channel_follow_up_delivery_id": delivery_id,
                 },
             )
         )
@@ -1301,6 +1398,9 @@ class WorkflowEngine:
                     "user_email": task.created_by,
                     "status": str(task.status),
                     "result_summary": task.result_summary,
+                    "delivery_id": delivery_id,
+                    "channel_deliverable": channel_deliverable,
+                    "delivery_fallback_text": delivery_fallback_text,
                 },
             )
         )

@@ -195,6 +195,16 @@ Cognis validates all of the following before saving:
 3. Verify the account reaches `connected` state.
 4. Send a test Signal message and confirm the agent replies.
 
+Background follow-ups now use the same channel binding as the original
+conversation. That means wait=false delegation results, task completions,
+and similar system-initiated follow-up turns are delivered back to the
+same Signal chat instead of only appearing in the web UI.
+
+If the channel adapter is temporarily unavailable, Cognis keeps a
+metadata-only delivery record and retries later. When it cannot safely
+reconstruct the full assistant reply after a restart, it falls back to a
+generic recovery message that points the user back to the conversation.
+
 #### Default behavior in direct mode
 
 Direct mode enables these features by default when supported by the installed `signal-cli` version:

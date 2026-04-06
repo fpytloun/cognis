@@ -17,6 +17,7 @@ from cognis.store.models import (
     ArtifactRecordRow,
     ChannelAccountRow,
     ChannelContact,
+    ChannelDeliveryOutboxRow,
     ChannelPairingRequest,
     Conversation,
     ExecutorRow,
@@ -665,6 +666,48 @@ async def get_conversation(session: AsyncSession, conversation_id: str) -> Conve
         select(Conversation).where(Conversation.conversation_id == conversation_id)
     )
     return result.scalar_one_or_none()
+
+
+async def get_conversation_channel_route(
+    session: AsyncSession,
+    conversation_id: str,
+) -> tuple[str, str, str, str | None, str] | None:
+    """Resolve stored channel routing metadata for a conversation.
+
+    Returns ``(channel_type, account_id, chat_id, thread_id, user_email)``
+    or ``None`` when the conversation is not channel-bound.
+    """
+
+    row = await get_conversation(session, conversation_id)
+    if row is None or row.context_type in {"web", "api"}:
+        return None
+
+    platform_data = row.context_data or {}
+    channel_type = platform_data.get("channel_type")
+    account_id = platform_data.get("account_id")
+    chat_id = platform_data.get("chat_id")
+    thread_id = platform_data.get("thread_id")
+
+    if not all([channel_type, account_id, chat_id]):
+        if row.context_ref and ":" in row.context_ref:
+            parts = row.context_ref.split(":", 3)
+            if len(parts) >= 3:
+                channel_type = parts[0]
+                account_id = parts[1]
+                chat_id = parts[2]
+                thread_id = parts[3] if len(parts) > 3 else None
+            else:
+                return None
+        else:
+            return None
+
+    return (
+        str(channel_type),
+        str(account_id),
+        str(chat_id),
+        str(thread_id) if thread_id else None,
+        row.user_email,
+    )
 
 
 async def list_conversations(
@@ -2772,6 +2815,208 @@ async def reject_pairing_request(
     row.completed_at = _utcnow()
     await session.flush()
     return row
+
+
+# --- Channel delivery outbox ---
+
+
+async def create_channel_delivery_outbox(
+    session: AsyncSession,
+    *,
+    delivery_id: str,
+    user_email: str,
+    conversation_id: str,
+    session_id: str | None,
+    source_type: str,
+    source_id: str | None,
+    channel_type: str,
+    account_id: str,
+    chat_id: str,
+    thread_id: str | None,
+    fallback_text: str | None,
+) -> ChannelDeliveryOutboxRow:
+    row = ChannelDeliveryOutboxRow(
+        delivery_id=delivery_id,
+        user_email=user_email,
+        conversation_id=conversation_id,
+        session_id=session_id,
+        source_type=source_type,
+        source_id=source_id,
+        channel_type=channel_type,
+        account_id=account_id,
+        chat_id=chat_id,
+        thread_id=thread_id,
+        fallback_text=fallback_text,
+        status="pending",
+    )
+    session.add(row)
+    await session.flush()
+    return row
+
+
+async def get_channel_delivery_outbox(
+    session: AsyncSession,
+    delivery_id: str,
+) -> ChannelDeliveryOutboxRow | None:
+    return await session.get(ChannelDeliveryOutboxRow, delivery_id)
+
+
+async def has_channel_delivery_outbox_for_source(
+    session: AsyncSession,
+    *,
+    conversation_id: str,
+    source_type: str,
+    source_id: str,
+) -> bool:
+    result = await session.execute(
+        select(ChannelDeliveryOutboxRow.delivery_id).where(
+            ChannelDeliveryOutboxRow.conversation_id == conversation_id,
+            ChannelDeliveryOutboxRow.source_type == source_type,
+            ChannelDeliveryOutboxRow.source_id == source_id,
+            ChannelDeliveryOutboxRow.status != "suppressed",
+        )
+    )
+    return result.scalar_one_or_none() is not None
+
+
+async def claim_channel_delivery_outbox(
+    session: AsyncSession,
+    *,
+    delivery_id: str,
+    lease_token: str,
+    lease_expires_at: datetime,
+) -> ChannelDeliveryOutboxRow | None:
+    result = await session.execute(
+        update(ChannelDeliveryOutboxRow)
+        .where(
+            ChannelDeliveryOutboxRow.delivery_id == delivery_id,
+            ChannelDeliveryOutboxRow.status.in_(["pending", "failed"]),
+            sa.or_(
+                ChannelDeliveryOutboxRow.next_attempt_at.is_(None),
+                ChannelDeliveryOutboxRow.next_attempt_at <= _utcnow(),
+            ),
+        )
+        .values(
+            status="sending",
+            lease_token=lease_token,
+            lease_expires_at=lease_expires_at,
+            updated_at=_utcnow(),
+        )
+    )
+    if not getattr(result, "rowcount", 0):
+        return None
+    return await get_channel_delivery_outbox(session, delivery_id)
+
+
+async def mark_channel_delivery_sent(
+    session: AsyncSession,
+    *,
+    delivery_id: str,
+    lease_token: str,
+) -> bool:
+    result = await session.execute(
+        update(ChannelDeliveryOutboxRow)
+        .where(
+            ChannelDeliveryOutboxRow.delivery_id == delivery_id,
+            ChannelDeliveryOutboxRow.status == "sending",
+            ChannelDeliveryOutboxRow.lease_token == lease_token,
+        )
+        .values(
+            status="sent",
+            sent_at=_utcnow(),
+            lease_token=None,
+            lease_expires_at=None,
+            last_error=None,
+            updated_at=_utcnow(),
+        )
+    )
+    return bool(getattr(result, "rowcount", 0))
+
+
+async def mark_channel_delivery_failed(
+    session: AsyncSession,
+    *,
+    delivery_id: str,
+    lease_token: str,
+    last_error: str | None,
+    next_attempt_at: datetime,
+) -> bool:
+    result = await session.execute(
+        update(ChannelDeliveryOutboxRow)
+        .where(
+            ChannelDeliveryOutboxRow.delivery_id == delivery_id,
+            ChannelDeliveryOutboxRow.status == "sending",
+            ChannelDeliveryOutboxRow.lease_token == lease_token,
+        )
+        .values(
+            status="failed",
+            attempt_count=ChannelDeliveryOutboxRow.attempt_count + 1,
+            last_error=last_error,
+            next_attempt_at=next_attempt_at,
+            lease_token=None,
+            lease_expires_at=None,
+            updated_at=_utcnow(),
+        )
+    )
+    return bool(getattr(result, "rowcount", 0))
+
+
+async def mark_channel_delivery_uncertain(
+    session: AsyncSession,
+    *,
+    delivery_id: str,
+) -> bool:
+    result = await session.execute(
+        update(ChannelDeliveryOutboxRow)
+        .where(ChannelDeliveryOutboxRow.delivery_id == delivery_id)
+        .values(
+            status="uncertain",
+            lease_token=None,
+            lease_expires_at=None,
+            updated_at=_utcnow(),
+        )
+    )
+    return bool(getattr(result, "rowcount", 0))
+
+
+async def list_channel_delivery_outbox_due(
+    session: AsyncSession,
+    *,
+    now: datetime,
+    limit: int = 100,
+) -> list[ChannelDeliveryOutboxRow]:
+    result = await session.execute(
+        select(ChannelDeliveryOutboxRow)
+        .where(
+            ChannelDeliveryOutboxRow.status.in_(["pending", "failed"]),
+            sa.or_(
+                ChannelDeliveryOutboxRow.next_attempt_at.is_(None),
+                ChannelDeliveryOutboxRow.next_attempt_at <= now,
+            ),
+        )
+        .order_by(ChannelDeliveryOutboxRow.created_at.asc())
+        .limit(limit)
+    )
+    return list(result.scalars().all())
+
+
+async def list_channel_delivery_outbox_stale_sending(
+    session: AsyncSession,
+    *,
+    now: datetime,
+    limit: int = 100,
+) -> list[ChannelDeliveryOutboxRow]:
+    result = await session.execute(
+        select(ChannelDeliveryOutboxRow)
+        .where(
+            ChannelDeliveryOutboxRow.status == "sending",
+            ChannelDeliveryOutboxRow.lease_expires_at.is_not(None),
+            ChannelDeliveryOutboxRow.lease_expires_at <= now,
+        )
+        .order_by(ChannelDeliveryOutboxRow.updated_at.asc())
+        .limit(limit)
+    )
+    return list(result.scalars().all())
 
 
 async def expire_stale_pairing_requests(
