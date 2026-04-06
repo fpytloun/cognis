@@ -15,6 +15,18 @@ from cognis.models.channel import (
     SettingField,
 )
 
+_ASSISTANT_DELIVERY_MODE_FIELD = SettingField(
+    name="assistant_delivery_mode",
+    label="Assistant delivery mode",
+    description=(
+        "Choose whether channel replies are delivered once at the end of the turn "
+        "or in buffered chunks while the assistant is still generating."
+    ),
+    field_type="select",
+    default="final",
+    options=["final", "immediate"],
+)
+
 # ---------------------------------------------------------------------------
 # Channel metadata definitions
 # ---------------------------------------------------------------------------
@@ -468,6 +480,10 @@ CHANNEL_REGISTRY: dict[str, ChannelMeta] = {
     "google_chat": GOOGLE_CHAT_META,
     "bluebubbles": BLUEBUBBLES_META,
 }
+
+for _meta in CHANNEL_REGISTRY.values():
+    if not any(field.name == "assistant_delivery_mode" for field in _meta.setting_fields):
+        _meta.setting_fields.append(_ASSISTANT_DELIVERY_MODE_FIELD.model_copy())
 
 
 def get_channel_meta(channel_type: str) -> ChannelMeta | None:

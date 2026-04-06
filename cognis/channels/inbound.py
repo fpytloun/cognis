@@ -140,6 +140,7 @@ class InboundPipeline:
             turn_scheduler=self._turn_scheduler,
             reply_to_id=message.message_id,
             channel_manager_ref=self._channel_manager_ref,
+            assistant_delivery_mode=str(config.settings.get("assistant_delivery_mode", "final")),
         )
         self._turn_scheduler.add_observer(conversation_id, observer)
 
@@ -488,6 +489,38 @@ def _kind_for_media(content_type: str) -> ArtifactKind:
     return ArtifactKind.FILE
 
 
+def _extract_buffered_delivery_chunk(text: str) -> tuple[str, str]:
+    """Split buffered assistant text for immediate channel delivery.
+
+    Returns ``(chunk, remainder)``.  Prefers paragraph boundaries,
+    otherwise sentence-like punctuation once the buffer is reasonably
+    large.  Keeps short trailing fragments in the buffer so immediate
+    mode feels streamed but not too noisy.
+    """
+
+    if not text:
+        return "", ""
+
+    paragraph_idx = text.rfind("\n\n")
+    if paragraph_idx >= 0:
+        chunk = text[:paragraph_idx].strip()
+        remainder = text[paragraph_idx + 2 :].lstrip()
+        return chunk, remainder
+
+    if len(text) < 180:
+        return "", text
+
+    sentence_breaks = [text.rfind(". "), text.rfind("! "), text.rfind("? "), text.rfind("\n")]
+    split_idx = max(sentence_breaks)
+    if split_idx < 80:
+        return "", text
+
+    advance = 2 if text[split_idx : split_idx + 2] in {". ", "! ", "? "} else 1
+    chunk = text[: split_idx + advance].strip()
+    remainder = text[split_idx + advance :].lstrip()
+    return chunk, remainder
+
+
 # ---------------------------------------------------------------------------
 # ChannelTurnObserver — bridges TurnObserver to channel delivery
 # ---------------------------------------------------------------------------
@@ -511,6 +544,7 @@ class ChannelTurnObserver:
         turn_scheduler: Any,
         reply_to_id: str | None = None,
         channel_manager_ref: Any,
+        assistant_delivery_mode: str = "final",
     ) -> None:
         self._channel_type = channel_type
         self._account_id = account_id
@@ -522,6 +556,7 @@ class ChannelTurnObserver:
         self._channel_manager_ref = channel_manager_ref
         self._accumulated_text = ""
         self._typing_sent = False
+        self._assistant_delivery_mode = assistant_delivery_mode
 
     async def on_token(
         self,
@@ -540,6 +575,9 @@ class ChannelTurnObserver:
             if adapter is not None:
                 with contextlib.suppress(Exception):
                     await adapter.send_typing(self._chat_id)
+
+        if self._assistant_delivery_mode == "immediate":
+            await self._flush_buffered_output()
 
     async def on_tool_call(
         self,
@@ -570,8 +608,6 @@ class ChannelTurnObserver:
 
     async def on_turn_complete(self, result: Any) -> None:
         """Send the accumulated response to the channel."""
-        from cognis.channels.formatting import format_for_channel
-
         # Remove self from observers
         self._turn_scheduler_remove()
 
@@ -595,26 +631,10 @@ class ChannelTurnObserver:
                             )
                         )
 
-        # Send text response
+        # Send remaining buffered text response
         if self._accumulated_text:
-            chunks = format_for_channel(self._accumulated_text, adapter.capabilities)
-            for chunk in chunks:
-                with contextlib.suppress(Exception):
-                    await adapter.send_message(
-                        OutboundMessage(
-                            channel_type=self._channel_type,
-                            account_id=self._account_id,
-                            chat_id=self._chat_id,
-                            content=chunk,
-                            reply_to_id=self._reply_to_id,
-                            thread_id=self._thread_id,
-                        )
-                    )
-                    CHANNEL_OUTBOUND_TOTAL.labels(
-                        channel_type=self._channel_type,
-                        account_id=self._account_id,
-                    ).inc()
-                    self._reply_to_id = None
+            await self._send_text(self._accumulated_text, adapter=adapter)
+            self._accumulated_text = ""
 
         # Send outbound media attachments
         for media in outbound_media:
@@ -686,6 +706,41 @@ class ChannelTurnObserver:
         if manager is None:
             return None
         return manager.get_adapter(self._account_id)
+
+    async def _send_text(self, text: str, *, adapter: BaseChannelAdapter | None = None) -> None:
+        from cognis.channels.formatting import format_for_channel
+
+        if not text:
+            return
+        resolved_adapter = adapter or self._get_adapter()
+        if resolved_adapter is None:
+            return
+
+        chunks = format_for_channel(text, resolved_adapter.capabilities)
+        for chunk in chunks:
+            with contextlib.suppress(Exception):
+                await resolved_adapter.send_message(
+                    OutboundMessage(
+                        channel_type=self._channel_type,
+                        account_id=self._account_id,
+                        chat_id=self._chat_id,
+                        content=chunk,
+                        reply_to_id=self._reply_to_id,
+                        thread_id=self._thread_id,
+                    )
+                )
+                CHANNEL_OUTBOUND_TOTAL.labels(
+                    channel_type=self._channel_type,
+                    account_id=self._account_id,
+                ).inc()
+                self._reply_to_id = None
+
+    async def _flush_buffered_output(self) -> None:
+        chunk, remainder = _extract_buffered_delivery_chunk(self._accumulated_text)
+        if not chunk:
+            return
+        await self._send_text(chunk)
+        self._accumulated_text = remainder
 
     def _turn_scheduler_remove(self) -> None:
         """Remove self from turn scheduler observers.

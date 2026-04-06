@@ -205,6 +205,11 @@ metadata-only delivery record and retries later. When it cannot safely
 reconstruct the full assistant reply after a restart, it falls back to a
 generic recovery message that points the user back to the conversation.
 
+Channel accounts also expose an `Assistant delivery mode` setting:
+
+- `final` sends one consolidated assistant reply when the turn completes
+- `immediate` sends buffered assistant text while the turn is still running, then sends any remaining tail on completion
+
 #### Default behavior in direct mode
 
 Direct mode enables these features by default when supported by the installed `signal-cli` version:
