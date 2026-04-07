@@ -85,6 +85,42 @@ async def test_resolve_intaris_mcp_tools_prefers_aggregated_listing() -> None:
 
 
 @pytest.mark.asyncio
+async def test_resolve_intaris_mcp_tools_accepts_name_field_from_intaris() -> None:
+    """Intaris GET /mcp/tools returns 'name' (not 'tool' or 'raw_tool_name').
+
+    The extractor must accept 'name' as a valid tool name field so the
+    aggregated listing is used directly without falling back to server cache.
+    """
+    providers = SimpleNamespace(
+        guardrails=_Guardrails(
+            aggregated=[
+                {
+                    "server": "github",
+                    "name": "search/issues",
+                    "description": "Search issues",
+                    "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}},
+                }
+            ]
+        )
+    )
+
+    result = await _resolve_intaris_mcp_tools(
+        providers,
+        _agent(tools={"intaris_mcp_servers": ["github"]}),
+        set(),
+        set(),
+    )
+
+    assert result.fallback_used is False
+    assert result.warnings == []
+    assert len(result.tools) == 1
+    tool = result.tools[0]
+    assert tool.name == sanitize_mcp_tool_name("github", "search/issues")
+    assert tool.source.server_name == "github"
+    assert tool.source.raw_tool_name == "search/issues"
+
+
+@pytest.mark.asyncio
 async def test_resolve_intaris_mcp_tools_falls_back_per_missing_server() -> None:
     providers = SimpleNamespace(
         guardrails=_Guardrails(

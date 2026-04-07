@@ -17,6 +17,11 @@ from cognis.core.runtime import (
     build_local_executor_environment,
     environment_from_metadata,
 )
+from cognis.api.tool_inventory import (
+    build_intaris_tool_definition,
+    extract_intaris_aggregated_raw_tool_name,
+    extract_intaris_aggregated_server_name,
+)
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.tool import (
@@ -24,7 +29,6 @@ from cognis.models.tool import (
     ExecutorConfig,
     MCPServerConfig,
     ToolDefinition,
-    sanitize_mcp_tool_name,
     stable_tool_id,
 )
 from cognis.providers.executor.in_process import InProcessExecutorConnection
@@ -402,7 +406,13 @@ def build_step_runtime_factory(
             ws_provider: WebSocketExecutorProvider = providers.executor.websocket
             executor_id = executor_config.get("executor_id", "") if executor_config else ""
             conn = ws_provider.get_connection(executor_id)
-            if conn is not None:
+            runtime_ready = bool(
+                executor_config is not None
+                and executor_config.get("runtime_state", "offline") in {"active", "degraded"}
+                and int(executor_config.get("desired_config_version", 0) or 0)
+                == int(executor_config.get("applied_config_version", 0) or 0)
+            )
+            if conn is not None and runtime_ready:
                 try:
                     disabled_categories = (
                         set(agent.tools.get("disabled_categories") or [])
@@ -796,24 +806,12 @@ def _tool_collision_identity(tool: ToolDefinition) -> str:
 
 def _extract_intaris_aggregated_server_name(row: dict[str, Any]) -> str | None:
     """Extract the canonical Intaris server name from an aggregated row."""
-    source = row.get("source")
-    if isinstance(source, dict):
-        server_name = source.get("server_name") or source.get("server")
-    else:
-        server_name = row.get("server_name") or row.get("server")
-    resolved_server = str(server_name).strip() if isinstance(server_name, str) else None
-    return resolved_server or None
+    return extract_intaris_aggregated_server_name(row)
 
 
 def _extract_intaris_aggregated_raw_tool_name(row: dict[str, Any]) -> str | None:
     """Extract the canonical raw Intaris MCP tool name from an aggregated row."""
-    source = row.get("source")
-    if isinstance(source, dict):
-        raw_tool_name = source.get("raw_tool_name") or source.get("tool")
-    else:
-        raw_tool_name = row.get("raw_tool_name") or row.get("tool")
-    resolved_tool = str(raw_tool_name).strip() if isinstance(raw_tool_name, str) else None
-    return resolved_tool or None
+    return extract_intaris_aggregated_raw_tool_name(row)
 
 
 def _build_intaris_tool_definition(
@@ -822,20 +820,10 @@ def _build_intaris_tool_definition(
     raw_tool_name: str,
     payload: dict[str, Any],
 ) -> ToolDefinition:
-    from cognis.models.tool import ToolSource
-
-    tool_name = sanitize_mcp_tool_name(server_name, raw_tool_name)
-    return ToolDefinition(
-        name=tool_name,
-        description=str(payload.get("description", f"Intaris MCP tool {tool_name}")),
-        parameters=payload.get("inputSchema") or payload.get("parameters") or {},
-        source=ToolSource(
-            type="intaris_mcp",
-            server_name=server_name,
-            raw_tool_name=raw_tool_name,
-        ),
-        category="mcp",
-        timeout_seconds=30,
+    return build_intaris_tool_definition(
+        server_name=server_name,
+        raw_tool_name=raw_tool_name,
+        payload=payload,
     )
 
 
