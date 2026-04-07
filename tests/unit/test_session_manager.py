@@ -285,7 +285,13 @@ async def test_rotate_session_creates_new_root_and_marks_old_completed(tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_rotate_session_carries_forward_mnemory_session_id(tmp_path) -> None:
+async def test_rotate_session_resets_mnemory_session_id(tmp_path) -> None:
+    """Rotated sessions start with mnemory_session_id=None.
+
+    Session rotation creates a new context window.  The first recall in
+    the new session creates a fresh Mnemory session and reconstructs the
+    full immutable prefix (core memories + instructions) from scratch.
+    """
     engine, session_factory = await _session_factory(tmp_path)
     manager = SessionManager(session_factory, _Providers(), _Cache())
 
@@ -293,7 +299,7 @@ async def test_rotate_session_carries_forward_mnemory_session_id(tmp_path) -> No
         user_email="user@example.com",
         agent_id="agent-1",
         context=ConversationContext(type="web"),
-        title="Mnemory carry test",
+        title="Mnemory reset test",
     )
 
     # Set a mnemory_session_id on the root session
@@ -311,11 +317,13 @@ async def test_rotate_session_carries_forward_mnemory_session_id(tmp_path) -> No
         intention="Test",
     )
 
-    # The new session should carry forward mnemory_session_id
+    # The new session should NOT carry forward mnemory_session_id —
+    # it starts fresh so the first recall triggers is_first_call=True
+    # in Mnemory, which returns core memories and instructions.
     async with session_factory() as db:
         new_row = await db.get(Session, new_session.session_id)
         assert new_row is not None
-        assert new_row.mnemory_session_id == "mnemory-abc-123"
+        assert new_row.mnemory_session_id is None
 
     await engine.dispose()
 

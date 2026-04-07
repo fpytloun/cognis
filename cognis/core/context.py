@@ -427,20 +427,35 @@ class ContextAssembler:
         if isinstance(raw_core, str) and raw_core.strip():
             immutable_core_memories = raw_core.strip()
 
-        # Cache immutable parts on first recall (or refresh on stale)
-        if immutable_instructions or immutable_core_memories:
+        # Cache any new immutable parts (merge — None values preserve existing).
+        if immutable_instructions is not None or immutable_core_memories is not None:
             await self.session_cache.cache_memory(
                 session.session_id, immutable_instructions, immutable_core_memories
             )
-        else:
-            # Use cached values if recall didn't return new ones
-            # (subsequent calls don't include instructions/core)
-            cached_instr, cached_core, cache_valid = self.session_cache.get_cached_memory(
-                session.session_id
-            )
-            if cache_valid:
+
+        # Fill gaps from cache: partial recall (one field returned, the
+        # other not) or subsequent calls that omit both fields entirely.
+        # Ignores cache validity — immutable prefix values persist for
+        # the lifetime of the session regardless of TTL staleness.
+        if immutable_instructions is None or immutable_core_memories is None:
+            cached_instr, cached_core, _ = self.session_cache.get_cached_memory(session.session_id)
+            gap_filled: list[str] = []
+            if immutable_instructions is None and cached_instr is not None:
                 immutable_instructions = cached_instr
+                gap_filled.append("instructions")
+            if immutable_core_memories is None and cached_core is not None:
                 immutable_core_memories = cached_core
+                gap_filled.append("core_memories")
+            if gap_filled:
+                logger.debug(
+                    "context: filled immutable prefix gaps from cache",
+                    extra={
+                        "extra_data": {
+                            "session_id": session.session_id,
+                            "gap_filled": gap_filled,
+                        }
+                    },
+                )
 
         # Format mutable search results
         mutable_search_results = _format_search_results(raw_search)

@@ -490,10 +490,15 @@ class SessionCache:
 
         Returns ``is_valid=False`` when the cache is stale (older than
         *ttl_seconds*, default 30 minutes) or when no cached values exist.
+        Always returns whatever individual fields are cached, even when
+        the cache is considered invalid — callers use the values for
+        gap-filling the immutable prefix.
         """
 
         entry = self.get_entry(session_id)
-        if entry is None or entry.memory_instructions is None:
+        if entry is None:
+            return None, None, False
+        if entry.memory_instructions is None and entry.core_memories is None:
             return None, None, False
         if entry.memory_instructions_cached_at is None:
             return entry.memory_instructions, entry.core_memories, False
@@ -504,15 +509,33 @@ class SessionCache:
     async def cache_memory(
         self, session_id: str, instructions: str | None, core_memories: str | None
     ) -> None:
-        """Cache memory instructions and core memories from first recall."""
+        """Merge memory instructions and core memories into the cache.
+
+        Uses merge semantics: only non-``None`` values overwrite the
+        existing cached fields.  A ``None`` value means "not returned
+        this time" and preserves whatever was previously cached.  This
+        prevents partial Mnemory recall responses (e.g. instructions
+        refreshed but core_memories omitted) from wiping the immutable
+        prefix.
+        """
 
         entry = self.get_entry(session_id)
         if entry is None:
             return
         async with entry.lock:
-            entry.memory_instructions = instructions
-            entry.core_memories = core_memories
-            entry.memory_instructions_cached_at = monotonic()
+            if instructions is not None:
+                entry.memory_instructions = instructions
+            if core_memories is not None:
+                entry.core_memories = core_memories
+            # Only bump the TTL timestamp when instructions are actually
+            # refreshed — otherwise a core-memories-only update would
+            # suppress the next instructions refresh for another 30 min.
+            if instructions is not None:
+                entry.memory_instructions_cached_at = monotonic()
+            elif entry.memory_instructions_cached_at is None:
+                # First cache write with only core_memories — set the
+                # timestamp so get_cached_memory can compute validity.
+                entry.memory_instructions_cached_at = monotonic()
             entry.touched_at = monotonic()
         await self._redis_set(entry)
 

@@ -335,12 +335,15 @@ When compaction (or user reset) triggers session rotation:
 2. New root session created with ``previous_session_id`` pointing to old session
 3. New Intaris session created for the new root
 4. Conversation ``root_session_id`` updated to new session
-5. ``mnemory_session_id`` carried forward across the rotation boundary
+5. ``mnemory_session_id`` reset to ``None`` — the first recall in the new session
+   creates a fresh Mnemory session and reconstructs the full immutable prefix
+   (core memories + instructions) from scratch
 6. Old session cache evicted; new session cache pre-populated with compaction summary
 
 The ``previous_session_id`` chain enables "View previous session" navigation
-in the web UI. The ``mnemory_session_id`` carry-forward ensures memory
-deduplication continues across rotation boundaries.
+in the web UI. Resetting ``mnemory_session_id`` ensures the new context window
+gets a complete immutable prefix rebuild; the old Mnemory session's dedup set
+is stale after compaction anyway.
 
 ### Context Assembly
 
@@ -574,7 +577,7 @@ In all cases ``rotate_session()`` is called:
 1. Complete current session (``status=completed``, set ``completion_reason``)
 2. Create new root session with ``previous_session_id`` pointing to old session
 3. Create new Intaris session with inherited intention
-4. Carry forward ``mnemory_session_id`` (memory deduplication continues)
+4. Reset ``mnemory_session_id`` to ``None`` (fresh Mnemory session on first recall)
 5. Update ``conversation.root_session_id``
 6. Emit ``SESSION_COMPACTED`` event (for compaction) or push notification to client
 

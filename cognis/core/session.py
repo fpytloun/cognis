@@ -567,9 +567,12 @@ class SessionManager:
         """Create a new root session, completing the current one.
 
         This is used for compaction (new clean context window) and for
-        explicit session reset. The new session carries forward the
-        ``mnemory_session_id`` so memory deduplication continues across
-        the rotation boundary.
+        explicit session reset.  The new session starts with
+        ``mnemory_session_id=None`` so the first recall creates a fresh
+        Mnemory session and reconstructs the full immutable prefix
+        (core memories + instructions) from scratch.  This intentionally
+        resets Mnemory-side deduplication — the old session's
+        ``known_memory_ids`` are stale after compaction anyway.
         """
 
         logger.info(
@@ -597,14 +600,16 @@ class SessionManager:
                     completion_reason=completion_reason,
                 )
 
-                # 2. Create new root session (carry mnemory_session_id forward)
+                # 2. Create new root session (fresh Mnemory session — the
+                #    first recall will create a new Mnemory session and
+                #    reconstruct the full immutable prefix from scratch)
                 new_session_row = await queries.create_session(
                     db_session,
                     conversation_id=conversation_id,
                     user_email=current_session.user_email,
                     agent_id=current_session.agent_id,
                     previous_session_id=current_session.session_id,
-                    mnemory_session_id=current_session.mnemory_session_id,
+                    mnemory_session_id=None,
                 )
 
                 # 3. Create Intaris session for the new root

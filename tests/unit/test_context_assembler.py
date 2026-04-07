@@ -61,7 +61,7 @@ class _SessionCache:
         self, session_id: str, ttl_seconds: float = 1800.0
     ) -> tuple[str | None, str | None, bool]:
         del session_id, ttl_seconds
-        if self._cached_instructions is not None:
+        if self._cached_instructions is not None or self._cached_core is not None:
             return self._cached_instructions, self._cached_core, True
         return None, None, False
 
@@ -69,8 +69,11 @@ class _SessionCache:
         self, session_id: str, instructions: str | None, core_memories: str | None
     ) -> None:
         del session_id
-        self._cached_instructions = instructions
-        self._cached_core = core_memories
+        # Merge semantics: None means "not returned", preserve existing.
+        if instructions is not None:
+            self._cached_instructions = instructions
+        if core_memories is not None:
+            self._cached_core = core_memories
 
     def get_model_override(self, session_id: str) -> str | None:
         del session_id
@@ -498,3 +501,74 @@ async def test_context_assembler_includes_composed_identity_prompt() -> None:
     assert "Temperament: patient, methodical" in content
     assert "- Always cite sources" in content
     assert content.endswith("Be helpful.")
+
+
+@pytest.mark.asyncio
+async def test_context_assembler_preserves_core_memories_on_partial_refresh() -> None:
+    """When Mnemory returns instructions but not core_memories (e.g. TTL
+    refresh on a subsequent call), the previously cached core_memories
+    must survive — they are part of the immutable prefix.
+    """
+
+    call_count = 0
+
+    class _PartialMemory:
+        """First call returns both; second returns only instructions."""
+
+        search_modes: list[str] = []
+
+        async def recall(self, **kwargs: object) -> dict[str, object]:
+            nonlocal call_count
+            call_count += 1
+            self.search_modes.append(str(kwargs["search_mode"]))
+            await asyncio.sleep(0.01)
+            if call_count == 1:
+                return {
+                    "session_id": "mem-1",
+                    "instructions": "Use remember tool to store facts.",
+                    "core_memories": "## Agent Identity\n- I am a helpful assistant",
+                    "search_results": [{"memory": "Uses pytest", "score": 0.9}],
+                }
+            # Subsequent call: instructions refreshed, core_memories absent
+            return {
+                "session_id": "mem-1",
+                "instructions": "Use remember tool to store facts.",
+                "search_results": [],
+            }
+
+    memory = _PartialMemory()
+    cache = _SessionCache()
+    assembler = ContextAssembler(
+        memory=memory,
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=cache,
+        session_manager=_SessionManager(),
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+
+    # First call: both instructions and core_memories returned and cached
+    result1 = await assembler.assemble(
+        session=_session(),
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="hello",
+        tool_definitions=[],
+    )
+    core_in_first = [m for m in result1.messages if "Agent Identity" in str(m.get("content", ""))]
+    assert len(core_in_first) == 1, "Core memories should be in first turn context"
+
+    # Second call: instructions returned but NOT core_memories.
+    # The cached core_memories must still appear in the context.
+    result2 = await assembler.assemble(
+        session=_session(mnemory_session_id="mem-1"),
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="follow up",
+        tool_definitions=[],
+    )
+    core_in_second = [m for m in result2.messages if "Agent Identity" in str(m.get("content", ""))]
+    assert len(core_in_second) == 1, (
+        "Core memories must survive partial recall — they are part of the immutable prefix"
+    )

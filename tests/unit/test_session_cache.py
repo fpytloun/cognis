@@ -98,6 +98,67 @@ async def test_session_cache_appends_recorded_events_and_applies_compaction() ->
 
 
 @pytest.mark.asyncio
+async def test_cache_memory_preserves_existing_when_new_is_none() -> None:
+    """cache_memory uses merge semantics: None means 'not returned'."""
+    cache = SessionCache(_Guardrails(), max_entries=10)
+    session = _session()
+    await cache.refresh(session)
+
+    # Populate both fields
+    await cache.cache_memory(session.session_id, "instructions-v1", "core-v1")
+    instr, core, valid = cache.get_cached_memory(session.session_id)
+    assert instr == "instructions-v1"
+    assert core == "core-v1"
+    assert valid is True
+
+    # Partial update: only instructions refreshed, core_memories=None
+    await cache.cache_memory(session.session_id, "instructions-v2", None)
+    instr, core, valid = cache.get_cached_memory(session.session_id)
+    assert instr == "instructions-v2"
+    assert core == "core-v1"  # preserved, not wiped
+    assert valid is True
+
+    # Partial update: only core_memories refreshed, instructions=None
+    await cache.cache_memory(session.session_id, None, "core-v2")
+    instr, core, valid = cache.get_cached_memory(session.session_id)
+    assert instr == "instructions-v2"  # preserved
+    assert core == "core-v2"
+    assert valid is True
+
+
+@pytest.mark.asyncio
+async def test_cache_memory_overwrites_when_new_is_not_none() -> None:
+    """Non-None values always overwrite the cached field."""
+    cache = SessionCache(_Guardrails(), max_entries=10)
+    session = _session()
+    await cache.refresh(session)
+
+    await cache.cache_memory(session.session_id, "old-instr", "old-core")
+    await cache.cache_memory(session.session_id, "new-instr", "new-core")
+
+    instr, core, valid = cache.get_cached_memory(session.session_id)
+    assert instr == "new-instr"
+    assert core == "new-core"
+    assert valid is True
+
+
+@pytest.mark.asyncio
+async def test_cache_memory_both_none_preserves_all() -> None:
+    """Calling cache_memory(None, None) preserves all existing values."""
+    cache = SessionCache(_Guardrails(), max_entries=10)
+    session = _session()
+    await cache.refresh(session)
+
+    await cache.cache_memory(session.session_id, "instr", "core")
+    await cache.cache_memory(session.session_id, None, None)
+
+    instr, core, valid = cache.get_cached_memory(session.session_id)
+    assert instr == "instr"
+    assert core == "core"
+    assert valid is True
+
+
+@pytest.mark.asyncio
 async def test_session_cache_evicts_oldest_unlocked_entry_when_full() -> None:
     guardrails = _Guardrails()
     cache = SessionCache(guardrails, max_entries=1)
