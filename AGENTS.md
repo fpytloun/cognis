@@ -403,6 +403,8 @@ uv run alembic -c cognis/store/migrations/alembic.ini downgrade -1
 | `COGNIS_ARTIFACT_MAX_SIZE_MB` | `50` | Max artifact size in MB |
 | `COGNIS_INITIAL_ADMIN_EMAIL` | — | Container/CI: auto-create admin on first start |
 | `COGNIS_INITIAL_ADMIN_PASSWORD` | — | Container/CI: admin password (cleared after use) |
+| `COGNIS_CONTROLLER_URL` | — | Executor: controller WebSocket URL (alternative to `--controller-url`) |
+| `COGNIS_EXECUTOR_TOKEN` | — | Executor: JWT auth token (alternative to `--token`) |
 
 ### Database
 

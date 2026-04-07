@@ -186,10 +186,15 @@ cognis executor run --controller-url wss://... --token ...
 Run a standalone executor process that connects to a Cognis controller via WebSocket. The executor is a remote hand: the controller assigns tools, MCP setup, and decides whether LLM inference runs locally on the controller or is proxied through the executor.
 
 ```bash
-# On the remote machine
+# On the remote machine (via CLI flags)
 cognis executor run \
     --controller-url wss://cognis.example.com/api/executor/ws \
     --token <jwt-token>
+
+# Or via environment variables (preferred — avoids token in /proc/cmdline)
+export COGNIS_CONTROLLER_URL=wss://cognis.example.com/api/executor/ws
+export COGNIS_EXECUTOR_TOKEN=<jwt-token>
+cognis executor run
 ```
 
 Or run as a Python module:
@@ -208,6 +213,8 @@ For multi-user production deployments, disable local executor modes with the DB-
 **Generating a token:** Create the executor in **Settings > Executors**, then click **Generate token**. The token is displayed once — copy it or the ready-made CLI command. Alternatively, use the API: `POST /api/v1/executors/{id}/token` (admin only).
 
 **Subprocess mode:** When using `python -m cognis.executor`, the token can also be piped via stdin (used internally by the subprocess executor to avoid exposing the token in process listings).
+
+**Systemd service templates** for both the controller and executor are available in [`deploy/systemd/`](deploy/systemd/). See [`deploy/systemd/README.md`](deploy/systemd/README.md) for installation instructions covering system-level units (per-user executor template) and user-level units (no root required).
 
 The same split is the deployment model for stateful channel adapters.
 For example, a user can either run Signal's `signal-cli` REST API next to a

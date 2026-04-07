@@ -1,0 +1,17 @@
+[Unit]
+Description=Cognis Executor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.cognis/executor.env
+# PyPI install (uvx):
+ExecStart=%h/.local/bin/uvx cognis executor run
+# Git checkout — uncomment and adjust path instead:
+# ExecStart=/usr/bin/uv run --project /path/to/cognis cognis executor run
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
