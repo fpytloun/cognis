@@ -3,11 +3,28 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
+import sys
 
 import typer
 
 executor_app = typer.Typer(help="Executor management commands")
+
+
+def _setup_logging(level_name: str) -> None:
+    """Configure logging for the executor process."""
+    level = getattr(logging, level_name.upper(), logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)-7s [%(name)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        stream=sys.stderr,
+    )
+    if level > logging.DEBUG:
+        logging.getLogger("websockets").setLevel(logging.WARNING)
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 @executor_app.command("run")
@@ -22,6 +39,11 @@ def run_executor(
         "--token",
         help="JWT authentication token (or COGNIS_EXECUTOR_TOKEN env var)",
     ),
+    log_level: str | None = typer.Option(
+        None,
+        "--log-level",
+        help="Log level: debug, info, warning, error (or COGNIS_LOG_LEVEL env var, default: info)",
+    ),
 ) -> None:
     """Run a standalone executor process that connects to a Cognis controller.
 
@@ -32,8 +54,11 @@ def run_executor(
 
         COGNIS_CONTROLLER_URL   WebSocket URL of the controller
         COGNIS_EXECUTOR_TOKEN   JWT authentication token
+        COGNIS_LOG_LEVEL        Log level (debug, info, warning, error)
     """
     import asyncio
+
+    _setup_logging(log_level or os.environ.get("COGNIS_LOG_LEVEL", "info"))
 
     url = controller_url or os.environ.get("COGNIS_CONTROLLER_URL", "")
     tok = token or os.environ.get("COGNIS_EXECUTOR_TOKEN", "")

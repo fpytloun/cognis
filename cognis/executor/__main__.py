@@ -5,8 +5,25 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import logging
 import os
 import sys
+
+
+def _setup_logging(level_name: str) -> None:
+    """Configure logging for the executor process."""
+    level = getattr(logging, level_name.upper(), logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)-7s [%(name)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        stream=sys.stderr,
+    )
+    # Quiet noisy third-party loggers unless debug
+    if level > logging.DEBUG:
+        logging.getLogger("websockets").setLevel(logging.WARNING)
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 def main() -> None:
@@ -23,7 +40,16 @@ def main() -> None:
         default="",
         help="JWT authentication token (or COGNIS_EXECUTOR_TOKEN env var)",
     )
+    parser.add_argument(
+        "--log-level",
+        required=False,
+        default="",
+        help="Log level: debug, info, warning, error (or COGNIS_LOG_LEVEL env var, default: info)",
+    )
     args = parser.parse_args()
+
+    log_level = args.log_level or os.environ.get("COGNIS_LOG_LEVEL", "info")
+    _setup_logging(log_level)
 
     # Resolve: CLI flag > env var (> stdin for token)
     url = args.controller_url or os.environ.get("COGNIS_CONTROLLER_URL", "")

@@ -54,7 +54,23 @@ class StdioMCPClient:
         """Start the subprocess and perform the initialize handshake."""
 
         if self.config.command is None:
-            raise RuntimeError("MCP stdio command is required")
+            raise MCPClientError(
+                self.config.name,
+                "spawn",
+                "MCP stdio command is required",
+                error_class="missing_command",
+            )
+        # Guard against shell-style commands stored as a single string.
+        # create_subprocess_exec treats the entire string as argv[0], so
+        # "npx -y @doist/todoist-ai" would try to exec a binary with that
+        # exact name (or fall through to sh on some systems).
+        if " " in self.config.command:
+            logger.warning(
+                "MCP stdio: %s command contains spaces (%r) — this is likely wrong. "
+                "Put only the executable in 'command' and flags/args in 'args'.",
+                self.config.name,
+                self.config.command,
+            )
         logger.info(
             "MCP stdio: spawning %s (command=%s, timeout=%ds)",
             self.config.name,
