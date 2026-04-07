@@ -724,6 +724,9 @@ async def get_mcp_server_route(request: Request, server_id: str) -> dict[str, An
 @router.post("/api/v1/mcp-servers")
 async def create_mcp_server_route(request: Request, body: MCPServerCreateRequest) -> dict[str, Any]:
     user = require_current_user(request)
+    # Normalize args: split any whitespace-containing entries so that
+    # "npx -y @doist/todoist-ai" stored as a single arg becomes ["-y", "@doist/todoist-ai"].
+    normalized_args = _normalize_mcp_args(body.args)
     async with request.app.state.session_factory() as session:
         row = await create_mcp_server(
             session,
@@ -732,7 +735,7 @@ async def create_mcp_server_route(request: Request, body: MCPServerCreateRequest
             transport=body.transport,
             command=body.command,
             url=body.url,
-            args=body.args,
+            args=normalized_args,
             env=body.env,
             timeout_seconds=body.timeout_seconds,
             description=body.description,
@@ -752,6 +755,8 @@ async def update_mcp_server_route(
         if existing is None:
             raise api_exception(404, "not_found", "MCP server not found")
         updates = body.model_dump(exclude_unset=True)
+        if "args" in updates and isinstance(updates["args"], list):
+            updates["args"] = _normalize_mcp_args(updates["args"])
         if isinstance(updates.get("env"), dict) and isinstance(existing.env, dict):
             preserved_env: dict[str, str] = {}
             for key, value in updates["env"].items():
@@ -799,3 +804,21 @@ async def delete_mcp_server_route(request: Request, server_id: str) -> dict[str,
             raise api_exception(404, "not_found", "MCP server not found")
         await session.commit()
     return {"status": "deleted"}
+
+
+def _normalize_mcp_args(args: list[str] | None) -> list[str]:
+    """Split whitespace-containing arg entries into individual tokens.
+
+    Users often paste ``-y @doist/todoist-ai`` as a single argument.
+    ``create_subprocess_exec`` treats each list element as one argv entry,
+    so the space-containing string is passed verbatim and breaks the
+    spawned process.  This normalizer splits such entries so the executor
+    receives clean individual tokens.
+    """
+    if not args:
+        return []
+    normalized: list[str] = []
+    for arg in args:
+        parts = arg.strip().split()
+        normalized.extend(p for p in parts if p)
+    return normalized

@@ -52,10 +52,15 @@
       </div>
 
       {#if entry.type === 'secret'}
+        {@const availableSecrets = secrets.filter((s) => s.scope === 'global' || s.scope === 'user')}
+        {@const currentInList = !entry.value || availableSecrets.some((s) => s.name === entry.value)}
         <div class="flex gap-2">
           <select class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" bind:value={entry.value} onchange={() => updateAt(index, { value: entry.value })}>
             <option value="">Select credential...</option>
-            {#each secrets.filter((s) => s.scope === 'global' || s.scope === 'user') as secret}
+            {#if !currentInList}
+              <option value={entry.value}>{entry.value} (saved)</option>
+            {/if}
+            {#each availableSecrets as secret}
               <option value={secret.name}>{secret.name}{secret.description ? ` - ${secret.description}` : ''}</option>
             {/each}
           </select>

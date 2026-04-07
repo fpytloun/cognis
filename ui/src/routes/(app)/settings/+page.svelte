@@ -2084,7 +2084,7 @@
             <div class="flex gap-2 justify-end">
               <Button variant="secondary" size="sm" onclick={() => showMcpForm = false}>Cancel</Button>
               <Button variant="primary" size="sm" disabled={!mcpForm.name.trim() || (mcpForm.transport === 'stdio' && !!validateStdioCommand(mcpForm.command))} onclick={async () => {
-                const args = mcpForm.args.split('\n').map(s => s.trim()).filter(Boolean);
+                const args = mcpForm.args.split('\n').flatMap(s => s.trim().split(/\s+/)).filter(Boolean);
                 const env = serializeMcpEnvVars(mcpForm.envVars);
                 try {
                   if (editingMcpServer) {
