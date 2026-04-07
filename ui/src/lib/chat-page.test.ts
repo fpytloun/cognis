@@ -4,6 +4,7 @@ import {
   getNextHistoryAfterSeq,
   getConversationRetryScope,
   isCurrentConversationLoad,
+  nextPollDelayMs,
   nextConversationLoadId
 } from '$lib/chat-page';
 
@@ -48,5 +49,12 @@ describe('chat page helpers', () => {
         last_seq: 0
       })
     ).toBe(5);
+  });
+
+  it('backs off polling delay with a bounded jittered increase', () => {
+    const nextDelay = nextPollDelayMs(3000);
+
+    expect(nextDelay).toBeGreaterThanOrEqual(5100);
+    expect(nextDelay).toBeLessThanOrEqual(6900);
   });
 });

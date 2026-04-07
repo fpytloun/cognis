@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import contextlib
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 
 from cognis.api.common import require_current_user
 from cognis.api.models import EscalationResolveRequest, EscalationResponse
@@ -36,7 +36,7 @@ async def resolve_escalation(
     call_id: str,
     payload: EscalationResolveRequest,
 ) -> dict[str, object]:
-    require_current_user(request)
+    user = require_current_user(request)
 
     # Try the unified notification service first (call_id is the notification_id
     # for escalation-type notifications).
@@ -46,13 +46,31 @@ async def resolve_escalation(
             call_id,
             payload.decision,
             {"note": payload.note or ""},
+            user_email=user.email,
         )
         if ok:
             return {"ok": True, "call_id": call_id, "decision": payload.decision}
+        raise HTTPException(
+            status_code=409,
+            detail="Escalation could not be resolved because the upstream approval state was not confirmed.",
+        )
 
     # Fallback: resolve via PauseWaiter directly (legacy path for
     # escalations created before the notification service was available).
     pause_id = f"escalation:{call_id}"
+    submitted = False
+    with contextlib.suppress(Exception):
+        await request.app.state.providers.guardrails.submit_decision(
+            call_id,
+            payload.decision,
+            payload.note,
+        )
+        submitted = True
+    if not submitted:
+        raise HTTPException(
+            status_code=502,
+            detail="Unable to submit escalation decision to Intaris.",
+        )
     request.app.state.pause_waiter.resolve(
         pause_id,
         PauseResolution(
@@ -60,12 +78,4 @@ async def resolve_escalation(
             data={"note": payload.note or ""},
         ),
     )
-
-    # Submit to Intaris for audit trail
-    with contextlib.suppress(Exception):
-        await request.app.state.providers.guardrails.submit_decision(
-            call_id,
-            payload.decision,
-            payload.note,
-        )
     return {"ok": True, "call_id": call_id, "decision": payload.decision}

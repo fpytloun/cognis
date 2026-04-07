@@ -128,6 +128,10 @@ export interface MessageHistoryResponse {
   items: MessageEvent[];
   last_seq: number;
   has_more: boolean;
+  active_session_id?: string | null;
+  active_session_last_seq?: number;
+  history_truncated?: boolean;
+  truncation_reason?: string | null;
 }
 
 export interface Session {
@@ -771,6 +775,21 @@ export interface Escalation {
   received_at?: number;
 }
 
+export interface Notification {
+  notification_id: string;
+  notification_type: string;
+  conversation_id: string;
+  task_id: string | null;
+  step_name: string | null;
+  step_run_id: string | null;
+  session_id: string | null;
+  payload: Record<string, unknown>;
+  status: string;
+  resolution: Record<string, unknown> | null;
+  created_at: string | null;
+  resolved_at: string | null;
+}
+
 export interface WebSocketAuthenticatedEvent {
   type: 'authenticated';
 }
@@ -816,6 +835,7 @@ export interface WebSocketToolCallEvent {
   type: 'tool_call';
   conversation_id?: string;
   session_id?: string;
+  seq?: number;
   call_id: string;
   tool_name: string;
   status: string;
@@ -928,6 +948,7 @@ export interface WebSocketReconnectedEvent {
   type: 'reconnected';
   conversation_id?: string;
   missed_events_count: number;
+  last_seq?: number;
 }
 
 export interface WebSocketSessionRecoveredEvent {
@@ -947,6 +968,7 @@ export interface WebSocketToolResultEvent {
   type: 'tool_result';
   conversation_id?: string;
   session_id?: string;
+  seq?: number;
   call_id: string;
   tool_name: string;
   result: string;
@@ -965,6 +987,7 @@ export interface WebSocketReasoningEvent {
   type: 'reasoning';
   conversation_id?: string;
   session_id?: string;
+  seq?: number;
   message_id: string;
   content: string;
 }
@@ -985,7 +1008,17 @@ export interface WebSocketPongEvent {
 export interface WebSocketSystemMessageEvent {
   type: 'system_message';
   conversation_id?: string;
+  seq?: number;
   text: string;
+}
+
+export interface WebSocketNoticeEvent {
+  type: 'history_notice';
+  conversation_id?: string;
+  seq?: number;
+  title: string;
+  description: string;
+  tone?: 'info' | 'warning' | 'error';
 }
 
 export interface WebSocketEscalationEvent {
@@ -1052,6 +1085,7 @@ export type CognisWebSocketEvent =
   | WebSocketWorkflowCancelledEvent
   | WebSocketTaskPausedEvent
   | WebSocketSystemMessageEvent
+  | WebSocketNoticeEvent
   | WebSocketEscalationEvent
   | WebSocketEscalationResolvedEvent
   | WebSocketSessionCompactedEvent

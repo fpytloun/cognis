@@ -2038,6 +2038,7 @@ class AgentLoop:
                     original_size = (
                         result.metadata.get("original_size") if result.metadata else None
                     )
+                    eval_meta = result.metadata.get("evaluation") if result.metadata else None
                     events_to_record.append(
                         SessionEvent(
                             type="tool_result",
@@ -2050,11 +2051,11 @@ class AgentLoop:
                                 "result": intaris_preview,
                                 "output_size": original_size or len(result.output),
                                 "has_full_output": raw_output is not None,
+                                "evaluation": eval_meta,
                             },
                         )
                     )
                     ws_preview = _truncate_tool_data(result.output)
-                    eval_meta = result.metadata.get("evaluation") if result.metadata else None
                     if on_tool_result:
                         await on_tool_result(
                             tc.call_id,
@@ -2210,6 +2211,10 @@ class AgentLoop:
                 "risk": eval_meta.get("risk"),
                 "reasoning": eval_meta.get("reasoning"),
                 "timeout_seconds": timeout_raw,
+                "context": {
+                    "call_id": intaris_call_id,
+                    "tool_name": tc.name,
+                },
             },
         )
         pause_id = intaris_call_id

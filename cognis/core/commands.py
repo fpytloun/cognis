@@ -552,11 +552,18 @@ class CommandDispatcher:
 
         # Use the unified notification service
         if self._notification_service is not None:
-            await self._notification_service.resolve(
+            resolved = await self._notification_service.resolve(
                 pending.pause_id,
                 esc_decision,
                 {"note": note or ""},
+                user_email=user_email,
             )
+            if not resolved:
+                return CommandResult(
+                    type="error",
+                    text="Could not resolve the pending escalation. It may already be resolved or Intaris rejected the approval update.",
+                    data={"code": "escalation_resolve_failed", "call_id": pending.pause_id},
+                )
         else:
             # Legacy fallback
             self._pause_waiter.resolve(

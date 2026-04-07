@@ -11,10 +11,18 @@ from cognis.models.session import ConversationContext, ConversationModel, Sessio
 class _NotificationService:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, dict[str, object]]] = []
+        self.resolve_result = True
 
-    async def resolve(self, notification_id: str, decision: str, data: dict[str, object]) -> bool:
+    async def resolve(
+        self,
+        notification_id: str,
+        decision: str,
+        data: dict[str, object],
+        *,
+        user_email: str | None = None,
+    ) -> bool:
         self.calls.append((notification_id, decision, data))
-        return True
+        return self.resolve_result
 
 
 class _TurnScheduler:
@@ -149,3 +157,40 @@ async def test_help_lists_stop_and_alias_commands() -> None:
     assert "/cancel" in (result.text or "")
     assert "/summarize" in (result.text or "")
     assert "/reset" in (result.text or "")
+
+
+@pytest.mark.asyncio
+async def test_approve_reports_failure_when_notification_service_cannot_resolve() -> None:
+    pause_waiter = PauseWaiter()
+    pause_waiter.register(
+        PendingPause(
+            pause_id="esc-1",
+            pause_type="escalation",
+            conversation_id="conv-1",
+            session_id="sess-1",
+            context={"tool_name": "bash"},
+        )
+    )
+    notifications = _NotificationService()
+    notifications.resolve_result = False
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=None,
+        session_cache=None,
+        compaction_strategy=None,
+        providers=None,
+        pause_waiter=pause_waiter,
+        notification_service=notifications,
+    )
+
+    result = await dispatcher.dispatch(
+        "/approve looks safe",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert result is not None
+    assert result.type == "error"
+    assert result.data["code"] == "escalation_resolve_failed"

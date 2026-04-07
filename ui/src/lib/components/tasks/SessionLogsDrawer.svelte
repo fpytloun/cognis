@@ -2,6 +2,12 @@
   import { onMount } from 'svelte';
 
   import { api, asApiError } from '$lib/api/client';
+  import {
+    nextPollDelayMs,
+    SESSION_LOG_BOOTSTRAP_MAX_PAGES,
+    SESSION_LOG_PAGE_SIZE,
+    SESSION_LOG_POLL_INTERVAL_MS
+  } from '$lib/chat-page';
   import { normalizeHistory, type TimelineItem } from '$lib/chat';
   import ChatMessage from '$lib/components/ChatMessage.svelte';
   import DelegationCard from '$lib/components/DelegationCard.svelte';
@@ -9,6 +15,7 @@
   import ReasoningBlock from '$lib/components/ReasoningBlock.svelte';
   import ToolCallBlock from '$lib/components/ToolCallBlock.svelte';
   import Button from '$lib/components/ui/Button.svelte';
+  import type { MessageEvent } from '$lib/types/api';
 
   let {
     conversationId,
@@ -24,20 +31,56 @@
 
   let loading = $state(true);
   let error = $state('');
+  let events = $state<MessageEvent[]>([]);
   let timeline = $state<TimelineItem[]>([]);
+  let lastSeq = $state(0);
+  let pollDelayMs = $state(SESSION_LOG_POLL_INTERVAL_MS);
 
   let initialLoadDone = $state(false);
 
-  async function loadEvents(): Promise<void> {
+  async function loadEvents(refresh = false): Promise<void> {
     // Only show loading spinner on the first load — background refreshes
     // update the timeline in-place without blanking the UI.
     if (!initialLoadDone) loading = true;
     error = '';
     try {
-      const result = await api.conversations.sessionEvents(conversationId, sessionId, 0, 200);
-      timeline = normalizeHistory(result.items ?? []);
+      if (refresh || !initialLoadDone) {
+        const history: MessageEvent[] = [];
+        let afterSeq = 0;
+        let pageCount = 0;
+        let finalLastSeq = 0;
+        while (pageCount < SESSION_LOG_BOOTSTRAP_MAX_PAGES) {
+          const result = await api.conversations.sessionEvents(conversationId, sessionId, afterSeq, SESSION_LOG_PAGE_SIZE);
+          history.push(...(result.items ?? []));
+          finalLastSeq = result.last_seq;
+          pageCount += 1;
+          if (!result.has_more || result.items.length === 0) break;
+          afterSeq = result.last_seq;
+          if (afterSeq === 0) break;
+        }
+        if (pageCount >= SESSION_LOG_BOOTSTRAP_MAX_PAGES) {
+          history.push({
+            seq: null,
+            type: 'history_gap',
+            data: { reason: 'bootstrap_cap_reached', session_id: sessionId },
+            timestamp: new Date().toISOString()
+          });
+        }
+        events = history;
+        lastSeq = finalLastSeq;
+        timeline = normalizeHistory(history);
+      } else {
+        const result = await api.conversations.sessionEvents(conversationId, sessionId, lastSeq, SESSION_LOG_PAGE_SIZE);
+        if ((result.items ?? []).length > 0) {
+          events = [...events, ...(result.items ?? [])];
+          timeline = normalizeHistory(events);
+        }
+        lastSeq = result.last_seq;
+      }
+      pollDelayMs = SESSION_LOG_POLL_INTERVAL_MS;
     } catch (caughtError) {
       error = asApiError(caughtError).message;
+      pollDelayMs = nextPollDelayMs(pollDelayMs);
     } finally {
       loading = false;
       initialLoadDone = true;
@@ -56,10 +99,17 @@
 
   onMount(() => {
     void loadEvents();
-    // Auto-refresh every 3 seconds so events appear during execution
-    pollTimer = window.setInterval(() => { void loadEvents(); }, 3000);
+    const schedule = (): void => {
+      pollTimer = window.setTimeout(async () => {
+        if (!document.hidden) {
+          await loadEvents();
+        }
+        schedule();
+      }, pollDelayMs);
+    };
+    schedule();
     return () => {
-      if (pollTimer !== null) window.clearInterval(pollTimer);
+      if (pollTimer !== null) window.clearTimeout(pollTimer);
     };
   });
 </script>
@@ -75,7 +125,7 @@
         <h3 class="text-sm font-semibold text-white">{stepName || sessionId}</h3>
       </div>
       <div class="flex items-center gap-2">
-        <Button size="sm" variant="secondary" onclick={loadEvents}>Refresh</Button>
+        <Button size="sm" variant="secondary" onclick={() => loadEvents(true)}>Refresh</Button>
         <button class="text-slate-400 hover:text-white" onclick={onclose} aria-label="Close">&times;</button>
       </div>
     </div>
@@ -103,6 +153,15 @@
             <div class="rounded-xl border border-slate-800/60 bg-slate-900/50 px-3 py-2 text-xs text-slate-400">
               <p class="font-medium">{item.title}</p>
               {#if item.description}<p class="mt-1 opacity-75">{item.description}</p>{/if}
+            </div>
+          {:else if item.kind === 'system_message'}
+            <div class="rounded-xl border border-amber-900/50 bg-amber-950/30 px-3 py-2 text-sm text-amber-100/90">
+              {item.text}
+            </div>
+          {:else if item.kind === 'compaction'}
+            <div class="rounded-xl border border-sky-900/40 bg-sky-950/20 px-3 py-3 text-sm text-sky-100/90">
+              <p class="font-medium">Conversation compacted</p>
+              <p class="mt-1 text-sky-100/70">{item.summaryPreview}</p>
             </div>
           {/if}
         {/each}

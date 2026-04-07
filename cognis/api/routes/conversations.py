@@ -272,6 +272,10 @@ async def conversation_messages(
     all_events: list[dict[str, Any]] = []
     last_seq_value = 0
     has_more = False
+    active_session_id = session_rows[-1].session_id if session_rows else None
+    active_session_last_seq = 0
+    history_truncated = False
+    truncation_reason: str | None = None
 
     if after_seq > 0:
         # Incremental: single session read
@@ -296,11 +300,12 @@ async def conversation_messages(
         all_events = list(event_result.events)
         last_seq_value = event_result.last_seq
         has_more = event_result.has_more
+        active_session_last_seq = event_result.last_seq
     else:
         # Full load: read all sessions in parallel
         import asyncio as _asyncio
 
-        async def _read_session(sr: Any) -> tuple[Any, list[dict[str, Any]]]:
+        async def _read_session(sr: Any) -> tuple[Any, list[dict[str, Any]], int]:
             try:
                 result = await guardrails.read_events(
                     session_id=sr.intaris_session_id or sr.session_id,
@@ -318,18 +323,22 @@ async def conversation_messages(
                             }
                         },
                     )
-                    return sr, [
-                        {
-                            "type": "history_gap",
-                            "data": {
-                                "reason": "stream_missing",
-                                "session_id": sr.session_id,
-                            },
-                            "seq": 0,
-                            "ts": None,
-                        }
-                    ]
-                return sr, list(result.events)
+                    return (
+                        sr,
+                        [
+                            {
+                                "type": "history_gap",
+                                "data": {
+                                    "reason": "stream_missing",
+                                    "session_id": sr.session_id,
+                                },
+                                "seq": 0,
+                                "ts": None,
+                            }
+                        ],
+                        result.last_seq,
+                    )
+                return sr, list(result.events), result.last_seq
             except Exception:
                 logger.warning(
                     "Failed to read session events during lineage walk",
@@ -341,21 +350,27 @@ async def conversation_messages(
                     },
                     exc_info=True,
                 )
-                return sr, [
-                    {
-                        "type": "history_gap",
-                        "data": {
-                            "reason": "read_failed",
-                            "session_id": sr.session_id,
-                        },
-                        "seq": 0,
-                        "ts": None,
-                    }
-                ]
+                return (
+                    sr,
+                    [
+                        {
+                            "type": "history_gap",
+                            "data": {
+                                "reason": "read_failed",
+                                "session_id": sr.session_id,
+                            },
+                            "seq": 0,
+                            "ts": None,
+                        }
+                    ],
+                    0,
+                )
 
         results = await _asyncio.gather(*[_read_session(sr) for sr in session_rows])
 
         if lineage_truncated:
+            history_truncated = True
+            truncation_reason = "lineage_truncated"
             all_events.append(
                 {
                     "type": "history_gap",
@@ -365,10 +380,12 @@ async def conversation_messages(
                 }
             )
 
-        for sr, events in results:
+        for sr, events, session_last_seq in results:
             # Tag each event with session_id so the UI can build
             # lineage-safe timeline item IDs (seq is session-local).
             sid = sr.session_id
+            if sid == active_session_id:
+                active_session_last_seq = session_last_seq
             for event in events:
                 if isinstance(event, dict):
                     data = event.get("data")
@@ -425,6 +442,10 @@ async def conversation_messages(
         ),
         last_seq=last_seq_value,
         has_more=has_more,
+        active_session_id=active_session_id,
+        active_session_last_seq=active_session_last_seq,
+        history_truncated=history_truncated,
+        truncation_reason=truncation_reason,
     )
 
 

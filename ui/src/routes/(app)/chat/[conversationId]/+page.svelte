@@ -18,7 +18,16 @@
   import Card from '$lib/components/ui/Card.svelte';
   import Input from '$lib/components/ui/Input.svelte';
   import { api, asApiError } from '$lib/api/client';
-  import { getConversationRetryScope, getNextHistoryAfterSeq, isCurrentConversationLoad, nextConversationLoadId } from '$lib/chat-page';
+  import {
+    getConversationRetryScope,
+    getNextHistoryAfterSeq,
+    isCurrentConversationLoad,
+    nextConversationLoadId,
+    nextPollDelayMs,
+    SESSION_LOG_BOOTSTRAP_MAX_PAGES,
+    SESSION_LOG_PAGE_SIZE,
+    SESSION_LOG_POLL_INTERVAL_MS
+  } from '$lib/chat-page';
   import { confirmAction } from '$lib/stores/confirm';
   import { addToast } from '$lib/stores/toasts';
   import { onCancelActiveTurnRequest, onChatComposerFocusRequest } from '$lib/shortcuts';
@@ -82,9 +91,12 @@
   let subSessionPanelOpen = $state(false);
   let subSessionClosing = $state(false);
   let subSessionId = $state('');
+  let subSessionEvents = $state<MessageEvent[]>([]);
   let subSessionTimeline = $state<TimelineItem[]>([]);
   let subSessionLoading = $state(false);
   let subSessionError = $state('');
+  let subSessionLastSeq = $state(0);
+  let subSessionPollDelayMs = $state(SESSION_LOG_POLL_INTERVAL_MS);
   let timelineEl = $state<HTMLDivElement | null>(null);
   let userScrolledUp = $state(false);
   let programmaticScroll = false;
@@ -251,31 +263,78 @@
     return agents.find((agent) => agent.agent_id === conversation.agent_id);
   }
 
-  function latestSeq(events: MessageEvent[]): number {
-    return events.reduce((max, event) => {
-      if (typeof event.seq === 'number') {
-        return Math.max(max, event.seq);
-      }
-      return max;
-    }, 0);
-  }
-
-  async function loadHistory(conversationId: string): Promise<MessageEvent[]> {
+  async function loadHistory(conversationId: string): Promise<import('$lib/types/api').MessageHistoryResponse> {
     const events: MessageEvent[] = [];
     let afterSeq = 0;
+    let activeSessionId: string | null | undefined = null;
+    let activeSessionLastSeq = 0;
+    let historyTruncated = false;
+    let truncationReason: string | null | undefined = null;
 
     while (true) {
       const response = await api.conversations.messages(conversationId, afterSeq, 200);
       events.push(...response.items);
+      activeSessionId = response.active_session_id;
+      activeSessionLastSeq = response.active_session_last_seq ?? activeSessionLastSeq;
+      historyTruncated = response.history_truncated ?? historyTruncated;
+      truncationReason = response.truncation_reason ?? truncationReason;
       if (!response.has_more || response.items.length === 0) {
-        return events;
+        return {
+          items: events,
+          last_seq: response.last_seq,
+          has_more: response.has_more,
+          active_session_id: activeSessionId,
+          active_session_last_seq: activeSessionLastSeq,
+          history_truncated: historyTruncated,
+          truncation_reason: truncationReason
+        };
       }
 
       afterSeq = getNextHistoryAfterSeq(response);
       if (afterSeq === 0) {
-        return events;
+        return {
+          items: events,
+          last_seq: response.last_seq,
+          has_more: response.has_more,
+          active_session_id: activeSessionId,
+          active_session_last_seq: activeSessionLastSeq,
+          history_truncated: historyTruncated,
+          truncation_reason: truncationReason
+        };
       }
     }
+  }
+
+  async function loadSessionHistory(
+    conversationId: string,
+    sessionId: string,
+  ): Promise<{ events: MessageEvent[]; lastSeq: number; truncated: boolean }> {
+    const events: MessageEvent[] = [];
+    let afterSeq = 0;
+    let pageCount = 0;
+    let lastSeq = 0;
+
+    while (pageCount < SESSION_LOG_BOOTSTRAP_MAX_PAGES) {
+      const response = await api.conversations.sessionEvents(conversationId, sessionId, afterSeq, SESSION_LOG_PAGE_SIZE);
+      events.push(...(response.items ?? []));
+      lastSeq = response.last_seq;
+      pageCount += 1;
+      if (!response.has_more || response.items.length === 0) {
+        return { events, lastSeq, truncated: false };
+      }
+      afterSeq = getNextHistoryAfterSeq(response);
+      if (afterSeq === 0) {
+        return { events, lastSeq, truncated: false };
+      }
+    }
+
+    events.push({
+      seq: null,
+      type: 'history_gap',
+      data: { reason: 'bootstrap_cap_reached', session_id: sessionId },
+      timestamp: new Date().toISOString()
+    });
+    return { events, lastSeq, truncated: true };
   }
 
   async function refreshSidebarData(): Promise<void> {
@@ -311,15 +370,28 @@
   async function refreshEscalations(): Promise<void> {
     if (document.hidden) return;
     try {
-      const allEscalations = await api.escalations.list();
-      const filtered = allEscalations.filter(
-        (item) => sessionIds.size === 0 || item.session_id === null || sessionIds.has(item.session_id)
-      );
-      const now = Date.now();
+      const filtered = (await api.notifications.list(currentConversation?.conversation_id ?? null))
+        .filter((item) => item.notification_type === 'escalation')
+        .filter(
+          (item) => sessionIds.size === 0 || item.session_id === null || sessionIds.has(item.session_id)
+        )
+        .map((item) => ({
+          call_id: item.notification_id,
+          session_id: item.session_id,
+          tool_name: typeof item.payload.tool_name === 'string' ? item.payload.tool_name : null,
+          decision: 'escalate',
+          resolved: false,
+          reasoning: typeof item.payload.reasoning === 'string' ? item.payload.reasoning : null,
+          risk: typeof item.payload.risk === 'string' ? item.payload.risk : null,
+          timeout_seconds:
+            typeof item.payload.timeout_seconds === 'number'
+              ? item.payload.timeout_seconds
+              : escalationTimeoutSeconds,
+          received_at: item.created_at ? Date.parse(item.created_at) : Date.now()
+        }) satisfies Escalation);
       for (const item of filtered) {
         if (!escalations.some((e) => e.call_id === item.call_id)) {
-          item.received_at = now;
-          item.timeout_seconds = escalationTimeoutSeconds;
+          item.timeout_seconds = item.timeout_seconds ?? escalationTimeoutSeconds;
         }
       }
       escalations = filtered;
@@ -477,7 +549,17 @@
 
     const [sessionResult, historyResult] = await Promise.allSettled([
       reloadSessions ? api.conversations.sessions(conversationId) : Promise.resolve(sessions),
-      reloadHistory ? loadHistory(conversationId) : Promise.resolve([]),
+      reloadHistory
+        ? loadHistory(conversationId)
+        : Promise.resolve({
+            items: [],
+            last_seq: 0,
+            has_more: false,
+            active_session_id: null,
+            active_session_last_seq: 0,
+            history_truncated: false,
+            truncation_reason: null
+          }),
     ]);
 
     if (isStaleConversationLoad(requestId)) {
@@ -497,7 +579,7 @@
     }
 
     if (reloadHistory && historyResult.status === 'fulfilled') {
-      timeline = normalizeHistory(historyResult.value);
+      timeline = normalizeHistory(historyResult.value.items);
       syncVisibleWindow();
       userScrolledUp = false;
     } else if (reloadHistory && historyResult.status === 'rejected') {
@@ -509,7 +591,9 @@
     if (shouldResubscribe) {
       wsClient.subscribeConversation(
         conversationId,
-        reloadHistory && historyResult.status === 'fulfilled' ? latestSeq(historyResult.value) : 0
+        reloadHistory && historyResult.status === 'fulfilled'
+          ? (historyResult.value.active_session_last_seq ?? 0)
+          : 0
       );
     }
 
@@ -977,14 +1061,6 @@
   async function handleEscalationDecision(callId: string, decision: 'approve' | 'deny'): Promise<void> {
     escalationBusyCallId = callId;
     wsClient.resolveEscalation(callId, decision);
-    // Optimistically remove after a short delay (server push will confirm)
-    setTimeout(() => {
-      if (escalationBusyCallId === callId) {
-        escalations = escalations.filter((e) => e.call_id !== callId);
-        escalationBusyCallId = null;
-        if (escalations.length === 0) stopEscalationCountdown();
-      }
-    }, 3000);
   }
 
   function escalationSecondsRemaining(esc: Escalation): number {
@@ -1208,12 +1284,17 @@
     subSessionPanelOpen = true;
     subSessionLoading = true;
     subSessionError = '';
+    subSessionEvents = [];
     subSessionTimeline = [];
+    subSessionLastSeq = 0;
+    subSessionPollDelayMs = SESSION_LOG_POLL_INTERVAL_MS;
     subSessionInfo = null;
     subSessionInfoOpen = false;
     try {
-      const result = await api.conversations.sessionEvents(currentConversation.conversation_id, sessionId, 0, 200);
-      subSessionTimeline = normalizeHistory(result.items ?? []);
+      const result = await loadSessionHistory(currentConversation.conversation_id, sessionId);
+      subSessionEvents = result.events;
+      subSessionTimeline = normalizeHistory(result.events);
+      subSessionLastSeq = result.lastSeq;
     } catch (err) {
       subSessionError = asApiError(err)?.message ?? 'Failed to load session events';
     } finally {
@@ -1224,18 +1305,41 @@
 
   function startSubSessionPolling(): void {
     stopSubSessionPolling();
-    subSessionPollTimer = window.setInterval(async () => {
-      if (document.hidden || !subSessionPanelOpen || !subSessionId || !currentConversation) return;
+    const tick = async (): Promise<void> => {
       try {
-        const result = await api.conversations.sessionEvents(currentConversation.conversation_id, subSessionId, 0, 200);
-        subSessionTimeline = normalizeHistory(result.items ?? []);
-      } catch { /* silently ignore polling errors */ }
-    }, 3000);
+        if (document.hidden || !subSessionPanelOpen || !subSessionId || !currentConversation) {
+          return;
+        }
+        const result = await api.conversations.sessionEvents(
+          currentConversation.conversation_id,
+          subSessionId,
+          subSessionLastSeq,
+          SESSION_LOG_PAGE_SIZE
+        );
+        if ((result.items ?? []).length > 0) {
+          subSessionEvents = [...subSessionEvents, ...(result.items ?? [])];
+          subSessionTimeline = normalizeHistory(subSessionEvents);
+        }
+        subSessionLastSeq = result.last_seq;
+        subSessionPollDelayMs = SESSION_LOG_POLL_INTERVAL_MS;
+      } catch {
+        subSessionPollDelayMs = nextPollDelayMs(subSessionPollDelayMs);
+      } finally {
+        if (subSessionPanelOpen) {
+          subSessionPollTimer = window.setTimeout(() => {
+            void tick();
+          }, subSessionPollDelayMs);
+        }
+      }
+    };
+    subSessionPollTimer = window.setTimeout(() => {
+      void tick();
+    }, subSessionPollDelayMs);
   }
 
   function stopSubSessionPolling(): void {
     if (subSessionPollTimer !== null) {
-      window.clearInterval(subSessionPollTimer);
+      window.clearTimeout(subSessionPollTimer);
       subSessionPollTimer = null;
     }
   }
@@ -1247,7 +1351,9 @@
       subSessionPanelOpen = false;
       subSessionClosing = false;
       subSessionId = '';
+      subSessionEvents = [];
       subSessionTimeline = [];
+      subSessionLastSeq = 0;
       subSessionInfo = null;
       subSessionInfoOpen = false;
     }, 250);

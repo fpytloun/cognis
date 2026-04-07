@@ -604,7 +604,7 @@ def test_websocket_direct_chat_step_response_resolves_notification(
         resolved = asyncio.run(app.state.notification_service.get(notification.notification_id))
         assert resolved is not None
         assert resolved.status == "resolved"
-        assert resolved.resolution == {"decision": "continue", "response": "A"}
+        assert resolved.resolution == {"decision": "continue", "response": "A", "state": "resolved"}
 
 
 def test_websocket_direct_chat_step_response_conflicts_without_live_pause(
@@ -980,7 +980,15 @@ def test_conversation_messages_returns_empty_when_stream_missing(
             headers=_auth_headers(app, email="user@example.com"),
         )
         assert response.status_code == 200
-        assert response.json() == {"items": [], "last_seq": 0, "has_more": False}
+        assert response.json() == {
+            "items": [],
+            "last_seq": 0,
+            "has_more": False,
+            "active_session_id": _session_id,
+            "active_session_last_seq": 0,
+            "history_truncated": False,
+            "truncation_reason": None,
+        }
 
 
 def test_conversation_session_events_skip_malformed_rows(

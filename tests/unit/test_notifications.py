@@ -1,75 +1,139 @@
 from __future__ import annotations
 
-import asyncio
-from pathlib import Path
+from datetime import UTC, datetime
+from types import SimpleNamespace
+from typing import Any
 
-from fastapi.testclient import TestClient
+import pytest
 
-from cognis.api.app import create_app
-from cognis.store.queries import create_agent, create_conversation, create_session, create_user
-
-
-def _create_test_client(monkeypatch: object, tmp_path: Path) -> TestClient:
-    monkeypatch.setenv("COGNIS_DATA_DIR", str(tmp_path))  # type: ignore[attr-defined]
-    monkeypatch.setenv("COGNIS_HOST", "127.0.0.1")  # type: ignore[attr-defined]
-    app = create_app()
-    return TestClient(app)
+from cognis.core.notifications import NotificationService
 
 
-def test_reconcile_pending_marks_direct_chat_questions_orphaned(
-    monkeypatch: object, tmp_path: Path
-) -> None:
-    with _create_test_client(monkeypatch, tmp_path) as client:
-        app = client.app
+class _FakeSession:
+    def __init__(self, row: Any) -> None:
+        self._row = row
 
-        async def _seed() -> None:
-            async with app.state.session_factory() as session:
-                await create_user(
-                    session,
-                    email="user@example.com",
-                    name="User",
-                    password_hash=app.state.password_hasher.hash("password123"),
-                    role="user",
-                )
-                await create_agent(
-                    session,
-                    agent_id="agent-1",
-                    owner_email="user@example.com",
-                    name="Agent 1",
-                    status="active",
-                )
-                conversation = await create_conversation(
-                    session,
-                    user_email="user@example.com",
-                    agent_id="agent-1",
-                    context_type="web",
-                    title="Conversation",
-                )
-                session_row = await create_session(
-                    session,
-                    conversation_id=conversation.conversation_id,
-                    user_email="user@example.com",
-                    agent_id="agent-1",
-                )
-                await session.commit()
-                await app.state.notification_service.create(
-                    notification_type="step_question",
-                    user_email="user@example.com",
-                    conversation_id=conversation.conversation_id,
-                    session_id=session_row.session_id,
-                    notification_id="notif_restart_orphan",
-                    payload={"question": "Need input"},
-                )
+    async def __aenter__(self) -> _FakeSession:
+        return self
 
-        asyncio.run(_seed())
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        return None
 
-    with _create_test_client(monkeypatch, tmp_path) as restarted_client:
-        app = restarted_client.app
-        notification = asyncio.run(app.state.notification_service.get("notif_restart_orphan"))
-        assert notification is not None
-        assert notification.status == "resolved"
-        assert notification.resolution == {
-            "decision": "cancel",
-            "reason": "controller_restart",
-        }
-        assert app.state.pause_waiter.get("notif_restart_orphan") is None
+    async def get(self, model: Any, notification_id: str) -> Any:
+        if self._row.notification_id == notification_id:
+            return self._row
+        return None
+
+    async def execute(self, statement: Any) -> None:
+        for key, value in getattr(statement, "_values", {}).items():
+            attr = key.key if hasattr(key, "key") else str(key)
+            if hasattr(value, "value"):
+                value = value.value
+            setattr(self._row, attr, value)
+
+    async def commit(self) -> None:
+        return None
+
+
+class _FakeSessionFactory:
+    def __init__(self, row: Any) -> None:
+        self._row = row
+
+    def __call__(self) -> _FakeSession:
+        return _FakeSession(self._row)
+
+
+class _FakePauseWaiter:
+    def __init__(self, *, should_resolve: bool = True, order: list[str] | None = None) -> None:
+        self.should_resolve = should_resolve
+        self.order = order if order is not None else []
+
+    def resolve(self, pause_id: str, resolution: Any) -> bool:
+        self.order.append("resolve")
+        return self.should_resolve
+
+
+class _FakeGuardrails:
+    def __init__(self, *, fail: bool = False, order: list[str] | None = None) -> None:
+        self.fail = fail
+        self.order = order if order is not None else []
+
+    async def submit_decision(self, call_id: str, decision: str, note: str | None = None) -> None:
+        self.order.append("submit")
+        if self.fail:
+            raise RuntimeError("submit failed")
+
+
+class _FakeEventBus:
+    def __init__(self) -> None:
+        self.events: list[Any] = []
+
+    async def publish(self, event: Any) -> None:
+        self.events.append(event)
+
+
+def _notification_row() -> Any:
+    return SimpleNamespace(
+        notification_id="call-1",
+        notification_type="escalation",
+        user_email="user@example.com",
+        conversation_id="conv-1",
+        task_id=None,
+        step_name=None,
+        step_run_id=None,
+        session_id="sess-1",
+        payload={},
+        status="pending",
+        resolution=None,
+        created_at=datetime.now(UTC),
+        resolved_at=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_escalation_resolution_submits_before_unblocking_waiter() -> None:
+    row = _notification_row()
+    order: list[str] = []
+    service = NotificationService(
+        session_factory=_FakeSessionFactory(row),
+        pause_waiter=_FakePauseWaiter(order=order),
+        event_bus=_FakeEventBus(),
+        providers=SimpleNamespace(guardrails=_FakeGuardrails(order=order)),
+    )
+
+    resolved = await service.resolve(
+        "call-1",
+        "approve",
+        {"note": "safe"},
+        user_email="user@example.com",
+    )
+
+    assert resolved is True
+    assert order == ["submit", "resolve"]
+    assert row.status == "resolved"
+    assert row.resolution["decision"] == "approve"
+    assert row.resolution["state"] == "resolved"
+
+
+@pytest.mark.asyncio
+async def test_escalation_resolution_keeps_pending_when_submit_fails() -> None:
+    row = _notification_row()
+    order: list[str] = []
+    service = NotificationService(
+        session_factory=_FakeSessionFactory(row),
+        pause_waiter=_FakePauseWaiter(order=order),
+        event_bus=_FakeEventBus(),
+        providers=SimpleNamespace(guardrails=_FakeGuardrails(fail=True, order=order)),
+    )
+
+    resolved = await service.resolve(
+        "call-1",
+        "approve",
+        {"note": "safe"},
+        user_email="user@example.com",
+    )
+
+    assert resolved is False
+    assert order == ["submit"]
+    assert row.status == "pending"
+    assert row.resolution is None

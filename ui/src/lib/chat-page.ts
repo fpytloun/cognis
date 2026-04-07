@@ -3,6 +3,18 @@ export interface ConversationRetryScope {
   history: boolean;
 }
 
+export const SESSION_LOG_PAGE_SIZE = 200;
+export const SESSION_LOG_BOOTSTRAP_MAX_PAGES = 5;
+export const SESSION_LOG_POLL_INTERVAL_MS = 3000;
+export const SESSION_LOG_POLL_MAX_INTERVAL_MS = 30000;
+
+export function nextPollDelayMs(currentDelayMs: number): number {
+  const baseDelay = Math.max(currentDelayMs, SESSION_LOG_POLL_INTERVAL_MS);
+  const doubled = Math.min(baseDelay * 2, SESSION_LOG_POLL_MAX_INTERVAL_MS);
+  const jitter = 0.85 + Math.random() * 0.3;
+  return Math.round(doubled * jitter);
+}
+
 export function nextConversationLoadId(current: number): number {
   return current + 1;
 }

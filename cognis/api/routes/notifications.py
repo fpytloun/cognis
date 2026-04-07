@@ -121,7 +121,7 @@ async def resolve_notification(
     if payload.feedback:
         data["feedback"] = payload.feedback
 
-    ok = await svc.resolve(notification_id, payload.decision, data)
+    ok = await svc.resolve(notification_id, payload.decision, data, user_email=user.email)
     if not ok:
         raise HTTPException(
             status_code=409,

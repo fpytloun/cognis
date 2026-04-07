@@ -33,6 +33,7 @@ import type {
   MCPServer,
   MCPServerUpdateRequest,
   MessageHistoryResponse,
+  Notification,
   ModelRouting,
   ProviderTestResult,
   PairingRequest,
@@ -965,6 +966,19 @@ export const api = {
 
     resolve(callId: string, payload: { decision: string; note?: string }): Promise<{ ok: boolean; call_id: string; decision: string }> {
       return request<{ ok: boolean; call_id: string; decision: string }>(`/api/v1/escalations/${callId}/resolve`, {
+        method: 'POST',
+        body: JSON.stringify(payload)
+      });
+    }
+  },
+
+  notifications: {
+    list(conversationId?: string | null): Promise<Notification[]> {
+      return request<Notification[]>(`/api/v1/notifications${encodeQuery({ conversation_id: conversationId })}`);
+    },
+
+    resolve(notificationId: string, payload: { decision: string; note?: string; response?: string; feedback?: string }): Promise<{ ok: boolean; notification_id: string; decision: string }> {
+      return request<{ ok: boolean; notification_id: string; decision: string }>(`/api/v1/notifications/${notificationId}/resolve`, {
         method: 'POST',
         body: JSON.stringify(payload)
       });

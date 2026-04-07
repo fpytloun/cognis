@@ -15,6 +15,8 @@ callbacks from the TurnScheduler and forward them to connected clients.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -483,6 +485,7 @@ class WebSocketConnectionManager:
         replayed = 0
         for item in result.events:
             event_type = item.get("type")
+            data = item.get("data", {})
             if event_type == "assistant_message":
                 message_id = f"replay_{item.get('seq', uuid.uuid4().hex)}"
                 await connection.send_json(
@@ -491,7 +494,7 @@ class WebSocketConnectionManager:
                         "conversation_id": conversation_id,
                         "session_id": session.session_id,
                         "message_id": message_id,
-                        "content": str(item.get("data", {}).get("content", "")),
+                        "content": str(data.get("content", "")),
                         "index": 0,
                     }
                 )
@@ -507,13 +510,60 @@ class WebSocketConnectionManager:
                     }
                 )
                 replayed += 1
+            elif event_type == "tool_call":
+                arguments = data.get("arguments")
+                if isinstance(arguments, str):
+                    with contextlib.suppress(Exception):
+                        arguments = json.loads(arguments)
+                await connection.send_json(
+                    {
+                        "type": "tool_call",
+                        "conversation_id": conversation_id,
+                        "session_id": session.session_id,
+                        "seq": item.get("seq"),
+                        "call_id": data.get("call_id"),
+                        "tool_name": data.get("name") or data.get("tool_name"),
+                        "status": data.get("status", "started"),
+                        "arguments": arguments,
+                    }
+                )
+                replayed += 1
+            elif event_type == "tool_result":
+                await connection.send_json(
+                    {
+                        "type": "tool_result",
+                        "conversation_id": conversation_id,
+                        "session_id": session.session_id,
+                        "seq": item.get("seq"),
+                        "call_id": data.get("call_id"),
+                        "tool_name": data.get("name") or data.get("tool_name"),
+                        "result": data.get("result", ""),
+                        "is_error": bool(data.get("is_error", False)),
+                        "duration_ms": data.get("duration_ms"),
+                        "evaluation": data.get("evaluation"),
+                    }
+                )
+                replayed += 1
+            elif event_type == "reasoning":
+                await connection.send_json(
+                    {
+                        "type": "reasoning",
+                        "conversation_id": conversation_id,
+                        "session_id": session.session_id,
+                        "seq": item.get("seq"),
+                        "message_id": data.get("message_id")
+                        or f"replay_reasoning_{item.get('seq', uuid.uuid4().hex)}",
+                        "content": data.get("content", ""),
+                    }
+                )
+                replayed += 1
             elif event_type == "task_result":
                 await connection.send_json(
                     {
                         "type": "workflow_completed",
                         "conversation_id": conversation_id,
-                        "task_id": item.get("data", {}).get("task_id"),
-                        "result": item.get("data", {}).get("result_summary"),
+                        "task_id": data.get("task_id"),
+                        "result": data.get("result_summary"),
                     }
                 )
                 replayed += 1
@@ -522,8 +572,8 @@ class WebSocketConnectionManager:
                     {
                         "type": "workflow_failed",
                         "conversation_id": conversation_id,
-                        "task_id": item.get("data", {}).get("task_id"),
-                        "reason": item.get("data", {}).get("result_summary"),
+                        "task_id": data.get("task_id"),
+                        "reason": data.get("result_summary"),
                     }
                 )
                 replayed += 1
@@ -532,13 +582,12 @@ class WebSocketConnectionManager:
                     {
                         "type": "workflow_cancelled",
                         "conversation_id": conversation_id,
-                        "task_id": item.get("data", {}).get("task_id"),
-                        "reason": item.get("data", {}).get("result_summary") or "cancelled",
+                        "task_id": data.get("task_id"),
+                        "reason": data.get("result_summary") or "cancelled",
                     }
                 )
                 replayed += 1
             elif event_type == "delegation":
-                data = item.get("data", {})
                 status = data.get("status")
                 if status == "completed":
                     await connection.send_json(
@@ -571,6 +620,44 @@ class WebSocketConnectionManager:
                         }
                     )
                 replayed += 1
+            elif event_type == "lifecycle" and data.get("event") == "system_notice":
+                await connection.send_json(
+                    {
+                        "type": "system_message",
+                        "conversation_id": conversation_id,
+                        "seq": item.get("seq"),
+                        "text": str(data.get("message", "")),
+                    }
+                )
+                replayed += 1
+            elif event_type == "evaluation" and data.get("event") == "evaluation_feedback":
+                await connection.send_json(
+                    {
+                        "type": "history_notice",
+                        "conversation_id": conversation_id,
+                        "seq": item.get("seq"),
+                        "title": f"Step Evaluation (attempt {data.get('attempt', '?')})",
+                        "description": f"{data.get('decision', 'unknown')} — {data.get('feedback', '')}",
+                        "tone": "info"
+                        if data.get("decision") in {"approved", "approve"}
+                        else "error"
+                        if data.get("decision") in {"failed", "reject"}
+                        else "warning",
+                    }
+                )
+                replayed += 1
+            elif event_type == "history_gap":
+                await connection.send_json(
+                    {
+                        "type": "history_notice",
+                        "conversation_id": conversation_id,
+                        "seq": item.get("seq"),
+                        "title": "History incomplete",
+                        "description": f"History gap detected: {data.get('reason', 'unknown')}.",
+                        "tone": "warning",
+                    }
+                )
+                replayed += 1
 
         pending_pauses = await _load_pending_task_prompts(self.app, conversation_id)
         for payload in pending_pauses:
@@ -595,6 +682,7 @@ class WebSocketConnectionManager:
                 "type": "reconnected",
                 "conversation_id": conversation_id,
                 "missed_events_count": replayed,
+                "last_seq": result.last_seq,
             }
         )
         WS_RECONNECTIONS_TOTAL.inc()
@@ -948,7 +1036,12 @@ async def _handle_resolve_escalation(
     )
 
     svc = app.state.notification_service
-    resolved = await svc.resolve(call_id, decision, {"note": note if isinstance(note, str) else ""})
+    resolved = await svc.resolve(
+        call_id,
+        decision,
+        {"note": note if isinstance(note, str) else ""},
+        user_email=connection.user_email,
+    )
     if not resolved:
         await manager.send_error(
             connection,

@@ -208,6 +208,22 @@ class MessageHistoryResponse(BaseModel):
     items: list[MessageEventResponse]
     last_seq: int = 0
     has_more: bool = False
+    active_session_id: str | None = Field(
+        default=None,
+        description="Active session identifier for switching the client from lineage bootstrap to active-session replay.",
+    )
+    active_session_last_seq: int = Field(
+        default=0,
+        description="Last persisted sequence number in the active session's seq space.",
+    )
+    history_truncated: bool = Field(
+        default=False,
+        description="Whether the returned history is incomplete and the client should surface a truncation notice.",
+    )
+    truncation_reason: str | None = Field(
+        default=None,
+        description="Machine-readable reason explaining why the history response was truncated.",
+    )
 
 
 class SessionResponse(BaseModel):

@@ -14,7 +14,6 @@ queryable via a unified REST endpoint.
 
 from __future__ import annotations
 
-import contextlib
 import uuid
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -28,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from cognis.core.agent_loop import PauseResolution, PauseWaiter, PendingPause
 from cognis.core.events import Event, EventBus, EventType
 from cognis.logging import get_logger
+from cognis.runtime_context import scoped_runtime_context
 from cognis.store.models import NotificationRow
 from cognis.store.queries import get_task
 
@@ -52,6 +52,14 @@ NOTIFICATION_RESOLUTION_DURATION = Histogram(
     "Time from notification creation to resolution",
     ["type"],
     buckets=[1, 5, 15, 30, 60, 120, 300, 600, 1800, 3600],
+)
+NOTIFICATION_ESCALATION_SUBMIT_FAILURES = Counter(
+    "cognis_notification_escalation_submit_failures_total",
+    "Escalation decision submissions to Intaris that failed",
+)
+NOTIFICATION_ESCALATION_RECOVERY_PENDING = Counter(
+    "cognis_notification_escalation_recovery_pending_total",
+    "Escalations left pending after Intaris approval was submitted but local resume could not proceed",
 )
 
 
@@ -192,6 +200,19 @@ class NotificationService:
             await db.commit()
 
         # Register PauseWaiter so the blocking coroutine can be resolved
+        pause_context = (
+            (payload or {}).get("context")
+            if isinstance((payload or {}).get("context"), dict)
+            else None
+        )
+        if pause_context is None and notification_type == NotificationType.ESCALATION:
+            pause_context = {
+                "call_id": (payload or {}).get("call_id"),
+                "tool_name": (payload or {}).get("tool_name"),
+                "risk": (payload or {}).get("risk"),
+                "reasoning": (payload or {}).get("reasoning"),
+                "timeout_seconds": (payload or {}).get("timeout_seconds"),
+            }
         self._pause_waiter.register(
             PendingPause(
                 pause_id=nid,
@@ -203,9 +224,7 @@ class NotificationService:
                 conversation_id=resolved_conversation_id,
                 question=str((payload or {}).get("question", "")),
                 options=(payload or {}).get("options"),
-                context=(payload or {}).get("context")
-                if isinstance((payload or {}).get("context"), dict)
-                else None,
+                context=pause_context if isinstance(pause_context, dict) else None,
             )
         )
 
@@ -248,6 +267,8 @@ class NotificationService:
         notification_id: str,
         decision: str,
         data: dict[str, Any] | None = None,
+        *,
+        user_email: str | None = None,
     ) -> bool:
         """Resolve a notification, update DB, resolve PauseWaiter.
 
@@ -257,7 +278,6 @@ class NotificationService:
         resolution_data = data or {}
         now = datetime.now(UTC)
 
-        # Update DB
         async with self._session_factory() as db:
             row = await db.get(NotificationRow, notification_id)
             if row is None:
@@ -280,17 +300,22 @@ class NotificationService:
 
             notification_type = row.notification_type
             created_at = row.created_at
-
-            await db.execute(
-                update(NotificationRow)
-                .where(NotificationRow.notification_id == notification_id)
-                .values(
-                    status="resolved",
-                    resolution={"decision": decision, **resolution_data},
-                    resolved_at=now,
+        if notification_type == NotificationType.ESCALATION:
+            try:
+                with scoped_runtime_context(user_email=user_email or row.user_email):
+                    await self._providers.guardrails.submit_decision(
+                        notification_id, decision, resolution_data.get("note")
+                    )
+            except Exception:
+                NOTIFICATION_ESCALATION_SUBMIT_FAILURES.inc()
+                logger.warning(
+                    "notification: escalation decision submit failed",
+                    extra={
+                        "extra_data": {"notification_id": notification_id, "decision": decision}
+                    },
+                    exc_info=True,
                 )
-            )
-            await db.commit()
+                return False
 
         # Resolve PauseWaiter (unblocks the agent loop / workflow engine)
         ok = self._pause_waiter.resolve(
@@ -298,14 +323,39 @@ class NotificationService:
             PauseResolution(decision=decision, data=resolution_data),
         )
 
-        # Type-specific side effects
-        if notification_type == NotificationType.ESCALATION:
-            # Submit decision to Intaris for audit trail.
-            # The notification_id for escalations IS the Intaris call_id.
-            with contextlib.suppress(Exception):
-                await self._providers.guardrails.submit_decision(
-                    notification_id, decision, resolution_data.get("note")
+        async with self._session_factory() as db:
+            if (
+                notification_type == NotificationType.ESCALATION
+                and not ok
+                and decision == "approve"
+            ):
+                await db.execute(
+                    update(NotificationRow)
+                    .where(NotificationRow.notification_id == notification_id)
+                    .values(
+                        resolution={"decision": decision, "state": "submitted", **resolution_data},
+                    )
                 )
+                await db.commit()
+                NOTIFICATION_ESCALATION_RECOVERY_PENDING.inc()
+                logger.warning(
+                    "notification: escalation submitted to Intaris but local resume is pending recovery",
+                    extra={
+                        "extra_data": {"notification_id": notification_id, "decision": decision}
+                    },
+                )
+                return False
+
+            await db.execute(
+                update(NotificationRow)
+                .where(NotificationRow.notification_id == notification_id)
+                .values(
+                    status="resolved",
+                    resolution={"decision": decision, "state": "resolved", **resolution_data},
+                    resolved_at=now,
+                )
+            )
+            await db.commit()
 
         # Publish resolution event
         await self._event_bus.publish(

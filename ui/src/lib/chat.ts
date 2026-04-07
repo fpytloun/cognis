@@ -43,6 +43,7 @@ export interface ToolCallTimelineItem {
   isError?: boolean;
   durationMs?: number;
   evaluation?: ToolCallEvaluation;
+  reconstructed?: boolean;
 }
 
 export interface DelegationTimelineItem {
@@ -228,6 +229,10 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
 
     if (event.type === 'tool_result') {
       const callId = String(event.data.call_id ?? '');
+      const evaluation =
+        typeof event.data.evaluation === 'object' && event.data.evaluation !== null
+          ? (event.data.evaluation as ToolCallEvaluation)
+          : undefined;
       const index = toolCallIndexByCallId.get(callId);
       if (index !== undefined && items[index]?.kind === 'tool_call') {
         const existing = items[index] as ToolCallTimelineItem;
@@ -236,9 +241,43 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
           status: event.data.is_error ? 'failed' : 'completed',
           result: typeof event.data.result === 'string' ? event.data.result : undefined,
           isError: typeof event.data.is_error === 'boolean' ? event.data.is_error : undefined,
-          durationMs: typeof event.data.duration_ms === 'number' ? event.data.duration_ms : undefined
+          durationMs: typeof event.data.duration_ms === 'number' ? event.data.duration_ms : undefined,
+          evaluation
         };
+      } else {
+        items.push({
+          id: `tool:${callId || `tc-${eid}`}`,
+          kind: 'tool_call',
+          callId: callId || `tc-${eid}`,
+          toolName: String(event.data.name ?? event.data.tool_name ?? 'unknown'),
+          status: event.data.is_error ? 'failed' : 'completed',
+          timestamp: event.timestamp,
+          result: typeof event.data.result === 'string' ? event.data.result : undefined,
+          isError: typeof event.data.is_error === 'boolean' ? event.data.is_error : undefined,
+          durationMs: typeof event.data.duration_ms === 'number' ? event.data.duration_ms : undefined,
+          evaluation,
+          reconstructed: true
+        });
       }
+      continue;
+    }
+
+    if (event.type === 'history_gap') {
+      const reason = String(event.data?.reason ?? 'unknown');
+      const descriptionMap: Record<string, string> = {
+        stream_missing: 'A session event stream was missing in Intaris, so part of this history could not be loaded.',
+        read_failed: 'A session event stream could not be read from Intaris, so part of this history may be incomplete.',
+        lineage_truncated: 'Older conversation lineage was truncated during history bootstrap. Load the session directly for more detail.',
+        bootstrap_cap_reached: 'History bootstrap reached the configured safety cap. Refresh or inspect the session directly to load more.'
+      };
+      items.push({
+        id: `history-gap:${eid}:${reason}`,
+        kind: 'notice',
+        title: 'History incomplete',
+        description: descriptionMap[reason] ?? 'Some persisted history could not be loaded completely.',
+        tone: 'warning',
+        timestamp: event.timestamp
+      });
       continue;
     }
 
@@ -541,8 +580,8 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
       const existing = next[index] as ReasoningTimelineItem;
       next[index] = {
         ...existing,
-        content: `${existing.content}${event.content}`,
-        streaming: true
+        content: typeof event.seq === 'number' ? event.content : `${existing.content}${event.content}`,
+        streaming: typeof event.seq !== 'number'
       };
       return next;
     }
@@ -551,7 +590,7 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
       kind: 'reasoning',
       messageId: event.message_id,
       content: event.content,
-      streaming: true,
+      streaming: typeof event.seq !== 'number',
       timestamp: new Date().toISOString()
     });
     return next;
@@ -559,6 +598,28 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
 
   if (event.type === 'conversation_updated') {
     // Title updates are handled by the page handler directly, not the timeline
+    return next;
+  }
+
+  if (event.type === 'history_notice') {
+    const itemId =
+      typeof event.seq === 'number'
+        ? `history-notice:${event.seq}`
+        : `history-notice:${Date.now()}:${next.length}`;
+    const index = next.findIndex((item) => item.id === itemId && item.kind === 'notice');
+    const notice = {
+      id: itemId,
+      kind: 'notice' as const,
+      title: event.title,
+      description: event.description,
+      tone: event.tone ?? 'info',
+      timestamp: new Date().toISOString()
+    };
+    if (index >= 0) {
+      next[index] = notice;
+      return next;
+    }
+    next.push(notice);
     return next;
   }
 
@@ -710,12 +771,22 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
   }
 
   if (event.type === 'system_message') {
-    next.push({
-      id: `sysmsg:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`,
-      kind: 'system_message',
+    const itemId =
+      typeof event.seq === 'number'
+        ? `sysmsg:${event.seq}`
+        : `sysmsg:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
+    const index = next.findIndex((item) => item.id === itemId && item.kind === 'system_message');
+    const systemMessage = {
+      id: itemId,
+      kind: 'system_message' as const,
       text: event.text,
       timestamp: new Date().toISOString(),
-    });
+    };
+    if (index >= 0) {
+      next[index] = systemMessage;
+      return next;
+    }
+    next.push(systemMessage);
     return next;
   }
 

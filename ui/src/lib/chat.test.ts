@@ -60,4 +60,80 @@ describe('chat timeline helpers', () => {
       description: 'Which repository should I use?'
     });
   });
+
+  it('creates a placeholder tool block when persisted history contains a tool_result first', () => {
+    const items = normalizeHistory([
+      {
+        seq: 5,
+        type: 'tool_result',
+        data: {
+          call_id: 'call-1',
+          name: 'bash',
+          result: 'done',
+          is_error: false,
+          evaluation: { decision: 'approve', reasoning: 'ok' }
+        },
+        timestamp: '2026-04-07T00:00:00Z'
+      }
+    ]);
+
+    expect(items[0]).toMatchObject({
+      kind: 'tool_call',
+      callId: 'call-1',
+      toolName: 'bash',
+      status: 'completed',
+      result: 'done',
+      reconstructed: true,
+      evaluation: { decision: 'approve', reasoning: 'ok' }
+    });
+  });
+
+  it('turns history gaps into visible warning notices', () => {
+    const items = normalizeHistory([
+      {
+        seq: null,
+        type: 'history_gap',
+        data: { reason: 'bootstrap_cap_reached' },
+        timestamp: '2026-04-07T00:00:00Z'
+      }
+    ]);
+
+    expect(items[0]).toMatchObject({
+      kind: 'notice',
+      title: 'History incomplete',
+      tone: 'warning'
+    });
+    expect((items[0] as { description: string }).description).toContain('configured safety cap');
+  });
+
+  it('deduplicates replayed system and history notice events using seq', () => {
+    const systemOnce = applyWebSocketEvent([], {
+      type: 'system_message',
+      text: 'Recovered',
+      seq: 11
+    });
+    const systemTwice = applyWebSocketEvent(systemOnce, {
+      type: 'system_message',
+      text: 'Recovered',
+      seq: 11
+    });
+
+    const noticeOnce = applyWebSocketEvent(systemTwice, {
+      type: 'history_notice',
+      title: 'History incomplete',
+      description: 'Gap',
+      tone: 'warning',
+      seq: 12
+    });
+    const noticeTwice = applyWebSocketEvent(noticeOnce, {
+      type: 'history_notice',
+      title: 'History incomplete',
+      description: 'Gap',
+      tone: 'warning',
+      seq: 12
+    });
+
+    expect(systemTwice).toHaveLength(1);
+    expect(noticeTwice).toHaveLength(2);
+  });
 });
