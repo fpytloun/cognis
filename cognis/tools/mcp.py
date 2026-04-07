@@ -60,17 +60,6 @@ class StdioMCPClient:
                 "MCP stdio command is required",
                 error_class="missing_command",
             )
-        # Guard against shell-style commands stored as a single string.
-        # create_subprocess_exec treats the entire string as argv[0], so
-        # "npx -y @doist/todoist-ai" would try to exec a binary with that
-        # exact name (or fall through to sh on some systems).
-        if " " in self.config.command:
-            logger.warning(
-                "MCP stdio: %s command contains spaces (%r) — this is likely wrong. "
-                "Put only the executable in 'command' and flags/args in 'args'.",
-                self.config.name,
-                self.config.command,
-            )
         logger.info(
             "MCP stdio: spawning %s (command=%s, timeout=%ds)",
             self.config.name,
@@ -85,9 +74,18 @@ class StdioMCPClient:
             sorted(self.env.keys()) if self.env else [],
         )
         try:
-            self.process = await asyncio.create_subprocess_exec(
-                self.config.command,
-                *self.config.args,
+            # Spawn through a shell so that package runners (npx, bunx,
+            # uvx, pnpx) and nvm/asdf shim scripts work correctly with
+            # stdio piping.  create_subprocess_exec bypasses the shell,
+            # which breaks commands that are shell scripts or wrappers
+            # because stdin/stdout connect to the wrapper process instead
+            # of the actual MCP server it spawns.
+            import shlex
+
+            shell_cmd = shlex.join([self.config.command, *self.config.args])
+            logger.debug("MCP stdio: %s shell command: %s", self.config.name, shell_cmd)
+            self.process = await asyncio.create_subprocess_shell(
+                shell_cmd,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
