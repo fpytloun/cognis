@@ -2183,6 +2183,7 @@ async def update_executor_runtime_state(
     desired_config_version: int | None = None,
     applied_config_version: int | None = None,
     observed_tools: list[dict[str, Any]] | None = None,
+    runtime_metadata: dict[str, Any] | None = None,
     last_observed_at: datetime | None = None,
     runtime_state: str | None = None,
 ) -> ExecutorRow | None:
@@ -2195,6 +2196,8 @@ async def update_executor_runtime_state(
         row.applied_config_version = applied_config_version
     if observed_tools is not None:
         row.observed_tools = observed_tools
+    if runtime_metadata is not None:
+        row.runtime_metadata = runtime_metadata
     if last_observed_at is not None:
         row.last_observed_at = last_observed_at
     if runtime_state is not None:

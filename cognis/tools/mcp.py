@@ -13,6 +13,29 @@ from cognis.logging import get_logger
 from cognis.models.tool import MCPServerConfig, ToolDefinition, ToolSource, sanitize_mcp_tool_name
 
 logger = get_logger(__name__)
+_MAX_SAFE_STDERR_LINES = 5
+_MAX_SAFE_STDERR_LENGTH = 240
+
+
+class MCPClientError(RuntimeError):
+    """Structured MCP client error with safe diagnostics."""
+
+    def __init__(
+        self,
+        server_name: str,
+        phase: str,
+        message: str,
+        *,
+        error_class: str,
+        timed_out: bool = False,
+        safe_stderr: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.server_name = server_name
+        self.phase = phase
+        self.error_class = error_class
+        self.timed_out = timed_out
+        self.safe_stderr = safe_stderr
 
 
 class StdioMCPClient:
@@ -25,43 +48,69 @@ class StdioMCPClient:
         self._next_id = 0
         self._lock = asyncio.Lock()
         self._stderr_task: asyncio.Task[None] | None = None
+        self._stderr_lines: list[str] = []
 
     async def start(self) -> None:
         """Start the subprocess and perform the initialize handshake."""
 
         if self.config.command is None:
             raise RuntimeError("MCP stdio command is required")
-        self.process = await asyncio.create_subprocess_exec(
-            self.config.command,
-            *self.config.args,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=self.env,
-        )
+        try:
+            self.process = await asyncio.create_subprocess_exec(
+                self.config.command,
+                *self.config.args,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=self.env,
+            )
+        except FileNotFoundError as exc:
+            raise MCPClientError(
+                self.config.name,
+                "spawn",
+                f"command not found: {self.config.command}",
+                error_class="command_not_found",
+            ) from exc
+        except Exception as exc:
+            raise MCPClientError(
+                self.config.name,
+                "spawn",
+                _safe_message(str(exc)),
+                error_class=exc.__class__.__name__.lower(),
+            ) from exc
         self._stderr_task = asyncio.create_task(self._drain_stderr())
-        await self._request(
-            "initialize",
-            {
-                "protocolVersion": "2024-11-05",
-                "clientInfo": {"name": "cognis", "version": "0.1.0"},
-                "capabilities": {},
-            },
-        )
-        # MCP spec requires notifications/initialized after handshake
-        await self._send_notification("notifications/initialized")
+        try:
+            await self._request(
+                "initialize",
+                {
+                    "protocolVersion": "2024-11-05",
+                    "clientInfo": {"name": "cognis", "version": "0.1.0"},
+                    "capabilities": {},
+                },
+                phase="initialize",
+            )
+            # MCP spec requires notifications/initialized after handshake
+            await self._send_notification("notifications/initialized")
+        except Exception:
+            with suppress(Exception):
+                await self.close()
+            raise
 
     async def list_tools(self) -> list[dict[str, Any]]:
         """Discover tools exposed by the MCP server."""
 
-        payload = await self._request("tools/list", {})
+        payload = await self._request("tools/list", {}, phase="list_tools")
         tools = payload.get("tools", [])
         return tools if isinstance(tools, list) else []
 
     async def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> str:
         """Execute a tool and normalize its content into a text result."""
 
-        payload = await self._request("tools/call", {"name": tool_name, "arguments": arguments})
+        payload = await self._request(
+            "tools/call",
+            {"name": tool_name, "arguments": arguments},
+            phase="call_tool",
+        )
         return _normalize_mcp_result(payload)
 
     async def close(self) -> None:
@@ -94,9 +143,11 @@ class StdioMCPClient:
                     break
                 text = line.decode("utf-8", errors="replace").rstrip()
                 if text:
+                    self._stderr_lines.append(text)
+                    self._stderr_lines = self._stderr_lines[-_MAX_SAFE_STDERR_LINES:]
                     logger.debug(
                         "MCP server stderr",
-                        extra={"extra_data": {"server": self.config.name, "line": text}},
+                        extra={"extra_data": {"server": self.config.name, "captured": True}},
                     )
         except asyncio.CancelledError:
             raise
@@ -114,61 +165,120 @@ class StdioMCPClient:
         process.stdin.write(message)
         await process.stdin.drain()
 
-    async def _request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+    async def _request(
+        self,
+        method: str,
+        params: dict[str, Any],
+        *,
+        phase: str | None = None,
+    ) -> dict[str, Any]:
         process = self.process
         if process is None or process.stdin is None or process.stdout is None:
             raise RuntimeError("MCP client is not started")
 
-        async with self._lock:
-            self._next_id += 1
-            request_id = self._next_id
-            payload = {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "method": method,
-                "params": params,
-            }
-            body = json.dumps(payload).encode("utf-8")
-            message = f"Content-Length: {len(body)}\r\n\r\n".encode() + body
-            process.stdin.write(message)
-            await process.stdin.drain()
-
-            # Read messages until we get one with our request ID.
-            # MCP servers may send notifications (no "id" field)
-            # between request and response — skip those.
-            deadline = asyncio.get_event_loop().time() + self.config.timeout_seconds
-            while True:
-                remaining = deadline - asyncio.get_event_loop().time()
-                if remaining <= 0:
-                    raise TimeoutError(f"MCP request {method} timed out")
-                response = await asyncio.wait_for(
-                    self._read_message(process.stdout), timeout=remaining
-                )
-                # Notifications have no "id" — skip them
-                if "id" not in response:
-                    logger.debug(
-                        "MCP notification received (skipped)",
-                        extra={
-                            "extra_data": {
-                                "server": self.config.name,
-                                "method": response.get("method"),
-                            }
-                        },
-                    )
-                    continue
-                if response.get("id") != request_id:
-                    raise RuntimeError(
-                        f"MCP response ID mismatch: expected {request_id}, got {response.get('id')}"
-                    )
-                break
+        response = await self._perform_request_locked(process, method, params, phase=phase)
 
         if "error" in response:
             error = response["error"]
-            raise RuntimeError(json.dumps(error, sort_keys=True))
+            raise MCPClientError(
+                self.config.name,
+                phase or method,
+                _safe_message(json.dumps(error, sort_keys=True)),
+                error_class="remote_error",
+                safe_stderr=self._stderr_summary(),
+            )
         result = response.get("result")
         if not isinstance(result, dict):
-            raise RuntimeError("MCP result payload must be an object")
+            raise MCPClientError(
+                self.config.name,
+                phase or method,
+                "MCP result payload must be an object",
+                error_class="invalid_result",
+                safe_stderr=self._stderr_summary(),
+            )
         return result
+
+    async def _perform_request_locked(
+        self,
+        process: asyncio.subprocess.Process,
+        method: str,
+        params: dict[str, Any],
+        *,
+        phase: str | None = None,
+    ) -> dict[str, Any]:
+        try:
+            async with self._lock:
+                self._next_id += 1
+                request_id = self._next_id
+                payload = {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": method,
+                    "params": params,
+                }
+                body = json.dumps(payload).encode("utf-8")
+                message = f"Content-Length: {len(body)}\r\n\r\n".encode() + body
+                assert process.stdin is not None
+                assert process.stdout is not None
+                process.stdin.write(message)
+                await process.stdin.drain()
+
+                deadline = asyncio.get_event_loop().time() + self.config.timeout_seconds
+                while True:
+                    remaining = deadline - asyncio.get_event_loop().time()
+                    if remaining <= 0:
+                        raise MCPClientError(
+                            self.config.name,
+                            phase or method,
+                            f"MCP request {method} timed out",
+                            error_class="timeout",
+                            timed_out=True,
+                            safe_stderr=self._stderr_summary(),
+                        )
+                    try:
+                        response = await asyncio.wait_for(
+                            self._read_message(process.stdout), timeout=remaining
+                        )
+                    except TimeoutError as exc:
+                        raise MCPClientError(
+                            self.config.name,
+                            phase or method,
+                            f"MCP request {method} timed out",
+                            error_class="timeout",
+                            timed_out=True,
+                            safe_stderr=self._stderr_summary(),
+                        ) from exc
+                    if "id" not in response:
+                        logger.debug(
+                            "MCP notification received (skipped)",
+                            extra={
+                                "extra_data": {
+                                    "server": self.config.name,
+                                    "method": response.get("method"),
+                                }
+                            },
+                        )
+                        continue
+                    if response.get("id") != request_id:
+                        raise RuntimeError(
+                            f"MCP response ID mismatch: expected {request_id}, got {response.get('id')}"
+                        )
+                    return response
+        except MCPClientError:
+            raise
+        except Exception as exc:
+            raise MCPClientError(
+                self.config.name,
+                phase or method,
+                _safe_message(str(exc)),
+                error_class=exc.__class__.__name__.lower(),
+                safe_stderr=self._stderr_summary(),
+            ) from exc
+
+    def _stderr_summary(self) -> str | None:
+        if not self._stderr_lines:
+            return None
+        return _safe_message(" | ".join(self._stderr_lines), limit=_MAX_SAFE_STDERR_LENGTH)
 
     async def _read_message(self, stdout: asyncio.StreamReader) -> dict[str, Any]:
         header_bytes = bytearray()
@@ -273,3 +383,7 @@ def _normalize_mcp_result(result: dict[str, Any]) -> str:
     if isinstance(result.get("text"), str):
         return str(result["text"])
     return json.dumps(result, sort_keys=True, default=str)
+
+
+def _safe_message(message: str, *, limit: int = _MAX_SAFE_STDERR_LENGTH) -> str:
+    return " ".join(message.split())[:limit]

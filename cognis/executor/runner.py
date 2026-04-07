@@ -26,6 +26,7 @@ from cognis.models.tool import (
 )
 from cognis.tools.executor.definitions import executor_tool_definitions, executor_tool_handlers
 from cognis.tools.mcp import (
+    MCPClientError,
     StdioMCPClient,
     mcp_tools_to_definitions,
     resolve_secret_refs,
@@ -37,6 +38,8 @@ logger = logging.getLogger("cognis.executor.runner")
 _HEARTBEAT_INTERVAL = 15
 _RECONNECT_BASE = 1.0
 _RECONNECT_MAX = 60.0
+_MCP_PREPARE_TOTAL_TIMEOUT_SECONDS = 90.0
+_RUNTIME_METADATA_SCHEMA_VERSION = 1
 
 
 def _build_environment_payload() -> dict[str, str]:
@@ -197,7 +200,8 @@ class ExecutorRunner:
             await self._send_rpc_error(ws, msg_id, -32020, "Stale executor.configure version")
             return
 
-        self._configured = False
+        previous_configured = self._configured
+        previous_runtime_state = self._runtime_state
         self._runtime_state = "reconfiguring"
 
         config = params.get("config", {})
@@ -205,6 +209,11 @@ class ExecutorRunner:
         enabled_tool_groups = params.get("enabled_tool_groups", [])
         mcp_servers_raw = params.get("mcp_servers") or []
         secrets = dict(params.get("secrets") or {})
+
+        previous_clients = self._mcp_clients
+        previous_tool_handlers = dict(self._tool_handlers)
+        previous_tool_definitions = list(self._configured_tool_definitions)
+        previous_runtime_metadata = dict(self._runtime_metadata)
 
         try:
             mcp_servers = [MCPServerConfig.model_validate(item) for item in mcp_servers_raw]
@@ -214,11 +223,22 @@ class ExecutorRunner:
                         f"Executor-hosted MCP currently supports stdio only (server {server.name})"
                     )
             validate_unique_server_names(mcp_servers)
-            await self._close_mcp_clients()
-            self._mcp_clients = await self._start_mcp_clients(mcp_servers, secrets)
-            discovered_tools = await self._discover_mcp_tools(mcp_servers)
+            (
+                staged_mcp_clients,
+                discovered_tools,
+                mcp_statuses,
+                mcp_warnings,
+            ) = await asyncio.wait_for(
+                self._prepare_mcp_runtime(mcp_servers, secrets),
+                timeout=_MCP_PREPARE_TOTAL_TIMEOUT_SECONDS,
+            )
         except Exception as exc:
-            self._runtime_state = "blocked"
+            self._mcp_clients = previous_clients
+            self._tool_handlers = previous_tool_handlers
+            self._configured_tool_definitions = previous_tool_definitions
+            self._runtime_metadata = previous_runtime_metadata
+            self._configured = previous_configured
+            self._runtime_state = "blocked" if not previous_configured else previous_runtime_state
             await self._send_rpc_error(ws, msg_id, -32021, f"Executor configure failed: {exc}")
             return
 
@@ -235,44 +255,69 @@ class ExecutorRunner:
 
         web_defs = web_tool_definitions(web_backends)
         # Store web runtime metadata for handler context
-        self._runtime_metadata = {
-            "web_backend": web_config_raw.get("web_backend", "direct"),
-            "web_available_backends": web_backends,
-            "web_secrets": secrets,
-            "environment": _build_environment_payload(),
-        }
+        runtime_state = "degraded" if mcp_warnings else "active"
+        try:
+            self._runtime_metadata = {
+                "schema_version": _RUNTIME_METADATA_SCHEMA_VERSION,
+                "configure_capabilities": ["mcp_runtime_status_v1"],
+                "legacy_metadata": False,
+                "web_backend": web_config_raw.get("web_backend", "direct"),
+                "web_available_backends": web_backends,
+                "web_secrets": secrets,
+                "environment": _build_environment_payload(),
+                "mcp_servers": mcp_statuses,
+                "warnings": mcp_warnings,
+            }
 
-        self._configured_tool_definitions = [*native_defs, *web_defs, *discovered_tools]
-        native_handlers = executor_tool_handlers()
-        allowed_native = {t.name for t in native_defs}
-        allowed_web = {t.name for t in web_defs}
-        self._tool_handlers = {
-            name: handler
-            for name, handler in native_handlers.items()
-            if name in allowed_native or name in allowed_web
-        }
-        for tool in discovered_tools:
-            if tool.source.server_name is not None:
-                self._tool_handlers[tool.name] = self._build_mcp_handler(tool)
+            self._configured_tool_definitions = [*native_defs, *web_defs, *discovered_tools]
+            native_handlers = executor_tool_handlers()
+            allowed_native = {t.name for t in native_defs}
+            allowed_web = {t.name for t in web_defs}
+            self._tool_handlers = {
+                name: handler
+                for name, handler in native_handlers.items()
+                if name in allowed_native or name in allowed_web
+            }
+            for tool in discovered_tools:
+                if tool.source.server_name is not None:
+                    self._tool_handlers[tool.name] = self._build_mcp_handler(tool)
 
-        # Register skill tool handlers from controller-provided manifests
-        skill_manifests_raw = params.get("skill_manifests") or []
-        await self._register_skill_handlers(skill_manifests_raw, secrets)
+            old_clients = self._mcp_clients
+            self._mcp_clients = staged_mcp_clients
 
-        if self._inference_handler is None:
-            from cognis.executor.inference import InferenceHandler
+            # Register skill tool handlers from controller-provided manifests
+            skill_manifests_raw = params.get("skill_manifests") or []
+            await self._register_skill_handlers(skill_manifests_raw, secrets)
 
-            self._inference_handler = InferenceHandler()
-        if self._channel_handler is None:
-            from cognis.executor.channel_handler import ChannelHandler
+            if self._inference_handler is None:
+                from cognis.executor.inference import InferenceHandler
 
-            self._channel_handler = ChannelHandler()
-        self._channel_handler.set_ws(ws)
-        self._channel_handler.set_executor_config(config)
+                self._inference_handler = InferenceHandler()
+            if self._channel_handler is None:
+                from cognis.executor.channel_handler import ChannelHandler
+
+                self._channel_handler = ChannelHandler()
+            self._channel_handler.set_ws(ws)
+            self._channel_handler.set_executor_config(config)
+
+            if old_clients is not previous_clients:
+                await self._close_clients(old_clients)
+            elif previous_clients is not staged_mcp_clients:
+                await self._close_clients(previous_clients)
+        except Exception as exc:
+            await self._close_clients(staged_mcp_clients)
+            self._mcp_clients = previous_clients
+            self._tool_handlers = previous_tool_handlers
+            self._configured_tool_definitions = previous_tool_definitions
+            self._runtime_metadata = previous_runtime_metadata
+            self._configured = previous_configured
+            self._runtime_state = "blocked" if not previous_configured else previous_runtime_state
+            await self._send_rpc_error(ws, msg_id, -32021, f"Executor configure failed: {exc}")
+            return
 
         self._config_version = requested_version
         self._configured = True
-        self._runtime_state = "active"
+        self._runtime_state = runtime_state
         if msg_id is not None:
             await self._send_rpc_result(
                 ws,
@@ -281,6 +326,7 @@ class ExecutorRunner:
                     "status": "configured",
                     "applied_version": self._config_version,
                     "ready": True,
+                    "runtime_state": runtime_state,
                     "observed_at": datetime.now(UTC).isoformat(),
                     "capabilities": {
                         "tools": [tool.name for tool in self._configured_tool_definitions],
@@ -295,6 +341,7 @@ class ExecutorRunner:
                     "config_keys": sorted(config.keys()) if isinstance(config, dict) else [],
                     "environment": self._runtime_metadata.get("environment")
                     or _build_environment_payload(),
+                    "runtime_metadata": self._public_runtime_metadata(),
                 },
             )
 
@@ -737,6 +784,66 @@ class ExecutorRunner:
             clients[server.name] = client
         return clients
 
+    async def _prepare_mcp_runtime(
+        self, servers: list[MCPServerConfig], secrets: dict[str, str]
+    ) -> tuple[dict[str, StdioMCPClient], list[ToolDefinition], list[dict[str, Any]], list[str]]:
+        clients: dict[str, StdioMCPClient] = {}
+        discovered: list[ToolDefinition] = []
+        statuses: list[dict[str, Any]] = []
+        warnings: list[str] = []
+        for server in servers:
+            client = StdioMCPClient(server, env=resolve_secret_refs(server.env, secrets))
+            try:
+                await client.start()
+                tools = await client.list_tools()
+            except MCPClientError as exc:
+                await client.close()
+                statuses.append(
+                    {
+                        "server_id": server.server_id,
+                        "name": server.name,
+                        "phase": exc.phase,
+                        "status": "failed",
+                        "error_class": exc.error_class,
+                        "timed_out": exc.timed_out,
+                    }
+                )
+                warnings.append(f"MCP server {server.name} failed during {exc.phase}.")
+                continue
+            except Exception as exc:
+                await client.close()
+                statuses.append(
+                    {
+                        "server_id": server.server_id,
+                        "name": server.name,
+                        "phase": "unknown",
+                        "status": "failed",
+                        "error_class": exc.__class__.__name__.lower(),
+                        "timed_out": False,
+                    }
+                )
+                warnings.append(f"MCP server {server.name} failed to initialize.")
+                continue
+            clients[server.name] = client
+            statuses.append(
+                {
+                    "server_id": server.server_id,
+                    "name": server.name,
+                    "phase": "ready",
+                    "status": "ready",
+                    "tool_count": len(tools),
+                }
+            )
+            discovered.extend(
+                mcp_tools_to_definitions(
+                    server.name,
+                    tools,
+                    timeout_seconds=server.timeout_seconds,
+                    server_id=server.server_id,
+                )
+            )
+        return clients, discovered, statuses, warnings
+
     async def _discover_mcp_tools(self, servers: list[MCPServerConfig]) -> list[ToolDefinition]:
         discovered: list[ToolDefinition] = []
         for server in servers:
@@ -760,10 +867,18 @@ class ExecutorRunner:
         return _handler
 
     async def _close_mcp_clients(self) -> None:
-        for client in self._mcp_clients.values():
+        await self._close_clients(self._mcp_clients)
+        self._mcp_clients = {}
+
+    async def _close_clients(self, clients: dict[str, StdioMCPClient]) -> None:
+        for client in clients.values():
             with contextlib.suppress(Exception):
                 await client.close()
-        self._mcp_clients = {}
+
+    def _public_runtime_metadata(self) -> dict[str, Any]:
+        metadata = dict(self._runtime_metadata)
+        metadata.pop("web_secrets", None)
+        return metadata
 
     async def _send_rpc_result(self, ws: Any, msg_id: str | None, result: dict[str, Any]) -> None:
         if msg_id is None:

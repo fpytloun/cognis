@@ -783,6 +783,7 @@ class ExecutorConfigResponse(BaseModel):
     runtime_state: str = "offline"
     desired_config_version: int = 0
     applied_config_version: int = 0
+    runtime_metadata: dict[str, Any] = Field(default_factory=dict)
     last_observed_at: datetime | None = None
     is_default: bool = False
     owner_email: str | None = None

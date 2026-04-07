@@ -7,6 +7,7 @@ from typing import Any
 from fastapi import APIRouter, Request
 
 from cognis.api.common import api_exception, require_current_user
+from cognis.api.executor_runtime import schedule_executor_reconfigure
 from cognis.api.models import (
     ExecutorConfigResponse,
     ExecutorCreateRequest,
@@ -24,6 +25,7 @@ from cognis.store.queries import (
     get_executor_row,
     list_executors,
     update_executor,
+    update_executor_runtime_state,
 )
 
 router = APIRouter(tags=["executors"])
@@ -42,6 +44,7 @@ def _executor_to_response(row: Any) -> ExecutorConfigResponse:
         runtime_state=getattr(row, "runtime_state", "offline"),
         desired_config_version=getattr(row, "desired_config_version", 0),
         applied_config_version=getattr(row, "applied_config_version", 0),
+        runtime_metadata=getattr(row, "runtime_metadata", None) or {},
         last_observed_at=getattr(row, "last_observed_at", None),
         is_default=row.is_default,
         owner_email=row.owner_email,
@@ -99,6 +102,8 @@ async def create_executor_route(
             is_default=body.is_default,
             owner_email=user.email,
         )
+        if row.executor_type == "websocket":
+            row.desired_config_version = 1
         await session.commit()
     return _executor_to_response(row)
 
@@ -125,11 +130,11 @@ async def update_executor_route(
     updates = body.model_dump(exclude_none=True)
     if not updates:
         raise api_exception(400, "validation_error", "No fields to update")
+    policy = await load_executor_policy(request.app.state.session_factory)
     async with request.app.state.session_factory() as session:
         existing = await get_executor_row(session, executor_id, owner_email=user.email)
         if existing is None:
             raise api_exception(404, "not_found", "Executor not found")
-        policy = await load_executor_policy(request.app.state.session_factory)
         executor_type = str(updates.get("executor_type", existing.executor_type))
         try:
             ensure_executor_type_allowed(executor_type, policy)
@@ -143,7 +148,22 @@ async def update_executor_route(
         row = await update_executor(session, executor_id, owner_email=user.email, **updates)
         if row is None:
             raise api_exception(404, "not_found", "Executor not found")
+        runtime_affecting = (
+            any(key in updates for key in {"config", "enabled_tools", "enabled_tool_groups"})
+            and row.executor_type == "websocket"
+        )
+        if runtime_affecting:
+            connected = request.app.state.providers.executor.websocket.get_connection(executor_id)
+            desired_version = max(int(getattr(row, "desired_config_version", 0) or 0), 0) + 1
+            await update_executor_runtime_state(
+                session,
+                executor_id,
+                desired_config_version=desired_version,
+                runtime_state="reconfiguring" if connected is not None else "stale",
+            )
         await session.commit()
+    if runtime_affecting:
+        schedule_executor_reconfigure(request.app, executor_id)
     return _executor_to_response(row)
 
 

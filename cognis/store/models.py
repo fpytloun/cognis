@@ -400,6 +400,7 @@ class ExecutorRow(Base):
     desired_config_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     applied_config_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     observed_tools: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
+    runtime_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     last_observed_at: Mapped[datetime | None] = mapped_column(
         TIMESTAMP(timezone=True), nullable=True
     )

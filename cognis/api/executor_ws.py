@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy.ext.asyncio import async_sessionmaker
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
+from cognis.api.executor_runtime import reconcile_executor
 from cognis.core.executor_policy import is_executor_type_allowed, load_executor_policy
 from cognis.logging import get_logger
 from cognis.models.tool import MCP_SERVER_IDS_KEY, ExecutorCapabilities, MCPServerConfig
@@ -99,142 +99,22 @@ async def handle_executor_websocket(
     )
 
     try:
-        desired_version = row.desired_config_version + 1
-        mcp_servers, scoped_secrets = await _resolve_executor_mcp_payload(row, providers)
-
-        # Resolve web backend config so the executor can register web tools
-        from cognis.api.runtime_support import _resolve_web_config
-
-        web_config = await _resolve_web_config(providers, row.owner_email)
-        # Merge web API keys into scoped_secrets so the executor has them
-        scoped_secrets.update(web_config.get("web_secrets", {}))
-
-        async with session_factory() as session:
-            await update_executor_runtime_state(
-                session,
-                executor_id,
-                desired_config_version=desired_version,
-                runtime_state="reconfiguring",
-            )
-            await session.commit()
-        # Resolve skill manifests for executable skill tools on this executor
-        skill_manifests: list[dict[str, Any]] = []
-        try:
-            # Resolve skills visible to the executor owner
-            # Note: at executor connect time we don't know which agent will use it,
-            # so we resolve all visible skills for the owner. Per-agent filtering
-            # happens at step runtime.
-            from cognis.models.agent import AgentDefinition
-            from cognis.tools.skills import resolve_skills_for_agent
-
-            dummy_agent = AgentDefinition(
-                agent_id="executor_configure",
-                owner_email=row.owner_email,
-                name="executor_configure",
-            )
-            async with session_factory() as db_session:
-                resolved = await resolve_skills_for_agent(
-                    db_session, dummy_agent, owner_email=row.owner_email
-                )
-            for skill in resolved.skills:
-                if skill.tools:
-                    manifest: dict[str, Any] = {
-                        "skill_id": skill.skill_id,
-                        "version_id": skill.version_id,
-                        "content_hash": skill.content_hash,
-                        "tools": [t.model_dump(mode="json") for t in skill.tools],
-                        "asset_manifest": [a.model_dump(mode="json") for a in skill.asset_manifest],
-                    }
-                    # Generate signed URLs for assets
-                    artifact_store = getattr(providers, "artifact_store", None)
-                    if artifact_store and skill.asset_manifest:
-                        for asset_entry in manifest["asset_manifest"]:
-                            ns = asset_entry.get("artifact_namespace", "skills")
-                            oid = asset_entry.get("artifact_object_id", "")
-                            if oid:
-                                try:
-                                    url = await artifact_store.async_get_signed_url(ns, oid)
-                                    asset_entry["signed_url"] = url
-                                except Exception:
-                                    pass
-                    skill_manifests.append(manifest)
-        except Exception:
-            _logger.warning(
-                "executor_ws: failed to resolve skill manifests",
-                extra={"extra_data": {"executor_id": executor_id}},
-                exc_info=True,
-            )
-
-        configure_result = await conn.rpc_call(
-            "executor.configure",
-            {
-                "config_version": desired_version,
-                "enabled_tools": row.enabled_tools or [],
-                "enabled_tool_groups": row.enabled_tool_groups or [],
-                "config": row.config or {},
-                "mcp_servers": [server.model_dump(mode="json") for server in mcp_servers],
-                "secrets": scoped_secrets,
-                "web_config": {
-                    "web_backend": web_config.get("web_backend", "direct"),
-                    "web_available_backends": web_config.get("web_available_backends", ["direct"]),
-                },
-                "skill_manifests": skill_manifests,
-            },
-            timeout=30.0,
-        )
+        configure_ok = await reconcile_executor(ws.app, executor_id, connection=conn)
     except Exception:
         _logger.warning(
             "executor_ws: executor configuration failed",
             extra={"extra_data": {"executor_id": executor_id}},
             exc_info=True,
         )
-        await _send_error(ws, msg_id, -32010, "Executor configuration failed")
-        await _close_ws(ws, 1011, "Executor configuration failed")
-        ws_provider.unregister_connection(executor_id)
-        async with session_factory() as session:
-            await update_executor_runtime_state(session, executor_id, runtime_state="blocked")
-            await session.commit()
-        return
-
-    caps_raw = configure_result.get("capabilities") or {}
-    applied_version = int(configure_result.get("applied_version") or desired_version)
-    observed_tools = list(configure_result.get("observed_tools") or [])
-    capabilities = ExecutorCapabilities(
-        tools=list(caps_raw.get("tools") or []),
-        inference=bool(caps_raw.get("inference", False)),
-        inference_models=list(caps_raw.get("inference_models") or []),
-        inference_type=caps_raw.get("inference_type"),
-        channels=bool(caps_raw.get("channels", False)),
-    )
-    ws_provider.mark_ready(
-        executor_id,
-        capabilities,
-        metadata=_executor_connection_metadata(
-            labels=row.labels or {},
-            environment=(
-                configure_result.get("environment")
-                if configure_result.get("environment") is not None
-                else params.get("environment")
-            ),
-            platform=params.get("platform") or {},
-            status=row.status,
-        ),
-    )
+        configure_ok = False
 
     async with session_factory() as session:
-        await update_executor_runtime_state(
-            session,
-            executor_id,
-            applied_config_version=applied_version,
-            observed_tools=observed_tools,
-            last_observed_at=datetime.now(UTC),
-            runtime_state="active",
-        )
-        await session.commit()
+        row = await get_executor_row(session, executor_id)
+    runtime_state = getattr(row, "runtime_state", "offline") if row is not None else "offline"
 
     # Start any channel accounts assigned to this executor
     channel_manager = getattr(ws.app.state, "channel_manager", None)
-    if channel_manager is not None:
+    if channel_manager is not None and configure_ok and runtime_state in {"active", "degraded"}:
         try:
             await channel_manager.start_executor_channels(executor_id, conn)
         except Exception:
@@ -253,8 +133,9 @@ async def handle_executor_websocket(
             exc_info=True,
         )
     finally:
+        is_current = ws_provider.owns_connection(executor_id, conn)
         # Clean up executor-hosted channel adapters before unregistering
-        if channel_manager is not None:
+        if channel_manager is not None and is_current:
             try:
                 await channel_manager.stop_executor_channels(executor_id)
             except Exception:
@@ -263,10 +144,18 @@ async def handle_executor_websocket(
                     extra={"extra_data": {"executor_id": executor_id}},
                     exc_info=True,
                 )
-        ws_provider.unregister_connection(executor_id)
-        async with session_factory() as session:
-            await update_executor_runtime_state(session, executor_id, runtime_state="offline")
-            await session.commit()
+        ws_provider.unregister_connection(executor_id, conn)
+        if is_current:
+            async with session_factory() as session:
+                current = await get_executor_row(session, executor_id)
+                next_state = "offline"
+                if (
+                    current is not None
+                    and current.desired_config_version != current.applied_config_version
+                ):
+                    next_state = "stale"
+                await update_executor_runtime_state(session, executor_id, runtime_state=next_state)
+                await session.commit()
 
 
 async def _resolve_executor_mcp_payload(

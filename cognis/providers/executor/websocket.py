@@ -517,8 +517,15 @@ class WebSocketExecutorProvider:
         if event is not None:
             event.set()
 
-    def unregister_connection(self, executor_id: str) -> None:
+    def unregister_connection(
+        self,
+        executor_id: str,
+        connection: WebSocketExecutorConnection | None = None,
+    ) -> None:
         """Called when an executor WebSocket disconnects."""
+        conn = self._connections.get(executor_id)
+        if connection is not None and conn is not connection:
+            return
         conn = self._connections.pop(executor_id, None)
         if conn is not None:
             EXECUTOR_WS_CONNECTIONS.dec()
@@ -621,3 +628,7 @@ class WebSocketExecutorProvider:
         if conn is not None and conn.connected:
             return conn
         return None
+
+    def owns_connection(self, executor_id: str, connection: WebSocketExecutorConnection) -> bool:
+        """Return whether the given connection is still current for an executor."""
+        return self._connections.get(executor_id) is connection

@@ -17,6 +17,13 @@
   import { addToast } from '$lib/stores/toasts';
   import { blockNavigationIfDirty, installBeforeUnloadGuard } from '$lib/navigation/unsaved';
   import { auth } from '$lib/stores/auth';
+  import {
+    executorObservedNote,
+    executorRuntimeBadgeStatus,
+    executorRuntimeLabel,
+    executorRuntimeSummary,
+    validateStdioCommand
+  } from '$lib/executors';
   import type {
     ApiKeyCreateResponse,
     ApiKeyMetadata,
@@ -54,6 +61,7 @@
   let activeTab = $state<SettingsTab>('providers');
   let loading = $state(true);
   let busy = $state(false);
+  let savingExecutorIds = $state<string[]>([]);
   let error = $state('');
   let notice = $state('');
   let settings = $state<SettingsCategory[]>([]);
@@ -447,25 +455,18 @@
     initialSnapshot = snapshotState();
   }
 
-  function executorRuntimeBadgeStatus(executor: ExecutorConfig): 'healthy' | 'degraded' | 'unhealthy' {
-    if (executor.status !== 'active') return 'degraded';
-    if (executor.runtime_state === 'active') return 'healthy';
-    if (executor.runtime_state === 'reconfiguring') return 'degraded';
-    if (executor.runtime_state === 'blocked') return 'unhealthy';
-    return 'unhealthy';
+  function setExecutorSaving(executorId: string, saving: boolean): void {
+    if (saving) {
+      if (!savingExecutorIds.includes(executorId)) {
+        savingExecutorIds = [...savingExecutorIds, executorId];
+      }
+      return;
+    }
+    savingExecutorIds = savingExecutorIds.filter((value) => value !== executorId);
   }
 
-  function executorRuntimeLabel(executor: ExecutorConfig): string {
-    if (executor.status !== 'active') return 'disabled';
-    if (executor.runtime_state === 'active') return 'connected';
-    if (executor.runtime_state === 'reconfiguring') return 'reconfiguring';
-    if (executor.runtime_state === 'blocked') return 'blocked';
-    return 'offline';
-  }
-
-  function executorObservedNote(executor: ExecutorConfig): string | null {
-    if (!executor.last_observed_at) return null;
-    return `last seen ${new Date(executor.last_observed_at).toLocaleString()}`;
+  function isExecutorSaving(executorId: string): boolean {
+    return savingExecutorIds.includes(executorId);
   }
 
   async function loadSettings(): Promise<void> {
@@ -1602,6 +1603,9 @@
             {#if executorObservedNote(exec)}
               <div class="text-xs text-slate-500">{executorObservedNote(exec)}</div>
             {/if}
+            {#if executorRuntimeSummary(exec)}
+              <div class="text-xs {exec.runtime_state === 'degraded' ? 'text-amber-300' : 'text-slate-500'}">{executorRuntimeSummary(exec)}</div>
+            {/if}
             {#if exec.desired_config_version !== exec.applied_config_version}
               <div class="text-xs text-amber-300">
                 config pending: desired v{exec.desired_config_version}, applied v{exec.applied_config_version}
@@ -1863,6 +1867,7 @@
                     <button
                       class="px-3 py-1.5 rounded-lg text-sm border transition-colors {assigned ? 'bg-emerald-500/20 border-emerald-500/50 text-emerald-300' : 'bg-slate-900 border-slate-700 text-slate-400 hover:border-slate-600'}"
                       title="{srv.description || srv.name} ({srv.transport})"
+                      disabled={isExecutorSaving(exec.executor_id)}
                       onclick={async () => {
                         const ids = [...assignedIds];
                         if (assigned) {
@@ -1871,8 +1876,19 @@
                           ids.push(srv.server_id);
                         }
                         const cfg = { ...(exec.config || {}), mcp_server_ids: ids };
-                        await api.executor.update(exec.executor_id, { config: cfg });
-                        await refreshPageState();
+                        setExecutorSaving(exec.executor_id, true);
+                        try {
+                          await api.executor.update(exec.executor_id, { config: cfg });
+                          await refreshPageState();
+                          addToast(
+                            `${assigned ? 'Removed' : 'Assigned'} MCP server ${srv.name}.`,
+                            'success'
+                          );
+                        } catch (caughtError) {
+                          error = asApiError(caughtError).message;
+                        } finally {
+                          setExecutorSaving(exec.executor_id, false);
+                        }
                       }}
                     >
                       {srv.name}
@@ -2033,7 +2049,12 @@
               {#if mcpForm.transport === 'stdio'}
                 <label class="space-y-1 text-sm text-slate-200">
                   <span>Command</span>
-                  <Input bind:value={mcpForm.command} placeholder="e.g. npx -y @modelcontextprotocol/server-github" />
+                  <Input bind:value={mcpForm.command} placeholder="e.g. npx" />
+                  {#if validateStdioCommand(mcpForm.command)}
+                    <p class="text-xs text-amber-300">{validateStdioCommand(mcpForm.command)}</p>
+                  {:else}
+                    <p class="text-xs text-slate-500">Use only the executable name or absolute path here. Put flags and package names into Arguments.</p>
+                  {/if}
                 </label>
               {:else}
                 <label class="space-y-1 text-sm text-slate-200">
@@ -2049,7 +2070,7 @@
             {#if mcpForm.transport === 'stdio'}
               <label class="space-y-1 text-sm text-slate-200">
                 <span>Arguments (one per line)</span>
-                <textarea bind:value={mcpForm.args} class="min-h-[60px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500 font-mono" placeholder="--port&#10;3000"></textarea>
+                <textarea bind:value={mcpForm.args} class="min-h-[60px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500 font-mono" placeholder="-y&#10;@doist/todoist-ai"></textarea>
               </label>
             {/if}
             <div class="space-y-1 text-sm text-slate-200">
@@ -2062,7 +2083,7 @@
             </label>
             <div class="flex gap-2 justify-end">
               <Button variant="secondary" size="sm" onclick={() => showMcpForm = false}>Cancel</Button>
-              <Button variant="primary" size="sm" disabled={!mcpForm.name.trim()} onclick={async () => {
+              <Button variant="primary" size="sm" disabled={!mcpForm.name.trim() || (mcpForm.transport === 'stdio' && !!validateStdioCommand(mcpForm.command))} onclick={async () => {
                 const args = mcpForm.args.split('\n').map(s => s.trim()).filter(Boolean);
                 const env = serializeMcpEnvVars(mcpForm.envVars);
                 try {

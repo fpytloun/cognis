@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from cognis.executor.runner import ExecutorRunner, _normalize_result
-from cognis.models.tool import ExecutorConfig, ToolResult
+from cognis.models.tool import ExecutorConfig, ToolDefinition, ToolResult, ToolSource
 
 
 class DummyWebSocket:
@@ -122,3 +122,91 @@ async def test_heartbeat_includes_configuration_state() -> None:
     runner._running = False
     await task
     assert ws.sent[0]["params"]["configured"] is False
+
+
+@pytest.mark.asyncio
+async def test_handle_configure_reports_degraded_when_some_mcp_servers_fail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    ws = DummyWebSocket()
+
+    async def _prepare_mcp_runtime(
+        servers: list[object], secrets: dict[str, str]
+    ) -> tuple[dict[str, object], list[ToolDefinition], list[dict[str, object]], list[str]]:
+        del servers, secrets
+        return (
+            {},
+            [
+                ToolDefinition(
+                    name="mcp_todoist__list_tasks",
+                    description="List tasks",
+                    parameters={"type": "object", "properties": {}},
+                    source=ToolSource(
+                        type="local_mcp", server_name="todoist", raw_tool_name="list_tasks"
+                    ),
+                    category="mcp",
+                )
+            ],
+            [
+                {"name": "todoist", "status": "ready", "phase": "ready", "tool_count": 1},
+                {
+                    "name": "github",
+                    "status": "failed",
+                    "phase": "initialize",
+                    "error_class": "timeout",
+                    "timed_out": True,
+                },
+            ],
+            ["MCP server github failed during initialize."],
+        )
+
+    monkeypatch.setattr(runner, "_prepare_mcp_runtime", _prepare_mcp_runtime)
+
+    await runner._handle_configure(
+        ws,
+        "cfg-1",
+        {
+            "enabled_tools": ["read"],
+            "mcp_servers": [
+                {
+                    "name": "todoist",
+                    "transport": "stdio",
+                    "command": "npx",
+                    "args": ["-y", "todoist"],
+                }
+            ],
+            "config": {},
+        },
+    )
+
+    assert runner._configured is True
+    assert runner._runtime_state == "degraded"
+    assert ws.sent[-1]["result"]["runtime_state"] == "degraded"
+    assert ws.sent[-1]["result"]["runtime_metadata"]["warnings"]
+    assert "message" not in ws.sent[-1]["result"]["runtime_metadata"]["mcp_servers"][1]
+
+
+@pytest.mark.asyncio
+async def test_failed_reconfigure_preserves_previous_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    ws = DummyWebSocket()
+    await runner._handle_configure(ws, "cfg-1", {"enabled_tools": ["read"], "config": {}})
+
+    async def _broken_prepare(
+        servers: list[object], secrets: dict[str, str]
+    ) -> tuple[dict[str, object], list[ToolDefinition], list[dict[str, object]], list[str]]:
+        del servers, secrets
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(runner, "_prepare_mcp_runtime", _broken_prepare)
+    ws.sent.clear()
+
+    await runner._handle_configure(ws, "cfg-2", {"enabled_tools": ["glob"], "config": {}})
+
+    assert runner._configured is True
+    assert "read" in runner._tool_handlers
+    assert "glob" not in runner._tool_handlers
+    assert ws.sent[-1]["error"]["message"].startswith("Executor configure failed")

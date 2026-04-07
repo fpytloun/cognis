@@ -342,6 +342,8 @@ def _ensure_executor_runtime_state_columns(sync_conn: object) -> None:
         )
     if "observed_tools" not in columns:
         execute(text("ALTER TABLE executors ADD COLUMN observed_tools JSON"))
+    if "runtime_metadata" not in columns:
+        execute(text("ALTER TABLE executors ADD COLUMN runtime_metadata JSON"))
     if "last_observed_at" not in columns:
         execute(text("ALTER TABLE executors ADD COLUMN last_observed_at TIMESTAMP WITH TIME ZONE"))
     if "runtime_state" not in columns:

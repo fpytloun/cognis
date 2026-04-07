@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from cognis.models.tool import ExecutorCapabilities, ExecutorConfig, ToolCall
+from cognis.models.tool import ExecutorCapabilities, ExecutorConfig, ExecutorHandle, ToolCall
 from cognis.providers.circuit_breaker import CircuitBreaker
 from cognis.providers.executor.websocket import (
     ExecutorDisconnectedError,
@@ -245,6 +245,20 @@ async def test_provider_unregister_marks_disconnected() -> None:
     handle = ExecutorHandle(executor_id="exec-1", executor_type="websocket")
     with pytest.raises(ExecutorDisconnectedError):
         await provider.get_executor(handle)
+
+
+@pytest.mark.asyncio
+async def test_provider_unregister_ignores_stale_connection_cleanup() -> None:
+    provider = WebSocketExecutorProvider()
+    first = provider.register_connection("exec-1", FakeWebSocket(), ExecutorCapabilities())
+    second = provider.register_connection("exec-1", FakeWebSocket(), ExecutorCapabilities())
+
+    provider.unregister_connection("exec-1", first)
+
+    handle = await provider.get_executor(
+        ExecutorHandle(executor_id="exec-1", executor_type="websocket")
+    )
+    assert handle is second
 
 
 @pytest.mark.asyncio

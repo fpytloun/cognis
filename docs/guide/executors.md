@@ -40,9 +40,23 @@ Open `Settings` and use the executors section to inspect:
 
 - configured executors
 - status and health
+- desired vs applied config generation
 - enabled tool groups
 - individually enabled tools
 - attached MCP servers
+
+### Runtime states
+
+WebSocket executors can report several runtime states:
+
+- `active` - the current desired generation is fully applied
+- `degraded` - the current desired generation is applied, but one or more assigned MCP servers failed and were omitted from the active tool set
+- `reconfiguring` - Cognis is pushing a newer desired generation to the connected executor
+- `stale` - a newer desired generation is stored in Cognis, but the executor has not applied it yet
+- `blocked` - the executor is connected, but the last configure attempt failed in a non-recoverable way
+- `offline` - no executor WebSocket connection is currently active
+
+`desired` and `applied` are config generations, not simple reconnect counters. If they differ, the executor is behind the latest saved configuration.
 
 ## Choosing the right mode
 
@@ -53,9 +67,28 @@ Open `Settings` and use the executors section to inspect:
 ## Common troubleshooting checks
 
 - verify the executor is connected
+- if `desired != applied`, wait for reconfigure or reconnect the executor
 - confirm the required tools are enabled on the executor
 - confirm the agent is bound to the expected executor or label selector
 - confirm any required secrets or MCP servers are assigned correctly
+
+## MCP stdio command format
+
+For executor-hosted stdio MCP servers, `Command` is the executable only. Cognis does not run a shell.
+
+Use:
+
+- `Command`: `npx`
+- `Arguments`:
+
+```text
+-y
+@doist/todoist-ai
+```
+
+Do not paste the full shell command into `Command`. Values like `npx -y @doist/todoist-ai` are treated as a single executable path and will fail.
+
+If an assigned MCP server fails or times out during `spawn`, `initialize`, or `tools/list`, Cognis keeps the executor connected and marks it as `degraded`. The failing MCP server is omitted from the active observed tool set until the configuration is fixed and reapplied.
 
 ## Running as a systemd service
 
