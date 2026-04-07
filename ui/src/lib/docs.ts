@@ -66,6 +66,16 @@ const DOC_ASSET_URLS: Record<string, string> = {
   'docs/assets/images/cognis-workflow-task-lifecycle.svg': workflowLifecycleSvg
 };
 
+// Relative links to repo files that cannot be bundled as Vite assets.
+// These are rewritten to GitHub URLs at render time and allowed by the
+// validator.  Add new entries here when a guide links to a repo path
+// outside docs/ (e.g. deploy/, examples/).
+const GITHUB_REPO_URL = 'https://github.com/fpytloun/cognis';
+const DOC_REPO_URLS = new Set([
+  'deploy/systemd',
+  'deploy/systemd/README.md'
+]);
+
 function normalizeDocPath(path: string): string {
   const parts = path.split('/');
   const normalized: string[] = [];
@@ -101,12 +111,21 @@ function rewriteMarkdownAssets(sourcePath: string, markdown: string): string {
     }
 
     const resolvedTarget = resolveDocRelativePath(sourcePath, rawTarget);
-    const rewrittenTarget = DOC_ASSET_URLS[resolvedTarget];
-    if (!rewrittenTarget) {
-      return fullMatch;
+
+    const bundledAsset = DOC_ASSET_URLS[resolvedTarget];
+    if (bundledAsset) {
+      return fullMatch.replace(rawTarget, bundledAsset);
     }
 
-    return fullMatch.replace(rawTarget, rewrittenTarget);
+    // Strip trailing slash for set lookup (deploy/systemd/ -> deploy/systemd)
+    const normalized = resolvedTarget.replace(/\/$/, '');
+    if (DOC_REPO_URLS.has(normalized)) {
+      const isDir = resolvedTarget.endsWith('/') || !resolvedTarget.includes('.');
+      const segment = isDir ? 'tree' : 'blob';
+      return fullMatch.replace(rawTarget, `${GITHUB_REPO_URL}/${segment}/main/${normalized}`);
+    }
+
+    return fullMatch;
   });
 }
 
@@ -370,7 +389,8 @@ export function validateEmbeddedDocs(): string[] {
 
       if (target.startsWith('./') || target.startsWith('../')) {
         const resolvedTarget = resolveDocRelativePath(doc.sourcePath, target);
-        if (!DOC_ASSET_URLS[resolvedTarget]) {
+        const normalized = resolvedTarget.replace(/\/$/, '');
+        if (!DOC_ASSET_URLS[resolvedTarget] && !DOC_REPO_URLS.has(normalized)) {
           errors.push(`Relative link or asset is not allowlisted in ${doc.sourcePath}: ${target}`);
         }
         continue;
