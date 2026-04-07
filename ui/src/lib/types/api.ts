@@ -1063,6 +1063,13 @@ export interface WebSocketConversationCreatedEvent {
   old_conversation_id: string;
 }
 
+export interface WebSocketUserMessageEvent {
+  type: 'user_message';
+  conversation_id?: string;
+  session_id?: string;
+  content: string;
+}
+
 export type CognisWebSocketEvent =
   | WebSocketAuthenticatedEvent
   | WebSocketChunkEvent
@@ -1091,6 +1098,7 @@ export type CognisWebSocketEvent =
   | WebSocketSessionCompactedEvent
   | WebSocketSessionResetEvent
   | WebSocketConversationCreatedEvent
+  | WebSocketUserMessageEvent
   | WebSocketQueuedEvent
   | WebSocketReconnectedEvent
   | WebSocketSessionRecoveredEvent

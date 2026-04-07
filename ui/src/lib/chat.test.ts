@@ -106,6 +106,22 @@ describe('chat timeline helpers', () => {
     expect((items[0] as { description: string }).description).toContain('configured safety cap');
   });
 
+  it('adds a user message to the timeline from a user_message WS event', () => {
+    const items = applyWebSocketEvent([], {
+      type: 'user_message',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      content: 'Hello from Signal'
+    });
+
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({
+      kind: 'message',
+      role: 'user',
+      content: 'Hello from Signal'
+    });
+  });
+
   it('deduplicates replayed system and history notice events using seq', () => {
     const systemOnce = applyWebSocketEvent([], {
       type: 'system_message',

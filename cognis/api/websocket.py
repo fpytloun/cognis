@@ -1558,6 +1558,13 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
                 "call_id": event.data.get("notification_id"),
                 "decision": event.data.get("decision"),
             }
+    if event.type == EventType.USER_MESSAGE:
+        return {
+            "type": "user_message",
+            "conversation_id": conversation_id,
+            "session_id": event.data.get("session_id"),
+            "content": event.data.get("content", ""),
+        }
     return None
 
 

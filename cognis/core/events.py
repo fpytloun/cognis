@@ -70,6 +70,7 @@ class EventType(StrEnum):
     TURN_STARTED = "turn_started"
     TURN_COMPLETED = "turn_completed"
     TURN_ERROR = "turn_error"
+    USER_MESSAGE = "user_message"
 
     # Agent lifecycle
     AGENT_PROFILE_UPDATED = "agent_profile_updated"

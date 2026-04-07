@@ -470,6 +470,14 @@ export function appendOptimisticUserMessage(items: TimelineItem[], content: stri
 export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocketEvent): TimelineItem[] {
   const next = [...items];
 
+  if (event.type === 'user_message') {
+    const itemId = `user-msg:${Date.now()}:${next.length}`;
+    next.push(
+      createMessageItem(itemId, 'user', event.content, new Date().toISOString(), null)
+    );
+    return next;
+  }
+
   if (event.type === 'chunk') {
     const itemId = `message:${event.message_id}`;
     const index = next.findIndex((item) => item.id === itemId && item.kind === 'message');

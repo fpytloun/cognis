@@ -740,6 +740,21 @@ class TurnScheduler:
                 )
             )
 
+            # Publish USER_MESSAGE so WebSocket clients watching this
+            # conversation see channel-originated messages in real time
+            # (without waiting for a page refresh / history reload).
+            if not system_initiated:
+                await self._event_bus.publish(
+                    Event(
+                        type=EventType.USER_MESSAGE,
+                        data={
+                            "conversation_id": conversation_id,
+                            "session_id": session.session_id,
+                            "content": content,
+                        },
+                    )
+                )
+
             # Decision engine (skip for system-initiated turns)
             if not system_initiated:
                 decision = await self._decision_engine.decide(

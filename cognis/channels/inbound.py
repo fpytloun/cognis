@@ -621,8 +621,18 @@ class ChannelTurnObserver:
         tool_name: str,
         arguments: dict[str, Any] | None,
     ) -> None:
-        """Send typing indicator during tool execution."""
+        """Flush buffered text (immediate mode) and send typing indicator."""
         self._turn_active = True
+
+        # In immediate mode, deliver any accumulated assistant text before
+        # the tool starts executing so the user sees the message right away.
+        if self._assistant_delivery_mode == "immediate" and self._accumulated_text:
+            adapter = self._get_adapter()
+            if adapter is not None:
+                await self._send_text(self._accumulated_text, adapter=adapter)
+                self._accumulated_text = ""
+                return  # typing indicator is implicit after a sent message
+
         adapter = self._get_adapter()
         if adapter is not None:
             with contextlib.suppress(Exception):

@@ -178,6 +178,61 @@ async def test_channel_turn_observer_immediate_mode_flushes_full_buffer_only_whe
 
 
 @pytest.mark.asyncio
+async def test_channel_turn_observer_immediate_mode_flushes_on_tool_call() -> None:
+    adapter = _FakeAdapter()
+    manager = _FakeManager(adapter)
+    turn_scheduler = MagicMock()
+
+    observer = ChannelTurnObserver(
+        channel_type="signal",
+        account_id="acct-1",
+        chat_id="chat-1",
+        conversation_id="conv-1",
+        turn_scheduler=turn_scheduler,
+        reply_to_id="msg-1",
+        channel_manager_ref=lambda: manager,
+        assistant_delivery_mode="immediate",
+    )
+
+    await observer.on_token("conv-1", "sess-1", "msg-2", "Let me check that.")
+    await observer.on_tool_call("conv-1", "sess-1", "call-1", "bash", {"command": "ls"})
+
+    # The accumulated text should have been flushed to the channel
+    adapter.send_message.assert_awaited_once()
+    outbound = adapter.send_message.await_args.args[0]
+    assert outbound.content == "Let me check that."
+
+    # Buffer should be empty now
+    assert observer._accumulated_text == ""
+
+
+@pytest.mark.asyncio
+async def test_channel_turn_observer_final_mode_does_not_flush_on_tool_call() -> None:
+    adapter = _FakeAdapter()
+    manager = _FakeManager(adapter)
+    turn_scheduler = MagicMock()
+
+    observer = ChannelTurnObserver(
+        channel_type="signal",
+        account_id="acct-1",
+        chat_id="chat-1",
+        conversation_id="conv-1",
+        turn_scheduler=turn_scheduler,
+        reply_to_id="msg-1",
+        channel_manager_ref=lambda: manager,
+        assistant_delivery_mode="final",
+    )
+
+    await observer.on_token("conv-1", "sess-1", "msg-2", "Let me check that.")
+    await observer.on_tool_call("conv-1", "sess-1", "call-1", "bash", {"command": "ls"})
+
+    # In final mode, text should NOT be flushed on tool_call — only typing indicator
+    adapter.send_message.assert_not_awaited()
+    adapter.send_typing.assert_awaited()
+    assert observer._accumulated_text == "Let me check that."
+
+
+@pytest.mark.asyncio
 async def test_channel_turn_observer_final_mode_never_flushes_mid_turn() -> None:
     adapter = _FakeAdapter()
     manager = _FakeManager(adapter)
