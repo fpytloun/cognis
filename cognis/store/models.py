@@ -362,19 +362,34 @@ class StepRun(Base):
 
 
 class Schedule(Base):
-    """Cron-like task factory."""
+    """Cron/interval/one-shot task factory.
+
+    Schedules evaluate on a timer and create Tasks when they fire.
+    The task_template JSON blob is used as kwargs to TaskQueue.submit().
+    """
 
     __tablename__ = "schedules"
 
     schedule_id: Mapped[str] = mapped_column(String, primary_key=True)
     name: Mapped[str] = mapped_column(String, nullable=False)
-    cron_expr: Mapped[str] = mapped_column(String, nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    schedule_type: Mapped[str] = mapped_column(String, nullable=False, default="cron")
+    cron_expr: Mapped[str | None] = mapped_column(String, nullable=True)
+    interval_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    one_shot_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    timezone: Mapped[str] = mapped_column(String, nullable=False, default="UTC")
     agent_id: Mapped[str] = mapped_column(String, ForeignKey("agents.agent_id"), nullable=False)
     workflow_id: Mapped[str | None] = mapped_column(String, nullable=True)
     task_template: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     enabled: Mapped[bool] = mapped_column(nullable=False, default=True)
+    max_concurrent_runs: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    delete_after_run: Mapped[bool] = mapped_column(nullable=False, default=False)
+    suppress_empty: Mapped[bool] = mapped_column(nullable=False, default=False)
     last_fired_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
     next_fire_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    last_run_status: Mapped[str | None] = mapped_column(String, nullable=True)
+    consecutive_errors: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    disabled_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_by: Mapped[str] = mapped_column(String, ForeignKey("users.email"), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, default=_utcnow
@@ -382,6 +397,8 @@ class Schedule(Base):
     updated_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
     )
+
+    __table_args__ = (Index("ix_schedules_enabled_next_fire", "enabled", "next_fire_at"),)
 
 
 class ExecutorRow(Base):

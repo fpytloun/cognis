@@ -75,6 +75,11 @@ class EventType(StrEnum):
     # Agent lifecycle
     AGENT_PROFILE_UPDATED = "agent_profile_updated"
 
+    # Schedule lifecycle
+    SCHEDULE_FIRED = "schedule_fired"
+    SCHEDULE_ERROR = "schedule_error"
+    SCHEDULE_DISABLED = "schedule_disabled"
+
     # Unified notifications
     NOTIFICATION_CREATED = "notification_created"
     NOTIFICATION_RESOLVED = "notification_resolved"

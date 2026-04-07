@@ -545,6 +545,89 @@ class TaskDetailResponse(TaskResponse):
     pending_pause: PendingPauseResponse | None = None
 
 
+# ---------------------------------------------------------------------------
+# Schedules
+# ---------------------------------------------------------------------------
+
+
+class CreateScheduleRequest(BaseModel):
+    name: str
+    description: str | None = None
+    schedule_type: str = "cron"
+    cron_expr: str | None = None
+    interval_seconds: int | None = None
+    one_shot_at: datetime | None = None
+    timezone: str = "UTC"
+    agent_id: str
+    workflow_id: str | None = None
+    task_template: dict[str, Any] = Field(default_factory=dict)
+    enabled: bool = True
+    max_concurrent_runs: int = 1
+    delete_after_run: bool = False
+    suppress_empty: bool = False
+
+    @model_validator(mode="after")
+    def _validate_schedule_type(self) -> CreateScheduleRequest:
+        if self.schedule_type == "cron" and not self.cron_expr:
+            raise PydanticCustomError("missing_cron_expr", "cron_expr required for cron schedules")
+        if self.schedule_type == "interval" and not self.interval_seconds:
+            raise PydanticCustomError(
+                "missing_interval", "interval_seconds required for interval schedules"
+            )
+        if self.schedule_type == "interval" and (self.interval_seconds or 0) < 10:
+            raise PydanticCustomError("interval_too_short", "interval_seconds must be at least 10")
+        if self.schedule_type == "one_shot" and not self.one_shot_at:
+            raise PydanticCustomError(
+                "missing_one_shot_at", "one_shot_at required for one_shot schedules"
+            )
+        return self
+
+
+class UpdateScheduleRequest(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    schedule_type: str | None = None
+    cron_expr: str | None = None
+    interval_seconds: int | None = None
+    one_shot_at: datetime | None = None
+    timezone: str | None = None
+    agent_id: str | None = None
+    workflow_id: str | None = None
+    task_template: dict[str, Any] | None = None
+    enabled: bool | None = None
+    max_concurrent_runs: int | None = None
+    delete_after_run: bool | None = None
+    suppress_empty: bool | None = None
+
+
+class ScheduleResponse(BaseModel):
+    schedule_id: str
+    name: str
+    description: str | None = None
+    schedule_type: str
+    cron_expr: str | None = None
+    interval_seconds: int | None = None
+    one_shot_at: datetime | None = None
+    timezone: str = "UTC"
+    agent_id: str
+    workflow_id: str | None = None
+    task_template: dict[str, Any] = Field(default_factory=dict)
+    enabled: bool = True
+    max_concurrent_runs: int = 1
+    delete_after_run: bool = False
+    suppress_empty: bool = False
+    last_fired_at: datetime | None = None
+    next_fire_at: datetime | None = None
+    last_run_status: str | None = None
+    consecutive_errors: int = 0
+    disabled_reason: str | None = None
+    created_by: str
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    # Computed fields
+    human_schedule: str | None = None
+
+
 class GateResponseRequest(BaseModel):
     step_name: str | None = None
     action: str

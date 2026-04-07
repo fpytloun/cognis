@@ -1793,22 +1793,40 @@ async def create_schedule(
     *,
     schedule_id: str | None = None,
     name: str,
-    cron_expr: str,
+    description: str | None = None,
+    schedule_type: str = "cron",
+    cron_expr: str | None = None,
+    interval_seconds: int | None = None,
+    one_shot_at: datetime | None = None,
+    timezone: str = "UTC",
     agent_id: str,
-    task_template: dict[str, object],
-    created_by: str,
     workflow_id: str | None = None,
+    task_template: dict[str, object],
     enabled: bool = True,
+    max_concurrent_runs: int = 1,
+    delete_after_run: bool = False,
+    suppress_empty: bool = False,
+    next_fire_at: datetime | None = None,
+    created_by: str,
 ) -> Schedule:
     """Create a schedule record."""
     row = Schedule(
         schedule_id=schedule_id or f"sched_{uuid.uuid4().hex}",
         name=name,
+        description=description,
+        schedule_type=schedule_type,
         cron_expr=cron_expr,
+        interval_seconds=interval_seconds,
+        one_shot_at=one_shot_at,
+        timezone=timezone,
         agent_id=agent_id,
         workflow_id=workflow_id,
         task_template=task_template,
         enabled=enabled,
+        max_concurrent_runs=max_concurrent_runs,
+        delete_after_run=delete_after_run,
+        suppress_empty=suppress_empty,
+        next_fire_at=next_fire_at,
         created_by=created_by,
     )
     session.add(row)
@@ -1820,6 +1838,127 @@ async def get_schedule(session: AsyncSession, schedule_id: str) -> Schedule | No
     """Get a schedule by ID."""
     result = await session.execute(select(Schedule).where(Schedule.schedule_id == schedule_id))
     return result.scalar_one_or_none()
+
+
+async def list_schedules(
+    session: AsyncSession,
+    *,
+    created_by: str | None = None,
+    enabled: bool | None = None,
+    schedule_type: str | None = None,
+    agent_id: str | None = None,
+) -> list[Schedule]:
+    """List schedules with optional filters."""
+    stmt = select(Schedule).order_by(Schedule.name)
+    if created_by is not None:
+        stmt = stmt.where(Schedule.created_by == created_by)
+    if enabled is not None:
+        stmt = stmt.where(Schedule.enabled == enabled)
+    if schedule_type is not None:
+        stmt = stmt.where(Schedule.schedule_type == schedule_type)
+    if agent_id is not None:
+        stmt = stmt.where(Schedule.agent_id == agent_id)
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def update_schedule(
+    session: AsyncSession,
+    schedule_id: str,
+    **fields: Any,
+) -> Schedule | None:
+    """Update mutable fields on a schedule. Returns the updated row or None."""
+    row = await get_schedule(session, schedule_id)
+    if row is None:
+        return None
+    allowed = {
+        "name",
+        "description",
+        "schedule_type",
+        "cron_expr",
+        "interval_seconds",
+        "one_shot_at",
+        "timezone",
+        "agent_id",
+        "workflow_id",
+        "task_template",
+        "enabled",
+        "max_concurrent_runs",
+        "delete_after_run",
+        "suppress_empty",
+        "next_fire_at",
+    }
+    for key, value in fields.items():
+        if key in allowed:
+            setattr(row, key, value)
+    row.updated_at = datetime.now(UTC)
+    await session.flush()
+    return row
+
+
+async def delete_schedule(session: AsyncSession, schedule_id: str) -> bool:
+    """Delete a schedule by ID."""
+    result = await session.execute(delete(Schedule).where(Schedule.schedule_id == schedule_id))
+    await session.flush()
+    return int(getattr(result, "rowcount", 0) or 0) > 0
+
+
+async def list_due_schedules(session: AsyncSession, now: datetime) -> list[Schedule]:
+    """Return enabled schedules whose next_fire_at is at or before *now*."""
+    stmt = (
+        select(Schedule)
+        .where(
+            Schedule.enabled.is_(True),
+            Schedule.next_fire_at.isnot(None),
+            Schedule.next_fire_at <= now,
+        )
+        .order_by(Schedule.next_fire_at)
+    )
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def update_schedule_fire_state(
+    session: AsyncSession,
+    schedule_id: str,
+    *,
+    last_fired_at: datetime,
+    next_fire_at: datetime | None,
+    last_run_status: str,
+    consecutive_errors: int,
+    disabled_reason: str | None = None,
+    enabled: bool | None = None,
+) -> None:
+    """Atomically update schedule state after a fire attempt."""
+    values: dict[str, Any] = {
+        "last_fired_at": last_fired_at,
+        "next_fire_at": next_fire_at,
+        "last_run_status": last_run_status,
+        "consecutive_errors": consecutive_errors,
+        "updated_at": datetime.now(UTC),
+    }
+    if disabled_reason is not None:
+        values["disabled_reason"] = disabled_reason
+    if enabled is not None:
+        values["enabled"] = enabled
+    await session.execute(
+        update(Schedule).where(Schedule.schedule_id == schedule_id).values(**values)
+    )
+    await session.flush()
+
+
+async def count_active_tasks_for_schedule(session: AsyncSession, schedule_id: str) -> int:
+    """Count running/queued/ready tasks created by a specific schedule."""
+    result = await session.execute(
+        select(sa.func.count())
+        .select_from(Task)
+        .where(
+            Task.source_type == "scheduler",
+            Task.source_ref == schedule_id,
+            Task.status.in_(["queued", "ready", "running", "paused"]),
+        )
+    )
+    return int(result.scalar_one())
 
 
 # --- Skills ---

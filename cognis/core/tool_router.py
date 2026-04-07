@@ -20,6 +20,7 @@ from cognis.store.queries import get_setting_value
 from cognis.tools.builtin.image import handle_image_tool, is_image_tool
 from cognis.tools.builtin.memory import handle_memory_tool, is_memory_tool
 from cognis.tools.builtin.orchestration import handle_delegate_tool_call, is_orchestration_tool
+from cognis.tools.builtin.schedule import handle_schedule_tool, is_schedule_tool
 from cognis.tools.builtin.skill_management import (
     handle_skill_management_tool,
     is_skill_management_tool,
@@ -54,6 +55,7 @@ class ToolRoute(StrEnum):
     TOOL_OUTPUT = "tool_output"
     IMAGE = "image"
     SKILL_MANAGEMENT = "skill_management"
+    SCHEDULE = "schedule"
     INTARIS_MCP = "intaris_mcp"
     LOCAL = "local"
     UNKNOWN = "unknown"
@@ -91,6 +93,7 @@ class ToolRouter:
         self.image_generation_provider = image_generation_provider
         self.artifact_store = artifact_store
         self._session_factory = session_factory
+        self._scheduler: Any | None = None
         self.non_bypassable_patterns = non_bypassable_patterns or []
 
     @classmethod
@@ -130,6 +133,8 @@ class ToolRouter:
             return ToolRoute.IMAGE
         if is_skill_management_tool(tool_name):
             return ToolRoute.SKILL_MANAGEMENT
+        if is_schedule_tool(tool_name):
+            return ToolRoute.SCHEDULE
         registered_tool = registry.get(tool_name)
         if registered_tool is None:
             return ToolRoute.UNKNOWN
@@ -348,6 +353,23 @@ class ToolRouter:
             if result.metadata is not None:
                 combined_meta.update(result.metadata)
             result = result.model_copy(update={"metadata": combined_meta})
+            outcome = "success" if not result.is_error else "failure"
+            TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome=outcome).inc()
+            return self._sanitize_result(tool_call.name, result, 50_000, call_id=cid)
+        if route is ToolRoute.SCHEDULE:
+            if self._session_factory is None:
+                result = ToolResult(output="Schedule management not available.", is_error=True)
+            else:
+                from cognis.runtime_context import current_user_email
+
+                result = await handle_schedule_tool(
+                    tool_name=tool_call.name,
+                    arguments=dict(tool_call.arguments),
+                    session_factory=self._session_factory,
+                    scheduler=self._scheduler,
+                    user_email=current_user_email.get(),
+                    agent_id=agent.agent_id if agent else None,
+                )
             outcome = "success" if not result.is_error else "failure"
             TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome=outcome).inc()
             return self._sanitize_result(tool_call.name, result, 50_000, call_id=cid)

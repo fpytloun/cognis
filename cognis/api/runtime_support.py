@@ -110,6 +110,8 @@ def static_tool_definitions() -> list[ToolDefinition]:
 
     # Include all web tools for discovery (as if all backends were available)
     all_web = web_tool_definitions(["direct", "tavily", "brave"])
+    from cognis.tools.builtin.schedule import schedule_tools
+
     return [
         *system_tools(),
         *orchestration_tools(),
@@ -118,6 +120,7 @@ def static_tool_definitions() -> list[ToolDefinition]:
         *tool_output_tools(),
         *image_tools(),
         *skill_management_tools(),
+        *schedule_tools(),
         *executor_tool_definitions(),
         *all_web,
     ]

@@ -27,6 +27,7 @@ from cognis.api.routes.escalations import router as escalations_router
 from cognis.api.routes.executors import router as executors_router
 from cognis.api.routes.images import router as images_router
 from cognis.api.routes.notifications import router as notifications_router
+from cognis.api.routes.schedules import router as schedules_router
 from cognis.api.routes.secrets import router as secrets_router
 from cognis.api.routes.sessions import router as sessions_router
 from cognis.api.routes.settings import router as settings_router
@@ -46,6 +47,7 @@ from cognis.core.context import ContextAssembler
 from cognis.core.decision import DecisionEngine
 from cognis.core.events import EventBus
 from cognis.core.remember_queue import RememberRetryQueue
+from cognis.core.scheduler import Scheduler
 from cognis.core.session import SessionManager
 from cognis.core.session_cache import SessionCache
 from cognis.core.step_evaluator import StepEvaluator
@@ -378,6 +380,16 @@ def create_app() -> FastAPI:
         recovered_paused_tasks = await task_queue.recover_paused_tasks()
         await task_queue.start()
 
+        # Scheduler — evaluates cron/interval/one-shot schedules and
+        # creates Tasks via task_queue.submit() when they become due.
+        scheduler = Scheduler(
+            session_factory=session_factory,
+            task_queue=task_queue,
+            event_bus=event_bus,
+        )
+        await scheduler.start()
+        tool_router._scheduler = scheduler
+
         app.state.config = config_runtime
         app.state.engine = engine
         app.state.session_factory = session_factory
@@ -413,6 +425,7 @@ def create_app() -> FastAPI:
         app.state.agent_loop = agent_loop
         app.state.workflow_engine = workflow_engine
         app.state.task_queue = task_queue
+        app.state.scheduler = scheduler
         app.state.tool_registry = shared_runtime.tool_registry
         app.state.executor_connection = shared_runtime.executor_connection
         # Store as frozensets for O(1) lookup; these are written once at
@@ -492,6 +505,7 @@ def create_app() -> FastAPI:
         await artifact_maintenance.stop()
         await channel_delivery.stop()
         await channel_manager.stop_all()
+        await scheduler.stop()
         await task_queue.stop()
         await shared_runtime.cleanup()
         await remember_queue.stop()
@@ -527,6 +541,7 @@ def create_app() -> FastAPI:
     app.include_router(sessions_router)
     app.include_router(settings_router)
     app.include_router(tasks_router)
+    app.include_router(schedules_router)
     app.include_router(workflows_router)
     app.include_router(secrets_router)
     app.include_router(tools_router)

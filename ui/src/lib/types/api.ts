@@ -738,6 +738,43 @@ export interface Workflow {
   owner_email: string | null;
 }
 
+export interface Schedule {
+  schedule_id: string;
+  name: string;
+  description: string | null;
+  schedule_type: string;
+  cron_expr: string | null;
+  interval_seconds: number | null;
+  one_shot_at: string | null;
+  timezone: string;
+  agent_id: string;
+  workflow_id: string | null;
+  task_template: Record<string, unknown>;
+  enabled: boolean;
+  max_concurrent_runs: number;
+  delete_after_run: boolean;
+  suppress_empty: boolean;
+  last_fired_at: string | null;
+  next_fire_at: string | null;
+  last_run_status: string | null;
+  consecutive_errors: number;
+  disabled_reason: string | null;
+  created_by: string;
+  created_at: string | null;
+  updated_at: string | null;
+  human_schedule: string | null;
+}
+
+export interface ScheduleRun {
+  task_id: string;
+  title: string;
+  status: string;
+  created_at: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  result_summary: string | null;
+}
+
 export interface Setting {
   key: string;
   value: unknown;

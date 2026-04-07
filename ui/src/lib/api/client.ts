@@ -37,6 +37,8 @@ import type {
   ModelRouting,
   ProviderTestResult,
   PairingRequest,
+  Schedule,
+  ScheduleRun,
   SecretMetadata,
   Session,
   SessionEventsResponse,
@@ -834,6 +836,50 @@ export const api = {
 
     duplicate(workflowId: string): Promise<Workflow> {
       return request<Workflow>(`/api/v1/workflows/${workflowId}/duplicate`, { method: 'POST' });
+    }
+  },
+
+  schedules: {
+    list(params: Record<string, string | boolean | null | undefined> = {}): Promise<Schedule[]> {
+      return request<Schedule[]>(`/api/v1/schedules${encodeQuery(params)}`);
+    },
+
+    detail(scheduleId: string): Promise<Schedule> {
+      return request<Schedule>(`/api/v1/schedules/${scheduleId}`);
+    },
+
+    create(payload: Record<string, unknown>): Promise<Schedule> {
+      return request<Schedule>('/api/v1/schedules', {
+        method: 'POST',
+        body: JSON.stringify(payload)
+      });
+    },
+
+    update(scheduleId: string, payload: Record<string, unknown>): Promise<Schedule> {
+      return request<Schedule>(`/api/v1/schedules/${scheduleId}`, {
+        method: 'PUT',
+        body: JSON.stringify(payload)
+      });
+    },
+
+    remove(scheduleId: string): Promise<void> {
+      return request<void>(`/api/v1/schedules/${scheduleId}`, { method: 'DELETE' });
+    },
+
+    trigger(scheduleId: string): Promise<Schedule> {
+      return request<Schedule>(`/api/v1/schedules/${scheduleId}/trigger`, { method: 'POST' });
+    },
+
+    enable(scheduleId: string): Promise<Schedule> {
+      return request<Schedule>(`/api/v1/schedules/${scheduleId}/enable`, { method: 'POST' });
+    },
+
+    disable(scheduleId: string): Promise<Schedule> {
+      return request<Schedule>(`/api/v1/schedules/${scheduleId}/disable`, { method: 'POST' });
+    },
+
+    runs(scheduleId: string, limit = 20): Promise<ScheduleRun[]> {
+      return request<ScheduleRun[]>(`/api/v1/schedules/${scheduleId}/runs${encodeQuery({ limit })}`);
     }
   },
 
