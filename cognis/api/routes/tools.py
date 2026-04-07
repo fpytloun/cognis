@@ -669,13 +669,20 @@ _SECRET_PATTERNS = {"KEY", "SECRET", "TOKEN", "PASSWORD", "CREDENTIAL"}
 
 
 def _redact_env(env: dict[str, str] | None) -> dict[str, str]:
-    """Redact environment variable values that look like secrets."""
+    """Redact environment variable values that look like secrets.
+
+    ``$secret:NAME`` references are preserved as-is because they contain
+    only the credential store reference name, not the actual secret value.
+    The UI needs the prefix to distinguish "Credential store" entries from
+    literal values on reload.
+    """
     if not env:
         return {}
     redacted: dict[str, str] = {}
     for key, value in env.items():
-        upper_key = key.upper()
-        if any(pat in upper_key for pat in _SECRET_PATTERNS) or value.startswith("$secret:"):
+        if value.startswith("$secret:"):
+            redacted[key] = value
+        elif any(pat in key.upper() for pat in _SECRET_PATTERNS):
             redacted[key] = "***"
         else:
             redacted[key] = value

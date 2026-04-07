@@ -126,7 +126,7 @@ def test_admin_can_create_and_list_mcp_servers(monkeypatch: object, tmp_path: Pa
         created = create_response.json()
         assert created["server_id"]
         assert created["name"] == "demo"
-        assert created["env"]["API_TOKEN"] == "***"
+        assert created["env"]["API_TOKEN"] == "$secret:DEMO_TOKEN"
 
         list_response = client.get("/api/v1/mcp-servers", headers=headers)
         assert list_response.status_code == 200
