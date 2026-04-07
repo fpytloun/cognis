@@ -353,9 +353,28 @@ class ToolRouter:
             return self._sanitize_result(tool_call.name, result, 50_000, call_id=cid)
         if route is ToolRoute.INTARIS_MCP:
             result = await self._call_intaris_mcp(tool_call, session, registry)
-            TOOL_ROUTE_OUTCOMES.labels(
-                route=str(route), outcome="success" if not result.is_error else "failure"
-            ).inc()
+            if (
+                result.is_error
+                and result.metadata is not None
+                and result.metadata.get("decision") == "escalate"
+                and result.metadata.get("call_id")
+            ):
+                eval_meta: dict[str, Any] = {
+                    "decision": "escalate",
+                    "reasoning": result.metadata.get("reasoning"),
+                    "source": "guardrails",
+                    "risk": result.metadata.get("risk"),
+                    "path": result.metadata.get("path"),
+                    "latency_ms": result.metadata.get("latency_ms", 0),
+                    "call_id": result.metadata["call_id"],
+                }
+                result = result.model_copy(
+                    update={"metadata": {**result.metadata, "evaluation": eval_meta}}
+                )
+                outcome = "escalated"
+            else:
+                outcome = "success" if not result.is_error else "failure"
+            TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome=outcome).inc()
             return self._sanitize_result(
                 tool_call.name,
                 result,

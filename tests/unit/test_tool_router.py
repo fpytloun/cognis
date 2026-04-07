@@ -23,6 +23,7 @@ class _Guardrails:
         self.evaluate_calls = 0
         self.mcp_calls = 0
         self.last_mcp_call: tuple[str, str] | None = None
+        self.mcp_result = ToolResult(output="remote result")
 
     async def evaluate(
         self, session_id: str, tool_name: str, arguments: dict, context: dict
@@ -48,7 +49,7 @@ class _Guardrails:
         del session_id, arguments
         self.mcp_calls += 1
         self.last_mcp_call = (server_name, tool_name)
-        return ToolResult(output="remote result")
+        return self.mcp_result
 
 
 class _Executor:
@@ -231,6 +232,44 @@ async def test_tool_router_dispatches_intaris_mcp_using_raw_tool_name() -> None:
     )
 
     assert guardrails.last_mcp_call == ("github", "search/issues")
+
+
+@pytest.mark.asyncio
+async def test_tool_router_wraps_intaris_mcp_escalation_metadata() -> None:
+    guardrails = _Guardrails()
+    guardrails.mcp_result = ToolResult(
+        output="This tool call has been escalated for review (call_id: call-123).",
+        is_error=True,
+        metadata={
+            "decision": "escalate",
+            "call_id": "call-123",
+            "reasoning": "Needs approval",
+            "risk": "high",
+            "latency_ms": 42,
+        },
+    )
+    router = ToolRouter(guardrails=guardrails, non_bypassable_patterns=[])
+
+    result = await router.execute(
+        ToolCall(call_id="esc-1", name=sanitize_mcp_tool_name("github", "search"), arguments={}),
+        _session(),
+        _agent(),
+        _registry(),
+        _Executor(),
+    )
+
+    assert result.metadata is not None
+    assert result.metadata["decision"] == "escalate"
+    assert result.metadata["call_id"] == "call-123"
+    assert result.metadata["evaluation"] == {
+        "decision": "escalate",
+        "reasoning": "Needs approval",
+        "source": "guardrails",
+        "risk": "high",
+        "path": None,
+        "latency_ms": 42,
+        "call_id": "call-123",
+    }
 
 
 @pytest.mark.asyncio
