@@ -511,6 +511,10 @@ export const api = {
       return request<ToolDefinitionSummary[]>('/api/v1/tools');
     },
 
+    observedLocalMcpTools(): Promise<ToolDefinitionSummary[]> {
+      return request<ToolDefinitionSummary[]>('/api/v1/tools/local-mcp/observed');
+    },
+
     executorTools(): Promise<ToolDefinitionSummary[]> {
       return request<ToolDefinitionSummary[]>('/api/v1/tools/executor');
     },
@@ -521,6 +525,10 @@ export const api = {
 
     intarisMcpServers(): Promise<IntarisMCPServer[]> {
       return request<IntarisMCPServer[]>('/api/v1/intaris/mcp/servers');
+    },
+
+    intarisMcpTools(): Promise<ToolDefinitionSummary[]> {
+      return request<ToolDefinitionSummary[]>('/api/v1/intaris/mcp/tools');
     },
 
     testAgentMcp(agentId: string): Promise<MCPServerTestResponse> {

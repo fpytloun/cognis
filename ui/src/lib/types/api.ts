@@ -217,9 +217,19 @@ export interface ToolDefinitionSummary {
   parameters: ToolParameters;
   category: string;
   read_only: boolean;
-  source: Record<string, unknown>;
+  source: ToolSource;
   timeout_seconds: number;
   non_bypassable: boolean;
+}
+
+export interface ToolSource {
+  type: string;
+  server_name?: string | null;
+  server_id?: string | null;
+  raw_tool_name?: string | null;
+  skill_id?: string | null;
+  skill_version_id?: string | null;
+  skill_content_hash?: string | null;
 }
 
 export interface EffectiveToolItem {
@@ -228,7 +238,7 @@ export interface EffectiveToolItem {
   description: string;
   category: string;
   read_only: boolean;
-  source: Record<string, unknown>;
+  source: ToolSource;
   permission: string;
   enabled: boolean;
   disabled_reason?: string | null;
@@ -451,12 +461,14 @@ export interface ExecutorConfig {
   labels: Record<string, string>;
   enabled_tools: string[];
   enabled_tool_groups: string[];
-  config: Record<string, unknown>;
+  config: ExecutorRuntimeConfig;
   status: string;
   runtime_state: string;
   desired_config_version: number;
   applied_config_version: number;
+  runtime_metadata: ExecutorRuntimeMetadata;
   last_observed_at: string | null;
+  observed_tools?: ToolDefinitionSummary[];
   is_default: boolean;
   owner_email: string | null;
   created_at: string | null;
@@ -470,7 +482,7 @@ export interface ExecutorCreateRequest {
   labels?: Record<string, string>;
   enabled_tools?: string[];
   enabled_tool_groups?: string[];
-  config?: Record<string, unknown>;
+  config?: ExecutorRuntimeConfig;
   is_default?: boolean;
 }
 
@@ -479,9 +491,49 @@ export interface ExecutorUpdateRequest {
   labels?: Record<string, string>;
   enabled_tools?: string[];
   enabled_tool_groups?: string[];
-  config?: Record<string, unknown>;
+  config?: ExecutorRuntimeConfig;
   status?: string;
   is_default?: boolean;
+}
+
+export interface ExecutorSignalConfig {
+  direct_enabled?: boolean;
+  command?: string;
+}
+
+export interface ExecutorRuntimeConfig {
+  mcp_server_ids?: string[];
+  lsp_enabled?: boolean;
+  lsp_auto_install?: boolean;
+  lsp_diagnostics_timeout_ms?: number;
+  lsp_idle_timeout_seconds?: number;
+  lsp_max_concurrent_servers?: number;
+  signal?: ExecutorSignalConfig;
+  [key: string]: unknown;
+}
+
+export interface ExecutorMCPServerRuntimeStatus {
+  server_id?: string | null;
+  name: string;
+  status: string;
+  phase: string;
+  error_class?: string | null;
+  timed_out?: boolean;
+  message?: string;
+  stderr_summary?: string;
+  tool_count?: number;
+}
+
+export interface ExecutorRuntimeMetadata {
+  schema_version?: number;
+  configure_capabilities?: string[];
+  legacy_metadata?: boolean;
+  single_controller_process?: boolean;
+  warnings?: string[];
+  mcp_servers?: ExecutorMCPServerRuntimeStatus[];
+  environment?: Record<string, string>;
+  platform?: Record<string, unknown>;
+  [key: string]: unknown;
 }
 
 export interface ExecutorTokenResponse {

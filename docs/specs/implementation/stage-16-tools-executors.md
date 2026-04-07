@@ -81,13 +81,15 @@ Read operations (read, glob, grep, list_directory, web_fetch) are `read_only=Tru
 ### 7. New API Endpoints (`cognis/api/routes/tools.py`)
 
 - `GET /api/v1/tools/executor` — list executor-native tools
+- `GET /api/v1/tools/local-mcp/observed` — list cached observed local MCP tools
 - `GET /api/v1/executor/status` — executor status and capabilities
 - `GET /api/v1/intaris/mcp/servers` — auto-discover Intaris MCP servers
+- `GET /api/v1/intaris/mcp/tools` — list normalized Intaris MCP tools
 
 ### 8. UI: Tools & Skills Page (`ui/src/routes/(app)/tools/+page.svelte`)
 
 - Tab-based page: Tool Registry + Skills
-- Tool Registry: browse all tools grouped by source, search/filter, expandable details
+- Tool Registry: browse all tools grouped by category with source-aware badges, search/filter, expandable details
 - Skills: list, create, edit, delete skills with form UI
 - Added "Tools" to sidebar navigation with Wrench icon
 

@@ -130,15 +130,19 @@ Tab-based page with two tabs:
 
 ### Tool Registry Tab
 
-Browse all registered tools grouped by source:
+Browse all registered tools grouped by category with source-aware badges:
 
 - **Executor-native** — read, write, edit, bash, glob, grep, etc. (always available)
 - **Built-in** — delegate, spawn_worker, fork, list_agents, get_status
-- **Local MCP** — per-agent MCP server tools (shown with agent context)
+- **Local MCP** — cached observed MCP tools aggregated from the user's executor inventory
 - **Intaris MCP** — remote MCP tools proxied through Intaris
 
 Each tool shows: name, description, source badge, category, read_only flag,
-non_bypassable flag. Expandable detail shows full parameter schema.
+non_bypassable flag. Expandable detail shows full parameter schema. Local MCP
+rows are labeled as cached/observed rather than live discovery.
+
+The registry also shows configured local MCP server cards so users can see
+which server definitions exist even when no live discovery is running.
 
 Filter/search by name, source, category. Global default permissions section
 shows non-bypassable tool patterns (admin-editable).

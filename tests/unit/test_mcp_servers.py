@@ -297,6 +297,217 @@ def test_effective_tools_live_state_includes_merged_intaris_tools_for_websocket(
         assert sanitize_mcp_tool_name("github", "search/issues") in live_names
 
 
+def test_effective_tools_live_state_skips_stale_websocket_executor(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        import asyncio
+
+        async def _seed() -> None:
+            async with client.app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="alice@example.com",
+                    name="Alice",
+                    password_hash=client.app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                executor = await create_executor(
+                    session,
+                    executor_id="alice_exec",
+                    name="Alice exec",
+                    executor_type="websocket",
+                    owner_email="alice@example.com",
+                )
+                executor.runtime_state = "active"
+                executor.desired_config_version = 2
+                executor.applied_config_version = 1
+                await session.commit()
+
+        asyncio.run(_seed())
+
+        class _Conn:
+            async def list_tools(self) -> list[dict[str, object]]:
+                return []
+
+        client.app.state.providers.executor.websocket.get_connection = lambda executor_id: (  # type: ignore[method-assign]
+            _Conn() if executor_id == "alice_exec" else None
+        )
+
+        response = client.post(
+            "/api/v1/agents/effective-tools/preview",
+            headers=_auth_headers(client.app, email="alice@example.com", role="user"),
+            json={"execution": {"executor_id": "alice_exec"}},
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["live_state"]["connected"] is False
+        assert any("offline or not ready" in warning for warning in payload["warnings"])
+
+
+def test_list_intaris_mcp_tools_returns_normalized_rows(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        import asyncio
+
+        async def _seed() -> None:
+            async with client.app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="alice@example.com",
+                    name="Alice",
+                    password_hash=client.app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await session.commit()
+
+        asyncio.run(_seed())
+
+        async def _list_mcp_tools() -> list[dict[str, object]]:
+            return [
+                {
+                    "server": "github",
+                    "tool": "search/issues",
+                    "description": "Search issues",
+                    "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}},
+                },
+                {
+                    "server": "github",
+                    "description": "Malformed row",
+                },
+            ]
+
+        async def _list_mcp_servers(enabled_only: bool = True) -> list[dict[str, object]]:
+            assert enabled_only is True
+            return [
+                {
+                    "name": "github",
+                    "tools_cache": [
+                        {
+                            "name": "search/issues",
+                            "description": "Cached duplicate",
+                            "inputSchema": {"type": "object", "properties": {}},
+                        }
+                    ],
+                }
+            ]
+
+        client.app.state.providers.guardrails.list_mcp_tools = _list_mcp_tools  # type: ignore[method-assign]
+        client.app.state.providers.guardrails.list_mcp_servers = _list_mcp_servers  # type: ignore[method-assign]
+
+        response = client.get(
+            "/api/v1/intaris/mcp/tools",
+            headers=_auth_headers(client.app, email="alice@example.com", role="user"),
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert len(payload) == 1
+        assert payload[0]["name"] == sanitize_mcp_tool_name("github", "search/issues")
+        assert payload[0]["source"]["type"] == "intaris_mcp"
+        assert payload[0]["source"]["server_name"] == "github"
+
+
+def test_list_observed_local_mcp_tools_dedupes_and_filters_scope(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        import asyncio
+
+        async def _seed() -> None:
+            async with app.state.session_factory() as session:
+                for email in ("alice@example.com", "bob@example.com"):
+                    await create_user(
+                        session,
+                        email=email,
+                        name=email.split("@")[0].title(),
+                        password_hash=app.state.password_hasher.hash("password123"),
+                        role="user",
+                    )
+
+                alice_one = await create_executor(
+                    session,
+                    executor_id="alice_exec_1",
+                    name="Alice Exec 1",
+                    executor_type="websocket",
+                    owner_email="alice@example.com",
+                )
+                alice_two = await create_executor(
+                    session,
+                    executor_id="alice_exec_2",
+                    name="Alice Exec 2",
+                    executor_type="websocket",
+                    owner_email="alice@example.com",
+                )
+                bob_exec = await create_executor(
+                    session,
+                    executor_id="bob_exec",
+                    name="Bob Exec",
+                    executor_type="websocket",
+                    owner_email="bob@example.com",
+                )
+
+                observed_local = {
+                    "name": sanitize_mcp_tool_name("github", "search/issues"),
+                    "description": "Search issues",
+                    "parameters": {"type": "object", "properties": {}},
+                    "source": ToolSource(
+                        type="local_mcp",
+                        server_id="srv_github",
+                        server_name="github",
+                        raw_tool_name="search/issues",
+                    ).model_dump(mode="json"),
+                    "category": "mcp",
+                    "read_only": True,
+                    "timeout_seconds": 30,
+                    "non_bypassable": False,
+                }
+                alice_one.observed_tools = [
+                    observed_local,
+                    {
+                        "name": "read",
+                        "description": "Read file",
+                        "parameters": {},
+                        "source": ToolSource(type="executor").model_dump(mode="json"),
+                        "category": "filesystem",
+                        "read_only": True,
+                        "timeout_seconds": 30,
+                        "non_bypassable": False,
+                    },
+                    {"bad": "row"},
+                ]
+                alice_two.observed_tools = [observed_local]
+                bob_exec.observed_tools = [
+                    {
+                        **observed_local,
+                        "source": ToolSource(
+                            type="local_mcp",
+                            server_id="srv_bob",
+                            server_name="bob-github",
+                            raw_tool_name="search/issues",
+                        ).model_dump(mode="json"),
+                    }
+                ]
+                await session.commit()
+
+        asyncio.run(_seed())
+
+        response = client.get(
+            "/api/v1/tools/local-mcp/observed",
+            headers=_auth_headers(client.app, email="alice@example.com", role="user"),
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert len(payload) == 1
+        assert payload[0]["source"]["type"] == "local_mcp"
+        assert payload[0]["source"]["server_id"] == "srv_github"
+
+
 def test_delete_referenced_mcp_server_returns_409(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
         app = client.app

@@ -38,6 +38,12 @@ from cognis.api.runtime_support import (
     select_static_tools,
 )
 from cognis.api.serializers import agent_to_response, mcp_server_to_response, tool_to_response
+from cognis.api.tool_inventory import (
+    build_intaris_tool_definition,
+    collect_unique_observed_local_mcp_tools,
+    extract_intaris_aggregated_raw_tool_name,
+    extract_intaris_aggregated_server_name,
+)
 from cognis.core.executor_policy import load_executor_policy
 from cognis.core.executor_resolution import is_tool_enabled, select_executor_for_agent
 from cognis.models.agent import AgentDefinition, AgentPermissions
@@ -111,6 +117,29 @@ async def _discover_local_mcp_tools(
 async def list_tools(request: Request) -> list[ToolResponse]:
     require_current_user(request)
     return [tool_to_response(tool) for tool in select_static_tools()]
+
+
+@router.get("/api/v1/tools/local-mcp/observed", response_model=list[ToolResponse])
+async def list_observed_local_mcp_tools(request: Request) -> list[ToolResponse]:
+    user = require_current_user(request)
+    async with request.app.state.session_factory() as session:
+        executors = await list_executors(session, owner_email=user.email)
+
+    unique: dict[str, ToolDefinition] = {}
+    for row in executors:
+        observed = collect_unique_observed_local_mcp_tools(getattr(row, "observed_tools", None))
+        for tool in observed:
+            unique.setdefault(stable_tool_id(tool), tool)
+
+    ordered = sorted(
+        unique.values(),
+        key=lambda tool: (
+            tool.source.server_name or "",
+            tool.source.raw_tool_name or tool.name,
+            tool.name,
+        ),
+    )
+    return [tool_to_response(tool) for tool in ordered]
 
 
 @router.get("/api/v1/tools/executor", response_model=list[ToolResponse])
@@ -313,7 +342,10 @@ async def _resolve_effective_tools_response(
             configured_tools.extend(
                 await _discover_temp_mcp_tools(request.app.state.providers, mcp_servers, user_email)
             )
-        elif selected.observed_tools:
+        elif (
+            selected.observed_tools
+            and selected.desired_config_version == selected.applied_config_version
+        ):
             configured_tools.extend(
                 [ToolDefinition.model_validate(item) for item in selected.observed_tools]
             )
@@ -356,7 +388,11 @@ async def _resolve_effective_tools_response(
     stale_after = observed_at + timedelta(seconds=45) if observed_at is not None else None
     if selected.executor_type in {"websocket", "subprocess"}:
         conn = request.app.state.providers.executor.websocket.get_connection(selected.executor_id)
-        if conn is not None and selected.runtime_state == "active":
+        if (
+            conn is not None
+            and selected.runtime_state in {"active", "degraded"}
+            and selected.desired_config_version == selected.applied_config_version
+        ):
             connected = True
             remote_tools = await conn.list_tools()
             merged_result = await _merge_remote_runtime_inventory(
@@ -431,6 +467,68 @@ async def list_intaris_mcp_servers(request: Request) -> list[IntarisMCPServerRes
         for s in servers
         if isinstance(s, dict) and s.get("name")
     ]
+
+
+@router.get("/api/v1/intaris/mcp/tools", response_model=list[ToolResponse])
+async def list_intaris_mcp_tools(request: Request) -> list[ToolResponse]:
+    """List normalized Intaris MCP tools across all enabled servers."""
+    require_current_user(request)
+    guardrails = request.app.state.providers.guardrails
+    aggregated = await guardrails.list_mcp_tools()
+
+    unique: dict[str, ToolDefinition] = {}
+    malformed_servers: set[str] = set()
+    for row in aggregated:
+        if not isinstance(row, dict):
+            continue
+        server_name = extract_intaris_aggregated_server_name(row)
+        raw_tool_name = extract_intaris_aggregated_raw_tool_name(row)
+        if server_name and not raw_tool_name:
+            malformed_servers.add(server_name)
+        if not server_name or not raw_tool_name:
+            continue
+        tool = build_intaris_tool_definition(
+            server_name=server_name,
+            raw_tool_name=raw_tool_name,
+            payload=row,
+        )
+        unique.setdefault(stable_tool_id(tool), tool)
+
+    if not aggregated or malformed_servers:
+        servers = await guardrails.list_mcp_servers(enabled_only=True)
+        for server in servers:
+            if not isinstance(server, dict):
+                continue
+            server_name = server.get("name")
+            if not isinstance(server_name, str) or not server_name:
+                continue
+            if aggregated and server_name not in malformed_servers:
+                continue
+            tools_cache = server.get("tools_cache") or []
+            if not isinstance(tools_cache, list):
+                continue
+            for raw_tool in tools_cache:
+                if not isinstance(raw_tool, dict):
+                    continue
+                raw_tool_name = raw_tool.get("name")
+                if not isinstance(raw_tool_name, str) or not raw_tool_name:
+                    continue
+                tool = build_intaris_tool_definition(
+                    server_name=server_name,
+                    raw_tool_name=raw_tool_name,
+                    payload=raw_tool,
+                )
+                unique.setdefault(stable_tool_id(tool), tool)
+
+    ordered = sorted(
+        unique.values(),
+        key=lambda tool: (
+            tool.source.server_name or "",
+            tool.source.raw_tool_name or tool.name,
+            tool.name,
+        ),
+    )
+    return [tool_to_response(tool) for tool in ordered]
 
 
 @router.get("/api/v1/agents/{agent_id}/tools", response_model=list[ToolResponse])

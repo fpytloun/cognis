@@ -10,17 +10,17 @@ from typing import Any, cast
 
 from prometheus_client import Counter, Histogram
 
+from cognis.api.tool_inventory import (
+    build_intaris_tool_definition,
+    extract_intaris_aggregated_raw_tool_name,
+    extract_intaris_aggregated_server_name,
+)
 from cognis.core.executor_policy import load_executor_policy
 from cognis.core.executor_resolution import select_executor_for_agent
 from cognis.core.runtime import (
     ResolvedStepRuntime,
     build_local_executor_environment,
     environment_from_metadata,
-)
-from cognis.api.tool_inventory import (
-    build_intaris_tool_definition,
-    extract_intaris_aggregated_raw_tool_name,
-    extract_intaris_aggregated_server_name,
 )
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition

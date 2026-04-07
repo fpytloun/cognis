@@ -1,0 +1,99 @@
+import { describe, expect, it } from 'vitest';
+
+import {
+  buildRegistryWarnings,
+  filterTools,
+  formatSourceSummary,
+  getToolKey,
+  groupToolsByCategory,
+  mergeToolInventories
+} from '$lib/tools-registry';
+import type { ToolDefinitionSummary } from '$lib/types/api';
+
+function tool(overrides: Partial<ToolDefinitionSummary> & Pick<ToolDefinitionSummary, 'name'>): ToolDefinitionSummary {
+  return {
+    name: overrides.name,
+    description: overrides.description || overrides.name,
+    parameters: overrides.parameters || { type: 'object', properties: {} },
+    category: overrides.category || 'mcp',
+    read_only: overrides.read_only ?? true,
+    source: overrides.source || { type: 'builtin' },
+    timeout_seconds: overrides.timeout_seconds ?? 30,
+    non_bypassable: overrides.non_bypassable ?? false
+  };
+}
+
+describe('tools registry helpers', () => {
+  it('keeps local and intaris MCP variants as separate rows', () => {
+    const local = tool({
+      name: 'mcp_github__search',
+      source: { type: 'local_mcp', server_name: 'github', raw_tool_name: 'search' }
+    });
+    const intaris = tool({
+      name: 'mcp_github__search',
+      source: { type: 'intaris_mcp', server_name: 'github', raw_tool_name: 'search' }
+    });
+
+    expect(getToolKey(local)).not.toBe(getToolKey(intaris));
+    expect(mergeToolInventories([[local], [intaris]])).toHaveLength(2);
+  });
+
+  it('collapses duplicate local MCP observations across executors', () => {
+    const first = tool({
+      name: 'mcp_github__search',
+      source: { type: 'local_mcp', server_id: 'srv-1', server_name: 'github', raw_tool_name: 'search' }
+    });
+    const second = tool({
+      name: 'mcp_github__search',
+      description: 'same tool from another executor',
+      source: { type: 'local_mcp', server_id: 'srv-1', server_name: 'github', raw_tool_name: 'search' }
+    });
+
+    const merged = mergeToolInventories([[first], [second]]);
+    expect(merged).toHaveLength(1);
+  });
+
+  it('groups mixed-source categories without losing source visibility', () => {
+    const groups = groupToolsByCategory([
+      tool({ name: 'read', category: 'filesystem', source: { type: 'executor' } }),
+      tool({ name: 'mcp_github__search', category: 'mcp', source: { type: 'local_mcp', server_name: 'github', raw_tool_name: 'search' } }),
+      tool({ name: 'mcp_linear__search', category: 'mcp', source: { type: 'intaris_mcp', server_name: 'linear', raw_tool_name: 'search' } })
+    ]);
+
+    expect(groups[0]?.category).toBe('filesystem');
+    expect(groups[1]?.category).toBe('mcp');
+    expect(groups[1]?.sourceTypes).toEqual(['intaris_mcp', 'local_mcp']);
+    expect(formatSourceSummary(groups[1]?.sourceTypes || [])).toBe('Intaris MCP + Local MCP');
+  });
+
+  it('filters by search, source, and category together', () => {
+    const tools = [
+      tool({ name: 'read', category: 'filesystem', source: { type: 'executor' } }),
+      tool({ name: 'mcp_github__search', description: 'GitHub issues', source: { type: 'local_mcp', server_name: 'github', raw_tool_name: 'search' } })
+    ];
+
+    const filtered = filterTools(tools, {
+      searchQuery: 'git',
+      sourceFilter: 'local_mcp',
+      categoryFilter: 'mcp'
+    });
+
+    expect(filtered).toHaveLength(1);
+    expect(filtered[0]?.name).toBe('mcp_github__search');
+  });
+
+  it('builds partial-failure warnings per data source', () => {
+    expect(buildRegistryWarnings({
+      staticTools: true,
+      intarisMcpTools: false,
+      observedLocalMcpTools: false,
+      skills: true,
+      executors: false,
+      mcpServers: true
+    })).toEqual([
+      'Intaris MCP tools are unavailable right now.',
+      'Cached local MCP tool inventory is unavailable right now.',
+      'Executors failed to load.'
+    ]);
+  });
+});

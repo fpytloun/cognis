@@ -240,7 +240,8 @@ POST   /api/v1/sessions/:id/cancel            → Cancel
 ### Tools
 
 ```
-GET    /api/v1/tools                          → List all available tools (all sources)
+GET    /api/v1/tools                          → List static tool catalog (built-in + executor-native + web)
+GET    /api/v1/tools/local-mcp/observed       → List cached observed local MCP tools across the user's executors
 GET    /api/v1/tools/executor                 → List executor-native tools with status
 GET    /api/v1/agents/:id/tools               → Tools for agent (filtered by agent config)
 POST   /api/v1/agents/:id/mcp/test           → Test local MCP server discovery for agent
