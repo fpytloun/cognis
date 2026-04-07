@@ -336,11 +336,11 @@
       const credential_refs: Record<string, string> = { ...(current.credential_refs ?? {}) };
       const replacedSecretNames: string[] = [];
       for (const field of selectedType.credential_fields) {
-        const replacement = (credentialOverrides[field.name] ?? '').trim();
-        if (!replacement) {
-          continue;
-        }
         if (field.secret) {
+          const replacement = (credentialOverrides[field.name] ?? '').trim();
+          if (!replacement) {
+            continue;
+          }
           const secretName = `channel.${selectedType.channel_type}.${Date.now()}.${field.name}`;
           await api.secrets.upsert({
             name: secretName,
@@ -355,7 +355,10 @@
           }
           credential_refs[field.name] = secretName;
         } else {
-          (updates.config as Record<string, unknown>)[field.name] = replacement;
+          const value = (draft.credentialValues[field.name] ?? '').trim();
+          if (value) {
+            (updates.config as Record<string, unknown>)[field.name] = value;
+          }
         }
       }
       updates.credential_refs = credential_refs;

@@ -556,38 +556,6 @@ def _kind_for_media(content_type: str) -> ArtifactKind:
     return ArtifactKind.FILE
 
 
-def _extract_buffered_delivery_chunk(text: str) -> tuple[str, str]:
-    """Split buffered assistant text for immediate channel delivery.
-
-    Returns ``(chunk, remainder)``.  Prefers paragraph boundaries,
-    otherwise sentence-like punctuation once the buffer is reasonably
-    large.  Keeps short trailing fragments in the buffer so immediate
-    mode feels streamed but not too noisy.
-    """
-
-    if not text:
-        return "", ""
-
-    paragraph_idx = text.rfind("\n\n")
-    if paragraph_idx >= 0:
-        chunk = text[:paragraph_idx].strip()
-        remainder = text[paragraph_idx + 2 :].lstrip()
-        return chunk, remainder
-
-    if len(text) < 180:
-        return "", text
-
-    sentence_breaks = [text.rfind(". "), text.rfind("! "), text.rfind("? "), text.rfind("\n")]
-    split_idx = max(sentence_breaks)
-    if split_idx < 80:
-        return "", text
-
-    advance = 2 if text[split_idx : split_idx + 2] in {". ", "! ", "? "} else 1
-    chunk = text[: split_idx + advance].strip()
-    remainder = text[split_idx + advance :].lstrip()
-    return chunk, remainder
-
-
 # ---------------------------------------------------------------------------
 # ChannelTurnObserver — bridges TurnObserver to channel delivery
 # ---------------------------------------------------------------------------
@@ -645,9 +613,6 @@ class ChannelTurnObserver:
                 with contextlib.suppress(Exception):
                     await adapter.send_typing(self._chat_id)
 
-        if self._assistant_delivery_mode == "immediate":
-            await self._flush_buffered_output()
-
     async def on_tool_call(
         self,
         conversation_id: str,
@@ -682,6 +647,8 @@ class ChannelTurnObserver:
         Called by the delivery service before sending a step_question
         notification so the assistant's preceding message arrives first.
         """
+        if self._assistant_delivery_mode != "immediate":
+            return
         if not self._accumulated_text:
             return
         adapter = self._get_adapter()
@@ -824,13 +791,6 @@ class ChannelTurnObserver:
                     account_id=self._account_id,
                 ).inc()
                 self._reply_to_id = None
-
-    async def _flush_buffered_output(self) -> None:
-        chunk, remainder = _extract_buffered_delivery_chunk(self._accumulated_text)
-        if not chunk:
-            return
-        await self._send_text(chunk)
-        self._accumulated_text = remainder
 
     def _turn_scheduler_remove(self) -> None:
         """Remove self from turn scheduler observers.

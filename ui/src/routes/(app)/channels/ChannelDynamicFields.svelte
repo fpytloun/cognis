@@ -13,10 +13,12 @@
   <label class="grid gap-2 text-sm text-slate-300">
     {field.label}
     <Input
-      value={editing ? (credentialOverrides[field.name] ?? '') : (draft.credentialValues[field.name] ?? '')}
+      value={editing
+        ? (field.secret ? (credentialOverrides[field.name] ?? '') : (draft.credentialValues[field.name] ?? ''))
+        : (draft.credentialValues[field.name] ?? '')}
       oninput={(event) => {
         const value = (event.currentTarget as HTMLInputElement).value;
-        if (editing) {
+        if (editing && field.secret) {
           credentialOverrides[field.name] = value;
         } else {
           draft.credentialValues[field.name] = value;

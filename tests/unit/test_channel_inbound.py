@@ -7,7 +7,6 @@ import pytest
 from cognis.channels.inbound import (
     ChannelTurnObserver,
     InboundPipeline,
-    _extract_buffered_delivery_chunk,
 )
 from cognis.core.commands import CommandResult
 from cognis.models.channel import ChannelAccountConfig, InboundMessage
@@ -129,20 +128,8 @@ async def test_channel_inbound_submits_normal_messages() -> None:
     turn_scheduler.submit_turn.assert_awaited_once()
 
 
-def test_extract_buffered_delivery_chunk_prefers_paragraphs() -> None:
-    chunk, remainder = _extract_buffered_delivery_chunk("Hello world.\n\nNext part")
-    assert chunk == "Hello world."
-    assert remainder == "Next part"
-
-
-def test_extract_buffered_delivery_chunk_keeps_short_text_buffered() -> None:
-    chunk, remainder = _extract_buffered_delivery_chunk("Short sentence.")
-    assert chunk == ""
-    assert remainder == "Short sentence."
-
-
 @pytest.mark.asyncio
-async def test_channel_turn_observer_immediate_mode_flushes_buffered_text() -> None:
+async def test_channel_turn_observer_immediate_mode_does_not_flush_on_tokens() -> None:
     adapter = _FakeAdapter()
     manager = _FakeManager(adapter)
     turn_scheduler = MagicMock()
@@ -160,7 +147,57 @@ async def test_channel_turn_observer_immediate_mode_flushes_buffered_text() -> N
 
     await observer.on_token("conv-1", "sess-1", "msg-2", "First sentence. Second sentence. " * 8)
 
-    assert adapter.send_message.await_count >= 1
+    adapter.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_channel_turn_observer_immediate_mode_flushes_full_buffer_only_when_requested() -> (
+    None
+):
+    adapter = _FakeAdapter()
+    manager = _FakeManager(adapter)
+    turn_scheduler = MagicMock()
+
+    observer = ChannelTurnObserver(
+        channel_type="signal",
+        account_id="acct-1",
+        chat_id="chat-1",
+        conversation_id="conv-1",
+        turn_scheduler=turn_scheduler,
+        reply_to_id="msg-1",
+        channel_manager_ref=lambda: manager,
+        assistant_delivery_mode="immediate",
+    )
+
+    await observer.on_token("conv-1", "sess-1", "msg-2", "First paragraph.\n\nSecond paragraph.")
+    await observer.flush_buffered_text()
+
+    adapter.send_message.assert_awaited_once()
+    outbound = adapter.send_message.await_args.args[0]
+    assert outbound.content == "First paragraph.\n\nSecond paragraph."
+
+
+@pytest.mark.asyncio
+async def test_channel_turn_observer_final_mode_never_flushes_mid_turn() -> None:
+    adapter = _FakeAdapter()
+    manager = _FakeManager(adapter)
+    turn_scheduler = MagicMock()
+
+    observer = ChannelTurnObserver(
+        channel_type="signal",
+        account_id="acct-1",
+        chat_id="chat-1",
+        conversation_id="conv-1",
+        turn_scheduler=turn_scheduler,
+        reply_to_id="msg-1",
+        channel_manager_ref=lambda: manager,
+        assistant_delivery_mode="final",
+    )
+
+    await observer.on_token("conv-1", "sess-1", "msg-2", "Some buffered content")
+    await observer.flush_buffered_text()
+
+    adapter.send_message.assert_not_awaited()
 
     await observer.on_turn_complete(None)
     assert turn_scheduler.remove_observer.called
