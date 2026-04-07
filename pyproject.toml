@@ -38,6 +38,7 @@ dependencies = [
     "ddgs>=9.0.0",
     "websockets>=14.0",
     "python-multipart>=0.0.9",
+    "mcp>=1.6.0",
 ]
 
 [project.optional-dependencies]

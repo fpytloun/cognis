@@ -29,6 +29,8 @@ from cognis.tools.registry import RegisteredTool, ToolRegistry
 
 
 def _mcp_server_script() -> str:
+    # The MCP SDK uses newline-delimited JSON (one JSON object per line),
+    # not Content-Length framing.
     return """
 from __future__ import annotations
 import json
@@ -36,28 +38,15 @@ import sys
 
 
 def read_message() -> dict:
-    header = bytearray()
-    while True:
-        line = sys.stdin.buffer.readline()
-        if not line:
-            raise EOFError
-        header.extend(line)
-        if header.endswith(b"\\r\\n\\r\\n"):
-            break
-    content_length = 0
-    for raw_header in header.decode("utf-8").split("\\r\\n"):
-        if raw_header.lower().startswith("content-length:"):
-            content_length = int(raw_header.split(":", 1)[1].strip())
-            break
-    body = sys.stdin.buffer.read(content_length)
-    return json.loads(body.decode("utf-8"))
+    line = sys.stdin.readline()
+    if not line:
+        raise EOFError
+    return json.loads(line.strip())
 
 
 def write_message(payload: dict) -> None:
-    body = json.dumps(payload).encode("utf-8")
-    sys.stdout.buffer.write(f"Content-Length: {len(body)}\\r\\n\\r\\n".encode("utf-8"))
-    sys.stdout.buffer.write(body)
-    sys.stdout.buffer.flush()
+    sys.stdout.write(json.dumps(payload) + "\\n")
+    sys.stdout.flush()
 
 
 while True:
@@ -70,7 +59,11 @@ while True:
         continue
     method = request["method"]
     if method == "initialize":
-        write_message({"jsonrpc": "2.0", "id": request["id"], "result": {"capabilities": {}}})
+        write_message({"jsonrpc": "2.0", "id": request["id"], "result": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "serverInfo": {"name": "test-server", "version": "0.1.0"},
+        }})
     elif method == "tools/list":
         write_message(
             {
@@ -259,7 +252,7 @@ async def test_in_process_executor_discovers_local_mcp_tools(
                     name="filesystem",
                     command=sys.executable,
                     args=[str(server)],
-                    timeout_seconds=2,
+                    timeout_seconds=10,
                 )
             ],
         )

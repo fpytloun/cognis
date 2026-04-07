@@ -1,19 +1,24 @@
-"""Minimal stdio MCP client for local tool servers."""
+"""MCP client using the official MCP Python SDK."""
 
 from __future__ import annotations
 
-import asyncio
+import io
 import json
 import os
+import threading
 from collections.abc import Sequence
-from contextlib import suppress
+from contextlib import AsyncExitStack, suppress
+from datetime import timedelta
 from typing import Any
+
+from mcp.client.session import ClientSession
+from mcp.client.stdio import StdioServerParameters, stdio_client
 
 from cognis.logging import get_logger
 from cognis.models.tool import MCPServerConfig, ToolDefinition, ToolSource, sanitize_mcp_tool_name
 
 logger = get_logger(__name__)
-_MAX_SAFE_STDERR_LINES = 5
+
 _MAX_SAFE_STDERR_LENGTH = 240
 
 
@@ -38,21 +43,65 @@ class MCPClientError(RuntimeError):
         self.safe_stderr = safe_stderr
 
 
+class _StderrLogger(io.RawIOBase):
+    """Routes subprocess stderr to Python logging via an OS pipe.
+
+    Ported from Intaris. Uses a real OS pipe so that the MCP SDK can
+    wire up the child process's stderr via fileno(). A background daemon
+    thread reads from the pipe and routes complete lines through logging.
+    """
+
+    def __init__(self, server_name: str) -> None:
+        super().__init__()
+        self._server_name = server_name
+        self._read_fd, self._write_fd = os.pipe()
+        self._thread = threading.Thread(
+            target=self._reader_loop,
+            daemon=True,
+            name=f"mcp-stderr-{server_name}",
+        )
+        self._thread.start()
+
+    def _reader_loop(self) -> None:
+        try:
+            with os.fdopen(self._read_fd, "r", errors="replace") as f:
+                for line in f:
+                    stripped = line.rstrip()
+                    if stripped:
+                        logger.debug(
+                            "MCP stdio: %s stderr: %s",
+                            self._server_name,
+                            stripped[:_MAX_SAFE_STDERR_LENGTH],
+                        )
+        except Exception:
+            pass
+
+    def fileno(self) -> int:
+        return self._write_fd
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, b: bytes | bytearray) -> int:
+        return os.write(self._write_fd, b)
+
+    def close(self) -> None:
+        with suppress(OSError):
+            os.close(self._write_fd)
+
+
 class StdioMCPClient:
-    """JSON-RPC 2.0 MCP client over Content-Length framed stdio."""
+    """MCP client for a local stdio server using the official MCP SDK."""
 
     def __init__(self, config: MCPServerConfig, env: dict[str, str] | None = None) -> None:
         self.config = config
-        self.env = {**os.environ, **(env or {})}
-        self.process: asyncio.subprocess.Process | None = None
-        self._next_id = 0
-        self._lock = asyncio.Lock()
-        self._stderr_task: asyncio.Task[None] | None = None
-        self._stderr_lines: list[str] = []
+        self.env = env
+        self._exit_stack: AsyncExitStack | None = None
+        self._session: ClientSession | None = None
+        self._stderr_logger: _StderrLogger | None = None
 
     async def start(self) -> None:
-        """Start the subprocess and perform the initialize handshake."""
-
+        """Spawn the MCP server subprocess and perform the initialize handshake."""
         if self.config.command is None:
             raise MCPClientError(
                 self.config.name,
@@ -60,6 +109,7 @@ class StdioMCPClient:
                 "MCP stdio command is required",
                 error_class="missing_command",
             )
+
         logger.info(
             "MCP stdio: spawning %s (command=%s, timeout=%ds)",
             self.config.name,
@@ -73,292 +123,116 @@ class StdioMCPClient:
             self.config.args,
             sorted(self.env.keys()) if self.env else [],
         )
-        try:
-            # Spawn through a shell so that package runners (npx, bunx,
-            # uvx, pnpx) and nvm/asdf shim scripts work correctly with
-            # stdio piping.  create_subprocess_exec bypasses the shell,
-            # which breaks commands that are shell scripts or wrappers
-            # because stdin/stdout connect to the wrapper process instead
-            # of the actual MCP server it spawns.
-            import shlex
 
-            shell_cmd = shlex.join([self.config.command, *self.config.args])
-            logger.debug("MCP stdio: %s shell command: %s", self.config.name, shell_cmd)
-            self.process = await asyncio.create_subprocess_shell(
-                shell_cmd,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=self.env,
-            )
-        except FileNotFoundError as exc:
-            logger.warning(
-                "MCP stdio: %s command not found: %s", self.config.name, self.config.command
-            )
-            raise MCPClientError(
-                self.config.name,
-                "spawn",
-                f"command not found: {self.config.command}",
-                error_class="command_not_found",
-            ) from exc
-        except Exception as exc:
-            logger.warning("MCP stdio: %s spawn failed: %s", self.config.name, exc)
-            raise MCPClientError(
-                self.config.name,
-                "spawn",
-                _safe_message(str(exc)),
-                error_class=exc.__class__.__name__.lower(),
-            ) from exc
-        logger.info(
-            "MCP stdio: %s process started (pid=%s), sending initialize",
-            self.config.name,
-            self.process.pid,
+        params = StdioServerParameters(
+            command=self.config.command,
+            args=self.config.args,
+            env=self.env,
         )
-        self._stderr_task = asyncio.create_task(self._drain_stderr())
+
+        self._stderr_logger = _StderrLogger(self.config.name)
+        exit_stack = AsyncExitStack()
         try:
-            await self._request(
-                "initialize",
-                {
-                    "protocolVersion": "2024-11-05",
-                    "clientInfo": {"name": "cognis", "version": "0.1.0"},
-                    "capabilities": {},
-                },
-                phase="initialize",
+            read_stream, write_stream = await exit_stack.enter_async_context(
+                stdio_client(params, errlog=self._stderr_logger)
             )
-            logger.info("MCP stdio: %s initialize handshake complete", self.config.name)
-            # MCP spec requires notifications/initialized after handshake
-            await self._send_notification("notifications/initialized")
-        except Exception as exc:
-            logger.warning(
-                "MCP stdio: %s initialize failed: %s%s",
+            logger.info(
+                "MCP stdio: %s process started, sending initialize",
                 self.config.name,
-                exc,
-                f" | stderr: {self._stderr_summary()}" if self._stderr_summary() else "",
             )
-            with suppress(Exception):
-                await self.close()
-            raise
+            session = await exit_stack.enter_async_context(
+                ClientSession(
+                    read_stream,
+                    write_stream,
+                    read_timeout_seconds=timedelta(seconds=self.config.timeout_seconds),
+                )
+            )
+            await session.initialize()
+            logger.info("MCP stdio: %s initialize handshake complete", self.config.name)
+        except Exception as exc:
+            await exit_stack.aclose()
+            self._stderr_logger.close()
+            self._stderr_logger = None
+            timed_out = "timed out" in str(exc).lower() or "timeout" in type(exc).__name__.lower()
+            logger.warning(
+                "MCP stdio: %s initialize failed: %s",
+                self.config.name,
+                _safe_message(str(exc)),
+            )
+            raise MCPClientError(
+                self.config.name,
+                "initialize",
+                _safe_message(str(exc)),
+                error_class="timeout" if timed_out else type(exc).__name__.lower(),
+                timed_out=timed_out,
+            ) from exc
+
+        self._exit_stack = exit_stack
+        self._session = session
 
     async def list_tools(self) -> list[dict[str, Any]]:
         """Discover tools exposed by the MCP server."""
-
+        if self._session is None:
+            raise RuntimeError("MCP client is not started")
         logger.debug("MCP stdio: %s requesting tools/list", self.config.name)
-        payload = await self._request("tools/list", {}, phase="list_tools")
-        tools = payload.get("tools", [])
-        tool_list = tools if isinstance(tools, list) else []
-        logger.info("MCP stdio: %s discovered %d tool(s)", self.config.name, len(tool_list))
+        try:
+            result = await self._session.list_tools()
+        except Exception as exc:
+            timed_out = "timed out" in str(exc).lower() or "timeout" in type(exc).__name__.lower()
+            raise MCPClientError(
+                self.config.name,
+                "list_tools",
+                _safe_message(str(exc)),
+                error_class="timeout" if timed_out else type(exc).__name__.lower(),
+                timed_out=timed_out,
+            ) from exc
+        tools = [
+            {
+                "name": t.name,
+                "description": t.description or "",
+                "inputSchema": t.inputSchema.model_dump()
+                if hasattr(t.inputSchema, "model_dump")
+                else dict(t.inputSchema),
+            }
+            for t in result.tools
+        ]
+        logger.info("MCP stdio: %s discovered %d tool(s)", self.config.name, len(tools))
         logger.debug(
             "MCP stdio: %s tool names: %s",
             self.config.name,
-            [t.get("name", "?") for t in tool_list],
+            [t["name"] for t in tools],
         )
-        return tool_list
+        return tools
 
     async def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> str:
-        """Execute a tool and normalize its content into a text result."""
-
-        payload = await self._request(
-            "tools/call",
-            {"name": tool_name, "arguments": arguments},
-            phase="call_tool",
-        )
-        return _normalize_mcp_result(payload)
+        """Execute a tool and return the result as a string."""
+        if self._session is None:
+            raise RuntimeError("MCP client is not started")
+        try:
+            result = await self._session.call_tool(tool_name, arguments)
+        except Exception as exc:
+            timed_out = "timed out" in str(exc).lower() or "timeout" in type(exc).__name__.lower()
+            raise MCPClientError(
+                self.config.name,
+                "call_tool",
+                _safe_message(str(exc)),
+                error_class="timeout" if timed_out else type(exc).__name__.lower(),
+                timed_out=timed_out,
+            ) from exc
+        return _normalize_call_result(result)
 
     async def close(self) -> None:
-        """Terminate the MCP subprocess and cleanup resources."""
-
-        process = self.process
-        if process is None:
-            return
-        logger.debug("MCP stdio: %s closing (pid=%s)", self.config.name, process.pid)
-        if process.returncode is None:
-            process.terminate()
-            try:
-                await asyncio.wait_for(process.wait(), timeout=2.0)
-            except TimeoutError:
-                logger.debug(
-                    "MCP stdio: %s did not exit after terminate, killing", self.config.name
-                )
-                process.kill()
-                await process.wait()
-        if self._stderr_task is not None:
-            self._stderr_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await self._stderr_task
-        self.process = None
+        """Terminate the MCP server and clean up resources."""
+        logger.debug("MCP stdio: %s closing", self.config.name)
+        if self._exit_stack is not None:
+            with suppress(Exception):
+                await self._exit_stack.aclose()
+            self._exit_stack = None
+            self._session = None
+        if self._stderr_logger is not None:
+            self._stderr_logger.close()
+            self._stderr_logger = None
         logger.debug("MCP stdio: %s closed", self.config.name)
-
-    async def _drain_stderr(self) -> None:
-        process = self.process
-        if process is None or process.stderr is None:
-            return
-        try:
-            while True:
-                line = await process.stderr.readline()
-                if not line:
-                    break
-                text = line.decode("utf-8", errors="replace").rstrip()
-                if text:
-                    self._stderr_lines.append(text)
-                    self._stderr_lines = self._stderr_lines[-_MAX_SAFE_STDERR_LINES:]
-                    logger.debug(
-                        "MCP stdio: %s stderr: %s",
-                        self.config.name,
-                        text,
-                    )
-        except asyncio.CancelledError:
-            raise
-
-    async def _send_notification(self, method: str, params: dict[str, Any] | None = None) -> None:
-        """Send a JSON-RPC notification (no id, no response expected)."""
-        process = self.process
-        if process is None or process.stdin is None:
-            return
-        payload: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
-        if params is not None:
-            payload["params"] = params
-        body = json.dumps(payload).encode("utf-8")
-        message = f"Content-Length: {len(body)}\r\n\r\n".encode() + body
-        process.stdin.write(message)
-        await process.stdin.drain()
-
-    async def _request(
-        self,
-        method: str,
-        params: dict[str, Any],
-        *,
-        phase: str | None = None,
-    ) -> dict[str, Any]:
-        process = self.process
-        if process is None or process.stdin is None or process.stdout is None:
-            raise RuntimeError("MCP client is not started")
-
-        response = await self._perform_request_locked(process, method, params, phase=phase)
-
-        if "error" in response:
-            error = response["error"]
-            raise MCPClientError(
-                self.config.name,
-                phase or method,
-                _safe_message(json.dumps(error, sort_keys=True)),
-                error_class="remote_error",
-                safe_stderr=self._stderr_summary(),
-            )
-        result = response.get("result")
-        if not isinstance(result, dict):
-            raise MCPClientError(
-                self.config.name,
-                phase or method,
-                "MCP result payload must be an object",
-                error_class="invalid_result",
-                safe_stderr=self._stderr_summary(),
-            )
-        return result
-
-    async def _perform_request_locked(
-        self,
-        process: asyncio.subprocess.Process,
-        method: str,
-        params: dict[str, Any],
-        *,
-        phase: str | None = None,
-    ) -> dict[str, Any]:
-        try:
-            async with self._lock:
-                self._next_id += 1
-                request_id = self._next_id
-                payload = {
-                    "jsonrpc": "2.0",
-                    "id": request_id,
-                    "method": method,
-                    "params": params,
-                }
-                body = json.dumps(payload).encode("utf-8")
-                message = f"Content-Length: {len(body)}\r\n\r\n".encode() + body
-                assert process.stdin is not None
-                assert process.stdout is not None
-                process.stdin.write(message)
-                await process.stdin.drain()
-
-                deadline = asyncio.get_event_loop().time() + self.config.timeout_seconds
-                while True:
-                    remaining = deadline - asyncio.get_event_loop().time()
-                    if remaining <= 0:
-                        raise MCPClientError(
-                            self.config.name,
-                            phase or method,
-                            f"MCP request {method} timed out",
-                            error_class="timeout",
-                            timed_out=True,
-                            safe_stderr=self._stderr_summary(),
-                        )
-                    try:
-                        response = await asyncio.wait_for(
-                            self._read_message(process.stdout), timeout=remaining
-                        )
-                    except TimeoutError as exc:
-                        raise MCPClientError(
-                            self.config.name,
-                            phase or method,
-                            f"MCP request {method} timed out",
-                            error_class="timeout",
-                            timed_out=True,
-                            safe_stderr=self._stderr_summary(),
-                        ) from exc
-                    if "id" not in response:
-                        logger.debug(
-                            "MCP notification received (skipped)",
-                            extra={
-                                "extra_data": {
-                                    "server": self.config.name,
-                                    "method": response.get("method"),
-                                }
-                            },
-                        )
-                        continue
-                    if response.get("id") != request_id:
-                        raise RuntimeError(
-                            f"MCP response ID mismatch: expected {request_id}, got {response.get('id')}"
-                        )
-                    return response
-        except MCPClientError:
-            raise
-        except Exception as exc:
-            raise MCPClientError(
-                self.config.name,
-                phase or method,
-                _safe_message(str(exc)),
-                error_class=exc.__class__.__name__.lower(),
-                safe_stderr=self._stderr_summary(),
-            ) from exc
-
-    def _stderr_summary(self) -> str | None:
-        if not self._stderr_lines:
-            return None
-        return _safe_message(" | ".join(self._stderr_lines), limit=_MAX_SAFE_STDERR_LENGTH)
-
-    async def _read_message(self, stdout: asyncio.StreamReader) -> dict[str, Any]:
-        header_bytes = bytearray()
-        while True:
-            line = await stdout.readline()
-            if not line:
-                raise RuntimeError("MCP server closed stdout")
-            header_bytes.extend(line)
-            if header_bytes.endswith(b"\r\n\r\n"):
-                break
-        headers = header_bytes.decode("utf-8").split("\r\n")
-        content_length = 0
-        for header in headers:
-            if header.lower().startswith("content-length:"):
-                content_length = int(header.split(":", 1)[1].strip())
-                break
-        if content_length <= 0:
-            raise RuntimeError("Missing MCP Content-Length header")
-        body = await stdout.readexactly(content_length)
-        payload = json.loads(body.decode("utf-8"))
-        if not isinstance(payload, dict):
-            raise RuntimeError("MCP payload must be an object")
-        return payload
 
 
 def mcp_tools_to_definitions(
@@ -369,7 +243,6 @@ def mcp_tools_to_definitions(
     server_id: str | None = None,
 ) -> list[ToolDefinition]:
     """Convert MCP tool metadata into Cognis tool definitions."""
-
     definitions: list[ToolDefinition] = []
     for tool in tools:
         name = tool.get("name")
@@ -415,31 +288,38 @@ def validate_unique_server_names(servers: Sequence[MCPServerConfig]) -> None:
         raise ValueError(msg)
 
 
-def _normalize_mcp_result(result: dict[str, Any]) -> str:
-    content = result.get("content")
+def _normalize_call_result(result: Any) -> str:
+    """Normalize a CallToolResult from the MCP SDK into a string."""
+    content = getattr(result, "content", None)
     if isinstance(content, list):
         parts: list[str] = []
         for item in content:
-            if not isinstance(item, dict):
-                parts.append(json.dumps(item, sort_keys=True, default=str))
-                continue
-            item_type = item.get("type")
-            if item_type == "text" and isinstance(item.get("text"), str):
-                parts.append(item["text"])
+            item_type = getattr(item, "type", None)
+            if item_type == "text":
+                parts.append(str(getattr(item, "text", "")))
             elif item_type == "image":
                 parts.append("[image content omitted]")
             elif item_type == "resource":
                 parts.append("[resource content omitted]")
             else:
-                parts.append(f"[{item_type or 'content'} omitted]")
+                try:
+                    parts.append(json.dumps(item, sort_keys=True, default=str))
+                except Exception:
+                    parts.append(str(item))
         if parts:
             return "\n".join(parts)
-    structured_content = result.get("structuredContent")
-    if isinstance(structured_content, (dict, list)):
-        return json.dumps(structured_content, sort_keys=True, default=str)
-    if isinstance(result.get("text"), str):
-        return str(result["text"])
-    return json.dumps(result, sort_keys=True, default=str)
+    # Fallback: try dict-style access (older SDK versions)
+    if isinstance(result, dict):
+        raw_content = result.get("content")
+        if isinstance(raw_content, list):
+            texts = [
+                item.get("text", "")
+                for item in raw_content
+                if isinstance(item, dict) and item.get("type") == "text"
+            ]
+            if texts:
+                return "\n".join(texts)
+    return str(result)
 
 
 def _safe_message(message: str, *, limit: int = _MAX_SAFE_STDERR_LENGTH) -> str:
