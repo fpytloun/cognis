@@ -3,9 +3,12 @@ import { describe, expect, it } from 'vitest';
 import {
   buildRegistryWarnings,
   filterTools,
+  filterMcpTools,
+  formatMcpCommand,
   formatSourceSummary,
   getToolKey,
   groupToolsByCategory,
+  groupToolsByServer,
   mergeToolInventories
 } from '$lib/tools-registry';
 import type { ToolDefinitionSummary } from '$lib/types/api';
@@ -62,24 +65,56 @@ describe('tools registry helpers', () => {
 
     expect(groups[0]?.category).toBe('filesystem');
     expect(groups[1]?.category).toBe('mcp');
-    expect(groups[1]?.sourceTypes).toEqual(['intaris_mcp', 'local_mcp']);
-    expect(formatSourceSummary(groups[1]?.sourceTypes || [])).toBe('Intaris MCP + Local MCP');
+    // sorted by label: "Executor MCP" < "Intaris MCP"
+    expect(groups[1]?.sourceTypes).toEqual(['local_mcp', 'intaris_mcp']);
+    expect(formatSourceSummary(groups[1]?.sourceTypes || [])).toBe('Executor MCP + Intaris MCP');
   });
 
-  it('filters by search, source, and category together', () => {
+  it('groups MCP tools by server name', () => {
+    const tools = [
+      tool({ name: 'mcp_github__search', source: { type: 'intaris_mcp', server_name: 'github', raw_tool_name: 'search' } }),
+      tool({ name: 'mcp_github__create', source: { type: 'intaris_mcp', server_name: 'github', raw_tool_name: 'create' } }),
+      tool({ name: 'mcp_linear__list', source: { type: 'intaris_mcp', server_name: 'linear', raw_tool_name: 'list' } })
+    ];
+
+    const groups = groupToolsByServer(tools);
+    expect(groups).toHaveLength(2);
+    expect(groups[0]?.serverName).toBe('github');
+    expect(groups[0]?.tools).toHaveLength(2);
+    expect(groups[1]?.serverName).toBe('linear');
+    expect(groups[1]?.tools).toHaveLength(1);
+  });
+
+  it('filters tools by search query including server name', () => {
+    const tools = [
+      tool({ name: 'mcp_github__search', description: 'Search issues', source: { type: 'intaris_mcp', server_name: 'github', raw_tool_name: 'search' } }),
+      tool({ name: 'mcp_linear__list', description: 'List items', source: { type: 'intaris_mcp', server_name: 'linear', raw_tool_name: 'list' } })
+    ];
+
+    expect(filterMcpTools(tools, 'github')).toHaveLength(1);
+    expect(filterMcpTools(tools, 'list')).toHaveLength(1);
+    expect(filterMcpTools(tools, '')).toHaveLength(2);
+  });
+
+  it('filters by search and category together', () => {
     const tools = [
       tool({ name: 'read', category: 'filesystem', source: { type: 'executor' } }),
-      tool({ name: 'mcp_github__search', description: 'GitHub issues', source: { type: 'local_mcp', server_name: 'github', raw_tool_name: 'search' } })
+      tool({ name: 'mcp_github__search', description: 'GitHub issues', category: 'mcp', source: { type: 'local_mcp', server_name: 'github', raw_tool_name: 'search' } })
     ];
 
     const filtered = filterTools(tools, {
       searchQuery: 'git',
-      sourceFilter: 'local_mcp',
       categoryFilter: 'mcp'
     });
 
     expect(filtered).toHaveLength(1);
     expect(filtered[0]?.name).toBe('mcp_github__search');
+  });
+
+  it('formats MCP command with args', () => {
+    expect(formatMcpCommand('npx', ['-y', '@doist/todoist-ai'])).toBe('npx -y @doist/todoist-ai');
+    expect(formatMcpCommand('npx', [])).toBe('npx');
+    expect(formatMcpCommand(null, [])).toBe('');
   });
 
   it('builds partial-failure warnings per data source', () => {

@@ -2,7 +2,6 @@ import type { ToolDefinitionSummary, ToolSource } from '$lib/types/api';
 
 export interface ToolsFilters {
   searchQuery: string;
-  sourceFilter: string;
   categoryFilter: string;
 }
 
@@ -10,6 +9,11 @@ export interface ToolGroup {
   category: string;
   tools: ToolDefinitionSummary[];
   sourceTypes: string[];
+}
+
+export interface McpServerGroup {
+  serverName: string;
+  tools: ToolDefinitionSummary[];
 }
 
 export interface RegistryLoadState {
@@ -21,7 +25,7 @@ export interface RegistryLoadState {
   mcpServers: boolean;
 }
 
-export const CATEGORY_ORDER = ['memory', 'filesystem', 'shell', 'web', 'mcp', 'workflow', 'orchestration', 'system'];
+export const CATEGORY_ORDER = ['memory', 'filesystem', 'shell', 'web', 'workflow', 'orchestration', 'system'];
 
 export function getSourceType(tool: ToolDefinitionSummary): string {
   return tool.source?.type || 'unknown';
@@ -34,7 +38,7 @@ export function getSourceLabel(sourceType: string): string {
     case 'builtin':
       return 'Built-in';
     case 'local_mcp':
-      return 'Local MCP';
+      return 'Executor MCP';
     case 'intaris_mcp':
       return 'Intaris MCP';
     case 'skill':
@@ -71,9 +75,8 @@ export function filterTools(tools: ToolDefinitionSummary[], filters: ToolsFilter
     const matchesSearch = !query
       || tool.name.toLowerCase().includes(query)
       || tool.description.toLowerCase().includes(query);
-    const matchesSource = filters.sourceFilter === 'all' || getSourceType(tool) === filters.sourceFilter;
     const matchesCategory = filters.categoryFilter === 'all' || tool.category === filters.categoryFilter;
-    return matchesSearch && matchesSource && matchesCategory;
+    return matchesSearch && matchesCategory;
   });
 }
 
@@ -101,6 +104,33 @@ export function groupToolsByCategory(tools: ToolDefinitionSummary[]): ToolGroup[
   });
 }
 
+export function groupToolsByServer(tools: ToolDefinitionSummary[]): McpServerGroup[] {
+  const grouped = new Map<string, ToolDefinitionSummary[]>();
+  for (const tool of tools) {
+    const serverName = tool.source.server_name || 'unknown';
+    const group = grouped.get(serverName) || [];
+    group.push(tool);
+    grouped.set(serverName, group);
+  }
+
+  return Array.from(grouped.entries())
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([serverName, serverTools]) => ({
+      serverName,
+      tools: serverTools.sort((left, right) => left.name.localeCompare(right.name))
+    }));
+}
+
+export function filterMcpTools(tools: ToolDefinitionSummary[], searchQuery: string): ToolDefinitionSummary[] {
+  const query = searchQuery.trim().toLowerCase();
+  if (!query) return tools;
+  return tools.filter((tool) =>
+    tool.name.toLowerCase().includes(query)
+    || tool.description.toLowerCase().includes(query)
+    || (tool.source.server_name || '').toLowerCase().includes(query)
+  );
+}
+
 export function formatSourceSummary(sourceTypes: string[]): string {
   if (sourceTypes.length === 0) return '';
   if (sourceTypes.length === 1) return getSourceLabel(sourceTypes[0]);
@@ -109,6 +139,12 @@ export function formatSourceSummary(sourceTypes: string[]): string {
 
 export function isCachedObservedTool(source: ToolSource): boolean {
   return source.type === 'local_mcp';
+}
+
+export function formatMcpCommand(command: string | null, args: string[]): string {
+  if (!command) return '';
+  if (!args || args.length === 0) return command;
+  return `${command} ${args.join(' ')}`;
 }
 
 export function buildRegistryWarnings(state: RegistryLoadState): string[] {
