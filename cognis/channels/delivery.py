@@ -282,23 +282,30 @@ class ChannelDeliveryService:
     def _render_step_question_notification(self, payload: dict[str, Any]) -> str:
         """Render a step question prompt for channel integrations."""
         question = str(payload.get("question") or "The assistant needs more input to continue.")
-        lines = [question]
-        options = payload.get("options")
-        if isinstance(options, list) and options:
-            option_labels: list[str] = []
-            for option in options:
-                if isinstance(option, str):
-                    option_labels.append(option)
-                elif isinstance(option, dict) and isinstance(option.get("label"), str):
-                    option_labels.append(option["label"])
-            if option_labels:
-                lines.append("Options: " + ", ".join(option_labels))
+        lines: list[str] = []
+        # Context first (provides rationale before the question)
         context = payload.get("context")
         if isinstance(context, str) and context.strip():
             lines.append(context.strip())
         elif isinstance(context, dict) and isinstance(context.get("context"), str):
             lines.append(context["context"].strip())
-        lines.append("Reply with your answer to continue.")
+        lines.append(question)
+        # Numbered option list
+        options = payload.get("options")
+        if isinstance(options, list) and options:
+            option_lines: list[str] = []
+            idx = 1
+            for option in options:
+                label: str | None = None
+                if isinstance(option, str):
+                    label = option
+                elif isinstance(option, dict) and isinstance(option.get("label"), str):
+                    label = option["label"]
+                if label:
+                    option_lines.append(f"{idx}. {label}")
+                    idx += 1
+            if option_lines:
+                lines.append("\n".join(option_lines))
         return "\n\n".join(lines)
 
     def _render_gate_notification(self, payload: dict[str, Any]) -> str:
@@ -308,18 +315,23 @@ class ChannelDeliveryService:
             or payload.get("question")
             or "A workflow step needs your decision."
         )
-        lines = [f"[gate] {message}"]
+        lines = [f"*[gate]* {message}"]
         options = payload.get("options")
         if isinstance(options, list) and options:
-            option_labels: list[str] = []
+            option_lines: list[str] = []
+            idx = 1
             for option in options:
+                label: str | None = None
                 if isinstance(option, str):
-                    option_labels.append(option)
+                    label = option
                 elif isinstance(option, dict) and isinstance(option.get("label"), str):
-                    option_labels.append(option["label"])
-            if option_labels:
-                lines.append("Options: " + ", ".join(option_labels))
-        lines.append("Reply /approve or /deny to continue.")
+                    label = option["label"]
+                if label:
+                    option_lines.append(f"{idx}. {label}")
+                    idx += 1
+            if option_lines:
+                lines.append("\n".join(option_lines))
+        lines.append("_Reply /approve or /deny to continue._")
         return "\n\n".join(lines)
 
     def _render_escalation_notification(self, payload: dict[str, Any]) -> str:
@@ -328,13 +340,13 @@ class ChannelDeliveryService:
         risk = payload.get("risk")
         reasoning = payload.get("reasoning")
 
-        lines = [f'[escalation] Approval required for tool "{tool_name}".']
+        lines = [f"*[escalation]* Approval required for tool `{tool_name}`."]
         if risk:
-            lines.append(f"Risk: {risk}")
+            lines.append(f"**Risk:** {risk}")
         if reasoning:
-            lines.append(f"Reason: {reasoning}")
-        lines.append("Reply /approve to allow it or /deny to block it.")
-        lines.append("You can optionally add a note, for example: /approve safe to continue")
+            lines.append(f"**Reason:** {reasoning}")
+        lines.append("_Reply /approve to allow it or /deny to block it._")
+        lines.append("_You can optionally add a note, for example: /approve safe to continue_")
         return "\n\n".join(lines)
 
     async def _flush_observer_buffers(self, conversation_id: str) -> None:

@@ -27,9 +27,9 @@ def test_render_escalation_notification_includes_required_details() -> None:
         }
     )
 
-    assert 'Approval required for tool "bash".' in content
-    assert "Risk: high" in content
-    assert "Reason: Needs network access and may change files." in content
+    assert "Approval required for tool `bash`." in content
+    assert "**Risk:** high" in content
+    assert "**Reason:** Needs network access and may change files." in content
     assert "/approve" in content
     assert "/deny" in content
     assert "optionally add a note" in content
@@ -58,7 +58,7 @@ async def test_notification_event_delivers_rich_escalation_text() -> None:
 
     service.send_to_conversation.assert_awaited_once()
     content = service.send_to_conversation.await_args.args[1]
-    assert 'Approval required for tool "bash".' in content
+    assert "Approval required for tool `bash`." in content
     assert "Reply /approve to allow it or /deny to block it." in content
 
 
