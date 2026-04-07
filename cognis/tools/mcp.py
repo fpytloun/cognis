@@ -55,6 +55,19 @@ class StdioMCPClient:
 
         if self.config.command is None:
             raise RuntimeError("MCP stdio command is required")
+        logger.info(
+            "MCP stdio: spawning %s (command=%s, timeout=%ds)",
+            self.config.name,
+            self.config.command,
+            self.config.timeout_seconds,
+        )
+        logger.debug(
+            "MCP stdio: %s full spawn: command=%s args=%s env_keys=%s",
+            self.config.name,
+            self.config.command,
+            self.config.args,
+            sorted(self.env.keys()) if self.env else [],
+        )
         try:
             self.process = await asyncio.create_subprocess_exec(
                 self.config.command,
@@ -65,6 +78,9 @@ class StdioMCPClient:
                 env=self.env,
             )
         except FileNotFoundError as exc:
+            logger.warning(
+                "MCP stdio: %s command not found: %s", self.config.name, self.config.command
+            )
             raise MCPClientError(
                 self.config.name,
                 "spawn",
@@ -72,12 +88,18 @@ class StdioMCPClient:
                 error_class="command_not_found",
             ) from exc
         except Exception as exc:
+            logger.warning("MCP stdio: %s spawn failed: %s", self.config.name, exc)
             raise MCPClientError(
                 self.config.name,
                 "spawn",
                 _safe_message(str(exc)),
                 error_class=exc.__class__.__name__.lower(),
             ) from exc
+        logger.info(
+            "MCP stdio: %s process started (pid=%s), sending initialize",
+            self.config.name,
+            self.process.pid,
+        )
         self._stderr_task = asyncio.create_task(self._drain_stderr())
         try:
             await self._request(
@@ -89,9 +111,16 @@ class StdioMCPClient:
                 },
                 phase="initialize",
             )
+            logger.info("MCP stdio: %s initialize handshake complete", self.config.name)
             # MCP spec requires notifications/initialized after handshake
             await self._send_notification("notifications/initialized")
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "MCP stdio: %s initialize failed: %s%s",
+                self.config.name,
+                exc,
+                f" | stderr: {self._stderr_summary()}" if self._stderr_summary() else "",
+            )
             with suppress(Exception):
                 await self.close()
             raise
@@ -99,9 +128,17 @@ class StdioMCPClient:
     async def list_tools(self) -> list[dict[str, Any]]:
         """Discover tools exposed by the MCP server."""
 
+        logger.debug("MCP stdio: %s requesting tools/list", self.config.name)
         payload = await self._request("tools/list", {}, phase="list_tools")
         tools = payload.get("tools", [])
-        return tools if isinstance(tools, list) else []
+        tool_list = tools if isinstance(tools, list) else []
+        logger.info("MCP stdio: %s discovered %d tool(s)", self.config.name, len(tool_list))
+        logger.debug(
+            "MCP stdio: %s tool names: %s",
+            self.config.name,
+            [t.get("name", "?") for t in tool_list],
+        )
+        return tool_list
 
     async def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> str:
         """Execute a tool and normalize its content into a text result."""
@@ -119,11 +156,15 @@ class StdioMCPClient:
         process = self.process
         if process is None:
             return
+        logger.debug("MCP stdio: %s closing (pid=%s)", self.config.name, process.pid)
         if process.returncode is None:
             process.terminate()
             try:
                 await asyncio.wait_for(process.wait(), timeout=2.0)
             except TimeoutError:
+                logger.debug(
+                    "MCP stdio: %s did not exit after terminate, killing", self.config.name
+                )
                 process.kill()
                 await process.wait()
         if self._stderr_task is not None:
@@ -131,6 +172,7 @@ class StdioMCPClient:
             with suppress(asyncio.CancelledError):
                 await self._stderr_task
         self.process = None
+        logger.debug("MCP stdio: %s closed", self.config.name)
 
     async def _drain_stderr(self) -> None:
         process = self.process
@@ -146,8 +188,9 @@ class StdioMCPClient:
                     self._stderr_lines.append(text)
                     self._stderr_lines = self._stderr_lines[-_MAX_SAFE_STDERR_LINES:]
                     logger.debug(
-                        "MCP server stderr",
-                        extra={"extra_data": {"server": self.config.name, "captured": True}},
+                        "MCP stdio: %s stderr: %s",
+                        self.config.name,
+                        text,
                     )
         except asyncio.CancelledError:
             raise

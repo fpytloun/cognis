@@ -44,24 +44,35 @@ def schedule_executor_reconfigure(app: Any, executor_id: str) -> None:
 
 async def reconcile_executor(app: Any, executor_id: str, *, connection: Any | None = None) -> bool:
     """Reconcile a connected websocket executor to the desired generation."""
+    _logger.info("executor_runtime: reconciling executor %s", executor_id)
     lock = _get_executor_lock(app, executor_id)
     async with lock:
         while True:
             async with app.state.session_factory() as session:
                 row = await get_executor_row(session, executor_id)
             if row is None or row.executor_type != "websocket" or row.status != "active":
+                _logger.info(
+                    "executor_runtime: skipping reconcile for %s (not found, not websocket, or inactive)",
+                    executor_id,
+                )
                 return False
 
             target_version = max(int(getattr(row, "desired_config_version", 0) or 0), 1)
+            applied_version = int(getattr(row, "applied_config_version", 0) or 0)
             current_conn = connection or app.state.providers.executor.websocket.get_connection(
                 executor_id
             )
             if current_conn is None or not getattr(current_conn, "connected", False):
+                _logger.info(
+                    "executor_runtime: executor %s not connected, skipping reconcile",
+                    executor_id,
+                )
                 return False
 
-            if int(getattr(row, "applied_config_version", 0) or 0) == target_version and getattr(
-                row, "runtime_state", "offline"
-            ) in {"active", "degraded"}:
+            if applied_version == target_version and getattr(row, "runtime_state", "offline") in {
+                "active",
+                "degraded",
+            }:
                 observed_tools = list(getattr(row, "observed_tools", None) or [])
                 runtime_metadata = getattr(row, "runtime_metadata", None) or {}
                 app.state.providers.executor.websocket.mark_ready(
@@ -83,8 +94,20 @@ async def reconcile_executor(app: Any, executor_id: str, *, connection: Any | No
                         runtime_metadata=runtime_metadata,
                     ),
                 )
+                _logger.info(
+                    "executor_runtime: executor %s already at desired v%d (%s), no reconfigure needed",
+                    executor_id,
+                    target_version,
+                    getattr(row, "runtime_state", "?"),
+                )
                 return True
 
+            _logger.info(
+                "executor_runtime: executor %s needs reconfigure: desired v%d, applied v%d",
+                executor_id,
+                target_version,
+                applied_version,
+            )
             async with app.state.session_factory() as session:
                 await update_executor_runtime_state(
                     session,
@@ -95,14 +118,34 @@ async def reconcile_executor(app: Any, executor_id: str, *, connection: Any | No
                 await session.commit()
 
             try:
+                _logger.info(
+                    "executor_runtime: building configure payload for %s v%d",
+                    executor_id,
+                    target_version,
+                )
                 payload, metadata = await _build_configure_payload(app, row, target_version)
+                _logger.info(
+                    "executor_runtime: sending executor.configure RPC to %s (timeout=%ds, %d MCP server(s))",
+                    executor_id,
+                    CONFIGURE_RPC_TIMEOUT_SECONDS,
+                    len(payload.get("mcp_servers", [])),
+                )
                 configure_result = await current_conn.rpc_call(
                     "executor.configure",
                     payload,
                     timeout=CONFIGURE_RPC_TIMEOUT_SECONDS,
                 )
             except Exception as exc:
+                _logger.warning(
+                    "executor_runtime: executor %s configure failed: %s",
+                    executor_id,
+                    _safe_error_message(str(exc)),
+                )
                 if not _is_current_connection(app, executor_id, current_conn):
+                    _logger.info(
+                        "executor_runtime: executor %s connection replaced during configure, retrying",
+                        executor_id,
+                    )
                     connection = None
                     continue
                 runtime_metadata = _merge_runtime_metadata(
@@ -125,6 +168,10 @@ async def reconcile_executor(app: Any, executor_id: str, *, connection: Any | No
                 return False
 
             if not _is_current_connection(app, executor_id, current_conn):
+                _logger.info(
+                    "executor_runtime: executor %s connection replaced after configure, retrying",
+                    executor_id,
+                )
                 connection = None
                 continue
 
@@ -132,6 +179,13 @@ async def reconcile_executor(app: Any, executor_id: str, *, connection: Any | No
             runtime_state = str(configure_result.get("runtime_state") or "active")
             applied_version = int(configure_result.get("applied_version") or target_version)
             observed_tools = list(configure_result.get("observed_tools") or [])
+            _logger.info(
+                "executor_runtime: executor %s configure result: state=%s, applied v%d, %d tool(s)",
+                executor_id,
+                runtime_state,
+                applied_version,
+                len(observed_tools),
+            )
             runtime_metadata = _merge_runtime_metadata(
                 metadata,
                 dict(configure_result.get("runtime_metadata") or {}),
@@ -168,8 +222,18 @@ async def reconcile_executor(app: Any, executor_id: str, *, connection: Any | No
             if refreshed is None:
                 return False
             if int(getattr(refreshed, "desired_config_version", 0) or 0) > applied_version:
+                _logger.info(
+                    "executor_runtime: executor %s has newer desired version after apply, re-reconciling",
+                    executor_id,
+                )
                 connection = None
                 continue
+            _logger.info(
+                "executor_runtime: executor %s reconciled to v%d (%s)",
+                executor_id,
+                applied_version,
+                runtime_state,
+            )
             return True
 
 

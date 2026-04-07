@@ -91,6 +91,7 @@ class ExecutorRunner:
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 2, _RECONNECT_MAX)
         finally:
+            logger.info("Executor shutting down, cleaning up resources")
             await self._close_mcp_clients()
             if self._channel_handler is not None:
                 with contextlib.suppress(Exception):
@@ -98,6 +99,7 @@ class ExecutorRunner:
             if self._inference_handler is not None:
                 with contextlib.suppress(Exception):
                     await self._inference_handler.close()
+            logger.info("Executor shutdown complete")
 
     async def _connect_and_serve(self) -> None:
         try:
@@ -118,7 +120,9 @@ class ExecutorRunner:
         self._tool_handlers = {}
         self._configured_tool_definitions = []
 
+        logger.info("Connecting to controller at %s", url)
         async with websockets.connect(url, compression="deflate", max_size=10 * 1024 * 1024) as ws:
+            logger.info("WebSocket connected, sending executor.ready")
             ready_id = uuid.uuid4().hex
             await ws.send(
                 json.dumps(
@@ -144,6 +148,10 @@ class ExecutorRunner:
                 self._running = False
                 return
 
+            logger.info(
+                "Registered with controller as %s",
+                response.get("result", {}).get("executor_id", "unknown"),
+            )
             heartbeat_task = asyncio.create_task(self._heartbeat_loop(ws))
             try:
                 await self._message_loop(ws)
@@ -153,6 +161,7 @@ class ExecutorRunner:
                     await heartbeat_task
 
     async def _message_loop(self, ws: Any) -> None:
+        logger.info("Entering message loop, waiting for controller commands")
         async for raw_message in ws:
             try:
                 msg = json.loads(raw_message)
@@ -166,21 +175,29 @@ class ExecutorRunner:
             if method == "executor.configure":
                 await self._handle_configure(ws, msg_id, params)
             elif method == "tool.list":
+                logger.debug("Received tool.list request")
                 await self._handle_tool_list(ws, msg_id)
             elif method == "tool.execute":
+                tool_name = params.get("tool_name", params.get("name", "?"))
+                logger.debug("Received tool.execute: %s", tool_name)
                 task = asyncio.create_task(self._handle_tool_execute(ws, msg_id, params))
                 self._active_calls[params.get("call_id", msg_id)] = task
             elif method == "tool.cancel":
                 call_id = params.get("call_id")
+                logger.debug("Received tool.cancel: %s", call_id)
                 if call_id and call_id in self._active_calls:
                     self._active_calls[call_id].cancel()
             elif method == "llm.complete":
+                logger.debug("Received llm.complete")
                 asyncio.create_task(self._handle_llm_complete(ws, msg_id, params))
             elif method == "channel.start":
+                logger.info("Received channel.start for account %s", params.get("account_id", "?"))
                 asyncio.create_task(self._handle_channel_start(ws, msg_id, params))
             elif method == "channel.stop":
+                logger.info("Received channel.stop for account %s", params.get("account_id", "?"))
                 asyncio.create_task(self._handle_channel_stop(ws, msg_id, params))
             elif method == "channel.send":
+                logger.debug("Received channel.send for account %s", params.get("account_id", "?"))
                 asyncio.create_task(self._handle_channel_send(ws, msg_id, params))
             elif method == "channel.fetch_media":
                 asyncio.create_task(self._handle_channel_fetch_media(ws, msg_id, params))
@@ -191,12 +208,27 @@ class ExecutorRunner:
             elif method == "channel.sync_profile":
                 asyncio.create_task(self._handle_channel_sync_profile(ws, msg_id, params))
             elif method == "executor.cancel":
+                logger.info("Received executor.cancel, shutting down")
                 self._running = False
                 break
+            else:
+                logger.debug("Received unknown method: %s", method)
 
     async def _handle_configure(self, ws: Any, msg_id: str | None, params: dict[str, Any]) -> None:
         requested_version = int(params.get("config_version") or (self._config_version + 1))
+        mcp_servers_raw = params.get("mcp_servers") or []
+        logger.info(
+            "Received executor.configure v%d (current v%d, %d MCP server(s))",
+            requested_version,
+            self._config_version,
+            len(mcp_servers_raw),
+        )
         if requested_version <= self._config_version:
+            logger.warning(
+                "Ignoring stale executor.configure v%d (already at v%d)",
+                requested_version,
+                self._config_version,
+            )
             await self._send_rpc_error(ws, msg_id, -32020, "Stale executor.configure version")
             return
 
@@ -207,7 +239,6 @@ class ExecutorRunner:
         config = params.get("config", {})
         enabled_tools = params.get("enabled_tools", [])
         enabled_tool_groups = params.get("enabled_tool_groups", [])
-        mcp_servers_raw = params.get("mcp_servers") or []
         secrets = dict(params.get("secrets") or {})
 
         previous_clients = self._mcp_clients
@@ -233,6 +264,9 @@ class ExecutorRunner:
                 timeout=_MCP_PREPARE_TOTAL_TIMEOUT_SECONDS,
             )
         except Exception as exc:
+            logger.warning(
+                "Configure v%d failed during MCP preparation: %s", requested_version, exc
+            )
             self._mcp_clients = previous_clients
             self._tool_handlers = previous_tool_handlers
             self._configured_tool_definitions = previous_tool_definitions
@@ -305,6 +339,9 @@ class ExecutorRunner:
             elif previous_clients is not staged_mcp_clients:
                 await self._close_clients(previous_clients)
         except Exception as exc:
+            logger.warning(
+                "Configure v%d failed during tool/handler setup: %s", requested_version, exc
+            )
             await self._close_clients(staged_mcp_clients)
             self._mcp_clients = previous_clients
             self._tool_handlers = previous_tool_handlers
@@ -318,6 +355,14 @@ class ExecutorRunner:
         self._config_version = requested_version
         self._configured = True
         self._runtime_state = runtime_state
+        logger.info(
+            "Configure v%d complete: state=%s, %d tool(s), %d MCP client(s)%s",
+            requested_version,
+            runtime_state,
+            len(self._configured_tool_definitions),
+            len(self._mcp_clients),
+            f", warnings: {mcp_warnings}" if mcp_warnings else "",
+        )
         if msg_id is not None:
             await self._send_rpc_result(
                 ws,
@@ -792,11 +837,33 @@ class ExecutorRunner:
         statuses: list[dict[str, Any]] = []
         warnings: list[str] = []
         for server in servers:
+            logger.info(
+                "MCP: starting server %s (command=%s, transport=%s)",
+                server.name,
+                server.command,
+                server.transport,
+            )
+            logger.debug(
+                "MCP: server %s full config: args=%s, env_keys=%s, timeout=%ds",
+                server.name,
+                server.args,
+                sorted(server.env.keys()) if server.env else [],
+                server.timeout_seconds,
+            )
             client = StdioMCPClient(server, env=resolve_secret_refs(server.env, secrets))
             try:
                 await client.start()
                 tools = await client.list_tools()
             except MCPClientError as exc:
+                logger.warning(
+                    "MCP: server %s failed during %s (%s, timed_out=%s)",
+                    server.name,
+                    exc.phase,
+                    exc.error_class,
+                    exc.timed_out,
+                )
+                if exc.safe_stderr:
+                    logger.warning("MCP: server %s stderr: %s", server.name, exc.safe_stderr)
                 await client.close()
                 statuses.append(
                     {
@@ -811,6 +878,11 @@ class ExecutorRunner:
                 warnings.append(f"MCP server {server.name} failed during {exc.phase}.")
                 continue
             except Exception as exc:
+                logger.warning(
+                    "MCP: server %s failed unexpectedly: %s",
+                    server.name,
+                    exc,
+                )
                 await client.close()
                 statuses.append(
                     {
@@ -824,6 +896,11 @@ class ExecutorRunner:
                 )
                 warnings.append(f"MCP server {server.name} failed to initialize.")
                 continue
+            logger.info(
+                "MCP: server %s ready (%d tool(s) discovered)",
+                server.name,
+                len(tools),
+            )
             clients[server.name] = client
             statuses.append(
                 {

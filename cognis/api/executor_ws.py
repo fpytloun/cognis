@@ -74,6 +74,12 @@ async def handle_executor_websocket(
         await _close_ws(ws, 4403, "Executor type disabled")
         return
 
+    _logger.info(
+        "executor_ws: registering executor %s (type=%s, owner=%s)",
+        executor_id,
+        row.executor_type,
+        row.owner_email,
+    )
     conn = ws_provider.register_connection(
         executor_id,
         ws,
@@ -98,12 +104,13 @@ async def handle_executor_websocket(
         }
     )
 
+    _logger.info("executor_ws: executor %s registered, starting reconcile", executor_id)
     try:
         configure_ok = await reconcile_executor(ws.app, executor_id, connection=conn)
     except Exception:
         _logger.warning(
-            "executor_ws: executor configuration failed",
-            extra={"extra_data": {"executor_id": executor_id}},
+            "executor_ws: executor %s configuration failed",
+            executor_id,
             exc_info=True,
         )
         configure_ok = False
@@ -111,6 +118,12 @@ async def handle_executor_websocket(
     async with session_factory() as session:
         row = await get_executor_row(session, executor_id)
     runtime_state = getattr(row, "runtime_state", "offline") if row is not None else "offline"
+    _logger.info(
+        "executor_ws: executor %s post-configure state: %s (configure_ok=%s)",
+        executor_id,
+        runtime_state,
+        configure_ok,
+    )
 
     # Start any channel accounts assigned to this executor
     channel_manager = getattr(ws.app.state, "channel_manager", None)
@@ -124,16 +137,22 @@ async def handle_executor_websocket(
                 exc_info=True,
             )
 
+    _logger.info("executor_ws: executor %s ready, entering connection loop", executor_id)
     try:
         await conn.wait_until_closed()
     except Exception:
         _logger.debug(
-            "executor_ws: connection ended",
-            extra={"extra_data": {"executor_id": executor_id}},
+            "executor_ws: executor %s connection ended",
+            executor_id,
             exc_info=True,
         )
     finally:
         is_current = ws_provider.owns_connection(executor_id, conn)
+        _logger.info(
+            "executor_ws: executor %s disconnected (is_current=%s)",
+            executor_id,
+            is_current,
+        )
         # Clean up executor-hosted channel adapters before unregistering
         if channel_manager is not None and is_current:
             try:
