@@ -83,6 +83,7 @@ async def test_turn_completed_event_uses_delivery_outbox() -> None:
         delivery_id="cdel_1",
         final_content="Done.",
         fallback_text="fallback",
+        ignore_next_attempt=True,
     )
 
 
@@ -106,6 +107,7 @@ async def test_turn_error_event_uses_fallback_outbox_delivery() -> None:
         delivery_id="cdel_2",
         final_content=None,
         fallback_text="fallback",
+        ignore_next_attempt=True,
     )
 
 

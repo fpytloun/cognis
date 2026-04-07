@@ -213,6 +213,7 @@ class ChannelDeliveryService:
             delivery_id=delivery_id,
             final_content=final_content.strip() or None,
             fallback_text=fallback_text,
+            ignore_next_attempt=True,
         )
 
     async def _handle_turn_error_event(self, event: Event) -> None:
@@ -229,6 +230,7 @@ class ChannelDeliveryService:
             final_content=None,
             fallback_text=fallback_text
             or "I could not deliver the detailed follow-up reply. Please open the conversation for details.",
+            ignore_next_attempt=True,
         )
 
     async def _handle_escalation_event(self, event: Event) -> None:
@@ -423,6 +425,7 @@ class ChannelDeliveryService:
         delivery_id: str,
         final_content: str | None,
         fallback_text: str | None,
+        ignore_next_attempt: bool = False,
     ) -> None:
         from cognis.store.queries import (
             claim_channel_delivery_outbox,
@@ -439,6 +442,7 @@ class ChannelDeliveryService:
                 delivery_id=delivery_id,
                 lease_token=lease_token,
                 lease_expires_at=lease_expires_at,
+                ignore_next_attempt=ignore_next_attempt,
             )
             await session.commit()
 

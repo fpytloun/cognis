@@ -2887,16 +2887,20 @@ async def claim_channel_delivery_outbox(
     delivery_id: str,
     lease_token: str,
     lease_expires_at: datetime,
+    ignore_next_attempt: bool = False,
 ) -> ChannelDeliveryOutboxRow | None:
+    due_clause = sa.true()
+    if not ignore_next_attempt:
+        due_clause = sa.or_(
+            ChannelDeliveryOutboxRow.next_attempt_at.is_(None),
+            ChannelDeliveryOutboxRow.next_attempt_at <= _utcnow(),
+        )
     result = await session.execute(
         update(ChannelDeliveryOutboxRow)
         .where(
             ChannelDeliveryOutboxRow.delivery_id == delivery_id,
             ChannelDeliveryOutboxRow.status.in_(["pending", "failed"]),
-            sa.or_(
-                ChannelDeliveryOutboxRow.next_attempt_at.is_(None),
-                ChannelDeliveryOutboxRow.next_attempt_at <= _utcnow(),
-            ),
+            due_clause,
         )
         .values(
             status="sending",
