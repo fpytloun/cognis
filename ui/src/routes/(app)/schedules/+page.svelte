@@ -36,6 +36,30 @@
   let showCreateModal = $state(false);
   let creating = $state(false);
 
+  // Detect local IANA timezone
+  const localTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+
+  const timezoneOptions = [
+    localTimezone,
+    'UTC',
+    'Europe/London',
+    'Europe/Berlin',
+    'Europe/Paris',
+    'Europe/Prague',
+    'Europe/Moscow',
+    'America/New_York',
+    'America/Chicago',
+    'America/Denver',
+    'America/Los_Angeles',
+    'America/Sao_Paulo',
+    'Asia/Tokyo',
+    'Asia/Shanghai',
+    'Asia/Kolkata',
+    'Asia/Dubai',
+    'Australia/Sydney',
+    'Pacific/Auckland'
+  ].filter((tz, i, arr) => arr.indexOf(tz) === i); // deduplicate if local matches one
+
   // Create form state
   let form = $state({
     name: '',
@@ -44,7 +68,7 @@
     cron_expr: '0 9 * * *',
     interval_seconds: 1800,
     one_shot_at: '',
-    timezone: 'UTC',
+    timezone: localTimezone,
     agent_id: '',
     workflow_id: '',
     task_title: '',
@@ -144,7 +168,7 @@
       cron_expr: '0 9 * * *',
       interval_seconds: 1800,
       one_shot_at: '',
-      timezone: 'UTC',
+      timezone: localTimezone,
       agent_id: agents.find((a) => a.status === 'active')?.agent_id ?? agents[0]?.agent_id ?? '',
       workflow_id: '',
       task_title: '',
@@ -156,6 +180,7 @@
   }
 
   function openHeartbeatPreset(): void {
+    resetForm();
     form.name = 'Heartbeat';
     form.description = 'Periodic check-in: review pending items, check messages, and report anything that needs attention.';
     form.schedule_type = 'interval';
@@ -480,7 +505,11 @@
           </div>
           <div class="space-y-1">
             <label for="sched-tz" class="text-xs font-medium uppercase tracking-widest text-slate-400">Timezone</label>
-            <Input id="sched-tz" bind:value={form.timezone} placeholder="UTC" />
+            <select id="sched-tz" bind:value={form.timezone} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+              {#each timezoneOptions as tz}
+                <option value={tz}>{tz}{tz === localTimezone ? ' (local)' : ''}</option>
+              {/each}
+            </select>
           </div>
         {:else if form.schedule_type === 'interval'}
           <div class="space-y-1">

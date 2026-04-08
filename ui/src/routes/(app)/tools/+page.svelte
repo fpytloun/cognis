@@ -65,6 +65,16 @@
   let executorMcpSearch = '';
 
   let expandedTools: Set<string> = new Set();
+  let expandedGroups: Set<string> = new Set();
+
+  function toggleGroup(key: string) {
+    if (expandedGroups.has(key)) {
+      expandedGroups.delete(key);
+    } else {
+      expandedGroups.add(key);
+    }
+    expandedGroups = expandedGroups;
+  }
 
   let showSkillForm = false;
   let showImportForm = false;
@@ -327,18 +337,25 @@
 
       {#each groupedBuiltinTools as group}
         <div class="bg-zinc-800/50 border border-zinc-700 rounded-lg overflow-hidden">
-          <div class="px-4 py-3 bg-zinc-800 border-b border-zinc-700 flex items-center gap-2">
+          <button class="w-full px-4 py-3 bg-zinc-800 border-b border-zinc-700 flex items-center gap-2 text-left hover:bg-zinc-750 transition-colors" onclick={() => toggleGroup(group.category)}>
+            {#if expandedGroups.has(group.category)}
+              <ChevronDown class="w-4 h-4 text-zinc-500 shrink-0" />
+            {:else}
+              <ChevronRight class="w-4 h-4 text-zinc-500 shrink-0" />
+            {/if}
             <svelte:component this={getCategoryIcon(group.category)} class="w-4 h-4 text-zinc-400" />
             <span class="text-sm font-medium text-zinc-200">{getCategoryLabel(group.category)}</span>
             <Badge>{group.tools.length}</Badge>
             <span class="text-xs text-zinc-500 ml-auto">{formatSourceSummary(group.sourceTypes)}</span>
-          </div>
-          <div class="divide-y divide-zinc-700/50">
-            {#each group.tools as tool}
-              {@const toolKey = getToolKey(tool)}
-              {@render toolRow(tool, toolKey)}
-            {/each}
-          </div>
+          </button>
+          {#if expandedGroups.has(group.category)}
+            <div class="divide-y divide-zinc-700/50">
+              {#each group.tools as tool}
+                {@const toolKey = getToolKey(tool)}
+                {@render toolRow(tool, toolKey)}
+              {/each}
+            </div>
+          {/if}
         </div>
       {/each}
 
@@ -379,19 +396,27 @@
         </div>
       {:else}
         {#each intarisServerGroups as serverGroup}
+          {@const groupKey = `intaris:${serverGroup.serverName}`}
           <div class="bg-zinc-800/50 border border-zinc-700 rounded-lg overflow-hidden">
-            <div class="px-4 py-3 bg-zinc-800 border-b border-zinc-700 flex items-center gap-2">
+            <button class="w-full px-4 py-3 bg-zinc-800 border-b border-zinc-700 flex items-center gap-2 text-left hover:bg-zinc-750 transition-colors" onclick={() => toggleGroup(groupKey)}>
+              {#if expandedGroups.has(groupKey)}
+                <ChevronDown class="w-4 h-4 text-zinc-500 shrink-0" />
+              {:else}
+                <ChevronRight class="w-4 h-4 text-zinc-500 shrink-0" />
+              {/if}
               <Plug class="w-4 h-4 text-zinc-400" />
               <span class="text-sm font-medium text-zinc-200">{serverGroup.serverName}</span>
               <Badge>{serverGroup.tools.length}</Badge>
               <span class="text-xs text-zinc-500 ml-auto">Intaris MCP</span>
-            </div>
-            <div class="divide-y divide-zinc-700/50">
-              {#each serverGroup.tools as tool}
-                {@const toolKey = getToolKey(tool)}
-                {@render mcpToolRow(tool, toolKey)}
-              {/each}
-            </div>
+            </button>
+            {#if expandedGroups.has(groupKey)}
+              <div class="divide-y divide-zinc-700/50">
+                {#each serverGroup.tools as tool}
+                  {@const toolKey = getToolKey(tool)}
+                  {@render mcpToolRow(tool, toolKey)}
+                {/each}
+              </div>
+            {/if}
           </div>
         {/each}
         {#if filteredIntarisTools.length === 0 && intarisSearch}
@@ -424,20 +449,28 @@
 
       {#if executorMcpServerGroups.length > 0}
         {#each executorMcpServerGroups as serverGroup}
+          {@const groupKey = `executor:${serverGroup.serverName}`}
           <div class="bg-zinc-800/50 border border-zinc-700 rounded-lg overflow-hidden">
-            <div class="px-4 py-3 bg-zinc-800 border-b border-zinc-700 flex items-center gap-2">
+            <button class="w-full px-4 py-3 bg-zinc-800 border-b border-zinc-700 flex items-center gap-2 text-left hover:bg-zinc-750 transition-colors" onclick={() => toggleGroup(groupKey)}>
+              {#if expandedGroups.has(groupKey)}
+                <ChevronDown class="w-4 h-4 text-zinc-500 shrink-0" />
+              {:else}
+                <ChevronRight class="w-4 h-4 text-zinc-500 shrink-0" />
+              {/if}
               <Plug class="w-4 h-4 text-zinc-400" />
               <span class="text-sm font-medium text-zinc-200">{serverGroup.serverName}</span>
               <Badge>{serverGroup.tools.length}</Badge>
               <Badge class="border-sky-500/30 bg-sky-500/10 text-sky-300">cached</Badge>
               <span class="text-xs text-zinc-500 ml-auto">Executor MCP</span>
-            </div>
-            <div class="divide-y divide-zinc-700/50">
-              {#each serverGroup.tools as tool}
-                {@const toolKey = getToolKey(tool)}
-                {@render mcpToolRow(tool, toolKey)}
-              {/each}
-            </div>
+            </button>
+            {#if expandedGroups.has(groupKey)}
+              <div class="divide-y divide-zinc-700/50">
+                {#each serverGroup.tools as tool}
+                  {@const toolKey = getToolKey(tool)}
+                  {@render mcpToolRow(tool, toolKey)}
+                {/each}
+              </div>
+            {/if}
           </div>
         {/each}
       {/if}

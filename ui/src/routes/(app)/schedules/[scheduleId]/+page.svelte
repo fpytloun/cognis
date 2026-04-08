@@ -8,6 +8,15 @@
   import Badge from '$lib/components/ui/Badge.svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import Card from '$lib/components/ui/Card.svelte';
+
+  const localTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+  const timezoneOptions = [
+    localTimezone, 'UTC', 'Europe/London', 'Europe/Berlin', 'Europe/Paris',
+    'Europe/Prague', 'Europe/Moscow', 'America/New_York', 'America/Chicago',
+    'America/Denver', 'America/Los_Angeles', 'America/Sao_Paulo',
+    'Asia/Tokyo', 'Asia/Shanghai', 'Asia/Kolkata', 'Asia/Dubai',
+    'Australia/Sydney', 'Pacific/Auckland'
+  ].filter((tz, i, arr) => arr.indexOf(tz) === i);
   import Input from '$lib/components/ui/Input.svelte';
   import Tooltip from '$lib/components/ui/Tooltip.svelte';
   import { confirmAction } from '$lib/stores/confirm';
@@ -332,7 +341,11 @@
             </div>
             <div class="space-y-1">
               <label for="edit-tz" class="text-xs font-medium uppercase tracking-widest text-slate-400">Timezone</label>
-              <Input id="edit-tz" bind:value={form.timezone} />
+              <select id="edit-tz" bind:value={form.timezone} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+                {#each [...new Set([form.timezone, ...timezoneOptions])] as tz}
+                  <option value={tz}>{tz}{tz === localTimezone ? ' (local)' : ''}</option>
+                {/each}
+              </select>
             </div>
           </div>
         {:else if form.schedule_type === 'interval'}
