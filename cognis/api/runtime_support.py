@@ -32,6 +32,7 @@ from cognis.models.tool import (
     stable_tool_id,
 )
 from cognis.providers.executor.in_process import InProcessExecutorConnection
+from cognis.tools.builtin.datetime_tools import build_datetime_tool_handlers, datetime_tools
 from cognis.tools.builtin.image import image_tools
 from cognis.tools.builtin.memory import memory_tools
 from cognis.tools.builtin.orchestration import orchestration_tools
@@ -114,6 +115,7 @@ def static_tool_definitions() -> list[ToolDefinition]:
 
     return [
         *system_tools(),
+        *datetime_tools(),
         *orchestration_tools(),
         *workflow_tools(),
         *memory_tools(),
@@ -167,6 +169,7 @@ def _build_handler_map(session_factory: Any, status_provider: Any) -> dict[str, 
     """Build a combined handler map for all tool sources."""
     handlers: dict[str, Any] = {}
     handlers.update(build_system_tool_handlers(session_factory, status_provider))
+    handlers.update(build_datetime_tool_handlers())
     handlers.update(executor_tool_handlers())
     return handlers
 

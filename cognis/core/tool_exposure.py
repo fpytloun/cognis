@@ -216,15 +216,16 @@ def _is_deferred_tool(tool: ToolDefinition) -> bool:
 def _tool_sort_key(tool: ToolDefinition) -> tuple[int, int, str]:
     category_priority = {
         "system": 0,
-        "workflow": 1,
-        "memory": 2,
-        "tool_output": 3,
-        "image": 4,
-        "filesystem": 5,
-        "search": 6,
-        "shell": 7,
-        "web": 8,
-        "mcp": 9,
+        "datetime": 1,
+        "workflow": 2,
+        "memory": 3,
+        "tool_output": 4,
+        "image": 5,
+        "filesystem": 6,
+        "search": 7,
+        "shell": 8,
+        "web": 9,
+        "mcp": 10,
     }
     source_priority = {
         "builtin": 0,

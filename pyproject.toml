@@ -40,6 +40,7 @@ dependencies = [
     "python-multipart>=0.0.9",
     "mcp>=1.6.0",
     "croniter>=2.0.0",
+    "python-dateutil>=2.9.0",
 ]
 
 [project.optional-dependencies]
@@ -128,5 +129,6 @@ module = [
     "markdownify.*",
     "ddgs.*",
     "croniter.*",
+    "dateutil.*",
 ]
 ignore_missing_imports = true
