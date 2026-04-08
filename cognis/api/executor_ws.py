@@ -104,6 +104,15 @@ async def handle_executor_websocket(
         }
     )
 
+    # Reset DB runtime_state so reconcile_executor() does not hit the fast
+    # path that skips sending executor.configure.  After a controller crash
+    # the DB may still show "active" with applied == desired, but the
+    # freshly-reconnected executor has _configured=False and needs a full
+    # configure handshake.
+    async with session_factory() as session:
+        await update_executor_runtime_state(session, executor_id, runtime_state="offline")
+        await session.commit()
+
     _logger.info("executor_ws: executor %s registered, starting reconcile", executor_id)
     try:
         configure_ok = await reconcile_executor(ws.app, executor_id, connection=conn)

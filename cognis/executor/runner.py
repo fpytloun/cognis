@@ -117,6 +117,7 @@ class ExecutorRunner:
 
         self._configured = False
         self._runtime_state = "offline"
+        self._config_version = 0
         self._tool_handlers = {}
         self._configured_tool_definitions = []
 
@@ -152,6 +153,14 @@ class ExecutorRunner:
                 "Registered with controller as %s",
                 response.get("result", {}).get("executor_id", "unknown"),
             )
+
+            # Update channel handler WS reference early so surviving
+            # channel adapters can forward inbound messages to the new
+            # controller immediately, rather than silently dropping them
+            # until executor.configure completes.
+            if self._channel_handler is not None:
+                self._channel_handler.set_ws(ws)
+
             heartbeat_task = asyncio.create_task(self._heartbeat_loop(ws))
             try:
                 await self._message_loop(ws)
