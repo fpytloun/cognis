@@ -1387,6 +1387,34 @@ class WorkflowEngine:
                 },
             )
         )
+        # Check suppress_empty: skip follow-up turn if the schedule has
+        # suppress_empty enabled and the result is empty/trivial.
+        # The lifecycle event is already recorded to Intaris for audit.
+        if (
+            task.source_type == "scheduler"
+            and task.source_ref
+            and task.status == TaskStatus.COMPLETED
+            and not (task.result_summary or "").strip()
+        ):
+            try:
+                async with self._session_factory() as db_session:
+                    from cognis.store.queries import get_schedule
+
+                    schedule_row = await get_schedule(db_session, task.source_ref)
+                    if schedule_row is not None and schedule_row.suppress_empty:
+                        logger.info(
+                            "task_delivery: suppressing empty follow-up for schedule",
+                            extra={
+                                "extra_data": {
+                                    "task_id": task.task_id,
+                                    "schedule_id": task.source_ref,
+                                }
+                            },
+                        )
+                        return
+            except Exception:
+                logger.debug("suppress_empty check failed, proceeding with delivery", exc_info=True)
+
         # Always request a follow-up turn so the agent can process the
         # result even if Intaris recording failed (degraded mode).
         await self._event_bus.publish(
@@ -1400,6 +1428,8 @@ class WorkflowEngine:
                     "user_email": task.created_by,
                     "status": str(task.status),
                     "result_summary": task.result_summary,
+                    "description": task.description,
+                    "source_type": task.source_type,
                     "delivery_id": delivery_id,
                     "channel_deliverable": channel_deliverable,
                     "delivery_fallback_text": delivery_fallback_text,

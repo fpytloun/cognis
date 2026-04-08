@@ -503,6 +503,12 @@ class TurnScheduler:
             result_summary=event.data.get("result_summary")
             if isinstance(event.data.get("result_summary"), str)
             else None,
+            description=event.data.get("description")
+            if isinstance(event.data.get("description"), str)
+            else None,
+            source_type=event.data.get("source_type")
+            if isinstance(event.data.get("source_type"), str)
+            else None,
             gate_message=event.data.get("gate_message")
             if isinstance(event.data.get("gate_message"), str)
             else None,
@@ -1403,50 +1409,63 @@ def _build_follow_up_prompt(
     task_id: str | None = None,
     task_title: str | None = None,
     result_summary: str | None = None,
+    description: str | None = None,
+    source_type: str | None = None,
     gate_message: str | None = None,
     gate_options: list[dict[str, Any]] | None = None,
 ) -> str:
-    """Build a system prompt for the follow-up turn after a task/delegation completes."""
+    """Build a system prompt for the follow-up turn after a task/delegation completes.
+
+    The prompt provides facts about the completed task and lets the LLM
+    decide how to present the result based on the agent's personality and
+    the user's preferences (which are already in context via Mnemory).
+    """
     status_name = (status or "updated").lower()
 
     # Task-specific prompts (from workflow engine)
     if task_id:
+        is_scheduled = source_type == "scheduler"
+        prefix = "Scheduled task" if is_scheduled else "Background task"
         title_str = f'"{task_title}"' if task_title else task_id
+
         if status_name == "completed":
-            lines = [
-                f"Background task {title_str} (task_id: {task_id}) has completed.",
-            ]
+            lines = [f"{prefix} {title_str} (task_id: {task_id}) has completed."]
+            if is_scheduled:
+                lines.append("This task runs on a recurring schedule.")
+            if description:
+                lines.append(f"\nTask description: {description}")
             if result_summary:
                 lines.append(f"\nResult summary: {result_summary}")
             lines.append(
-                "\nPresent this result to the user concisely. "
-                "If you need the full detailed output, use the get_task_output "
-                f'tool with task_id="{task_id}".'
+                "\nDecide how to handle this result based on the user's preferences "
+                "and the context. You may present the summary directly if it is "
+                "sufficient, or use the get_task_output tool with "
+                f'task_id="{task_id}" to retrieve the full output first if you '
+                "need more detail for a complete response."
             )
             return "\n".join(lines)
+
         if status_name == "failed":
-            lines = [
-                f"Background task {title_str} (task_id: {task_id}) has failed.",
-            ]
+            lines = [f"{prefix} {title_str} (task_id: {task_id}) has failed."]
+            if description:
+                lines.append(f"\nTask description: {description}")
             if result_summary:
                 lines.append(f"\nError details: {result_summary}")
             lines.append(
-                "\nInform the user that the task has failed and briefly explain "
-                "why based on the error details above. Do NOT attempt to complete "
-                "the task yourself, do NOT call retry_task or create_task, and do "
-                "NOT make additional tool calls to gather the task's results. "
-                "Simply inform the user and let them decide what to do next."
+                "\nInform the user about the failure. Do not attempt to retry "
+                "or recreate the task automatically — let the user decide how "
+                "to proceed."
             )
             return "\n".join(lines)
+
         if status_name == "cancelled":
             return (
-                f"Background task {title_str} (task_id: {task_id}) was cancelled. "
+                f"{prefix} {title_str} (task_id: {task_id}) was cancelled. "
                 "Provide a brief follow-up to the user if warranted."
             )
+
         if status_name == "paused":
-            lines = [
-                f"Background task {title_str} (task_id: {task_id}) needs your attention.",
-            ]
+            lines = [f"{prefix} {title_str} (task_id: {task_id}) needs your attention."]
             if gate_message:
                 lines.append(f"\nReason: {gate_message}")
             if gate_options:
@@ -1464,11 +1483,11 @@ def _build_follow_up_prompt(
                 "the task. Do NOT retry automatically — let the user decide."
             )
             return "\n".join(lines)
+
         # Generic task update
         return (
-            f"Background task {title_str} (task_id: {task_id}) status: {status_name}. "
-            f"Summary: {result_summary or 'No summary available.'}. "
-            "Provide a concise follow-up to the user."
+            f"{prefix} {title_str} (task_id: {task_id}) status: {status_name}. "
+            f"Summary: {result_summary or 'No summary available.'}."
         )
 
     # Delegation-specific prompts (from agent_loop async delegations)
