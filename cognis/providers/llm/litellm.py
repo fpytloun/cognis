@@ -130,8 +130,15 @@ def _merge_request_kwargs(
 
 
 def _model_dump(value: Any) -> dict[str, Any]:
+    import warnings
+
     if hasattr(value, "model_dump"):
-        dumped = value.model_dump()
+        with warnings.catch_warnings():
+            # LiteLLM's model_construct() can leave nested fields (e.g.
+            # ``usage``) as raw dicts instead of Pydantic model instances,
+            # triggering a harmless serialisation warning.  Suppress it.
+            warnings.filterwarnings("ignore", message=".*Pydantic serializer.*")
+            dumped = value.model_dump()
         if isinstance(dumped, dict):
             return dumped
     if isinstance(value, dict):

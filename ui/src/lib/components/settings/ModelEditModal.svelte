@@ -9,8 +9,18 @@
     onsave: (updated: ModelEntry) => void;
   }>();
 
-  // Deep clone model so edits don't affect the original until save
-  let draft: ModelEntry = $state(JSON.parse(JSON.stringify(model)));
+  // Deep clone model so edits don't affect the original until save.
+  // Ensure optional string/number fields have safe defaults for binding
+  // (Svelte 5 $bindable props reject undefined).
+  let draft: ModelEntry = $state({
+    ...JSON.parse(JSON.stringify(model)),
+    display_name: model.display_name ?? '',
+  });
+
+  // Cost fields need separate state since they're optional (number | undefined)
+  // but Input bind:value rejects undefined.
+  let inputCost = $state(String(model.input_cost_per_mtok ?? ''));
+  let outputCost = $state(String(model.output_cost_per_mtok ?? ''));
 
   const tiers = ['nano', 'mini', 'standard', 'premium'];
 
@@ -31,7 +41,12 @@
   ];
 
   function handleSave(): void {
-    onsave(draft);
+    const result = { ...draft };
+    const ic = parseFloat(inputCost);
+    const oc = parseFloat(outputCost);
+    result.input_cost_per_mtok = Number.isFinite(ic) ? ic : undefined;
+    result.output_cost_per_mtok = Number.isFinite(oc) ? oc : undefined;
+    onsave(result);
   }
 
   function handleBackdropClick(event: MouseEvent): void {
@@ -127,11 +142,11 @@
         <div class="grid grid-cols-2 gap-4">
           <div class="space-y-1">
             <label for="model-input-cost" class="text-sm font-medium text-slate-200">Input</label>
-            <Input id="model-input-cost" type="number" step="0.01" bind:value={draft.input_cost_per_mtok} placeholder="0.00" />
+            <Input id="model-input-cost" bind:value={inputCost} placeholder="0.00" />
           </div>
           <div class="space-y-1">
             <label for="model-output-cost" class="text-sm font-medium text-slate-200">Output</label>
-            <Input id="model-output-cost" type="number" step="0.01" bind:value={draft.output_cost_per_mtok} placeholder="0.00" />
+            <Input id="model-output-cost" bind:value={outputCost} placeholder="0.00" />
           </div>
         </div>
       </div>

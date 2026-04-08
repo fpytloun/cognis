@@ -450,8 +450,20 @@ def _extract_finish_reason(payload: dict[str, Any]) -> str:
 
 
 def _extract_usage(payload: dict[str, Any]) -> dict[str, Any]:
+    """Extract usage from a Responses API payload and normalise to chat-completions keys.
+
+    The Responses API uses ``input_tokens`` / ``output_tokens`` while the
+    chat-completions API (and all downstream Cognis consumers such as
+    ``StreamAccumulator``) expect ``prompt_tokens`` / ``completion_tokens``.
+    """
     usage = payload.get("usage")
-    return usage if isinstance(usage, dict) else {}
+    if not isinstance(usage, dict):
+        return {}
+    return {
+        "prompt_tokens": usage.get("prompt_tokens") or usage.get("input_tokens", 0),
+        "completion_tokens": usage.get("completion_tokens") or usage.get("output_tokens", 0),
+        "total_tokens": usage.get("total_tokens", 0),
+    }
 
 
 def _extract_message_item_text(item: dict[str, Any]) -> str:
@@ -489,7 +501,15 @@ def _to_dict(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
     if hasattr(value, "model_dump"):
-        dumped = value.model_dump()
+        import warnings
+
+        with warnings.catch_warnings():
+            # LiteLLM's model_construct() can leave the ``usage`` field as a
+            # raw dict instead of a ``ResponseAPIUsage`` instance, which
+            # triggers a harmless Pydantic serialisation warning on
+            # ``model_dump()``.  Suppress it here — the dict is still valid.
+            warnings.filterwarnings("ignore", message=".*Pydantic serializer.*")
+            dumped = value.model_dump()
         if isinstance(dumped, dict):
             return dumped
     if hasattr(value, "__dict__"):

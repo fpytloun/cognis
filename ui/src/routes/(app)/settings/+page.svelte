@@ -356,10 +356,10 @@
     }
     busy = true;
     try {
-      let raw: Record<string, unknown>;
+      let raw: ModelEntry | undefined;
       if (selectedProviderId) {
         const result = await api.llmProviders.enrichModels(selectedProviderId, [mid]);
-        raw = (result.models[0] ?? {}) as Record<string, unknown>;
+        raw = result.models[0];
       } else {
         const result = await api.llmProviders.enrichModelsPreview({
           preset: providerForm.preset,
@@ -372,12 +372,13 @@
             ? { env_var: providerForm.auth_env_var }
             : {})
         });
-        raw = (result.models[0] ?? {}) as Record<string, unknown>;
+        raw = result.models[0];
       }
       // Guard against error/sparse responses — fill missing fields with defaults
+      const rawObj = (raw ?? {}) as unknown as Record<string, unknown>;
       const enriched: ModelEntry = {
         ...defaultModelEntry(mid),
-        ...('error' in raw ? {} : raw),
+        ...('error' in rawObj ? {} : rawObj),
         model_id: mid
       };
       providerForm.models = [...providerForm.models, enriched];
