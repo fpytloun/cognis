@@ -21,7 +21,7 @@
   import Tooltip from '$lib/components/ui/Tooltip.svelte';
   import { confirmAction } from '$lib/stores/confirm';
   import { addToast } from '$lib/stores/toasts';
-  import type { Agent, Schedule, ScheduleRun, Workflow } from '$lib/types/api';
+  import type { Agent, Conversation, Schedule, ScheduleRun, Workflow } from '$lib/types/api';
   import {
     AlertTriangle,
     ArrowLeft,
@@ -44,6 +44,7 @@
   let runs = $state<ScheduleRun[]>([]);
   let agents = $state<Agent[]>([]);
   let workflows = $state<Workflow[]>([]);
+  let conversations = $state<Conversation[]>([]);
 
   let form = $state({
     name: '',
@@ -57,6 +58,10 @@
     workflow_id: '',
     task_title: '',
     task_description: '',
+    priority: 0,
+    expected_output: '',
+    delivery_mode: 'latest_active_for_agent',
+    delivery_target: '',
     suppress_empty: false,
     max_concurrent_runs: 1
   });
@@ -80,16 +85,18 @@
     loading = true;
     error = '';
     try {
-      const [sched, agentList, workflowList, runList] = await Promise.all([
+      const [sched, agentList, workflowList, runList, convList] = await Promise.all([
         api.schedules.detail(scheduleId()),
         api.agents.listAll({ agent_type: 'primary' }),
         api.workflows.listAll(),
-        api.schedules.runs(scheduleId())
+        api.schedules.runs(scheduleId()),
+        api.conversations.list()
       ]);
       schedule = sched;
       agents = agentList;
       workflows = workflowList;
       runs = runList;
+      conversations = convList;
       populateForm(sched);
     } catch (e) {
       error = asApiError(e).message;
@@ -98,8 +105,18 @@
     }
   }
 
+  function conversationLabel(conv: Conversation): string {
+    const title = conv.title ?? conv.conversation_id;
+    const channelType = conv.context?.type;
+    if (channelType && channelType !== 'web') {
+      return `${title} (${channelType})`;
+    }
+    return title;
+  }
+
   function populateForm(s: Schedule): void {
     const tmpl = s.task_template ?? {};
+    const delivery = (tmpl.delivery as Record<string, unknown>) ?? {};
     form = {
       name: s.name,
       description: s.description ?? '',
@@ -112,6 +129,10 @@
       workflow_id: s.workflow_id ?? '',
       task_title: (tmpl.title as string) ?? '',
       task_description: (tmpl.description as string) ?? '',
+      priority: (tmpl.priority as number) ?? 0,
+      expected_output: (tmpl.expected_output as string) ?? '',
+      delivery_mode: (delivery.mode as string) ?? 'latest_active_for_agent',
+      delivery_target: (delivery.target as string) ?? '',
       suppress_empty: s.suppress_empty,
       max_concurrent_runs: s.max_concurrent_runs
     };
@@ -124,8 +145,18 @@
       const taskTemplate: Record<string, unknown> = {
         ...(schedule.task_template ?? {}),
         title: form.task_title || form.name,
-        description: form.task_description
+        description: form.task_description,
+        priority: form.priority,
+        delivery: {
+          mode: form.delivery_mode,
+          target: form.delivery_mode === 'specific_conversation' ? form.delivery_target || null : null
+        }
       };
+      if (form.expected_output) {
+        taskTemplate.expected_output = form.expected_output;
+      } else {
+        delete taskTemplate.expected_output;
+      }
       const updated = await api.schedules.update(schedule.schedule_id, {
         name: form.name,
         description: form.description || null,
@@ -383,6 +414,44 @@
             bind:value={form.task_description}
             class="min-h-[80px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500"
             placeholder="Instructions for the agent"
+          ></textarea>
+        </div>
+
+        <div class="grid grid-cols-2 gap-4">
+          <div class="space-y-1">
+            <label for="edit-priority" class="text-xs font-medium uppercase tracking-widest text-slate-400">Priority</label>
+            <Input id="edit-priority" bind:value={form.priority} type="number" />
+          </div>
+          <div class="space-y-1">
+            <label for="edit-delivery" class="text-xs font-medium uppercase tracking-widest text-slate-400">Delivery</label>
+            <select id="edit-delivery" bind:value={form.delivery_mode} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+              <option value="latest_active_for_agent">Latest active conversation</option>
+              <option value="specific_conversation">Specific conversation</option>
+              <option value="preferred_channel">Preferred channel</option>
+              <option value="silent">Silent (no delivery)</option>
+            </select>
+          </div>
+        </div>
+
+        {#if form.delivery_mode === 'specific_conversation'}
+          <div class="space-y-1">
+            <label for="edit-target" class="text-xs font-medium uppercase tracking-widest text-slate-400">Target conversation</label>
+            <select id="edit-target" bind:value={form.delivery_target} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+              <option value="">Select conversation</option>
+              {#each conversations as conv}
+                <option value={conv.conversation_id}>{conversationLabel(conv)}</option>
+              {/each}
+            </select>
+          </div>
+        {/if}
+
+        <div class="space-y-1">
+          <label for="edit-expected" class="text-xs font-medium uppercase tracking-widest text-slate-400">Expected output <span class="normal-case tracking-normal text-slate-500">(optional)</span></label>
+          <textarea
+            id="edit-expected"
+            bind:value={form.expected_output}
+            class="min-h-[60px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500"
+            placeholder="What should the agent produce? Used for step evaluation."
           ></textarea>
         </div>
 

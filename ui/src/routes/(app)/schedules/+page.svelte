@@ -11,7 +11,7 @@
   import Tooltip from '$lib/components/ui/Tooltip.svelte';
   import { confirmAction } from '$lib/stores/confirm';
   import { addToast } from '$lib/stores/toasts';
-  import type { Agent, Schedule, Workflow } from '$lib/types/api';
+  import type { Agent, Conversation, Schedule, Workflow } from '$lib/types/api';
   import {
     AlertTriangle,
     Calendar,
@@ -30,6 +30,7 @@
   let schedules = $state<Schedule[]>([]);
   let agents = $state<Agent[]>([]);
   let workflows = $state<Workflow[]>([]);
+  let conversations = $state<Conversation[]>([]);
   let search = $state('');
   let filterType = $state<string>('');
   let filterEnabled = $state<string>('');
@@ -74,8 +75,10 @@
     task_title: '',
     task_description: '',
     priority: 0,
+    expected_output: '',
     suppress_empty: false,
-    delivery_mode: 'latest_active_for_agent'
+    delivery_mode: 'latest_active_for_agent',
+    delivery_target: ''
   });
 
   const typeIcons: Record<string, typeof Clock> = {
@@ -110,10 +113,11 @@
     loading = true;
     error = '';
     try {
-      [schedules, agents, workflows] = await Promise.all([
+      [schedules, agents, workflows, conversations] = await Promise.all([
         api.schedules.list(),
         api.agents.listAll({ agent_type: 'primary' }),
-        api.workflows.listAll()
+        api.workflows.listAll(),
+        api.conversations.list()
       ]);
       if (!form.agent_id && agents.length > 0) {
         const active = agents.find((a) => a.status === 'active');
@@ -134,8 +138,12 @@
         title: form.task_title || form.name,
         description: form.task_description,
         priority: form.priority,
-        delivery: { mode: form.delivery_mode, target: null }
+        delivery: {
+          mode: form.delivery_mode,
+          target: form.delivery_mode === 'specific_conversation' ? form.delivery_target || null : null
+        }
       };
+      if (form.expected_output) taskTemplate.expected_output = form.expected_output;
       await api.schedules.create({
         name: form.name,
         description: form.description || null,
@@ -174,8 +182,10 @@
       task_title: '',
       task_description: '',
       priority: 0,
+      expected_output: '',
       suppress_empty: false,
-      delivery_mode: 'latest_active_for_agent'
+      delivery_mode: 'latest_active_for_agent',
+      delivery_target: ''
     };
   }
 
@@ -230,6 +240,15 @@
     } catch (e) {
       addToast(asApiError(e).message, 'error');
     }
+  }
+
+  function conversationLabel(conv: Conversation): string {
+    const title = conv.title ?? conv.conversation_id;
+    const channelType = conv.context?.type;
+    if (channelType && channelType !== 'web') {
+      return `${title} (${channelType})`;
+    }
+    return title;
   }
 
   function agentName(agentId: string): string {
@@ -566,6 +585,45 @@
             bind:value={form.task_description}
             class="min-h-[80px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500"
             placeholder="Instructions for the agent when this schedule fires"
+          ></textarea>
+        </div>
+
+        <!-- Task options -->
+        <div class="grid grid-cols-2 gap-4">
+          <div class="space-y-1">
+            <label for="sched-priority" class="text-xs font-medium uppercase tracking-widest text-slate-400">Priority</label>
+            <Input id="sched-priority" bind:value={form.priority} type="number" />
+          </div>
+          <div class="space-y-1">
+            <label for="sched-delivery" class="text-xs font-medium uppercase tracking-widest text-slate-400">Delivery</label>
+            <select id="sched-delivery" bind:value={form.delivery_mode} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+              <option value="latest_active_for_agent">Latest active conversation</option>
+              <option value="specific_conversation">Specific conversation</option>
+              <option value="preferred_channel">Preferred channel</option>
+              <option value="silent">Silent (no delivery)</option>
+            </select>
+          </div>
+        </div>
+
+        {#if form.delivery_mode === 'specific_conversation'}
+          <div class="space-y-1">
+            <label for="sched-target" class="text-xs font-medium uppercase tracking-widest text-slate-400">Target conversation</label>
+            <select id="sched-target" bind:value={form.delivery_target} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+              <option value="">Select conversation</option>
+              {#each conversations as conv}
+                <option value={conv.conversation_id}>{conversationLabel(conv)}</option>
+              {/each}
+            </select>
+          </div>
+        {/if}
+
+        <div class="space-y-1">
+          <label for="sched-expected" class="text-xs font-medium uppercase tracking-widest text-slate-400">Expected output <span class="normal-case tracking-normal text-slate-500">(optional)</span></label>
+          <textarea
+            id="sched-expected"
+            bind:value={form.expected_output}
+            class="min-h-[60px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500"
+            placeholder="What should the agent produce? Used for step evaluation."
           ></textarea>
         </div>
 

@@ -106,6 +106,27 @@ MANAGE_SCHEDULES_TOOL = ToolDefinition(
                 "type": "boolean",
                 "description": "Whether the schedule is active.",
             },
+            "delivery_mode": {
+                "type": "string",
+                "enum": [
+                    "latest_active_for_agent",
+                    "preferred_channel",
+                    "silent",
+                ],
+                "description": (
+                    "How task results are delivered. "
+                    "'latest_active_for_agent' delivers to the most recent active conversation (default). "
+                    "'preferred_channel' delivers via the user's preferred channel. "
+                    "'silent' records the result without delivery."
+                ),
+            },
+            "expected_output": {
+                "type": "string",
+                "description": (
+                    "What the agent should produce. Used for semantic step evaluation "
+                    "in workflow-driven tasks."
+                ),
+            },
             "suppress_empty": {
                 "type": "boolean",
                 "description": (
@@ -255,6 +276,10 @@ async def _handle_create(
         task_template["description"] = arguments["task_description"]
     if arguments.get("task_priority") is not None:
         task_template["priority"] = arguments["task_priority"]
+    if arguments.get("expected_output"):
+        task_template["expected_output"] = arguments["expected_output"]
+    delivery_mode = arguments.get("delivery_mode", "latest_active_for_agent")
+    task_template["delivery"] = {"mode": delivery_mode, "target": None}
 
     target_agent = arguments.get("agent_id") or agent_id
     if not target_agent:
@@ -345,11 +370,14 @@ async def _handle_update(
             if key in arguments and arguments[key] is not None:
                 fields[key] = arguments[key]
 
-        if (
-            "task_title" in arguments
-            or "task_description" in arguments
-            or "task_priority" in arguments
-        ):
+        template_keys = {
+            "task_title",
+            "task_description",
+            "task_priority",
+            "delivery_mode",
+            "expected_output",
+        }
+        if template_keys & arguments.keys():
             template = dict(existing.task_template)
             if arguments.get("task_title"):
                 template["title"] = arguments["task_title"]
@@ -357,6 +385,14 @@ async def _handle_update(
                 template["description"] = arguments["task_description"]
             if arguments.get("task_priority") is not None:
                 template["priority"] = arguments["task_priority"]
+            if arguments.get("expected_output") is not None:
+                template["expected_output"] = arguments["expected_output"]
+            if arguments.get("delivery_mode"):
+                delivery = template.get("delivery", {})
+                if not isinstance(delivery, dict):
+                    delivery = {}
+                delivery["mode"] = arguments["delivery_mode"]
+                template["delivery"] = delivery
             fields["task_template"] = template
 
         if not fields:
