@@ -223,6 +223,54 @@ def is_skill_management_tool(tool_name: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Auto-bind helper
+# ---------------------------------------------------------------------------
+
+
+async def _auto_bind_skill_to_agent(session_factory: Any, skill_id: str) -> None:
+    """Add a skill to the current agent's selected skills if not already present.
+
+    Uses ``current_agent_id`` from the runtime context.  Best-effort:
+    silently returns if no agent context is available or on any error.
+    """
+    from cognis.runtime_context import current_agent_id
+    from cognis.store.queries import get_agent, update_agent
+
+    agent_id = current_agent_id.get()
+    if not agent_id:
+        return
+
+    try:
+        async with session_factory() as session:
+            agent_row = await get_agent(session, agent_id)
+            if agent_row is None:
+                return
+
+            skills_json = agent_row.skills or {}
+            items = skills_json.get("items", [])
+            if not isinstance(items, list):
+                items = []
+
+            # Check if already bound
+            for item in items:
+                if isinstance(item, dict) and item.get("skill_id") == skill_id:
+                    return  # already bound
+
+            # Add the skill ref
+            items.append({"skill_id": skill_id, "enabled": True})
+            skills_json["items"] = items
+
+            await update_agent(session, agent_id, updates={"skills": skills_json})
+            await session.commit()
+    except Exception:
+        logger.warning(
+            "Failed to auto-bind skill to agent",
+            extra={"extra_data": {"skill_id": skill_id, "agent_id": agent_id}},
+            exc_info=True,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Tool handlers
 # ---------------------------------------------------------------------------
 
@@ -453,6 +501,9 @@ async def _handle_skill_write(
         await set_current_version(session, skill_id, version_row.version_id)
         await session.commit()
 
+    # Auto-bind the skill to the current agent so it is immediately available
+    await _auto_bind_skill_to_agent(session_factory, skill_id)
+
     result = {
         "skill_id": skill_id,
         "name": name,
@@ -545,6 +596,9 @@ async def _handle_skill_import_url(
         )
         await set_current_version(session, row.skill_id, version_row.version_id)
         await session.commit()
+
+    # Auto-bind the imported skill to the current agent
+    await _auto_bind_skill_to_agent(session_factory, row.skill_id)
 
     result = {
         "skill_id": row.skill_id,

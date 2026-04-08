@@ -538,10 +538,11 @@ class ContextAssembler:
                 {
                     "role": "system",
                     "content": (
-                        skill_metadata
-                        + "\n\nWhen a skill is relevant to the current task, use the "
-                        "skill_load tool to read its full instructions before proceeding. "
-                        "Do not guess skill behavior from the summary alone."
+                        skill_metadata + "\n\nYou have skills that extend your capabilities. "
+                        "Review the list above and use skill_load to load any "
+                        "skills relevant to the current task. Follow loaded skill "
+                        "instructions carefully. You can also create new skills "
+                        "with skill_write to remember procedures for future use."
                     ),
                 }
             )

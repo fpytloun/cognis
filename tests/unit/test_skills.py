@@ -404,6 +404,7 @@ def test_build_available_skills_metadata_basic() -> None:
             ResolvedSkill(
                 skill_id="git-release",
                 name="Git Release",
+                description="Automate git release workflows",
                 version_id="v1",
                 version_number=1,
                 content_hash="h1",
@@ -417,11 +418,32 @@ def test_build_available_skills_metadata_basic() -> None:
     assert "<name>Git Release</name>" in metadata
     assert "<skill_id>git-release</skill_id>" in metadata
     assert "<tools>tag_release</tools>" in metadata
-    # Description should be stable (not instruction snippet)
-    assert "skill_load" in metadata
+    # Description should use the real description field
+    assert "Automate git release workflows" in metadata
     # Should NOT contain version ids (for prompt caching stability)
     assert "v1" not in metadata
     assert "h1" not in metadata
+
+
+def test_build_available_skills_metadata_fallback_description() -> None:
+    """When description is None, fall back to truncated instruction snippet."""
+    from cognis.tools.skills import build_available_skills_metadata
+
+    skill_set = ResolvedSkillSet(
+        skills=[
+            ResolvedSkill(
+                skill_id="no-desc",
+                name="No Description",
+                description=None,
+                version_id="v1",
+                version_number=1,
+                content_hash="h1",
+                instructions="This skill does something specific and useful.",
+            ),
+        ]
+    )
+    metadata = build_available_skills_metadata(skill_set)
+    assert "This skill does something specific" in metadata
 
 
 def test_build_available_skills_metadata_auto_load() -> None:

@@ -176,6 +176,7 @@ async def resolve_skills_for_agent(
                     ResolvedSkill(
                         skill_id=skill_id,
                         name=skill_row.name,
+                        description=skill_row.description,
                         version_id=version_row.version_id,
                         version_number=version_row.version_number,
                         content_hash=version_row.content_hash,
@@ -196,6 +197,7 @@ async def resolve_skills_for_agent(
             ResolvedSkill(
                 skill_id=skill_id,
                 name=skill_row.name,
+                description=skill_row.description,
                 version_id="",
                 version_number=0,
                 content_hash="",
@@ -269,9 +271,17 @@ def build_available_skills_metadata(resolved: ResolvedSkillSet) -> str:
         lines.append("  <skill>")
         lines.append(f"    <name>{skill.name}</name>")
         lines.append(f"    <skill_id>{skill.skill_id}</skill_id>")
-        # Use a stable description for prompt caching — avoid instruction
-        # snippets that change on every edit.
-        desc = f"Use skill_load to read full instructions for {skill.name}."
+        # Use the real skill description so the model can decide which
+        # skills are relevant.  Fall back to a truncated instruction hint
+        # if no description is set.
+        if skill.description:
+            desc = skill.description
+        elif skill.instructions:
+            desc = skill.instructions[:150].replace("\n", " ").strip()
+            if len(skill.instructions) > 150:
+                desc += "..."
+        else:
+            desc = f"Skill {skill.name}. Use skill_load for details."
         lines.append(f"    <description>{desc}</description>")
         if tool_names:
             lines.append(f"    <tools>{tool_names}</tools>")

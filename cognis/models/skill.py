@@ -127,6 +127,7 @@ class ResolvedSkill(BaseModel):
 
     skill_id: str
     name: str
+    description: str | None = None
     version_id: str
     version_number: int
     content_hash: str
