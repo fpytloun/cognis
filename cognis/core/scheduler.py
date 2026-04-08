@@ -89,8 +89,17 @@ class Scheduler:
         self._running = True
         self._stop_event.clear()
 
-        await self._initialise_next_fire_times()
-        await self._catch_up_missed()
+        try:
+            await self._initialise_next_fire_times()
+            await self._catch_up_missed()
+        except Exception:
+            # Gracefully handle missing columns (migration not yet applied).
+            # The scheduler will still start and work once the migration runs.
+            logger.warning(
+                "Scheduler startup initialisation failed (migration pending?); "
+                "continuing with empty schedule cache",
+                exc_info=True,
+            )
         self._timer_task = asyncio.create_task(self._timer_loop(), name="scheduler-timer")
         logger.info("Scheduler started")
 
