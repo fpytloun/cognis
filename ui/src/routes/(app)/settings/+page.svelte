@@ -70,7 +70,7 @@
   let notice = $state('');
   let settings = $state<SettingsCategory[]>([]);
   let providers = $state<LLMProvider[]>([]);
-  let modelRouting = $state<ModelRouting>({ default: null, classifier: null, compaction: null, simple_inline: null, image_generation: null, items: {} });
+  let modelRouting = $state<ModelRouting>({ default: null, classifier: null, compaction: null, evaluator: null, simple_inline: null, image_generation: null, items: {} });
   let secrets = $state<SecretMetadata[]>([]);
   let health = $state<HealthResponse | null>(null);
   let diagnostics = $state<SystemDiagnostics | null>(null);
@@ -126,6 +126,7 @@
     default: '',
     classifier: '',
     compaction: '',
+    evaluator: '',
     simple_inline: '',
     image_generation: '',
     extraJson: '{}'
@@ -231,7 +232,7 @@
 
   function routingWarnings(): string[] {
     const knownModels = new Set(modelOptions().map((item) => item.value));
-    return [routingForm.default, routingForm.classifier, routingForm.compaction, routingForm.simple_inline, routingForm.image_generation]
+    return [routingForm.default, routingForm.classifier, routingForm.compaction, routingForm.evaluator, routingForm.simple_inline, routingForm.image_generation]
       .filter(Boolean)
       .filter((model) => !knownModels.has(model))
       .map((model) => `Model '${model}' is not present in configured providers.`);
@@ -500,6 +501,7 @@
       default: modelRouting.default ?? '',
       classifier: modelRouting.classifier ?? '',
       compaction: modelRouting.compaction ?? '',
+      evaluator: modelRouting.evaluator ?? '',
       simple_inline: modelRouting.simple_inline ?? '',
       image_generation: modelRouting.image_generation ?? '',
       extraJson: JSON.stringify(modelRouting.items, null, 2)
@@ -655,6 +657,7 @@
         default: routingForm.default || null,
         classifier: routingForm.classifier || null,
         compaction: routingForm.compaction || null,
+        evaluator: routingForm.evaluator || null,
         simple_inline: routingForm.simple_inline || null,
         image_generation: routingForm.image_generation || null,
         items: JSON.parse(routingForm.extraJson || '{}')
@@ -678,6 +681,7 @@
       ...routingForm,
       classifier: routingForm.default,
       compaction: routingForm.default,
+      evaluator: routingForm.default,
       simple_inline: routingForm.default
     };
   }
@@ -1388,6 +1392,16 @@
               {/each}
             </select>
             <span class="block text-xs text-slate-400">Context compaction summaries.</span>
+          </label>
+          <label class="space-y-2 text-sm font-medium text-slate-200">
+            <span>evaluator</span>
+            <select bind:value={routingForm.evaluator} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+              <option value="">Use provider default</option>
+              {#each modelOptions() as option}
+                <option value={option.value}>{option.label}</option>
+              {/each}
+            </select>
+            <span class="block text-xs text-slate-400">Workflow step evaluation. Falls back to default if not set.</span>
           </label>
           <label class="space-y-2 text-sm font-medium text-slate-200">
             <span>simple_inline</span>

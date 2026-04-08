@@ -110,13 +110,11 @@ MANAGE_SCHEDULES_TOOL = ToolDefinition(
                 "type": "string",
                 "enum": [
                     "latest_active_for_agent",
-                    "preferred_channel",
                     "silent",
                 ],
                 "description": (
                     "How task results are delivered. "
                     "'latest_active_for_agent' delivers to the most recent active conversation (default). "
-                    "'preferred_channel' delivers via the user's preferred channel. "
                     "'silent' records the result without delivery."
                 ),
             },

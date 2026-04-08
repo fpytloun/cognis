@@ -129,18 +129,26 @@ class StepEvaluator:
                     else "You are a workflow step evaluator. Respond with JSON only."
                 )
 
-                response = await asyncio.wait_for(
-                    self.llm.generate(
-                        [
-                            {"role": "system", "content": evaluator_prompt},
-                            {"role": "user", "content": prompt},
-                        ],
-                        task_type="evaluator",
-                        temperature=0,
-                        response_format={"type": "json_object"},
-                    ),
-                    timeout=self.evaluator_timeout_seconds,
-                )
+                messages = [
+                    {"role": "system", "content": evaluator_prompt},
+                    {"role": "user", "content": prompt},
+                ]
+                generate_kwargs = {
+                    "temperature": 0,
+                    "response_format": {"type": "json_object"},
+                }
+                try:
+                    response = await asyncio.wait_for(
+                        self.llm.generate(messages, task_type="evaluator", **generate_kwargs),
+                        timeout=self.evaluator_timeout_seconds,
+                    )
+                except ValueError:
+                    # "evaluator" task type not configured — fall back to default
+                    logger.debug("Evaluator task_type not configured, falling back to default")
+                    response = await asyncio.wait_for(
+                        self.llm.generate(messages, task_type="default", **generate_kwargs),
+                        timeout=self.evaluator_timeout_seconds,
+                    )
                 evaluation = self._parse_response(response)
                 logger.info(
                     "Step evaluation complete",

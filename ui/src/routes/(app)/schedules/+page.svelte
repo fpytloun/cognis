@@ -117,7 +117,7 @@
         api.schedules.list(),
         api.agents.listAll({ agent_type: 'primary' }),
         api.workflows.listAll(),
-        api.conversations.list()
+        api.conversations.listAll()
       ]);
       if (!form.agent_id && agents.length > 0) {
         const active = agents.find((a) => a.status === 'active');
@@ -599,7 +599,6 @@
             <select id="sched-delivery" bind:value={form.delivery_mode} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
               <option value="latest_active_for_agent">Latest active conversation</option>
               <option value="specific_conversation">Specific conversation</option>
-              <option value="preferred_channel">Preferred channel</option>
               <option value="silent">Silent (no delivery)</option>
             </select>
           </div>

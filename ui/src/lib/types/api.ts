@@ -856,6 +856,7 @@ export interface ModelRouting {
   default: string | null;
   classifier: string | null;
   compaction: string | null;
+  evaluator: string | null;
   simple_inline: string | null;
   image_generation: string | null;
   items: Record<string, string>;

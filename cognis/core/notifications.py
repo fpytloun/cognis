@@ -29,7 +29,7 @@ from cognis.core.events import Event, EventBus, EventType
 from cognis.logging import get_logger
 from cognis.runtime_context import scoped_runtime_context
 from cognis.store.models import NotificationRow
-from cognis.store.queries import get_task
+from cognis.store.queries import get_latest_active_conversation_for_agent, get_task
 
 logger = get_logger(__name__)
 
@@ -123,15 +123,48 @@ class NotificationService:
     ) -> str | None:
         """Resolve the user-facing conversation for a notification.
 
-        For task-originated notifications, the target is the task's
-        ``source_ref`` (the conversation that created the task).  For
-        direct-chat notifications, the conversation_id is used as-is.
+        For task-originated notifications, the target is resolved using
+        the task's delivery settings — the same logic used for task result
+        delivery.  This ensures escalations, gates, and step questions
+        from scheduled tasks reach the user via the configured channel.
+
+        For direct-chat notifications, the conversation_id is used as-is.
         """
-        if task_id:
-            async with self._session_factory() as db:
-                task_row = await get_task(db, task_id)
-                if task_row is not None and task_row.source_type == "chat" and task_row.source_ref:
+        if not task_id:
+            return conversation_id
+
+        async with self._session_factory() as db:
+            task_row = await get_task(db, task_id)
+            if task_row is None:
+                return conversation_id
+
+            delivery_mode = task_row.delivery_mode or "same_conversation"
+
+            if delivery_mode == "same_conversation":
+                # For chat-created tasks, source_ref is the originating conversation
+                if task_row.source_type == "chat" and task_row.source_ref:
                     return task_row.source_ref
+                return conversation_id
+
+            if delivery_mode == "specific_conversation" and task_row.delivery_target:
+                return task_row.delivery_target
+
+            if delivery_mode in ("latest_active_for_agent", "preferred_channel"):
+                latest = await get_latest_active_conversation_for_agent(
+                    db, task_row.created_by, task_row.agent_id
+                )
+                if latest is not None:
+                    return latest.conversation_id
+                # Fall back to task's own conversation if no active one found
+                return conversation_id
+
+            if delivery_mode == "silent":
+                # Silent tasks still need a conversation_id for the notification
+                # record, but the WebSocket won't deliver it to a subscribed user.
+                # Use the task's internal conversation so it's at least visible
+                # in the task detail view.
+                return conversation_id
+
         return conversation_id
 
     # ------------------------------------------------------------------
