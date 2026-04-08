@@ -99,6 +99,7 @@ class StdioMCPClient:
         self._exit_stack: AsyncExitStack | None = None
         self._session: ClientSession | None = None
         self._stderr_logger: _StderrLogger | None = None
+        self._tool_schemas: dict[str, dict[str, Any]] = {}
 
     async def start(self) -> None:
         """Spawn the MCP server subprocess and perform the initialize handshake."""
@@ -196,6 +197,22 @@ class StdioMCPClient:
             }
             for t in result.tools
         ]
+        # Cache inputSchema per tool for argument sanitization in call_tool().
+        for t in tools:
+            name = t["name"]
+            input_schema = t.get("inputSchema", {})
+            if isinstance(name, str) and isinstance(input_schema, dict):
+                self._tool_schemas[name] = input_schema
+        # Bypass MCP SDK client-side output schema validation.  The SDK
+        # validates structuredContent against the tool's outputSchema using
+        # jsonschema.  When MCP servers declare strict schemas
+        # (additionalProperties: false) but the upstream API returns new
+        # fields, the validation fails even though the result is perfectly
+        # usable.  Cognis normalises all MCP results to plain strings via
+        # _normalize_call_result(), so the structured-content validation
+        # adds no value here.
+        if hasattr(self._session, "_tool_output_schemas"):
+            self._session._tool_output_schemas.clear()
         logger.info("MCP stdio: %s discovered %d tool(s)", self.config.name, len(tools))
         logger.debug(
             "MCP stdio: %s tool names: %s",
@@ -208,8 +225,10 @@ class StdioMCPClient:
         """Execute a tool and return the result as a string."""
         if self._session is None:
             raise RuntimeError("MCP client is not started")
+        schema = self._tool_schemas.get(tool_name, {})
+        sanitized = _strip_empty_optionals(arguments, schema)
         try:
-            result = await self._session.call_tool(tool_name, arguments)
+            result = await self._session.call_tool(tool_name, sanitized)
         except Exception as exc:
             timed_out = "timed out" in str(exc).lower() or "timeout" in type(exc).__name__.lower()
             raise MCPClientError(
@@ -286,6 +305,59 @@ def validate_unique_server_names(servers: Sequence[MCPServerConfig]) -> None:
         duplicates = sorted({name for name in names if names.count(name) > 1})
         msg = f"Duplicate MCP server names are not allowed: {', '.join(duplicates)}"
         raise ValueError(msg)
+
+
+def _strip_empty_optionals(
+    arguments: dict[str, Any],
+    schema: dict[str, Any],
+) -> dict[str, Any]:
+    """Remove empty-string values for optional fields before calling an MCP tool.
+
+    LLMs frequently fill every visible field in a JSON Schema with empty
+    strings or empty arrays rather than omitting optional parameters.  Many
+    MCP servers (and the upstream APIs they wrap) treat ``""`` as a present
+    value and attempt to validate it, causing spurious errors like
+    ``"Invalid argument value"`` for ``project_id`` or ``parent_id``.
+
+    This helper inspects the tool's ``inputSchema`` and drops any argument
+    whose value is an empty string (or empty list) **and** whose key is not
+    listed in the schema's ``required`` array.  Required fields are never
+    touched.
+
+    For ``object``-typed arguments the function recurses into nested schemas
+    (``properties.<key>`` in the parent schema) so that nested optional
+    empty strings are also stripped.
+    """
+    if not schema:
+        return arguments
+    required: set[str] = set(schema.get("required", []))
+    properties: dict[str, Any] = schema.get("properties", {})
+    cleaned: dict[str, Any] = {}
+    for key, value in arguments.items():
+        if key not in required:
+            if isinstance(value, str) and value == "":
+                continue
+            if isinstance(value, list) and len(value) == 0:
+                continue
+        # Recurse into nested objects
+        if isinstance(value, dict) and key in properties:
+            nested_schema = properties[key]
+            if isinstance(nested_schema, dict) and nested_schema.get("type") == "object":
+                value = _strip_empty_optionals(value, nested_schema)
+        # Recurse into arrays of objects
+        if isinstance(value, list) and key in properties:
+            nested_schema = properties[key]
+            if isinstance(nested_schema, dict):
+                items_schema = nested_schema.get("items", {})
+                if isinstance(items_schema, dict) and items_schema.get("type") == "object":
+                    value = [
+                        _strip_empty_optionals(item, items_schema)
+                        if isinstance(item, dict)
+                        else item
+                        for item in value
+                    ]
+        cleaned[key] = value
+    return cleaned
 
 
 def _normalize_call_result(result: Any) -> str:
