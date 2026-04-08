@@ -168,6 +168,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_avatar_image_id_column)
         await conn.run_sync(_ensure_executor_runtime_state_columns)
         await conn.run_sync(_ensure_skill_versioning_columns)
+        await conn.run_sync(_ensure_schedule_extended_columns)
 
 
 def _ensure_session_lifecycle_columns(sync_conn: object) -> None:
@@ -377,6 +378,56 @@ def _ensure_skill_versioning_columns(sync_conn: object) -> None:
 
     if "current_version_id" not in columns:
         execute(text("ALTER TABLE skills ADD COLUMN current_version_id VARCHAR"))
+
+
+def _ensure_schedule_extended_columns(sync_conn: object) -> None:
+    """Add schedule type, error tracking, and heartbeat columns."""
+    inspector = cast(Any, inspect(sync_conn))
+    try:
+        columns = {column["name"] for column in inspector.get_columns("schedules")}
+    except Exception:
+        return  # table doesn't exist yet (create_all will handle it)
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+
+    if "description" not in columns:
+        execute(text("ALTER TABLE schedules ADD COLUMN description TEXT"))
+    if "schedule_type" not in columns:
+        execute(
+            text("ALTER TABLE schedules ADD COLUMN schedule_type VARCHAR NOT NULL DEFAULT 'cron'")
+        )
+    if "interval_seconds" not in columns:
+        execute(text("ALTER TABLE schedules ADD COLUMN interval_seconds INTEGER"))
+    if "one_shot_at" not in columns:
+        execute(text("ALTER TABLE schedules ADD COLUMN one_shot_at TIMESTAMP WITH TIME ZONE"))
+    if "timezone" not in columns:
+        execute(text("ALTER TABLE schedules ADD COLUMN timezone VARCHAR NOT NULL DEFAULT 'UTC'"))
+    if "max_concurrent_runs" not in columns:
+        execute(
+            text("ALTER TABLE schedules ADD COLUMN max_concurrent_runs INTEGER NOT NULL DEFAULT 1")
+        )
+    if "delete_after_run" not in columns:
+        execute(
+            text("ALTER TABLE schedules ADD COLUMN delete_after_run BOOLEAN NOT NULL DEFAULT false")
+        )
+    if "last_run_status" not in columns:
+        execute(text("ALTER TABLE schedules ADD COLUMN last_run_status VARCHAR"))
+    if "consecutive_errors" not in columns:
+        execute(
+            text("ALTER TABLE schedules ADD COLUMN consecutive_errors INTEGER NOT NULL DEFAULT 0")
+        )
+    if "disabled_reason" not in columns:
+        execute(text("ALTER TABLE schedules ADD COLUMN disabled_reason TEXT"))
+    if "suppress_empty" not in columns:
+        execute(
+            text("ALTER TABLE schedules ADD COLUMN suppress_empty BOOLEAN NOT NULL DEFAULT false")
+        )
+    # Make cron_expr nullable (PostgreSQL: drop NOT NULL constraint).
+    # Idempotent — if already nullable, it's a no-op.
+    # SQLite doesn't support ALTER COLUMN; create_all handles it there.
+    import contextlib
+
+    with contextlib.suppress(Exception):
+        execute(text("ALTER TABLE schedules ALTER COLUMN cron_expr DROP NOT NULL"))
 
 
 _SYSTEM_USER_EMAIL = "system@cognis.local"

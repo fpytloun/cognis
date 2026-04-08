@@ -315,11 +315,23 @@ mypy cognis/
 
 ### Database migrations
 
+Cognis uses **two complementary schema evolution mechanisms**:
+
+1. **Bootstrap helpers** (`cognis/bootstrap.py`) — idempotent `_ensure_*` functions that run on every startup via `run_schema_bootstrap()`. These use `ALTER TABLE ADD COLUMN` with column-existence checks. This is the **primary mechanism** that keeps the schema up to date automatically.
+
+2. **Alembic migrations** (`cognis/store/migrations/versions/`) — formal reversible migrations for CI, production rollbacks, and documentation. These are **not run automatically** on startup.
+
+**IMPORTANT: When adding or modifying columns on an existing table, you MUST do BOTH:**
+- Create an Alembic migration file in `cognis/store/migrations/versions/`
+- Add a corresponding `_ensure_*` function in `cognis/bootstrap.py` and register it in `run_schema_bootstrap()`
+
+If you only create the Alembic migration, the schema change will NOT be applied automatically on startup — the app will crash with `UndefinedColumnError` until someone manually runs `alembic upgrade head`.
+
 ```bash
 # Create a new migration
 uv run alembic -c cognis/store/migrations/alembic.ini revision --autogenerate -m "description"
 
-# Apply all migrations
+# Apply all migrations (not needed for normal startup — bootstrap handles it)
 uv run alembic -c cognis/store/migrations/alembic.ini upgrade head
 
 # Rollback one migration
@@ -518,9 +530,11 @@ This is enforced by a logging allowlist, not by developer discipline.
 
 ### Database migrations
 
-- Use Alembic for all schema changes
-- Migrations live in `cognis/store/migrations/versions/`
-- Every migration must be reversible (`upgrade()` and `downgrade()`)
+- **Every schema change requires BOTH an Alembic migration AND a bootstrap `_ensure_*` function** — see the "Database migrations" section under "Build / Run / Test" for details
+- Alembic migrations live in `cognis/store/migrations/versions/`
+- Bootstrap helpers live in `cognis/bootstrap.py` → `run_schema_bootstrap()`
+- Every Alembic migration must be reversible (`upgrade()` and `downgrade()`)
+- Bootstrap `_ensure_*` functions must be idempotent (check column existence before ALTER)
 - Test against both SQLite and PostgreSQL
 - Never add `last_event_seq`, `last_compaction_*`, or `intention` columns to the `sessions` table — these belong in the session cache
 
