@@ -6,9 +6,13 @@
   import { api, asApiError } from '$lib/api/client';
   import { deriveGettingStartedSteps } from '$lib/getting-started';
   import { collectModelOptions, createProviderForm, deriveProviderId, presetHasBaseUrl, presetNeedsAuth, PRESET_LABELS, providerFormToPayload, type ProviderFormState, type ProviderPreset } from '$lib/providers';
+  import { defaultModelEntry, type ModelEntry } from '$lib/types/api';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import ProviderStatusBadge from '$lib/components/ProviderStatusBadge.svelte';
   import EnvVarEditor from '$lib/components/settings/EnvVarEditor.svelte';
+  import ModelCard from '$lib/components/settings/ModelCard.svelte';
+  import ModelEditModal from '$lib/components/settings/ModelEditModal.svelte';
+  import ModelDiscoveryModal from '$lib/components/settings/ModelDiscoveryModal.svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import Card from '$lib/components/ui/Card.svelte';
   import Input from '$lib/components/ui/Input.svelte';
@@ -90,6 +94,10 @@
   let settingValueText = $state('');
   let providerForm = $state<ProviderFormState>(createProviderForm());
   let providerTestResult = $state<ProviderTestResult | null>(null);
+  let showModelDiscovery = $state(false);
+  let editingModel = $state<ModelEntry | null>(null);
+  let addModelId = $state('');
+  let showAdvancedSettings = $state(false);
   let showSecretModal = $state(false);
   let secretModalTarget = $state<'provider' | 'mcp'>('provider');
   let mcpSecretTargetKey = $state('');
@@ -285,12 +293,11 @@
     busy = true;
     error = '';
     try {
-      let models: Array<{ model_id: string; name: string }>;
+      let models: ModelEntry[];
       if (selectedProviderId) {
         const result = await api.llmProviders.discoverModels(selectedProviderId);
         models = result.models;
       } else {
-        // Preview mode: pass form values directly
         const result = await api.llmProviders.discoverModelsPreview({
           preset: providerForm.preset,
           base_url: providerForm.base_url,
@@ -304,10 +311,88 @@
         models = result.models;
       }
       providerForm.discovered_models = models;
+      showModelDiscovery = true;
       addToast(`Discovered ${models.length} models.`, 'success');
     } catch (caughtError) {
       error = asApiError(caughtError).message;
       addToast(error, 'error', 4_000, 'Model discovery failed');
+    } finally {
+      busy = false;
+    }
+  }
+
+  function handleAddDiscoveredModels(selected: ModelEntry[]): void {
+    const existingIds = new Set(providerForm.models.map((m) => m.model_id));
+    const newModels = selected.filter((m) => !existingIds.has(m.model_id));
+    providerForm.models = [...providerForm.models, ...newModels];
+    // Auto-set default model if none is set
+    if (!providerForm.default_model && providerForm.models.length > 0) {
+      providerForm.default_model = providerForm.models[0].model_id;
+    }
+    showModelDiscovery = false;
+  }
+
+  function handleRemoveModel(modelId: string): void {
+    providerForm.models = providerForm.models.filter((m) => m.model_id !== modelId);
+    if (providerForm.default_model === modelId) {
+      providerForm.default_model = providerForm.models[0]?.model_id ?? '';
+    }
+  }
+
+  function handleSaveModelEdit(updated: ModelEntry): void {
+    providerForm.models = providerForm.models.map((m) =>
+      m.model_id === updated.model_id ? updated : m
+    );
+    editingModel = null;
+  }
+
+  async function handleAddManualModel(): Promise<void> {
+    const mid = addModelId.trim();
+    if (!mid) return;
+    if (providerForm.models.some((m) => m.model_id === mid)) {
+      addToast('Model already configured.', 'error');
+      return;
+    }
+    busy = true;
+    try {
+      let raw: Record<string, unknown>;
+      if (selectedProviderId) {
+        const result = await api.llmProviders.enrichModels(selectedProviderId, [mid]);
+        raw = (result.models[0] ?? {}) as Record<string, unknown>;
+      } else {
+        const result = await api.llmProviders.enrichModelsPreview({
+          preset: providerForm.preset,
+          base_url: providerForm.base_url,
+          model_ids: [mid],
+          ...(providerForm.auth_mode === 'secret' && providerForm.auth_secret_name
+            ? { secret_name: providerForm.auth_secret_name }
+            : {}),
+          ...(providerForm.auth_mode === 'env' && providerForm.auth_env_var
+            ? { env_var: providerForm.auth_env_var }
+            : {})
+        });
+        raw = (result.models[0] ?? {}) as Record<string, unknown>;
+      }
+      // Guard against error/sparse responses — fill missing fields with defaults
+      const enriched: ModelEntry = {
+        ...defaultModelEntry(mid),
+        ...('error' in raw ? {} : raw),
+        model_id: mid
+      };
+      providerForm.models = [...providerForm.models, enriched];
+      if (!providerForm.default_model) {
+        providerForm.default_model = mid;
+      }
+      addModelId = '';
+      addToast(`Added model: ${mid}`, 'success');
+    } catch {
+      // Fallback: add with defaults if enrichment fails
+      providerForm.models = [...providerForm.models, defaultModelEntry(mid)];
+      if (!providerForm.default_model) {
+        providerForm.default_model = mid;
+      }
+      addModelId = '';
+      addToast(`Added model with default properties: ${mid}`, 'success');
     } finally {
       busy = false;
     }
@@ -399,7 +484,7 @@
     }
   }
 
-  const presetOptions: ProviderPreset[] = ['openai', 'openai_compatible', 'anthropic', 'ollama', 'litellm_proxy', 'custom'];
+  const presetOptions: ProviderPreset[] = ['openai', 'openai_compatible', 'anthropic', 'ollama', 'litellm_proxy'];
 
   async function refreshPageState(): Promise<void> {
     isAdmin = auth.getSnapshot().user?.role === 'admin';
@@ -488,14 +573,6 @@
     if (!providerForm.display_name.trim()) {
       error = 'Display name is required.';
       return;
-    }
-    if (providerForm.preset === 'custom') {
-      try {
-        JSON.parse(providerForm.custom_json || '{}');
-      } catch {
-        error = 'Provider config JSON must be valid.';
-        return;
-      }
     }
     busy = true;
     error = '';
@@ -1110,110 +1187,142 @@
             </div>
           {/if}
 
-          {#if providerForm.preset === 'custom'}
-            <!-- Custom: raw JSON -->
-            <label class="block space-y-2 text-sm font-medium text-slate-200">
-              <span>Config JSON</span>
-              <textarea bind:value={providerForm.custom_json} class="min-h-[240px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 font-mono text-sm text-slate-100"></textarea>
-            </label>
-          {:else}
-            <!-- Credentials -->
-            {#if presetNeedsAuth(providerForm.preset)}
-              <div class="rounded-2xl border border-slate-800 bg-slate-900/60 p-4">
-                <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Credentials</p>
-                <div class="mt-3 grid gap-3 md:grid-cols-2">
-                  <label class="space-y-2 text-sm font-medium text-slate-200">
-                    <span>Auth mode</span>
-                    <select bind:value={providerForm.auth_mode} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
-                      <option value="env">Environment variable</option>
-                      <option value="secret">Credential store</option>
-                    </select>
-                  </label>
-
-                  {#if providerForm.auth_mode === 'env'}
-                    <label class="space-y-2 text-sm font-medium text-slate-200">
-                      <span>Env variable name</span>
-                      <Input bind:value={providerForm.auth_env_var} placeholder="OPENAI_API_KEY" />
-                      <span class="block text-xs text-slate-400">Must be set before starting Cognis.</span>
-                    </label>
-                  {:else}
-                    <div class="space-y-2 text-sm font-medium text-slate-200">
-                      <span>Credential</span>
-                      <div class="flex gap-2">
-                        <select bind:value={providerForm.auth_secret_name} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
-                          <option value="">Select credential...</option>
-                          {#each secrets.filter((s) => s.scope === 'global' || s.scope === 'user') as secret}
-                            <option value={secret.name}>{secret.name}{secret.description ? ` — ${secret.description}` : ''}</option>
-                          {/each}
-                        </select>
-                        <Button size="sm" variant="secondary" onclick={openSecretModal}>New</Button>
-                      </div>
-                      {#if providerForm.auth_secret_name}
-                        <span class="block text-xs text-slate-400">Using credential: {providerForm.auth_secret_name}</span>
-                      {:else}
-                        <span class="block text-xs text-amber-300">No credential selected. Create or select one.</span>
-                      {/if}
-                    </div>
-                  {/if}
-                </div>
-              </div>
-            {/if}
-
-            <!-- Connection -->
-            {#if presetHasBaseUrl(providerForm.preset)}
-              <label class="block space-y-2 text-sm font-medium text-slate-200">
-                <span>Base URL {#if providerForm.preset !== 'ollama'}<span class="text-rose-300">*</span>{/if}</span>
-                <Input bind:value={providerForm.base_url} placeholder={providerForm.preset === 'ollama' ? 'http://localhost:11434' : 'https://your-provider.example.com/v1'} />
-              </label>
-            {/if}
-
-            {#if ['openai', 'openai_compatible', 'litellm_proxy'].includes(providerForm.preset)}
-              <label class="flex items-start gap-3 rounded-2xl border border-slate-800 bg-slate-900/60 p-4 text-sm text-slate-200">
-                <input bind:checked={providerForm.use_responses_api} type="checkbox" class="mt-1 rounded border-slate-600 bg-slate-950 text-sky-400 focus:ring-sky-400" />
-                <span class="space-y-1">
-                  <span class="block font-medium">Use OpenAI Responses transport when supported</span>
-                  <span class="block text-xs text-slate-400">Recommended for `gpt-5*` models. Disable this if your provider or LiteLLM proxy behaves better on the legacy chat-completions path.</span>
-                </span>
-              </label>
-            {/if}
-
-            <!-- Models -->
+          <!-- Credentials -->
+          {#if presetNeedsAuth(providerForm.preset)}
             <div class="rounded-2xl border border-slate-800 bg-slate-900/60 p-4">
-              <div class="flex items-center justify-between gap-3">
-                <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Models</p>
+              <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Credentials</p>
+              <div class="mt-3 grid gap-3 md:grid-cols-2">
+                <label class="space-y-2 text-sm font-medium text-slate-200">
+                  <span>Auth mode</span>
+                  <select bind:value={providerForm.auth_mode} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+                    <option value="env">Environment variable</option>
+                    <option value="secret">Credential store</option>
+                  </select>
+                </label>
+
+                {#if providerForm.auth_mode === 'env'}
+                  <label class="space-y-2 text-sm font-medium text-slate-200">
+                    <span>Env variable name</span>
+                    <Input bind:value={providerForm.auth_env_var} placeholder="OPENAI_API_KEY" />
+                    <span class="block text-xs text-slate-400">Must be set before starting Cognis.</span>
+                  </label>
+                {:else}
+                  <div class="space-y-2 text-sm font-medium text-slate-200">
+                    <span>Credential</span>
+                    <div class="flex gap-2">
+                      <select bind:value={providerForm.auth_secret_name} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+                        <option value="">Select credential...</option>
+                        {#each secrets.filter((s) => s.scope === 'global' || s.scope === 'user') as secret}
+                          <option value={secret.name}>{secret.name}{secret.description ? ` — ${secret.description}` : ''}</option>
+                        {/each}
+                      </select>
+                      <Button size="sm" variant="secondary" onclick={openSecretModal}>New</Button>
+                    </div>
+                    {#if providerForm.auth_secret_name}
+                      <span class="block text-xs text-slate-400">Using credential: {providerForm.auth_secret_name}</span>
+                    {:else}
+                      <span class="block text-xs text-amber-300">No credential selected. Create or select one.</span>
+                    {/if}
+                  </div>
+                {/if}
+              </div>
+            </div>
+          {/if}
+
+          <!-- Connection -->
+          {#if presetHasBaseUrl(providerForm.preset)}
+            <label class="block space-y-2 text-sm font-medium text-slate-200">
+              <span>Base URL {#if providerForm.preset !== 'ollama'}<span class="text-rose-300">*</span>{/if}</span>
+              <Input bind:value={providerForm.base_url} placeholder={providerForm.preset === 'ollama' ? 'http://localhost:11434' : 'https://your-provider.example.com/v1'} />
+            </label>
+          {/if}
+
+          {#if ['openai', 'openai_compatible', 'litellm_proxy'].includes(providerForm.preset)}
+            <label class="flex items-start gap-3 rounded-2xl border border-slate-800 bg-slate-900/60 p-4 text-sm text-slate-200">
+              <input bind:checked={providerForm.use_responses_api} type="checkbox" class="mt-1 rounded border-slate-600 bg-slate-950 text-sky-400 focus:ring-sky-400" />
+              <span class="space-y-1">
+                <span class="block font-medium">Use OpenAI Responses transport when supported</span>
+                <span class="block text-xs text-slate-400">Recommended for `gpt-5*` models. Disable this if your provider or LiteLLM proxy behaves better on the legacy chat-completions path.</span>
+              </span>
+            </label>
+          {/if}
+
+          <!-- Models -->
+          <div class="rounded-2xl border border-slate-800 bg-slate-900/60 p-4">
+            <div class="flex items-center justify-between gap-3">
+              <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Models</p>
+              <div class="flex gap-2">
                 <Button size="sm" variant="secondary" onclick={discoverModels} disabled={busy || providerForm.location === 'executor'}>
-                  Discover models
+                  Discover
                 </Button>
               </div>
-              {#if providerForm.location === 'executor'}
-                <p class="mt-3 text-xs text-slate-400">Model discovery runs from the controller. For executor-routed providers, enter models manually.</p>
-              {/if}
+            </div>
+            {#if providerForm.location === 'executor'}
+              <p class="mt-3 text-xs text-slate-400">Model discovery runs from the controller. For executor-routed providers, add models manually.</p>
+            {/if}
 
-              {#if providerForm.discovered_models.length > 0}
-                <div class="mt-3 max-h-48 overflow-y-auto rounded-xl border border-slate-800 bg-slate-950/80 p-2">
-                  <div class="space-y-1">
-                    {#each providerForm.discovered_models as m}
-                      <button type="button" class="w-full rounded-lg px-3 py-1.5 text-left text-xs text-slate-200 transition hover:bg-slate-800" onclick={() => (providerForm.default_model = m.model_id)}>
-                        {m.model_id}
-                      </button>
-                    {/each}
-                  </div>
-                </div>
-                <p class="mt-2 text-xs text-slate-400">Click a model to set it as default.</p>
-              {/if}
-
+            <!-- Default model selection -->
+            {#if providerForm.models.length > 0}
               <div class="mt-3">
                 <label class="space-y-2 text-sm font-medium text-slate-200">
                   <span>Default model <span class="text-rose-300">*</span></span>
-                  <Input bind:value={providerForm.default_model} placeholder="model id (type or pick from discovered)" />
+                  <select bind:value={providerForm.default_model} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+                    {#each providerForm.models as m}
+                      <option value={m.model_id}>{m.model_id}</option>
+                    {/each}
+                  </select>
                 </label>
               </div>
+            {/if}
 
-              <label class="mt-3 block space-y-2 text-sm font-medium text-slate-200">
-                <span>Additional models (one per line, optional)</span>
-                <textarea bind:value={providerForm.additional_models} class="min-h-[80px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 font-mono text-sm text-slate-100" placeholder="gpt-4o&#10;gpt-4o-mini"></textarea>
-              </label>
+            <!-- Model cards -->
+            <div class="mt-3 space-y-2">
+              {#each providerForm.models as model (model.model_id)}
+                <ModelCard
+                  {model}
+                  isDefault={model.model_id === providerForm.default_model}
+                  onedit={() => (editingModel = { ...model })}
+                  onremove={() => handleRemoveModel(model.model_id)}
+                />
+              {/each}
             </div>
+
+            {#if providerForm.models.length === 0}
+              <p class="mt-3 text-sm text-slate-400">No models configured. Click Discover to find available models, or add one manually below.</p>
+            {/if}
+
+            <!-- Manual add -->
+            <div class="mt-3 flex gap-2">
+              <Input bind:value={addModelId} placeholder="Add model by ID..." onkeydown={(e: KeyboardEvent) => e.key === 'Enter' && handleAddManualModel()} />
+              <Button size="sm" variant="secondary" onclick={handleAddManualModel} disabled={busy || !addModelId.trim()}>Add</Button>
+            </div>
+          </div>
+
+          <!-- Advanced settings -->
+          {#if providerForm.advanced_settings.length > 0 || showAdvancedSettings}
+            <div class="rounded-2xl border border-slate-800 bg-slate-900/60 p-4">
+              <button type="button" class="flex w-full items-center justify-between text-xs uppercase tracking-[0.25em] text-slate-400" onclick={() => (showAdvancedSettings = !showAdvancedSettings)}>
+                <span>Advanced settings</span>
+                <span class="text-slate-500">{showAdvancedSettings ? '−' : '+'}</span>
+              </button>
+              {#if showAdvancedSettings}
+                <div class="mt-3 space-y-2">
+                  {#each providerForm.advanced_settings as setting, i}
+                    <div class="flex gap-2">
+                      <Input bind:value={providerForm.advanced_settings[i].key} placeholder="key" />
+                      <Input bind:value={providerForm.advanced_settings[i].value} placeholder="value" />
+                      <Button size="sm" variant="ghost" onclick={() => (providerForm.advanced_settings = providerForm.advanced_settings.filter((_, idx) => idx !== i))}>x</Button>
+                    </div>
+                  {/each}
+                  <Button size="sm" variant="secondary" onclick={() => (providerForm.advanced_settings = [...providerForm.advanced_settings, { key: '', value: '' }])}>+ Add setting</Button>
+                </div>
+                <p class="mt-2 text-xs text-slate-400">Additional key-value pairs merged into the provider config. Use for provider-specific litellm kwargs.</p>
+              {/if}
+            </div>
+          {:else}
+            <button type="button" class="text-xs text-slate-500 hover:text-slate-300 transition" onclick={() => (showAdvancedSettings = true)}>
+              + Advanced settings
+            </button>
           {/if}
 
           <!-- Actions -->
@@ -1292,11 +1401,12 @@
           </label>
           <label class="space-y-2 text-sm font-medium text-slate-200">
             <span>image_generation</span>
-            <input
-              bind:value={routingForm.image_generation}
-              class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-500"
-              placeholder="e.g. gpt-image-1, dall-e-3, gemini-2.0-flash-image-generation"
-            />
+            <select bind:value={routingForm.image_generation} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+              <option value="">Use provider default</option>
+              {#each modelOptions() as option}
+                <option value={option.value}>{option.label}</option>
+              {/each}
+            </select>
             <span class="block text-xs text-slate-400">Image-capable model for avatars and tools. Must support image generation.</span>
           </label>
         </div>
@@ -2411,4 +2521,23 @@
       </div>
     </div>
   </div>
+{/if}
+
+<!-- Model discovery modal -->
+{#if showModelDiscovery && providerForm.discovered_models.length > 0}
+  <ModelDiscoveryModal
+    models={providerForm.discovered_models}
+    existingModelIds={providerForm.models.map((m) => m.model_id)}
+    onclose={() => (showModelDiscovery = false)}
+    onadd={handleAddDiscoveredModels}
+  />
+{/if}
+
+<!-- Model edit modal -->
+{#if editingModel}
+  <ModelEditModal
+    model={editingModel}
+    onclose={() => (editingModel = null)}
+    onsave={handleSaveModelEdit}
+  />
 {/if}

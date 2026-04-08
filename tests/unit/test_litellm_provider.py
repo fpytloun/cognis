@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from cognis.models.config import DEFAULT_MODEL_INFO
-from cognis.providers.llm.litellm import LiteLLMProvider
+from cognis.providers.llm.litellm import LiteLLMProvider, _normalize_proxy_model_info
 from cognis.store.database import create_engine, create_session_factory
 from cognis.store.models import Base, LLMProvider, ModelRouting
 
@@ -949,3 +949,375 @@ def test_apply_model_prefix_no_prefix_when_preset_missing() -> None:
         status="active",
     )
     assert LiteLLMProvider._apply_model_prefix("my-model", provider) == "my-model"
+
+
+# ---------------------------------------------------------------------------
+# Proxy model info tests
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_proxy_model_info_maps_fields() -> None:
+    raw = {
+        "max_input_tokens": 1048576,
+        "max_output_tokens": 32768,
+        "supports_function_calling": True,
+        "supports_vision": True,
+        "supports_audio_input": False,
+        "supports_pdf_input": True,
+        "supports_reasoning": False,
+        "supports_prompt_caching": True,
+        "input_cost_per_token": 0.0000025,
+        "output_cost_per_token": 0.00001,
+    }
+    result = _normalize_proxy_model_info(raw)
+    assert result["context_window"] == 1048576
+    assert result["max_output_tokens"] == 32768
+    assert result["supports_tools"] is True
+    assert result["supports_vision"] is True
+    assert result["supports_audio_input"] is False
+    assert result["supports_pdf_input"] is True
+    assert result["supports_reasoning"] is False
+    assert result["supports_prompt_caching"] is True
+    assert result["input_cost_per_mtok"] == 2.5
+    assert result["output_cost_per_mtok"] == 10.0
+
+
+def test_normalize_proxy_model_info_cost_rounding() -> None:
+    raw = {"input_cost_per_token": 0.0000003, "output_cost_per_token": 0.0000012}
+    result = _normalize_proxy_model_info(raw)
+    assert result["input_cost_per_mtok"] == 0.3
+    assert result["output_cost_per_mtok"] == 1.2
+
+
+def test_normalize_proxy_model_info_empty_input() -> None:
+    result = _normalize_proxy_model_info({})
+    assert result == {}
+
+
+def test_normalize_proxy_model_info_max_tokens_fallback() -> None:
+    raw = {"max_tokens": 4096}
+    result = _normalize_proxy_model_info(raw)
+    assert result["context_window"] == 4096
+
+
+@pytest.mark.asyncio
+async def test_fetch_proxy_model_info_success(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    provider = LiteLLMProvider(session_factory)
+
+    async def _fake_get(self, url, **kwargs):
+        class FakeResponse:
+            status_code = 200
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {
+                    "data": [
+                        {
+                            "model_name": "gpt-5.4",
+                            "model_info": {
+                                "max_input_tokens": 1048576,
+                                "max_output_tokens": 32768,
+                                "supports_function_calling": True,
+                                "supports_vision": True,
+                            },
+                        },
+                        {
+                            "model_name": "gpt-4o-mini",
+                            "model_info": {
+                                "max_input_tokens": 128000,
+                                "max_output_tokens": 16384,
+                            },
+                        },
+                    ]
+                }
+
+        return FakeResponse()
+
+    import httpx
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", _fake_get)
+
+    result = await provider._fetch_proxy_model_info("http://localhost:4000", "test-key")
+    assert "gpt-5.4" in result
+    assert result["gpt-5.4"]["context_window"] == 1048576
+    assert result["gpt-5.4"]["max_output_tokens"] == 32768
+    assert "gpt-4o-mini" in result
+    assert result["gpt-4o-mini"]["context_window"] == 128000
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_fetch_proxy_model_info_failure_returns_empty(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    provider = LiteLLMProvider(session_factory)
+
+    async def _fake_get(self, url, **kwargs):
+        raise ConnectionError("proxy down")
+
+    import httpx
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", _fake_get)
+
+    result = await provider._fetch_proxy_model_info("http://localhost:4000", "test-key")
+    assert result == {}
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_fetch_proxy_model_info_negative_cache(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    provider = LiteLLMProvider(session_factory)
+
+    call_count = 0
+
+    async def _fake_get(self, url, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        raise ConnectionError("proxy down")
+
+    import httpx
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", _fake_get)
+
+    # First call: makes HTTP request, fails, caches empty result
+    result1 = await provider._fetch_proxy_model_info("http://localhost:4000", "key")
+    assert result1 == {}
+    assert call_count == 1
+
+    # Second call: should hit negative cache, no HTTP request
+    result2 = await provider._fetch_proxy_model_info("http://localhost:4000", "key")
+    assert result2 == {}
+    assert call_count == 1  # No additional HTTP call
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_fetch_proxy_model_info_bypass_cache(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    provider = LiteLLMProvider(session_factory)
+
+    call_count = 0
+
+    async def _fake_get(self, url, **kwargs):
+        nonlocal call_count
+        call_count += 1
+
+        class FakeResponse:
+            status_code = 200
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"data": [{"model_name": "m1", "model_info": {"max_input_tokens": 100}}]}
+
+        return FakeResponse()
+
+    import httpx
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", _fake_get)
+
+    # First call populates cache
+    await provider._fetch_proxy_model_info("http://localhost:4000", "key")
+    assert call_count == 1
+
+    # Second call with bypass_cache=True should make another HTTP request
+    await provider._fetch_proxy_model_info("http://localhost:4000", "key", bypass_cache=True)
+    assert call_count == 2
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_merge_proxy_overrides_litellm_static(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Proxy /model/info data should override litellm static data."""
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="proxy",
+                display_name="LiteLLM Proxy",
+                location="controller",
+                backend="litellm",
+                config={
+                    "preset": "litellm_proxy",
+                    "default_model": "gpt-5.4",
+                    "base_url": "http://localhost:4000",
+                },
+                status="active",
+            )
+        )
+        await session.commit()
+
+    provider = LiteLLMProvider(session_factory)
+
+    # Mock proxy to return 1M context window
+    async def _fake_get(self, url, **kwargs):
+        class FakeResponse:
+            status_code = 200
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {
+                    "data": [
+                        {
+                            "model_name": "gpt-5.4",
+                            "model_info": {
+                                "max_input_tokens": 1048576,
+                                "max_output_tokens": 65536,
+                                "supports_function_calling": True,
+                                "supports_vision": True,
+                            },
+                        }
+                    ]
+                }
+
+        return FakeResponse()
+
+    import httpx
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", _fake_get)
+
+    model_info = await provider.get_model_info("gpt-5.4")
+
+    # Proxy data (1M) should override whatever litellm static returns
+    assert model_info.context_window == 1048576
+    assert model_info.max_output_tokens == 65536
+    assert model_info.supports_vision is True
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_merge_user_config_overrides_proxy(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """User-configured overrides in DB should win over proxy data."""
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="proxy",
+                display_name="LiteLLM Proxy",
+                location="controller",
+                backend="litellm",
+                config={
+                    "preset": "litellm_proxy",
+                    "default_model": "gpt-5.4",
+                    "base_url": "http://localhost:4000",
+                    "models": [{"model_id": "gpt-5.4", "context_window": 500000}],
+                },
+                status="active",
+            )
+        )
+        await session.commit()
+
+    provider = LiteLLMProvider(session_factory)
+
+    # Mock proxy to return 1M context window
+    async def _fake_get(self, url, **kwargs):
+        class FakeResponse:
+            status_code = 200
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {
+                    "data": [
+                        {
+                            "model_name": "gpt-5.4",
+                            "model_info": {"max_input_tokens": 1048576},
+                        }
+                    ]
+                }
+
+        return FakeResponse()
+
+    import httpx
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", _fake_get)
+
+    model_info = await provider.get_model_info("gpt-5.4")
+
+    # User-configured 500k should win over proxy's 1M
+    assert model_info.context_window == 500000
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_enrich_model_info_public_method(tmp_path: object) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="openai",
+                display_name="OpenAI",
+                location="controller",
+                backend="litellm",
+                config={"preset": "openai", "default_model": "gpt-4o-mini"},
+                status="active",
+            )
+        )
+        await session.commit()
+
+    provider = LiteLLMProvider(session_factory)
+    model_info = await provider.enrich_model_info("gpt-4o-mini", provider_id="openai")
+
+    assert model_info.model_id == "gpt-4o-mini"
+    # Should have some reasonable context window (not the 8192 default)
+    assert model_info.context_window > 0
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_enrich_model_info_preview_mode(tmp_path: object) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    provider = LiteLLMProvider(session_factory)
+
+    model_info = await provider.enrich_model_info("gpt-4o-mini", preset="openai")
+
+    assert model_info.model_id == "gpt-4o-mini"
+    assert model_info.context_window > 0
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_find_provider_for_model(tmp_path: object) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="openai",
+                display_name="OpenAI",
+                location="controller",
+                backend="litellm",
+                config={
+                    "preset": "openai",
+                    "default_model": "gpt-4o-mini",
+                    "models": [{"model_id": "gpt-4o-mini"}, {"model_id": "gpt-4o"}],
+                },
+                status="active",
+            )
+        )
+        await session.commit()
+
+    provider = LiteLLMProvider(session_factory)
+
+    assert await provider.find_provider_for_model("gpt-4o-mini") == "openai"
+    assert await provider.find_provider_for_model("gpt-4o") == "openai"
+    assert await provider.find_provider_for_model("nonexistent") is None
+    await engine.dispose()

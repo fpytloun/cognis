@@ -11,6 +11,8 @@ from fastapi import APIRouter, Request
 from cognis.api.common import api_exception, require_admin, require_current_user
 from cognis.api.models import (
     CursorPage,
+    EnrichModelsPreviewRequest,
+    EnrichModelsRequest,
     LLMProviderRequest,
     LLMProviderResponse,
     LLMProviderTestResponse,
@@ -322,6 +324,68 @@ async def llm_provider_discover_models(request: Request, provider_id: str) -> di
     return {"provider_id": provider_id, "models": models}
 
 
+@router.post("/api/v1/llm-providers/{provider_id}/enrich-models")
+async def llm_provider_enrich_models(
+    request: Request, provider_id: str, payload: EnrichModelsRequest
+) -> dict[str, Any]:
+    """Enrich model IDs with metadata from a saved provider."""
+    require_admin(request)
+    async with request.app.state.session_factory() as session:
+        row = await get_llm_provider(session, provider_id)
+    if row is None:
+        raise api_exception(404, "not_found", "LLM provider not found")
+
+    llm = request.app.state.providers.llm
+    models: list[dict[str, Any]] = []
+    for mid in payload.model_ids:
+        mid = mid.strip()
+        if not mid:
+            continue
+        try:
+            info = await llm.enrich_model_info(mid, provider_id=provider_id)
+            models.append(info.model_dump())
+        except Exception:
+            models.append({"model_id": mid, "error": "enrichment_failed"})
+    return {"models": models}
+
+
+@router.post("/api/v1/llm-providers/enrich-models-preview")
+async def llm_provider_enrich_models_preview(
+    request: Request, payload: EnrichModelsPreviewRequest
+) -> dict[str, Any]:
+    """Enrich model IDs without a saved provider (preview mode)."""
+    require_admin(request)
+    import contextlib
+    import os
+
+    resolved_key = payload.api_key or ""
+    if not resolved_key and payload.env_var:
+        resolved_key = os.environ.get(payload.env_var, "")
+    if not resolved_key and payload.secret_name:
+        secrets = getattr(request.app.state.providers, "secrets", None)
+        if secrets:
+            with contextlib.suppress(Exception):
+                resolved_key = await secrets.get_secret(payload.secret_name, "system", None)
+
+    llm = request.app.state.providers.llm
+    models: list[dict[str, Any]] = []
+    for mid in payload.model_ids:
+        mid = mid.strip()
+        if not mid:
+            continue
+        try:
+            info = await llm.enrich_model_info(
+                mid,
+                preset=payload.preset,
+                base_url=payload.base_url,
+                api_key=resolved_key or None,
+            )
+            models.append(info.model_dump())
+        except Exception:
+            models.append({"model_id": mid, "error": "enrichment_failed"})
+    return {"models": models}
+
+
 @router.get("/api/v1/model-routing", response_model=ModelRoutingResponse)
 async def model_routing_get(request: Request) -> ModelRoutingResponse:
     require_current_user(request)
@@ -352,15 +416,18 @@ async def model_routing_put(
         "image_generation": payload.image_generation,
         **payload.items,
     }
+    llm = request.app.state.providers.llm
     async with request.app.state.session_factory() as session:
         for task_type, model in updates.items():
             if model is None:
                 await delete_model_routing(session, task_type)
                 continue
+            # Auto-resolve provider_id from the model when possible
+            resolved_provider_id = await llm.find_provider_for_model(model)
             await upsert_model_routing(
                 session,
                 task_type=task_type,
-                provider_id=None,
+                provider_id=resolved_provider_id,
                 model=model,
             )
         await session.commit()

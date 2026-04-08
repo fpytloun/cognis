@@ -1,8 +1,14 @@
 import { slugify } from '$lib/agents';
-import type { LLMProvider } from '$lib/types/api';
+import type { LLMProvider, ModelEntry } from '$lib/types/api';
+import { defaultModelEntry } from '$lib/types/api';
 
-export type ProviderPreset = 'openai' | 'openai_compatible' | 'anthropic' | 'ollama' | 'litellm_proxy' | 'custom';
+export type ProviderPreset = 'openai' | 'openai_compatible' | 'anthropic' | 'ollama' | 'litellm_proxy';
 export type AuthMode = 'env' | 'secret' | 'none';
+
+export interface AdvancedSetting {
+  key: string;
+  value: string;
+}
 
 export interface ProviderFormState {
   provider_id: string;
@@ -14,14 +20,14 @@ export interface ProviderFormState {
   preset: ProviderPreset;
   base_url: string;
   default_model: string;
-  additional_models: string;
-  custom_json: string;
+  models: ModelEntry[];
   auth_mode: AuthMode;
   auth_env_var: string;
   auth_secret_name: string;
   auth_secret_value: string;
   use_responses_api: boolean;
-  discovered_models: Array<{ model_id: string; name: string }>;
+  advanced_settings: AdvancedSetting[];
+  discovered_models: ModelEntry[];
 }
 
 export interface ProviderModelOption {
@@ -44,12 +50,52 @@ export const PRESET_LABELS: Record<ProviderPreset, string> = {
   openai_compatible: 'OpenAI Compatible',
   anthropic: 'Anthropic',
   ollama: 'Ollama (local)',
-  litellm_proxy: 'LiteLLM Proxy',
-  custom: 'Custom (raw JSON)'
+  litellm_proxy: 'LiteLLM Proxy'
 };
 
-function normalizeModelRows(modelIds: string[]): Array<Record<string, unknown>> {
-  return modelIds.map((model_id) => ({ model_id }));
+/** Config keys that are handled by structured form fields. */
+const KNOWN_CONFIG_KEYS = new Set([
+  'preset', 'default_model', 'models', 'auth_config', 'use_responses_api',
+  'base_url', 'api_base', 'executor_labels'
+]);
+
+/** All known ModelEntry keys (including optional ones that defaultModelEntry omits). */
+const MODEL_ENTRY_KEYS: Array<keyof ModelEntry> = [
+  'model_id', 'display_name', 'context_window', 'max_output_tokens',
+  'supports_tools', 'supports_streaming', 'supports_vision', 'supports_audio_input',
+  'supports_pdf_input', 'supports_file_input', 'supports_reasoning', 'reasoning_efforts',
+  'supports_prompt_caching', 'supports_tool_search', 'supports_defer_loading',
+  'supports_responses_api', 'supports_extended_thinking', 'supports_image_generation',
+  'supported_openai_params', 'max_tools', 'input_cost_per_mtok', 'output_cost_per_mtok', 'tier'
+];
+
+/** Parse a raw model dict from the DB into a typed ModelEntry. */
+function parseModelEntry(raw: Record<string, unknown>): ModelEntry {
+  const base = defaultModelEntry(typeof raw.model_id === 'string' ? raw.model_id : '');
+  for (const key of MODEL_ENTRY_KEYS) {
+    if (key in raw && raw[key] !== undefined && raw[key] !== null) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (base as any)[key] = raw[key];
+    }
+  }
+  return base;
+}
+
+/** Serialize a ModelEntry for the config.models array, omitting default values. */
+function serializeModelEntry(entry: ModelEntry): Record<string, unknown> {
+  const defaults = defaultModelEntry(entry.model_id);
+  const result: Record<string, unknown> = { model_id: entry.model_id };
+  if (entry.display_name) result.display_name = entry.display_name;
+  for (const key of MODEL_ENTRY_KEYS) {
+    if (key === 'model_id' || key === 'display_name') continue;
+    const val = entry[key];
+    const def = defaults[key];
+    // Include if value differs from default, or if it's set and default is undefined
+    if (val !== undefined && val !== null && JSON.stringify(val) !== JSON.stringify(def)) {
+      result[key] = val;
+    }
+  }
+  return result;
 }
 
 export function detectProviderPreset(provider: LLMProvider | null): ProviderPreset {
@@ -60,7 +106,11 @@ export function detectProviderPreset(provider: LLMProvider | null): ProviderPres
   const config = provider.config ?? {};
   if (typeof config.preset === 'string') {
     const raw = config.preset as string;
-    if (['openai', 'openai_compatible', 'anthropic', 'ollama', 'litellm_proxy', 'custom'].includes(raw)) {
+    // Migrate deprecated 'custom' preset to 'openai_compatible'
+    if (raw === 'custom') {
+      return 'openai_compatible';
+    }
+    if (['openai', 'openai_compatible', 'anthropic', 'ollama', 'litellm_proxy'].includes(raw)) {
       return raw as ProviderPreset;
     }
   }
@@ -82,7 +132,7 @@ export function detectProviderPreset(provider: LLMProvider | null): ProviderPres
   ) {
     return 'openai';
   }
-  return 'custom';
+  return 'openai_compatible';
 }
 
 function readAuthConfig(config: Record<string, unknown>): {
@@ -103,14 +153,29 @@ function readAuthConfig(config: Record<string, unknown>): {
   };
 }
 
+/** Extract unknown config keys into advanced settings KV pairs. */
+function extractAdvancedSettings(config: Record<string, unknown>): AdvancedSetting[] {
+  const settings: AdvancedSetting[] = [];
+  for (const [key, value] of Object.entries(config)) {
+    if (KNOWN_CONFIG_KEYS.has(key)) continue;
+    if (value === undefined || value === null) continue;
+    settings.push({
+      key,
+      value: typeof value === 'string' ? value : JSON.stringify(value)
+    });
+  }
+  return settings;
+}
+
 export function createProviderForm(provider: LLMProvider | null = null): ProviderFormState {
   const preset = detectProviderPreset(provider);
   const config = provider?.config ?? {};
-  const models = Array.isArray(config.models)
-    ? (config.models as Array<Record<string, unknown>>)
-        .map((item) => (typeof item?.model_id === 'string' ? item.model_id : ''))
-        .filter(Boolean)
-    : [];
+
+  // Parse models from config — preserve full model properties
+  const rawModels = Array.isArray(config.models) ? (config.models as Array<Record<string, unknown>>) : [];
+  const models: ModelEntry[] = rawModels
+    .filter((item): item is Record<string, unknown> => typeof item?.model_id === 'string' && item.model_id !== '')
+    .map(parseModelEntry);
 
   const authInfo = readAuthConfig(config);
   const defaultEnvVar = PRESET_ENV_VARS[preset] ?? '';
@@ -139,13 +204,13 @@ export function createProviderForm(provider: LLMProvider | null = null): Provide
               ? 'http://localhost:4000'
               : '',
     default_model: typeof config.default_model === 'string' ? config.default_model : '',
-    additional_models: models.join('\n'),
-    custom_json: JSON.stringify(config, null, 2),
+    models,
     auth_mode: preset === 'ollama' ? 'none' : authInfo.auth_mode,
     auth_env_var: authInfo.auth_env_var || defaultEnvVar,
     auth_secret_name: authInfo.auth_secret_name || `${preset}_api_key`,
     auth_secret_value: '',
     use_responses_api: config.use_responses_api !== false,
+    advanced_settings: extractAdvancedSettings(config),
     discovered_models: []
   };
 }
@@ -167,24 +232,8 @@ export function providerFormToPayload(form: ProviderFormState): Record<string, u
       .filter(([key, value]) => key && value)
   );
 
-  if (form.preset === 'custom') {
-    const config = JSON.parse(form.custom_json || '{}');
-    if (form.location === 'executor' && Object.keys(executorLabels).length > 0) {
-      config.executor_labels = executorLabels;
-    }
-    return {
-      ...(form.provider_id.trim() ? { provider_id: form.provider_id } : {}),
-      display_name: form.display_name,
-      location: form.location,
-      backend: form.backend,
-      status: form.status,
-      config
-    };
-  }
-
-  const modelIds = [form.default_model, ...form.additional_models.split(/\n+/)]
-    .map((value) => value.trim())
-    .filter(Boolean);
+  // Serialize models with full properties (only non-default values)
+  const serializedModels = form.models.map(serializeModelEntry);
 
   const authConfig: Record<string, unknown> =
     form.auth_mode === 'secret'
@@ -193,24 +242,37 @@ export function providerFormToPayload(form: ProviderFormState): Record<string, u
         ? { mode: 'env', env_var: form.auth_env_var }
         : { mode: 'none' };
 
+  // Merge advanced settings into config
+  const advancedConfig: Record<string, unknown> = {};
+  for (const { key, value } of form.advanced_settings) {
+    if (!key.trim()) continue;
+    // Try to parse JSON values, fall back to string
+    try {
+      advancedConfig[key.trim()] = JSON.parse(value);
+    } catch {
+      advancedConfig[key.trim()] = value;
+    }
+  }
+
   return {
     ...(form.provider_id.trim() ? { provider_id: form.provider_id } : {}),
     display_name: form.display_name,
     location: form.location,
     backend: 'litellm',
     status: form.status,
-      config: {
-        preset: form.preset,
-        default_model: form.default_model,
-        models: normalizeModelRows([...new Set(modelIds)]),
-        auth_config: authConfig,
-        use_responses_api: form.use_responses_api,
-        ...(form.location === 'executor' && Object.keys(executorLabels).length > 0
-          ? { executor_labels: executorLabels }
-          : {}),
-        ...(form.base_url ? { base_url: form.base_url, api_base: form.base_url } : {})
-      }
-    };
+    config: {
+      preset: form.preset,
+      default_model: form.default_model,
+      models: serializedModels,
+      auth_config: authConfig,
+      use_responses_api: form.use_responses_api,
+      ...(form.location === 'executor' && Object.keys(executorLabels).length > 0
+        ? { executor_labels: executorLabels }
+        : {}),
+      ...(form.base_url ? { base_url: form.base_url, api_base: form.base_url } : {}),
+      ...advancedConfig
+    }
+  };
 }
 
 export function collectModelOptions(providers: LLMProvider[]): ProviderModelOption[] {
@@ -249,10 +311,23 @@ export function collectModelOptions(providers: LLMProvider[]): ProviderModelOpti
 
 /** Whether the preset needs authentication credentials. */
 export function presetNeedsAuth(preset: ProviderPreset): boolean {
-  return preset !== 'ollama' && preset !== 'custom';
+  return preset !== 'ollama';
 }
 
 /** Whether the preset allows configuring base URL. */
 export function presetHasBaseUrl(preset: ProviderPreset): boolean {
   return preset === 'openai_compatible' || preset === 'ollama' || preset === 'litellm_proxy';
+}
+
+/** Format a token count for display (e.g. 1048576 → "~1M", 128000 → "128k"). */
+export function formatTokenCount(tokens: number): string {
+  if (tokens >= 1_000_000) {
+    const m = tokens / 1_000_000;
+    return m === Math.floor(m) ? `${m}M` : `~${Math.round(m)}M`;
+  }
+  if (tokens >= 1_000) {
+    const k = tokens / 1_000;
+    return k === Math.floor(k) ? `${k}k` : `${k.toFixed(1)}k`;
+  }
+  return String(tokens);
 }

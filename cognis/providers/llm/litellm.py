@@ -38,6 +38,8 @@ from cognis.store.models import ModelRouting
 logger = get_logger(__name__)
 
 MODEL_CACHE_TTL_SECONDS = 60.0
+PROXY_MODEL_INFO_CACHE_TTL = 300.0  # 5 minutes for successful proxy /model/info fetches
+PROXY_MODEL_INFO_NEGATIVE_TTL = 30.0  # 30 seconds negative cache for failures
 SAFE_PROVIDER_KWARGS = {"api_base", "api_version", "base_url", "max_retries", "timeout"}
 
 # Preset-to-litellm model prefix mapping.  LiteLLM uses the prefix to
@@ -137,6 +139,48 @@ def _model_dump(value: Any) -> dict[str, Any]:
     return {}
 
 
+def _normalize_proxy_model_info(info: dict[str, Any]) -> dict[str, Any]:
+    """Convert litellm proxy ``model_info`` fields to Cognis ``ModelInfo`` fields.
+
+    The litellm proxy ``/model/info`` endpoint returns a dict per model with
+    keys like ``max_input_tokens``, ``supports_function_calling``, etc.  This
+    helper maps them to the field names used by :class:`ModelInfo`.
+    """
+    normalized: dict[str, Any] = {}
+    # Context / output limits
+    if info.get("max_input_tokens"):
+        normalized["context_window"] = int(info["max_input_tokens"])
+    elif info.get("max_tokens"):
+        normalized["context_window"] = int(info["max_tokens"])
+    if info.get("max_output_tokens"):
+        normalized["max_output_tokens"] = int(info["max_output_tokens"])
+    # Capability flags
+    if "supports_function_calling" in info:
+        normalized["supports_tools"] = bool(info["supports_function_calling"])
+    if "supports_vision" in info:
+        normalized["supports_vision"] = bool(info["supports_vision"])
+    if "supports_audio_input" in info:
+        normalized["supports_audio_input"] = bool(info["supports_audio_input"])
+    if "supports_pdf_input" in info:
+        normalized["supports_pdf_input"] = bool(info["supports_pdf_input"])
+    if "supports_reasoning" in info:
+        normalized["supports_reasoning"] = bool(info["supports_reasoning"])
+    if "supports_prompt_caching" in info:
+        normalized["supports_prompt_caching"] = bool(info["supports_prompt_caching"])
+    if "supports_tool_choice" in info and info.get("supports_function_calling"):
+        normalized["supports_tools"] = True
+    # Cost conversion: per-token → per-million-tokens (rounded to avoid float drift)
+    if "input_cost_per_token" in info and info["input_cost_per_token"] is not None:
+        normalized["input_cost_per_mtok"] = round(
+            float(info["input_cost_per_token"]) * 1_000_000, 6
+        )
+    if "output_cost_per_token" in info and info["output_cost_per_token"] is not None:
+        normalized["output_cost_per_mtok"] = round(
+            float(info["output_cost_per_token"]) * 1_000_000, 6
+        )
+    return normalized
+
+
 class LiteLLMProvider:
     """Load provider/model config from DB and route through LiteLLM."""
 
@@ -152,6 +196,7 @@ class LiteLLMProvider:
         self._cache_lock = asyncio.Lock()
         self._resolved_model_cache: dict[str, tuple[str, float]] = {}
         self._model_info_cache: dict[str, tuple[ModelInfo, float]] = {}
+        self._proxy_model_info_cache: dict[str, tuple[dict[str, dict[str, Any]], float]] = {}
 
     async def resolve_model(
         self, explicit_model: str | None = None, task_type: str = "default"
@@ -233,13 +278,95 @@ class LiteLLMProvider:
         await self._set_cached_model_info(model_id, DEFAULT_MODEL_INFO)
         return DEFAULT_MODEL_INFO
 
+    async def enrich_model_info(
+        self,
+        model_id: str,
+        *,
+        provider_id: str | None = None,
+        preset: str | None = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
+    ) -> ModelInfo:
+        """Enrich a model ID with metadata from a provider and/or litellm.
+
+        Can be called with either ``provider_id`` (for saved providers) or
+        ``preset``/``base_url``/``api_key`` (for preview mode before the
+        provider is saved).
+        """
+        if provider_id is not None:
+            async with self.session_factory() as session:
+                provider = await session.get(LLMProviderRow, provider_id)
+            if provider is None:
+                raise ValueError(f"Provider {provider_id!r} not found")
+            return await self._merge_litellm_model_info(
+                model_id, provider, {}, api_key_override=api_key
+            )
+
+        # Preview mode: construct a temporary provider row so the merge
+        # chain can resolve preset, base_url, and model prefix correctly.
+        temp_config: dict[str, Any] = {}
+        if preset:
+            temp_config["preset"] = preset
+        if base_url:
+            temp_config["base_url"] = base_url
+            temp_config["api_base"] = base_url
+        temp_provider = LLMProviderRow(
+            provider_id="__preview__",
+            display_name="Preview",
+            location="controller",
+            backend="litellm",
+            config=temp_config,
+            status="active",
+        )
+        return await self._merge_litellm_model_info(
+            model_id, temp_provider, {}, api_key_override=api_key
+        )
+
+    async def find_provider_for_model(self, model_id: str) -> str | None:
+        """Return the ``provider_id`` that owns *model_id*, or ``None``.
+
+        Returns ``None`` when the model exists in multiple providers to
+        avoid silently pinning routing to an arbitrary provider.
+        """
+        async with self.session_factory() as session:
+            rows = (await session.execute(select(LLMProviderRow))).scalars().all()
+        matches: list[str] = []
+        for row in rows:
+            config = dict(row.config)
+            if config.get("default_model") == model_id:
+                matches.append(row.provider_id)
+                continue
+            row_models = config.get("models", [])
+            if isinstance(row_models, list):
+                for model in row_models:
+                    if isinstance(model, dict) and model.get("model_id") == model_id:
+                        matches.append(row.provider_id)
+                        break
+        if len(matches) == 1:
+            return matches[0]
+        return None  # ambiguous or not found
+
     async def _merge_litellm_model_info(
         self,
         model_id: str,
         provider: LLMProviderRow | None,
         configured: dict[str, Any],
+        *,
+        api_key_override: str | None = None,
     ) -> ModelInfo:
+        """Build a :class:`ModelInfo` by merging multiple metadata sources.
+
+        Merge order (later wins):
+        ``DEFAULT_MODEL_INFO`` → capability defaults → litellm static →
+        **proxy /model/info** → user-configured overrides from DB.
+
+        ``api_key_override`` is used in preview mode where the API key is
+        not yet persisted in the provider's ``auth_config``.
+        """
         merged: dict[str, Any] = dict(DEFAULT_MODEL_INFO.model_dump())
+        preset = (
+            str(dict(provider.config).get("preset", "")).lower() if provider is not None else ""
+        )
         try:
             provider_kwargs = await self._resolve_provider_kwargs(provider)
             capability_defaults = self._infer_model_capabilities(model_id, provider)
@@ -295,6 +422,23 @@ class LiteLLMProvider:
                 extra={"extra_data": {"model_id": model_id}},
                 exc_info=True,
             )
+
+        # For litellm_proxy preset, fetch live metadata from the proxy's
+        # /model/info endpoint.  This overrides the (potentially stale)
+        # litellm static data but is itself overridden by user-configured
+        # values from the DB.
+        if preset == "litellm_proxy" and provider is not None:
+            prov_config = dict(provider.config)
+            proxy_base = prov_config.get("base_url") or prov_config.get("api_base") or ""
+            proxy_key = api_key_override or (await self._resolve_provider_kwargs(provider)).get(
+                "api_key", ""
+            )
+            if proxy_base:
+                proxy_info_map = await self._fetch_proxy_model_info(proxy_base, proxy_key)
+                proxy_info = proxy_info_map.get(model_id, {})
+                if proxy_info:
+                    merged.update(proxy_info)
+
         merged.update(configured)
         merged["model_id"] = model_id
         return ModelInfo.model_validate(merged)
@@ -647,17 +791,47 @@ class LiteLLMProvider:
                     {"model_id": "claude-opus-4-20250514", "name": "Claude Opus 4"},
                 ]
 
-            # OpenAI-compatible (incl. litellm_proxy): GET /v1/models
+            # litellm_proxy: prefer /model/info for enriched metadata
+            if preset == "litellm_proxy":
+                proxy_url = base_url.rstrip("/") if base_url else "http://localhost:4000"
+                try:
+                    proxy_info_map = await self._fetch_proxy_model_info(
+                        proxy_url, api_key, bypass_cache=True
+                    )
+                    if proxy_info_map:
+                        return [
+                            {"model_id": name, "name": name, **info}
+                            for name, info in proxy_info_map.items()
+                        ]
+                except Exception:
+                    logger.debug(
+                        "Proxy /model/info failed during discovery, falling back to /v1/models",
+                        exc_info=True,
+                    )
+                # Fall through to /v1/models below
+
+            # OpenAI-compatible (incl. litellm_proxy fallback): GET /v1/models
             openai_url = base_url.rstrip("/") if base_url else "https://api.openai.com"
             response = await client.get(f"{openai_url}/v1/models", headers=headers)
             response.raise_for_status()
             data = response.json()
-            models = data.get("data", [])
-            return [
-                {"model_id": m.get("id", ""), "name": m.get("id", "")}
-                for m in models
-                if isinstance(m, dict) and m.get("id")
-            ]
+            raw_models = data.get("data", [])
+
+            # Enrich each model with litellm static metadata when available
+            enriched: list[dict[str, Any]] = []
+            for m in raw_models:
+                if not isinstance(m, dict) or not m.get("id"):
+                    continue
+                mid = str(m["id"])
+                entry: dict[str, Any] = {"model_id": mid, "name": mid}
+                try:
+                    live = litellm.get_model_info(model=mid)
+                    if isinstance(live, dict):
+                        entry.update(_normalize_proxy_model_info(live))
+                except Exception:
+                    pass
+                enriched.append(entry)
+            return enriched
 
     async def get_cost(self, usage: TokenUsage, model: str) -> Cost:
         return Cost(
@@ -941,6 +1115,92 @@ class LiteLLMProvider:
                 model_info,
                 monotonic() + MODEL_CACHE_TTL_SECONDS,
             )
+
+    # ------------------------------------------------------------------
+    # Proxy model info fetching
+    # ------------------------------------------------------------------
+
+    async def _fetch_proxy_model_info(
+        self,
+        base_url: str,
+        api_key: str,
+        *,
+        bypass_cache: bool = False,
+    ) -> dict[str, dict[str, Any]]:
+        """Fetch model metadata from a litellm proxy ``/model/info`` endpoint.
+
+        Returns a dict mapping ``model_name`` → normalised model info dict.
+        Results are cached in-memory with a 5-minute TTL keyed by
+        ``base_url``.  Failures are negatively cached for 30 seconds to
+        avoid repeated timeouts on the hot path.
+
+        Pass ``bypass_cache=True`` (e.g. during explicit discovery) to
+        force a fresh fetch.
+        """
+        import httpx
+
+        cache_key = base_url.rstrip("/")
+
+        if not bypass_cache:
+            async with self._cache_lock:
+                cached = self._proxy_model_info_cache.get(cache_key)
+                if cached is not None:
+                    value, expires_at = cached
+                    if expires_at >= monotonic():
+                        return value
+                    self._proxy_model_info_cache.pop(cache_key, None)
+
+        headers: dict[str, str] = {}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                response = await client.get(f"{cache_key}/model/info", headers=headers)
+                response.raise_for_status()
+                data = response.json()
+        except Exception:
+            logger.warning(
+                "Failed to fetch proxy model info",
+                extra={
+                    "extra_data": {"base_url": re.sub(r"://[^@/]+@", "://[redacted]@", cache_key)}
+                },
+                exc_info=True,
+            )
+            # Negative cache: store empty dict for 30 s to avoid repeated
+            # timeouts on the hot path.
+            async with self._cache_lock:
+                self._proxy_model_info_cache[cache_key] = (
+                    {},
+                    monotonic() + PROXY_MODEL_INFO_NEGATIVE_TTL,
+                )
+            return {}
+
+        result: dict[str, dict[str, Any]] = {}
+        for entry in data.get("data", []):
+            model_name = entry.get("model_name", "")
+            if not model_name:
+                continue
+            info = entry.get("model_info", {})
+            if not isinstance(info, dict):
+                continue
+            result[model_name] = _normalize_proxy_model_info(info)
+
+        async with self._cache_lock:
+            self._proxy_model_info_cache[cache_key] = (
+                result,
+                monotonic() + PROXY_MODEL_INFO_CACHE_TTL,
+            )
+        logger.info(
+            "Populated proxy model info cache",
+            extra={
+                "extra_data": {
+                    "base_url": re.sub(r"://[^@/]+@", "://[redacted]@", cache_key),
+                    "model_count": len(result),
+                }
+            },
+        )
+        return result
 
     # ------------------------------------------------------------------
     # Executor-side inference routing

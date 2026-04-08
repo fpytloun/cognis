@@ -27,6 +27,7 @@ import type {
   IntarisMCPServer,
   IntarisSessionDetail,
   LLMProvider,
+  ModelEntry,
   MCPServerConfigResponse,
   MCPServerCreateRequest,
   MCPServerTestResponse,
@@ -933,8 +934,8 @@ export const api = {
       });
     },
 
-    discoverModels(providerId: string): Promise<{ provider_id: string; models: Array<{ model_id: string; name: string }> }> {
-      return request<{ provider_id: string; models: Array<{ model_id: string; name: string }> }>(`/api/v1/llm-providers/${providerId}/discover-models`, {
+    discoverModels(providerId: string): Promise<{ provider_id: string; models: ModelEntry[] }> {
+      return request<{ provider_id: string; models: ModelEntry[] }>(`/api/v1/llm-providers/${providerId}/discover-models`, {
         method: 'POST'
       });
     },
@@ -949,8 +950,29 @@ export const api = {
       api_key?: string;
       secret_name?: string;
       env_var?: string;
-    }): Promise<{ models: Array<{ model_id: string; name: string }> }> {
-      return request<{ models: Array<{ model_id: string; name: string }> }>('/api/v1/llm-providers/discover-models-preview', {
+    }): Promise<{ models: ModelEntry[] }> {
+      return request<{ models: ModelEntry[] }>('/api/v1/llm-providers/discover-models-preview', {
+        method: 'POST',
+        body: JSON.stringify(payload)
+      });
+    },
+
+    enrichModels(providerId: string, modelIds: string[]): Promise<{ models: ModelEntry[] }> {
+      return request<{ models: ModelEntry[] }>(`/api/v1/llm-providers/${providerId}/enrich-models`, {
+        method: 'POST',
+        body: JSON.stringify({ model_ids: modelIds })
+      });
+    },
+
+    enrichModelsPreview(payload: {
+      preset: string;
+      base_url: string;
+      model_ids: string[];
+      api_key?: string;
+      secret_name?: string;
+      env_var?: string;
+    }): Promise<{ models: ModelEntry[] }> {
+      return request<{ models: ModelEntry[] }>('/api/v1/llm-providers/enrich-models-preview', {
         method: 'POST',
         body: JSON.stringify(payload)
       });

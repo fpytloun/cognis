@@ -788,6 +788,56 @@ export interface SettingsCategory {
   items: Setting[];
 }
 
+export interface ModelEntry {
+  model_id: string;
+  display_name?: string;
+  context_window: number;
+  max_output_tokens: number;
+  supports_tools: boolean;
+  supports_streaming: boolean;
+  supports_vision: boolean;
+  supports_audio_input: boolean;
+  supports_pdf_input: boolean;
+  supports_file_input: boolean;
+  supports_reasoning: boolean;
+  reasoning_efforts: string[];
+  supports_prompt_caching: boolean;
+  supports_tool_search: boolean;
+  supports_defer_loading: boolean;
+  supports_responses_api: boolean;
+  supports_extended_thinking: boolean;
+  supports_image_generation: boolean;
+  supported_openai_params: string[];
+  max_tools?: number;
+  input_cost_per_mtok?: number;
+  output_cost_per_mtok?: number;
+  tier: string;
+}
+
+export function defaultModelEntry(modelId: string): ModelEntry {
+  return {
+    model_id: modelId,
+    context_window: 128000,
+    max_output_tokens: 16384,
+    supports_tools: true,
+    supports_streaming: true,
+    supports_vision: false,
+    supports_audio_input: false,
+    supports_pdf_input: false,
+    supports_file_input: false,
+    supports_reasoning: false,
+    reasoning_efforts: [],
+    supports_prompt_caching: false,
+    supports_tool_search: false,
+    supports_defer_loading: false,
+    supports_responses_api: false,
+    supports_extended_thinking: false,
+    supports_image_generation: false,
+    supported_openai_params: [],
+    tier: 'standard'
+  };
+}
+
 export interface LLMProvider {
   provider_id: string;
   display_name: string;
@@ -798,7 +848,7 @@ export interface LLMProvider {
   status: string;
   created_at: string | null;
   updated_at: string | null;
-  models: Array<Record<string, unknown>>;
+  models: ModelEntry[];
   last_test: ProviderTestResult | null;
 }
 

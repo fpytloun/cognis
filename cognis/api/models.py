@@ -398,6 +398,23 @@ class ModelRoutingUpdateRequest(BaseModel):
     items: dict[str, str] = Field(default_factory=dict)
 
 
+class EnrichModelsRequest(BaseModel):
+    """Request body for enriching model IDs with provider metadata."""
+
+    model_ids: list[str] = Field(max_length=50)
+
+
+class EnrichModelsPreviewRequest(BaseModel):
+    """Request body for enriching model IDs without a saved provider."""
+
+    model_ids: list[str] = Field(max_length=50)
+    preset: str = ""
+    base_url: str = ""
+    api_key: str | None = None
+    secret_name: str | None = None
+    env_var: str | None = None
+
+
 class PendingPauseResponse(BaseModel):
     pause_id: str
     pause_type: str

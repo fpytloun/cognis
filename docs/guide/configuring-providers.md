@@ -6,18 +6,19 @@ Providers tell Cognis which model backends are available for chat, routing, clas
 
 Open `Settings` and use the providers and routing sections.
 
-Provider configuration is stored in the Cognis database. You usually do not need to edit raw JSON unless you are using the custom preset.
+Provider configuration is stored in the Cognis database. All provider settings are managed through structured UI forms.
 
 ## Supported presets
 
-The UI currently includes guided forms for:
+The UI includes guided forms for:
 
 - **OpenAI** for direct OpenAI API access
 - **OpenAI Compatible** for APIs that follow the OpenAI chat format
 - **Anthropic** for direct Anthropic API access
 - **Ollama** for local Ollama deployments
 - **LiteLLM Proxy** for a LiteLLM proxy that performs routing upstream
-- **Custom** for manual configuration
+
+For provider-specific settings not covered by the structured fields (e.g., Azure `api_version`), use the collapsible **Advanced settings** section to add key-value pairs.
 
 ## Common provider choices
 
@@ -48,6 +49,30 @@ Some providers can run on the controller, while others can be routed through an 
 - the model endpoint is only reachable from a remote executor
 - inference should stay on a user-local machine
 - you want tool execution and model access to share the same remote environment
+
+## Managing models
+
+Each provider has a list of configured models with their properties (context window, output limits, capabilities, and costs).
+
+### Discovering models
+
+Click **Discover** to query the provider for available models. For LiteLLM Proxy providers, Cognis fetches enriched metadata from the proxy's `/model/info` endpoint, including accurate context window sizes, capability flags, and pricing. For other providers, models are enriched with litellm's built-in model database.
+
+Discovered models appear in a selection modal where you can choose which to add. You can also add models manually by typing a model ID.
+
+### Editing model properties
+
+Each configured model shows its properties (context window, max output tokens, capabilities, costs). Click **Edit** to override any property. User-configured overrides always take precedence over auto-detected values.
+
+This is particularly useful when:
+
+- the auto-detected context window is incorrect or outdated
+- you want to restrict capabilities for a specific model
+- you need to set custom pricing for cost tracking
+
+### Default model
+
+Select one configured model as the default. This is the model used when no explicit model is specified in routing or agent configuration.
 
 ## Testing a provider
 
