@@ -123,7 +123,7 @@ async def create_schedule_route(
 ) -> ScheduleResponse:
     """Create a new schedule."""
     user = require_current_user(request)
-    forbid_mutation_for_viewer(user)
+    forbid_mutation_for_viewer(request)
 
     # Validate agent exists and belongs to user
     async with request.app.state.session_factory() as db:
@@ -214,7 +214,7 @@ async def update_schedule_route(
 ) -> ScheduleResponse:
     """Update a schedule."""
     user = require_current_user(request)
-    forbid_mutation_for_viewer(user)
+    forbid_mutation_for_viewer(request)
 
     async with request.app.state.session_factory() as db:
         existing = await get_schedule(db, schedule_id)
@@ -258,7 +258,7 @@ async def delete_schedule_route(
 ) -> None:
     """Delete a schedule."""
     user = require_current_user(request)
-    forbid_mutation_for_viewer(user)
+    forbid_mutation_for_viewer(request)
 
     async with request.app.state.session_factory() as db:
         existing = await get_schedule(db, schedule_id)
@@ -280,7 +280,7 @@ async def trigger_schedule_route(
 ) -> ScheduleResponse:
     """Fire a schedule immediately (create a task now)."""
     user = require_current_user(request)
-    forbid_mutation_for_viewer(user)
+    forbid_mutation_for_viewer(request)
 
     async with request.app.state.session_factory() as db:
         row = await get_schedule(db, schedule_id)
@@ -309,7 +309,7 @@ async def enable_schedule_route(
 ) -> ScheduleResponse:
     """Enable a schedule."""
     user = require_current_user(request)
-    forbid_mutation_for_viewer(user)
+    forbid_mutation_for_viewer(request)
 
     async with request.app.state.session_factory() as db:
         existing = await get_schedule(db, schedule_id)
@@ -338,7 +338,7 @@ async def disable_schedule_route(
 ) -> ScheduleResponse:
     """Disable a schedule."""
     user = require_current_user(request)
-    forbid_mutation_for_viewer(user)
+    forbid_mutation_for_viewer(request)
 
     async with request.app.state.session_factory() as db:
         existing = await get_schedule(db, schedule_id)
