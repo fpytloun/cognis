@@ -217,7 +217,7 @@ class ContextAssembler:
 
         async with session_factory() as db_session:
             max_context_tokens = await get_setting_value(
-                db_session, "session.max_context_tokens", 128000
+                db_session, "session.max_context_tokens", 250000
             )
             compaction_threshold = await get_setting_value(
                 db_session, "session.compaction_threshold", 0.85
@@ -230,7 +230,7 @@ class ContextAssembler:
             session_manager=session_manager,
             max_context_tokens=int(max_context_tokens)
             if isinstance(max_context_tokens, int)
-            else 128000,
+            else 250000,
             compaction_threshold=float(compaction_threshold)
             if isinstance(compaction_threshold, (int, float))
             else 0.85,

@@ -39,7 +39,7 @@ class ModelInfo(BaseModel):
 
     model_id: str
     display_name: str | None = None
-    context_window: int = 128000
+    context_window: int = 250000
     max_output_tokens: int = 16384
     supports_tools: bool = True
     supports_streaming: bool = True

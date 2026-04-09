@@ -23,7 +23,7 @@ from cognis.store.queries import count_users, create_user, get_setting, upsert_s
 logger = get_logger(__name__)
 
 DEFAULT_SETTINGS: Final[dict[str, tuple[str, object]]] = {
-    "session.max_context_tokens": ("session", 128000),
+    "session.max_context_tokens": ("session", 250000),
     "session.compaction_threshold": ("session", 0.85),
     "session.compaction_preserve_turns": ("session", 10),
     "session.max_tool_calls_per_turn": ("session", 50),
@@ -493,6 +493,12 @@ async def seed_default_settings(session: AsyncSession) -> None:
     for key, (category, value) in DEFAULT_SETTINGS.items():
         existing = await get_setting(session, key)
         if existing is None:
+            await upsert_setting(session, key=key, value=value, category=category)
+            continue
+
+        # Upgrade the legacy default context cap from 128k to 250k while
+        # preserving any user-customised value.
+        if key == "session.max_context_tokens" and existing.value == 128000 and value == 250000:
             await upsert_setting(session, key=key, value=value, category=category)
 
 

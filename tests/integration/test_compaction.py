@@ -107,7 +107,7 @@ def test_compaction_triggers_after_threshold_crossed(live_stack: LiveStack, run_
     # Step 5: Restore settings
     live.put(
         "/api/v1/settings/session.max_context_tokens",
-        json={"value": 128000},
+        json={"value": 250000},
     )
     live.put(
         "/api/v1/settings/session.compaction_threshold",

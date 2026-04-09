@@ -64,6 +64,66 @@ async def test_bootstrap_does_not_overwrite_existing_settings(
 
 
 @pytest.mark.asyncio
+async def test_bootstrap_upgrades_legacy_default_context_cap(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    """Legacy default 128k context cap is upgraded to the new 250k default."""
+    monkeypatch.setenv("COGNIS_DATA_DIR", str(tmp_path))  # type: ignore[attr-defined]
+    config = load_config()
+    password_hasher = create_password_hasher()
+
+    _, engine, session_factory, _ = await bootstrap_runtime(config, password_hasher)
+
+    async with session_factory() as session:
+        await upsert_setting(
+            session,
+            key="session.max_context_tokens",
+            value=128000,
+            category="session",
+        )
+        await session.commit()
+
+    _, engine2, session_factory2, _ = await bootstrap_runtime(config, password_hasher)
+
+    async with session_factory2() as session:
+        setting = await get_setting(session, "session.max_context_tokens")
+        assert setting is not None
+        assert setting.value == 250000
+
+    await engine.dispose()
+    await engine2.dispose()
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_preserves_custom_context_cap(monkeypatch: object, tmp_path: Path) -> None:
+    """Non-default custom context caps are preserved across bootstrap."""
+    monkeypatch.setenv("COGNIS_DATA_DIR", str(tmp_path))  # type: ignore[attr-defined]
+    config = load_config()
+    password_hasher = create_password_hasher()
+
+    _, engine, session_factory, _ = await bootstrap_runtime(config, password_hasher)
+
+    async with session_factory() as session:
+        await upsert_setting(
+            session,
+            key="session.max_context_tokens",
+            value=180000,
+            category="session",
+        )
+        await session.commit()
+
+    _, engine2, session_factory2, _ = await bootstrap_runtime(config, password_hasher)
+
+    async with session_factory2() as session:
+        setting = await get_setting(session, "session.max_context_tokens")
+        assert setting is not None
+        assert setting.value == 180000
+
+    await engine.dispose()
+    await engine2.dispose()
+
+
+@pytest.mark.asyncio
 async def test_bootstrap_fails_fast_with_require_external_crypto(
     monkeypatch: object, tmp_path: Path
 ) -> None:

@@ -285,11 +285,19 @@ class CommandDispatcher:
                 text="Context usage: no data yet (send a message first).",
             )
 
-        lines = [
-            f"Context: {usage['prompt_tokens']:,} / {usage['max_context_tokens']:,} tokens ({usage['percentage']}%)",
-            f"Model: {usage['model']}",
-            f"Compaction threshold: {int(self._compaction_strategy.compaction_threshold * 100)}%",
-        ]
+        lines = [f"Model: {usage['model']}"]
+        try:
+            model_info = await self._providers.llm.get_model_info(usage["model"])
+            lines.append(f"Model context window: {model_info.context_window:,} tokens")
+        except Exception:
+            pass
+        lines.extend(
+            [
+                f"Session configured cap: {usage['max_context_tokens']:,} tokens",
+                f"Current usage: {usage['prompt_tokens']:,} tokens ({usage['percentage']}% of session cap)",
+                f"Compaction threshold: {int(self._compaction_strategy.compaction_threshold * 100)}%",
+            ]
+        )
         return CommandResult(type="system_message", text="\n".join(lines))
 
     async def _handle_info(self, session: SessionModel) -> CommandResult:
@@ -305,8 +313,14 @@ class CommandDispatcher:
         usage = self._session_cache.get_context_usage(session.session_id)
         if usage:
             lines.append(f"Model: {usage['model']}")
+            try:
+                model_info = await self._providers.llm.get_model_info(usage["model"])
+                lines.append(f"Model context window: {model_info.context_window:,} tokens")
+            except Exception:
+                pass
+            lines.append(f"Session configured cap: {usage['max_context_tokens']:,} tokens")
             lines.append(
-                f"Context: {usage['prompt_tokens']:,} / {usage['max_context_tokens']:,} tokens ({usage['percentage']}%)"
+                f"Current usage: {usage['prompt_tokens']:,} tokens ({usage['percentage']}% of session cap)"
             )
         reasoning = self._session_cache.get_reasoning_effort_override(session.session_id)
         if reasoning:
