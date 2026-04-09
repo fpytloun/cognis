@@ -47,6 +47,7 @@ SIGNAL_META = ChannelMeta(
         supports_reactions=True,
         supports_read_receipts=True,
         supports_media=True,
+        supports_markdown=True,
         max_message_length=10000,
     ),
     credential_fields=[

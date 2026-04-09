@@ -783,6 +783,25 @@ class ChannelTurnObserver:
         if resolved_adapter is None:
             return
 
+        if self._channel_type == "signal":
+            with contextlib.suppress(Exception):
+                await resolved_adapter.send_message(
+                    OutboundMessage(
+                        channel_type=self._channel_type,
+                        account_id=self._account_id,
+                        chat_id=self._chat_id,
+                        content=text,
+                        reply_to_id=self._reply_to_id,
+                        thread_id=self._thread_id,
+                    )
+                )
+                CHANNEL_OUTBOUND_TOTAL.labels(
+                    channel_type=self._channel_type,
+                    account_id=self._account_id,
+                ).inc()
+                self._reply_to_id = None
+            return
+
         chunks = format_for_channel(text, resolved_adapter.capabilities)
         for chunk in chunks:
             with contextlib.suppress(Exception):

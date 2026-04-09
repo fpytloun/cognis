@@ -678,6 +678,64 @@ class TestDirectSendBehavior:
         called_params = mock_runtime.request.await_args.args[1]
         assert "quoteTimestamp" not in called_params
 
+    @pytest.mark.asyncio
+    async def test_direct_send_formats_markdown_into_text_styles(self) -> None:
+        adapter = SignalAdapter()
+        adapter._signal_config = _SignalConfig(
+            {"transport": "direct_jsonrpc"},
+            {"account_number": "+1"},
+        )
+        adapter._account_number = "+1"
+
+        mock_runtime = MagicMock()
+        mock_runtime.is_running = True
+        mock_runtime.single_account_mode = True
+        mock_runtime.request = AsyncMock(return_value={"timestamp": 12345})
+        adapter._runtime = mock_runtime
+
+        message = OutboundMessage(
+            channel_type="signal",
+            account_id="acct-1",
+            chat_id="+420111222333",
+            content="# Heading\n\n**Bold** and `code`",
+        )
+
+        result = await adapter.send_message(message)
+
+        assert result == "12345"
+        called_params = mock_runtime.request.await_args.args[1]
+        assert called_params["message"] == "Heading\n\nBold and code"
+        assert called_params["textStyle"] == ["0:7:BOLD", "9:4:BOLD", "18:4:MONOSPACE"]
+
+
+class TestRestSendBehavior:
+    @pytest.mark.asyncio
+    async def test_rest_send_uses_signal_styled_text_mode(self) -> None:
+        adapter = SignalAdapter()
+        adapter._signal_config = _SignalConfig({}, {"account_number": "+1"})
+        adapter._account_number = "+1"
+
+        client = AsyncMock()
+        response = MagicMock()
+        response.json.return_value = {"timestamp": "999"}
+        response.raise_for_status.return_value = None
+        client.post = AsyncMock(return_value=response)
+        adapter._client = client
+
+        message = OutboundMessage(
+            channel_type="signal",
+            account_id="acct-1",
+            chat_id="+420111222333",
+            content="# Heading\n\n**Bold** and `code`",
+        )
+
+        result = await adapter.send_message(message)
+
+        assert result == "999"
+        payload = client.post.await_args.kwargs["json"]
+        assert payload["message"] == "**Heading**\n\n**Bold** and `code`"
+        assert payload["text_mode"] == "styled"
+
 
 class TestDirectRuntimeFatalFailures:
     @pytest.mark.asyncio

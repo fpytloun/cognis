@@ -31,9 +31,9 @@ from cognis.channels.adapters.signal_cli_runtime import (
     SignalCliRuntime,
     SignalCliRuntimeError,
 )
-from cognis.channels.protocol import BaseChannelAdapter
-from cognis.channels.protocol import NonRetryableChannelError
+from cognis.channels.protocol import BaseChannelAdapter, NonRetryableChannelError
 from cognis.channels.registry import SIGNAL_META
+from cognis.channels.signal_formatting import format_for_signal, to_signal_text_styles
 from cognis.logging import get_logger
 from cognis.models.channel import (
     AgentProfile,
@@ -318,9 +318,35 @@ class SignalAdapter(BaseChannelAdapter):
 
     async def send_message(self, message: OutboundMessage) -> str | None:
         """Send a message via the active transport."""
-        if self._signal_config and self._signal_config.is_direct:
-            return await self._send_direct(message)
-        return await self._send_rest(message)
+        chunks = format_for_signal(message.content, self.capabilities.max_message_length)
+        if not chunks:
+            chunks = []
+
+        if not chunks and not message.media:
+            return None
+
+        last_message_id: str | None = None
+        for index, chunk in enumerate(chunks or [None]):
+            chunk_message = message.model_copy(
+                update={
+                    "content": chunk.plain_text if chunk is not None else message.content,
+                    "platform_data": {
+                        **message.platform_data,
+                        "signal_markdown_text": chunk.markdown_text
+                        if chunk is not None
+                        else message.content,
+                        "signal_text_styles": to_signal_text_styles(chunk.plain_text, chunk.styles)
+                        if chunk is not None
+                        else [],
+                    },
+                    "media": message.media if index == 0 else [],
+                }
+            )
+            if self._signal_config and self._signal_config.is_direct:
+                last_message_id = await self._send_direct(chunk_message)
+            else:
+                last_message_id = await self._send_rest(chunk_message)
+        return last_message_id
 
     async def _send_rest(self, message: OutboundMessage) -> str | None:
         """Send via REST API."""
@@ -328,10 +354,13 @@ class SignalAdapter(BaseChannelAdapter):
             return None
 
         payload: dict[str, Any] = {
-            "message": message.content,
+            "message": message.platform_data.get("signal_markdown_text", message.content),
             "number": self._account_number,
             "recipients": [message.chat_id],
         }
+
+        if payload["message"]:
+            payload["text_mode"] = "styled"
 
         if message.reply_to_id:
             payload["quote_timestamp"] = message.reply_to_id
@@ -368,6 +397,10 @@ class SignalAdapter(BaseChannelAdapter):
                 "recipient": [message.chat_id],
             }
         )
+
+        text_styles = message.platform_data.get("signal_text_styles")
+        if isinstance(text_styles, list) and text_styles:
+            params["textStyle"] = text_styles
 
         if message.reply_to_id:
             logger.debug(

@@ -123,6 +123,29 @@ class ChannelDeliveryService:
 
         adapter, config = result
 
+        if channel_type == "signal":
+            try:
+                await adapter.send_message(
+                    OutboundMessage(
+                        channel_type=channel_type,
+                        account_id=account_id,
+                        chat_id=chat_id,
+                        content=content,
+                        thread_id=thread_id,
+                    )
+                )
+                CHANNEL_OUTBOUND_TOTAL.labels(
+                    channel_type=channel_type,
+                    account_id=account_id,
+                ).inc()
+                return "sent"
+            except Exception:
+                CHANNEL_DELIVERY_ERRORS.labels(
+                    channel_type=channel_type,
+                    account_id=account_id,
+                ).inc()
+                return "failed"
+
         # Format for channel
         chunks = format_for_channel(content, adapter.capabilities)
 
