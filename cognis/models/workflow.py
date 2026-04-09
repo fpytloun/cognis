@@ -179,6 +179,7 @@ class StepOutput(BaseModel):
     completed_at: datetime | None = None
     session_id: str | None = None
     intaris_session_id: str | None = None
+    attachments: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class StepEvaluation(BaseModel):

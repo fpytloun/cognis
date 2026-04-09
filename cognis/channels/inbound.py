@@ -696,29 +696,27 @@ class ChannelTurnObserver:
                             )
                         )
 
-        # Send remaining buffered text response
-        if self._accumulated_text:
-            await self._send_text(self._accumulated_text, adapter=adapter)
-            self._accumulated_text = ""
+        content = self._accumulated_text
+        self._accumulated_text = ""
+        if not content and not outbound_media:
+            return
 
-        # Send outbound media attachments
-        for media in outbound_media:
-            with contextlib.suppress(Exception):
-                await adapter.send_message(
-                    OutboundMessage(
-                        channel_type=self._channel_type,
-                        account_id=self._account_id,
-                        chat_id=self._chat_id,
-                        content="",
-                        reply_to_id=self._reply_to_id,
-                        thread_id=self._thread_id,
-                        media=[media],
-                    )
-                )
-                CHANNEL_OUTBOUND_TOTAL.labels(
+        with contextlib.suppress(Exception):
+            await adapter.send_message(
+                OutboundMessage(
                     channel_type=self._channel_type,
                     account_id=self._account_id,
-                ).inc()
+                    chat_id=self._chat_id,
+                    content=content,
+                    reply_to_id=self._reply_to_id,
+                    thread_id=self._thread_id,
+                    media=outbound_media,
+                )
+            )
+            CHANNEL_OUTBOUND_TOTAL.labels(
+                channel_type=self._channel_type,
+                account_id=self._account_id,
+            ).inc()
 
     async def on_turn_error(self, conversation_id: str, error: Any) -> None:
         """Send error message to the channel."""

@@ -7,6 +7,7 @@ Routed via ToolRoute.IMAGE in the tool router.
 from __future__ import annotations
 
 import json
+import mimetypes
 from typing import Any
 
 import httpx
@@ -14,6 +15,7 @@ import httpx
 from cognis.models.config import ImageGenerationResult
 from cognis.models.tool import ToolDefinition, ToolResult, ToolSource
 from cognis.runtime_context import current_user_email
+from cognis.tools.argument_normalization import strip_empty_optional_values
 
 _SOURCE = ToolSource(type="builtin")
 
@@ -125,6 +127,7 @@ async def handle_image_tool(
     available, the generated image is saved and an image_id + URL are
     returned. Otherwise, the raw base64 data is returned.
     """
+    arguments = _normalize_image_arguments(tool_name, arguments)
     prompt = arguments.get("prompt", "")
     if not prompt:
         return ToolResult(output="Error: prompt is required.", is_error=True)
@@ -173,13 +176,13 @@ async def handle_image_tool(
 
     # Save generated images to artifact store and return IDs
     output_images: list[dict[str, Any]] = []
+    outbound_attachments: list[dict[str, Any]] = []
     for img in result.images:
         if artifact_store is not None:
-            import base64
-
             image_id = artifact_store.generate_id("img")
             try:
                 image_bytes = await _image_bytes(img)
+                filename = _image_filename(image_id, img.content_type)
                 await artifact_store.async_save(
                     "images",
                     image_id,
@@ -188,14 +191,25 @@ async def handle_image_tool(
                     img.content_type,
                     owner_email=current_user_email.get(),
                 )
+                signed_url = await _resolve_image_url(artifact_store, image_id)
                 output_images.append(
                     {
                         "image_id": image_id,
-                        "url": f"/api/v1/images/{image_id}",
+                        "url": signed_url or f"/api/v1/images/{image_id}",
                         "content_type": img.content_type,
                         "revised_prompt": img.revised_prompt,
                     }
                 )
+                if signed_url:
+                    outbound_attachments.append(
+                        {
+                            "artifact_id": image_id,
+                            "url": signed_url,
+                            "mime_type": img.content_type,
+                            "filename": filename,
+                            "size_bytes": len(image_bytes),
+                        }
+                    )
             except Exception:
                 # Fall back to inline base64 if save fails
                 output_images.append(
@@ -221,7 +235,26 @@ async def handle_image_tool(
         sort_keys=True,
         default=str,
     )
-    return ToolResult(output=output)
+    return ToolResult(output=output, attachments=outbound_attachments or None)
+
+
+def _normalize_image_arguments(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    schema = (
+        IMAGE_EDIT_TOOL.parameters if tool_name == "image_edit" else IMAGE_GENERATE_TOOL.parameters
+    )
+    return strip_empty_optional_values(arguments, schema)
+
+
+def _image_filename(image_id: str, content_type: str) -> str:
+    ext = mimetypes.guess_extension(content_type) or ".png"
+    return f"{image_id}{ext}"
+
+
+async def _resolve_image_url(artifact_store: Any, image_id: str) -> str | None:
+    try:
+        return await artifact_store.async_get_signed_url("images", image_id, "image")
+    except Exception:
+        return None
 
 
 async def _image_bytes(img: Any) -> bytes:

@@ -1420,6 +1420,7 @@ class AgentLoop:
         mid_stream_retries = 0
         _MAX_MID_STREAM_RETRIES = 2
         discovered_tool_ids: set[str] = set()
+        collected_attachments: list[dict[str, Any]] = []
         while True:
             self._raise_if_cancelled(ctx)
 
@@ -1603,6 +1604,7 @@ class AgentLoop:
                         content="\n\n".join(assistant_content_parts),
                         outputs={},
                         claims=[],
+                        attachments=list(collected_attachments),
                         session_id=ctx.session.session_id,
                         intaris_session_id=ctx.session.intaris_session_id or ctx.session.session_id,
                         completed_at=datetime.now(UTC),
@@ -1725,6 +1727,7 @@ class AgentLoop:
                         content="\n\n".join(assistant_content_parts),
                         outputs=tc.arguments.get("outputs", {}),
                         claims=tc.arguments.get("claims", []),
+                        attachments=list(collected_attachments),
                         session_id=ctx.session.session_id,
                         intaris_session_id=ctx.session.intaris_session_id or ctx.session.session_id,
                         completed_at=datetime.now(UTC),
@@ -2065,6 +2068,8 @@ class AgentLoop:
                             result.duration_ms,
                             eval_meta,
                         )
+                    if result.attachments:
+                        collected_attachments.extend(result.attachments)
                     messages.append(
                         {
                             "role": "tool",
@@ -2105,6 +2110,7 @@ class AgentLoop:
                 step_output = StepOutput(
                     summary="Delegation spawned — working in background.",
                     content="\n\n".join(assistant_content_parts),
+                    attachments=list(collected_attachments),
                 )
                 break
 

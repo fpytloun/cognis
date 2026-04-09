@@ -217,6 +217,7 @@ class WebSocketExecutorConnection:
                 output=str(result.get("output", "")),
                 is_error=bool(result.get("is_error", False)),
                 duration_ms=result.get("duration_ms"),
+                attachments=result.get("attachments"),
             )
         except (TimeoutError, asyncio.CancelledError):
             return ToolResult(output="Tool execution timed out.", is_error=True)

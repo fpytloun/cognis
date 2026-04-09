@@ -73,6 +73,56 @@ async def test_litellm_provider_raises_when_no_model_is_configured(tmp_path: obj
 
 
 @pytest.mark.asyncio
+async def test_litellm_provider_image_generate_omits_response_format_for_gpt_image_1(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    provider = LiteLLMProvider(session_factory)
+
+    captured: dict[str, object] = {}
+
+    class _Response:
+        data = [{"b64_json": "YWJj"}]
+        usage = None
+
+    async def fake_with_llm_retry(_func: object, **kwargs: object) -> object:
+        captured.update(kwargs)
+        return _Response()
+
+    monkeypatch.setattr("cognis.providers.llm.retry.with_llm_retry", fake_with_llm_retry)
+
+    await provider.image_generate(prompt="draw", model="gpt-image-1")
+
+    assert "response_format" not in captured
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_litellm_provider_image_generate_keeps_response_format_for_other_models(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    provider = LiteLLMProvider(session_factory)
+
+    captured: dict[str, object] = {}
+
+    class _Response:
+        data = [{"b64_json": "YWJj"}]
+        usage = None
+
+    async def fake_with_llm_retry(_func: object, **kwargs: object) -> object:
+        captured.update(kwargs)
+        return _Response()
+
+    monkeypatch.setattr("cognis.providers.llm.retry.with_llm_retry", fake_with_llm_retry)
+
+    await provider.image_generate(prompt="draw", model="dall-e-3")
+
+    assert captured["response_format"] == "b64_json"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_litellm_provider_returns_model_info_from_provider_config(tmp_path: object) -> None:
     engine, session_factory = await _session_factory(tmp_path)
     async with session_factory() as session:

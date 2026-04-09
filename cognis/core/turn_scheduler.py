@@ -102,6 +102,7 @@ class TurnResult:
     channel_deliverable: bool = False
     delivery_id: str | None = None
     delivery_fallback_text: str | None = None
+    attachments: list[dict[str, Any]] | None = None
 
 
 @dataclass(slots=True)
@@ -872,6 +873,7 @@ class TurnScheduler:
                 channel_deliverable=channel_deliverable,
                 delivery_id=delivery_id,
                 delivery_fallback_text=delivery_fallback_text,
+                attachments=step_output.attachments if step_output else None,
             )
             await self._publish_turn_completed(result)
             TURNS_TOTAL.labels(outcome="completed").inc()

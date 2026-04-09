@@ -65,6 +65,11 @@ _IMAGE_GEN_STRATEGY: dict[str, str] = {
 _ANTHROPIC_MODEL_PATTERNS = re.compile(r"(claude|anthropic)", re.IGNORECASE)
 
 
+def _supports_image_response_format(model: str) -> bool:
+    normalized = model.rsplit("/", 1)[-1].lower()
+    return normalized != "gpt-image-1"
+
+
 def _apply_message_cache_hints(
     messages: list[dict[str, Any]],
     model: str,
@@ -1372,6 +1377,9 @@ class LiteLLMProvider:
         if image is not None:
             # Edit mode — pass the source image when the backend supports it.
             try:
+                image_kwargs: dict[str, Any] = {}
+                if _supports_image_response_format(model):
+                    image_kwargs["response_format"] = response_format
                 response = await with_llm_retry(
                     litellm.aimage_generation,
                     prompt=prompt,
@@ -1379,14 +1387,17 @@ class LiteLLMProvider:
                     n=n,
                     size=size,
                     quality=quality,
-                    response_format=response_format,
                     image=image,
                     operation=f"image_edit({model})",
+                    **image_kwargs,
                     **gen_kwargs,
                     **kwargs,
                 )
             except Exception:
                 # Fall back to regular generation if edit not supported
+                image_kwargs = {}
+                if _supports_image_response_format(model):
+                    image_kwargs["response_format"] = response_format
                 response = await with_llm_retry(
                     litellm.aimage_generation,
                     prompt=prompt,
@@ -1394,12 +1405,15 @@ class LiteLLMProvider:
                     n=n,
                     size=size,
                     quality=quality,
-                    response_format=response_format,
                     operation=f"image_generate({model})",
+                    **image_kwargs,
                     **gen_kwargs,
                     **kwargs,
                 )
         else:
+            image_kwargs = {}
+            if _supports_image_response_format(model):
+                image_kwargs["response_format"] = response_format
             response = await with_llm_retry(
                 litellm.aimage_generation,
                 prompt=prompt,
@@ -1407,8 +1421,8 @@ class LiteLLMProvider:
                 n=n,
                 size=size,
                 quality=quality,
-                response_format=response_format,
                 operation=f"image_generate({model})",
+                **image_kwargs,
                 **gen_kwargs,
                 **kwargs,
             )

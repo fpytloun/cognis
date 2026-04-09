@@ -198,6 +198,7 @@ class ToolResult(BaseModel):
     is_error: bool = False
     duration_ms: int | None = None
     metadata: dict[str, Any] | None = None
+    attachments: list[dict[str, Any]] | None = None
 
 
 class EscalationRecord(BaseModel):

@@ -16,6 +16,7 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 
 from cognis.logging import get_logger
 from cognis.models.tool import MCPServerConfig, ToolDefinition, ToolSource, sanitize_mcp_tool_name
+from cognis.tools.argument_normalization import strip_empty_optional_values
 
 logger = get_logger(__name__)
 
@@ -311,53 +312,8 @@ def _strip_empty_optionals(
     arguments: dict[str, Any],
     schema: dict[str, Any],
 ) -> dict[str, Any]:
-    """Remove empty-string values for optional fields before calling an MCP tool.
-
-    LLMs frequently fill every visible field in a JSON Schema with empty
-    strings or empty arrays rather than omitting optional parameters.  Many
-    MCP servers (and the upstream APIs they wrap) treat ``""`` as a present
-    value and attempt to validate it, causing spurious errors like
-    ``"Invalid argument value"`` for ``project_id`` or ``parent_id``.
-
-    This helper inspects the tool's ``inputSchema`` and drops any argument
-    whose value is an empty string (or empty list) **and** whose key is not
-    listed in the schema's ``required`` array.  Required fields are never
-    touched.
-
-    For ``object``-typed arguments the function recurses into nested schemas
-    (``properties.<key>`` in the parent schema) so that nested optional
-    empty strings are also stripped.
-    """
-    if not schema:
-        return arguments
-    required: set[str] = set(schema.get("required", []))
-    properties: dict[str, Any] = schema.get("properties", {})
-    cleaned: dict[str, Any] = {}
-    for key, value in arguments.items():
-        if key not in required:
-            if isinstance(value, str) and value == "":
-                continue
-            if isinstance(value, list) and len(value) == 0:
-                continue
-        # Recurse into nested objects
-        if isinstance(value, dict) and key in properties:
-            nested_schema = properties[key]
-            if isinstance(nested_schema, dict) and nested_schema.get("type") == "object":
-                value = _strip_empty_optionals(value, nested_schema)
-        # Recurse into arrays of objects
-        if isinstance(value, list) and key in properties:
-            nested_schema = properties[key]
-            if isinstance(nested_schema, dict):
-                items_schema = nested_schema.get("items", {})
-                if isinstance(items_schema, dict) and items_schema.get("type") == "object":
-                    value = [
-                        _strip_empty_optionals(item, items_schema)
-                        if isinstance(item, dict)
-                        else item
-                        for item in value
-                    ]
-        cleaned[key] = value
-    return cleaned
+    """Compatibility wrapper for older tests/imports."""
+    return strip_empty_optional_values(arguments, schema)
 
 
 def _normalize_call_result(result: Any) -> str:

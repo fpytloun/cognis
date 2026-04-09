@@ -405,11 +405,14 @@ async def test_stream_complete_returns_error_for_failed_responses_event(
 async def test_image_generate_method_still_available(monkeypatch: pytest.MonkeyPatch) -> None:
     handler = InferenceHandler()
 
+    captured: dict[str, object] = {}
+
     class _Response:
         def model_dump(self) -> dict[str, object]:
             return {"data": [{"b64_json": "abc"}]}
 
-    async def fake_aimage_generation(**_: object):
+    async def fake_aimage_generation(**kwargs: object):
+        captured.update(kwargs)
         return _Response()
 
     monkeypatch.setattr(
@@ -423,3 +426,4 @@ async def test_image_generate_method_still_available(monkeypatch: pytest.MonkeyP
     )
 
     assert result["data"][0]["b64_json"] == "abc"
+    assert "response_format" not in captured

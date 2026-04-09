@@ -19,6 +19,7 @@ from cognis.models.agent import AgentDefinition
 from cognis.models.session import SessionModel
 from cognis.models.tool import ExecutorHandle, Permission, ToolCall, ToolResult, stable_tool_id
 from cognis.store.queries import get_setting_value
+from cognis.tools.argument_normalization import strip_empty_optional_values
 from cognis.tools.builtin.image import handle_image_tool, is_image_tool
 from cognis.tools.builtin.memory import handle_memory_tool, is_memory_tool
 from cognis.tools.builtin.orchestration import handle_delegate_tool_call, is_orchestration_tool
@@ -518,7 +519,11 @@ class ToolRouter:
         context = ToolExecutionContext(
             executor_handle=executor_handle,
         )
-        raw = await handler(tool_call.arguments, context)
+        normalized_arguments = strip_empty_optional_values(
+            tool_call.arguments,
+            registered_tool.definition.parameters,
+        )
+        raw = await handler(normalized_arguments, context)
         duration_ms = int((perf_counter() - start) * 1000)
         return self._normalize_local_tool_result(raw, duration_ms)
 

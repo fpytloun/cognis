@@ -15,6 +15,11 @@ from cognis.providers.llm.responses_bridge import (
 )
 
 
+def _supports_image_response_format(model: str) -> bool:
+    normalized = model.rsplit("/", 1)[-1].lower()
+    return normalized != "gpt-image-1"
+
+
 class InferenceHandler:
     """Proxy LLM requests from the controller through LiteLLM.
 
@@ -191,13 +196,16 @@ class InferenceHandler:
             dumped = response.model_dump()
             return dumped if isinstance(dumped, dict) else {}
 
+        image_kwargs: dict[str, Any] = {}
+        if _supports_image_response_format(model):
+            image_kwargs["response_format"] = response_format
         response = await litellm.aimage_generation(
             prompt=prompt,
             model=model,
             n=n,
             size=size,
             quality=quality,
-            response_format=response_format,
+            **image_kwargs,
             **gen_kwargs,
         )
         dumped = response.model_dump()

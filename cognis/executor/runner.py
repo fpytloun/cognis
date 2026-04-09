@@ -640,6 +640,7 @@ class ExecutorRunner:
                 "output": result.output,
                 "is_error": result.is_error,
                 "duration_ms": result.duration_ms,
+                "attachments": result.attachments,
             },
         )
 
