@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass
 from enum import StrEnum
 from fnmatch import fnmatchcase
+from time import perf_counter
 from typing import Any
 
 from prometheus_client import Counter
@@ -15,7 +17,7 @@ from cognis.core.truncation import middle_truncate
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.session import SessionModel
-from cognis.models.tool import Permission, ToolCall, ToolResult, stable_tool_id
+from cognis.models.tool import ExecutorHandle, Permission, ToolCall, ToolResult, stable_tool_id
 from cognis.store.queries import get_setting_value
 from cognis.tools.builtin.image import handle_image_tool, is_image_tool
 from cognis.tools.builtin.memory import handle_memory_tool, is_memory_tool
@@ -26,7 +28,7 @@ from cognis.tools.builtin.skill_management import (
     is_skill_management_tool,
 )
 from cognis.tools.builtin.tool_output import handle_tool_output_tool, is_tool_output_tool
-from cognis.tools.registry import ToolRegistry
+from cognis.tools.registry import ToolExecutionContext, ToolRegistry
 
 TOOL_ROUTE_DECISIONS = Counter(
     "cognis_tool_route_decisions_total",
@@ -446,6 +448,27 @@ class ToolRouter:
             return self._sanitize_result(
                 tool_call.name, ToolResult(output="Unknown tool.", is_error=True), 50_000
             )
+        if registered_tool.handler is not None:
+            result = await self._execute_local_handler(
+                tool_call,
+                registered_tool=registered_tool,
+                executor=executor,
+            )
+            if result.metadata is None:
+                result = result.model_copy(update={"metadata": {"evaluation": eval_meta}})
+            else:
+                result = result.model_copy(
+                    update={"metadata": {**result.metadata, "evaluation": eval_meta}}
+                )
+            TOOL_ROUTE_OUTCOMES.labels(
+                route=str(route), outcome="success" if not result.is_error else "failure"
+            ).inc()
+            return self._sanitize_result(
+                tool_call.name,
+                result,
+                registered_tool.definition.max_result_size,
+                call_id=cid,
+            )
         try:
             result = await asyncio.wait_for(
                 executor.tool_execute(
@@ -479,6 +502,44 @@ class ToolRouter:
             registered_tool.definition.max_result_size,
             call_id=cid,
         )
+
+    async def _execute_local_handler(
+        self,
+        tool_call: ToolCall,
+        *,
+        registered_tool: Any,
+        executor: Any,
+    ) -> ToolResult:
+        handler = registered_tool.handler
+        if handler is None:
+            return ToolResult(output="Unknown tool handler.", is_error=True)
+        start = perf_counter()
+        executor_handle = self._executor_handle_for_local_tool(executor)
+        context = ToolExecutionContext(
+            executor_handle=executor_handle,
+        )
+        raw = await handler(tool_call.arguments, context)
+        duration_ms = int((perf_counter() - start) * 1000)
+        return self._normalize_local_tool_result(raw, duration_ms)
+
+    def _executor_handle_for_local_tool(self, executor: Any) -> ExecutorHandle:
+        handle = getattr(executor, "handle", None)
+        if isinstance(handle, ExecutorHandle):
+            return handle
+        executor_id = getattr(executor, "executor_id", "controller")
+        executor_type = getattr(executor, "executor_type", "controller")
+        return ExecutorHandle(executor_id=executor_id, executor_type=executor_type)
+
+    def _normalize_local_tool_result(self, result: Any, duration_ms: int) -> ToolResult:
+        if isinstance(result, ToolResult):
+            return result.model_copy(update={"duration_ms": result.duration_ms or duration_ms})
+        if isinstance(result, (dict, list)):
+            output = json.dumps(result, sort_keys=True, default=str)
+        elif isinstance(result, str):
+            output = result
+        else:
+            output = str(result)
+        return ToolResult(output=output, duration_ms=duration_ms)
 
     def _is_non_bypassable(self, tool_name: str, explicit_flag: bool) -> bool:
         if explicit_flag:

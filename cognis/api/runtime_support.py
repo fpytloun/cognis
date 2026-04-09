@@ -197,6 +197,23 @@ def build_registry_with_handlers(
     return registry
 
 
+def _build_remote_runtime_registry(
+    tools: list[ToolDefinition],
+    handler_map: dict[str, Any],
+) -> ToolRegistry:
+    """Build a remote runtime registry.
+
+    Remote runtimes expose executor-native tools over RPC, but controller-side
+    builtins still need local handlers so the router can execute them locally.
+    """
+
+    registry = ToolRegistry()
+    for tool in tools:
+        handler = handler_map.get(tool.name) if tool.source.type == "builtin" else None
+        registry.register(RegisteredTool(definition=tool, handler=cast(Any, handler)))
+    return registry
+
+
 def build_static_registry(agent: AgentDefinition | None = None) -> ToolRegistry:
     """Build a static ToolRegistry for one agent's builtin tools.
 
@@ -440,9 +457,14 @@ def build_step_runtime_factory(
                         disabled_categories=disabled_categories,
                         disabled_tools=disabled_tools,
                     )
-                    remote_registry = ToolRegistry()
-                    for tool in merge_result.tools:
-                        remote_registry.register(RegisteredTool(definition=tool))
+                    handler_map = _build_handler_map(
+                        session_factory,
+                        getattr(providers.executor, "status_provider", None),
+                    )
+                    remote_registry = _build_remote_runtime_registry(
+                        merge_result.tools,
+                        handler_map,
+                    )
                     for warning in merge_result.warnings:
                         logger.warning(
                             "Remote runtime inventory warning",

@@ -4,7 +4,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from cognis.api.runtime_support import _merge_remote_runtime_inventory, _resolve_intaris_mcp_tools
+from cognis.api.runtime_support import (
+    _build_remote_runtime_registry,
+    _merge_remote_runtime_inventory,
+    _resolve_intaris_mcp_tools,
+)
 from cognis.models.agent import AgentDefinition
 from cognis.models.tool import ToolDefinition, ToolSource, sanitize_mcp_tool_name
 
@@ -462,3 +466,32 @@ async def test_merge_remote_runtime_inventory_dedupes_intaris_collisions_determi
     assert result.tools[0].source.server_name == "a-server"
     assert result.collision_count == 1
     assert any("same runtime name" in warning.lower() for warning in result.warnings)
+
+
+def test_build_remote_runtime_registry_attaches_only_builtin_handlers() -> None:
+    async def builtin_handler(arguments: dict[str, object], context: object) -> object:
+        del arguments, context
+        return {"ok": True}
+
+    registry = _build_remote_runtime_registry(
+        [
+            _builtin_tool("get_current_datetime"),
+            ToolDefinition(
+                name="read",
+                description="read",
+                parameters={"type": "object", "properties": {}},
+                source=ToolSource(type="executor"),
+                category="filesystem",
+                read_only=True,
+            ),
+        ],
+        {"get_current_datetime": builtin_handler, "read": builtin_handler},
+    )
+
+    builtin = registry.get("get_current_datetime")
+    assert builtin is not None
+    assert builtin.handler is builtin_handler
+
+    executor_tool = registry.get("read")
+    assert executor_tool is not None
+    assert executor_tool.handler is None

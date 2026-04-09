@@ -78,6 +78,13 @@ class _SlowExecutor(_Executor):
         return ToolResult(output="too slow")
 
 
+class _RemoteExecutor(_Executor):
+    def __init__(self, result: ToolResult | None = None) -> None:
+        super().__init__(result=result)
+        self.executor_id = "remote-exec"
+        self.executor_type = "websocket"
+
+
 def _registry_with_result_limit(max_result_size: int = 20) -> ToolRegistry:
     registry = ToolRegistry()
     registry.register(
@@ -310,6 +317,41 @@ async def test_tool_router_truncates_and_wraps_local_results() -> None:
     assert result.metadata["truncated"] is True
     assert result.metadata["evaluation"]["decision"] == "approve"
     assert "middle truncated" in result.output
+
+
+@pytest.mark.asyncio
+async def test_tool_router_executes_registered_builtin_handler_locally() -> None:
+    async def builtin_handler(arguments: dict[str, object], context: object) -> object:
+        del arguments
+        return {"executor_type": context.executor_handle.executor_type}
+
+    router = ToolRouter(guardrails=_Guardrails(), non_bypassable_patterns=[])
+    executor = _RemoteExecutor()
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="get_current_datetime",
+                description="datetime",
+                parameters={"type": "object", "properties": {}},
+                source=ToolSource(type="builtin"),
+                category="datetime",
+                read_only=True,
+            ),
+            handler=builtin_handler,
+        )
+    )
+
+    result = await router.execute(
+        ToolCall(call_id="builtin-1", name="get_current_datetime", arguments={}),
+        _session(),
+        _agent(),
+        registry,
+        executor,
+    )
+
+    assert executor.calls == 0
+    assert '"executor_type": "websocket"' in result.output
 
 
 @pytest.mark.asyncio
