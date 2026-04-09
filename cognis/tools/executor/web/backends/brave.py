@@ -20,7 +20,22 @@ from cognis.providers.circuit_breaker import CircuitBreaker, CircuitBreakerError
 logger = logging.getLogger(__name__)
 
 _BASE_URL = "https://api.search.brave.com/res/v1/web/search"
-_breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=30.0)
+
+
+def _should_trip_brave(exc: Exception) -> bool:
+    """Trip only on availability failures, not caller-side 4xx errors."""
+    if isinstance(exc, httpx.TimeoutException | httpx.RequestError):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code >= 500
+    return True
+
+
+_breaker = CircuitBreaker(
+    failure_threshold=5,
+    recovery_timeout=30.0,
+    should_trip=_should_trip_brave,
+)
 
 
 class BraveBackend:

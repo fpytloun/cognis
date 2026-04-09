@@ -8,6 +8,7 @@ import httpx
 import pytest
 
 from cognis.models.tool import ExecutorHandle, ToolResult
+from cognis.providers.circuit_breaker import CircuitBreaker, CircuitState
 from cognis.tools.executor.definitions import (
     executor_tool_definitions,
     executor_tool_handlers,
@@ -517,6 +518,31 @@ class TestTavilyBackend:
 
         result = _format_tavily_search({"results": []})
         assert "No search results" in result.output
+
+    @pytest.mark.asyncio()
+    async def test_http_400_does_not_open_circuit_breaker(self) -> None:
+        from cognis.tools.executor.web.backends import tavily as tavily_module
+
+        backend = TavilyBackend(api_key="test")
+        request = httpx.Request("POST", "https://api.tavily.com/search")
+        response = httpx.Response(400, request=request, json={"detail": {"error": "Bad request"}})
+        error = httpx.HTTPStatusError("bad request", request=request, response=response)
+        breaker = CircuitBreaker(
+            failure_threshold=1,
+            recovery_timeout=30,
+            should_trip=tavily_module._should_trip_tavily,
+        )
+
+        with (
+            patch.object(tavily_module, "_breaker", breaker),
+            patch.object(backend, "_post", AsyncMock(side_effect=error)),
+        ):
+            result = await backend.search("test")
+
+        assert result.is_error
+        assert "HTTP 400" in result.output
+        assert breaker.state == CircuitState.CLOSED
+        assert breaker.failures == 0
 
 
 class TestBraveBackend:

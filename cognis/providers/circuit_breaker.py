@@ -23,9 +23,16 @@ class CircuitBreakerError(RuntimeError):
 class CircuitBreaker:
     """Simple async circuit breaker."""
 
-    def __init__(self, failure_threshold: int = 5, recovery_timeout: float = 30.0) -> None:
+    def __init__(
+        self,
+        failure_threshold: int = 5,
+        recovery_timeout: float = 30.0,
+        *,
+        should_trip: Callable[[Exception], bool] | None = None,
+    ) -> None:
         self.failure_threshold = failure_threshold
         self.recovery_timeout = recovery_timeout
+        self.should_trip = should_trip
         self.failures = 0
         self.state = CircuitState.CLOSED
         self.opened_at: datetime | None = None
@@ -48,7 +55,9 @@ class CircuitBreaker:
             raise CircuitBreakerError("Circuit breaker is open")
         try:
             result = await func()
-        except Exception:
+        except Exception as exc:
+            if self.should_trip is not None and not self.should_trip(exc):
+                raise
             self.failures += 1
             if self.failures >= self.failure_threshold:
                 self.state = CircuitState.OPEN

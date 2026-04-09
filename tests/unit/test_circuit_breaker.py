@@ -81,9 +81,28 @@ async def test_circuit_breaker_allows_concurrent_successful_calls() -> None:
     assert breaker.state == CircuitState.CLOSED
 
 
+@pytest.mark.asyncio
+async def test_circuit_breaker_ignores_non_trip_exceptions() -> None:
+    breaker = CircuitBreaker(
+        failure_threshold=1,
+        recovery_timeout=30,
+        should_trip=lambda exc: not isinstance(exc, ValueError),
+    )
+
+    with pytest.raises(ValueError):
+        await breaker.call(_raise_value_error)
+
+    assert breaker.failures == 0
+    assert breaker.state == CircuitState.CLOSED
+
+
 async def _return_value(value: str) -> str:
     return value
 
 
 async def _raise_runtime_error() -> str:
     raise RuntimeError("boom")
+
+
+async def _raise_value_error() -> str:
+    raise ValueError("boom")
