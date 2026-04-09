@@ -367,6 +367,66 @@ class TestWebSearchHandler:
             assert options["topic"] == "news"
             assert options["include_answer"] is True
 
+    @pytest.mark.asyncio()
+    async def test_search_omits_empty_optional_strings(self) -> None:
+        from cognis.tools.executor.web.handlers import handle_web_search
+
+        with patch("cognis.tools.executor.web.handlers.resolve_search_backend") as mock_resolve:
+            mock_backend = AsyncMock()
+            mock_backend.search.return_value = ToolResult(output="results")
+            mock_resolve.return_value = mock_backend
+
+            await handle_web_search(
+                {
+                    "query": "Lovosice weather today forecast",
+                    "backend": "tavily",
+                    "search_depth": "advanced",
+                    "topic": "general",
+                    "include_answer": True,
+                    "time_range": "",
+                    "country": "",
+                    "include_domains": [],
+                    "exclude_domains": [],
+                },
+                _DUMMY_CONTEXT,
+            )
+            call_kwargs = mock_backend.search.call_args
+            options = call_kwargs.kwargs.get("options", {})
+            assert options["search_depth"] == "advanced"
+            assert options["topic"] == "general"
+            assert options["include_answer"] is True
+            assert "time_range" not in options
+            assert "country" not in options
+            assert "include_domains" not in options
+            assert "exclude_domains" not in options
+
+    @pytest.mark.asyncio()
+    async def test_search_preserves_explicit_false_flags(self) -> None:
+        from cognis.tools.executor.web.handlers import handle_web_search
+
+        with patch("cognis.tools.executor.web.handlers.resolve_search_backend") as mock_resolve:
+            mock_backend = AsyncMock()
+            mock_backend.search.return_value = ToolResult(output="results")
+            mock_resolve.return_value = mock_backend
+
+            await handle_web_search(
+                {
+                    "query": "FFIV stock price",
+                    "backend": "tavily",
+                    "search_depth": "advanced",
+                    "topic": "finance",
+                    "include_answer": False,
+                    "time_range": "",
+                    "country": "",
+                },
+                _DUMMY_CONTEXT,
+            )
+            call_kwargs = mock_backend.search.call_args
+            options = call_kwargs.kwargs.get("options", {})
+            assert options["include_answer"] is False
+            assert "time_range" not in options
+            assert "country" not in options
+
 
 class TestTavilyRequiredTools:
     """Test tools that require Tavily backend."""

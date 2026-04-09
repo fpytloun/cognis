@@ -13,6 +13,34 @@ from cognis.tools.executor.web.backends.tavily import TavilyBackend
 from cognis.tools.registry import ToolExecutionContext
 
 
+def _normalize_optional_web_value(value: Any) -> Any:
+    """Normalize optional tool values before forwarding them to web backends.
+
+    LLMs often materialize optional parameters as empty strings or empty
+    collections instead of omitting them. Many downstream APIs treat those as
+    invalid present values rather than as "unset". Preserve explicit booleans
+    (including ``False``), numeric zeros, and any non-empty values.
+    """
+    if isinstance(value, str) and value == "":
+        return None
+    if isinstance(value, (list, dict)) and len(value) == 0:
+        return None
+    return value
+
+
+def _collect_optional_options(arguments: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
+    """Collect optional backend options, omitting empty optional values."""
+    options: dict[str, Any] = {}
+    for key in keys:
+        if key not in arguments:
+            continue
+        value = _normalize_optional_web_value(arguments[key])
+        if value is None:
+            continue
+        options[key] = value
+    return options
+
+
 async def handle_web_fetch(arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
     """Fetch content from a URL and return it as text or markdown."""
     url = arguments.get("url", "")
@@ -23,11 +51,10 @@ async def handle_web_fetch(arguments: dict[str, Any], context: ToolExecutionCont
     timeout = arguments.get("timeout", 30)
     backend_name = arguments.get("backend")
 
-    # Collect backend-specific options
-    options: dict[str, Any] = {}
-    for key in ("query", "extract_depth", "chunks_per_source", "include_images"):
-        if key in arguments:
-            options[key] = arguments[key]
+    options = _collect_optional_options(
+        arguments,
+        ("query", "extract_depth", "chunks_per_source", "include_images"),
+    )
 
     backend = resolve_fetch_backend(context.runtime_metadata, backend_name)
     return await backend.fetch(
@@ -47,41 +74,40 @@ async def handle_web_search(arguments: dict[str, Any], context: ToolExecutionCon
     num_results = int(arguments.get("num_results", 8))
     backend_name = arguments.get("backend")
 
-    # Collect backend-specific options
-    options: dict[str, Any] = {}
-    for key in (
-        # Tavily options
-        "search_depth",
-        "topic",
-        "include_answer",
-        "include_raw_content",
-        "include_images",
-        "include_image_descriptions",
-        "include_domains",
-        "exclude_domains",
-        "country",
-        "days",
-        "time_range",
-        "auto_parameters",
-        "chunks_per_source",
-        # Brave options
-        "search_lang",
-        "ui_lang",
-        "offset",
-        "safesearch",
-        "freshness",
-        "text_decorations",
-        "spellcheck",
-        "extra_snippets",
-        "goggles_id",
-        "units",
-        "result_filter",
-        # Direct/DDG options
-        "region",
-        "timelimit",
-    ):
-        if key in arguments:
-            options[key] = arguments[key]
+    options = _collect_optional_options(
+        arguments,
+        (
+            # Tavily options
+            "search_depth",
+            "topic",
+            "include_answer",
+            "include_raw_content",
+            "include_images",
+            "include_image_descriptions",
+            "include_domains",
+            "exclude_domains",
+            "country",
+            "days",
+            "time_range",
+            "auto_parameters",
+            "chunks_per_source",
+            # Brave options
+            "search_lang",
+            "ui_lang",
+            "offset",
+            "safesearch",
+            "freshness",
+            "text_decorations",
+            "spellcheck",
+            "extra_snippets",
+            "goggles_id",
+            "units",
+            "result_filter",
+            # Direct/DDG options
+            "region",
+            "timelimit",
+        ),
+    )
 
     backend = resolve_search_backend(context.runtime_metadata, backend_name)
     return await backend.search(
@@ -101,23 +127,23 @@ async def handle_web_crawl(arguments: dict[str, Any], context: ToolExecutionCont
     if not url:
         return ToolResult(output="No URL provided.", is_error=True)
 
-    options: dict[str, Any] = {}
-    for key in (
-        "max_depth",
-        "max_breadth",
-        "limit",
-        "instructions",
-        "select_paths",
-        "select_domains",
-        "exclude_paths",
-        "exclude_domains",
-        "allow_external",
-        "extract_depth",
-        "format",
-        "include_images",
-    ):
-        if key in arguments:
-            options[key] = arguments[key]
+    options = _collect_optional_options(
+        arguments,
+        (
+            "max_depth",
+            "max_breadth",
+            "limit",
+            "instructions",
+            "select_paths",
+            "select_domains",
+            "exclude_paths",
+            "exclude_domains",
+            "allow_external",
+            "extract_depth",
+            "format",
+            "include_images",
+        ),
+    )
 
     return await tavily.crawl(url, options=options if options else None)
 
@@ -132,21 +158,21 @@ async def handle_web_map(arguments: dict[str, Any], context: ToolExecutionContex
     if not url:
         return ToolResult(output="No URL provided.", is_error=True)
 
-    options: dict[str, Any] = {}
-    for key in (
-        "max_depth",
-        "max_breadth",
-        "limit",
-        "instructions",
-        "select_paths",
-        "select_domains",
-        "exclude_paths",
-        "exclude_domains",
-        "allow_external",
-        "timeout",
-    ):
-        if key in arguments:
-            options[key] = arguments[key]
+    options = _collect_optional_options(
+        arguments,
+        (
+            "max_depth",
+            "max_breadth",
+            "limit",
+            "instructions",
+            "select_paths",
+            "select_domains",
+            "exclude_paths",
+            "exclude_domains",
+            "allow_external",
+            "timeout",
+        ),
+    )
 
     return await tavily.map_site(url, options=options if options else None)
 
@@ -163,9 +189,7 @@ async def handle_web_research(
     if not query:
         return ToolResult(output="No research query provided.", is_error=True)
 
-    options: dict[str, Any] = {}
-    if "model" in arguments:
-        options["model"] = arguments["model"]
+    options = _collect_optional_options(arguments, ("model",))
 
     return await tavily.research(query, options=options if options else None)
 
