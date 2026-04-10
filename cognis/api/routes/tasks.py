@@ -532,7 +532,7 @@ def _task_pending_pause(request: Request, task: TaskModel) -> Any:
         step_name=payload.get("step_name"),
         step_run_id=payload.get("step_run_id"),
         session_id=payload.get("session_id"),
-        question=payload.get("question") or payload.get("message"),
+        question=payload.get("question") or payload.get("message") or payload.get("label"),
         options=payload.get("options"),
         context=payload.get("context"),
     )

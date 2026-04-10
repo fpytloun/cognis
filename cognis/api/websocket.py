@@ -1673,6 +1673,36 @@ async def _load_pending_task_prompts(app: Any, conversation_id: str) -> list[dic
                             "context": payload.get("context"),
                         }
                     )
+                elif notif.notification_type == "credential_request":
+                    payloads.append(
+                        {
+                            "type": "credential_request",
+                            "notification_id": notif.notification_id,
+                            "task_id": notif.task_id,
+                            "step_name": notif.step_name,
+                            "label": payload.get("label", "Credential required"),
+                            "message": payload.get("message") or payload.get("description", ""),
+                            "credential_id": payload.get("credential_id"),
+                            "kind": payload.get("kind"),
+                            "metadata": payload.get("metadata"),
+                            "required_fields": payload.get("required_fields"),
+                        }
+                    )
+                elif notif.notification_type == "auth_challenge":
+                    payloads.append(
+                        {
+                            "type": "auth_challenge",
+                            "notification_id": notif.notification_id,
+                            "task_id": notif.task_id,
+                            "step_name": notif.step_name,
+                            "label": payload.get("label", "Authentication required"),
+                            "message": payload.get("message", ""),
+                            "kind": payload.get("kind"),
+                            "metadata": payload.get("metadata"),
+                            "required_fields": payload.get("required_fields"),
+                            "expires_at": payload.get("expires_at"),
+                        }
+                    )
                 elif notif.notification_type == "escalation":
                     payloads.append(
                         {

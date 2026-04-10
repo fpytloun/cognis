@@ -501,6 +501,15 @@ export interface ExecutorSignalConfig {
   command?: string;
 }
 
+export interface ExecutorBrowserConfig {
+  enabled?: boolean;
+  auto_install?: boolean;
+  headed_allowed?: boolean;
+  engine?: string;
+  max_sessions?: number;
+  idle_timeout_seconds?: number;
+}
+
 export interface ExecutorRuntimeConfig {
   mcp_server_ids?: string[];
   lsp_enabled?: boolean;
@@ -509,6 +518,7 @@ export interface ExecutorRuntimeConfig {
   lsp_idle_timeout_seconds?: number;
   lsp_max_concurrent_servers?: number;
   signal?: ExecutorSignalConfig;
+  browser?: ExecutorBrowserConfig;
   [key: string]: unknown;
 }
 
@@ -868,6 +878,23 @@ export interface SecretMetadata {
   scope: string;
   agent_id: string | null;
   description: string | null;
+}
+
+export interface CredentialMetadata {
+  credential_id: string;
+  kind: string;
+  label: string;
+  metadata: Record<string, unknown>;
+  scope: string;
+  agent_id: string | null;
+  description: string | null;
+  version: number;
+  status: string;
+  last_verified_at: string | null;
+  expires_at: string | null;
+  revoked_at: string | null;
+  created_at: string | null;
+  updated_at: string | null;
 }
 
 export interface WebConfigStatus {

@@ -78,7 +78,7 @@
   };
 
   function scheduleId(): string {
-    return $page.params.scheduleId;
+    return $page.params.scheduleId ?? '';
   }
 
   async function loadData(): Promise<void> {

@@ -28,6 +28,7 @@ export interface AgentFormState {
   purpose: string;
   behavioralRules: string;
   allowedSecrets: string[];
+  allowedCredentials: string[];
   canDelegate: boolean;
   maxDelegationDepth: number;
   toolPermissions: Record<string, string>;
@@ -89,6 +90,7 @@ export function createEmptyAgentForm(workflows: Workflow[] = []): AgentFormState
     purpose: '',
     behavioralRules: '',
     allowedSecrets: [],
+    allowedCredentials: [],
     canDelegate: true,
     maxDelegationDepth: 3,
     toolPermissions: {},
@@ -138,6 +140,9 @@ export function agentToFormState(agent: Agent): AgentFormState {
       : '',
     allowedSecrets: Array.isArray(permissions.allowed_secrets)
       ? (permissions.allowed_secrets as unknown[]).filter((v): v is string => typeof v === 'string')
+      : [],
+    allowedCredentials: Array.isArray(permissions.allowed_credentials)
+      ? (permissions.allowed_credentials as unknown[]).filter((v): v is string => typeof v === 'string')
       : [],
     canDelegate: permissions.can_delegate !== false,
     maxDelegationDepth:
@@ -259,12 +264,13 @@ export function formStateToPayload(form: AgentFormState): Record<string, unknown
       purpose: form.purpose || undefined,
       behavioral_rules: nonEmptyLines(form.behavioralRules)
     },
-    permissions: {
-      tool_permissions: toolPermissions,
-      allowed_secrets: form.allowedSecrets,
-      can_delegate: form.canDelegate,
-      max_delegation_depth: form.maxDelegationDepth
-    },
+      permissions: {
+        tool_permissions: toolPermissions,
+        allowed_secrets: form.allowedSecrets,
+        allowed_credentials: form.allowedCredentials,
+        can_delegate: form.canDelegate,
+        max_delegation_depth: form.maxDelegationDepth
+      },
     tools: {
       ...preservedTools,
       delegation_tools: form.canDelegate,

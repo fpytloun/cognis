@@ -291,6 +291,22 @@ POST   /api/v1/secrets                         → Create/update
 DELETE /api/v1/secrets/:name                   → Delete
 ```
 
+### Credentials
+
+```
+GET    /api/v1/credentials                     → List structured credential records (metadata only)
+GET    /api/v1/credentials/:id                 → Get credential metadata
+POST   /api/v1/credentials                     → Create/update a structured credential record
+POST   /api/v1/credentials/:id/revoke         → Revoke a credential without deleting it
+DELETE /api/v1/credentials/:id                → Delete a credential record
+```
+
+`secrets` remain the low-level encrypted storage primitive used for provider
+keys, MCP env refs, and similar infrastructure concerns. `credentials` are the
+agent-facing structured auth records used for browser automation, saved auth
+state, and controller-mediated auth flows. Credential payload values are never
+returned by the REST API.
+
 ### Tasks (Kanban / Work Queue)
 
 ```
@@ -305,7 +321,7 @@ POST   /api/v1/tasks/:id/resume                   → Resume paused task
 POST   /api/v1/tasks/:id/cancel                   → Cancel task (any state)
 POST   /api/v1/tasks/:id/gate-response            → Respond to a gate step
 POST   /api/v1/tasks/:id/step-response            → Respond to `step_request_input` for the current step
-GET    /api/v1/notifications                      → List pending notifications (escalations, gates, step questions)
+GET    /api/v1/notifications                      → List pending notifications (escalations, gates, step questions, credential requests, auth challenges)
 POST   /api/v1/notifications/:id/resolve         → Resolve a notification directly
 POST   /api/v1/tasks/batch-submit                 → Submit multiple draft tasks at once
 GET    /api/v1/tasks/:id/steps                    → List step runs with status and output
@@ -320,6 +336,15 @@ Task create/update payloads also support:
 
 These control where task results/questions are routed back (same conversation,
 specific conversation, latest active for agent, preferred channel, or silent).
+
+Workflow pauses can now include:
+
+- `credential_request` — request a durable structured credential from the user
+- `auth_challenge` — request a live MFA / OTP / push-approval response
+
+Notification resolution for these flows stores only safe metadata and returns
+opaque credential IDs or ephemeral credential refs back into the workflow when
+needed.
 
 ### Schedules (Phase 2, model in MVP)
 

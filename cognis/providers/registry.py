@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from cognis.config import CognisConfig
 from cognis.models.config import ProviderHealth
 from cognis.providers.auth.jwt import JWTAuthProvider
+from cognis.providers.credentials.encrypted_db import EncryptedDBCredentialsProvider
 from cognis.providers.executor.composite import CompositeExecutorProvider
 from cognis.providers.executor.in_process import InProcessExecutorProvider
 from cognis.providers.executor.subprocess import SubprocessExecutorProvider
@@ -27,6 +28,7 @@ class ProviderRegistry:
     guardrails: IntarisProvider
     executor: CompositeExecutorProvider
     secrets: EncryptedDBSecretsProvider
+    credentials: EncryptedDBCredentialsProvider
     llm: LiteLLMProvider
     auth: JWTAuthProvider
     # LiteLLMProvider implements both LLMProvider and ImageGenerationProvider.
@@ -39,6 +41,7 @@ class ProviderRegistry:
             "guardrails": await self.guardrails.health(),
             "executor": await self.executor.health(),
             "secrets": await self.secrets.health(),
+            "credentials": await self.credentials.health(),
             "llm": await self.llm.health(),
             "auth": await self.auth.health(),
         }
@@ -50,6 +53,9 @@ def build_provider_registry(
     auth_provider: JWTAuthProvider,
 ) -> ProviderRegistry:
     secrets_provider = EncryptedDBSecretsProvider(session_factory, str(config.secrets_key_path))
+    credentials_provider = EncryptedDBCredentialsProvider(
+        session_factory, str(config.secrets_key_path)
+    )
 
     # Build executor sub-providers
     in_process = InProcessExecutorProvider(session_factory=session_factory)
@@ -80,6 +86,7 @@ def build_provider_registry(
         guardrails=IntarisProvider(config.intaris_url, auth_provider),
         executor=composite_executor,
         secrets=secrets_provider,
+        credentials=credentials_provider,
         llm=llm_provider,
         auth=auth_provider,
         # LiteLLMProvider implements ImageGenerationProvider

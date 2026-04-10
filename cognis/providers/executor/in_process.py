@@ -24,6 +24,7 @@ from cognis.models.tool import (
 )
 from cognis.providers.circuit_breaker import CircuitBreaker
 from cognis.tools.builtin.system import StatusProvider, build_system_tool_handlers
+from cognis.tools.executor.browser.manager import BROWSER_MANAGER_KEY, BrowserManager
 from cognis.tools.executor.definitions import executor_tool_handlers
 from cognis.tools.executor.lsp import LSP_MANAGER_KEY, LSPManager
 from cognis.tools.mcp import StdioMCPClient, mcp_tools_to_definitions
@@ -276,6 +277,15 @@ class InProcessExecutorProvider:
             except Exception:
                 _logger.debug(
                     "lsp: cleanup error during executor cancel",
+                    extra={"extra_data": {"executor_id": handle.executor_id}},
+                )
+        browser_manager = runtime.connection.runtime_metadata.get(BROWSER_MANAGER_KEY)
+        if isinstance(browser_manager, BrowserManager):
+            try:
+                await browser_manager.cleanup()
+            except Exception:
+                _logger.debug(
+                    "browser: cleanup error during executor cancel",
                     extra={"extra_data": {"executor_id": handle.executor_id}},
                 )
 

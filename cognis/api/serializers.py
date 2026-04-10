@@ -11,6 +11,7 @@ from cognis.api.models import (
     AgentResponse,
     ConversationContextModel,
     ConversationResponse,
+    CredentialResponse,
     DependencyResponse,
     EscalationResponse,
     LLMProviderResponse,
@@ -267,6 +268,26 @@ def secret_to_response(row: dict[str, Any]) -> SecretResponse:
         scope=str(row.get("scope", "user")),
         agent_id=row.get("agent_id"),
         description=row.get("description"),
+    )
+
+
+def credential_to_response(row: Any) -> CredentialResponse:
+    metadata = row.metadata_json if hasattr(row, "metadata_json") else row.metadata
+    return CredentialResponse(
+        credential_id=row.credential_id,
+        kind=row.kind,
+        label=row.label,
+        metadata=metadata or {},
+        scope=row.scope,
+        agent_id=row.agent_id,
+        description=row.description,
+        version=int(row.version or 1),
+        status=row.status,
+        last_verified_at=row.last_verified_at,
+        expires_at=row.expires_at,
+        revoked_at=row.revoked_at,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
     )
 
 

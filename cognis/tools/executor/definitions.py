@@ -5,6 +5,19 @@ from __future__ import annotations
 from typing import Any
 
 from cognis.models.tool import ToolDefinition, ToolSource
+from cognis.tools.executor.browser.definitions import browser_tool_definitions
+from cognis.tools.executor.browser.handlers import (
+    handle_browser_click,
+    handle_browser_close,
+    handle_browser_fill,
+    handle_browser_get_text,
+    handle_browser_open,
+    handle_browser_press,
+    handle_browser_save_auth_state,
+    handle_browser_screenshot,
+    handle_browser_snapshot,
+    handle_browser_wait_for,
+)
 from cognis.tools.executor.document import (
     ARTIFACT_PUBLISH_TOOL,
     DOCUMENT_GENERATE_TOOL,
@@ -244,6 +257,10 @@ BASH_TOOL = ToolDefinition(
                 "type": "string",
                 "description": "Working directory for the command. Use ~ for home directory. Defaults to the executor home directory if omitted.",
             },
+            "env": {
+                "type": "object",
+                "description": "Optional environment variables for the command. Values may be resolved transiently from credential refs.",
+            },
         },
         "required": ["command"],
     },
@@ -472,6 +489,7 @@ ALL_EXECUTOR_TOOLS: list[ToolDefinition] = [
     BASH_TOOL,
     DOCUMENT_GENERATE_TOOL,
     ARTIFACT_PUBLISH_TOOL,
+    *browser_tool_definitions(),
 ]
 
 _HANDLER_MAP: dict[
@@ -489,6 +507,16 @@ _HANDLER_MAP: dict[
     "bash": handle_bash,
     "document_generate": handle_document_generate,
     "artifact_publish": handle_artifact_publish,
+    "browser_open": handle_browser_open,
+    "browser_snapshot": handle_browser_snapshot,
+    "browser_get_text": handle_browser_get_text,
+    "browser_click": handle_browser_click,
+    "browser_fill": handle_browser_fill,
+    "browser_press": handle_browser_press,
+    "browser_wait_for": handle_browser_wait_for,
+    "browser_screenshot": handle_browser_screenshot,
+    "browser_close": handle_browser_close,
+    "browser_save_auth_state": handle_browser_save_auth_state,
     "web_fetch": handle_web_fetch,
     "web_search": handle_web_search,
     "web_crawl": handle_web_crawl,

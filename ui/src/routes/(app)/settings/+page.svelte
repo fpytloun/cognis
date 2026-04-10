@@ -31,6 +31,7 @@
   import type {
     ApiKeyCreateResponse,
     ApiKeyMetadata,
+    CredentialMetadata,
     ExecutorConfig,
     ExecutorTokenResponse,
     HealthResponse,
@@ -72,6 +73,7 @@
   let providers = $state<LLMProvider[]>([]);
   let modelRouting = $state<ModelRouting>({ default: null, classifier: null, compaction: null, evaluator: null, simple_inline: null, speech_to_text: null, image_generation: null, items: {} });
   let secrets = $state<SecretMetadata[]>([]);
+  let credentials = $state<CredentialMetadata[]>([]);
   let health = $state<HealthResponse | null>(null);
   let diagnostics = $state<SystemDiagnostics | null>(null);
   let executorConfigs = $state<ExecutorConfig[]>([]);
@@ -141,6 +143,18 @@
     description: ''
   });
 
+  let credentialForm = $state({
+    credential_id: '',
+    kind: 'token',
+    label: '',
+    payload_json: '{\n  "token": ""\n}',
+    metadata_json: '{}',
+    scope: 'user',
+    agent_id: '',
+    description: '',
+    expires_at: ''
+  });
+
   let passwordForm = $state({
     current_password: '',
     new_password: '',
@@ -152,6 +166,7 @@
       providerForm,
       routingForm,
       secretForm,
+      credentialForm,
       passwordForm,
       newApiKeyName,
       newApiKeyExpiresInDays,
@@ -491,10 +506,11 @@
 
   async function refreshPageState(): Promise<void> {
     isAdmin = auth.getSnapshot().user?.role === 'admin';
-    [settings, modelRouting, secrets, health, apiKeys] = await Promise.all([
+    [settings, modelRouting, secrets, credentials, health, apiKeys] = await Promise.all([
       api.settings.list(),
       api.modelRouting.get(),
       api.secrets.list(),
+      api.credentials.list().catch(() => []),
       api.system.health(),
       api.auth.listApiKeys()
     ]);
@@ -714,6 +730,70 @@
     } catch (caughtError) {
       error = asApiError(caughtError).message;
       addToast(error, 'error', 4_000, 'Unable to save secret');
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function saveCredential(): Promise<void> {
+    if (!credentialForm.credential_id.trim() || !credentialForm.label.trim()) {
+      error = 'Credential ID and label are required.';
+      return;
+    }
+    busy = true;
+    error = '';
+    try {
+      const payload = JSON.parse(credentialForm.payload_json || '{}');
+      const metadata = JSON.parse(credentialForm.metadata_json || '{}');
+      await api.credentials.upsert({
+        credential_id: credentialForm.credential_id,
+        kind: credentialForm.kind,
+        label: credentialForm.label,
+        payload,
+        metadata,
+        scope: credentialForm.scope,
+        agent_id: credentialForm.scope === 'agent' ? credentialForm.agent_id || null : null,
+        description: credentialForm.description || null,
+        expires_at: credentialForm.expires_at ? new Date(credentialForm.expires_at).toISOString() : null,
+      });
+      credentialForm = {
+        ...credentialForm,
+        credential_id: '',
+        label: '',
+        payload_json: '{\n  "token": ""\n}',
+        metadata_json: '{}',
+        agent_id: '',
+        description: '',
+        expires_at: ''
+      };
+      credentials = await api.credentials.list();
+      addToast('Credential saved.', 'success');
+      initialSnapshot = snapshotState();
+    } catch (caughtError) {
+      error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to save credential');
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function deleteCredential(credential: CredentialMetadata): Promise<void> {
+    const confirmed = await confirmAction({
+      title: 'Delete credential?',
+      message: `Delete ${credential.label}? Stored credential material cannot be recovered after deletion.`,
+      confirmLabel: 'Delete credential'
+    });
+    if (!confirmed) return;
+    busy = true;
+    error = '';
+    try {
+      await api.credentials.remove(credential.credential_id);
+      credentials = await api.credentials.list();
+      addToast('Credential deleted.', 'success');
+      initialSnapshot = snapshotState();
+    } catch (caughtError) {
+      error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to delete credential');
     } finally {
       busy = false;
     }
@@ -1511,6 +1591,82 @@
           </div>
         </Card>
       </div>
+      <div class="mt-5 grid gap-5 xl:grid-cols-[360px_minmax(0,1fr)]">
+        <Card class="p-5">
+          <div class="space-y-4">
+            <p class="text-sm leading-6 text-slate-400">
+              Structured credentials for agents and browser automation. Payload and metadata are stored separately from LLM context.
+            </p>
+            <label class="space-y-2 text-sm font-medium text-slate-200">
+              <span>Credential ID <span class="text-rose-300">*</span></span>
+              <Input bind:value={credentialForm.credential_id} placeholder="github_work" />
+            </label>
+            <label class="space-y-2 text-sm font-medium text-slate-200">
+              <span>Kind</span>
+              <select bind:value={credentialForm.kind} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+                <option value="token">Token</option>
+                <option value="text">Text</option>
+                <option value="username_password">Username/password</option>
+                <option value="totp_seed">TOTP seed</option>
+                <option value="recovery_codes">Recovery codes</option>
+                <option value="browser_storage_state">Browser auth state</option>
+              </select>
+            </label>
+            <label class="space-y-2 text-sm font-medium text-slate-200">
+              <span>Label <span class="text-rose-300">*</span></span>
+              <Input bind:value={credentialForm.label} placeholder="GitHub work login" />
+            </label>
+            <label class="space-y-2 text-sm font-medium text-slate-200">
+              <span>Payload (JSON)</span>
+              <textarea bind:value={credentialForm.payload_json} class="min-h-[140px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 font-mono text-sm text-slate-100"></textarea>
+            </label>
+            <label class="space-y-2 text-sm font-medium text-slate-200">
+              <span>Metadata (JSON)</span>
+              <textarea bind:value={credentialForm.metadata_json} class="min-h-[120px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 font-mono text-sm text-slate-100"></textarea>
+            </label>
+            <label class="space-y-2 text-sm font-medium text-slate-200">
+              <span>Scope</span>
+              <select bind:value={credentialForm.scope} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+                <option value="user">User</option>
+                <option value="agent">Agent-specific</option>
+              </select>
+            </label>
+            {#if credentialForm.scope === 'agent'}
+              <label class="space-y-2 text-sm font-medium text-slate-200">
+                <span>Agent</span>
+                <select bind:value={credentialForm.agent_id} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+                  <option value="">Select agent...</option>
+                  {#each agents.filter((a) => !a.is_system) as agent}
+                    <option value={agent.agent_id}>{agent.name} ({agent.agent_id})</option>
+                  {/each}
+                </select>
+              </label>
+            {/if}
+            <label class="space-y-2 text-sm font-medium text-slate-200">
+              <span>Expires at</span>
+              <Input bind:value={credentialForm.expires_at} type="datetime-local" />
+            </label>
+            <label class="space-y-2 text-sm font-medium text-slate-200">
+              <span>Description</span>
+              <Input bind:value={credentialForm.description} placeholder="What this credential is for" />
+            </label>
+            <Button class="w-full justify-center" onclick={saveCredential} disabled={busy}>Save credential</Button>
+          </div>
+        </Card>
+        <Card class="p-5">
+          <div class="space-y-3">
+            {#each credentials as credential}
+              <div class="flex items-center justify-between gap-3 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3">
+                <div>
+                  <p class="font-medium text-white">{credential.label}</p>
+                  <p class="text-xs text-slate-400">{credential.credential_id} · {credential.kind} · {credential.status}</p>
+                </div>
+                <Button size="sm" variant="danger" onclick={() => deleteCredential(credential)} disabled={busy}>Delete</Button>
+              </div>
+            {/each}
+          </div>
+        </Card>
+      </div>
     {:else if activeTab === 'web'}
       <div class="grid gap-5 xl:grid-cols-[360px_minmax(0,1fr)]">
         <!-- Left: backend selector -->
@@ -1931,6 +2087,99 @@
                     />
                   </label>
                 </div>
+              </div>
+            </details>
+
+            <!-- Browser automation settings -->
+            {@const browserConfig = ((exec.config || {}).browser || {}) as Record<string, unknown>}
+            {@const browserEnabled = browserConfig.enabled !== false}
+            {@const browserAutoInstall = browserConfig.auto_install === true}
+            <details class="group">
+              <summary class="cursor-pointer text-xs uppercase tracking-wider text-slate-400 hover:text-slate-300 select-none">
+                Browser Automation
+                <span class="ml-1 text-slate-500">{browserEnabled ? '(enabled)' : '(disabled)'}</span>
+              </summary>
+              <div class="mt-3 space-y-3 pl-1">
+                <div class="flex flex-wrap gap-4">
+                  <label class="flex items-center gap-2 text-sm text-slate-300">
+                    <input type="checkbox" checked={browserEnabled}
+                      class="rounded border-slate-600 bg-slate-800 text-emerald-500 focus:ring-emerald-500/30"
+                      onchange={async (e) => {
+                        const checked = e.currentTarget.checked;
+                        const cfg = { ...(exec.config || {}), browser: { ...browserConfig, enabled: checked } };
+                        await api.executor.update(exec.executor_id, { config: cfg });
+                        await refreshPageState();
+                        addToast(`Browser automation ${checked ? 'enabled' : 'disabled'}.`, 'success');
+                      }}
+                    />
+                    Enabled
+                  </label>
+                  <label class="flex items-center gap-2 text-sm text-slate-300">
+                    <input type="checkbox" checked={browserAutoInstall} disabled={!browserEnabled}
+                      class="rounded border-slate-600 bg-slate-800 text-emerald-500 focus:ring-emerald-500/30 disabled:opacity-40"
+                      onchange={async (e) => {
+                        const checked = e.currentTarget.checked;
+                        const cfg = { ...(exec.config || {}), browser: { ...browserConfig, auto_install: checked } };
+                        await api.executor.update(exec.executor_id, { config: cfg });
+                        await refreshPageState();
+                        addToast(`Browser auto-install ${checked ? 'enabled' : 'disabled'}.`, 'success');
+                      }}
+                    />
+                    Auto-install Playwright browser
+                  </label>
+                </div>
+                <div class="grid gap-3 md:grid-cols-3">
+                  <label class="space-y-1 text-sm text-slate-300">
+                    <span class="text-xs text-slate-400">Browser engine</span>
+                    <select class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+                      value={String(browserConfig.engine ?? 'chromium')}
+                      onchange={async (e) => {
+                        const cfg = { ...(exec.config || {}), browser: { ...browserConfig, engine: e.currentTarget.value } };
+                        await api.executor.update(exec.executor_id, { config: cfg });
+                        await refreshPageState();
+                      }}>
+                      <option value="chromium">Chromium</option>
+                    </select>
+                  </label>
+                  <label class="space-y-1 text-sm text-slate-300">
+                    <span class="text-xs text-slate-400">Max sessions</span>
+                    <Input value={Number(browserConfig.max_sessions ?? 4)} disabled={!browserEnabled}
+                      type="number" min="1" max="16" step="1"
+                      onchange={async (e) => {
+                        const val = parseInt(e.currentTarget.value, 10);
+                        if (isNaN(val)) return;
+                        const cfg = { ...(exec.config || {}), browser: { ...browserConfig, max_sessions: val } };
+                        await api.executor.update(exec.executor_id, { config: cfg });
+                        await refreshPageState();
+                      }}
+                    />
+                  </label>
+                  <label class="space-y-1 text-sm text-slate-300">
+                    <span class="text-xs text-slate-400">Idle timeout (seconds)</span>
+                    <Input value={Number(browserConfig.idle_timeout_seconds ?? 600)} disabled={!browserEnabled}
+                      type="number" min="60" max="3600" step="60"
+                      onchange={async (e) => {
+                        const val = parseInt(e.currentTarget.value, 10);
+                        if (isNaN(val)) return;
+                        const cfg = { ...(exec.config || {}), browser: { ...browserConfig, idle_timeout_seconds: val } };
+                        await api.executor.update(exec.executor_id, { config: cfg });
+                        await refreshPageState();
+                      }}
+                    />
+                  </label>
+                </div>
+                <label class="flex items-center gap-2 text-sm text-slate-300">
+                  <input type="checkbox" checked={browserConfig.headed_allowed === true} disabled={!browserEnabled}
+                    class="rounded border-slate-600 bg-slate-800 text-emerald-500 focus:ring-emerald-500/30 disabled:opacity-40"
+                    onchange={async (e) => {
+                      const checked = e.currentTarget.checked;
+                      const cfg = { ...(exec.config || {}), browser: { ...browserConfig, headed_allowed: checked } };
+                      await api.executor.update(exec.executor_id, { config: cfg });
+                      await refreshPageState();
+                    }}
+                  />
+                  Allow headed mode on this executor
+                </label>
               </div>
             </details>
 

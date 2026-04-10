@@ -14,7 +14,7 @@
     slugify,
     type AgentFormState
   } from '$lib/agents';
-  import type { Agent, EffectiveToolItem, ExecutorConfig, IntarisMCPServer, LLMProvider, SecretMetadata, Skill, ToolDefinitionSummary, Workflow } from '$lib/types/api';
+  import type { Agent, CredentialMetadata, EffectiveToolItem, ExecutorConfig, IntarisMCPServer, LLMProvider, SecretMetadata, Skill, ToolDefinitionSummary, Workflow } from '$lib/types/api';
 
   type AgentToolOption = (ToolDefinitionSummary & { tool_id?: string; permission?: string }) | EffectiveToolItem;
 
@@ -26,6 +26,7 @@
     providers,
     executors = [],
     secrets = [],
+    credentials = [],
     skills = [],
     intarisMcpServers = [],
     secondaryAgents = [],
@@ -43,6 +44,7 @@
     providers: LLMProvider[];
     executors?: ExecutorConfig[];
     secrets?: SecretMetadata[];
+    credentials?: CredentialMetadata[];
     skills?: Skill[];
     intarisMcpServers?: IntarisMCPServer[];
     secondaryAgents?: Agent[];
@@ -212,6 +214,14 @@
       form.allowedSecrets = form.allowedSecrets.filter((v: string) => v !== secretName);
     } else {
       form.allowedSecrets = [...form.allowedSecrets, secretName];
+    }
+  }
+
+  function toggleCredential(credentialId: string): void {
+    if (form.allowedCredentials.includes(credentialId)) {
+      form.allowedCredentials = form.allowedCredentials.filter((v: string) => v !== credentialId);
+    } else {
+      form.allowedCredentials = [...form.allowedCredentials, credentialId];
     }
   }
 
@@ -512,6 +522,27 @@
                     {/each}
                   </div>
                 </details>
+              {/each}
+            </div>
+          </div>
+        {/if}
+
+        {#if credentials.length > 0}
+          <div class="mt-4">
+            <p class="mb-2 text-sm font-medium text-slate-200">Allowed credentials</p>
+            <div class="grid gap-2 md:grid-cols-2">
+              {#each credentials as credential}
+                <label class="flex items-center gap-2 text-sm text-slate-200">
+                  <input
+                    checked={form.allowedCredentials.includes(credential.credential_id)}
+                    class="h-4 w-4 rounded border-slate-600 bg-slate-950"
+                    type="checkbox"
+                    onchange={() => toggleCredential(credential.credential_id)}
+                    disabled={readonly}
+                  />
+                  {credential.label}
+                  <span class="text-xs text-slate-400">({credential.kind})</span>
+                </label>
               {/each}
             </div>
           </div>

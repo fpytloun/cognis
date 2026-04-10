@@ -100,11 +100,15 @@ AUTO_COMPACTION_TIMEOUT_SECONDS = 15
 # Controller-injected tool names
 STEP_COMPLETE = "step_complete"
 STEP_REQUEST_INPUT = "step_request_input"
+REQUEST_CREDENTIAL = "request_credential"
+REQUEST_AUTH_CHALLENGE = "request_auth_challenge"
 STEP_TODO_WRITE = "step_todo_write"
 STEP_TODO_LIST = "step_todo_list"
 CONTROLLER_TOOLS = {
     STEP_COMPLETE,
     STEP_REQUEST_INPUT,
+    REQUEST_CREDENTIAL,
+    REQUEST_AUTH_CHALLENGE,
     STEP_TODO_WRITE,
     STEP_TODO_LIST,
     SEARCH_TOOLS_TOOL.name,
@@ -1939,6 +1943,146 @@ class AgentLoop:
                         timeout_content = json.dumps({"error": "Input request timed out."})
                         messages.append(
                             {"role": "tool", "tool_call_id": tc.call_id, "content": timeout_content}
+                        )
+                        _append_tool_result_event(
+                            events_to_record, tc, timeout_content, True, tool_id=tool_id
+                        )
+                        if on_tool_result:
+                            await on_tool_result(
+                                tc.call_id, tc.name, timeout_content, True, None, None
+                            )
+                    continue
+
+                elif tc.name in {REQUEST_CREDENTIAL, REQUEST_AUTH_CHALLENGE}:
+                    _append_tool_call_event(events_to_record, tc, tool_id)
+                    pause_id = f"auth_{uuid.uuid4().hex[:12]}"
+                    timeout_seconds = int(tc.arguments.get("timeout_seconds", 600) or 600)
+                    payload = {
+                        "credential_id": tc.arguments.get("credential_id"),
+                        "kind": tc.arguments.get("kind"),
+                        "scope": tc.arguments.get("scope", "user"),
+                        "agent_id": tc.arguments.get("agent_id"),
+                        "label": tc.arguments.get("label")
+                        or tc.arguments.get("credential_id")
+                        or "Authentication required",
+                        "message": tc.arguments.get("message")
+                        or tc.arguments.get("description")
+                        or "Authentication is required to continue.",
+                        "description": tc.arguments.get("description"),
+                        "metadata": (
+                            tc.arguments.get("metadata")
+                            if isinstance(tc.arguments.get("metadata"), dict)
+                            else {}
+                        ),
+                        "required_fields": (
+                            tc.arguments.get("required_fields")
+                            if isinstance(tc.arguments.get("required_fields"), list)
+                            else []
+                        ),
+                        "expires_at": (
+                            datetime.now(UTC) + timedelta(seconds=timeout_seconds)
+                        ).isoformat(),
+                    }
+                    notification_type = (
+                        "credential_request" if tc.name == REQUEST_CREDENTIAL else "auth_challenge"
+                    )
+                    await self.notification_service.create(
+                        notification_type=notification_type,
+                        user_email=ctx.session.user_email,
+                        conversation_id=ctx.conversation.conversation_id,
+                        task_id=ctx.task_id,
+                        step_name=ctx.step_definition.name,
+                        step_run_id=ctx.step_run_id,
+                        session_id=ctx.session.session_id,
+                        notification_id=pause_id,
+                        payload=payload,
+                    )
+                    await self._set_interactive_pause_state(
+                        ctx,
+                        pause_type=notification_type,
+                        pause_payload={
+                            "pause_id": pause_id,
+                            "step_name": ctx.step_definition.name,
+                            "step_run_id": ctx.step_run_id,
+                            "session_id": ctx.session.session_id,
+                            **payload,
+                        },
+                    )
+                    try:
+                        resolution = await self.pause_waiter.wait(
+                            pause_id, timeout=float(timeout_seconds)
+                        )
+                        await self._clear_interactive_pause_state(ctx)
+                        if resolution.decision in {"cancel", "deny"}:
+                            raise StepInterrupted("Authentication request cancelled")
+                        if tc.name == REQUEST_CREDENTIAL and not resolution.data.get(
+                            "credential_id"
+                        ):
+                            err_content = json.dumps(
+                                {"error": "Credential request was not fulfilled."}
+                            )
+                            messages.append(
+                                {"role": "tool", "tool_call_id": tc.call_id, "content": err_content}
+                            )
+                            _append_tool_result_event(
+                                events_to_record, tc, err_content, True, tool_id=tool_id
+                            )
+                            if on_tool_result:
+                                await on_tool_result(
+                                    tc.call_id, tc.name, err_content, True, None, None
+                                )
+                            continue
+                        if tc.name == REQUEST_AUTH_CHALLENGE and not (
+                            resolution.data.get("response_ref")
+                            or resolution.data.get("challenge_completed")
+                        ):
+                            err_content = json.dumps({"error": "Auth challenge was not fulfilled."})
+                            messages.append(
+                                {"role": "tool", "tool_call_id": tc.call_id, "content": err_content}
+                            )
+                            _append_tool_result_event(
+                                events_to_record, tc, err_content, True, tool_id=tool_id
+                            )
+                            if on_tool_result:
+                                await on_tool_result(
+                                    tc.call_id, tc.name, err_content, True, None, None
+                                )
+                            continue
+                        resp_content = json.dumps(
+                            {
+                                "credential_id": resolution.data.get("credential_id"),
+                                "credential_label": resolution.data.get("credential_label"),
+                                "credential_kind": resolution.data.get("credential_kind"),
+                                "response_ref": resolution.data.get("response_ref"),
+                                "challenge_completed": resolution.data.get(
+                                    "challenge_completed", False
+                                ),
+                            }
+                        )
+                        messages.append(
+                            {"role": "tool", "tool_call_id": tc.call_id, "content": resp_content}
+                        )
+                        _append_tool_result_event(
+                            events_to_record, tc, resp_content, False, tool_id=tool_id
+                        )
+                        if on_tool_result:
+                            await on_tool_result(
+                                tc.call_id, tc.name, resp_content, False, None, None
+                            )
+                    except TimeoutError:
+                        await self._clear_interactive_pause_state(ctx)
+                        if self.notification_service is not None:
+                            await self.notification_service.mark_orphaned(
+                                pause_id,
+                                reason="timeout",
+                            )
+                        timeout_content = json.dumps({"error": "Authentication request timed out."})
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc.call_id,
+                                "content": timeout_content,
+                            }
                         )
                         _append_tool_result_event(
                             events_to_record, tc, timeout_content, True, tool_id=tool_id

@@ -110,6 +110,7 @@ describe('agent payload mapping', () => {
 
     expect(payload).toEqual({
       agent_id: 'agent-1',
+      skills: {},
       tools: {
         delegation_tools: true,
         mcp_servers: [
@@ -126,6 +127,7 @@ describe('agent payload mapping', () => {
       permissions: {
         tool_permissions: {},
         allowed_secrets: [],
+        allowed_credentials: [],
         can_delegate: true,
         max_delegation_depth: 3
       },
@@ -141,5 +143,33 @@ describe('agent payload mapping', () => {
         step_agent_overrides: {}
       }
     });
+  });
+
+  it('round-trips allowed credentials independently of allowed secrets', () => {
+    const form = createEmptyAgentForm();
+    form.agentId = 'agent-1';
+    form.name = 'Agent';
+    form.allowedSecrets = ['legacy_secret'];
+    form.allowedCredentials = ['github_work'];
+
+    const payload = formStateToPayload(form);
+    expect(payload.permissions).toMatchObject({
+      allowed_secrets: ['legacy_secret'],
+      allowed_credentials: ['github_work']
+    });
+
+    const next = agentToFormState({
+      agent_id: 'agent-1',
+      name: 'Agent',
+      agent_type: 'primary',
+      tools: {},
+      permissions: {
+        allowed_secrets: ['legacy_secret'],
+        allowed_credentials: ['github_work']
+      }
+    } as never);
+
+    expect(next.allowedSecrets).toEqual(['legacy_secret']);
+    expect(next.allowedCredentials).toEqual(['github_work']);
   });
 });

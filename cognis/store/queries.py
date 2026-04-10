@@ -20,6 +20,7 @@ from cognis.store.models import (
     ChannelDeliveryOutboxRow,
     ChannelPairingRequest,
     Conversation,
+    CredentialRow,
     ExecutorRow,
     LLMProvider,
     MCPServerRow,
@@ -1110,6 +1111,27 @@ async def get_secret(
 async def list_secrets(session: AsyncSession, user_email: str) -> list[Secret]:
     """List secrets for a user (metadata only, no decrypted values)."""
     result = await session.execute(select(Secret).where(Secret.user_email == user_email))
+    return list(result.scalars().all())
+
+
+async def get_credential_row(
+    session: AsyncSession, user_email: str, credential_id: str
+) -> CredentialRow | None:
+    result = await session.execute(
+        select(CredentialRow).where(
+            CredentialRow.user_email == user_email,
+            CredentialRow.credential_id == credential_id,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def list_credential_rows(session: AsyncSession, user_email: str) -> list[CredentialRow]:
+    result = await session.execute(
+        select(CredentialRow)
+        .where(CredentialRow.user_email == user_email)
+        .order_by(CredentialRow.label, CredentialRow.credential_id)
+    )
     return list(result.scalars().all())
 
 

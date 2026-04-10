@@ -201,7 +201,9 @@ class WorkflowState(BaseModel):
     status: Literal["running", "paused", "completed", "failed", "cancelled"] = "running"
     skipped_steps: list[str] = Field(default_factory=list)  # Steps skipped due to exhaustion
     last_evaluation_feedback: str | None = None  # Feedback from evaluator for retries
-    pending_pause_type: Literal["gate", "step_input"] | None = None
+    pending_pause_type: (
+        Literal["gate", "step_input", "credential_request", "auth_challenge"] | None
+    ) = None
     pending_pause_payload: dict[str, Any] | None = None
     current_step_status: Literal["running", "paused"] | None = None
 

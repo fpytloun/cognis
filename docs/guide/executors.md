@@ -31,6 +31,7 @@ Executors can also be used to:
 
 - attach MCP servers
 - expose only selected tool groups
+- host Playwright-backed browser automation
 - host channel adapters that need local services
 - route provider calls to executor-side inference when supported
 
@@ -44,6 +45,10 @@ Open `Settings` and use the executors section to inspect:
 - enabled tool groups
 - individually enabled tools
 - attached MCP servers
+
+If browser automation is enabled on an executor, the same settings area also
+lets you configure browser runtime behavior such as auto-install, engine,
+headed-mode allowance, session limits, and idle timeout.
 
 ### Runtime states
 
@@ -71,6 +76,33 @@ WebSocket executors can report several runtime states:
 - confirm the required tools are enabled on the executor
 - confirm the agent is bound to the expected executor or label selector
 - confirm any required secrets or MCP servers are assigned correctly
+- confirm browser automation is enabled if browser tools are expected
+
+## Browser automation
+
+Browser automation is executor-native. The controller handles orchestration,
+credentials, approvals, and retry policy, but the executor is the only
+component that launches Playwright and performs page actions.
+
+In `Settings -> Executors`, the browser section stores executor config like:
+
+```json
+{
+  "browser": {
+    "enabled": true,
+    "auto_install": true,
+    "headed_allowed": false,
+    "engine": "chromium",
+    "max_sessions": 4,
+    "idle_timeout_seconds": 600
+  }
+}
+```
+
+Saved browser auth state is stored in Cognis as an encrypted credential record,
+not as an unmanaged browser profile on the executor. This keeps the controller
+as the durable source of truth while still allowing temporary executors to
+rehydrate browser sessions when a site permits it.
 
 ## MCP stdio command format
 

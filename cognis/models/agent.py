@@ -82,6 +82,7 @@ class AgentPermissions(BaseModel):
     denied_tools: list[str] | None = None
     tool_permissions: dict[str, Permission] | None = None
     allowed_secrets: list[str] = Field(default_factory=list)
+    allowed_credentials: list[str] = Field(default_factory=list)
     max_delegation_depth: int = 5
     can_delegate: bool = True
 

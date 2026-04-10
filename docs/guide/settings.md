@@ -32,6 +32,15 @@ Secrets are stored encrypted and can be reused by tools, MCP servers, channels, 
 
 Use the secrets section when you want credentials managed inside Cognis rather than only through environment variables.
 
+The same area now also exposes structured **credentials** for agent-facing
+authentication flows. Use credentials when you need metadata and typed payloads,
+for example:
+
+- username/password login records
+- tokens scoped to a target URL or domain
+- saved browser authentication state
+- MFA-related recovery material such as TOTP seeds or recovery codes
+
 ## Web search
 
 The web search section controls which search provider integrations are available to the workspace. Configure this early if your agents or tools need live web results.
@@ -47,6 +56,11 @@ The executors section lets you inspect:
 - token generation for remote executors
 
 This is also where you decide whether local executor modes should remain enabled in production.
+
+Executor cards also include **Browser Automation** settings for Playwright-based
+browser tools. These control whether browser automation is enabled on the
+executor, whether browser binaries may be auto-installed, whether headed mode is
+allowed, and how many concurrent browser sessions the executor should allow.
 
 ## Tools and MCP servers
 

@@ -72,6 +72,8 @@ class NotificationType(StrEnum):
     ESCALATION = "escalation"
     GATE = "gate"
     STEP_QUESTION = "step_question"
+    CREDENTIAL_REQUEST = "credential_request"
+    AUTH_CHALLENGE = "auth_challenge"
 
 
 class Notification(BaseModel):

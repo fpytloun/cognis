@@ -529,7 +529,7 @@ class TaskQueue:
                 continue
             if pause_type == "gate":
                 self._launch_task_run(task)
-            elif pause_type == "step_input":
+            elif pause_type in {"step_input", "credential_request", "auth_challenge"}:
                 # Check if reconcile_pending already handled this
                 payload = task.workflow_state.pending_pause_payload or {}
                 pause_id = str(payload.get("pause_id", f"recovered_{task.task_id}"))
@@ -541,12 +541,12 @@ class TaskQueue:
                     self._workflow_engine._pause_waiter.register(  # noqa: SLF001
                         PendingPause(
                             pause_id=pause_id,
-                            pause_type="step_input",
+                            pause_type=str(pause_type),
                             task_id=task.task_id,
                             step_name=payload.get("step_name"),
                             step_run_id=payload.get("step_run_id"),
                             session_id=payload.get("session_id"),
-                            question=payload.get("question"),
+                            question=payload.get("question") or payload.get("message"),
                             options=(
                                 [
                                     {"label": str(item), "action": str(item)}

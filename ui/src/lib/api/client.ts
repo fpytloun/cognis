@@ -7,8 +7,9 @@ import type {
   AttachmentRef,
   ChannelAccount,
   ChannelAccountStatus,
-  ChannelContact,
-  ChannelMeta,
+    ChannelContact,
+    CredentialMetadata,
+    ChannelMeta,
   ApiErrorResponse,
   ApiKeyMetadata,
   BootstrapStatusResponse,
@@ -40,7 +41,7 @@ import type {
   PairingRequest,
   Schedule,
   ScheduleRun,
-  SecretMetadata,
+    SecretMetadata,
   Session,
   SessionEventsResponse,
   Setting,
@@ -1012,6 +1013,31 @@ export const api = {
 
     remove(name: string, scope = 'user', agentId: string | null = null): Promise<{ ok: boolean }> {
       return request<{ ok: boolean }>(`/api/v1/secrets/${name}${encodeQuery({ scope, agent_id: agentId })}`, {
+        method: 'DELETE'
+      });
+    }
+  },
+
+  credentials: {
+    list(): Promise<CredentialMetadata[]> {
+      return request<CredentialMetadata[]>('/api/v1/credentials');
+    },
+
+    upsert(payload: Record<string, unknown>): Promise<CredentialMetadata> {
+      return request<CredentialMetadata>('/api/v1/credentials', {
+        method: 'POST',
+        body: JSON.stringify(payload)
+      });
+    },
+
+    revoke(credentialId: string): Promise<{ ok: boolean }> {
+      return request<{ ok: boolean }>(`/api/v1/credentials/${encodeURIComponent(credentialId)}/revoke`, {
+        method: 'POST'
+      });
+    },
+
+    remove(credentialId: string): Promise<{ ok: boolean }> {
+      return request<{ ok: boolean }>(`/api/v1/credentials/${encodeURIComponent(credentialId)}`, {
         method: 'DELETE'
       });
     }

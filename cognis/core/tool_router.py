@@ -11,6 +11,7 @@ from enum import StrEnum
 from fnmatch import fnmatchcase
 from time import perf_counter
 from typing import Any
+from urllib.parse import urlparse
 
 from prometheus_client import Counter
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -19,6 +20,7 @@ from cognis.core.truncation import middle_truncate
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.artifact import ArtifactKind
+from cognis.models.credential import CredentialResolution
 from cognis.models.session import SessionModel
 from cognis.models.tool import ExecutorHandle, Permission, ToolCall, ToolResult, stable_tool_id
 from cognis.store.queries import create_artifact_record, get_artifact_record, get_setting_value
@@ -88,6 +90,7 @@ class ToolRouter:
         guardrails: Any,
         non_bypassable_patterns: list[str] | None = None,
         memory: Any | None = None,
+        credentials_provider: Any | None = None,
         tool_output_store: Any | None = None,
         image_generation_provider: Any | None = None,
         artifact_store: Any | None = None,
@@ -95,6 +98,7 @@ class ToolRouter:
     ) -> None:
         self.guardrails = guardrails
         self.memory = memory
+        self.credentials_provider = credentials_provider
         self.tool_output_store = tool_output_store
         self.image_generation_provider = image_generation_provider
         self.artifact_store = artifact_store
@@ -108,6 +112,7 @@ class ToolRouter:
         guardrails: Any,
         session_factory: async_sessionmaker[AsyncSession],
         memory: Any | None = None,
+        credentials_provider: Any | None = None,
         tool_output_store: Any | None = None,
         image_generation_provider: Any | None = None,
         artifact_store: Any | None = None,
@@ -120,6 +125,7 @@ class ToolRouter:
             guardrails=guardrails,
             non_bypassable_patterns=_coerce_patterns(patterns),
             memory=memory,
+            credentials_provider=credentials_provider,
             tool_output_store=tool_output_store,
             image_generation_provider=image_generation_provider,
             artifact_store=artifact_store,
@@ -242,7 +248,7 @@ class ToolRouter:
         )
         TOOL_ROUTE_DECISIONS.labels(route=str(route)).inc()
         if route is ToolRoute.LOCAL:
-            tool_call = await self._prepare_local_tool_call(tool_call, session)
+            tool_call = await self._prepare_local_tool_call(tool_call, session, agent)
         if route is ToolRoute.UNKNOWN:
             TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome="unknown").inc()
             return self._sanitize_result(
@@ -470,6 +476,7 @@ class ToolRouter:
                 registered_tool=registered_tool,
                 executor=executor,
             )
+            result = await self._persist_browser_auth_state_if_needed(result, session, agent)
             result = await self._materialize_inline_attachments(result, session, tool_call.name)
             if result.metadata is None:
                 result = result.model_copy(update={"metadata": {"evaluation": eval_meta}})
@@ -493,6 +500,7 @@ class ToolRouter:
                 ),
                 timeout=registered_tool.definition.timeout_seconds,
             )
+            result = await self._persist_browser_auth_state_if_needed(result, session, agent)
             result = await self._materialize_inline_attachments(result, session, tool_call.name)
         except TimeoutError:
             await executor.cancel_call(tool_call.call_id)
@@ -564,16 +572,16 @@ class ToolRouter:
         return ToolResult(output=output, duration_ms=duration_ms)
 
     async def _prepare_local_tool_call(
-        self, tool_call: ToolCall, session: SessionModel
+        self, tool_call: ToolCall, session: SessionModel, agent: AgentDefinition
     ) -> ToolCall:
-        if tool_call.name != "document_generate":
-            return tool_call
         arguments = dict(tool_call.arguments)
-        if artifact_id := arguments.get("source_artifact_id"):
+        if tool_call.name == "document_generate" and (
+            artifact_id := arguments.get("source_artifact_id")
+        ):
             arguments["source_artifact_content"] = await self._load_text_artifact(
                 str(artifact_id), session.user_email
             )
-        assets = arguments.get("assets")
+        assets = arguments.get("assets") if tool_call.name == "document_generate" else None
         if isinstance(assets, list):
             resolved_assets: list[dict[str, Any]] = []
             for raw in assets:
@@ -589,7 +597,110 @@ class ToolRouter:
                     item.setdefault("filename", filename)
                 resolved_assets.append(item)
             arguments["assets"] = resolved_assets
+        if self.credentials_provider is not None:
+            arguments = await self._resolve_credential_refs(arguments, session, agent)
         return tool_call.model_copy(update={"arguments": arguments})
+
+    async def _resolve_credential_refs(
+        self, arguments: dict[str, Any], session: SessionModel, agent: AgentDefinition
+    ) -> dict[str, Any]:
+        resolved = dict(arguments)
+        if "value_ref" in resolved and isinstance(resolved.get("value_ref"), str):
+            cred = await self._resolve_credential_value(str(resolved["value_ref"]), session, agent)
+            resolved["value"] = str(cred.value)
+        if "auth_state_ref" in resolved and isinstance(resolved.get("auth_state_ref"), str):
+            auth_state_ref = str(resolved["auth_state_ref"])
+            cred = await self._resolve_credential_value(auth_state_ref, session, agent)
+            credential_id = auth_state_ref[len("$credential:") :].split(".", 1)[0]
+            record = await self.credentials_provider.get_credential(
+                credential_id, session.user_email
+            )
+            if record is None or record.kind != "browser_storage_state":
+                raise PermissionError(
+                    "auth_state_ref must reference a browser_storage_state credential"
+                )
+            target_url = str(resolved.get("url", ""))
+            origin = str((record.metadata or {}).get("origin") or "")
+            if not origin:
+                raise PermissionError("auth_state_ref is missing a bound origin")
+            origin_parts = urlparse(origin)
+            target_parts = urlparse(target_url)
+            if (
+                not target_url
+                or origin_parts.scheme != target_parts.scheme
+                or (origin_parts.hostname or "") != (target_parts.hostname or "")
+                or (origin_parts.port or _default_port(origin_parts.scheme))
+                != (target_parts.port or _default_port(target_parts.scheme))
+            ):
+                raise PermissionError("auth_state_ref origin does not match target URL")
+            if isinstance(cred.value, dict):
+                if isinstance(cred.value.get("storage_state"), dict):
+                    resolved["auth_state"] = cred.value["storage_state"]
+                else:
+                    resolved["auth_state"] = cred.value
+        env = resolved.get("env")
+        if isinstance(env, dict):
+            new_env: dict[str, Any] = {}
+            for key, value in env.items():
+                if isinstance(value, str) and value.startswith("$credential:"):
+                    cred = await self._resolve_credential_value(value, session, agent)
+                    new_env[str(key)] = str(cred.value)
+                else:
+                    new_env[str(key)] = value
+            resolved["env"] = new_env
+        return resolved
+
+    async def _resolve_credential_value(
+        self, ref: str, session: SessionModel, agent: AgentDefinition
+    ) -> CredentialResolution:
+        if self.credentials_provider is None:
+            raise ValueError("Credential resolution not available")
+        return await self.credentials_provider.resolve_ref(
+            ref, agent=agent, user_email=session.user_email
+        )
+
+    async def _persist_browser_auth_state_if_needed(
+        self, result: ToolResult, session: SessionModel, agent: AgentDefinition
+    ) -> ToolResult:
+        if self.credentials_provider is None or not isinstance(result.metadata, dict):
+            return result
+        auth_state = result.metadata.get("browser_auth_state")
+        if not isinstance(auth_state, dict):
+            return result
+        credential_id = str(auth_state.get("credential_id", "")).strip()
+        label = str(auth_state.get("label", "")).strip()
+        payload = auth_state.get("payload")
+        if not credential_id or not label or not isinstance(payload, dict):
+            return result.model_copy(
+                update={
+                    "metadata": {
+                        k: v for k, v in result.metadata.items() if k != "browser_auth_state"
+                    }
+                }
+            )
+        if agent.permissions is not None and credential_id not in set(
+            agent.permissions.allowed_credentials
+        ):
+            raise PermissionError(f"Credential not allowed for agent: {credential_id}")
+        created = await self.credentials_provider.upsert_credential(
+            credential_id=credential_id,
+            user_email=session.user_email,
+            kind=str(auth_state.get("kind", "browser_storage_state")),
+            label=label,
+            payload=payload,
+            metadata=auth_state.get("metadata")
+            if isinstance(auth_state.get("metadata"), dict)
+            else {},
+            description="Saved browser authentication state",
+        )
+        next_metadata = {k: v for k, v in result.metadata.items() if k != "browser_auth_state"}
+        next_metadata["saved_credential_id"] = created.credential_id
+        return result.model_copy(
+            update={
+                "metadata": next_metadata,
+                "output": f"Saved browser auth state as credential '{created.credential_id}'.",
+            }
+        )
 
     async def _load_text_artifact(self, artifact_id: str, user_email: str) -> str:
         if self._session_factory is None or self.artifact_store is None:
@@ -790,6 +901,14 @@ def _tool_max_size(registry: ToolRegistry, tool_name: str) -> int:
     if registered_tool is None:
         return 50_000
     return registered_tool.definition.max_result_size
+
+
+def _default_port(scheme: str) -> int | None:
+    if scheme == "https":
+        return 443
+    if scheme == "http":
+        return 80
+    return None
 
 
 def _kind_for_mime_type(mime_type: str) -> ArtifactKind:

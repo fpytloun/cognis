@@ -23,6 +23,7 @@ from cognis.api.routes.artifacts import router as artifacts_router
 from cognis.api.routes.auth import router as auth_router
 from cognis.api.routes.channels import router as channels_router
 from cognis.api.routes.conversations import router as conversations_router
+from cognis.api.routes.credentials import router as credentials_router
 from cognis.api.routes.escalations import router as escalations_router
 from cognis.api.routes.executors import router as executors_router
 from cognis.api.routes.images import router as images_router
@@ -273,6 +274,7 @@ def create_app() -> FastAPI:
             providers.guardrails,
             session_factory,
             memory=providers.memory,
+            credentials_provider=providers.credentials,
             tool_output_store=tool_output_store,
             image_generation_provider=providers.image_generation,
             artifact_store=artifact_store,
@@ -540,6 +542,7 @@ def create_app() -> FastAPI:
     app.include_router(artifacts_router)
     app.include_router(channels_router)
     app.include_router(conversations_router)
+    app.include_router(credentials_router)
     app.include_router(agents_router)
     app.include_router(images_router)
     app.include_router(sessions_router)

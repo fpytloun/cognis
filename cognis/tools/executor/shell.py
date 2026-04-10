@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from typing import Any
 
 from cognis.models.tool import ToolResult
@@ -18,6 +19,7 @@ async def handle_bash(arguments: dict[str, Any], context: ToolExecutionContext) 
     command = arguments.get("command", "")
     timeout_ms = arguments.get("timeout", _DEFAULT_TIMEOUT_MS)
     workdir = arguments.get("workdir")
+    env = arguments.get("env")
 
     if not command.strip():
         return ToolResult(output="No command provided.", is_error=True)
@@ -26,11 +28,17 @@ async def handle_bash(arguments: dict[str, Any], context: ToolExecutionContext) 
 
     try:
         resolved_cwd = str(resolve_path(workdir, default_to_home=True))
+        merged_env = (
+            {**os.environ, **{str(key): str(value) for key, value in env.items()}}
+            if isinstance(env, dict)
+            else None
+        )
         process = await asyncio.create_subprocess_shell(
             command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=resolved_cwd,
+            env=merged_env,
         )
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
     except TimeoutError:

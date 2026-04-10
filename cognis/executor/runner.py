@@ -297,6 +297,7 @@ class ExecutorRunner:
         # Generate dynamic web tool definitions from controller-provided config
         web_config_raw = params.get("web_config") or {}
         web_backends = web_config_raw.get("web_available_backends", ["direct"])
+        browser_config = config.get("browser") if isinstance(config, dict) else {}
         from cognis.tools.executor.web.definitions import web_tool_definitions
 
         web_defs = web_tool_definitions(web_backends)
@@ -310,6 +311,7 @@ class ExecutorRunner:
                 "web_backend": web_config_raw.get("web_backend", "direct"),
                 "web_available_backends": web_backends,
                 "web_secrets": secrets,
+                "browser": browser_config if isinstance(browser_config, dict) else {},
                 "environment": _build_environment_payload(),
                 "mcp_servers": mcp_statuses,
                 "warnings": mcp_warnings,
@@ -350,6 +352,13 @@ class ExecutorRunner:
                 await self._close_clients(old_clients)
             elif previous_clients is not staged_mcp_clients:
                 await self._close_clients(previous_clients)
+            old_browser_manager = previous_runtime_metadata.get("browser_manager")
+            if (
+                old_browser_manager is not None
+                and old_browser_manager is not self._runtime_metadata.get("browser_manager")
+            ):
+                with contextlib.suppress(Exception):
+                    await old_browser_manager.cleanup()
         except Exception as exc:
             logger.warning(
                 "Configure v%d failed during tool/handler setup: %s", requested_version, exc
@@ -996,6 +1005,7 @@ class ExecutorRunner:
     def _public_runtime_metadata(self) -> dict[str, Any]:
         metadata = dict(self._runtime_metadata)
         metadata.pop("web_secrets", None)
+        metadata.pop("browser_manager", None)
         return metadata
 
     async def _send_rpc_result(self, ws: Any, msg_id: str | None, result: dict[str, Any]) -> None:

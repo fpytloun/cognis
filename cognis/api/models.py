@@ -712,6 +712,35 @@ class SecretResponse(BaseModel):
     description: str | None = None
 
 
+class CredentialUpsertRequest(BaseModel):
+    credential_id: str
+    kind: str
+    label: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    scope: str = "user"
+    agent_id: str | None = None
+    description: str | None = None
+    expires_at: datetime | None = None
+
+
+class CredentialResponse(BaseModel):
+    credential_id: str
+    kind: str
+    label: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    scope: str = "user"
+    agent_id: str | None = None
+    description: str | None = None
+    version: int = 1
+    status: str = "active"
+    last_verified_at: datetime | None = None
+    expires_at: datetime | None = None
+    revoked_at: datetime | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
 class ToolResponse(BaseModel):
     name: str
     description: str

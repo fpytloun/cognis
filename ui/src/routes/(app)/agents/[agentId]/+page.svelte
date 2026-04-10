@@ -12,7 +12,7 @@
   import { installBeforeUnloadGuard, blockNavigationIfDirty } from '$lib/navigation/unsaved';
   import { confirmAction } from '$lib/stores/confirm';
   import { addToast } from '$lib/stores/toasts';
-  import type { Agent, EffectiveToolItem, ExecutorConfig, IntarisMCPServer, LLMProvider, SecretMetadata, Skill, Workflow } from '$lib/types/api';
+  import type { Agent, CredentialMetadata, EffectiveToolItem, ExecutorConfig, IntarisMCPServer, LLMProvider, SecretMetadata, Skill, Workflow } from '$lib/types/api';
 
   let loading = $state(true);
   let saving = $state(false);
@@ -23,6 +23,7 @@
   let providers = $state<LLMProvider[]>([]);
   let executors = $state<ExecutorConfig[]>([]);
   let secrets = $state<SecretMetadata[]>([]);
+  let credentials = $state<CredentialMetadata[]>([]);
   let skills = $state<Skill[]>([]);
   let intarisMcpServers = $state<IntarisMCPServer[]>([]);
   let secondaryAgents = $state<Agent[]>([]);
@@ -73,10 +74,11 @@
   async function loadAgent(): Promise<void> {
     loading = true;
     try {
-      [agent, workflows, secrets, skills, intarisMcpServers, secondaryAgents, secondaryBindings] = await Promise.all([
+      [agent, workflows, secrets, credentials, skills, intarisMcpServers, secondaryAgents, secondaryBindings] = await Promise.all([
         api.agents.detail(agentIdFromRoute()),
         api.workflows.listAll(),
         api.secrets.list(),
+        api.credentials.list().catch(() => []),
         api.skills.list().catch(() => []),
         api.tools.intarisMcpServers().catch(() => []),
         api.agents.listAll({ agent_type: 'secondary' }),
@@ -207,6 +209,7 @@
       {providers}
       {executors}
       {secrets}
+      {credentials}
       {skills}
       {intarisMcpServers}
       {secondaryAgents}

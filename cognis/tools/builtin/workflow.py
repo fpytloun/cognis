@@ -71,6 +71,69 @@ STEP_REQUEST_INPUT_TOOL = ToolDefinition(
     read_only=False,
 )
 
+REQUEST_CREDENTIAL_TOOL = ToolDefinition(
+    name="request_credential",
+    description=(
+        "Request a durable credential from the user without exposing the secret value to the LLM."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "credential_id": {"type": "string", "description": "Credential ID to create/update"},
+            "kind": {"type": "string", "description": "Credential kind"},
+            "label": {"type": "string", "description": "Human-readable credential label"},
+            "description": {"type": "string", "description": "Why this credential is needed"},
+            "metadata": {
+                "type": "object",
+                "description": "Non-secret metadata such as login_url or domain",
+            },
+            "required_fields": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Expected payload fields such as username/password/token",
+            },
+            "agent_id": {"type": "string", "description": "Optional agent scope override"},
+            "scope": {"type": "string", "description": "Credential scope (default: user)"},
+        },
+        "required": ["credential_id", "kind", "label"],
+    },
+    source=_SOURCE,
+    category="workflow",
+    read_only=False,
+)
+
+REQUEST_AUTH_CHALLENGE_TOOL = ToolDefinition(
+    name="request_auth_challenge",
+    description=(
+        "Request a live auth or MFA challenge response from the user without exposing the value to the LLM."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "kind": {
+                "type": "string",
+                "description": "Challenge kind such as otp_code or push_approval",
+            },
+            "label": {"type": "string", "description": "Short title shown to the user"},
+            "message": {"type": "string", "description": "What the user should do"},
+            "metadata": {
+                "type": "object",
+                "description": "Safe non-secret context such as origin/domain/login_url",
+            },
+            "required_fields": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Expected response fields, e.g. code",
+            },
+            "timeout_seconds": {"type": "integer", "description": "Challenge timeout in seconds"},
+        },
+        "required": ["kind", "label", "message"],
+    },
+    source=_SOURCE,
+    category="workflow",
+    read_only=False,
+)
+
 STEP_TODO_WRITE_TOOL = ToolDefinition(
     name="step_todo_write",
     description=(
@@ -126,6 +189,8 @@ def workflow_tools() -> list[ToolDefinition]:
     return [
         STEP_COMPLETE_TOOL,
         STEP_REQUEST_INPUT_TOOL,
+        REQUEST_CREDENTIAL_TOOL,
+        REQUEST_AUTH_CHALLENGE_TOOL,
         STEP_TODO_WRITE_TOOL,
         STEP_TODO_LIST_TOOL,
     ]

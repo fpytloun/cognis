@@ -522,6 +522,7 @@ async def test_tool_router_prepares_document_artifact_assets(
             },
         ),
         _session(),
+        AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
     )
 
     asset = prepared.arguments["assets"][0]
