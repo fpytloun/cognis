@@ -49,6 +49,10 @@ class AuthenticationMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
         if (request.method.upper(), request.url.path) in PUBLIC_ROUTES:
             return await call_next(request)
+        if request.method.upper() == "GET" and request.url.path.startswith(
+            "/api/v1/artifacts/content/"
+        ):
+            return await call_next(request)
 
         app_state = request.app.state
         auth_provider = app_state.auth_provider

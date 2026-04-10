@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import base64
 import json
@@ -628,7 +629,8 @@ class ToolRouter:
             materialized.append(await self._persist_inline_attachment(raw, session, tool_name))
         if not changed:
             return result
-        return result.model_copy(update={"attachments": materialized})
+        enriched_output = self._enrich_attachment_output(result.output, materialized)
+        return result.model_copy(update={"attachments": materialized, "output": enriched_output})
 
     async def _persist_inline_attachment(
         self,
@@ -684,6 +686,37 @@ class ToolRouter:
             "kind": kind.value,
             "content_b64": content_b64,
         }
+
+    def _enrich_attachment_output(self, output: str, attachments: list[dict[str, Any]]) -> str:
+        if not attachments:
+            return output
+        primary = next((item for item in attachments if isinstance(item, dict)), None)
+        if primary is None:
+            return output
+        enriched = {
+            "artifact_id": primary.get("artifact_id"),
+            "url": primary.get("url"),
+            "mime_type": primary.get("mime_type"),
+            "size_bytes": primary.get("size_bytes"),
+        }
+        try:
+            parsed = json.loads(output)
+            if isinstance(parsed, dict):
+                parsed.update({k: v for k, v in enriched.items() if v is not None})
+                return json.dumps(parsed, sort_keys=True, default=str)
+        except Exception:
+            pass
+        try:
+            parsed = ast.literal_eval(output)
+            if isinstance(parsed, dict):
+                parsed.update({k: v for k, v in enriched.items() if v is not None})
+                return str(parsed)
+        except Exception:
+            pass
+        summary = json.dumps({k: v for k, v in enriched.items() if v is not None}, sort_keys=True)
+        if not output.strip():
+            return summary
+        return f"{output}\n\nAttachment metadata: {summary}"
 
     def _is_non_bypassable(self, tool_name: str, explicit_flag: bool) -> bool:
         if explicit_flag:

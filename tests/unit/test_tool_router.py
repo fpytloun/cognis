@@ -479,6 +479,10 @@ async def test_tool_router_materializes_inline_attachments(monkeypatch: pytest.M
     assert artifact_store.saved
     assert result.attachments is not None
     assert result.attachments[0]["artifact_id"] == "doc_1"
+    assert result.metadata is not None
+    raw_output = result.metadata["_raw_output"]
+    assert "artifact_id" in raw_output
+    assert "https://cognis.example.com/documents/doc_1/report.pdf" in raw_output
 
 
 @pytest.mark.asyncio

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
 
 import pytest
@@ -14,6 +16,16 @@ def _make_service() -> ChannelDeliveryService:
         event_bus=EventBus(),
         channel_manager_ref=lambda: None,
     )
+
+
+class _ArtifactStore:
+    async def async_load(self, namespace: str, object_id: str, filename: str) -> tuple[bytes, str]:
+        return b"pdf-bytes", "application/pdf"
+
+
+class _Manager:
+    def __init__(self) -> None:
+        self._artifact_store = _ArtifactStore()
 
 
 def test_render_escalation_notification_includes_required_details() -> None:
@@ -86,6 +98,48 @@ async def test_turn_completed_event_uses_delivery_outbox() -> None:
         attachments=None,
         ignore_next_attempt=True,
     )
+
+
+@pytest.mark.asyncio
+async def test_materialize_media_attachment_loads_artifact_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    @asynccontextmanager
+    async def session_factory() -> object:
+        yield object()
+
+    service = ChannelDeliveryService(
+        session_factory=session_factory,
+        event_bus=EventBus(),
+        channel_manager_ref=lambda: _Manager(),
+    )
+    monkeypatch.setattr(
+        "cognis.store.queries.get_artifact_record",
+        AsyncMock(
+            return_value=type(
+                "ArtifactRow",
+                (),
+                {
+                    "status": "attached",
+                    "namespace": "documents",
+                    "object_id": "doc_1",
+                    "filename": "report.pdf",
+                },
+            )()
+        ),
+    )
+
+    media = await service._materialize_media_attachment(  # noqa: SLF001
+        {
+            "artifact_id": "doc_1",
+            "url": "https://cognis.example.com/report.pdf",
+            "mime_type": "application/pdf",
+            "filename": "report.pdf",
+            "size_bytes": 9,
+        }
+    )
+
+    assert media.content_b64 == base64.b64encode(b"pdf-bytes").decode("ascii")
 
 
 @pytest.mark.asyncio

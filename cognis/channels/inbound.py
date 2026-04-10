@@ -804,13 +804,7 @@ class ChannelTurnObserver:
                 for att in result_attachments:
                     if isinstance(att, dict):
                         outbound_media.append(
-                            MediaAttachment(
-                                url=att.get("url"),
-                                mime_type=att.get("mime_type"),
-                                filename=att.get("filename"),
-                                size_bytes=att.get("size_bytes"),
-                                content_b64=att.get("content_b64"),
-                            )
+                            await _materialize_turn_attachment(att, self._channel_manager_ref())
                         )
 
         content = self._accumulated_text
@@ -957,3 +951,36 @@ class ChannelTurnObserver:
         the next inbound message starts with a clean list.
         """
         self._turn_scheduler.remove_observer(self._conversation_id, self)
+
+
+async def _materialize_turn_attachment(att: dict[str, Any], manager: Any) -> MediaAttachment:
+    content_b64 = att.get("content_b64") if isinstance(att.get("content_b64"), str) else None
+    if content_b64 is None and manager is not None:
+        artifact_id = att.get("artifact_id")
+        if isinstance(artifact_id, str) and artifact_id:
+            import base64
+
+            from cognis.store.queries import get_artifact_record
+
+            try:
+                async with manager._session_factory() as session:  # noqa: SLF001
+                    row = await get_artifact_record(session, artifact_id)
+                if row is not None and row.status != "deleted":
+                    content, _ct = await manager._artifact_store.async_load(  # noqa: SLF001
+                        row.namespace,
+                        row.object_id,
+                        row.filename,
+                    )
+                    content_b64 = base64.b64encode(content).decode("ascii")
+            except Exception:
+                logger.warning(
+                    "channel observer: failed to materialize turn attachment",
+                    exc_info=True,
+                )
+    return MediaAttachment(
+        url=att.get("url"),
+        mime_type=att.get("mime_type"),
+        filename=att.get("filename"),
+        size_bytes=att.get("size_bytes"),
+        content_b64=content_b64,
+    )

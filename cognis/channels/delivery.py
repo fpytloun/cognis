@@ -124,7 +124,7 @@ class ChannelDeliveryService:
 
         adapter, config = result
 
-        outbound_media = [_to_media_attachment(item) for item in (media or [])]
+        outbound_media = await self._prepare_media_attachments(media or [])
 
         if channel_type == "signal":
             try:
@@ -208,6 +208,43 @@ class ChannelDeliveryService:
             ).inc()
 
         return "sent" if delivered else "failed"
+
+    async def _prepare_media_attachments(
+        self, media: list[dict[str, Any]]
+    ) -> list[MediaAttachment]:
+        prepared: list[MediaAttachment] = []
+        for item in media:
+            prepared.append(await self._materialize_media_attachment(item))
+        return prepared
+
+    async def _materialize_media_attachment(self, raw: dict[str, Any]) -> MediaAttachment:
+        content_b64 = raw.get("content_b64") if isinstance(raw.get("content_b64"), str) else None
+        artifact_id = raw.get("artifact_id")
+        if content_b64 is None and isinstance(artifact_id, str) and artifact_id:
+            import base64
+
+            from cognis.store.queries import get_artifact_record
+
+            try:
+                async with self._session_factory() as session:
+                    row = await get_artifact_record(session, artifact_id)
+                manager = self._channel_manager_ref()
+                if manager is not None and row is not None and row.status != "deleted":
+                    content, _ct = await manager._artifact_store.async_load(  # noqa: SLF001
+                        row.namespace,
+                        row.object_id,
+                        row.filename,
+                    )
+                    content_b64 = base64.b64encode(content).decode("ascii")
+            except Exception:
+                logger.warning("channel delivery: failed to materialize attachment", exc_info=True)
+        return MediaAttachment(
+            url=raw.get("url") if isinstance(raw.get("url"), str) else None,
+            mime_type=raw.get("mime_type") if isinstance(raw.get("mime_type"), str) else None,
+            filename=raw.get("filename") if isinstance(raw.get("filename"), str) else None,
+            size_bytes=raw.get("size_bytes") if isinstance(raw.get("size_bytes"), int) else None,
+            content_b64=content_b64,
+        )
 
     # ------------------------------------------------------------------
     # Event handlers
@@ -622,13 +659,3 @@ class ChannelDeliveryService:
             str(chat_id),
             str(thread_id) if thread_id else None,
         )
-
-
-def _to_media_attachment(raw: dict[str, Any]) -> MediaAttachment:
-    return MediaAttachment(
-        url=raw.get("url") if isinstance(raw.get("url"), str) else None,
-        mime_type=raw.get("mime_type") if isinstance(raw.get("mime_type"), str) else None,
-        filename=raw.get("filename") if isinstance(raw.get("filename"), str) else None,
-        size_bytes=raw.get("size_bytes") if isinstance(raw.get("size_bytes"), int) else None,
-        content_b64=raw.get("content_b64") if isinstance(raw.get("content_b64"), str) else None,
-    )

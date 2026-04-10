@@ -28,6 +28,15 @@ def test_public_health_route_bypasses_auth(monkeypatch: object, tmp_path: Path) 
         assert response.status_code == 200
 
 
+def test_signed_artifact_content_route_bypasses_auth(monkeypatch: object, tmp_path: Path) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        response = client.get(
+            "/api/v1/artifacts/content/images/example/image",
+            params={"exp": 1, "sig": "invalid"},
+        )
+        assert response.status_code != 401
+
+
 def test_middleware_rejects_malformed_bearer_token(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
         response = client.get("/api/auth/me", headers={"Authorization": "Bearer not-a-token"})
