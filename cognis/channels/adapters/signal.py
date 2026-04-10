@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import contextlib
 import json
 import os
@@ -137,6 +138,87 @@ def _infer_signal_voice_input(body: str | None, attachments: list[dict[str, Any]
         if str(attachment.get("contentType") or "").startswith("audio/")
     ]
     return len(attachments) == 1 and len(audio_attachments) == 1
+
+
+def _attachment_result_metadata(result: Any) -> dict[str, Any]:
+    if not isinstance(result, dict):
+        return {"result_type": type(result).__name__}
+    attachment_value = result.get("attachment")
+    return {
+        "result_keys": sorted(str(key) for key in result),
+        "has_file": bool(result.get("file")),
+        "has_filename": bool(result.get("filename")),
+        "has_path": bool(result.get("path")),
+        "has_fileName": bool(result.get("fileName")),
+        "has_data": isinstance(result.get("data"), str),
+        "has_base64": isinstance(result.get("base64"), str),
+        "has_content": isinstance(result.get("content"), str),
+        "attachment_type": type(attachment_value).__name__
+        if attachment_value is not None
+        else None,
+        "attachment_keys": sorted(str(key) for key in attachment_value)
+        if isinstance(attachment_value, dict)
+        else [],
+    }
+
+
+def _extract_direct_attachment_result(
+    result: Any,
+    attachment: MediaAttachment,
+) -> tuple[bytes, str, str] | None:
+    if not isinstance(result, dict):
+        return None
+
+    def _path_from(mapping: dict[str, Any]) -> str | None:
+        for key in ("file", "filename", "path", "fileName", "storedFile", "storedFilename"):
+            value = mapping.get(key)
+            if isinstance(value, str) and value:
+                return value
+        return None
+
+    def _payload_from(mapping: dict[str, Any]) -> str | None:
+        for key in ("base64", "data", "content"):
+            value = mapping.get(key)
+            if isinstance(value, str) and value:
+                return value
+        return None
+
+    result_path = _path_from(result)
+    if result_path:
+        path = Path(result_path)
+        if path.exists():
+            return (
+                path.read_bytes(),
+                attachment.mime_type or "application/octet-stream",
+                attachment.filename or path.name,
+            )
+
+    nested = result.get("attachment")
+    nested_path = _path_from(nested) if isinstance(nested, dict) else None
+    if nested_path:
+        path = Path(nested_path)
+        if path.exists():
+            return (
+                path.read_bytes(),
+                attachment.mime_type or "application/octet-stream",
+                attachment.filename or path.name,
+            )
+
+    payload = _payload_from(result)
+    if payload is None and isinstance(nested, dict):
+        payload = _payload_from(nested)
+    if payload is None:
+        return None
+
+    try:
+        content = base64.b64decode(payload, validate=True)
+    except (ValueError, binascii.Error):
+        return None
+    return (
+        content,
+        attachment.mime_type or "application/octet-stream",
+        attachment.filename or "attachment.bin",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -856,48 +938,44 @@ class SignalAdapter(BaseChannelAdapter):
                 self._direct_params({"account": self._account_number, "id": attachment_id}),
                 timeout=_ATTACHMENT_TIMEOUT_S,
             )
-            # signal-cli may return the attachment path
-            att_path = result.get("file") or result.get("filename")
             if _SIGNAL_DEBUG_ENABLED:
                 logger.info(
                     "signal adapter: direct attachment download result",
                     extra={
                         "extra_data": {
                             "account_id": self.account_id,
-                            "returned_path": bool(att_path),
+                            **_attachment_result_metadata(result),
                         }
                     },
                 )
-            if att_path:
-                path = Path(att_path)
-                if _SIGNAL_DEBUG_ENABLED:
-                    logger.info(
-                        "signal adapter: direct attachment path check",
+            extracted = await asyncio.to_thread(
+                _extract_direct_attachment_result, result, attachment
+            )
+            if extracted is not None:
+                content, mime_type, filename = extracted
+                if len(content) > _MAX_ATTACHMENT_BYTES:
+                    logger.warning(
+                        "signal adapter: attachment too large",
                         extra={
                             "extra_data": {
                                 "account_id": self.account_id,
-                                "path_exists": path.exists(),
+                                "size": len(content),
                             }
                         },
                     )
-                if path.exists():
-                    content = await asyncio.to_thread(path.read_bytes)
-                    if len(content) > _MAX_ATTACHMENT_BYTES:
-                        logger.warning(
-                            "signal adapter: attachment too large",
-                            extra={
-                                "extra_data": {
-                                    "account_id": self.account_id,
-                                    "size": len(content),
-                                }
-                            },
-                        )
-                        return None
-                    return (
-                        content,
-                        attachment.mime_type or "application/octet-stream",
-                        attachment.filename or path.name,
+                    return None
+                if _SIGNAL_DEBUG_ENABLED:
+                    logger.info(
+                        "signal adapter: direct attachment extracted",
+                        extra={
+                            "extra_data": {
+                                "account_id": self.account_id,
+                                "filename": filename,
+                                "mime_type": mime_type,
+                            }
+                        },
                     )
+                return content, mime_type, filename
         except SignalCliRuntimeError:
             logger.warning(
                 "signal adapter: getAttachment failed (direct)",

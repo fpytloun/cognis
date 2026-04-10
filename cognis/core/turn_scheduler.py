@@ -783,13 +783,14 @@ class TurnScheduler:
             # conversation see channel-originated messages in real time
             # (without waiting for a page refresh / history reload).
             if not system_initiated:
+                published_user_content = _effective_user_content(content, attachments or [])
                 await self._event_bus.publish(
                     Event(
                         type=EventType.USER_MESSAGE,
                         data={
                             "conversation_id": conversation_id,
                             "session_id": session.session_id,
-                            "content": content,
+                            "content": published_user_content,
                             "attachments": [
                                 item.model_dump(mode="json") for item in (attachments or [])
                             ],

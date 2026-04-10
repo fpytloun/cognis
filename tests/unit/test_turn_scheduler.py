@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from cognis.core.agent_loop import PauseWaiter, PendingPause
-from cognis.core.events import EventBus
+from cognis.core.events import EventBus, EventType
 from cognis.core.turn_scheduler import TurnScheduler, _effective_user_content
 from cognis.models.artifact import ArtifactKind, AttachmentRef
 from cognis.models.session import SessionStatus
@@ -270,3 +270,72 @@ def test_effective_user_content_describes_audio_only_turns() -> None:
         )
         == "User attached an audio file."
     )
+
+
+@pytest.mark.asyncio
+async def test_run_turn_publishes_effective_user_message_content() -> None:
+    event_bus = EventBus()
+    observed: list[object] = []
+
+    async def _record(event: object) -> None:
+        observed.append(event)
+
+    event_bus.subscribe(EventType.USER_MESSAGE, _record)
+
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(run_direct_turn=AsyncMock(return_value=SimpleNamespace())),
+        decision_engine=SimpleNamespace(
+            decide=AsyncMock(return_value=SimpleNamespace(decision="inline"))
+        ),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(
+            refresh=AsyncMock(return_value=SimpleNamespace(last_event_seq=0)),
+            get_context_usage=MagicMock(return_value=None),
+            get_entry=MagicMock(return_value=None),
+        ),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=event_bus,
+    )
+    scheduler._publish_turn_completed = AsyncMock()  # type: ignore[method-assign]
+    scheduler._touch_conversation = AsyncMock()  # type: ignore[method-assign]
+
+    await scheduler._run_turn(
+        conversation=SimpleNamespace(
+            conversation_id="conv-1", title="", user_email="user@example.com"
+        ),
+        session=SimpleNamespace(session_id="sess-1"),
+        agent=SimpleNamespace(agent_id="agent-1"),
+        content="",
+        user_email="user@example.com",
+        attachments=[
+            AttachmentRef(
+                artifact_id="att-1",
+                kind=ArtifactKind.AUDIO,
+                mime_type="audio/ogg",
+                filename="voice.ogg",
+                size_bytes=10,
+            )
+        ],
+        outbound_attachments=None,
+        attachment_notice=None,
+        system_initiated=False,
+        channel_deliverable=False,
+        delivery_id=None,
+        delivery_fallback_text=None,
+        bootstrap_wait_for_intention=False,
+        cancel_event=AsyncMock(),
+    )
+
+    user_events = [
+        event for event in observed if getattr(event, "type", None) == EventType.USER_MESSAGE
+    ]
+    assert len(user_events) == 1
+    assert user_events[0].data["content"] == "User attached an audio file."

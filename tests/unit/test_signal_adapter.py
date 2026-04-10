@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -11,6 +12,7 @@ import pytest
 
 from cognis.channels.adapters.signal import (
     SignalAdapter,
+    _extract_direct_attachment_result,
     _infer_signal_voice_input,
     _is_fatal_signal_error,
     _normalize_signal_cli_trust_mode,
@@ -24,6 +26,7 @@ from cognis.channels.protocol import NonRetryableChannelError
 from cognis.models.channel import (
     ChannelAccountConfig,
     InboundMessage,
+    MediaAttachment,
     OutboundMessage,
 )
 
@@ -140,6 +143,30 @@ class TestSignalVoiceInference:
             )
             is False
         )
+
+
+class TestSignalDirectAttachmentResult:
+    def test_extracts_inline_base64_attachment_payload(self) -> None:
+        attachment = MediaAttachment(mime_type="audio/ogg", filename="voice.ogg")
+
+        result = _extract_direct_attachment_result(
+            {"data": base64.b64encode(b"audio-bytes").decode("ascii")},
+            attachment,
+        )
+
+        assert result == (b"audio-bytes", "audio/ogg", "voice.ogg")
+
+    def test_extracts_nested_attachment_path_alias(self, tmp_path) -> None:
+        path = tmp_path / "voice.ogg"
+        path.write_bytes(b"audio-bytes")
+        attachment = MediaAttachment(mime_type="audio/ogg", filename="voice.ogg")
+
+        result = _extract_direct_attachment_result(
+            {"attachment": {"path": str(path)}},
+            attachment,
+        )
+
+        assert result == (b"audio-bytes", "audio/ogg", "voice.ogg")
 
 
 # ---------------------------------------------------------------------------
