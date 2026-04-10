@@ -56,6 +56,7 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 
 _SIGNAL_DEBUG_ENABLED = _env_flag("COGNIS_SIGNAL_DEBUG", False)
+_SIGNAL_MEDIA_PLACEHOLDER = "\u200b"
 
 
 def _is_fatal_signal_error(message: str) -> bool:
@@ -242,6 +243,13 @@ def _extract_direct_attachment_result(
         attachment.mime_type or "application/octet-stream",
         _fallback_attachment_filename(attachment),
     )
+
+
+def _signal_attachment_data_uri(content_b64: str, media: MediaAttachment) -> str:
+    mime_type = media.mime_type or "application/octet-stream"
+    filename = media.filename or "attachment"
+    safe_filename = filename.replace(";", "_").replace(",", "_")
+    return f"data:{mime_type};filename={safe_filename};base64,{content_b64}"
 
 
 # ---------------------------------------------------------------------------
@@ -488,8 +496,12 @@ class SignalAdapter(BaseChannelAdapter):
         if self._client is None:
             return None
 
+        text = message.platform_data.get("signal_markdown_text", message.content)
+        if not text and message.media:
+            text = _SIGNAL_MEDIA_PLACEHOLDER
+
         payload: dict[str, Any] = {
-            "message": message.platform_data.get("signal_markdown_text", message.content),
+            "message": text,
             "number": self._account_number,
             "recipients": [message.chat_id],
         }
@@ -538,9 +550,11 @@ class SignalAdapter(BaseChannelAdapter):
         if self._runtime is None or not self._runtime.is_running:
             return None
 
+        text = message.content or (_SIGNAL_MEDIA_PLACEHOLDER if message.media else "")
+
         params = self._direct_params(
             {
-                "message": message.content,
+                "message": text,
                 "account": self._account_number,
                 "recipient": [message.chat_id],
             }
@@ -556,22 +570,12 @@ class SignalAdapter(BaseChannelAdapter):
                 extra={"extra_data": {"account_id": self.account_id}},
             )
 
-        temp_files: list[Path] = []
         if message.media:
             attachments: list[str] = []
             for media in message.media:
                 if media.content_b64:
                     try:
-                        if self._temp_dir:
-                            import uuid
-
-                            fname = Path(self._temp_dir.name) / f"out-{uuid.uuid4().hex}"
-                            await asyncio.to_thread(
-                                fname.write_bytes,
-                                base64.b64decode(media.content_b64),
-                            )
-                            attachments.append(str(fname))
-                            temp_files.append(fname)
+                        attachments.append(_signal_attachment_data_uri(media.content_b64, media))
                         continue
                     except Exception:
                         logger.warning("signal adapter: inline media decode failed", exc_info=True)
@@ -581,14 +585,12 @@ class SignalAdapter(BaseChannelAdapter):
                     async with httpx.AsyncClient(timeout=60.0) as dl:
                         resp = await dl.get(media.url)
                         resp.raise_for_status()
-                    # Write to temp file for signal-cli
-                    if self._temp_dir:
-                        import uuid
-
-                        fname = Path(self._temp_dir.name) / f"out-{uuid.uuid4().hex}"
-                        await asyncio.to_thread(fname.write_bytes, resp.content)
-                        attachments.append(str(fname))
-                        temp_files.append(fname)
+                    attachments.append(
+                        _signal_attachment_data_uri(
+                            base64.b64encode(resp.content).decode("ascii"),
+                            media,
+                        )
+                    )
                 except Exception:
                     logger.warning("signal adapter: media download failed", exc_info=True)
             if attachments:
@@ -615,11 +617,6 @@ class SignalAdapter(BaseChannelAdapter):
                 exc_info=True,
             )
             return None
-        finally:
-            # Clean up temp files immediately after send
-            for tf in temp_files:
-                with contextlib.suppress(OSError):
-                    tf.unlink(missing_ok=True)
 
     # ------------------------------------------------------------------
     # Typing / read receipts / profile sync

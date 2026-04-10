@@ -6,7 +6,7 @@ import asyncio
 import base64
 import json
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -850,11 +850,6 @@ class TestDirectSendBehavior:
         mock_runtime.request = AsyncMock(return_value={"timestamp": 12345})
         adapter._runtime = mock_runtime
 
-        class _TempDir:
-            name = "/tmp"
-
-        adapter._temp_dir = _TempDir()
-
         message = OutboundMessage(
             channel_type="signal",
             account_id="acct-1",
@@ -869,13 +864,45 @@ class TestDirectSendBehavior:
             ],
         )
 
-        with patch("asyncio.to_thread", new=AsyncMock(return_value=None)) as to_thread:
-            result = await adapter.send_message(message)
+        result = await adapter.send_message(message)
 
         assert result == "12345"
         called_params = mock_runtime.request.await_args.args[1]
         assert "attachment" in called_params
-        to_thread.assert_awaited()
+        assert called_params["message"] == "\u200b"
+        assert called_params["attachment"][0].startswith(
+            "data:application/pdf;filename=report.pdf;base64,"
+        )
+
+    @pytest.mark.asyncio
+    async def test_rest_send_uses_placeholder_message_for_media_only(self) -> None:
+        adapter = SignalAdapter()
+        adapter._signal_config = _SignalConfig({}, {"account_number": "+1"})
+        adapter._account_number = "+1"
+
+        client = AsyncMock()
+        response = MagicMock()
+        response.json.return_value = {"timestamp": "999"}
+        response.raise_for_status.return_value = None
+        client.post = AsyncMock(return_value=response)
+        adapter._client = client
+
+        message = OutboundMessage(
+            channel_type="signal",
+            account_id="acct-1",
+            chat_id="+420111222333",
+            content="",
+            media=[
+                MediaAttachment(filename="image.jpg", mime_type="image/jpeg", content_b64="YWJj")
+            ],
+        )
+
+        result = await adapter.send_message(message)
+
+        assert result == "999"
+        payload = client.post.await_args.kwargs["json"]
+        assert payload["message"] == "\u200b"
+        assert payload["base64_attachments"] == ["YWJj"]
 
 
 class TestRestSendBehavior:
