@@ -57,7 +57,7 @@ Replace the current README Quick Start with an honest, step-by-step guide.
   commands).
 - **Step 2 — Start Cognis**:
   ```bash
-  OPENAI_API_KEY=sk-... uvx cognis
+  OPENAI_API_KEY=sk-... uvx cognis-controller
   ```
   Show the API key as part of the command. Explain that Cognis creates
   `~/.cognis/` with auto-generated keys and a SQLite database.
@@ -114,7 +114,7 @@ Revise the README to accurately describe the polished product.
 
 - **Remove "zero-config" language** where it implies no setup is needed.
   Replace with "quick local bootstrap" or "minimal setup".
-- **Document bundled UI**: explain that `uvx cognis` serves the web UI
+- **Document bundled UI**: explain that `uvx cognis-controller` serves the web UI
   on `:8080` by default, with `COGNIS_SERVE_UI=false` for split
   deployments.
 - **Document Docker deployment**: single image, combined vs API-only

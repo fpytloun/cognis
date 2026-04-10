@@ -134,7 +134,7 @@ live Mnemory and Intaris. Each test exercises a complete user flow.
 
 From `docs/specs/12-mvp-roadmap.md` — all must pass:
 
-- [x] `uvx cognis` starts with zero config, first-start setup URL works
+- [x] `uvx cognis-controller` starts with zero config, first-start setup URL works
 - [x] User can log in and configure LLM provider via Settings UI
 - [x] User can create an agent with name, personality, LLM config
 - [x] Agent chats with streaming responses

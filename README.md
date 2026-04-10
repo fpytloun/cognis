@@ -35,7 +35,7 @@ Part of the Openclaw ecosystem: Cognis controller, [Intaris](https://github.com/
 - **Polished workspace UX** -- Global toasts, confirmation dialogs, keyboard shortcuts, mobile navigation, chat timestamps, and unsaved-change protection.
 - **Degraded-mode guidance** -- Provider outage banners, setup-incomplete states, retry affordances, and contextual chat/task failure messaging.
 - **CLI** -- Typer-based CLI for server management and administration.
-- **Quick local bootstrap** -- `uvx cognis` creates local keys and a SQLite database, then serves the web UI on `:8080`.
+- **Quick local bootstrap** -- `uvx cognis-controller` creates local keys and a SQLite database, then serves the web UI on `:8080`.
 - **JWT service auth** -- Cognis issues ES256 JWTs. Mnemory and Intaris validate them. No API keys between services.
 - **Encrypted secrets** -- AES-256-GCM encrypted secret store for API keys and credentials. Injected into executors at runtime.
 
@@ -49,7 +49,7 @@ Part of the Openclaw ecosystem: Cognis controller, [Intaris](https://github.com/
 Cognis needs [Mnemory](https://github.com/fpytloun/mnemory) and [Intaris](https://github.com/fpytloun/intaris) running. Start Cognis once first so it can generate its JWT keypair and setup URL:
 
 ```bash
-uvx cognis                      # Controller on :8080
+uvx cognis-controller           # Controller on :8080
 ```
 
 Then start Mnemory and Intaris with Cognis's public key for JWT validation:
@@ -65,7 +65,7 @@ INTARIS_JWT_PUBLIC_KEY=~/.cognis/keys/public.pem uvx intaris
 If you started Cognis before setting provider credentials, restart it with an LLM credential available to LiteLLM:
 
 ```bash
-OPENAI_API_KEY=sk-... uvx cognis
+OPENAI_API_KEY=sk-... uvx cognis-controller
 ```
 
 On first start, Cognis creates `~/.cognis/` with auto-generated JWT keys, a secrets encryption key, and a SQLite database. When bundled UI assets are present, it serves the web UI on `:8080` and prints a one-time setup URL for the first admin account:
@@ -96,7 +96,7 @@ The bundled UI also includes embedded user-facing documentation under `Docs`.
 For headless setup, use the CLI:
 
 ```bash
-cognis admin create-user admin@example.com --name "Admin"
+cognis-controller admin create-user admin@example.com --name "Admin"
 ```
 
 ## Architecture
@@ -150,7 +150,7 @@ Auto-generated on first start (override with env vars for production):
 uv pip install -e ".[dev]"
 
 # Run server
-uv run cognis serve
+uv run cognis-controller serve
 
 # Run the SvelteKit UI in dev mode (not required for normal users)
 cd ui && npm install && npm run dev
@@ -174,14 +174,15 @@ mypy cognis/
 ## CLI
 
 ```bash
-cognis serve                            # Start the controller
-cognis admin create-user <email>        # Create user (direct DB access)
-cognis admin reset-password <email>     # Reset password
-cognis admin api-key create <email>     # Create API key
-cognis status                           # Health + provider status
-cognis config init                      # Print env var template
-cognis executor run --controller-url wss://... --token ...
-                                        # Run standalone executor process
+cognis-controller serve                 # Start the controller
+cognis-controller admin create-user <email>
+                                         # Create user (direct DB access)
+cognis-controller admin reset-password <email>
+                                         # Reset password
+cognis-controller admin api-key create <email>
+                                         # Create API key
+cognis-controller status                # Health + provider status
+cognis-controller config init           # Print env var template
 ```
 
 ### Remote Executor
@@ -190,15 +191,17 @@ Run a standalone executor process that connects to a Cognis controller via WebSo
 
 ```bash
 # On the remote machine (via CLI flags)
-cognis executor run \
+cognis-executor \
     --controller-url wss://cognis.example.com/api/executor/ws \
     --token <jwt-token>
 
 # Or via environment variables (preferred — avoids token in /proc/cmdline)
 export COGNIS_CONTROLLER_URL=wss://cognis.example.com/api/executor/ws
 export COGNIS_EXECUTOR_TOKEN=<jwt-token>
-cognis executor run
+cognis-executor
 ```
+
+For local development from a checkout, `uv run cognis-executor` and `python -m cognis.executor` are also available.
 
 Or run as a Python module:
 ```bash

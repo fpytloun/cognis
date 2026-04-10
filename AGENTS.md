@@ -231,7 +231,7 @@ uv pip install -e ".[dev]"
 # Start ecosystem
 uvx mnemory                     # Memory layer on :8050
 uvx intaris                     # Guardrails on :8060
-uvx cognis                      # Controller on :8080
+uvx cognis-controller           # Controller on :8080
 
 # Or run directly
 uv run python -m cognis serve
@@ -244,12 +244,12 @@ printed to stdout for creating the first admin user.
 ### CLI admin commands
 
 ```bash
-cognis admin create-user admin@example.com --name "Admin"
-cognis admin reset-password admin@example.com
-cognis admin api-key create admin@example.com --name "dev-key"
-cognis admin api-key list admin@example.com
-cognis status                   # Health + provider status (via API)
-cognis config init              # Print env var template
+cognis-controller admin create-user admin@example.com --name "Admin"
+cognis-controller admin reset-password admin@example.com
+cognis-controller admin api-key create admin@example.com --name "dev-key"
+cognis-controller admin api-key list admin@example.com
+cognis-controller status        # Health + provider status (via API)
+cognis-controller config init   # Print env var template
 ```
 
 `admin` commands access the database directly — no API auth needed, but

@@ -9,10 +9,10 @@ User=cognis
 Group=cognis
 EnvironmentFile=/etc/cognis/controller.env
 # PyPI install (uvx):
-ExecStart=/usr/bin/uvx cognis serve
+ExecStart=/usr/bin/uvx cognis-controller serve
 # Git checkout — uncomment and set WorkingDirectory instead:
 # WorkingDirectory=/opt/cognis
-# ExecStart=/usr/bin/uv run cognis serve
+# ExecStart=/usr/bin/uv run cognis-controller serve
 Restart=on-failure
 RestartSec=5
 

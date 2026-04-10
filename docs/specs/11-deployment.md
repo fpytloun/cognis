@@ -14,7 +14,7 @@
 ```bash
 uvx mnemory                              # starts on :8050
 uvx intaris                              # starts on :8060
-uvx cognis                               # starts on :8080
+uvx cognis-controller                    # starts on :8080
 ```
 
 On first start, Cognis:
@@ -29,7 +29,7 @@ web UI (or via the API).
 
 **Alternative: CLI bootstrap (headless)**
 ```bash
-cognis admin create-user admin@example.com --name "Admin"
+cognis-controller admin create-user admin@example.com --name "Admin"
 ```
 
 ### What Happens On First Start
@@ -222,7 +222,7 @@ COPY ui/ ./ui/
 COPY --from=ui-build /app/build ./ui/build
 RUN pip install --no-cache-dir .
 EXPOSE 8080
-CMD ["cognis", "serve"]
+CMD ["cognis-controller", "serve"]
 ```
 
 ## Kubernetes

@@ -177,7 +177,7 @@ Bidirectional JSON-RPC 2.0 over WebSocket between controller and executor.
 ```
 1. Admin creates executor in UI (name, type, labels, enabled tools)
 2. Admin generates a JWT token (POST /api/v1/executors/{id}/token)
-3. Executor process starts: cognis executor run --controller-url wss://... --token <jwt>
+3. Executor process starts: cognis-executor --controller-url wss://... --token <jwt>
 4. Executor connects to WS /api/executor/ws (permessage-deflate)
 5. Executor sends executor.ready with JWT token + platform info + optional environment snapshot
 6. Controller validates JWT (aud=cognis-executor, sub=executor_id)

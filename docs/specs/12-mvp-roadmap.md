@@ -87,7 +87,7 @@ surfaces mismatches in Week 0, not Week 5.
 - WebSocket reconnection protocol
 - Plugin hook system (basic events)
 - Configuration via env vars (infra) + DB/API (app settings). No config file.
-- Zero-config local deployment (`uvx cognis`, auto-generated keys, ~/.cognis)
+- Zero-config local deployment (`uvx cognis-controller`, auto-generated keys, ~/.cognis)
 - Health check, structured logging, Prometheus metrics
 - JWKS endpoint for JWT key distribution
 - Cross-service UI access via token exchange
@@ -108,7 +108,7 @@ surfaces mismatches in Week 0, not Week 5.
 - Cost tracking dashboard
 - PostgreSQL
 - Agent export/import (YAML)
-- Interactive CLI chat (`cognis chat`) — terminal rendering complexity
+- Interactive CLI chat (`cognis-controller chat`) — terminal rendering complexity
 - Redis L2 cache for session state
 
 ## Implementation Plan
@@ -151,12 +151,12 @@ surfaces mismatches in Week 0, not Week 5.
 - Token exchange endpoint for cross-service UI access
 
 #### 1.0.4 CLI Admin Commands (Typer)
-- `cognis` / `cognis serve` — start server
-- `cognis admin create-user` — direct DB user creation
-- `cognis admin reset-password` — direct DB password reset
-- `cognis admin api-key create/list` — API key management
-- `cognis config init` — print env var template
-- `cognis status` — health check via API
+- `cognis-controller` / `cognis-controller serve` — start server
+- `cognis-controller admin create-user` — direct DB user creation
+- `cognis-controller admin reset-password` — direct DB password reset
+- `cognis-controller admin api-key create/list` — API key management
+- `cognis-controller config init` — print env var template
+- `cognis-controller status` — health check via API
 
 ### Phase 1.1: Provider Layer (Week 2-3)
 
@@ -349,7 +349,7 @@ Phase 1.2: Executor         Phase 1.3: Orchestration Core
 
 The MVP is complete when a user can:
 
-1. Run `uvx cognis` with zero config and complete first-start setup
+1. Run `uvx cognis-controller` with zero config and complete first-start setup
 2. Log in and configure an LLM provider via the Settings UI
 3. Create an agent with name, personality, LLM config
 4. Chat with streaming responses

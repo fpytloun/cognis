@@ -89,14 +89,14 @@ can validate Cognis-issued tokens.
 ### 6. CLI Admin Commands
 
 - `cognis/cli/admin.py` (Typer subcommand group)
-  - `cognis admin create-user <email> --name "Name"` — prompts for password
-  - `cognis admin reset-password <email>` — prompts for new password
-  - `cognis admin api-key create <email> --name "key-name"` — generates key,
+  - `cognis-controller admin create-user <email> --name "Name"` — prompts for password
+  - `cognis-controller admin reset-password <email>` — prompts for new password
+  - `cognis-controller admin api-key create <email> --name "key-name"` — generates key,
     prints it once
-  - `cognis admin api-key list <email>` — list keys (metadata only)
+  - `cognis-controller admin api-key list <email>` — list keys (metadata only)
 - `cognis/cli/serve.py` — start the FastAPI server
-- `cognis config init` — print env var template to stdout
-- `cognis status` — call `/api/health` and display results
+- `cognis-controller config init` — print env var template to stdout
+- `cognis-controller status` — call `/api/health` and display results
 - All admin commands access the DB directly (no API auth needed)
 - Password hashing: argon2id
 
@@ -114,16 +114,16 @@ can validate Cognis-issued tokens.
 
 ## Acceptance Criteria
 
-- [x] `cognis serve` starts FastAPI on configured host/port
+- [x] `cognis-controller serve` starts FastAPI on configured host/port
 - [x] First start prints one-time setup URL with 15 min TTL
 - [x] `POST /api/setup` creates first admin user (with valid token)
 - [x] `POST /api/setup` returns 404 after first user exists
-- [x] `cognis admin create-user` creates user directly in DB
+- [x] `cognis-controller admin create-user` creates user directly in DB
 - [x] `POST /api/auth/login` returns JWT for valid credentials
 - [x] JWT contains correct `sub`, `aud`, `role` claims
 - [x] `GET /.well-known/jwks.json` returns valid JWKS
 - [x] Auth middleware rejects requests without valid JWT or API key
-- [x] `cognis admin api-key create` generates working API key
+- [x] `cognis-controller admin api-key create` generates working API key
 - [x] `COGNIS_INITIAL_ADMIN_EMAIL` + `COGNIS_INITIAL_ADMIN_PASSWORD` seeds admin
 - [x] Token exchange endpoint returns short-lived token
 - [x] WebSocket rejects connections that don't auth within 10s

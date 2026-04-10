@@ -13,7 +13,7 @@ This guide walks through the shortest path to a working Cognis system with the w
 ## 1. Start Cognis once to generate local state
 
 ```bash
-uvx cognis
+uvx cognis-controller
 ```
 
 On first start, Cognis creates `~/.cognis/` with:
@@ -52,7 +52,7 @@ Open the printed `/setup?token=...` URL and create the first admin account.
 If the token has expired, either restart Cognis or create the first user locally:
 
 ```bash
-cognis admin create-user admin@example.com --name "Admin"
+cognis-controller admin create-user admin@example.com --name "Admin"
 ```
 
 ## 4. Confirm readiness

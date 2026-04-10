@@ -24,7 +24,7 @@
 
 ## Objective
 
-Make `uvx cognis` land users in a working browser flow on `:8080` — setup,
+Make `uvx cognis-controller` land users in a working browser flow on `:8080` — setup,
 login, and into the app — without CLI workarounds, separate Node processes,
 or guesswork. After this stage, a fresh install produces a usable web
 application from a single command.
@@ -80,7 +80,7 @@ Replace the dead-end HTML stub with a real setup form in the SvelteKit app.
 - **Submit**: POSTs to `POST /api/setup` with the token. On success,
   auto-logs in (calls `/api/auth/login`) and redirects to `/chat`.
 - **Error states**: expired/invalid token shows a clear message with CLI
-  fallback instructions (`cognis admin create-user`). Already-setup state
+  fallback instructions (`cognis-controller admin create-user`). Already-setup state
   (users exist) shows "Setup already completed" with a login link.
 - **Backend change**: replace the bare HTML in `cognis/api/routes/auth.py`
   `GET /setup` with a redirect to the SPA `/setup` route (or remove it
@@ -104,7 +104,7 @@ configure next.
 
 ### 4. Startup Messaging Improvements
 
-Make the console output on `cognis serve` honest and actionable.
+Make the console output on `cognis-controller serve` honest and actionable.
 
 - **Setup URL**: print the URL pointing to the SPA `/setup` route, not
   the bare HTML endpoint.
@@ -114,7 +114,7 @@ Make the console output on `cognis serve` honest and actionable.
   will be unavailable".
 - **UI status**: if `COGNIS_SERVE_UI=true` and UI assets are present,
   print "Web UI: http://localhost:8080". If assets are missing, print
-  a warning: "Web UI assets not found — run `cognis ui build` or set
+  a warning: "Web UI assets not found — run `cognis-controller ui build` or set
   COGNIS_SERVE_UI=false".
 - **Bundled mode**: when UI is served, print a single URL for the user
   to open, not separate API and UI URLs.
@@ -126,7 +126,7 @@ Single image that can serve both backend and frontend, or either alone.
 - **Multi-stage build**:
   - Stage 1 (Node): `npm ci && npm run build` in `ui/`
   - Stage 2 (Python): copy built UI assets, install Python package
-- **Entrypoint**: `cognis serve` (default, serves both). Environment
+- **Entrypoint**: `cognis-controller serve` (default, serves both). Environment
   variable `COGNIS_SERVE_UI=false` for API-only pods.
 - **Same image for all roles**: production k8s can run API-only pods and
   UI-only pods (via nginx sidecar or static serving) from the same image.
@@ -134,7 +134,7 @@ Single image that can serve both backend and frontend, or either alone.
 
 ## Acceptance Criteria
 
-- [x] `pip install cognis` (or `uvx cognis`) includes built UI assets
+- [x] `pip install cognis-controller` (or `uvx cognis-controller`) includes built UI assets
 - [x] `http://localhost:8080` serves the SvelteKit app without a separate
       Node process
 - [x] `/setup?token=...` shows a real form with validation
@@ -143,7 +143,7 @@ Single image that can serve both backend and frontend, or either alone.
 - [x] First-run readiness checklist appears after first login
 - [x] Readiness checklist is dismissible and re-accessible
 - [x] `COGNIS_SERVE_UI=false` disables static serving
-- [x] Dev workflow (`npm run dev` + `cognis serve`) still works unchanged
+- [x] Dev workflow (`npm run dev` + `cognis-controller serve`) still works unchanged
 - [x] Docker build produces a single image
 - [x] Docker image supports both combined and API-only modes
 - [x] Startup logs show companion service reachability

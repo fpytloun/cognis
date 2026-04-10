@@ -105,6 +105,8 @@ The executor CLI reads connection parameters from environment variables so that 
 
 CLI flags (`--controller-url`, `--token`) still work and take precedence over environment variables.
 
+When installed from PyPI, the recommended command is `uvx cognis-executor`.
+
 ### System-level executor (template unit)
 
 The template unit `cognis-executor@.service` runs one executor per dedicated Unix user. The instance name (`%i`) is the user and group.
@@ -158,7 +160,7 @@ A system-level controller unit (`cognis-controller.service`) is also provided. S
 
 ### Running from a git checkout
 
-The default `ExecStart` uses `uvx cognis` (PyPI). To run from a local git checkout, swap to `uv run cognis` with a `WorkingDirectory`. Both variants are documented in the unit files as comments.
+The default `ExecStart` uses `uvx cognis-executor` (PyPI). To run from a local git checkout, swap to `uv run cognis-executor` with a `WorkingDirectory`. Both variants are documented in the unit files as comments.
 
 ## Signal on executors
 

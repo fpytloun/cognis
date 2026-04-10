@@ -9,10 +9,10 @@ User=%i
 Group=%i
 EnvironmentFile=/etc/cognis/executor-%i.env
 # PyPI install (uvx):
-ExecStart=/usr/bin/uvx cognis executor run
+ExecStart=/usr/bin/uvx cognis-executor
 # Git checkout — uncomment and set WorkingDirectory instead:
 # WorkingDirectory=/opt/cognis
-# ExecStart=/usr/bin/uv run cognis executor run
+# ExecStart=/usr/bin/uv run cognis-executor
 Restart=on-failure
 RestartSec=5
 

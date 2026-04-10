@@ -20,7 +20,7 @@
 
 Create the Cognis Python package with a working entry point, environment
 variable configuration, auto-generated data directory, and full database
-schema. After this stage, `uvx cognis` should start, create `~/.cognis/`,
+schema. After this stage, `uvx cognis-controller` should start, create `~/.cognis/`,
 initialize the database, seed default settings, and exit cleanly (no API
 server yet — that comes in Stage 2).
 
@@ -41,7 +41,7 @@ server yet — that comes in Stage 2).
 ### 1. Python Package
 
 - `pyproject.toml` with hatchling build backend
-- Entry point: `cognis` CLI command
+- Entry point: `cognis-controller` CLI command
 - Dependencies: fastapi, uvicorn, httpx, pydantic, sqlalchemy, aiosqlite,
   alembic, litellm, typer, argon2-cffi, cryptography, python-jose
 - Dev dependencies: pytest, pytest-asyncio, ruff, mypy
@@ -129,8 +129,8 @@ cognis/
 ## Acceptance Criteria
 
 - [x] `uv pip install -e ".[dev]"` succeeds
-- [x] `uvx cognis` or `uv run cognis` CLI starts (Typer help output)
-- [x] `uv run cognis serve` runs without error (can exit immediately)
+- [x] `uvx cognis-controller` or `uv run cognis-controller` CLI starts (Typer help output)
+- [x] `uv run cognis-controller serve` runs without error (can exit immediately)
 - [x] `~/.cognis/` auto-created with `keys/`, `secrets.key`, `cognis.db`
 - [x] Database has all 10 tables with correct schema
 - [x] `settings` table seeded with default values

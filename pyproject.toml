@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "cognis"
+name = "cognis-controller"
 version = "0.1.0"
 description = "Decoupled control plane for AI agents"
 readme = "README.md"
@@ -68,7 +68,8 @@ redis = [
 ]
 
 [project.scripts]
-cognis = "cognis.main:app"
+cognis-controller = "cognis.main:app"
+cognis-executor = "cognis.executor.__main__:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["cognis"]

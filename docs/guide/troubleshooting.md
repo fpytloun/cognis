@@ -4,7 +4,7 @@
 
 - **Setup page says the token is invalid or expired**
   - Restart Cognis to print a new setup URL.
-  - Or create the first user locally with `cognis admin create-user ...`.
+  - Or create the first user locally with `cognis-controller admin create-user ...`.
 
 ## UI problems
 

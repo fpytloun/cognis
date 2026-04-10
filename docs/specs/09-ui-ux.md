@@ -285,13 +285,13 @@ terminal.
 #### Server and Admin (MVP)
 
 ```bash
-cognis                              # Start the controller server
-cognis serve                        # Explicit server start (same as above)
-cognis admin create-user <email>    # Create user (direct DB, local only)
-cognis admin reset-password <email> # Reset password (direct DB, local only)
-cognis admin api-key create <email> # Create API key (direct DB)
-cognis admin api-key list <email>   # List API keys
-cognis config init                  # Print default env var template to stdout
+cognis-controller                   # Start the controller server
+cognis-controller serve                        # Explicit server start (same as above)
+cognis-controller admin create-user <email>    # Create user (direct DB, local only)
+cognis-controller admin reset-password <email> # Reset password (direct DB, local only)
+cognis-controller admin api-key create <email> # Create API key (direct DB)
+cognis-controller admin api-key list <email>   # List API keys
+cognis-controller config init                  # Print default env var template to stdout
 ```
 
 #### API Commands (MVP)
@@ -299,12 +299,12 @@ cognis config init                  # Print default env var template to stdout
 These commands talk to the Cognis REST API (require JWT or API key):
 
 ```bash
-cognis agent list                   # List agents
-cognis agent create <name>          # Create agent (interactive prompts)
-cognis agent show <agent_id>        # Show agent details
-cognis secret set <name>            # Set a secret (prompts for value)
-cognis secret list                  # List secrets (metadata only)
-cognis status                       # Health + provider status
+cognis-controller agent list                   # List agents
+cognis-controller agent create <name>          # Create agent (interactive prompts)
+cognis-controller agent show <agent_id>        # Show agent details
+cognis-controller secret set <name>            # Set a secret (prompts for value)
+cognis-controller secret list                  # List secrets (metadata only)
+cognis-controller status            # Health + provider status
 ```
 
 #### Interactive Chat (Phase 2)
@@ -320,7 +320,7 @@ terminal rendering complexity.
 
 ### Design Principles
 
-- `cognis admin` commands bypass the API and access the database directly.
+- `cognis-controller admin` commands bypass the API and access the database directly.
   They require local filesystem access to `COGNIS_DATA_DIR`. These are for
   bootstrapping and emergency administration.
 - All other commands go through the REST API with standard authentication.

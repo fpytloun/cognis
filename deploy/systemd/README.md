@@ -6,8 +6,8 @@ Systemd unit files for running Cognis as managed services on Linux.
 
 | File | Type | Purpose |
 |---|---|---|
-| `cognis-controller.service` | System unit | Cognis controller (`cognis serve`) |
-| `cognis-executor@.service` | System template unit | Per-user executor (`cognis executor run`) |
+| `cognis-controller.service` | System unit | Cognis controller (`cognis-controller serve`) |
+| `cognis-executor@.service` | System template unit | Per-user executor (`cognis-executor`) |
 | `cognis-executor.user.service` | User unit | Executor without root access |
 
 ## Controller (system-level)
@@ -149,21 +149,22 @@ loginctl enable-linger $USER
 
 ## Running from a git checkout
 
-The default `ExecStart` lines use `uvx cognis` (PyPI install). To run
+The controller `ExecStart` uses `uvx cognis-controller` (PyPI install). To run
 from a local git checkout instead, edit the service file and swap the
 `ExecStart` line:
 
 ```ini
 # Comment out the uvx line:
-# ExecStart=/usr/bin/uvx cognis serve
+# ExecStart=/usr/bin/uvx cognis-controller serve
 
 # Use uv run with a WorkingDirectory:
 WorkingDirectory=/opt/cognis
-ExecStart=/usr/bin/uv run cognis serve
+ExecStart=/usr/bin/uv run cognis-controller serve
 ```
 
-The same applies to executor units — replace `uvx cognis executor run`
-with `uv run cognis executor run` and set `WorkingDirectory`.
+For executor units, use `uvx cognis-executor` for PyPI installs. From a local
+git checkout, replace it with `uv run cognis-executor` and set
+`WorkingDirectory`.
 
 ## Security notes
 

@@ -157,18 +157,18 @@ On first start, if the `users` table is empty:
 
 **CLI fallback** (headless / missed the URL):
 ```bash
-cognis admin create-user admin@example.com --name "Admin"
+cognis-controller admin create-user admin@example.com --name "Admin"
 # Prompts for password interactively
 ```
 
-The `cognis admin` commands access the database directly (not the API).
+The `cognis-controller admin` commands access the database directly (not the API).
 They require local filesystem access to the Cognis data directory.
 
 **Container / CI seeding**:
 ```bash
 COGNIS_INITIAL_ADMIN_EMAIL=admin@example.com \
 COGNIS_INITIAL_ADMIN_PASSWORD=... \
-uvx cognis
+uvx cognis-controller
 ```
 Creates the admin user on startup if the users table is empty. Clears the
 password from memory after use.
@@ -212,7 +212,7 @@ class UserRole(str, Enum):
 ### User Management
 
 Admins can manage users via the REST API (`/api/v1/admin/users/*`) or CLI
-(`cognis admin` commands). The Users table includes:
+(`cognis-controller admin` commands). The Users table includes:
 
 - `is_active` — soft delete flag; disabled users cannot log in or use API
 - `last_login_at` — updated on each successful login
