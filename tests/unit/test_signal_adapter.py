@@ -13,6 +13,7 @@ import pytest
 from cognis.channels.adapters.signal import (
     SignalAdapter,
     _extract_direct_attachment_result,
+    _fallback_attachment_filename,
     _infer_signal_voice_input,
     _is_fatal_signal_error,
     _normalize_signal_cli_trust_mode,
@@ -167,6 +168,34 @@ class TestSignalDirectAttachmentResult:
         )
 
         assert result == (b"audio-bytes", "audio/ogg", "voice.ogg")
+
+    def test_extracts_inline_base64_attachment_with_mime_based_filename(self) -> None:
+        attachment = MediaAttachment(mime_type="audio/ogg")
+
+        result = _extract_direct_attachment_result(
+            {"data": base64.b64encode(b"audio-bytes").decode("ascii")},
+            attachment,
+        )
+
+        assert result == (b"audio-bytes", "audio/ogg", "attachment.ogg")
+
+
+class TestSignalFallbackAttachmentFilename:
+    def test_infers_audio_filename_extension(self) -> None:
+        assert (
+            _fallback_attachment_filename(MediaAttachment(mime_type="audio/ogg"))
+            == "attachment.ogg"
+        )
+        assert (
+            _fallback_attachment_filename(MediaAttachment(mime_type="audio/mpeg"))
+            == "attachment.mp3"
+        )
+
+    def test_uses_bin_when_mime_type_is_unknown(self) -> None:
+        assert (
+            _fallback_attachment_filename(MediaAttachment(mime_type="application/octet-stream"))
+            == "attachment.bin"
+        )
 
 
 # ---------------------------------------------------------------------------

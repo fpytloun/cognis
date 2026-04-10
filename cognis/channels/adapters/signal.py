@@ -162,6 +162,29 @@ def _attachment_result_metadata(result: Any) -> dict[str, Any]:
     }
 
 
+def _fallback_attachment_filename(attachment: MediaAttachment) -> str:
+    if attachment.filename:
+        return attachment.filename
+    mime_type = str(attachment.mime_type or "").lower()
+    extension_map = {
+        "audio/ogg": ".ogg",
+        "audio/opus": ".opus",
+        "audio/mpeg": ".mp3",
+        "audio/mp3": ".mp3",
+        "audio/mp4": ".m4a",
+        "audio/x-m4a": ".m4a",
+        "audio/wav": ".wav",
+        "audio/x-wav": ".wav",
+        "audio/webm": ".webm",
+        "audio/aac": ".aac",
+        "audio/flac": ".flac",
+    }
+    extension = extension_map.get(mime_type)
+    if extension:
+        return f"attachment{extension}"
+    return "attachment.bin"
+
+
 def _extract_direct_attachment_result(
     result: Any,
     attachment: MediaAttachment,
@@ -217,7 +240,7 @@ def _extract_direct_attachment_result(
     return (
         content,
         attachment.mime_type or "application/octet-stream",
-        attachment.filename or "attachment.bin",
+        _fallback_attachment_filename(attachment),
     )
 
 
