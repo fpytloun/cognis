@@ -13,3 +13,4 @@ ui/.svelte-kit/
 ui/build/
 ui/coverage/
 cognis/ui_dist/
+.playwright-mcp/
