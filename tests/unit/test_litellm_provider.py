@@ -168,6 +168,7 @@ async def test_litellm_provider_transcribe_routes_to_executor(tmp_path: object) 
 
     assert result.text == "hello"
     assert captured["model"] == "gpt-4o-mini-transcribe"
+    assert captured["provider_preset"] == "openai"
     assert captured["executor_labels"] == {"location": "local"}
     await engine.dispose()
 
@@ -1049,6 +1050,26 @@ def test_apply_model_prefix_no_prefix_when_preset_missing() -> None:
         status="active",
     )
     assert LiteLLMProvider._apply_model_prefix("my-model", provider) == "my-model"
+
+
+def test_transcription_wire_model_preserves_prefixed_model_for_litellm_proxy() -> None:
+    assert (
+        LiteLLMProvider._transcription_wire_model(
+            "openai/gpt-4o-transcribe",
+            "litellm_proxy",
+        )
+        == "openai/gpt-4o-transcribe"
+    )
+
+
+def test_transcription_wire_model_strips_openai_prefix_for_openai() -> None:
+    assert (
+        LiteLLMProvider._transcription_wire_model(
+            "openai/gpt-4o-transcribe",
+            "openai",
+        )
+        == "gpt-4o-transcribe"
+    )
 
 
 # ---------------------------------------------------------------------------

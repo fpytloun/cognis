@@ -9,12 +9,15 @@ from typing import Any
 import httpx
 import litellm
 
+from cognis.logging import get_logger
 from cognis.providers.llm.responses_bridge import (
     messages_to_responses_input,
     responses_request_kwargs,
     responses_stream_to_chat_chunks,
     responses_to_chat_response,
 )
+
+logger = get_logger(__name__)
 
 
 def _supports_image_response_format(model: str) -> bool:
@@ -220,6 +223,7 @@ class InferenceHandler:
         mime_type: str,
         filename: str,
         model: str,
+        provider_preset: str | None = None,
         request_kwargs: dict[str, Any],
         prompt: str | None = None,
         language: str | None = None,
@@ -235,7 +239,18 @@ class InferenceHandler:
         if isinstance(extra_headers, dict):
             headers.update({str(key): str(value) for key, value in extra_headers.items()})
 
-        data: dict[str, str] = {"model": _transcription_model_name(model)}
+        wire_model = _transcription_wire_model(model, provider_preset or "")
+        logger.debug(
+            "executor inference: speech-to-text request prepared",
+            extra={
+                "extra_data": {
+                    "resolved_model": model,
+                    "wire_model": wire_model,
+                    "provider_preset": provider_preset,
+                }
+            },
+        )
+        data: dict[str, str] = {"model": wire_model}
         if prompt:
             data["prompt"] = prompt
         if language:
@@ -244,13 +259,16 @@ class InferenceHandler:
         file_obj = io.BytesIO(audio_bytes)
         file_obj.name = filename
         async with httpx.AsyncClient(timeout=request_kwargs.get("timeout", 120)) as client:
-            response = await client.post(
-                f"{api_base.rstrip('/')}/v1/audio/transcriptions",
-                headers=headers,
-                data=data,
-                files={"file": (filename, file_obj, mime_type)},
-            )
-            response.raise_for_status()
+            try:
+                response = await client.post(
+                    f"{api_base.rstrip('/')}/v1/audio/transcriptions",
+                    headers=headers,
+                    data=data,
+                    files={"file": (filename, file_obj, mime_type)},
+                )
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise RuntimeError(_sanitize_http_error_detail(exc)) from exc
         payload = response.json()
         return {
             "text": payload.get("text", ""),
@@ -260,7 +278,26 @@ class InferenceHandler:
         }
 
 
-def _transcription_model_name(model: str) -> str:
-    if model.startswith("openai/") or model.startswith("litellm_proxy/"):
+def _transcription_wire_model(model: str, provider_preset: str) -> str:
+    if "/" not in model:
+        return model
+    if provider_preset == "litellm_proxy":
+        return model
+    if provider_preset in {"openai", "openai_compatible"}:
         return model.split("/", 1)[1]
     return model
+
+
+def _sanitize_http_error_detail(error: httpx.HTTPStatusError) -> str:
+    detail = str(error)
+    try:
+        payload = error.response.json()
+    except Exception:
+        return detail
+    if isinstance(payload, dict):
+        err = payload.get("error")
+        if isinstance(err, dict):
+            message = err.get("message")
+            if isinstance(message, str) and message:
+                return f"{detail}; provider_error={message[:250]}"
+    return detail

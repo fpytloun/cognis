@@ -307,7 +307,19 @@ class LiteLLMProvider:
         resolved_model, provider = await self._resolve_model_target(model, task_type=task_type)
         if provider is None:
             raise ValueError(f"No LLM provider found for transcription model {resolved_model!r}")
-        model_name = self._transcription_model_name(resolved_model, provider)
+        provider_preset = str(dict(provider.config).get("preset", "")).lower()
+        model_name = self._transcription_wire_model(resolved_model, provider_preset)
+        logger.debug(
+            "llm: speech-to-text request prepared",
+            extra={
+                "extra_data": {
+                    "resolved_model": resolved_model,
+                    "wire_model": model_name,
+                    "provider_preset": provider_preset,
+                    "executor_routed": self._should_route_to_executor(provider),
+                }
+            },
+        )
         if self._should_route_to_executor(provider):
             if self._inference_router is None:
                 raise RuntimeError("Speech-to-text executor routing is unavailable")
@@ -317,6 +329,7 @@ class LiteLLMProvider:
                 mime_type=mime_type,
                 filename=filename,
                 model=model_name,
+                provider_preset=provider_preset,
                 executor_labels=dict(provider.config).get("executor_labels"),
                 request_kwargs=request_kwargs,
                 prompt=prompt,
@@ -354,7 +367,7 @@ class LiteLLMProvider:
                 )
                 response.raise_for_status()
         except httpx.HTTPStatusError as exc:
-            detail = self._sanitize_error_detail(exc)
+            detail = self._sanitize_http_error_detail(exc)
             raise RuntimeError(f"Speech-to-text request failed: {detail}") from exc
         except Exception as exc:
             detail = self._sanitize_error_detail(exc)
@@ -1053,13 +1066,28 @@ class LiteLLMProvider:
         return model
 
     @staticmethod
-    def _transcription_model_name(model: str, provider: LLMProviderRow | None) -> str:
-        if provider is None or "/" not in model:
+    def _transcription_wire_model(model: str, provider_preset: str) -> str:
+        if "/" not in model:
             return model
-        preset = str(dict(provider.config).get("preset", "")).lower()
-        if preset in {"litellm_proxy", "openai_compatible"}:
+        if provider_preset == "litellm_proxy":
+            return model
+        if provider_preset in {"openai", "openai_compatible"}:
             return model.split("/", 1)[1]
         return model
+
+    def _sanitize_http_error_detail(self, error: httpx.HTTPStatusError) -> str:
+        detail = self._sanitize_error_detail(error)
+        try:
+            payload = error.response.json()
+        except Exception:
+            return detail
+        if isinstance(payload, dict):
+            err = payload.get("error")
+            if isinstance(err, dict):
+                message = err.get("message")
+                if isinstance(message, str) and message:
+                    return f"{detail}; provider_error={message[:250]}"
+        return detail
 
     def _provider_request_kwargs(self, provider: LLMProviderRow | None) -> dict[str, Any]:
         if provider is None:

@@ -462,9 +462,49 @@ async def test_transcribe_posts_to_openai_compatible_endpoint(
         mime_type="audio/ogg",
         filename="voice.ogg",
         model="openai/gpt-4o-mini-transcribe",
+        provider_preset="openai",
         request_kwargs={"api_key": "secret", "api_base": "https://example.test"},
     )
 
     assert captured["url"] == "https://example.test/v1/audio/transcriptions"
     assert captured["data"] == {"model": "gpt-4o-mini-transcribe"}
     assert result["text"] == "hello world"
+
+
+@pytest.mark.asyncio
+async def test_transcribe_preserves_prefixed_model_for_litellm_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handler = InferenceHandler()
+    captured: dict[str, object] = {}
+
+    class _Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {"text": "hello world"}
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, url: str, **kwargs: object) -> _Response:
+            captured.update(kwargs)
+            return _Response()
+
+    monkeypatch.setattr("cognis.executor.inference.httpx.AsyncClient", lambda **_: _Client())
+
+    await handler.transcribe(
+        audio_bytes=b"audio-bytes",
+        mime_type="audio/ogg",
+        filename="voice.ogg",
+        model="openai/gpt-4o-transcribe",
+        provider_preset="litellm_proxy",
+        request_kwargs={"api_key": "secret", "api_base": "https://proxy.example"},
+    )
+
+    assert captured["data"] == {"model": "openai/gpt-4o-transcribe"}

@@ -723,6 +723,7 @@ class ExecutorRunner:
                 mime_type=str(params.get("mime_type", "application/octet-stream")),
                 filename=str(params.get("filename", "audio.bin")),
                 model=str(params.get("model", "")),
+                provider_preset=params.get("provider_preset"),
                 request_kwargs=request_kwargs,
                 prompt=params.get("prompt"),
                 language=params.get("language"),
