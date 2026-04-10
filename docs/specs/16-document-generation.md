@@ -16,6 +16,29 @@ workflow must be one tool call for a simple report, while still supporting
 advanced reports with generated images, local executor files, Excalidraw-based
 diagrams rendered to files, and remote web assets.
 
+## Status
+
+Implemented today:
+
+1. executor-native `document_generate`,
+2. executor-native `artifact_publish`,
+3. Markdown and HTML/CSS PDF generation via WeasyPrint,
+4. assets from artifact id, path, and URL,
+5. optional local `output_path`,
+6. optional `append_pdf_assets` support,
+7. public Cognis artifact URLs for user-facing delivery,
+8. direct-turn and background-task attachment delivery,
+9. attachment-only assistant messages across persistence, replay, web UI, and
+   channel delivery.
+
+Still deferred:
+
+1. full persisted document bundle sidecars (`source.md` / `source.html`, CSS,
+   `manifest.json`) under one document object,
+2. richer regeneration workflow based on persisted document manifests,
+3. broader integration/end-to-end tests beyond the current unit coverage,
+4. extra output formats such as DOCX.
+
 ## Goals
 
 1. Let an agent generate a polished PDF from Markdown or HTML/CSS in a single
@@ -119,12 +142,13 @@ Optional fields:
 
 1. `title`
 2. `filename`
-3. `css`
-4. `template`
-5. `page_size`
-6. `orientation`
-7. `assets`
-8. `append_pdf_assets`
+3. `output_path`
+4. `css`
+5. `template`
+6. `page_size`
+7. `orientation`
+8. `assets`
+9. `append_pdf_assets`
 
 ### Recommended Shape
 
@@ -138,8 +162,9 @@ Optional fields:
     "source_artifact_id": {"type": "string"},
     "title": {"type": "string"},
     "filename": {"type": "string"},
+    "output_path": {"type": "string"},
     "css": {"type": "string"},
-    "template": {"type": "string", "enum": ["default", "design_spec", "report"]},
+    "template": {"type": "string", "enum": ["default", "design_spec", "research_report", "incident_report", "proposal"]},
     "page_size": {"type": "string", "enum": ["A4", "Letter"]},
     "orientation": {"type": "string", "enum": ["portrait", "landscape"]},
     "append_pdf_assets": {"type": "boolean"},
@@ -273,8 +298,8 @@ The tool MUST NOT return raw PDF bytes through normal tool output.
 
 ## Document Bundle Storage
 
-Store each generated document as a bundle under a dedicated namespace such as
-`documents`.
+Longer term, each generated document should be stored as a full bundle under a
+dedicated namespace such as `documents`.
 
 Recommended layout:
 
@@ -283,7 +308,14 @@ Recommended layout:
 3. `documents/doc_<id>/style.css` when used
 4. `documents/doc_<id>/manifest.json`
 
-The bundle preserves enough information for future revision or regeneration.
+This bundle format preserves enough information for future revision or
+regeneration.
+
+Current implementation note:
+
+1. the final generated PDF is persisted as the primary artifact,
+2. companion attachments are persisted and delivered as separate artifacts,
+3. full source/CSS/manifest sidecars are not yet persisted as a unified bundle.
 
 ### Manifest Fields
 
@@ -321,8 +353,11 @@ The tool returns:
 1. a structured textual summary in `ToolResult.output`,
 2. one primary attachment for the generated PDF,
 3. optional companion attachments for non-inline assets when requested.
+4. after controller-side artifact persistence, visible tool output is enriched
+   with final artifact metadata such as `artifact_id`, `url`, `mime_type`, and
+   `size_bytes`.
 
-Example summary payload:
+Example summary payload before controller-side enrichment:
 
 ```json
 {
@@ -331,8 +366,24 @@ Example summary payload:
   "filename": "cognis-design-spec.pdf",
   "url": "https://cognis.example.com/api/v1/artifacts/content/documents/doc_a1b2c3/document.pdf?...",
   "source_artifact_id": "docsrc_a1b2c3",
+  "append_pdf_assets": false,
+  "appended_pdfs": [],
+  "output_path": null,
   "warnings": [],
   "assets_used": ["architecture", "timeline"]
+}
+```
+
+Example enriched output after artifact persistence:
+
+```json
+{
+  "document_title": "Cognis Design Spec",
+  "filename": "cognis-design-spec.pdf",
+  "artifact_id": "doc_abc123",
+  "url": "https://cognis.example.com/api/v1/artifacts/content/documents/doc_abc123/cognis-design-spec.pdf?...",
+  "mime_type": "application/pdf",
+  "size_bytes": 48213
 }
 ```
 
@@ -377,14 +428,9 @@ the adapter can do so.
 This feature is not complete unless background task results can carry document
 attachments.
 
-### Current Gap
+### Implemented Design
 
-Direct turn completion can now carry attachments, but task result delivery is
-still summary-centric.
-
-### Required Design
-
-Persist generated attachments in `task.result_data`, then propagate them through:
+Generated attachments are persisted in `task.result_data`, then propagated through:
 
 1. workflow step completion,
 2. task completion persistence,
@@ -445,8 +491,11 @@ generation.
 
 ### Artifact Support
 
-1. Add internal executor-to-controller artifact publish support.
+1. Use controller-side materialization of inline tool attachments into artifact
+   storage.
 2. Reuse public signed URLs for all user-facing references.
+3. Provide `artifact_publish` as a constrained executor-native escape hatch for
+   locally generated files.
 
 ### Task Results
 
@@ -479,26 +528,25 @@ generation.
 
 ## Rollout Plan
 
-### Phase 1
+### Completed
 
 1. executor-native `document_generate`,
-2. Markdown and HTML input,
-3. WeasyPrint rendering,
-4. assets from artifact id, path, and URL,
-5. public artifact URLs,
-6. direct-turn attachment delivery.
+2. executor-native `artifact_publish`,
+3. Markdown and HTML input,
+4. WeasyPrint rendering,
+5. assets from artifact id, path, and URL,
+6. public artifact URLs,
+7. direct-turn attachment delivery,
+8. background task attachment delivery,
+9. richer built-in templates,
+10. attachment-aware assistant message persistence.
 
-### Phase 2
+### Deferred
 
-1. background task attachment delivery,
+1. persisted document source/CSS/manifest bundles,
 2. source artifact regeneration flow,
-3. richer templates and polish.
-
-### Phase 3
-
-1. constrained `artifact_publish` escape hatch,
-2. advanced diagram workflows,
-3. extra output formats if needed.
+3. advanced diagram workflows,
+4. extra output formats if needed.
 
 ## Recommendation
 
@@ -507,6 +555,7 @@ artifact, path, and URL asset support in v1. Treat Excalidraw and other
 diagram systems as separate render-to-file workflows that feed into the
 document tool through local files or Cognis artifacts.
 
-Most importantly, do not treat document generation as finished until the final
-PDF can travel through the same direct-turn and background-task delivery paths
-that users rely on in real conversations and channels.
+The core user-facing feature is complete once the final PDF or generated file
+travels through the same direct-turn and background-task delivery paths that
+users rely on in real conversations and channels. Remaining work should focus
+on richer bundle persistence and regeneration, not on the basic delivery path.
