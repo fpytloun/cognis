@@ -13,8 +13,8 @@ delivers the final document through the existing artifact and channel systems.
 
 The design goal is agent usability, not just renderer correctness. The normal
 workflow must be one tool call for a simple report, while still supporting
-advanced reports with generated images, Mermaid diagrams, local executor files,
-and remote web assets.
+advanced reports with generated images, local executor files, Excalidraw-based
+diagrams rendered to files, and remote web assets.
 
 ## Goals
 
@@ -22,14 +22,13 @@ and remote web assets.
    tool call.
 2. Support inline assets from Cognis artifacts, executor-local files, and remote
    URLs.
-3. Support Mermaid diagrams in phase 1.
-4. Preserve source content and render metadata so the document can be revised
+3. Preserve source content and render metadata so the document can be revised
    later.
-5. Deliver the generated PDF back to the user as a real channel attachment when
+4. Deliver the generated PDF back to the user as a real channel attachment when
    the channel supports files, with a public Cognis URL fallback when it does
    not.
-6. Make the feature work for direct turns and for background task results.
-7. Use only public Cognis artifact URLs for user-facing or channel-facing
+5. Make the feature work for direct turns and for background task results.
+6. Use only public Cognis artifact URLs for user-facing or channel-facing
    delivery.
 
 ## Non-Goals
@@ -56,8 +55,8 @@ Instead, Cognis should expose a high-level `document_generate` tool that:
 4. stores the result in the artifact store,
 5. returns attachment metadata for channel delivery.
 
-An escape hatch for publishing arbitrary local files may be added later as a
-separate constrained tool, but it is not the primary report-generation path.
+A constrained local-file publish escape hatch may exist separately, but it is
+not the primary report-generation path.
 
 ## User Stories
 
@@ -69,8 +68,8 @@ returns a PDF design document to the user in chat or Signal.
 ### Rich Design Doc
 
 The agent generates an architecture image with `image_generate`, references the
-returned artifact in the report, adds Mermaid diagrams, and produces a polished
-PDF with custom CSS.
+returned artifact in the report, includes rendered Excalidraw or other local
+diagram assets, and produces a polished PDF with custom CSS.
 
 ### Local Exploration Report
 
@@ -90,10 +89,9 @@ builtin handler.
 Reasons:
 
 1. local file support requires executor filesystem access,
-2. Mermaid rendering requires executor-side CLI/process access,
-3. WeasyPrint and related rendering dependencies are better isolated to the
+2. WeasyPrint and related rendering dependencies are better isolated to the
    executor environment,
-4. agents often create supporting files during research on the executor.
+3. agents often create supporting files during research on the executor.
 
 This is a deliberate exception from current image-tool behavior. Image generation
 can remain controller-side because it delegates to a provider and does not need
@@ -187,7 +185,7 @@ write, debug, and revise. Markdown mode should support at least:
 5. fenced code blocks,
 6. blockquotes,
 7. inline images via asset references,
-8. fenced Mermaid blocks.
+8. inline asset references for rendered diagrams and screenshots.
 
 ### HTML/CSS
 
@@ -233,30 +231,6 @@ Some assets cannot or should not be inlined into the PDF, such as ZIP files,
 CSVs, and non-renderable binaries. The tool may return them as companion
 attachments alongside the final PDF.
 
-## Mermaid Support
-
-Phase 1 MUST support Mermaid.
-
-### Markdown Mermaid Blocks
-
-The renderer should recognize fenced Mermaid blocks:
-
-```md
-```mermaid
-graph TD
-  A[User] --> B[Cognis]
-  B --> C[Executor]
-```
-```
-
-### Rendering Strategy
-
-1. Render Mermaid to SVG on the executor if the Mermaid CLI is available.
-2. Embed the SVG inline into the generated HTML before WeasyPrint runs.
-3. If Mermaid rendering is unavailable, fail clearly with an actionable error.
-
-Mermaid support is part of v1 because diagrams are a core report use case.
-
 ## Excalidraw Handling
 
 Native Excalidraw parsing is out of scope for v1.
@@ -277,37 +251,23 @@ The executor-side pipeline is:
 1. normalize arguments,
 2. load source from `content`, `source_path`, or `source_artifact_id`,
 3. resolve all assets,
-4. preprocess Markdown and Mermaid,
-5. convert Markdown to HTML if needed,
-6. apply template CSS and optional custom CSS,
-7. render HTML to PDF with WeasyPrint,
-8. save output bundle to Cognis artifact storage,
-9. return attachment metadata and a structured textual result.
+4. convert Markdown to HTML if needed,
+5. apply template CSS and optional custom CSS,
+6. render HTML to PDF with WeasyPrint,
+7. save output bundle to Cognis artifact storage,
+8. return attachment metadata and a structured textual result.
 
 ## Internal Artifact Publish Path
 
-Because `document_generate` is executor-native, the executor MUST be able to
-publish generated outputs back to the controller artifact store.
+Because `document_generate` is executor-native, the controller must be able to
+materialize generated outputs from executor tool results into the artifact store.
 
 This is an internal runtime capability, not an LLM-facing tool.
 
 ### Requirement
 
-Add an executor-to-controller artifact publish mechanism for generated files and
-document sidecars.
-
-Possible implementation shapes:
-
-1. extend executor WebSocket RPC with an internal `artifact.publish` method,
-2. or provide an internal controller endpoint authenticated by executor token.
-
-The mechanism must support:
-
-1. binary content upload,
-2. namespace, object id, and filename,
-3. content type,
-4. owner email,
-5. optional artifact metadata recording.
+The minimal implementation may reuse inline tool attachments from the executor
+and let the controller persist them into artifact storage before delivery.
 
 The tool MUST NOT return raw PDF bytes through normal tool output.
 
@@ -471,8 +431,7 @@ Enforce explicit limits for:
 V1 requires:
 
 1. WeasyPrint,
-2. a Markdown parser suitable for tables and fenced blocks,
-3. Mermaid CLI on executors that enable Mermaid report rendering.
+2. a Markdown parser suitable for tables and fenced blocks.
 
 These dependencies belong on the executor environment used for document
 generation.
@@ -505,10 +464,9 @@ generation.
 5. asset resolution from `artifact_id`.
 6. asset resolution from `path`.
 7. asset resolution from `url`.
-8. Mermaid block rendering.
-9. public Cognis URL generation.
-10. attachment metadata returned.
-11. task result attachment persistence.
+8. public Cognis URL generation.
+9. attachment metadata returned.
+10. task result attachment persistence.
 
 ### Integration Tests
 
@@ -527,9 +485,8 @@ generation.
 2. Markdown and HTML input,
 3. WeasyPrint rendering,
 4. assets from artifact id, path, and URL,
-5. Mermaid support,
-6. public artifact URLs,
-7. direct-turn attachment delivery.
+5. public artifact URLs,
+6. direct-turn attachment delivery.
 
 ### Phase 2
 
@@ -546,8 +503,8 @@ generation.
 ## Recommendation
 
 Implement `document_generate` as an executor-native high-level tool with
-artifact, path, and URL asset support in v1. Support Mermaid immediately.
-Treat Excalidraw as a separate render-to-file workflow that feeds into the
+artifact, path, and URL asset support in v1. Treat Excalidraw and other
+diagram systems as separate render-to-file workflows that feed into the
 document tool through local files or Cognis artifacts.
 
 Most importantly, do not treat document generation as finished until the final

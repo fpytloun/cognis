@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import html
 import mimetypes
 import re
-import shutil
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -21,8 +18,6 @@ from cognis.tools.registry import ToolExecutionContext
 _SOURCE = ToolSource(type="executor")
 _REMOTE_TIMEOUT = 20.0
 _MAX_REMOTE_BYTES = 10 * 1024 * 1024
-_MAX_INLINE_SOURCE_BYTES = 512 * 1024
-_MERMAID_BLOCK_RE = re.compile(r"```mermaid\s*\n(.*?)\n```", re.DOTALL)
 _MARKDOWN_IMAGE_ASSET_RE = re.compile(r"!\[(?P<alt>[^\]]*)\]\(asset:(?P<name>[^)]+)\)")
 
 
@@ -30,7 +25,7 @@ DOCUMENT_GENERATE_TOOL = ToolDefinition(
     name="document_generate",
     description=(
         "Generate a PDF document from Markdown or HTML/CSS. Supports inline assets "
-        "from artifact URLs, local executor files, and remote URLs."
+        "from Cognis artifacts, local executor files, and remote URLs."
     ),
     parameters={
         "type": "object",
@@ -54,7 +49,13 @@ DOCUMENT_GENERATE_TOOL = ToolDefinition(
             "css": {"type": "string", "description": "Optional custom CSS."},
             "template": {
                 "type": "string",
-                "enum": ["default", "design_spec", "report"],
+                "enum": [
+                    "default",
+                    "design_spec",
+                    "research_report",
+                    "incident_report",
+                    "proposal",
+                ],
                 "description": "Optional built-in template preset.",
             },
             "page_size": {
@@ -168,9 +169,15 @@ async def handle_document_generate(
         output = {
             "document_title": title,
             "filename": filename,
+            "input_format": input_format,
+            "template": template,
+            "page_size": page_size,
+            "orientation": orientation,
             "source_kind": source_kind,
+            "source_ref": _source_reference(arguments, source_kind),
             "warnings": warnings,
             "assets_used": sorted(assets.keys()),
+            "companion_attachments": [item["filename"] for item in companion_attachments],
         }
         attachments = [
             {
@@ -307,13 +314,13 @@ async def _resolve_assets(
 async def _load_asset_bytes(raw: dict[str, Any]) -> tuple[bytes, str, str]:
     filename = str(raw.get("filename") or raw.get("name") or "attachment")
     mime_type = str(raw.get("mime_type") or "")
+    if content_b64 := raw.get("content_b64"):
+        if not isinstance(content_b64, str):
+            raise DocumentGenerationError(f"Asset '{raw.get('name')}' has invalid inline content.")
+        content = base64.b64decode(content_b64)
+        guessed = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        return content, mime_type or guessed, filename
     sources = [key for key in ("path", "url") if raw.get(key)]
-    if raw.get("artifact_id") and raw.get("url"):
-        sources = ["url"]
-    elif raw.get("artifact_id"):
-        raise DocumentGenerationError(
-            f"Asset '{raw.get('name')}' requires controller-side artifact URL resolution."
-        )
     if len(sources) != 1:
         raise DocumentGenerationError(
             f"Asset '{raw.get('name')}' must specify exactly one of artifact_id, path, or url."
@@ -349,49 +356,12 @@ async def _markdown_to_html(markdown_text: str, assets: dict[str, dict[str, str]
             "Markdown support requires the 'Markdown' package to be installed."
         ) from exc
 
-    markdown_text = await _replace_mermaid_blocks(markdown_text)
     markdown_text = _replace_markdown_asset_refs(markdown_text, assets)
     return markdown_lib.markdown(
         markdown_text,
         extensions=["fenced_code", "tables", "toc"],
         output_format="html5",
     )
-
-
-async def _replace_mermaid_blocks(markdown_text: str) -> str:
-    matches = list(_MERMAID_BLOCK_RE.finditer(markdown_text))
-    if not matches:
-        return markdown_text
-    if shutil.which("mmdc") is None:
-        raise DocumentGenerationError("Mermaid rendering requires the 'mmdc' CLI on the executor.")
-    rendered = markdown_text
-    for match in reversed(matches):
-        svg = await _render_mermaid_svg(match.group(1).strip())
-        data_url = _to_data_url(svg.encode("utf-8"), "image/svg+xml")
-        rendered = rendered[: match.start()] + f"![]({data_url})" + rendered[match.end() :]
-    return rendered
-
-
-async def _render_mermaid_svg(diagram: str) -> str:
-    with tempfile.TemporaryDirectory(prefix="cognis-mermaid-") as tmpdir:
-        tmp = Path(tmpdir)
-        src = tmp / "diagram.mmd"
-        out = tmp / "diagram.svg"
-        src.write_text(diagram, encoding="utf-8")
-        proc = await asyncio.create_subprocess_exec(
-            "mmdc",
-            "-i",
-            str(src),
-            "-o",
-            str(out),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-        if proc.returncode != 0 or not out.exists():
-            detail = (stderr or stdout).decode("utf-8", errors="replace").strip()
-            raise DocumentGenerationError(f"Mermaid render failed: {detail or 'unknown error'}")
-        return out.read_text(encoding="utf-8")
 
 
 def _replace_markdown_asset_refs(
@@ -434,11 +404,28 @@ def _compose_css(*, template: str, page_size: str, orientation: str) -> str:
         "blockquote { border-left: 4px solid #94a3b8; margin: 1rem 0; padding-left: 1rem; color: #334155; }\n"
     )
     if template == "design_spec":
-        return (
-            base + "h1 { font-size: 30px; border-bottom: 2px solid #0ea5e9; padding-bottom: 8px; }"
+        return base + (
+            "h1 { font-size: 30px; border-bottom: 2px solid #0ea5e9; padding-bottom: 8px; }"
+            " h2 { margin-top: 2rem; color: #0f766e; }"
         )
-    if template == "report":
-        return base + "h1 { font-size: 28px; } h2 { margin-top: 1.8rem; }"
+    if template == "research_report":
+        return base + (
+            "h1 { font-size: 28px; } h2 { margin-top: 1.8rem; }"
+            " p, li { font-size: 11pt; }"
+            " .summary { background: #eff6ff; border: 1px solid #bfdbfe; padding: 12px; border-radius: 8px; }"
+        )
+    if template == "incident_report":
+        return base + (
+            "h1 { font-size: 28px; color: #991b1b; }"
+            " h2 { margin-top: 1.8rem; color: #b91c1c; }"
+            " table th { background: #fee2e2; }"
+        )
+    if template == "proposal":
+        return base + (
+            "h1 { font-size: 32px; } h2 { margin-top: 2rem; }"
+            " body { color: #172554; }"
+            " table th { background: #dbeafe; }"
+        )
     return base
 
 
@@ -480,3 +467,13 @@ def _output_filename(raw_filename: Any, title: str) -> str:
     if not filename.lower().endswith(".pdf"):
         filename += ".pdf"
     return filename
+
+
+def _source_reference(arguments: dict[str, Any], source_kind: str) -> str | None:
+    if source_kind == "path":
+        source_path = arguments.get("source_path")
+        return Path(str(source_path)).name if source_path else None
+    if source_kind == "artifact":
+        artifact_id = arguments.get("source_artifact_id")
+        return str(artifact_id) if artifact_id else None
+    return None

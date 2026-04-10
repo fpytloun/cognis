@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import base64
 import types
 from pathlib import Path
@@ -50,6 +51,9 @@ async def test_document_generate_from_markdown(monkeypatch: pytest.MonkeyPatch) 
     assert result.attachments is not None
     assert result.attachments[0]["mime_type"] == "application/pdf"
     assert base64.b64decode(result.attachments[0]["content_b64"]) == b"%PDF-test"
+    payload = ast.literal_eval(result.output)
+    assert payload["template"] == "default"
+    assert payload["input_format"] == "markdown"
 
 
 @pytest.mark.asyncio
@@ -95,6 +99,58 @@ async def test_document_generate_supports_local_assets(
     assert not result.is_error
     assert result.attachments is not None
     assert result.attachments[0]["filename"].endswith(".pdf")
+
+
+@pytest.mark.asyncio
+async def test_document_generate_supports_injected_artifact_assets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_markdown(text: str, **_: object) -> str:
+        assert "data:image/png;base64," in text
+        return text
+
+    class _FakeHTML:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def write_pdf(self, stylesheets: list[object]) -> bytes:
+            return b"%PDF-artifact"
+
+    class _FakeCSS:
+        def __init__(self, **_: object) -> None:
+            pass
+
+    monkeypatch.setitem(
+        __import__("sys").modules, "markdown", types.SimpleNamespace(markdown=fake_markdown)
+    )
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "weasyprint",
+        types.SimpleNamespace(HTML=_FakeHTML, CSS=_FakeCSS),
+    )
+
+    result = await handle_document_generate(
+        {
+            "content": "![Diagram](asset:diag)",
+            "input_format": "markdown",
+            "template": "proposal",
+            "assets": [
+                {
+                    "name": "diag",
+                    "artifact_id": "art_123",
+                    "filename": "diagram.png",
+                    "mime_type": "image/png",
+                    "content_b64": base64.b64encode(b"png-from-artifact").decode("ascii"),
+                }
+            ],
+        },
+        _DUMMY_CONTEXT,
+    )
+
+    assert not result.is_error
+    payload = ast.literal_eval(result.output)
+    assert payload["template"] == "proposal"
+    assert payload["assets_used"] == ["diag"]
 
 
 @pytest.mark.asyncio

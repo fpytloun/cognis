@@ -109,6 +109,9 @@ class _ArtifactStore:
     async def async_get_public_url(self, namespace: str, object_id: str, filename: str) -> str:
         return f"https://cognis.example.com/{namespace}/{object_id}/{filename}"
 
+    async def async_load(self, namespace: str, object_id: str, filename: str) -> tuple[bytes, str]:
+        return b"image-bytes", "image/png"
+
 
 def _registry_with_result_limit(max_result_size: int = 20) -> ToolRegistry:
     registry = ToolRegistry()
@@ -476,3 +479,48 @@ async def test_tool_router_materializes_inline_attachments(monkeypatch: pytest.M
     assert artifact_store.saved
     assert result.attachments is not None
     assert result.attachments[0]["artifact_id"] == "doc_1"
+
+
+@pytest.mark.asyncio
+async def test_tool_router_prepares_document_artifact_assets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact_store = _ArtifactStore()
+    router = ToolRouter(
+        guardrails=_Guardrails(),
+        artifact_store=artifact_store,
+        session_factory=_session_factory(),
+    )
+    monkeypatch.setattr(
+        "cognis.core.tool_router.get_artifact_record",
+        AsyncMock(
+            return_value=type(
+                "ArtifactRow",
+                (),
+                {
+                    "status": "attached",
+                    "owner_email": "user@example.com",
+                    "namespace": "attachments",
+                    "object_id": "art_1",
+                    "filename": "diagram.png",
+                },
+            )()
+        ),
+    )
+
+    prepared = await router._prepare_local_tool_call(  # noqa: SLF001
+        ToolCall(
+            call_id="7",
+            name="document_generate",
+            arguments={
+                "content": "![x](asset:diag)",
+                "assets": [{"name": "diag", "artifact_id": "art_1"}],
+            },
+        ),
+        _session(),
+    )
+
+    asset = prepared.arguments["assets"][0]
+    assert asset["filename"] == "diagram.png"
+    assert asset["mime_type"] == "image/png"
+    assert base64.b64decode(asset["content_b64"]) == b"image-bytes"

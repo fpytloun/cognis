@@ -570,12 +570,12 @@ class ToolRouter:
                     continue
                 item = dict(raw)
                 if artifact_id := item.get("artifact_id"):
-                    item.setdefault(
-                        "url",
-                        await self._resolve_public_artifact_url(
-                            str(artifact_id), session.user_email
-                        ),
+                    content, mime_type, filename = await self._load_binary_artifact(
+                        str(artifact_id), session.user_email
                     )
+                    item.setdefault("content_b64", base64.b64encode(content).decode("ascii"))
+                    item.setdefault("mime_type", mime_type)
+                    item.setdefault("filename", filename)
                 resolved_assets.append(item)
             arguments["assets"] = resolved_assets
         return tool_call.model_copy(update={"arguments": arguments})
@@ -594,7 +594,9 @@ class ToolRouter:
         )
         return content.decode("utf-8", errors="replace")
 
-    async def _resolve_public_artifact_url(self, artifact_id: str, user_email: str) -> str:
+    async def _load_binary_artifact(
+        self, artifact_id: str, user_email: str
+    ) -> tuple[bytes, str, str]:
         if self._session_factory is None or self.artifact_store is None:
             raise ValueError("Artifact support not available")
         async with self._session_factory() as db_session:
@@ -603,9 +605,10 @@ class ToolRouter:
             raise ValueError(f"Artifact not found: {artifact_id}")
         if row.owner_email and row.owner_email != user_email:
             raise ValueError(f"Artifact access denied: {artifact_id}")
-        return await self.artifact_store.async_get_public_url(
+        content, content_type = await self.artifact_store.async_load(
             row.namespace, row.object_id, row.filename
         )
+        return content, content_type, row.filename
 
     async def _materialize_inline_attachments(
         self,
