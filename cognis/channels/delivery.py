@@ -22,7 +22,7 @@ from cognis.channels.protocol import (
 )
 from cognis.core.events import Event, EventBus, EventType
 from cognis.logging import get_logger
-from cognis.models.channel import OutboundMessage
+from cognis.models.channel import MediaAttachment, OutboundMessage
 
 logger = get_logger(__name__)
 
@@ -105,6 +105,7 @@ class ChannelDeliveryService:
         chat_id: str,
         thread_id: str | None,
         content: str,
+        media: list[dict[str, Any]] | None = None,
     ) -> str:
         """Send content to a resolved channel route.
 
@@ -123,6 +124,8 @@ class ChannelDeliveryService:
 
         adapter, config = result
 
+        outbound_media = [_to_media_attachment(item) for item in (media or [])]
+
         if channel_type == "signal":
             try:
                 await adapter.send_message(
@@ -132,6 +135,31 @@ class ChannelDeliveryService:
                         chat_id=chat_id,
                         content=content,
                         thread_id=thread_id,
+                        media=outbound_media,
+                    )
+                )
+                CHANNEL_OUTBOUND_TOTAL.labels(
+                    channel_type=channel_type,
+                    account_id=account_id,
+                ).inc()
+                return "sent"
+            except Exception:
+                CHANNEL_DELIVERY_ERRORS.labels(
+                    channel_type=channel_type,
+                    account_id=account_id,
+                ).inc()
+                return "failed"
+
+        if outbound_media:
+            try:
+                await adapter.send_message(
+                    OutboundMessage(
+                        channel_type=channel_type,
+                        account_id=account_id,
+                        chat_id=chat_id,
+                        content=content,
+                        thread_id=thread_id,
+                        media=outbound_media,
                     )
                 )
                 CHANNEL_OUTBOUND_TOTAL.labels(
@@ -231,11 +259,15 @@ class ChannelDeliveryService:
         fallback_text = event.data.get("delivery_fallback_text")
         if not isinstance(fallback_text, str):
             fallback_text = None
+        attachments = event.data.get("attachments")
+        if not isinstance(attachments, list):
+            attachments = None
 
         await self._deliver_outbox(
             delivery_id=delivery_id,
             final_content=final_content.strip() or None,
             fallback_text=fallback_text,
+            attachments=attachments,
             ignore_next_attempt=True,
         )
 
@@ -460,6 +492,7 @@ class ChannelDeliveryService:
         delivery_id: str,
         final_content: str | None,
         fallback_text: str | None,
+        attachments: list[dict[str, Any]] | None = None,
         ignore_next_attempt: bool = False,
     ) -> None:
         from cognis.store.queries import (
@@ -503,6 +536,7 @@ class ChannelDeliveryService:
                 chat_id=row.chat_id,
                 thread_id=row.thread_id,
                 content=content,
+                media=attachments,
             )
         except Exception:
             logger.warning(
@@ -588,3 +622,12 @@ class ChannelDeliveryService:
             str(chat_id),
             str(thread_id) if thread_id else None,
         )
+
+
+def _to_media_attachment(raw: dict[str, Any]) -> MediaAttachment:
+    return MediaAttachment(
+        url=raw.get("url") if isinstance(raw.get("url"), str) else None,
+        mime_type=raw.get("mime_type") if isinstance(raw.get("mime_type"), str) else None,
+        filename=raw.get("filename") if isinstance(raw.get("filename"), str) else None,
+        size_bytes=raw.get("size_bytes") if isinstance(raw.get("size_bytes"), int) else None,
+    )

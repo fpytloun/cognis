@@ -41,6 +41,8 @@ dependencies = [
     "mcp>=1.6.0",
     "croniter>=2.0.0",
     "python-dateutil>=2.9.0",
+    "Markdown>=3.7",
+    "weasyprint>=63.0",
 ]
 
 [project.optional-dependencies]

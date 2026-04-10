@@ -574,7 +574,7 @@ class InboundPipeline:
                             mime_type=content_type,
                             filename=filename,
                             size_bytes=len(content),
-                            url=await manager._artifact_store.async_get_signed_url(  # noqa: SLF001
+                            url=await manager._artifact_store.async_get_public_url(  # noqa: SLF001
                                 "attachments", artifact_id, filename
                             ),
                         )

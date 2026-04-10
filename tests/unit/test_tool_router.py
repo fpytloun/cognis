@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+from contextlib import asynccontextmanager
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -83,6 +86,28 @@ class _RemoteExecutor(_Executor):
         super().__init__(result=result)
         self.executor_id = "remote-exec"
         self.executor_type = "websocket"
+
+
+class _ArtifactStore:
+    def __init__(self) -> None:
+        self.saved: list[tuple[str, str, str, bytes, str, str | None]] = []
+
+    def generate_id(self, prefix: str) -> str:
+        return f"{prefix}_1"
+
+    async def async_save(
+        self,
+        namespace: str,
+        object_id: str,
+        filename: str,
+        content: bytes,
+        mime_type: str,
+        owner_email: str | None = None,
+    ) -> None:
+        self.saved.append((namespace, object_id, filename, content, mime_type, owner_email))
+
+    async def async_get_public_url(self, namespace: str, object_id: str, filename: str) -> str:
+        return f"https://cognis.example.com/{namespace}/{object_id}/{filename}"
 
 
 def _registry_with_result_limit(max_result_size: int = 20) -> ToolRegistry:
@@ -172,6 +197,18 @@ def _session() -> SessionModel:
         user_email="user@example.com",
         agent_id="agent-a",
     )
+
+
+def _session_factory() -> object:
+    class _Session:
+        async def commit(self) -> None:
+            return None
+
+    @asynccontextmanager
+    async def factory() -> object:
+        yield _Session()
+
+    return factory
 
 
 def test_tool_router_classifies_routes() -> None:
@@ -393,3 +430,49 @@ async def test_tool_router_logs_do_not_include_tool_arguments(
     )
 
     assert "top-secret-value" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_tool_router_materializes_inline_attachments(monkeypatch: pytest.MonkeyPatch) -> None:
+    artifact_store = _ArtifactStore()
+    router = ToolRouter(
+        guardrails=_Guardrails(),
+        artifact_store=artifact_store,
+        session_factory=_session_factory(),
+    )
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="document_generate",
+                description="doc",
+                parameters={"type": "object", "properties": {}},
+                source=ToolSource(type="executor"),
+                timeout_seconds=1,
+            )
+        )
+    )
+    monkeypatch.setattr("cognis.core.tool_router.create_artifact_record", AsyncMock())
+
+    result = await router.execute(
+        ToolCall(call_id="6", name="document_generate", arguments={"content": "x"}),
+        _session(),
+        _agent(),
+        registry,
+        _RemoteExecutor(
+            ToolResult(
+                output="ok",
+                attachments=[
+                    {
+                        "filename": "report.pdf",
+                        "mime_type": "application/pdf",
+                        "content_b64": base64.b64encode(b"pdf").decode("ascii"),
+                    }
+                ],
+            )
+        ),
+    )
+
+    assert artifact_store.saved
+    assert result.attachments is not None
+    assert result.attachments[0]["artifact_id"] == "doc_1"

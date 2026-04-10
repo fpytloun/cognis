@@ -469,6 +469,8 @@ class WorkflowEngine:
                 task.result_summary = self._build_result_summary(state, workflow)
                 task.completed_at = datetime.now(UTC)
 
+            task.result_data = self._build_result_data(state)
+
             await self._persist_task_final(task)
 
             WORKFLOWS_TOTAL.labels(
@@ -1260,6 +1262,7 @@ class WorkflowEngine:
                 "title": task.title,
                 "status": task.status,
                 "result_summary": task.result_summary,
+                "attachments": (task.result_data or {}).get("attachments", []),
             },
         )
 
@@ -1383,6 +1386,7 @@ class WorkflowEngine:
                     "title": task.title,
                     "conversation_id": target_conversation_id,
                     "result_summary": task.result_summary,
+                    "attachments": (task.result_data or {}).get("attachments", []),
                     "channel_follow_up_delivery_id": delivery_id,
                 },
             )
@@ -1797,6 +1801,30 @@ class WorkflowEngine:
         if raw_output and isinstance(raw_output, dict):
             return str(raw_output.get("summary", ""))
         return ""
+
+    def _build_result_data(self, state: WorkflowState) -> dict[str, Any] | None:
+        attachments: list[dict[str, Any]] = []
+        for raw in state.step_outputs.values():
+            if not isinstance(raw, dict):
+                continue
+            try:
+                step_output = StepOutput.model_validate(raw)
+            except Exception:
+                continue
+            attachments.extend(step_output.attachments)
+        if not attachments:
+            return None
+        deduped: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for item in attachments:
+            artifact_id = str(item.get("artifact_id") or "")
+            url = str(item.get("url") or "")
+            key = (artifact_id, url)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(item)
+        return {"attachments": deduped}
 
 
 def _build_exhaustion_gate(step_def: StepDefinition, last_error: str | None = None) -> Any:

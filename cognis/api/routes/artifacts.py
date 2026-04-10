@@ -77,7 +77,7 @@ async def upload_artifact(
         )
         await session.commit()
 
-    signed_url = await artifact_store.async_get_signed_url("attachments", artifact_id, filename)
+    signed_url = await artifact_store.async_get_public_url("attachments", artifact_id, filename)
     return {
         "artifact_id": artifact_id,
         "kind": kind.value,
@@ -102,7 +102,7 @@ async def get_signed_url(
         raise api_exception(404, "not_found", "Artifact not found")
     if row.owner_email and row.owner_email != user.email and getattr(user, "role", "") != "admin":
         raise api_exception(404, "not_found", "Artifact not found")
-    url = await artifact_store.async_get_signed_url(
+    url = await artifact_store.async_get_public_url(
         row.namespace,
         row.object_id,
         row.filename,

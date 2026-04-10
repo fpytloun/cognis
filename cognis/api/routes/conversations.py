@@ -422,7 +422,7 @@ async def conversation_messages(
                         "filename": artifact_row.filename,
                         "mime_type": artifact_row.mime_type,
                         "size_bytes": artifact_row.size_bytes,
-                        "url": await artifact_store.async_get_signed_url(
+                        "url": await artifact_store.async_get_public_url(
                             artifact_row.namespace,
                             artifact_row.object_id,
                             artifact_row.filename,

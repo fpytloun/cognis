@@ -1,0 +1,407 @@
+"""Executor-native document generation tool."""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import html
+import mimetypes
+import re
+import shutil
+import tempfile
+from pathlib import Path
+from typing import Any
+
+import httpx
+
+from cognis.models.tool import ToolDefinition, ToolResult, ToolSource
+from cognis.tools.executor.paths import resolve_path
+from cognis.tools.registry import ToolExecutionContext
+
+_SOURCE = ToolSource(type="executor")
+_REMOTE_TIMEOUT = 20.0
+_MAX_REMOTE_BYTES = 10 * 1024 * 1024
+_MAX_INLINE_SOURCE_BYTES = 512 * 1024
+_MERMAID_BLOCK_RE = re.compile(r"```mermaid\s*\n(.*?)\n```", re.DOTALL)
+_MARKDOWN_IMAGE_ASSET_RE = re.compile(r"!\[(?P<alt>[^\]]*)\]\(asset:(?P<name>[^)]+)\)")
+
+
+DOCUMENT_GENERATE_TOOL = ToolDefinition(
+    name="document_generate",
+    description=(
+        "Generate a PDF document from Markdown or HTML/CSS. Supports inline assets "
+        "from artifact URLs, local executor files, and remote URLs."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "input_format": {
+                "type": "string",
+                "enum": ["markdown", "html"],
+                "description": "Source format. Defaults to markdown.",
+            },
+            "content": {"type": "string", "description": "Inline source content."},
+            "source_path": {
+                "type": "string",
+                "description": "Local executor path to the source document.",
+            },
+            "source_artifact_id": {
+                "type": "string",
+                "description": "Existing Cognis artifact id for the source document.",
+            },
+            "title": {"type": "string", "description": "Document title."},
+            "filename": {"type": "string", "description": "Output PDF filename."},
+            "css": {"type": "string", "description": "Optional custom CSS."},
+            "template": {
+                "type": "string",
+                "enum": ["default", "design_spec", "report"],
+                "description": "Optional built-in template preset.",
+            },
+            "page_size": {
+                "type": "string",
+                "enum": ["A4", "Letter"],
+                "description": "Page size. Defaults to A4.",
+            },
+            "orientation": {
+                "type": "string",
+                "enum": ["portrait", "landscape"],
+                "description": "Page orientation. Defaults to portrait.",
+            },
+            "append_pdf_assets": {
+                "type": "boolean",
+                "description": "Reserved for future PDF append support.",
+            },
+            "assets": {
+                "type": "array",
+                "description": "Named assets referenced with asset:name in the document.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "artifact_id": {"type": "string"},
+                        "path": {"type": "string"},
+                        "url": {"type": "string"},
+                        "alt": {"type": "string"},
+                        "caption": {"type": "string"},
+                        "mime_type": {"type": "string"},
+                    },
+                    "required": ["name"],
+                },
+            },
+        },
+        "required": [],
+    },
+    source=_SOURCE,
+    category="document",
+    read_only=True,
+    timeout_seconds=180,
+    max_result_size=100_000,
+)
+
+
+async def handle_document_generate(
+    arguments: dict[str, Any],
+    context: ToolExecutionContext,
+) -> ToolResult:
+    try:
+        source_kind, source_text, base_dir = await _load_source(arguments)
+        input_format = str(arguments.get("input_format") or "markdown").lower()
+        if input_format not in {"markdown", "html"}:
+            return ToolResult(
+                output="Unsupported input_format. Use 'markdown' or 'html'.", is_error=True
+            )
+
+        assets, companion_attachments, warnings = await _resolve_assets(
+            arguments.get("assets") or []
+        )
+        title = str(arguments.get("title") or _derive_title(source_text) or "Document")
+
+        if input_format == "markdown":
+            html_body = await _markdown_to_html(source_text, assets)
+        else:
+            html_body = _replace_html_asset_refs(source_text, assets)
+
+        template = str(arguments.get("template") or "default")
+        page_size = str(arguments.get("page_size") or "A4")
+        orientation = str(arguments.get("orientation") or "portrait")
+        css = _compose_css(template=template, page_size=page_size, orientation=orientation)
+        if custom_css := arguments.get("css"):
+            css += f"\n\n{custom_css}"
+
+        pdf_bytes = await _render_pdf(title=title, html_body=html_body, css=css, base_dir=base_dir)
+        filename = _output_filename(arguments.get("filename"), title)
+        output = {
+            "document_title": title,
+            "filename": filename,
+            "source_kind": source_kind,
+            "warnings": warnings,
+            "assets_used": sorted(assets.keys()),
+        }
+        attachments = [
+            {
+                "filename": filename,
+                "mime_type": "application/pdf",
+                "content_b64": base64.b64encode(pdf_bytes).decode("ascii"),
+                "kind": "pdf",
+                "purpose": "document_output",
+            },
+            *companion_attachments,
+        ]
+        return ToolResult(output=str(output), attachments=attachments)
+    except DocumentGenerationError as exc:
+        return ToolResult(output=f"Document generation failed: {exc}", is_error=True)
+    except Exception as exc:
+        return ToolResult(output=f"Document generation failed: {str(exc)[:500]}", is_error=True)
+
+
+class DocumentGenerationError(Exception):
+    pass
+
+
+async def _load_source(arguments: dict[str, Any]) -> tuple[str, str, str | None]:
+    provided = [
+        key for key in ("content", "source_path", "source_artifact_id") if arguments.get(key)
+    ]
+    if len(provided) != 1:
+        raise DocumentGenerationError(
+            "Exactly one of content, source_path, or source_artifact_id is required."
+        )
+    if content := arguments.get("content"):
+        return "content", str(content), None
+    if source_path := arguments.get("source_path"):
+        path = resolve_path(str(source_path))
+        if not path.is_file():
+            raise DocumentGenerationError(f"Source file not found: {source_path}")
+        text = path.read_text(encoding="utf-8", errors="replace")
+        return "path", text, str(path.parent)
+    if artifact_content := arguments.get("source_artifact_content"):
+        return "artifact", str(artifact_content), None
+    raise DocumentGenerationError(
+        "source_artifact_id requires controller-side artifact content resolution."
+    )
+
+
+async def _resolve_assets(
+    raw_assets: list[Any],
+) -> tuple[dict[str, dict[str, str]], list[dict[str, Any]], list[str]]:
+    resolved: dict[str, dict[str, str]] = {}
+    companion_attachments: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    for raw in raw_assets:
+        if not isinstance(raw, dict):
+            continue
+        name = raw.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        asset_bytes, mime_type, filename = await _load_asset_bytes(raw)
+        if mime_type == "application/pdf":
+            companion_attachments.append(
+                {
+                    "filename": filename,
+                    "mime_type": mime_type,
+                    "content_b64": base64.b64encode(asset_bytes).decode("ascii"),
+                    "kind": "pdf",
+                    "purpose": "document_companion",
+                }
+            )
+            warnings.append(f"Asset '{name}' is a PDF and was attached as a companion file.")
+            continue
+        if mime_type.startswith("image/") or mime_type == "image/svg+xml":
+            resolved[name] = {
+                "data_url": _to_data_url(asset_bytes, mime_type),
+                "mime_type": mime_type,
+                "filename": filename,
+                "alt": str(raw.get("alt") or filename),
+            }
+            continue
+        companion_attachments.append(
+            {
+                "filename": filename,
+                "mime_type": mime_type,
+                "content_b64": base64.b64encode(asset_bytes).decode("ascii"),
+                "kind": "file",
+                "purpose": "document_companion",
+            }
+        )
+        warnings.append(
+            f"Asset '{name}' could not be inlined and was attached as a companion file."
+        )
+    return resolved, companion_attachments, warnings
+
+
+async def _load_asset_bytes(raw: dict[str, Any]) -> tuple[bytes, str, str]:
+    filename = str(raw.get("filename") or raw.get("name") or "attachment")
+    mime_type = str(raw.get("mime_type") or "")
+    sources = [key for key in ("path", "url") if raw.get(key)]
+    if raw.get("artifact_id") and raw.get("url"):
+        sources = ["url"]
+    elif raw.get("artifact_id"):
+        raise DocumentGenerationError(
+            f"Asset '{raw.get('name')}' requires controller-side artifact URL resolution."
+        )
+    if len(sources) != 1:
+        raise DocumentGenerationError(
+            f"Asset '{raw.get('name')}' must specify exactly one of artifact_id, path, or url."
+        )
+    source = sources[0]
+    if source == "path":
+        path = resolve_path(str(raw["path"]))
+        if not path.is_file():
+            raise DocumentGenerationError(f"Asset file not found: {raw['path']}")
+        content = path.read_bytes()
+        mime_type = mime_type or mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        return content, mime_type, path.name
+    content, guessed = await _fetch_remote_bytes(str(raw["url"]))
+    return content, mime_type or guessed, filename
+
+
+async def _fetch_remote_bytes(url: str) -> tuple[bytes, str]:
+    async with httpx.AsyncClient(timeout=_REMOTE_TIMEOUT, follow_redirects=True) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        content = resp.content
+        if len(content) > _MAX_REMOTE_BYTES:
+            raise DocumentGenerationError(f"Remote asset too large: {url}")
+        mime_type = resp.headers.get("content-type", "application/octet-stream").split(";", 1)[0]
+        return content, mime_type
+
+
+async def _markdown_to_html(markdown_text: str, assets: dict[str, dict[str, str]]) -> str:
+    try:
+        import markdown as markdown_lib
+    except ImportError as exc:
+        raise DocumentGenerationError(
+            "Markdown support requires the 'Markdown' package to be installed."
+        ) from exc
+
+    markdown_text = await _replace_mermaid_blocks(markdown_text)
+    markdown_text = _replace_markdown_asset_refs(markdown_text, assets)
+    return markdown_lib.markdown(
+        markdown_text,
+        extensions=["fenced_code", "tables", "toc"],
+        output_format="html5",
+    )
+
+
+async def _replace_mermaid_blocks(markdown_text: str) -> str:
+    matches = list(_MERMAID_BLOCK_RE.finditer(markdown_text))
+    if not matches:
+        return markdown_text
+    if shutil.which("mmdc") is None:
+        raise DocumentGenerationError("Mermaid rendering requires the 'mmdc' CLI on the executor.")
+    rendered = markdown_text
+    for match in reversed(matches):
+        svg = await _render_mermaid_svg(match.group(1).strip())
+        data_url = _to_data_url(svg.encode("utf-8"), "image/svg+xml")
+        rendered = rendered[: match.start()] + f"![]({data_url})" + rendered[match.end() :]
+    return rendered
+
+
+async def _render_mermaid_svg(diagram: str) -> str:
+    with tempfile.TemporaryDirectory(prefix="cognis-mermaid-") as tmpdir:
+        tmp = Path(tmpdir)
+        src = tmp / "diagram.mmd"
+        out = tmp / "diagram.svg"
+        src.write_text(diagram, encoding="utf-8")
+        proc = await asyncio.create_subprocess_exec(
+            "mmdc",
+            "-i",
+            str(src),
+            "-o",
+            str(out),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0 or not out.exists():
+            detail = (stderr or stdout).decode("utf-8", errors="replace").strip()
+            raise DocumentGenerationError(f"Mermaid render failed: {detail or 'unknown error'}")
+        return out.read_text(encoding="utf-8")
+
+
+def _replace_markdown_asset_refs(
+    markdown_text: str,
+    assets: dict[str, dict[str, str]],
+) -> str:
+    def repl(match: re.Match[str]) -> str:
+        name = match.group("name")
+        asset = assets.get(name)
+        if asset is None:
+            raise DocumentGenerationError(f"Unknown asset reference: {name}")
+        alt = match.group("alt") or asset.get("alt") or name
+        return f"![{alt}]({asset['data_url']})"
+
+    return _MARKDOWN_IMAGE_ASSET_RE.sub(repl, markdown_text)
+
+
+def _replace_html_asset_refs(html_text: str, assets: dict[str, dict[str, str]]) -> str:
+    rendered = html_text
+    for name, asset in assets.items():
+        rendered = rendered.replace(f'src="asset:{name}"', f'src="{asset["data_url"]}"')
+        rendered = rendered.replace(f"src='asset:{name}'", f"src='{asset['data_url']}'")
+    unresolved = re.findall(r"asset:([A-Za-z0-9_.-]+)", rendered)
+    if unresolved:
+        raise DocumentGenerationError(f"Unknown asset reference: {unresolved[0]}")
+    return rendered
+
+
+def _compose_css(*, template: str, page_size: str, orientation: str) -> str:
+    size = f"{page_size} {orientation}"
+    base = (
+        f"@page {{ size: {size}; margin: 18mm; }}\n"
+        "body { font-family: Inter, Arial, sans-serif; color: #111827; line-height: 1.5; }\n"
+        "h1, h2, h3 { color: #0f172a; }\n"
+        "code, pre { font-family: ui-monospace, SFMono-Regular, monospace; }\n"
+        "pre { background: #0f172a; color: #e5e7eb; padding: 12px; border-radius: 8px; overflow: hidden; }\n"
+        "table { border-collapse: collapse; width: 100%; }\n"
+        "th, td { border: 1px solid #cbd5e1; padding: 6px 8px; vertical-align: top; }\n"
+        "img { max-width: 100%; height: auto; }\n"
+        "blockquote { border-left: 4px solid #94a3b8; margin: 1rem 0; padding-left: 1rem; color: #334155; }\n"
+    )
+    if template == "design_spec":
+        return (
+            base + "h1 { font-size: 30px; border-bottom: 2px solid #0ea5e9; padding-bottom: 8px; }"
+        )
+    if template == "report":
+        return base + "h1 { font-size: 28px; } h2 { margin-top: 1.8rem; }"
+    return base
+
+
+async def _render_pdf(*, title: str, html_body: str, css: str, base_dir: str | None) -> bytes:
+    try:
+        from weasyprint import CSS, HTML
+    except ImportError as exc:
+        raise DocumentGenerationError(
+            "PDF generation requires WeasyPrint to be installed on the executor."
+        ) from exc
+    document_html = (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        f"<title>{html.escape(title)}</title></head><body>{html_body}</body></html>"
+    )
+    kwargs: dict[str, Any] = {"string": document_html}
+    if base_dir:
+        kwargs["base_url"] = Path(base_dir).as_uri()
+    return HTML(**kwargs).write_pdf(stylesheets=[CSS(string=css)])
+
+
+def _to_data_url(content: bytes, mime_type: str) -> str:
+    encoded = base64.b64encode(content).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
+
+
+def _derive_title(source_text: str) -> str | None:
+    first_line = next(
+        (line.strip().lstrip("# ") for line in source_text.splitlines() if line.strip()), ""
+    )
+    return first_line[:120] or None
+
+
+def _output_filename(raw_filename: Any, title: str) -> str:
+    if isinstance(raw_filename, str) and raw_filename.strip():
+        filename = raw_filename.strip()
+    else:
+        slug = re.sub(r"[^A-Za-z0-9._-]+", "-", title.strip().lower()).strip("-") or "document"
+        filename = f"{slug}.pdf"
+    if not filename.lower().endswith(".pdf"):
+        filename += ".pdf"
+    return filename

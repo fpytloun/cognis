@@ -130,6 +130,7 @@ class _QueuedMessage:
     channel_deliverable: bool = False
     delivery_id: str | None = None
     delivery_fallback_text: str | None = None
+    outbound_attachments: list[dict[str, Any]] | None = None
 
 
 class SessionCreationFailedError(Exception):
@@ -296,6 +297,7 @@ class TurnScheduler:
         *,
         user_email: str,
         attachments: list[dict[str, Any]] | None = None,
+        outbound_attachments: list[dict[str, Any]] | None = None,
         system_initiated: bool = False,
         channel_deliverable: bool = False,
         delivery_id: str | None = None,
@@ -392,6 +394,7 @@ class TurnScheduler:
                         attachments=[
                             item.model_dump(mode="json") for item in normalized_attachments
                         ],
+                        outbound_attachments=outbound_attachments,
                         channel_deliverable=channel_deliverable,
                         delivery_id=delivery_id,
                         delivery_fallback_text=delivery_fallback_text,
@@ -440,6 +443,7 @@ class TurnScheduler:
                     content=effective_content,
                     user_email=user_email,
                     attachments=[item.model_dump(mode="json") for item in normalized_attachments],
+                    outbound_attachments=outbound_attachments,
                     system_initiated=system_initiated,
                     channel_deliverable=channel_deliverable,
                     delivery_id=delivery_id,
@@ -460,6 +464,7 @@ class TurnScheduler:
             content=effective_content,
             user_email=user_email,
             attachments=normalized_attachments,
+            outbound_attachments=outbound_attachments,
             attachment_notice=attachment_notice,
             system_initiated=system_initiated,
             channel_deliverable=channel_deliverable,
@@ -553,6 +558,12 @@ class TurnScheduler:
             conversation_id,
             prompt,
             user_email=row.user_email,
+            attachments=event.data.get("attachments")
+            if isinstance(event.data.get("attachments"), list)
+            else None,
+            outbound_attachments=event.data.get("attachments")
+            if isinstance(event.data.get("attachments"), list)
+            else None,
             system_initiated=True,
             channel_deliverable=bool(event.data.get("channel_deliverable")),
             delivery_id=event.data.get("delivery_id")
@@ -614,7 +625,7 @@ class TurnScheduler:
                         message="Attachment access denied",
                         recoverable=False,
                     )
-                url = await self._artifact_store.async_get_signed_url(
+                url = await self._artifact_store.async_get_public_url(
                     row.namespace,
                     row.object_id,
                     row.filename,
@@ -677,6 +688,7 @@ class TurnScheduler:
         content: str,
         user_email: str,
         attachments: list[AttachmentRef] | None = None,
+        outbound_attachments: list[dict[str, Any]] | None = None,
         attachment_notice: str | None = None,
         system_initiated: bool = False,
         channel_deliverable: bool = False,
@@ -699,6 +711,7 @@ class TurnScheduler:
                 content=content,
                 user_email=user_email,
                 attachments=attachments,
+                outbound_attachments=outbound_attachments,
                 attachment_notice=attachment_notice,
                 system_initiated=system_initiated,
                 channel_deliverable=channel_deliverable,
@@ -718,6 +731,7 @@ class TurnScheduler:
         content: str,
         user_email: str,
         attachments: list[AttachmentRef] | None,
+        outbound_attachments: list[dict[str, Any]] | None,
         attachment_notice: str | None,
         system_initiated: bool,
         channel_deliverable: bool,
@@ -825,6 +839,7 @@ class TurnScheduler:
                     channel_deliverable=channel_deliverable,
                     delivery_id=delivery_id,
                     delivery_fallback_text=delivery_fallback_text,
+                    attachments=outbound_attachments,
                 )
                 await self._publish_turn_completed(result)
                 TURNS_TOTAL.labels(outcome="delegated").inc()
@@ -894,7 +909,11 @@ class TurnScheduler:
                 channel_deliverable=channel_deliverable,
                 delivery_id=delivery_id,
                 delivery_fallback_text=delivery_fallback_text,
-                attachments=step_output.attachments if step_output else None,
+                attachments=[
+                    *(step_output.attachments if step_output else []),
+                    *(outbound_attachments or []),
+                ]
+                or None,
             )
             await self._publish_turn_completed(result)
             TURNS_TOTAL.labels(outcome="completed").inc()
@@ -968,6 +987,7 @@ class TurnScheduler:
                         queued.content,
                         user_email=queued.user_email,
                         attachments=queued.attachments,
+                        outbound_attachments=queued.outbound_attachments,
                         system_initiated=queued.system_initiated,
                         channel_deliverable=queued.channel_deliverable,
                         delivery_id=queued.delivery_id,
@@ -1065,6 +1085,7 @@ class TurnScheduler:
                     "delivery_id": result.delivery_id,
                     "delivery_fallback_text": result.delivery_fallback_text,
                     "final_content": result.final_content,
+                    "attachments": result.attachments,
                 },
             )
         )

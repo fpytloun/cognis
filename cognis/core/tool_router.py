@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 from dataclasses import dataclass
 from enum import StrEnum
@@ -16,9 +17,10 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from cognis.core.truncation import middle_truncate
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
+from cognis.models.artifact import ArtifactKind
 from cognis.models.session import SessionModel
 from cognis.models.tool import ExecutorHandle, Permission, ToolCall, ToolResult, stable_tool_id
-from cognis.store.queries import get_setting_value
+from cognis.store.queries import create_artifact_record, get_artifact_record, get_setting_value
 from cognis.tools.argument_normalization import strip_empty_optional_values
 from cognis.tools.builtin.image import handle_image_tool, is_image_tool
 from cognis.tools.builtin.memory import handle_memory_tool, is_memory_tool
@@ -238,6 +240,8 @@ class ToolRouter:
             },
         )
         TOOL_ROUTE_DECISIONS.labels(route=str(route)).inc()
+        if route is ToolRoute.LOCAL:
+            tool_call = await self._prepare_local_tool_call(tool_call, session)
         if route is ToolRoute.UNKNOWN:
             TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome="unknown").inc()
             return self._sanitize_result(
@@ -455,6 +459,7 @@ class ToolRouter:
                 registered_tool=registered_tool,
                 executor=executor,
             )
+            result = await self._materialize_inline_attachments(result, session, tool_call.name)
             if result.metadata is None:
                 result = result.model_copy(update={"metadata": {"evaluation": eval_meta}})
             else:
@@ -477,6 +482,7 @@ class ToolRouter:
                 ),
                 timeout=registered_tool.definition.timeout_seconds,
             )
+            result = await self._materialize_inline_attachments(result, session, tool_call.name)
         except TimeoutError:
             await executor.cancel_call(tool_call.call_id)
             result = ToolResult(output="Tool execution timed out.", is_error=True)
@@ -546,6 +552,135 @@ class ToolRouter:
             output = str(result)
         return ToolResult(output=output, duration_ms=duration_ms)
 
+    async def _prepare_local_tool_call(
+        self, tool_call: ToolCall, session: SessionModel
+    ) -> ToolCall:
+        if tool_call.name != "document_generate":
+            return tool_call
+        arguments = dict(tool_call.arguments)
+        if artifact_id := arguments.get("source_artifact_id"):
+            arguments["source_artifact_content"] = await self._load_text_artifact(
+                str(artifact_id), session.user_email
+            )
+        assets = arguments.get("assets")
+        if isinstance(assets, list):
+            resolved_assets: list[dict[str, Any]] = []
+            for raw in assets:
+                if not isinstance(raw, dict):
+                    continue
+                item = dict(raw)
+                if artifact_id := item.get("artifact_id"):
+                    item.setdefault(
+                        "url",
+                        await self._resolve_public_artifact_url(
+                            str(artifact_id), session.user_email
+                        ),
+                    )
+                resolved_assets.append(item)
+            arguments["assets"] = resolved_assets
+        return tool_call.model_copy(update={"arguments": arguments})
+
+    async def _load_text_artifact(self, artifact_id: str, user_email: str) -> str:
+        if self._session_factory is None or self.artifact_store is None:
+            raise ValueError("Artifact support not available")
+        async with self._session_factory() as db_session:
+            row = await get_artifact_record(db_session, artifact_id)
+        if row is None or row.status == "deleted":
+            raise ValueError(f"Artifact not found: {artifact_id}")
+        if row.owner_email and row.owner_email != user_email:
+            raise ValueError(f"Artifact access denied: {artifact_id}")
+        content, _content_type = await self.artifact_store.async_load(
+            row.namespace, row.object_id, row.filename
+        )
+        return content.decode("utf-8", errors="replace")
+
+    async def _resolve_public_artifact_url(self, artifact_id: str, user_email: str) -> str:
+        if self._session_factory is None or self.artifact_store is None:
+            raise ValueError("Artifact support not available")
+        async with self._session_factory() as db_session:
+            row = await get_artifact_record(db_session, artifact_id)
+        if row is None or row.status == "deleted":
+            raise ValueError(f"Artifact not found: {artifact_id}")
+        if row.owner_email and row.owner_email != user_email:
+            raise ValueError(f"Artifact access denied: {artifact_id}")
+        return await self.artifact_store.async_get_public_url(
+            row.namespace, row.object_id, row.filename
+        )
+
+    async def _materialize_inline_attachments(
+        self,
+        result: ToolResult,
+        session: SessionModel,
+        tool_name: str,
+    ) -> ToolResult:
+        if not result.attachments or self.artifact_store is None or self._session_factory is None:
+            return result
+        changed = False
+        materialized: list[dict[str, Any]] = []
+        for raw in result.attachments:
+            if not isinstance(raw, dict) or "content_b64" not in raw or raw.get("artifact_id"):
+                materialized.append(raw)
+                continue
+            changed = True
+            materialized.append(await self._persist_inline_attachment(raw, session, tool_name))
+        if not changed:
+            return result
+        return result.model_copy(update={"attachments": materialized})
+
+    async def _persist_inline_attachment(
+        self,
+        raw: dict[str, Any],
+        session: SessionModel,
+        tool_name: str,
+    ) -> dict[str, Any]:
+        if self.artifact_store is None or self._session_factory is None:
+            raise ValueError("Artifact support not available")
+        content_b64 = raw.get("content_b64")
+        if not isinstance(content_b64, str):
+            raise ValueError("Inline attachment missing content_b64")
+        content = base64.b64decode(content_b64)
+        mime_type = str(raw.get("mime_type") or "application/octet-stream")
+        filename = str(raw.get("filename") or "attachment")
+        kind = _kind_for_mime_type(mime_type)
+        artifact_id = self.artifact_store.generate_id("doc" if kind is ArtifactKind.PDF else "att")
+        namespace = "documents" if kind is ArtifactKind.PDF else "attachments"
+        await self.artifact_store.async_save(
+            namespace,
+            artifact_id,
+            filename,
+            content,
+            mime_type,
+            owner_email=session.user_email,
+        )
+        async with self._session_factory() as db_session:
+            await create_artifact_record(
+                db_session,
+                artifact_id=artifact_id,
+                namespace=namespace,
+                object_id=artifact_id,
+                filename=filename,
+                owner_email=session.user_email,
+                purpose=str(raw.get("purpose") or tool_name),
+                kind=kind.value,
+                mime_type=mime_type,
+                size_bytes=len(content),
+                status="attached",
+                expires_at=None,
+                conversation_id=session.conversation_id,
+                session_id=session.session_id,
+                message_role="assistant",
+            )
+            await db_session.commit()
+        url = await self.artifact_store.async_get_public_url(namespace, artifact_id, filename)
+        return {
+            "artifact_id": artifact_id,
+            "url": url,
+            "mime_type": mime_type,
+            "filename": filename,
+            "size_bytes": len(content),
+            "kind": kind.value,
+        }
+
     def _is_non_bypassable(self, tool_name: str, explicit_flag: bool) -> bool:
         if explicit_flag:
             return True
@@ -608,3 +743,15 @@ def _tool_max_size(registry: ToolRegistry, tool_name: str) -> int:
     if registered_tool is None:
         return 50_000
     return registered_tool.definition.max_result_size
+
+
+def _kind_for_mime_type(mime_type: str) -> ArtifactKind:
+    if mime_type.startswith("image/"):
+        return ArtifactKind.IMAGE
+    if mime_type.startswith("audio/"):
+        return ArtifactKind.AUDIO
+    if mime_type.startswith("video/"):
+        return ArtifactKind.VIDEO
+    if mime_type == "application/pdf":
+        return ArtifactKind.PDF
+    return ArtifactKind.FILE

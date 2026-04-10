@@ -83,6 +83,7 @@ async def test_turn_completed_event_uses_delivery_outbox() -> None:
         delivery_id="cdel_1",
         final_content="Done.",
         fallback_text="fallback",
+        attachments=None,
         ignore_next_attempt=True,
     )
 
