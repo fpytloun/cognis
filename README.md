@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="files/banner.jpg" alt="cognis banner" />
+</p>
+
 # cognis
 
 Decoupled control plane for AI agents. Cognis is the controller and orchestration layer of the Openclaw ecosystem -- it manages agent definitions, interactive chat, delegated sub-sessions, tool execution routing, and integrates with external memory and guardrails services.
