@@ -528,3 +528,51 @@ async def test_tool_router_prepares_document_artifact_assets(
     assert asset["filename"] == "diagram.png"
     assert asset["mime_type"] == "image/png"
     assert base64.b64decode(asset["content_b64"]) == b"image-bytes"
+
+
+@pytest.mark.asyncio
+async def test_tool_router_enriches_already_materialized_attachment_output() -> None:
+    artifact_store = _ArtifactStore()
+    router = ToolRouter(
+        guardrails=_Guardrails(),
+        artifact_store=artifact_store,
+        session_factory=_session_factory(),
+    )
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="artifact_publish",
+                description="artifact",
+                parameters={"type": "object", "properties": {}},
+                source=ToolSource(type="executor"),
+                timeout_seconds=1,
+            )
+        )
+    )
+
+    result = await router.execute(
+        ToolCall(call_id="8", name="artifact_publish", arguments={"path": "/tmp/x"}),
+        _session(),
+        _agent(),
+        registry,
+        _RemoteExecutor(
+            ToolResult(
+                output='{"images": [], "model": "test"}',
+                attachments=[
+                    {
+                        "artifact_id": "img_1",
+                        "url": "https://cognis.example.com/images/img_1/image",
+                        "mime_type": "image/jpeg",
+                        "filename": "img_1.jpg",
+                        "size_bytes": 12,
+                    }
+                ],
+            )
+        ),
+    )
+
+    assert result.metadata is not None
+    raw_output = result.metadata["_raw_output"]
+    assert '"artifact_id": "img_1"' in raw_output
+    assert '"mime_type": "image/jpeg"' in raw_output

@@ -627,9 +627,9 @@ class ToolRouter:
                 continue
             changed = True
             materialized.append(await self._persist_inline_attachment(raw, session, tool_name))
-        if not changed:
-            return result
         enriched_output = self._enrich_attachment_output(result.output, materialized)
+        if not changed and enriched_output == result.output:
+            return result
         return result.model_copy(update={"attachments": materialized, "output": enriched_output})
 
     async def _persist_inline_attachment(

@@ -146,7 +146,7 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
     }
 
     if (event.type === 'assistant_message') {
-      if (content.trim()) {
+      if (content.trim() || attachments.length > 0) {
         items.push(
           createMessageItem(`event:${eid}:assistant`, 'assistant', content, event.timestamp, event.seq, undefined, false, attachments)
         );

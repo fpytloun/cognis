@@ -493,16 +493,21 @@ class WebSocketConnectionManager:
             data = item.get("data", {})
             if event_type == "assistant_message":
                 message_id = f"replay_{item.get('seq', uuid.uuid4().hex)}"
-                await connection.send_json(
-                    {
-                        "type": "chunk",
-                        "conversation_id": conversation_id,
-                        "session_id": session.session_id,
-                        "message_id": message_id,
-                        "content": str(data.get("content", "")),
-                        "index": 0,
-                    }
+                content = str(data.get("content", ""))
+                attachments = (
+                    data.get("attachments") if isinstance(data.get("attachments"), list) else []
                 )
+                if content:
+                    await connection.send_json(
+                        {
+                            "type": "chunk",
+                            "conversation_id": conversation_id,
+                            "session_id": session.session_id,
+                            "message_id": message_id,
+                            "content": content,
+                            "index": 0,
+                        }
+                    )
                 await connection.send_json(
                     {
                         "type": "message_complete",
@@ -512,6 +517,7 @@ class WebSocketConnectionManager:
                         "seq": item.get("seq", 0),
                         "token_usage": None,
                         "queued_count": 0,
+                        "attachments": attachments,
                     }
                 )
                 replayed += 1

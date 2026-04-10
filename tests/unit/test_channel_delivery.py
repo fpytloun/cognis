@@ -28,6 +28,14 @@ class _Manager:
         self._artifact_store = _ArtifactStore()
 
 
+class _Session:
+    async def commit(self) -> None:
+        return None
+
+    async def rollback(self) -> None:
+        return None
+
+
 def test_render_escalation_notification_includes_required_details() -> None:
     service = _make_service()
 
@@ -164,6 +172,68 @@ async def test_turn_error_event_uses_fallback_outbox_delivery() -> None:
         fallback_text="fallback",
         ignore_next_attempt=True,
     )
+
+
+@pytest.mark.asyncio
+async def test_deliver_outbox_sends_attachment_only_follow_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    @asynccontextmanager
+    async def session_factory() -> object:
+        yield _Session()
+
+    service = ChannelDeliveryService(
+        session_factory=session_factory,
+        event_bus=EventBus(),
+        channel_manager_ref=lambda: _Manager(),
+    )
+    sent: dict[str, object] = {}
+
+    async def fake_send_to_route(**kwargs: object) -> str:
+        sent.update(kwargs)
+        return "sent"
+
+    monkeypatch.setattr(service, "_send_to_route", fake_send_to_route)
+    monkeypatch.setattr(
+        "cognis.store.queries.claim_channel_delivery_outbox",
+        AsyncMock(
+            return_value=type(
+                "OutboxRow",
+                (),
+                {
+                    "channel_type": "signal",
+                    "account_id": "acct-1",
+                    "chat_id": "chat-1",
+                    "thread_id": None,
+                    "conversation_id": "conv-1",
+                },
+            )()
+        ),
+    )
+    monkeypatch.setattr(
+        "cognis.store.queries.mark_channel_delivery_sent", AsyncMock(return_value=True)
+    )
+    monkeypatch.setattr("cognis.store.queries.mark_channel_delivery_failed", AsyncMock())
+    monkeypatch.setattr("cognis.store.queries.mark_channel_delivery_uncertain", AsyncMock())
+
+    await service._deliver_outbox(  # noqa: SLF001
+        delivery_id="cdel_3",
+        final_content=None,
+        fallback_text=None,
+        attachments=[
+            {
+                "artifact_id": "img_1",
+                "url": "https://cognis.example.com/image.jpg",
+                "mime_type": "image/jpeg",
+                "filename": "image.jpg",
+                "size_bytes": 12,
+            }
+        ],
+        ignore_next_attempt=True,
+    )
+
+    assert sent["content"] == ""
+    assert sent["media"] is not None
 
 
 @pytest.mark.asyncio

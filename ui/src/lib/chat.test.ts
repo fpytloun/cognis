@@ -99,6 +99,36 @@ describe('chat timeline helpers', () => {
     });
   });
 
+  it('keeps attachment-only assistant messages in normalized history', () => {
+    const items = normalizeHistory([
+      {
+        seq: 4,
+        type: 'assistant_message',
+        data: {
+          content: '',
+          attachments: [
+            {
+              artifact_id: 'img_2',
+              kind: 'image',
+              mime_type: 'image/jpeg',
+              filename: 'generated.jpg',
+              size_bytes: 321,
+              url: 'https://cognis.example.com/generated.jpg'
+            }
+          ]
+        },
+        timestamp: '2026-04-09T00:00:00Z'
+      }
+    ]);
+
+    expect(items[0]).toMatchObject({
+      kind: 'message',
+      role: 'assistant',
+      content: '',
+      attachments: [{ artifact_id: 'img_2', filename: 'generated.jpg' }]
+    });
+  });
+
   it('renders direct-chat clarification notices without task wording', () => {
     const items = applyWebSocketEvent([], {
       type: 'workflow_step_question',

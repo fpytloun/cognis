@@ -1539,7 +1539,7 @@ class AgentLoop:
                 # record a lifecycle event so the failure appears as a system
                 # message in the UI, not as assistant text.
                 partial_content = accumulator.get_content()
-                if partial_content:
+                if partial_content or collected_attachments:
                     events_to_record.append(
                         SessionEvent(
                             type="assistant_message",
@@ -1592,7 +1592,7 @@ class AgentLoop:
                     tc.name = mapped_name
 
             # Record assistant message
-            if content:
+            if content or collected_attachments:
                 events_to_record.append(
                     SessionEvent(
                         type="assistant_message",
@@ -1602,8 +1602,9 @@ class AgentLoop:
                         },
                     )
                 )
-                messages.append({"role": "assistant", "content": content})
-                assistant_content_parts.append(content)
+                if content:
+                    messages.append({"role": "assistant", "content": content})
+                    assistant_content_parts.append(content)
 
             # No tool calls — check if step is complete
             if not tool_calls:

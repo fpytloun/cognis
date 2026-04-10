@@ -554,8 +554,8 @@ class ChannelDeliveryService:
         if row is None:
             return
 
-        content = final_content or fallback_text
-        if not content:
+        content = final_content or fallback_text or ""
+        if not content and not attachments:
             async with self._session_factory() as session:
                 await mark_channel_delivery_sent(
                     session,
