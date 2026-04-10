@@ -682,6 +682,7 @@ class ToolRouter:
             "filename": filename,
             "size_bytes": len(content),
             "kind": kind.value,
+            "content_b64": content_b64,
         }
 
     def _is_non_bypassable(self, tool_name: str, explicit_flag: bool) -> bool:

@@ -132,6 +132,15 @@ def _truncate_tool_data(text: str) -> str:
     return text[:_MAX_TOOL_DATA_BYTES] + f"\n... (truncated, {len(text)} bytes total)"
 
 
+def _event_safe_attachments(attachments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    safe: list[dict[str, Any]] = []
+    for attachment in attachments:
+        if not isinstance(attachment, dict):
+            continue
+        safe.append({k: v for k, v in attachment.items() if k != "content_b64"})
+    return safe
+
+
 def _find_gate_revise_action(pause: PendingPause) -> str | None:
     """Extract the ``revise(step_name)`` action from a gate's options.
 
@@ -1532,7 +1541,13 @@ class AgentLoop:
                 partial_content = accumulator.get_content()
                 if partial_content:
                     events_to_record.append(
-                        SessionEvent(type="assistant_message", data={"content": partial_content})
+                        SessionEvent(
+                            type="assistant_message",
+                            data={
+                                "content": partial_content,
+                                "attachments": _event_safe_attachments(collected_attachments),
+                            },
+                        )
                     )
                     assistant_content_parts.append(partial_content)
 
@@ -1579,7 +1594,13 @@ class AgentLoop:
             # Record assistant message
             if content:
                 events_to_record.append(
-                    SessionEvent(type="assistant_message", data={"content": content})
+                    SessionEvent(
+                        type="assistant_message",
+                        data={
+                            "content": content,
+                            "attachments": _event_safe_attachments(collected_attachments),
+                        },
+                    )
                 )
                 messages.append({"role": "assistant", "content": content})
                 assistant_content_parts.append(content)

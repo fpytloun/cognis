@@ -226,6 +226,11 @@ class WebSocketTurnObserver:
             "token_usage": None,
             "context_usage": result.context_usage,
             "queued_count": 0,
+            "attachments": [
+                {k: v for k, v in attachment.items() if k != "content_b64"}
+                for attachment in (result.attachments or [])
+                if isinstance(attachment, dict)
+            ],
         }
         if result.delegated:
             payload["delegated"] = True

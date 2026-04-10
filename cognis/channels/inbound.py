@@ -809,6 +809,7 @@ class ChannelTurnObserver:
                                 mime_type=att.get("mime_type"),
                                 filename=att.get("filename"),
                                 size_bytes=att.get("size_bytes"),
+                                content_b64=att.get("content_b64"),
                             )
                         )
 

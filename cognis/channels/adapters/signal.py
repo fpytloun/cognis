@@ -503,6 +503,9 @@ class SignalAdapter(BaseChannelAdapter):
         if message.media:
             b64_attachments: list[str] = []
             for media in message.media:
+                if media.content_b64:
+                    b64_attachments.append(media.content_b64)
+                    continue
                 if not media.url:
                     continue
                 try:
@@ -547,6 +550,21 @@ class SignalAdapter(BaseChannelAdapter):
         if message.media:
             attachments: list[str] = []
             for media in message.media:
+                if media.content_b64:
+                    try:
+                        if self._temp_dir:
+                            import uuid
+
+                            fname = Path(self._temp_dir.name) / f"out-{uuid.uuid4().hex}"
+                            await asyncio.to_thread(
+                                fname.write_bytes,
+                                base64.b64decode(media.content_b64),
+                            )
+                            attachments.append(str(fname))
+                            temp_files.append(fname)
+                        continue
+                    except Exception:
+                        logger.warning("signal adapter: inline media decode failed", exc_info=True)
                 if not media.url:
                     continue
                 try:

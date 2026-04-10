@@ -506,10 +506,12 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
     const index = next.findIndex((item) => item.id === itemId && item.kind === 'message');
     if (index >= 0) {
       const message = next[index] as MessageTimelineItem;
+      const attachments = Array.isArray(event.attachments) ? event.attachments : message.attachments;
       next[index] = {
         ...message,
         seq: event.seq,
-        streaming: false
+        streaming: false,
+        attachments
       };
       return next;
     }

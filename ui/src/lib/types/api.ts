@@ -970,6 +970,7 @@ export interface WebSocketMessageCompleteEvent {
   token_usage: Record<string, unknown> | null;
   context_usage: ContextUsage | null;
   queued_count: number;
+  attachments?: AttachmentRef[];
 }
 
 export interface WebSocketToolCallEvent {

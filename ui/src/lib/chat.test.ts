@@ -30,11 +30,32 @@ describe('chat timeline helpers', () => {
       seq: 2,
       token_usage: null,
       context_usage: null,
-      queued_count: 0
+      queued_count: 0,
+      attachments: [
+        {
+          artifact_id: 'art_1',
+          kind: 'pdf',
+          mime_type: 'application/pdf',
+          filename: 'report.pdf',
+          size_bytes: 123,
+          url: 'https://cognis.example.com/report.pdf'
+        }
+      ]
     });
 
     expect(completed[0]).toMatchObject({ kind: 'message', role: 'user', content: 'hello' });
-    expect(completed[1]).toMatchObject({ kind: 'message', role: 'assistant', content: 'Hi', seq: 2 });
+    expect(completed[1]).toMatchObject({
+      kind: 'message',
+      role: 'assistant',
+      content: 'Hi',
+      seq: 2,
+      attachments: [
+        {
+          artifact_id: 'art_1',
+          filename: 'report.pdf'
+        }
+      ]
+    });
   });
 
   it('handles workflow failure payloads that omit conversation_id', () => {

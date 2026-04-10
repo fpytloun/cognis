@@ -630,4 +630,5 @@ def _to_media_attachment(raw: dict[str, Any]) -> MediaAttachment:
         mime_type=raw.get("mime_type") if isinstance(raw.get("mime_type"), str) else None,
         filename=raw.get("filename") if isinstance(raw.get("filename"), str) else None,
         size_bytes=raw.get("size_bytes") if isinstance(raw.get("size_bytes"), int) else None,
+        content_b64=raw.get("content_b64") if isinstance(raw.get("content_b64"), str) else None,
     )

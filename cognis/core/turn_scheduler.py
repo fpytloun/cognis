@@ -82,6 +82,17 @@ def _effective_user_content(content: str, attachments: list[AttachmentRef]) -> s
     return "User attached files."
 
 
+def _event_safe_attachments(attachments: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    if not attachments:
+        return []
+    safe: list[dict[str, Any]] = []
+    for attachment in attachments:
+        if not isinstance(attachment, dict):
+            continue
+        safe.append({k: v for k, v in attachment.items() if k != "content_b64"})
+    return safe
+
+
 # ---------------------------------------------------------------------------
 # Data types
 # ---------------------------------------------------------------------------
@@ -1086,7 +1097,7 @@ class TurnScheduler:
                     "delivery_id": result.delivery_id,
                     "delivery_fallback_text": result.delivery_fallback_text,
                     "final_content": result.final_content,
-                    "attachments": result.attachments,
+                    "attachments": _event_safe_attachments(result.attachments),
                 },
             )
         )

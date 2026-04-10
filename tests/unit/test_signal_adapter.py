@@ -6,7 +6,7 @@ import asyncio
 import base64
 import json
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -834,6 +834,48 @@ class TestDirectSendBehavior:
         called_params = mock_runtime.request.await_args.args[1]
         assert called_params["message"] == "Heading\n\nBold and code"
         assert called_params["textStyle"] == ["0:7:BOLD", "9:4:BOLD", "18:4:MONOSPACE"]
+
+    @pytest.mark.asyncio
+    async def test_direct_send_uses_inline_media_without_download(self) -> None:
+        adapter = SignalAdapter()
+        adapter._signal_config = _SignalConfig(
+            {"transport": "direct_jsonrpc"},
+            {"account_number": "+1"},
+        )
+        adapter._account_number = "+1"
+
+        mock_runtime = MagicMock()
+        mock_runtime.is_running = True
+        mock_runtime.single_account_mode = True
+        mock_runtime.request = AsyncMock(return_value={"timestamp": 12345})
+        adapter._runtime = mock_runtime
+
+        class _TempDir:
+            name = "/tmp"
+
+        adapter._temp_dir = _TempDir()
+
+        message = OutboundMessage(
+            channel_type="signal",
+            account_id="acct-1",
+            chat_id="+420111222333",
+            content="",
+            media=[
+                MediaAttachment(
+                    filename="report.pdf",
+                    mime_type="application/pdf",
+                    content_b64="JVBERi0x",
+                )
+            ],
+        )
+
+        with patch("asyncio.to_thread", new=AsyncMock(return_value=None)) as to_thread:
+            result = await adapter.send_message(message)
+
+        assert result == "12345"
+        called_params = mock_runtime.request.await_args.args[1]
+        assert "attachment" in called_params
+        to_thread.assert_awaited()
 
 
 class TestRestSendBehavior:

@@ -150,6 +150,7 @@ class MediaAttachment(BaseModel):
     mime_type: str | None = None
     filename: str | None = None
     size_bytes: int | None = None
+    content_b64: str | None = None
 
 
 class InboundMessage(BaseModel):
