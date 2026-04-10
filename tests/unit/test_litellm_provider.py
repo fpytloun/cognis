@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from cognis.models.config import DEFAULT_MODEL_INFO
@@ -119,6 +121,54 @@ async def test_litellm_provider_image_generate_keeps_response_format_for_other_m
     await provider.image_generate(prompt="draw", model="dall-e-3")
 
     assert captured["response_format"] == "b64_json"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_litellm_provider_transcribe_routes_to_executor(tmp_path: object) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="exec-openai",
+                display_name="Executor OpenAI",
+                location="executor",
+                backend="litellm",
+                config={
+                    "preset": "openai",
+                    "default_model": "gpt-4o-mini",
+                    "executor_labels": {"location": "local"},
+                },
+                status="active",
+            )
+        )
+        session.add(
+            ModelRouting(
+                task_type="speech_to_text",
+                provider_id="exec-openai",
+                model="gpt-4o-mini-transcribe",
+            )
+        )
+        await session.commit()
+
+    captured: dict[str, object] = {}
+
+    class _Router:
+        async def route_transcribe(self, **kwargs: object):
+            captured.update(kwargs)
+            return SimpleNamespace(text="hello", model="gpt-4o-mini-transcribe")
+
+    provider = LiteLLMProvider(session_factory, inference_router=_Router())
+
+    result = await provider.transcribe(
+        b"audio-bytes",
+        mime_type="audio/ogg",
+        filename="voice.ogg",
+    )
+
+    assert result.text == "hello"
+    assert captured["model"] == "gpt-4o-mini-transcribe"
+    assert captured["executor_labels"] == {"location": "local"}
     await engine.dispose()
 
 

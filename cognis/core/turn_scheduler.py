@@ -68,6 +68,20 @@ DEFAULT_TURN_LIMIT = 3
 _MAX_DEFERRED_LOCKS = 200
 
 
+def _effective_user_content(content: str, attachments: list[AttachmentRef]) -> str:
+    if content.strip():
+        return content
+    if not attachments:
+        return content
+    kinds = {attachment.kind for attachment in attachments}
+    if kinds == {ArtifactKind.AUDIO} and len(attachments) == 1:
+        return "User attached an audio file."
+    if len(attachments) == 1:
+        kind = next(iter(kinds))
+        return f"User attached a {kind.value} file."
+    return "User attached files."
+
+
 # ---------------------------------------------------------------------------
 # Data types
 # ---------------------------------------------------------------------------
@@ -304,10 +318,14 @@ class TurnScheduler:
         if attachment_error is not None:
             return attachment_error
 
+        effective_content = _effective_user_content(content, normalized_attachments)
+
         # Load conversation runtime only after validating attachments so
         # failed first sends do not bootstrap a session unnecessarily.
         try:
-            runtime = await self._load_conversation_runtime(conversation_id, user_message=content)
+            runtime = await self._load_conversation_runtime(
+                conversation_id, user_message=effective_content
+            )
         except SessionCreationFailedError:
             return TurnError(
                 code="session_creation_failed",
@@ -369,7 +387,7 @@ class TurnScheduler:
                 # Queue the message behind the escalation
                 self._queued_messages[conversation_id].append(
                     _QueuedMessage(
-                        content=content,
+                        content=effective_content,
                         user_email=user_email,
                         attachments=[
                             item.model_dump(mode="json") for item in normalized_attachments
@@ -419,7 +437,7 @@ class TurnScheduler:
                 )
             queue.append(
                 _QueuedMessage(
-                    content=content,
+                    content=effective_content,
                     user_email=user_email,
                     attachments=[item.model_dump(mode="json") for item in normalized_attachments],
                     system_initiated=system_initiated,
@@ -439,7 +457,7 @@ class TurnScheduler:
             conversation=conversation,
             session=session,
             agent=agent,
-            content=content,
+            content=effective_content,
             user_email=user_email,
             attachments=normalized_attachments,
             attachment_notice=attachment_notice,
@@ -758,6 +776,9 @@ class TurnScheduler:
                             "conversation_id": conversation_id,
                             "session_id": session.session_id,
                             "content": content,
+                            "attachments": [
+                                item.model_dump(mode="json") for item in (attachments or [])
+                            ],
                         },
                     )
                 )

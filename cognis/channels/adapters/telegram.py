@@ -243,6 +243,7 @@ class TelegramAdapter(BaseChannelAdapter):
         text = msg.get("text", "")
         caption = msg.get("caption", "")
         content = text or caption
+        voice_input = bool(msg.get("voice"))
 
         # Extract sender info
         sender = msg.get("from", {})
@@ -329,6 +330,8 @@ class TelegramAdapter(BaseChannelAdapter):
             timestamp=datetime.fromtimestamp(msg.get("date", 0), tz=UTC),
             platform_data={"update": update},
         )
+        if voice_input:
+            message.platform_data["voice_input"] = True
 
         await self._dispatch_inbound(message)
 

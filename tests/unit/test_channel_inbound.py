@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -10,6 +11,7 @@ from cognis.channels.inbound import (
 )
 from cognis.core.commands import CommandResult
 from cognis.core.turn_scheduler import TurnResult
+from cognis.models.artifact import ArtifactKind, AttachmentRef
 from cognis.models.channel import ChannelAccountConfig, InboundMessage
 
 
@@ -25,6 +27,8 @@ class _FakeAdapter:
 class _FakeManager:
     def __init__(self, adapter: _FakeAdapter) -> None:
         self._adapter = adapter
+        self._artifact_store = MagicMock()
+        self._artifact_store.async_load = AsyncMock(return_value=(b"audio-bytes", "audio/ogg"))
 
     def get_adapter(self, account_id: str) -> _FakeAdapter:
         return self._adapter
@@ -127,6 +131,130 @@ async def test_channel_inbound_submits_normal_messages() -> None:
 
     turn_scheduler.add_observer.assert_called_once()
     turn_scheduler.submit_turn.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_channel_inbound_transcribes_voice_input_before_submit() -> None:
+    adapter = _FakeAdapter()
+    manager = _FakeManager(adapter)
+    turn_scheduler = MagicMock()
+    turn_scheduler.submit_turn = AsyncMock(return_value=None)
+    turn_scheduler.add_observer = MagicMock()
+    llm_provider = MagicMock()
+    llm_provider.transcribe = AsyncMock(
+        return_value=SimpleNamespace(text="transcribed voice message")
+    )
+
+    pipeline = InboundPipeline(
+        session_factory=MagicMock(),
+        turn_scheduler=turn_scheduler,
+        llm_provider=llm_provider,
+        session_manager=MagicMock(),
+        pairing_service=MagicMock(),
+        channel_manager_ref=lambda: manager,
+        command_dispatcher=MagicMock(),
+    )
+
+    pipeline._resolve_user = AsyncMock(return_value="user@example.com")  # type: ignore[method-assign]
+    pipeline._resolve_conversation = AsyncMock(return_value="conv-1")  # type: ignore[method-assign]
+    pipeline._normalize_media_attachments = AsyncMock(  # type: ignore[method-assign]
+        return_value=[
+            AttachmentRef(
+                artifact_id="att-1",
+                kind=ArtifactKind.AUDIO,
+                mime_type="audio/ogg",
+                filename="voice.ogg",
+                size_bytes=128,
+            )
+        ]
+    )
+    pipeline._try_command_dispatch = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+    message = InboundMessage(
+        channel_type="signal",
+        account_id="acct-1",
+        message_id="msg-1",
+        sender_id="sender-1",
+        chat_id="chat-1",
+        content="",
+        timestamp=__import__("datetime").datetime.now(__import__("datetime").UTC),
+        platform_data={"voice_input": True},
+    )
+    config = ChannelAccountConfig(
+        account_id="acct-1",
+        channel_type="signal",
+        display_name="Signal",
+        credential_refs={},
+        agent_id="agent-1",
+        user_email="user@example.com",
+    )
+
+    await pipeline.process(message, config)
+
+    llm_provider.transcribe.assert_awaited_once()
+    turn_scheduler.submit_turn.assert_awaited_once()
+    assert turn_scheduler.submit_turn.await_args.args[1] == "transcribed voice message"
+
+
+@pytest.mark.asyncio
+async def test_channel_inbound_reports_voice_transcription_errors() -> None:
+    adapter = _FakeAdapter()
+    manager = _FakeManager(adapter)
+    turn_scheduler = MagicMock()
+    turn_scheduler.submit_turn = AsyncMock(return_value=None)
+    turn_scheduler.add_observer = MagicMock()
+    llm_provider = MagicMock()
+    llm_provider.transcribe = AsyncMock(side_effect=RuntimeError("provider unavailable"))
+
+    pipeline = InboundPipeline(
+        session_factory=MagicMock(),
+        turn_scheduler=turn_scheduler,
+        llm_provider=llm_provider,
+        session_manager=MagicMock(),
+        pairing_service=MagicMock(),
+        channel_manager_ref=lambda: manager,
+        command_dispatcher=MagicMock(),
+    )
+
+    pipeline._resolve_user = AsyncMock(return_value="user@example.com")  # type: ignore[method-assign]
+    pipeline._resolve_conversation = AsyncMock(return_value="conv-1")  # type: ignore[method-assign]
+    pipeline._normalize_media_attachments = AsyncMock(  # type: ignore[method-assign]
+        return_value=[
+            AttachmentRef(
+                artifact_id="att-1",
+                kind=ArtifactKind.AUDIO,
+                mime_type="audio/ogg",
+                filename="voice.ogg",
+                size_bytes=128,
+            )
+        ]
+    )
+    pipeline._try_command_dispatch = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+    message = InboundMessage(
+        channel_type="signal",
+        account_id="acct-1",
+        message_id="msg-1",
+        sender_id="sender-1",
+        chat_id="chat-1",
+        content="",
+        timestamp=__import__("datetime").datetime.now(__import__("datetime").UTC),
+        platform_data={"voice_input": True},
+    )
+    config = ChannelAccountConfig(
+        account_id="acct-1",
+        channel_type="signal",
+        display_name="Signal",
+        credential_refs={},
+        agent_id="agent-1",
+        user_email="user@example.com",
+    )
+
+    await pipeline.process(message, config)
+
+    turn_scheduler.submit_turn.assert_not_awaited()
+    adapter.send_message.assert_awaited_once()
+    assert "couldn't transcribe" in adapter.send_message.await_args.args[0].content.lower()
 
 
 @pytest.mark.asyncio

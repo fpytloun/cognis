@@ -7,7 +7,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from cognis.core.executor_resolution import labels_match
-from cognis.models.config import ImageGenerationResult
+from cognis.models.config import ImageGenerationResult, SpeechToTextResult
 from cognis.providers.executor.websocket import ExecutorDisconnectedError, WebSocketExecutorProvider
 
 
@@ -144,6 +144,41 @@ class InferenceRouter:
             return ImageGenerationResult.model_validate(result)
         except ExecutorDisconnectedError:
             raise RuntimeError("Executor disconnected during image generation") from None
+
+    async def route_transcribe(
+        self,
+        *,
+        audio_bytes: bytes,
+        mime_type: str,
+        filename: str,
+        model: str,
+        executor_labels: dict[str, str] | None = None,
+        request_kwargs: dict[str, Any] | None = None,
+        prompt: str | None = None,
+        language: str | None = None,
+    ) -> SpeechToTextResult:
+        conn = await self._find_executor(executor_labels)
+        if conn is None:
+            raise RuntimeError("No executor matches the provider selector for speech-to-text")
+
+        try:
+            result = await conn.rpc_call(
+                method="llm.transcribe",
+                params={
+                    "request_id": uuid.uuid4().hex,
+                    "audio_base64": audio_bytes.hex(),
+                    "audio_encoding": "hex",
+                    "mime_type": mime_type,
+                    "filename": filename,
+                    "model": model,
+                    "prompt": prompt,
+                    "language": language,
+                    "request_kwargs": request_kwargs or {},
+                },
+            )
+            return SpeechToTextResult.model_validate(result)
+        except ExecutorDisconnectedError:
+            raise RuntimeError("Executor disconnected during speech-to-text") from None
 
     async def _find_executor(self, executor_labels: dict[str, str] | None) -> Any | None:
         active = await self._ws_provider.list_active()

@@ -386,6 +386,7 @@ class ModelRoutingResponse(BaseModel):
     compaction: str | None = None
     evaluator: str | None = None
     simple_inline: str | None = None
+    speech_to_text: str | None = None
     image_generation: str | None = None
     items: dict[str, str] = Field(default_factory=dict)
 
@@ -396,6 +397,7 @@ class ModelRoutingUpdateRequest(BaseModel):
     compaction: str | None = None
     evaluator: str | None = None
     simple_inline: str | None = None
+    speech_to_text: str | None = None
     image_generation: str | None = None
     items: dict[str, str] = Field(default_factory=dict)
 

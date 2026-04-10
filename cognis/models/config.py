@@ -109,6 +109,15 @@ class Cost(BaseModel):
     provider: str = ""
 
 
+class SpeechToTextResult(BaseModel):
+    """Result of a speech-to-text transcription call."""
+
+    text: str
+    model: str
+    language: str | None = None
+    duration_seconds: float | None = None
+
+
 class GeneratedImage(BaseModel):
     """A single generated image."""
 

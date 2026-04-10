@@ -472,8 +472,9 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
 
   if (event.type === 'user_message') {
     const itemId = `user-msg:${Date.now()}:${next.length}`;
+    const attachments = Array.isArray(event.attachments) ? event.attachments : [];
     next.push(
-      createMessageItem(itemId, 'user', event.content, new Date().toISOString(), null)
+      createMessageItem(itemId, 'user', event.content, new Date().toISOString(), null, undefined, false, attachments)
     );
     return next;
   }

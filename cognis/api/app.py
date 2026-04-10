@@ -458,6 +458,7 @@ def create_app() -> FastAPI:
         inbound_pipeline = InboundPipeline(
             session_factory=session_factory,
             turn_scheduler=turn_scheduler,
+            llm_provider=providers.llm,
             session_manager=session_manager,
             pairing_service=pairing_service,
             channel_manager_ref=_get_channel_manager,

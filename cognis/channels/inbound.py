@@ -43,6 +43,7 @@ class InboundPipeline:
         *,
         session_factory: async_sessionmaker[Any],
         turn_scheduler: Any,  # TurnScheduler (avoid circular import)
+        llm_provider: Any | None = None,
         session_manager: Any,  # SessionManager
         pairing_service: Any,
         channel_manager_ref: Any,  # Callable[[], ChannelManager] — lazy ref
@@ -51,6 +52,7 @@ class InboundPipeline:
     ) -> None:
         self._session_factory = session_factory
         self._turn_scheduler = turn_scheduler
+        self._llm_provider = llm_provider
         self._session_manager = session_manager
         self._pairing_service = pairing_service
         self._channel_manager_ref = channel_manager_ref
@@ -156,6 +158,16 @@ class InboundPipeline:
             conversation_id=conversation_id,
             user_email=user_email,
         )
+        user_content = message.content
+        if self._is_voice_input(message):
+            try:
+                user_content = await self._transcribe_voice_input(
+                    message=message,
+                    attachments=attachments,
+                )
+            except Exception as exc:
+                await self._send_error(message, config, str(exc))
+                return
 
         # 4. Register observer for response delivery
         observer = ChannelTurnObserver(
@@ -174,7 +186,7 @@ class InboundPipeline:
         # 5. Submit turn
         error = await self._turn_scheduler.submit_turn(
             conversation_id,
-            message.content,
+            user_content,
             user_email=user_email,
             attachments=[item.model_dump(mode="json") for item in attachments],
         )
@@ -194,6 +206,45 @@ class InboundPipeline:
                 }
             },
         )
+
+    def _is_voice_input(self, message: InboundMessage) -> bool:
+        return bool(message.platform_data.get("voice_input"))
+
+    async def _transcribe_voice_input(
+        self,
+        *,
+        message: InboundMessage,
+        attachments: list[AttachmentRef],
+    ) -> str:
+        if self._llm_provider is None:
+            raise RuntimeError(
+                "I couldn't transcribe that voice message because speech-to-text is not configured."
+            )
+        audio_attachment = next(
+            (item for item in attachments if item.kind == ArtifactKind.AUDIO), None
+        )
+        if audio_attachment is None:
+            raise RuntimeError(
+                "I couldn't transcribe that voice message because no audio attachment was available."
+            )
+
+        manager = self._channel_manager_ref()
+        if manager is None:
+            raise RuntimeError(
+                "I couldn't transcribe that voice message because the channel runtime is unavailable."
+            )
+        content, _ = await manager._artifact_store.async_load(  # noqa: SLF001
+            "attachments", audio_attachment.artifact_id, audio_attachment.filename
+        )
+        try:
+            result = await self._llm_provider.transcribe(
+                content,
+                mime_type=audio_attachment.mime_type,
+                filename=audio_attachment.filename,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"I couldn't transcribe that voice message. {exc}") from exc
+        return result.text
 
     # ------------------------------------------------------------------
     # Access control

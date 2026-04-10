@@ -292,6 +292,35 @@ class WebSocketExecutorConnection:
         finally:
             self._inference_queues.pop(request_id, None)
 
+    async def llm_transcribe(
+        self,
+        *,
+        request_id: str,
+        audio_base64: str,
+        audio_encoding: str,
+        mime_type: str,
+        filename: str,
+        model: str,
+        request_kwargs: dict[str, Any] | None = None,
+        prompt: str | None = None,
+        language: str | None = None,
+    ) -> dict[str, Any]:
+        return await self.rpc_call(
+            "llm.transcribe",
+            {
+                "request_id": request_id,
+                "audio_base64": audio_base64,
+                "audio_encoding": audio_encoding,
+                "mime_type": mime_type,
+                "filename": filename,
+                "model": model,
+                "prompt": prompt,
+                "language": language,
+                "request_kwargs": request_kwargs or {},
+            },
+            timeout=300.0,
+        )
+
     # ------------------------------------------------------------------
     # Background receiver
     # ------------------------------------------------------------------

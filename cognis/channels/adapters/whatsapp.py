@@ -277,6 +277,8 @@ class WhatsAppAdapter(BaseChannelAdapter):
             else datetime.now(UTC),
             platform_data={"raw_message": msg},
         )
+        if msg_type == "audio" and bool(msg.get("audio", {}).get("voice")):
+            message.platform_data["voice_input"] = True
 
         await self._dispatch_inbound(message)
 

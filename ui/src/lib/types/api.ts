@@ -858,6 +858,7 @@ export interface ModelRouting {
   compaction: string | null;
   evaluator: string | null;
   simple_inline: string | null;
+  speech_to_text: string | null;
   image_generation: string | null;
   items: Record<string, string>;
 }
@@ -1208,6 +1209,7 @@ export interface WebSocketUserMessageEvent {
   conversation_id?: string;
   session_id?: string;
   content: string;
+  attachments?: AttachmentRef[];
 }
 
 export type CognisWebSocketEvent =

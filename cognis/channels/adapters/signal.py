@@ -651,7 +651,10 @@ class SignalAdapter(BaseChannelAdapter):
 
         # Parse attachments
         media: list[MediaAttachment] = []
+        voice_input = False
         for attachment in data_message.get("attachments", []):
+            if any(bool(attachment.get(key)) for key in ("voiceNote", "voiceMessage", "ptt")):
+                voice_input = True
             media.append(
                 MediaAttachment(
                     path=attachment.get("filename"),
@@ -685,6 +688,8 @@ class SignalAdapter(BaseChannelAdapter):
             else datetime.now(UTC),
             platform_data={"envelope": envelope},
         )
+        if voice_input:
+            message.platform_data["voice_input"] = True
 
         await self._dispatch_inbound(message)
 

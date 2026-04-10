@@ -23,6 +23,15 @@ class _Connection:
         }
         yield {"done": True, "usage": {"total_tokens": 9}, "finish_reason": "stop"}
 
+    async def rpc_call(self, method: str, params: dict[str, object], timeout: float | None = None):
+        del timeout
+        if method == "llm.image_generate":
+            return {"created": 1, "data": [], "usage": None, "provider": "test", "model": "img"}
+        if method == "llm.transcribe":
+            assert params["model"] == "whisper-1"
+            return {"text": "hello from audio", "model": "whisper-1"}
+        raise AssertionError(f"unexpected method {method}")
+
 
 class _Provider:
     def __init__(self) -> None:
@@ -50,3 +59,18 @@ async def test_inference_router_route_generate_reconstructs_normalized_response(
     assert result["choices"][0]["message"]["content"] == "Hello"
     assert result["choices"][0]["message"]["tool_calls"][0]["id"] == "call_1"
     assert result["usage"]["total_tokens"] == 9
+
+
+@pytest.mark.asyncio
+async def test_inference_router_route_transcribe_returns_result() -> None:
+    router = InferenceRouter(_Provider())
+
+    result = await router.route_transcribe(
+        audio_bytes=b"abc",
+        mime_type="audio/ogg",
+        filename="voice.ogg",
+        model="whisper-1",
+        executor_labels={"location": "local"},
+    )
+
+    assert result.text == "hello from audio"

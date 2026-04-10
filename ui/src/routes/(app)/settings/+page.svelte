@@ -70,7 +70,7 @@
   let notice = $state('');
   let settings = $state<SettingsCategory[]>([]);
   let providers = $state<LLMProvider[]>([]);
-  let modelRouting = $state<ModelRouting>({ default: null, classifier: null, compaction: null, evaluator: null, simple_inline: null, image_generation: null, items: {} });
+  let modelRouting = $state<ModelRouting>({ default: null, classifier: null, compaction: null, evaluator: null, simple_inline: null, speech_to_text: null, image_generation: null, items: {} });
   let secrets = $state<SecretMetadata[]>([]);
   let health = $state<HealthResponse | null>(null);
   let diagnostics = $state<SystemDiagnostics | null>(null);
@@ -128,6 +128,7 @@
     compaction: '',
     evaluator: '',
     simple_inline: '',
+    speech_to_text: '',
     image_generation: '',
     extraJson: '{}'
   });
@@ -232,7 +233,7 @@
 
   function routingWarnings(): string[] {
     const knownModels = new Set(modelOptions().map((item) => item.value));
-    return [routingForm.default, routingForm.classifier, routingForm.compaction, routingForm.evaluator, routingForm.simple_inline, routingForm.image_generation]
+    return [routingForm.default, routingForm.classifier, routingForm.compaction, routingForm.evaluator, routingForm.simple_inline, routingForm.speech_to_text, routingForm.image_generation]
       .filter(Boolean)
       .filter((model) => !knownModels.has(model))
       .map((model) => `Model '${model}' is not present in configured providers.`);
@@ -504,6 +505,7 @@
       compaction: modelRouting.compaction ?? '',
       evaluator: modelRouting.evaluator ?? '',
       simple_inline: modelRouting.simple_inline ?? '',
+      speech_to_text: modelRouting.speech_to_text ?? '',
       image_generation: modelRouting.image_generation ?? '',
       extraJson: JSON.stringify(modelRouting.items, null, 2)
     };
@@ -660,6 +662,7 @@
         compaction: routingForm.compaction || null,
         evaluator: routingForm.evaluator || null,
         simple_inline: routingForm.simple_inline || null,
+        speech_to_text: routingForm.speech_to_text || null,
         image_generation: routingForm.image_generation || null,
         items: JSON.parse(routingForm.extraJson || '{}')
       });
@@ -683,7 +686,8 @@
       classifier: routingForm.default,
       compaction: routingForm.default,
       evaluator: routingForm.default,
-      simple_inline: routingForm.default
+      simple_inline: routingForm.default,
+      speech_to_text: routingForm.default
     };
   }
 
@@ -1413,6 +1417,16 @@
               {/each}
             </select>
             <span class="block text-xs text-slate-400">Short inline responses / fast model.</span>
+          </label>
+          <label class="space-y-2 text-sm font-medium text-slate-200">
+            <span>speech_to_text</span>
+            <select bind:value={routingForm.speech_to_text} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+              <option value="">Use provider default</option>
+              {#each modelOptions() as option}
+                <option value={option.value}>{option.label}</option>
+              {/each}
+            </select>
+            <span class="block text-xs text-slate-400">Voice-note transcription. Use models like gpt-4o-transcribe, gpt-4o-mini-transcribe, or whisper.</span>
           </label>
           <label class="space-y-2 text-sm font-medium text-slate-200">
             <span>image_generation</span>

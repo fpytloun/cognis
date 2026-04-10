@@ -7,7 +7,8 @@ import pytest
 
 from cognis.core.agent_loop import PauseWaiter, PendingPause
 from cognis.core.events import EventBus
-from cognis.core.turn_scheduler import TurnScheduler
+from cognis.core.turn_scheduler import TurnScheduler, _effective_user_content
+from cognis.models.artifact import ArtifactKind, AttachmentRef
 from cognis.models.session import SessionStatus
 
 
@@ -249,3 +250,23 @@ async def test_follow_up_event_publishes_turn_error_on_immediate_rejection() -> 
         queries.get_conversation = original  # type: ignore[assignment]
 
     scheduler._publish_turn_error.assert_awaited_once()
+
+
+def test_effective_user_content_describes_audio_only_turns() -> None:
+    assert _effective_user_content("hello", []) == "hello"
+    assert _effective_user_content("", []) == ""
+    assert (
+        _effective_user_content(
+            "",
+            [
+                AttachmentRef(
+                    artifact_id="att-1",
+                    kind=ArtifactKind.AUDIO,
+                    mime_type="audio/ogg",
+                    filename="voice.ogg",
+                    size_bytes=10,
+                )
+            ],
+        )
+        == "User attached an audio file."
+    )

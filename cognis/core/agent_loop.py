@@ -56,6 +56,15 @@ logger = get_logger(__name__)
 
 _BOOTSTRAP_INTENTION_WAIT_MS = 1500
 
+
+def _user_message_for_recording(content: str, attachments: list[AttachmentRef]) -> str:
+    if content.strip():
+        return content
+    if not attachments:
+        return content
+    return "User attached files."
+
+
 # Prometheus metrics
 STEPS_TOTAL = Counter(
     "cognis_steps_total",
@@ -1280,12 +1289,16 @@ class AgentLoop:
         # - retry turns (session already has the original prompt)
         # ---------------------------------------------------------------
         _user_msg_recorded_early = False
-        if effective_user_message and not ctx.system_initiated and not ctx.is_retry:
+        recorded_user_message = _user_message_for_recording(
+            effective_user_message,
+            ctx.user_attachments,
+        )
+        if recorded_user_message and not ctx.system_initiated and not ctx.is_retry:
             intaris_id = ctx.session.intaris_session_id or ctx.session.session_id
             user_msg_event = SessionEvent(
                 type="user_message",
                 data={
-                    "content": effective_user_message,
+                    "content": recorded_user_message,
                     "attachments": [
                         item.model_dump(mode="json", exclude={"url"})
                         for item in ctx.user_attachments
@@ -1320,7 +1333,7 @@ class AgentLoop:
                 else:
                     reasoning_result = await self.providers.guardrails.report_reasoning(
                         session_id=intaris_id,
-                        content=f"User message: {effective_user_message[:500]}",
+                        content=f"User message: {recorded_user_message[:500]}",
                         wait_for_intention=ctx.bootstrap_wait_for_intention,
                         wait_timeout_ms=_BOOTSTRAP_INTENTION_WAIT_MS,
                     )
@@ -1390,12 +1403,12 @@ class AgentLoop:
         # (task completion, delegation results) are NOT recorded — the
         # lifecycle event already provides the audit trail and the prompt
         # is an internal instruction, not user-visible content.
-        if effective_user_message and not _user_msg_recorded_early and not ctx.system_initiated:
+        if recorded_user_message and not _user_msg_recorded_early and not ctx.system_initiated:
             events_to_record.append(
                 SessionEvent(
                     type="user_message",
                     data={
-                        "content": effective_user_message,
+                        "content": recorded_user_message,
                         "attachments": [
                             item.model_dump(mode="json", exclude={"url"})
                             for item in ctx.user_attachments

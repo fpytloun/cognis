@@ -114,6 +114,34 @@ async def test_handle_llm_complete_streams_chunks() -> None:
 
 
 @pytest.mark.asyncio
+async def test_handle_llm_transcribe_returns_result() -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    ws = DummyWebSocket()
+    await runner._handle_configure(ws, "cfg-1", {"enabled_tools": [], "config": {}})
+
+    runner._inference_handler = AsyncMock()
+    runner._inference_handler.transcribe = AsyncMock(
+        return_value={"text": "hello", "model": "whisper-1"}
+    )
+    ws.sent.clear()
+
+    await runner._handle_llm_transcribe(
+        ws,
+        "rpc-1",
+        {
+            "audio_base64": b"abc".hex(),
+            "audio_encoding": "hex",
+            "mime_type": "audio/ogg",
+            "filename": "voice.ogg",
+            "model": "whisper-1",
+            "request_kwargs": {},
+        },
+    )
+
+    assert ws.sent[-1]["result"]["text"] == "hello"
+
+
+@pytest.mark.asyncio
 async def test_heartbeat_includes_configuration_state() -> None:
     runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
     ws = DummyWebSocket()

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import io
 from collections.abc import AsyncIterator
 from typing import Any
 
+import httpx
 import litellm
 
 from cognis.providers.llm.responses_bridge import (
@@ -210,3 +212,55 @@ class InferenceHandler:
         )
         dumped = response.model_dump()
         return dumped if isinstance(dumped, dict) else {}
+
+    async def transcribe(
+        self,
+        *,
+        audio_bytes: bytes,
+        mime_type: str,
+        filename: str,
+        model: str,
+        request_kwargs: dict[str, Any],
+        prompt: str | None = None,
+        language: str | None = None,
+    ) -> dict[str, Any]:
+        api_base = request_kwargs.get("api_base") or request_kwargs.get("base_url")
+        if not isinstance(api_base, str) or not api_base:
+            api_base = "https://api.openai.com"
+        headers: dict[str, str] = {}
+        api_key = request_kwargs.get("api_key")
+        if isinstance(api_key, str) and api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        extra_headers = request_kwargs.get("extra_headers")
+        if isinstance(extra_headers, dict):
+            headers.update({str(key): str(value) for key, value in extra_headers.items()})
+
+        data: dict[str, str] = {"model": _transcription_model_name(model)}
+        if prompt:
+            data["prompt"] = prompt
+        if language:
+            data["language"] = language
+
+        file_obj = io.BytesIO(audio_bytes)
+        file_obj.name = filename
+        async with httpx.AsyncClient(timeout=request_kwargs.get("timeout", 120)) as client:
+            response = await client.post(
+                f"{api_base.rstrip('/')}/v1/audio/transcriptions",
+                headers=headers,
+                data=data,
+                files={"file": (filename, file_obj, mime_type)},
+            )
+            response.raise_for_status()
+        payload = response.json()
+        return {
+            "text": payload.get("text", ""),
+            "model": model,
+            "language": payload.get("language"),
+            "duration_seconds": payload.get("duration"),
+        }
+
+
+def _transcription_model_name(model: str) -> str:
+    if model.startswith("openai/") or model.startswith("litellm_proxy/"):
+        return model.split("/", 1)[1]
+    return model

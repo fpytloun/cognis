@@ -11,6 +11,7 @@ from cognis.models.config import (
     ImageGenerationResult,
     ModelInfo,
     ProviderHealth,
+    SpeechToTextResult,
     TokenUsage,
 )
 from cognis.models.session import (
@@ -213,6 +214,17 @@ class LLMProvider(Protocol):
         self, explicit_model: str | None = None, task_type: str = "default"
     ) -> str: ...
     async def get_model_info(self, model_id: str) -> ModelInfo: ...
+    async def transcribe(
+        self,
+        audio_bytes: bytes,
+        *,
+        mime_type: str,
+        filename: str,
+        model: str | None = None,
+        task_type: str = "speech_to_text",
+        prompt: str | None = None,
+        language: str | None = None,
+    ) -> SpeechToTextResult: ...
     def count_tokens(self, text: str, model: str) -> int: ...
     def count_messages_tokens(self, messages: list[dict[str, Any]], model: str) -> int: ...
     async def list_models(self) -> list[dict[str, Any]]: ...

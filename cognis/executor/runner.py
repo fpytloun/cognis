@@ -199,6 +199,9 @@ class ExecutorRunner:
             elif method == "llm.complete":
                 logger.debug("Received llm.complete")
                 asyncio.create_task(self._handle_llm_complete(ws, msg_id, params))
+            elif method == "llm.transcribe":
+                logger.debug("Received llm.transcribe")
+                asyncio.create_task(self._handle_llm_transcribe(ws, msg_id, params))
             elif method == "channel.start":
                 logger.info("Received channel.start for account %s", params.get("account_id", "?"))
                 asyncio.create_task(self._handle_channel_start(ws, msg_id, params))
@@ -700,6 +703,33 @@ class ExecutorRunner:
                         }
                     )
                 )
+
+    async def _handle_llm_transcribe(
+        self, ws: Any, msg_id: str | None, params: dict[str, Any]
+    ) -> None:
+        if self._inference_handler is None:
+            await self._send_rpc_error(ws, msg_id, -32601, "Inference handler unavailable")
+            return
+
+        try:
+            encoding = str(params.get("audio_encoding", "hex"))
+            audio_payload = str(params.get("audio_base64", ""))
+            if encoding != "hex":
+                raise ValueError("Unsupported audio encoding")
+            audio_bytes = bytes.fromhex(audio_payload)
+            request_kwargs = dict(params.get("request_kwargs") or {})
+            result = await self._inference_handler.transcribe(
+                audio_bytes=audio_bytes,
+                mime_type=str(params.get("mime_type", "application/octet-stream")),
+                filename=str(params.get("filename", "audio.bin")),
+                model=str(params.get("model", "")),
+                request_kwargs=request_kwargs,
+                prompt=params.get("prompt"),
+                language=params.get("language"),
+            )
+            await self._send_rpc_result(ws, msg_id, result)
+        except Exception as exc:
+            await self._send_rpc_error(ws, msg_id, -32000, str(exc)[:500])
 
     async def _handle_channel_start(
         self, ws: Any, msg_id: str | None, params: dict[str, Any]

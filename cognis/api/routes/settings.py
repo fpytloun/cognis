@@ -398,6 +398,7 @@ async def model_routing_get(request: Request) -> ModelRoutingResponse:
         compaction=items.get("compaction"),
         evaluator=items.get("evaluator"),
         simple_inline=items.get("simple_inline"),
+        speech_to_text=items.get("speech_to_text"),
         image_generation=items.get("image_generation"),
         items=items,
     )
@@ -415,6 +416,7 @@ async def model_routing_put(
         "compaction": payload.compaction,
         "evaluator": payload.evaluator,
         "simple_inline": payload.simple_inline,
+        "speech_to_text": payload.speech_to_text,
         "image_generation": payload.image_generation,
         **payload.items,
     }

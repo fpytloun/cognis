@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import os
 import re
 from collections.abc import AsyncIterator
@@ -10,6 +11,7 @@ from datetime import UTC, datetime
 from time import monotonic
 from typing import Any, cast
 
+import httpx
 import litellm
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -22,6 +24,7 @@ from cognis.models.config import (
     ImageGenerationResult,
     ModelInfo,
     ProviderHealth,
+    SpeechToTextResult,
     TokenUsage,
 )
 from cognis.providers.llm.responses_bridge import (
@@ -289,6 +292,85 @@ class LiteLLMProvider:
         )
         await self._set_cached_model_info(model_id, DEFAULT_MODEL_INFO)
         return DEFAULT_MODEL_INFO
+
+    async def transcribe(
+        self,
+        audio_bytes: bytes,
+        *,
+        mime_type: str,
+        filename: str,
+        model: str | None = None,
+        task_type: str = "speech_to_text",
+        prompt: str | None = None,
+        language: str | None = None,
+    ) -> SpeechToTextResult:
+        resolved_model, provider = await self._resolve_model_target(model, task_type=task_type)
+        if provider is None:
+            raise ValueError(f"No LLM provider found for transcription model {resolved_model!r}")
+        model_name = self._transcription_model_name(resolved_model, provider)
+        if self._should_route_to_executor(provider):
+            if self._inference_router is None:
+                raise RuntimeError("Speech-to-text executor routing is unavailable")
+            request_kwargs = await self._resolve_provider_kwargs(provider)
+            return await self._inference_router.route_transcribe(
+                audio_bytes=audio_bytes,
+                mime_type=mime_type,
+                filename=filename,
+                model=model_name,
+                executor_labels=dict(provider.config).get("executor_labels"),
+                request_kwargs=request_kwargs,
+                prompt=prompt,
+                language=language,
+            )
+
+        request_kwargs = await self._resolve_provider_kwargs(provider)
+        api_base = request_kwargs.get("api_base") or request_kwargs.get("base_url")
+        if not isinstance(api_base, str) or not api_base:
+            api_base = "https://api.openai.com"
+        api_key = request_kwargs.get("api_key")
+        extra_headers = request_kwargs.get("extra_headers")
+        timeout = request_kwargs.get("timeout", 120)
+        data: dict[str, str] = {"model": model_name}
+        if prompt:
+            data["prompt"] = prompt
+        if language:
+            data["language"] = language
+
+        headers: dict[str, str] = {}
+        if isinstance(api_key, str) and api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        if isinstance(extra_headers, dict):
+            headers.update({str(key): str(value) for key, value in extra_headers.items()})
+
+        file_obj = io.BytesIO(audio_bytes)
+        file_obj.name = filename
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.post(
+                    f"{api_base.rstrip('/')}/v1/audio/transcriptions",
+                    headers=headers,
+                    data=data,
+                    files={"file": (filename, file_obj, mime_type)},
+                )
+                response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            detail = self._sanitize_error_detail(exc)
+            raise RuntimeError(f"Speech-to-text request failed: {detail}") from exc
+        except Exception as exc:
+            detail = self._sanitize_error_detail(exc)
+            raise RuntimeError(f"Speech-to-text request failed: {detail}") from exc
+
+        payload = response.json()
+        text = payload.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise RuntimeError("Speech-to-text returned an empty transcript")
+        duration = payload.get("duration")
+        return SpeechToTextResult(
+            text=text.strip(),
+            model=resolved_model,
+            language=payload.get("language") if isinstance(payload.get("language"), str) else None,
+            duration_seconds=float(duration) if isinstance(duration, int | float) else None,
+        )
 
     async def enrich_model_info(
         self,
@@ -968,6 +1050,15 @@ class LiteLLMProvider:
         prefix = PRESET_TO_MODEL_PREFIX.get(preset)
         if prefix:
             return f"{prefix}/{model}"
+        return model
+
+    @staticmethod
+    def _transcription_model_name(model: str, provider: LLMProviderRow | None) -> str:
+        if provider is None or "/" not in model:
+            return model
+        preset = str(dict(provider.config).get("preset", "")).lower()
+        if preset in {"litellm_proxy", "openai_compatible"}:
+            return model.split("/", 1)[1]
         return model
 
     def _provider_request_kwargs(self, provider: LLMProviderRow | None) -> dict[str, Any]:

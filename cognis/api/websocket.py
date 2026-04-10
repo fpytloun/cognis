@@ -1564,6 +1564,7 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
             "conversation_id": conversation_id,
             "session_id": event.data.get("session_id"),
             "content": event.data.get("content", ""),
+            "attachments": event.data.get("attachments", []),
         }
     return None
 
