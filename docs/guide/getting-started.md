@@ -103,6 +103,7 @@ The chat view will show streaming responses, tool activity, and any approval pro
 Once basic chat is working, the next useful areas are:
 
 - `Tasks` for background or multi-step work
+- `Schedules` for recurring task creation
 - `Workflows` for reusable execution templates
 - `Channels` for external messaging integrations
 - `Docs` for embedded user guidance inside the app

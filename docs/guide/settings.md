@@ -54,6 +54,11 @@ The tools section inside settings manages shared MCP server definitions. These a
 
 This split matters because agents inherit tools from their executor rather than talking to MCP servers directly.
 
+This is separate from the top-level `Tools` workspace:
+
+- `Settings -> Tools` manages MCP server definitions and attachment points
+- `Tools` lets you inspect the tool registry and manage skills
+
 ## System diagnostics
 
 The system tab is the best place to confirm that a new deployment is healthy. It shows:
@@ -88,3 +93,4 @@ For a fresh environment, this order usually works best:
 4. configure executors and MCP servers
 5. create agents
 6. optionally add channels and pairing policies
+7. optionally add schedules for recurring work

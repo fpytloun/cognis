@@ -18,6 +18,7 @@ Cognis ships with embedded in-app docs under `/docs` and keeps the same guides i
 |---|---|
 | Using Chat | Streaming chat, tool calls, escalations, delegation, and recovery |
 | Managing Tasks | Task board, workflow runs, approvals, and results delivery |
+| Schedules | Recurring task creation and scheduled workflow execution |
 | Workflows | Build reusable workflows and understand step behavior |
 | Channels | Connect external messaging platforms and understand pairing |
 | Executors | Choose between local and remote executors and route tools safely |
@@ -41,6 +42,7 @@ When Cognis serves the bundled UI, these guides are also available directly insi
 - `/docs/settings`
 - `/docs/using-chat`
 - `/docs/managing-tasks`
+- `/docs/schedules`
 - `/docs/workflows`
 - `/docs/channels`
 - `/docs/executors`

@@ -51,3 +51,5 @@ Prefer tasks when the work needs:
 - persistence beyond the current turn
 - dependency tracking
 - later follow-up in the same conversation
+
+If the same kind of task should run repeatedly, use `Schedules` to create those tasks automatically instead of creating them by hand each time.

@@ -17,7 +17,7 @@
 | 8 | [UI](stage-8-ui.md) | DONE | SvelteKit UI under `ui/` with auth, chat, agents, tasks, workflows, settings, and Stage 8 workflow API alignment |
 | 9 | [Integration Testing](stage-9-testing.md) | DONE | 27+ integration tests, 14 contract tests, 21 WebSocket unit tests, compaction/shutdown/recovery/degradation tests, all MVP success criteria verified |
 
-### MVP Polish (Stages 10-15)
+### MVP Polish (Stages 10-16)
 
 | Stage | Name | Status | Notes |
 |-------|------|--------|-------|
@@ -27,6 +27,7 @@
 | 13 | [Core UX Polish](stage-13-ux-polish.md) | DONE | Global toasts/confirmations, mobile shell, keyboard shortcuts, chat search/pagination/timestamps, unsaved-change guards |
 | 14 | [Degraded Mode + Recovery UX](stage-14-degraded-ux.md) | DONE | Provider outage banners, contextual chat failures, setup-incomplete chat/task states, retry affordances, sync warnings |
 | 15 | [MVP Closure Sweep](stage-15-closure.md) | DONE | Delivery/purge TODOs resolved, skills loader MVP, general API rate limiting, sync metadata, expanded unit/UI coverage |
+| 16 | [Executor-Native Tools, Tool Management UI, and Executor UI](stage-16-tools-executors.md) | DONE | Native executor tools, Tools & Skills workspace, executor CRUD/tool toggles, default executor bootstrap |
 
 ## Dependency Graph
 
@@ -74,7 +75,10 @@ Stage 4 (executor + tools)    Stage 5 (orchestration core)
                   Stage 14 (degraded mode + recovery UX)
                       │
                       ▼
-                  Stage 15 (MVP closure sweep)
+                   Stage 15 (MVP closure sweep)
+                      │
+                      ▼
+                   Stage 16 (executor tools + tools/executors UI)
 ```
 
 Stages 4 and 5 can run in parallel after Stage 3 is complete.
@@ -93,13 +97,12 @@ bring the codebase in line with the updated specs.
 
 ## Scope Boundary
 
-Stages 0-9 build the MVP. Stages 10-15 polish it into a usable product.
+Stages 0-9 build the MVP. Stages 10-16 polish it into a usable product.
 Stages 6a+ align the codebase with spec refinements made during design review.
 
-**Out of scope for all stages** (Phase 2+): multi-user, scheduler
-execution, Docker/K8s executors, platform integrations (Slack/Discord),
-A2A federation, cost tracking dashboard, interactive CLI chat, Redis L2
-cache, PostgreSQL migration tooling, agent export/import YAML.
+**Still out of scope / not yet shipped**: multi-user production hardening,
+Docker/K8s executors, A2A federation, cost tracking dashboard,
+interactive CLI chat, Redis L2 cache, and PostgreSQL migration tooling.
 
 ## How To Use This
 

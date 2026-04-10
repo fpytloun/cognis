@@ -29,34 +29,27 @@ Whether an agent can actually use a tool depends on:
 
 ## Skills
 
-Skills are versioned, reusable instruction and tool bundles stored in the database. Each skill can contain:
+Skills are reusable instruction bundles stored in the database and exposed through the `Tools` workspace and skill APIs.
 
-- **Instructions** -- markdown guidance loaded on demand via `skill_load` when the agent decides a skill is relevant
-- **Tool definitions** -- first-class tools with execution recipes that appear in the agent's effective tool set
-- **Prompt templates** -- reusable templates for common patterns
-- **Assets** -- scripts, configuration files, and other resources stored in the Cognis artifact store
-- **Secret placeholders** -- declared secrets the skill needs at runtime, bound separately by the agent owner
+Today, the most visible skill workflow is:
+
+- create or edit database-backed skills
+- import skills from supported external formats such as `SKILL.md`
+- export skills for sharing or version control
+- organize skills with tags and auto-load behavior
+- attach skills to agents so their instructions are available at runtime
+
+Depending on the imported format and runtime configuration, a skill can also carry richer metadata such as templates, assets, or tool-related information. This guide focuses on the shipped workflow you can use directly from the current app.
 
 ### Managing skills
 
 In the UI you can:
 
-- create database-backed custom skills with instructions, tools, and templates
-- import skills from a URL (supports Claude Code / Agent Skills `SKILL.md` format, GitHub URLs, and Cognis YAML)
-- export skills as `SKILL.md` or Cognis YAML for sharing and version control
-- edit skill content (creates a new immutable version on each save)
-- view version history, provenance, and asset manifests
+- create and edit database-backed custom skills
+- import skills from a URL, including `SKILL.md`-style sources
+- export skills for sharing and version control
 - organize skills with tags
 - set auto-load to make a skill active for all agents
-
-### Skill versioning
-
-Every content change creates a new immutable version with a content hash. The logical skill record points to the current published version. This means:
-
-- runtime behavior is pinned to a specific version
-- effective-tools preview and runtime use the same resolved version set
-- version history is preserved for auditability
-- imported skills record provenance (source URL, commit SHA, checksum)
 
 ### How skills work at runtime
 
@@ -64,7 +57,7 @@ Skills use a hybrid lazy-loading model for token efficiency:
 
 1. **Compact metadata in the system prompt** -- only skill names, descriptions, and tool summaries are included in the immutable prompt prefix. This keeps the cached prefix stable and small.
 2. **On-demand loading via `skill_load`** -- the agent uses the `skill_load` tool to read full instructions when a skill is relevant to the current task. Instructions are loaded into the mutable context, not the cached prefix.
-3. **Executable skill tools** -- skill-defined tools are registered in the runtime tool inventory and can be called directly by the agent.
+3. **Executable skill tools** -- when a skill includes supported tool definitions and the runtime exposes them, those tools can be called directly by the agent.
 
 This means:
 - adding or removing skills does not invalidate the entire prompt cache
@@ -83,8 +76,8 @@ Skills are resolved in order: agent-specified skills first, then auto-load skill
 Agents can manage skills through built-in tools:
 
 - `skill_list` -- list available skills
-- `skill_load` -- load a skill's full instructions, templates, and tool summaries (read-only, always returns latest version)
-- `skill_get` -- get skill details including version history and provenance
+- `skill_load` -- load a skill's full instructions and related metadata
+- `skill_get` -- get skill details for inspection or debugging
 - `skill_write` -- create or update a skill (creates a new version)
 - `skill_delete` -- delete a skill
 - `skill_import_url` -- import a skill from a URL
@@ -99,7 +92,7 @@ Skills can be imported from:
 - **Raw SKILL.md URLs** -- any HTTPS URL pointing to a SKILL.md file
 - **GitHub blob URLs** -- automatically resolved to raw content
 - **GitHub folder URLs** -- `SKILL.md` is inferred inside the folder
-- **Cognis YAML** -- the native portable format with full metadata
+- **Cognis YAML** -- the native portable format
 
 Import security:
 

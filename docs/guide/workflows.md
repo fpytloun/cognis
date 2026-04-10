@@ -8,6 +8,7 @@ Workflows define how Cognis runs multi-step work. They are reusable templates th
 
 - `Workflows` in the main navigation opens the workflow editor.
 - `Tasks` use workflows to execute queued or background work.
+- `Schedules` use workflows to create recurring background work.
 - Agent settings can choose default workflows or limit which workflows an agent may use.
 
 ## What a workflow contains

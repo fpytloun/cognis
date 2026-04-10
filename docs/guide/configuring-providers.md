@@ -52,23 +52,23 @@ Some providers can run on the controller, while others can be routed through an 
 
 ## Managing models
 
-Each provider has a list of configured models with their properties (context window, output limits, capabilities, and costs).
+Each provider has a list of configured models with their properties, such as context window, output limits, capability flags, and pricing metadata.
 
 ### Discovering models
 
-Click **Discover** to query the provider for available models. For LiteLLM Proxy providers, Cognis fetches enriched metadata from the proxy's `/model/info` endpoint, including accurate context window sizes, capability flags, and pricing. For other providers, models are enriched with litellm's built-in model database.
+Click **Discover** to query the provider for available models. For LiteLLM Proxy providers, Cognis fetches enriched metadata from the proxy's `/model/info` endpoint, including context window sizes, capability flags, and pricing metadata. For other providers, models are enriched with LiteLLM's built-in model database.
 
 Discovered models appear in a selection modal where you can choose which to add. You can also add models manually by typing a model ID.
 
 ### Editing model properties
 
-Each configured model shows its properties (context window, max output tokens, capabilities, costs). Click **Edit** to override any property. User-configured overrides always take precedence over auto-detected values.
+Each configured model shows its properties, including context window, max output tokens, capabilities, and pricing metadata. Click **Edit** to override any property. User-configured overrides always take precedence over auto-detected values.
 
 This is particularly useful when:
 
 - the auto-detected context window is incorrect or outdated
 - you want to restrict capabilities for a specific model
-- you need to set custom pricing for cost tracking
+- you need to record custom pricing metadata for planning or documentation
 
 ### Default model
 

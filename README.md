@@ -22,15 +22,15 @@ Part of the Openclaw ecosystem: Cognis controller, [Intaris](https://github.com/
 - **Agent identity** -- Create agents with name, personality, behavioral rules, and skills. Personality bootstrapped to Mnemory and evolves through interactions.
 - **Sub-session delegation** -- Three modes: Agent (delegate to different agent), Worker (same agent, focused task), Fork (parallel exploration). Main chat stays responsive.
 - **Task queue + workflows** -- Durable kanban-style tasks with priorities, dependencies, portable workflow templates, step evaluation, and human-in-the-loop gates.
-- **Controller-executor separation** -- The controller decides; executors do. Ships with in-process, subprocess, and remote WebSocket executors using JSON-RPC 2.0 over WebSocket. Remote executors can provide local LLM inference (ollama, vllm) alongside tool execution, and the planned channel model allows executor-hosted adapters for platforms that need user-local services such as Signal via `signal-cli`.
+- **Controller-executor separation** -- The controller decides; executors do. Ships with in-process, subprocess, and remote WebSocket executors using JSON-RPC 2.0 over WebSocket. Remote executors can provide local LLM inference alongside tool execution, and executor-hosted channel adapters are already supported for integrations that need user-local services such as Signal via `signal-cli`.
 - **Memory integration** -- Persistent recall and remember through [Mnemory](https://github.com/fpytloun/mnemory). Agent identity, user facts, episodic memory, and artifacts.
 - **Guardrails integration** -- Every tool call evaluated by [Intaris](https://github.com/fpytloun/intaris). Escalation prompts with approve/deny. Session recording and behavioral analysis.
-- **LLM provider abstraction** -- Multi-provider support via LiteLLM. Configure providers and model routing through the UI. Cost tracking per agent and task.
-- **MCP tool support** -- Connect any MCP server. Tools discovered automatically, evaluated through guardrails, executed on the executor.
+- **LLM provider abstraction** -- Multi-provider support via LiteLLM. Configure providers and model routing through the UI, with model metadata, capability flags, and pricing fields.
+- **MCP tool support** -- Connect MCP servers over supported transports such as stdio, SSE, and streamable HTTP. Tools are discovered automatically, evaluated through guardrails, and executed on the executor.
 - **Decision Engine** -- Deterministic rules + lightweight LLM classifier decide whether a request runs inline or gets delegated to a background sub-session.
 - **Context management** -- Parallel context assembly (Mnemory recall + Intaris events + intention read via `asyncio.gather`). LLM-based compaction with mechanical fallback for long conversations.
 - **Web UI** -- SvelteKit application served by Cognis on `:8080` by default, with setup flow, diagnostics, provider presets, and account management.
-- **Channel adapters** -- Connect agents to Signal, WhatsApp, Telegram, Discord, Slack, Matrix, IRC, Google Chat, and iMessage (via BlueBubbles) with DB-managed channel accounts and webhook/gateway integrations.
+- **Channel adapters** -- Connect agents to Signal, WhatsApp, Telegram, Discord, Slack, Matrix, IRC, Google Chat, and iMessage (via BlueBubbles) with DB-managed channel accounts and webhook/gateway integrations. Signal and BlueBubbles currently have the most complete setup documentation.
 - **Secure pairing flow** -- External senders can be required to redeem a short-lived verification code in the Cognis UI before the agent accepts their messages.
 - **Polished workspace UX** -- Global toasts, confirmation dialogs, keyboard shortcuts, mobile navigation, chat timestamps, and unsaved-change protection.
 - **Degraded-mode guidance** -- Provider outage banners, setup-incomplete states, retry affordances, and contextual chat/task failure messaging.
@@ -46,15 +46,13 @@ Part of the Openclaw ecosystem: Cognis controller, [Intaris](https://github.com/
 - Python 3.12+
 - One LLM option: OpenAI, Anthropic, or a local Ollama instance
 
-Cognis needs [Mnemory](https://github.com/fpytloun/mnemory) and [Intaris](https://github.com/fpytloun/intaris) running. Each is a single command:
+Cognis needs [Mnemory](https://github.com/fpytloun/mnemory) and [Intaris](https://github.com/fpytloun/intaris) running. Start Cognis once first so it can generate its JWT keypair and setup URL:
 
 ```bash
-uvx mnemory                     # Memory layer on :8050
-uvx intaris                     # Guardrails on :8060
 uvx cognis                      # Controller on :8080
 ```
 
-Point Mnemory and Intaris at Cognis's public key for JWT validation:
+Then start Mnemory and Intaris with Cognis's public key for JWT validation:
 
 ```bash
 # Mnemory
@@ -64,7 +62,7 @@ MNEMORY_JWT_PUBLIC_KEY=~/.cognis/keys/public.pem uvx mnemory
 INTARIS_JWT_PUBLIC_KEY=~/.cognis/keys/public.pem uvx intaris
 ```
 
-Start Cognis with an LLM credential available to LiteLLM:
+If you started Cognis before setting provider credentials, restart it with an LLM credential available to LiteLLM:
 
 ```bash
 OPENAI_API_KEY=sk-... uvx cognis
@@ -86,9 +84,10 @@ After creating the admin:
 2. Create the first admin account in the web form
 3. Log in
 4. Open **Settings → Providers** and configure a provider preset
-5. Open **Agents → New** and create the first agent
-6. Start a conversation from **Chat**
-7. Optional: configure **Channels** and redeem pairing codes to link remote sender identities securely
+5. Open **Settings → Executors** and enable the tool groups you want available
+6. Open **Agents → New** and create the first agent
+7. Start a conversation from **Chat**
+8. Optional: configure **Channels** and redeem pairing codes to link remote sender identities securely
 
 Use **Settings → System** or **Getting started** for readiness checks and diagnostics.
 
@@ -118,7 +117,7 @@ Every major capability is a pluggable provider behind a Python `Protocol` interf
 
 - `MemoryProvider` -- default: Mnemory
 - `GuardrailsProvider` -- default: Intaris
-- `ExecutorProvider` -- default: in-process (Docker, K8s in Phase 2)
+- `ExecutorProvider` -- ships with in-process, subprocess, and remote WebSocket modes
 - `LLMProvider` -- default: LiteLLM
 - `SecretsProvider` -- default: encrypted DB
 - `AuthProvider` -- default: ES256 JWT
@@ -226,11 +225,20 @@ Cognis executor they control or let the executor run `signal-cli` directly via
 JSON-RPC, while the cloud controller continues to orchestrate pairing, turns,
 and outbound delivery without owning the Signal session state itself.
 
-## Roadmap
+## Status
 
-- **Phase 1 (MVP)** -- Interactive chat, background task queue + workflows, Mnemory/Intaris integration, SvelteKit UI, in-process executor, remote WebSocket executors, executor-side LLM inference
-- **Phase 2** -- Multi-agent, Docker/K8s executors, chat platform integrations, executor-hosted channel adapters for user-local services, scheduler
-- **Phase 3** -- A2A federation, cryptographic agent identity, multi-tenant production deployment
+Available today:
+
+- Interactive chat, agents, tasks, workflows, schedules, channels, and the bundled web UI
+- In-process, subprocess, and remote WebSocket executors
+- Executor-routed inference and executor-hosted Signal direct mode
+- Mnemory and Intaris integrations, MCP tools, encrypted secrets, setup diagnostics, and admin CLI flows
+
+Still ahead:
+
+- Docker and Kubernetes executor backends
+- federation and cryptographic agent identity
+- broader production hardening for multi-user and multi-replica deployments
 
 See [docs/specs/](docs/specs/) for the full specification set and [docs/specs/implementation/](docs/specs/implementation/) for the implementation stage tracker.
 
@@ -244,6 +252,7 @@ See [docs/specs/](docs/specs/) for the full specification set and [docs/specs/im
 - [Settings](docs/guide/settings.md)
 - [Using Chat](docs/guide/using-chat.md)
 - [Managing Tasks](docs/guide/managing-tasks.md)
+- [Schedules](docs/guide/schedules.md)
 - [Workflows](docs/guide/workflows.md)
 - [Channels](docs/guide/channels.md)
 - [Executors](docs/guide/executors.md)

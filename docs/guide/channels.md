@@ -15,6 +15,18 @@ A channel account binds:
 
 This lets a user talk to a Cognis agent through an external service while keeping the same conversation, session, and safety model.
 
+## Current support notes
+
+Channel support in Cognis is real, but not every adapter is documented to the same depth yet.
+
+| Adapter group | Current documentation level |
+|---|---|
+| Signal | Most complete coverage in this guide, including executor-hosted direct mode |
+| iMessage via BlueBubbles | Setup guidance included in this guide |
+| Slack, Discord, Telegram, WhatsApp, Matrix, IRC, Google Chat | Adapter support and setup forms are present in the product, but operator guidance is lighter and should be validated in your environment before broad rollout |
+
+For a first external integration, start with Signal or BlueBubbles if those fit your deployment.
+
 ## Creating a channel account
 
 Open `Channels` and start in the `Accounts` view. The page is organized around three workflows:
