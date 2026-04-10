@@ -573,6 +573,7 @@ Full architecture and design specifications are in `docs/specs/`:
 | `12-mvp-roadmap.md` | 8-week implementation plan |
 | `13-nfr-operations.md` | NFRs, SLOs, metrics, degraded modes, retention |
 | `14-workflow-engine.md` | Workflow templates, step types, completion protocol, evaluation, gates |
+| `15-browser-credentials.md` | Browser automation, credential records, auth request flows, and cloud-native executor behavior |
 
 **Read the relevant spec before making changes in that area.**
 
