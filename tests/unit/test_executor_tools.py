@@ -37,7 +37,7 @@ class TestDefinitions:
     def test_executor_tool_definitions_returns_all(self) -> None:
         defs = executor_tool_definitions()
         # Web tools are dynamic — not in the static list
-        assert len(defs) == 10
+        assert len(defs) == 11
         names = {d.name for d in defs}
         assert names == {
             "read",
@@ -50,6 +50,7 @@ class TestDefinitions:
             "grep",
             "bash",
             "document_generate",
+            "artifact_publish",
         }
 
     def test_all_definitions_have_executor_source(self) -> None:

@@ -5,7 +5,12 @@ from __future__ import annotations
 from typing import Any
 
 from cognis.models.tool import ToolDefinition, ToolSource
-from cognis.tools.executor.document import DOCUMENT_GENERATE_TOOL, handle_document_generate
+from cognis.tools.executor.document import (
+    ARTIFACT_PUBLISH_TOOL,
+    DOCUMENT_GENERATE_TOOL,
+    handle_artifact_publish,
+    handle_document_generate,
+)
 from cognis.tools.executor.filesystem import (
     handle_edit,
     handle_list_directory,
@@ -466,6 +471,7 @@ ALL_EXECUTOR_TOOLS: list[ToolDefinition] = [
     GREP_TOOL,
     BASH_TOOL,
     DOCUMENT_GENERATE_TOOL,
+    ARTIFACT_PUBLISH_TOOL,
 ]
 
 _HANDLER_MAP: dict[
@@ -482,6 +488,7 @@ _HANDLER_MAP: dict[
     "grep": handle_grep,
     "bash": handle_bash,
     "document_generate": handle_document_generate,
+    "artifact_publish": handle_artifact_publish,
     "web_fetch": handle_web_fetch,
     "web_search": handle_web_search,
     "web_crawl": handle_web_crawl,

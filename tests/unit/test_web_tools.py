@@ -195,7 +195,7 @@ class TestDefinitions:
         names = {d.name for d in defs}
         assert "web_fetch" not in names
         assert "web_search" not in names
-        assert len(defs) == 10
+        assert len(defs) == 11
 
 
 class TestDynamicWebDefinitions:

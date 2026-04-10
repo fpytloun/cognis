@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from cognis.models.tool import ExecutorHandle
-from cognis.tools.executor.document import handle_document_generate
+from cognis.tools.executor.document import handle_artifact_publish, handle_document_generate
 from cognis.tools.registry import ToolExecutionContext
 
 _DUMMY_CONTEXT = ToolExecutionContext(
@@ -95,3 +95,17 @@ async def test_document_generate_supports_local_assets(
     assert not result.is_error
     assert result.attachments is not None
     assert result.attachments[0]["filename"].endswith(".pdf")
+
+
+@pytest.mark.asyncio
+async def test_artifact_publish_reads_local_file(tmp_path: Path) -> None:
+    report = tmp_path / "report.pdf"
+    report.write_bytes(b"%PDF-published")
+
+    result = await handle_artifact_publish({"path": str(report)}, _DUMMY_CONTEXT)
+
+    assert not result.is_error
+    assert result.attachments is not None
+    assert result.attachments[0]["filename"] == "report.pdf"
+    assert result.attachments[0]["mime_type"] == "application/pdf"
+    assert base64.b64decode(result.attachments[0]["content_b64"]) == b"%PDF-published"
