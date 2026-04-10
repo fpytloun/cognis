@@ -120,7 +120,7 @@ def _normalize_signal_cli_trust_mode(value: str) -> str:
     return mapping.get(value, "on-first-use")
 
 
-def _infer_signal_voice_input(body: str, attachments: list[dict[str, Any]]) -> bool:
+def _infer_signal_voice_input(body: str | None, attachments: list[dict[str, Any]]) -> bool:
     if not attachments:
         return False
     if any(
@@ -128,7 +128,8 @@ def _infer_signal_voice_input(body: str, attachments: list[dict[str, Any]]) -> b
         for attachment in attachments
     ):
         return True
-    if body.strip():
+    normalized_body = body or ""
+    if normalized_body.strip():
         return False
     audio_attachments = [
         attachment
@@ -662,7 +663,7 @@ class SignalAdapter(BaseChannelAdapter):
         source = envelope.get("source", "") or envelope.get("sourceNumber", "")
         source_name = envelope.get("sourceName", "")
         timestamp = data_message.get("timestamp", 0)
-        body = data_message.get("message", "")
+        body = data_message.get("message") or ""
 
         if not body and not data_message.get("attachments"):
             return

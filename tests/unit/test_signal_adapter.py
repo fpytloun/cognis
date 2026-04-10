@@ -123,6 +123,15 @@ class TestSignalVoiceInference:
             is True
         )
 
+    def test_null_body_single_audio_attachment_is_treated_as_voice_input(self) -> None:
+        assert (
+            _infer_signal_voice_input(
+                None,
+                [{"contentType": "audio/ogg", "id": "att-1"}],
+            )
+            is True
+        )
+
     def test_audio_with_text_is_not_treated_as_voice_input(self) -> None:
         assert (
             _infer_signal_voice_input(
