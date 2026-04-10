@@ -8,11 +8,12 @@ import pytest
 from cognis.channels.inbound import (
     ChannelTurnObserver,
     InboundPipeline,
+    _fallback_attachment_content,
 )
 from cognis.core.commands import CommandResult
 from cognis.core.turn_scheduler import TurnResult
 from cognis.models.artifact import ArtifactKind, AttachmentRef
-from cognis.models.channel import ChannelAccountConfig, InboundMessage
+from cognis.models.channel import ChannelAccountConfig, InboundMessage, MediaAttachment
 
 
 class _FakeAdapter:
@@ -255,6 +256,17 @@ async def test_channel_inbound_reports_voice_transcription_errors() -> None:
     turn_scheduler.submit_turn.assert_not_awaited()
     adapter.send_message.assert_awaited_once()
     assert "couldn't transcribe" in adapter.send_message.await_args.args[0].content.lower()
+
+
+def test_fallback_attachment_content_uses_raw_media_when_normalization_fails() -> None:
+    assert (
+        _fallback_attachment_content(
+            "",
+            [],
+            [MediaAttachment(mime_type="audio/ogg", filename="voice.ogg")],
+        )
+        == "User attached an audio file."
+    )
 
 
 @pytest.mark.asyncio

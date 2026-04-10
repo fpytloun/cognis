@@ -18,6 +18,7 @@ import asyncio
 import base64
 import contextlib
 import json
+import os
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -44,6 +45,16 @@ from cognis.models.channel import (
 )
 
 logger = get_logger(__name__)
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+_SIGNAL_DEBUG_ENABLED = _env_flag("COGNIS_SIGNAL_DEBUG", False)
 
 
 def _is_fatal_signal_error(message: str) -> bool:
@@ -107,6 +118,24 @@ def _normalize_signal_cli_trust_mode(value: str) -> str:
         "never": "never",
     }
     return mapping.get(value, "on-first-use")
+
+
+def _infer_signal_voice_input(body: str, attachments: list[dict[str, Any]]) -> bool:
+    if not attachments:
+        return False
+    if any(
+        any(bool(attachment.get(key)) for key in ("voiceNote", "voiceMessage", "ptt"))
+        for attachment in attachments
+    ):
+        return True
+    if body.strip():
+        return False
+    audio_attachments = [
+        attachment
+        for attachment in attachments
+        if str(attachment.get("contentType") or "").startswith("audio/")
+    ]
+    return len(attachments) == 1 and len(audio_attachments) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -649,12 +678,39 @@ class SignalAdapter(BaseChannelAdapter):
             chat_type = "direct"
             chat_name = source_name
 
+        raw_attachments = list(data_message.get("attachments", []))
+        voice_input = _infer_signal_voice_input(body, raw_attachments)
+        if _SIGNAL_DEBUG_ENABLED:
+            logger.info(
+                "signal adapter: inbound attachment metadata",
+                extra={
+                    "extra_data": {
+                        "account_id": self.account_id,
+                        "body_empty": not bool(body.strip()),
+                        "attachment_count": len(raw_attachments),
+                        "attachment_content_types": [
+                            str(attachment.get("contentType") or "")
+                            for attachment in raw_attachments
+                        ],
+                        "attachment_has_voice_flags": [
+                            {
+                                "voiceNote": bool(attachment.get("voiceNote")),
+                                "voiceMessage": bool(attachment.get("voiceMessage")),
+                                "ptt": bool(attachment.get("ptt")),
+                            }
+                            for attachment in raw_attachments
+                        ],
+                        "attachment_has_platform_ids": [
+                            bool(attachment.get("id")) for attachment in raw_attachments
+                        ],
+                        "inferred_voice_input": voice_input,
+                    }
+                },
+            )
+
         # Parse attachments
         media: list[MediaAttachment] = []
-        voice_input = False
-        for attachment in data_message.get("attachments", []):
-            if any(bool(attachment.get(key)) for key in ("voiceNote", "voiceMessage", "ptt")):
-                voice_input = True
+        for attachment in raw_attachments:
             media.append(
                 MediaAttachment(
                     path=attachment.get("filename"),
@@ -744,10 +800,31 @@ class SignalAdapter(BaseChannelAdapter):
     ) -> tuple[bytes, str, str] | None:
         """Download attachment via signal-cli getAttachment (direct mode)."""
         if self._runtime is None or not self._runtime.is_running:
+            if _SIGNAL_DEBUG_ENABLED:
+                logger.info(
+                    "signal adapter: direct attachment download skipped",
+                    extra={
+                        "extra_data": {
+                            "account_id": self.account_id,
+                            "reason": "runtime_unavailable",
+                        }
+                    },
+                )
             return None
 
         attachment_id = attachment.platform_id
         if not attachment_id:
+            if _SIGNAL_DEBUG_ENABLED:
+                logger.info(
+                    "signal adapter: direct attachment missing platform id",
+                    extra={
+                        "extra_data": {
+                            "account_id": self.account_id,
+                            "has_path": bool(attachment.path),
+                            "mime_type": attachment.mime_type,
+                        }
+                    },
+                )
             # Try filesystem path as fallback
             if attachment.path:
                 path = Path(attachment.path)
@@ -762,6 +839,17 @@ class SignalAdapter(BaseChannelAdapter):
             return None
 
         try:
+            if _SIGNAL_DEBUG_ENABLED:
+                logger.info(
+                    "signal adapter: direct attachment download starting",
+                    extra={
+                        "extra_data": {
+                            "account_id": self.account_id,
+                            "attachment_id_present": True,
+                            "mime_type": attachment.mime_type,
+                        }
+                    },
+                )
             result = await self._runtime.request(
                 "getAttachment",
                 self._direct_params({"account": self._account_number, "id": attachment_id}),
@@ -769,8 +857,28 @@ class SignalAdapter(BaseChannelAdapter):
             )
             # signal-cli may return the attachment path
             att_path = result.get("file") or result.get("filename")
+            if _SIGNAL_DEBUG_ENABLED:
+                logger.info(
+                    "signal adapter: direct attachment download result",
+                    extra={
+                        "extra_data": {
+                            "account_id": self.account_id,
+                            "returned_path": bool(att_path),
+                        }
+                    },
+                )
             if att_path:
                 path = Path(att_path)
+                if _SIGNAL_DEBUG_ENABLED:
+                    logger.info(
+                        "signal adapter: direct attachment path check",
+                        extra={
+                            "extra_data": {
+                                "account_id": self.account_id,
+                                "path_exists": path.exists(),
+                            }
+                        },
+                    )
                 if path.exists():
                     content = await asyncio.to_thread(path.read_bytes)
                     if len(content) > _MAX_ATTACHMENT_BYTES:

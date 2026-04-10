@@ -11,6 +11,7 @@ import pytest
 
 from cognis.channels.adapters.signal import (
     SignalAdapter,
+    _infer_signal_voice_input,
     _is_fatal_signal_error,
     _normalize_signal_cli_trust_mode,
     _SignalConfig,
@@ -101,6 +102,35 @@ class TestSignalFatalErrorClassification:
 
     def test_generic_error_is_not_fatal(self) -> None:
         assert _is_fatal_signal_error("signal-cli process exited unexpectedly") is False
+
+
+class TestSignalVoiceInference:
+    def test_voice_flags_mark_voice_input(self) -> None:
+        assert (
+            _infer_signal_voice_input(
+                "",
+                [{"contentType": "audio/ogg", "voiceNote": True}],
+            )
+            is True
+        )
+
+    def test_empty_single_audio_attachment_is_treated_as_voice_input(self) -> None:
+        assert (
+            _infer_signal_voice_input(
+                "",
+                [{"contentType": "audio/ogg", "id": "att-1"}],
+            )
+            is True
+        )
+
+    def test_audio_with_text_is_not_treated_as_voice_input(self) -> None:
+        assert (
+            _infer_signal_voice_input(
+                "please analyze this file",
+                [{"contentType": "audio/mpeg", "id": "att-1"}],
+            )
+            is False
+        )
 
 
 # ---------------------------------------------------------------------------
