@@ -11,6 +11,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from cognis.core.attachment_utils import attachment_note as _attachment_note
 from cognis.core.prompts import PromptContext, build_system_instructions
 from cognis.core.runtime import ExecutorEnvironmentSnapshot, build_local_executor_environment
 from cognis.logging import get_logger
@@ -66,15 +67,6 @@ class ContextAssemblyResult(BaseModel):
     max_context_tokens: int = 0
     recommend_compaction: bool = False
     cache_breakpoint_index: int | None = None
-
-
-def _attachment_note(attachments: list[dict[str, Any]]) -> str:
-    parts: list[str] = []
-    for attachment in attachments:
-        filename = str(attachment.get("filename") or attachment.get("artifact_id") or "attachment")
-        kind = str(attachment.get("kind") or "file")
-        parts.append(f"{filename} ({kind})")
-    return "Attachments: " + ", ".join(parts)
 
 
 def _filter_attachments_by_names(

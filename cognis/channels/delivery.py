@@ -77,6 +77,7 @@ class ChannelDeliveryService:
         self,
         conversation_id: str,
         content: str,
+        attachments: list[dict[str, Any]] | None = None,
     ) -> bool:
         """Send a message to a conversation's channel.
 
@@ -94,6 +95,7 @@ class ChannelDeliveryService:
             chat_id=chat_id,
             thread_id=thread_id,
             content=content,
+            media=attachments,
         )
         return status == "sent"
 
@@ -271,6 +273,9 @@ class ChannelDeliveryService:
         task_title = event.data.get("task_title", "Background task")
         event.data.get("status", "completed")
         result_summary = event.data.get("result_summary", "")
+        attachments = event.data.get("attachments")
+        if not isinstance(attachments, list):
+            attachments = None
 
         if event.type == EventType.TASK_COMPLETED:
             content = f'Task "{task_title}" completed.'
@@ -283,7 +288,7 @@ class ChannelDeliveryService:
             if result_summary:
                 content += f"\n\nError: {result_summary}"
 
-        await self.send_to_conversation(conversation_id, content)
+        await self.send_to_conversation(conversation_id, content, attachments=attachments)
 
     async def _handle_turn_completed_event(self, event: Event) -> None:
         delivery_id = event.data.get("delivery_id")

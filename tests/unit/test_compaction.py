@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from cognis.core.compaction import CompactionStrategy
+from cognis.core.compaction import CompactionStrategy, _format_events_for_compaction
 from cognis.core.session_cache import CachedEvent, CachedSessionState
 from cognis.models.session import EventAppendResult, SessionModel
 
@@ -116,6 +116,31 @@ async def test_compaction_write_failure_leaves_cache_unchanged() -> None:
         await strategy.compact(_session())
 
     assert cache.applied == []
+
+
+def test_compaction_formats_attachment_notes() -> None:
+    events = [
+        type(
+            "Event",
+            (),
+            {
+                "seq": 1,
+                "type": "assistant_message",
+                "data": {
+                    "content": "",
+                    "attachments": [
+                        {"filename": "report.pdf", "kind": "pdf"},
+                        {"filename": "diagram.png", "kind": "image"},
+                    ],
+                },
+            },
+        )()
+    ]
+
+    formatted = _format_events_for_compaction(events)
+
+    assert "report.pdf (pdf)" in formatted
+    assert "diagram.png (image)" in formatted
 
 
 @pytest.mark.asyncio

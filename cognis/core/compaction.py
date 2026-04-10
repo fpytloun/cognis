@@ -8,6 +8,7 @@ from prometheus_client import Counter
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from cognis.core.attachment_utils import merge_content_and_attachment_note
 from cognis.core.json_utils import extract_text_from_response
 from cognis.logging import get_logger
 from cognis.models.session import SessionEvent, SessionModel
@@ -227,7 +228,10 @@ def _format_events_for_compaction(events: list[Any]) -> str:
         data = event.data
 
         if etype in ("user_message", "assistant_message"):
-            payload = data.get("content", "")
+            payload = merge_content_and_attachment_note(
+                str(data.get("content", "")),
+                [a for a in data.get("attachments", []) if isinstance(a, dict)],
+            )
         elif etype == "tool_call":
             name = data.get("name", "unknown")
             args = data.get("arguments", "")

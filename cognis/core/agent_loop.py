@@ -21,6 +21,7 @@ from typing import Any
 
 from prometheus_client import Counter, Histogram
 
+from cognis.core.attachment_utils import merge_content_and_attachment_note
 from cognis.core.compaction import ROTATION_TOTAL
 from cognis.core.events import Event, EventBus, EventType
 from cognis.core.prompts import PromptContext
@@ -1549,7 +1550,12 @@ class AgentLoop:
                             },
                         )
                     )
-                    assistant_content_parts.append(partial_content)
+                    assistant_content_parts.append(
+                        merge_content_and_attachment_note(
+                            partial_content,
+                            _event_safe_attachments(collected_attachments),
+                        )
+                    )
 
                 logger.warning(
                     "agent: mid-stream failure after retries exhausted",
@@ -1604,7 +1610,12 @@ class AgentLoop:
                 )
                 if content:
                     messages.append({"role": "assistant", "content": content})
-                    assistant_content_parts.append(content)
+                assistant_content_parts.append(
+                    merge_content_and_attachment_note(
+                        content,
+                        _event_safe_attachments(collected_attachments),
+                    )
+                )
 
             # No tool calls — check if step is complete
             if not tool_calls:
@@ -3363,9 +3374,13 @@ class AgentLoop:
         # from the events list (covers the non-incremental path).
         if assistant_content_parts is None:
             extracted = [
-                e.data.get("content", "")
+                merge_content_and_attachment_note(
+                    str(e.data.get("content", "")),
+                    [a for a in e.data.get("attachments", []) if isinstance(a, dict)],
+                )
                 for e in events
-                if e.type == "assistant_message" and e.data.get("content")
+                if e.type == "assistant_message"
+                and (e.data.get("content") or e.data.get("attachments"))
             ]
             await self._dispatch_remember(ctx, extracted or None)
         else:

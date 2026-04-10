@@ -57,6 +57,49 @@ async def test_document_generate_from_markdown(monkeypatch: pytest.MonkeyPatch) 
 
 
 @pytest.mark.asyncio
+async def test_document_generate_writes_output_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def fake_markdown(text: str, **_: object) -> str:
+        return f"<h1>{text}</h1>"
+
+    class _FakeHTML:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def write_pdf(self, stylesheets: list[object]) -> bytes:
+            return b"%PDF-local"
+
+    class _FakeCSS:
+        def __init__(self, **_: object) -> None:
+            pass
+
+    monkeypatch.setitem(
+        __import__("sys").modules, "markdown", types.SimpleNamespace(markdown=fake_markdown)
+    )
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "weasyprint",
+        types.SimpleNamespace(HTML=_FakeHTML, CSS=_FakeCSS),
+    )
+
+    output_path = tmp_path / "out" / "doc.pdf"
+    result = await handle_document_generate(
+        {
+            "content": "# Title",
+            "input_format": "markdown",
+            "output_path": str(output_path),
+        },
+        _DUMMY_CONTEXT,
+    )
+
+    assert not result.is_error
+    assert output_path.read_bytes() == b"%PDF-local"
+    payload = ast.literal_eval(result.output)
+    assert payload["output_path"] == str(output_path)
+
+
+@pytest.mark.asyncio
 async def test_document_generate_supports_local_assets(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -151,6 +194,82 @@ async def test_document_generate_supports_injected_artifact_assets(
     payload = ast.literal_eval(result.output)
     assert payload["template"] == "proposal"
     assert payload["assets_used"] == ["diag"]
+
+
+@pytest.mark.asyncio
+async def test_document_generate_appends_pdf_assets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_markdown(text: str, **_: object) -> str:
+        return text
+
+    class _FakeHTML:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def write_pdf(self, stylesheets: list[object]) -> bytes:
+            return b"BASEPDF"
+
+    class _FakeCSS:
+        def __init__(self, **_: object) -> None:
+            pass
+
+    class _Page:
+        pass
+
+    class _Reader:
+        def __init__(self, stream: object) -> None:
+            data = stream.getvalue()
+            self.pages = [data]
+
+    class _Writer:
+        def __init__(self) -> None:
+            self.pages: list[bytes] = []
+
+        def add_page(self, page: bytes) -> None:
+            self.pages.append(page)
+
+        def write(self, out: object) -> None:
+            out.write(b"|".join(self.pages))
+
+    monkeypatch.setitem(
+        __import__("sys").modules, "markdown", types.SimpleNamespace(markdown=fake_markdown)
+    )
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "weasyprint",
+        types.SimpleNamespace(HTML=_FakeHTML, CSS=_FakeCSS),
+    )
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "pypdf",
+        types.SimpleNamespace(PdfReader=_Reader, PdfWriter=_Writer),
+    )
+
+    result = await handle_document_generate(
+        {
+            "content": "hello",
+            "input_format": "markdown",
+            "append_pdf_assets": True,
+            "assets": [
+                {
+                    "name": "appendix",
+                    "filename": "appendix.pdf",
+                    "mime_type": "application/pdf",
+                    "content_b64": base64.b64encode(b"APPENDIX").decode("ascii"),
+                }
+            ],
+        },
+        _DUMMY_CONTEXT,
+    )
+
+    assert not result.is_error
+    assert result.attachments is not None
+    assert base64.b64decode(result.attachments[0]["content_b64"]) == b"BASEPDF|APPENDIX"
+    payload = ast.literal_eval(result.output)
+    assert payload["append_pdf_assets"] is True
+    assert payload["appended_pdfs"] == ["appendix.pdf"]
+    assert payload["companion_attachments"] == []
 
 
 @pytest.mark.asyncio

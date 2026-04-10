@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import html
 import mimetypes
 import re
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +48,10 @@ DOCUMENT_GENERATE_TOOL = ToolDefinition(
             },
             "title": {"type": "string", "description": "Document title."},
             "filename": {"type": "string", "description": "Output PDF filename."},
+            "output_path": {
+                "type": "string",
+                "description": "Optional local executor path to also write the generated PDF.",
+            },
             "css": {"type": "string", "description": "Optional custom CSS."},
             "template": {
                 "type": "string",
@@ -147,8 +153,10 @@ async def handle_document_generate(
                 output="Unsupported input_format. Use 'markdown' or 'html'.", is_error=True
             )
 
-        assets, companion_attachments, warnings = await _resolve_assets(
-            arguments.get("assets") or []
+        append_pdf_assets = bool(arguments.get("append_pdf_assets", False))
+        assets, companion_attachments, pdf_appendices, warnings = await _resolve_assets(
+            arguments.get("assets") or [],
+            append_pdf_assets=append_pdf_assets,
         )
         title = str(arguments.get("title") or _derive_title(source_text) or "Document")
 
@@ -165,7 +173,10 @@ async def handle_document_generate(
             css += f"\n\n{custom_css}"
 
         pdf_bytes = await _render_pdf(title=title, html_body=html_body, css=css, base_dir=base_dir)
+        if pdf_appendices:
+            pdf_bytes = _append_pdf_documents(pdf_bytes, pdf_appendices)
         filename = _output_filename(arguments.get("filename"), title)
+        written_path = await _write_output_path(arguments.get("output_path"), pdf_bytes)
         output = {
             "document_title": title,
             "filename": filename,
@@ -175,6 +186,9 @@ async def handle_document_generate(
             "orientation": orientation,
             "source_kind": source_kind,
             "source_ref": _source_reference(arguments, source_kind),
+            "append_pdf_assets": append_pdf_assets,
+            "appended_pdfs": [name for name, _content in pdf_appendices],
+            "output_path": written_path,
             "warnings": warnings,
             "assets_used": sorted(assets.keys()),
             "companion_attachments": [item["filename"] for item in companion_attachments],
@@ -265,9 +279,12 @@ async def _load_source(arguments: dict[str, Any]) -> tuple[str, str, str | None]
 
 async def _resolve_assets(
     raw_assets: list[Any],
-) -> tuple[dict[str, dict[str, str]], list[dict[str, Any]], list[str]]:
+    *,
+    append_pdf_assets: bool,
+) -> tuple[dict[str, dict[str, str]], list[dict[str, Any]], list[tuple[str, bytes]], list[str]]:
     resolved: dict[str, dict[str, str]] = {}
     companion_attachments: list[dict[str, Any]] = []
+    pdf_appendices: list[tuple[str, bytes]] = []
     warnings: list[str] = []
     for raw in raw_assets:
         if not isinstance(raw, dict):
@@ -277,6 +294,10 @@ async def _resolve_assets(
             continue
         asset_bytes, mime_type, filename = await _load_asset_bytes(raw)
         if mime_type == "application/pdf":
+            if append_pdf_assets:
+                pdf_appendices.append((filename, asset_bytes))
+                warnings.append(f"Asset '{name}' was appended to the final PDF.")
+                continue
             companion_attachments.append(
                 {
                     "filename": filename,
@@ -308,7 +329,7 @@ async def _resolve_assets(
         warnings.append(
             f"Asset '{name}' could not be inlined and was attached as a companion file."
         )
-    return resolved, companion_attachments, warnings
+    return resolved, companion_attachments, pdf_appendices, warnings
 
 
 async def _load_asset_bytes(raw: dict[str, Any]) -> tuple[bytes, str, str]:
@@ -477,3 +498,31 @@ def _source_reference(arguments: dict[str, Any], source_kind: str) -> str | None
         artifact_id = arguments.get("source_artifact_id")
         return str(artifact_id) if artifact_id else None
     return None
+
+
+def _append_pdf_documents(base_pdf: bytes, appendices: list[tuple[str, bytes]]) -> bytes:
+    try:
+        from pypdf import PdfReader, PdfWriter
+    except ImportError as exc:
+        raise DocumentGenerationError(
+            "Appending PDF assets requires the 'pypdf' package to be installed."
+        ) from exc
+
+    writer = PdfWriter()
+    for page in PdfReader(BytesIO(base_pdf)).pages:
+        writer.add_page(page)
+    for _filename, appendix_bytes in appendices:
+        for page in PdfReader(BytesIO(appendix_bytes)).pages:
+            writer.add_page(page)
+    out = BytesIO()
+    writer.write(out)
+    return out.getvalue()
+
+
+async def _write_output_path(raw_output_path: Any, pdf_bytes: bytes) -> str | None:
+    if not isinstance(raw_output_path, str) or not raw_output_path.strip():
+        return None
+    path = resolve_path(raw_output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    await asyncio.to_thread(path.write_bytes, pdf_bytes)
+    return str(path)

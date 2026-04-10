@@ -256,3 +256,33 @@ async def test_task_event_is_suppressed_when_follow_up_delivery_exists() -> None
     await service._handle_task_event(event)
 
     service.send_to_conversation.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_task_event_passes_attachments_to_fallback_notification() -> None:
+    service = _make_service()
+    service._resolve_channel = AsyncMock(return_value=("signal", "acct-1", "chat-1", None))  # type: ignore[method-assign]
+    service.send_to_conversation = AsyncMock(return_value=True)  # type: ignore[method-assign]
+
+    event = Event(
+        type=EventType.TASK_COMPLETED,
+        data={
+            "conversation_id": "conv-1",
+            "task_title": "Background task",
+            "result_summary": "Done",
+            "attachments": [
+                {
+                    "artifact_id": "doc_1",
+                    "filename": "report.pdf",
+                    "mime_type": "application/pdf",
+                }
+            ],
+        },
+    )
+
+    await service._handle_task_event(event)
+
+    service.send_to_conversation.assert_awaited_once()
+    assert (
+        service.send_to_conversation.await_args.kwargs["attachments"][0]["artifact_id"] == "doc_1"
+    )
