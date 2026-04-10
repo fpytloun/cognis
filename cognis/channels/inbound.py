@@ -71,6 +71,15 @@ def _fallback_attachment_content(
     return content
 
 
+def _filter_turn_attachments_for_voice_input(
+    message: InboundMessage,
+    attachments: list[AttachmentRef],
+) -> list[AttachmentRef]:
+    if not bool(message.platform_data.get("voice_input")):
+        return attachments
+    return [attachment for attachment in attachments if attachment.kind != ArtifactKind.AUDIO]
+
+
 class InboundPipeline:
     """Processes inbound messages from channel adapters.
 
@@ -222,6 +231,7 @@ class InboundPipeline:
             except Exception as exc:
                 await self._send_error(message, config, str(exc))
                 return
+        turn_attachments = _filter_turn_attachments_for_voice_input(message, attachments)
         user_content = _fallback_attachment_content(user_content, attachments, message.media)
 
         # 4. Register observer for response delivery
@@ -243,7 +253,7 @@ class InboundPipeline:
             conversation_id,
             user_content,
             user_email=user_email,
-            attachments=[item.model_dump(mode="json") for item in attachments],
+            attachments=[item.model_dump(mode="json") for item in turn_attachments],
         )
 
         if error is not None:

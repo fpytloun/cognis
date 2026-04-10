@@ -9,6 +9,7 @@ from cognis.channels.inbound import (
     ChannelTurnObserver,
     InboundPipeline,
     _fallback_attachment_content,
+    _filter_turn_attachments_for_voice_input,
 )
 from cognis.core.commands import CommandResult
 from cognis.core.turn_scheduler import TurnResult
@@ -267,6 +268,39 @@ def test_fallback_attachment_content_uses_raw_media_when_normalization_fails() -
         )
         == "User attached an audio file."
     )
+
+
+def test_filter_turn_attachments_for_voice_input_removes_audio() -> None:
+    attachments = [
+        AttachmentRef(
+            artifact_id="att-audio",
+            kind=ArtifactKind.AUDIO,
+            mime_type="audio/ogg",
+            filename="voice.ogg",
+            size_bytes=10,
+        ),
+        AttachmentRef(
+            artifact_id="att-image",
+            kind=ArtifactKind.IMAGE,
+            mime_type="image/png",
+            filename="image.png",
+            size_bytes=10,
+        ),
+    ]
+    message = InboundMessage(
+        channel_type="signal",
+        account_id="acct-1",
+        message_id="msg-1",
+        sender_id="sender-1",
+        chat_id="chat-1",
+        content="",
+        timestamp=__import__("datetime").datetime.now(__import__("datetime").UTC),
+        platform_data={"voice_input": True},
+    )
+
+    filtered = _filter_turn_attachments_for_voice_input(message, attachments)
+
+    assert [attachment.artifact_id for attachment in filtered] == ["att-image"]
 
 
 @pytest.mark.asyncio

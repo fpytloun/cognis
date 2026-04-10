@@ -72,6 +72,9 @@ def _as_user_facing_host(host: str) -> str:
 
 
 def _build_user_facing_url(config: object) -> str:
+    explicit = getattr(config, "public_base_url", "")
+    if isinstance(explicit, str) and explicit:
+        return explicit.rstrip("/")
     return f"http://{_as_user_facing_host(config.host)}:{config.port}"  # type: ignore[attr-defined]
 
 

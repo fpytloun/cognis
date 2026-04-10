@@ -28,6 +28,7 @@ class CognisConfig:
     # Service URLs
     mnemory_url: str
     intaris_url: str
+    public_base_url: str
 
     # Database
     database_url: str
@@ -113,6 +114,7 @@ def load_config() -> CognisConfig:
         port=int(os.environ.get("COGNIS_PORT", "8080")),
         mnemory_url=os.environ.get("COGNIS_MNEMORY_URL", "http://localhost:8050"),
         intaris_url=os.environ.get("COGNIS_INTARIS_URL", "http://localhost:8060"),
+        public_base_url=os.environ.get("COGNIS_PUBLIC_BASE_URL", "").rstrip("/"),
         database_url=os.environ.get("DATABASE_URL", default_db_url),
         jwt_private_key_path=_expand_path(
             os.environ.get(
