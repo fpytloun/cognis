@@ -785,17 +785,6 @@ class ChannelTurnObserver:
 
     async def on_turn_complete(self, result: Any) -> None:
         """Send the accumulated response to the channel."""
-        if not self._turn_active:
-            # This observer was registered for a queued message that hasn't
-            # started yet. Keep it alive for the next turn.
-            return
-        # Remove self from observers
-        self._turn_scheduler_remove()
-
-        adapter = self._get_adapter()
-        if adapter is None:
-            return
-
         # Extract outbound attachments from the turn result
         outbound_media: list[MediaAttachment] = []
         if result is not None:
@@ -806,6 +795,17 @@ class ChannelTurnObserver:
                         outbound_media.append(
                             await _materialize_turn_attachment(att, self._channel_manager_ref())
                         )
+
+        if not self._turn_active and not outbound_media:
+            # This observer was registered for a queued message that hasn't
+            # started yet. Keep it alive for the next turn.
+            return
+        # Remove self from observers
+        self._turn_scheduler_remove()
+
+        adapter = self._get_adapter()
+        if adapter is None:
+            return
 
         content = self._accumulated_text
         self._accumulated_text = ""

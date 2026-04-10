@@ -504,15 +504,20 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
   if (event.type === 'message_complete') {
     const itemId = `message:${event.message_id}`;
     const index = next.findIndex((item) => item.id === itemId && item.kind === 'message');
+    const attachments = Array.isArray(event.attachments) ? event.attachments : [];
     if (index >= 0) {
       const message = next[index] as MessageTimelineItem;
-      const attachments = Array.isArray(event.attachments) ? event.attachments : message.attachments;
       next[index] = {
         ...message,
         seq: event.seq,
         streaming: false,
-        attachments
+        attachments: attachments.length > 0 ? attachments : message.attachments
       };
+      return next;
+    }
+
+    if (attachments.length > 0) {
+      next.push(createMessageItem(itemId, 'assistant', '', new Date().toISOString(), event.seq, event.message_id, false, attachments));
       return next;
     }
 

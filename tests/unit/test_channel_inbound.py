@@ -475,6 +475,46 @@ async def test_channel_turn_observer_sends_text_and_media_together() -> None:
 
 
 @pytest.mark.asyncio
+async def test_channel_turn_observer_sends_attachment_only_turn() -> None:
+    adapter = _FakeAdapter()
+    manager = _FakeManager(adapter)
+    turn_scheduler = MagicMock()
+
+    observer = ChannelTurnObserver(
+        channel_type="signal",
+        account_id="acct-1",
+        chat_id="chat-1",
+        conversation_id="conv-1",
+        turn_scheduler=turn_scheduler,
+        reply_to_id="msg-1",
+        channel_manager_ref=lambda: manager,
+        assistant_delivery_mode="final",
+    )
+
+    await observer.on_turn_complete(
+        TurnResult(
+            conversation_id="conv-1",
+            session_id="sess-1",
+            message_id="msg-2",
+            attachments=[
+                {
+                    "url": "https://example.com/banner.png",
+                    "mime_type": "image/png",
+                    "filename": "banner.png",
+                    "size_bytes": 123,
+                }
+            ],
+        )
+    )
+
+    adapter.send_message.assert_awaited_once()
+    outbound = adapter.send_message.await_args.args[0]
+    assert outbound.content == ""
+    assert len(outbound.media) == 1
+    assert outbound.media[0].url == "https://example.com/banner.png"
+
+
+@pytest.mark.asyncio
 async def test_channel_turn_observer_logs_delivery_failure(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

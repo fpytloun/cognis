@@ -68,6 +68,37 @@ describe('chat timeline helpers', () => {
     expect(items[0]).toMatchObject({ kind: 'delegation', taskId: 'task_1', status: 'failed' });
   });
 
+  it('creates an assistant bubble for attachment-only message completion', () => {
+    const items = applyWebSocketEvent([], {
+      type: 'message_complete',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      message_id: 'msg_2',
+      seq: 3,
+      token_usage: null,
+      context_usage: null,
+      queued_count: 0,
+      attachments: [
+        {
+          artifact_id: 'img_1',
+          kind: 'image',
+          mime_type: 'image/jpeg',
+          filename: 'banner.jpg',
+          size_bytes: 456,
+          url: 'https://cognis.example.com/banner.jpg'
+        }
+      ]
+    });
+
+    expect(items[0]).toMatchObject({
+      kind: 'message',
+      role: 'assistant',
+      content: '',
+      seq: 3,
+      attachments: [{ artifact_id: 'img_1', filename: 'banner.jpg' }]
+    });
+  });
+
   it('renders direct-chat clarification notices without task wording', () => {
     const items = applyWebSocketEvent([], {
       type: 'workflow_step_question',
