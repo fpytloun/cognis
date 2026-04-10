@@ -456,6 +456,29 @@ class ArtifactStore:
         path = f"/api/v1/artifacts/content/{quote(namespace)}/{quote(object_id)}/{quote(filename)}"
         return f"{self._config.base_url}{path}?exp={exp}&sig={sig}"
 
+    def get_public_url(
+        self,
+        namespace: str,
+        object_id: str,
+        filename: str,
+        *,
+        ttl_seconds: int | None = None,
+    ) -> str:
+        """Generate a Cognis-served signed URL for an artifact.
+
+        Unlike ``get_signed_url()``, this always uses the controller-facing
+        Cognis URL instead of backend-native presigned URLs. Use this for any
+        user-facing or channel-facing artifact delivery where internal backend
+        hostnames may not be reachable.
+        """
+        if not self._config.base_url or not self._config.signing_secret:
+            raise ValueError("Artifact public URLs require base_url and signing_secret")
+        ttl = ttl_seconds or self._config.signed_url_ttl_seconds
+        exp = int(time.time()) + ttl
+        sig = self._filesystem_signature(namespace, object_id, filename, exp)
+        path = f"/api/v1/artifacts/content/{quote(namespace)}/{quote(object_id)}/{quote(filename)}"
+        return f"{self._config.base_url}{path}?exp={exp}&sig={sig}"
+
     def verify_signed_request(
         self, namespace: str, object_id: str, filename: str, *, exp: int, sig: str
     ) -> bool:
@@ -530,4 +553,18 @@ class ArtifactStore:
 
         return await asyncio.to_thread(
             self.get_signed_url, namespace, object_id, filename, ttl_seconds=ttl_seconds
+        )
+
+    async def async_get_public_url(
+        self,
+        namespace: str,
+        object_id: str,
+        filename: str,
+        *,
+        ttl_seconds: int | None = None,
+    ) -> str:
+        import asyncio
+
+        return await asyncio.to_thread(
+            self.get_public_url, namespace, object_id, filename, ttl_seconds=ttl_seconds
         )

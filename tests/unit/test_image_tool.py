@@ -56,7 +56,7 @@ async def test_handle_image_tool_returns_channel_attachments() -> None:
     artifact_store = MagicMock()
     artifact_store.generate_id.return_value = "img_123"
     artifact_store.async_save = AsyncMock()
-    artifact_store.async_get_signed_url = AsyncMock(return_value="https://example.com/signed.png")
+    artifact_store.async_get_public_url = AsyncMock(return_value="https://example.com/signed.png")
 
     with scoped_runtime_context(user_email="user@example.com"):
         result = await handle_image_tool(
@@ -78,3 +78,4 @@ async def test_handle_image_tool_returns_channel_attachments() -> None:
             "size_bytes": 3,
         }
     ]
+    artifact_store.async_get_public_url.assert_awaited_once_with("images", "img_123", "image")

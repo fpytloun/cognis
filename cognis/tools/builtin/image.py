@@ -252,7 +252,7 @@ def _image_filename(image_id: str, content_type: str) -> str:
 
 async def _resolve_image_url(artifact_store: Any, image_id: str) -> str | None:
     try:
-        return await artifact_store.async_get_signed_url("images", image_id, "image")
+        return await artifact_store.async_get_public_url("images", image_id, "image")
     except Exception:
         return None
 

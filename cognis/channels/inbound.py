@@ -701,7 +701,7 @@ class ChannelTurnObserver:
         if not content and not outbound_media:
             return
 
-        with contextlib.suppress(Exception):
+        try:
             await adapter.send_message(
                 OutboundMessage(
                     channel_type=self._channel_type,
@@ -717,6 +717,20 @@ class ChannelTurnObserver:
                 channel_type=self._channel_type,
                 account_id=self._account_id,
             ).inc()
+        except Exception:
+            logger.warning(
+                "channel observer: final delivery failed",
+                extra={
+                    "extra_data": {
+                        "channel_type": self._channel_type,
+                        "account_id": self._account_id,
+                        "conversation_id": self._conversation_id,
+                        "has_text": bool(content),
+                        "media_count": len(outbound_media),
+                    }
+                },
+                exc_info=True,
+            )
 
     async def on_turn_error(self, conversation_id: str, error: Any) -> None:
         """Send error message to the channel."""
