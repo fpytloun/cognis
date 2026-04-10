@@ -19,6 +19,7 @@ import base64
 import binascii
 import contextlib
 import json
+import mimetypes
 import os
 import tempfile
 from datetime import UTC, datetime
@@ -245,11 +246,18 @@ def _extract_direct_attachment_result(
     )
 
 
-def _signal_attachment_data_uri(content_b64: str, media: MediaAttachment) -> str:
-    mime_type = media.mime_type or "application/octet-stream"
-    filename = media.filename or "attachment"
-    safe_filename = filename.replace(";", "_").replace(",", "_")
-    return f"data:{mime_type};filename={safe_filename};base64,{content_b64}"
+async def _write_signal_temp_attachment(
+    temp_dir: str,
+    content: bytes,
+    media: MediaAttachment,
+) -> Path:
+    import uuid
+
+    filename = _fallback_attachment_filename(media)
+    suffix = Path(filename).suffix or mimetypes.guess_extension(media.mime_type or "") or ".bin"
+    path = Path(temp_dir) / f"out-{uuid.uuid4().hex}{suffix}"
+    await asyncio.to_thread(path.write_bytes, content)
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -570,12 +578,25 @@ class SignalAdapter(BaseChannelAdapter):
                 extra={"extra_data": {"account_id": self.account_id}},
             )
 
+        temp_files: list[Path] = []
         if message.media:
             attachments: list[str] = []
             for media in message.media:
                 if media.content_b64:
                     try:
-                        attachments.append(_signal_attachment_data_uri(media.content_b64, media))
+                        if self._temp_dir is None:
+                            logger.warning(
+                                "signal adapter: temp dir unavailable for direct media send",
+                                extra={"extra_data": {"account_id": self.account_id}},
+                            )
+                            continue
+                        temp_path = await _write_signal_temp_attachment(
+                            self._temp_dir.name,
+                            base64.b64decode(media.content_b64),
+                            media,
+                        )
+                        attachments.append(str(temp_path))
+                        temp_files.append(temp_path)
                         continue
                     except Exception:
                         logger.warning("signal adapter: inline media decode failed", exc_info=True)
@@ -585,12 +606,19 @@ class SignalAdapter(BaseChannelAdapter):
                     async with httpx.AsyncClient(timeout=60.0) as dl:
                         resp = await dl.get(media.url)
                         resp.raise_for_status()
-                    attachments.append(
-                        _signal_attachment_data_uri(
-                            base64.b64encode(resp.content).decode("ascii"),
-                            media,
+                    if self._temp_dir is None:
+                        logger.warning(
+                            "signal adapter: temp dir unavailable for direct media send",
+                            extra={"extra_data": {"account_id": self.account_id}},
                         )
+                        continue
+                    temp_path = await _write_signal_temp_attachment(
+                        self._temp_dir.name,
+                        resp.content,
+                        media,
                     )
+                    attachments.append(str(temp_path))
+                    temp_files.append(temp_path)
                 except Exception:
                     logger.warning("signal adapter: media download failed", exc_info=True)
             if attachments:
@@ -603,6 +631,7 @@ class SignalAdapter(BaseChannelAdapter):
                         "media_count": len(message.media),
                         "attachment_count": len(attachments),
                         "has_temp_dir": self._temp_dir is not None,
+                        "attachment_mode": "temp_file",
                     }
                 },
             )
@@ -617,6 +646,10 @@ class SignalAdapter(BaseChannelAdapter):
                 exc_info=True,
             )
             return None
+        finally:
+            for temp_path in temp_files:
+                with contextlib.suppress(OSError):
+                    temp_path.unlink(missing_ok=True)
 
     # ------------------------------------------------------------------
     # Typing / read receipts / profile sync

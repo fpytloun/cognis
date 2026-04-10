@@ -486,7 +486,45 @@ def _extract_part_text(part: Any) -> str:
 
 def _normalize_message_content(content: Any) -> Any:
     if isinstance(content, list):
-        return content
+        normalized: list[dict[str, Any]] = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            part_type = str(part.get("type") or "")
+            if part_type in {"input_text", "input_image", "input_file"}:
+                normalized.append(part)
+                continue
+            if part_type == "text":
+                normalized.append({"type": "input_text", "text": str(part.get("text") or "")})
+                continue
+            if part_type == "image_url":
+                image_url = part.get("image_url")
+                detail = part.get("detail")
+                if isinstance(image_url, dict):
+                    url = image_url.get("url")
+                    detail = image_url.get("detail", detail)
+                else:
+                    url = image_url
+                if isinstance(url, str) and url:
+                    item: dict[str, Any] = {"type": "input_image", "image_url": url}
+                    if isinstance(detail, str) and detail:
+                        item["detail"] = detail
+                    normalized.append(item)
+                continue
+            if part_type == "file":
+                file_data = part.get("file")
+                if isinstance(file_data, dict):
+                    item = {"type": "input_file"}
+                    if isinstance(file_data.get("file_id"), str):
+                        item["file_id"] = file_data["file_id"]
+                    elif isinstance(file_data.get("file_url"), str):
+                        item["file_url"] = file_data["file_url"]
+                    if isinstance(file_data.get("filename"), str):
+                        item["filename"] = file_data["filename"]
+                    if len(item) > 1:
+                        normalized.append(item)
+                continue
+        return normalized
     if content is None:
         return ""
     return content

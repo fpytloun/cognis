@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import tempfile
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -847,8 +849,19 @@ class TestDirectSendBehavior:
         mock_runtime = MagicMock()
         mock_runtime.is_running = True
         mock_runtime.single_account_mode = True
-        mock_runtime.request = AsyncMock(return_value={"timestamp": 12345})
+
+        async def fake_request(method: str, params: dict[str, Any]) -> dict[str, Any]:
+            assert method == "send"
+            assert params["attachment"]
+            path = Path(params["attachment"][0])
+            assert path.exists()
+            assert path.suffix == ".pdf"
+            assert path.read_bytes() == b"%PDF-1"
+            return {"timestamp": 12345}
+
+        mock_runtime.request = AsyncMock(side_effect=fake_request)
         adapter._runtime = mock_runtime
+        adapter._temp_dir = tempfile.TemporaryDirectory(prefix="signal-test-")
 
         message = OutboundMessage(
             channel_type="signal",
@@ -870,9 +883,8 @@ class TestDirectSendBehavior:
         called_params = mock_runtime.request.await_args.args[1]
         assert "attachment" in called_params
         assert called_params["message"] == "\u200b"
-        assert called_params["attachment"][0].startswith(
-            "data:application/pdf;filename=report.pdf;base64,"
-        )
+        assert called_params["attachment"][0].endswith(".pdf")
+        adapter._temp_dir.cleanup()
 
     @pytest.mark.asyncio
     async def test_rest_send_uses_placeholder_message_for_media_only(self) -> None:

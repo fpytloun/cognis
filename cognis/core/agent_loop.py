@@ -1553,12 +1553,12 @@ class AgentLoop:
                     )
                     if partial_content:
                         assistant_content_parts.append(partial_content)
-                    assistant_memory_parts.append(
-                        merge_content_and_attachment_note(
-                            partial_content,
-                            _event_safe_attachments(collected_attachments),
-                        )
+                    memory_text = merge_content_and_attachment_note(
+                        partial_content,
+                        _event_safe_attachments(collected_attachments),
                     )
+                    if memory_text.strip():
+                        assistant_memory_parts.append(memory_text)
 
                 logger.warning(
                     "agent: mid-stream failure after retries exhausted",
@@ -1614,12 +1614,12 @@ class AgentLoop:
                 if content:
                     messages.append({"role": "assistant", "content": content})
                     assistant_content_parts.append(content)
-                assistant_memory_parts.append(
-                    merge_content_and_attachment_note(
-                        content,
-                        _event_safe_attachments(collected_attachments),
-                    )
+                memory_text = merge_content_and_attachment_note(
+                    content,
+                    _event_safe_attachments(collected_attachments),
                 )
+                if memory_text.strip():
+                    assistant_memory_parts.append(memory_text)
 
             # No tool calls — check if step is complete
             if not tool_calls:
