@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import mimetypes
-from pathlib import Path
 from typing import Any
 
 import httpx
@@ -68,7 +67,7 @@ IMAGE_EDIT_TOOL = ToolDefinition(
     name="image_edit",
     description=(
         "Edit an existing image using a text prompt. Provide one image source: "
-        "an existing image/artifact id, a local filesystem path, a remote URL, "
+        "an existing image/artifact id, a remote URL, "
         "or an inline base64 payload."
     ),
     parameters={
@@ -88,10 +87,6 @@ IMAGE_EDIT_TOOL = ToolDefinition(
             "source_artifact_id": {
                 "type": "string",
                 "description": "Artifact id of an existing stored image to edit.",
-            },
-            "source_path": {
-                "type": "string",
-                "description": "Local filesystem path to an image file to edit.",
             },
             "source_url": {
                 "type": "string",
@@ -290,22 +285,22 @@ async def _resolve_edit_source_to_b64(
 ) -> str:
     source_keys = [
         key
-        for key in ("image", "source_artifact_id", "source_path", "source_url", "image_b64")
+        for key in ("image", "source_artifact_id", "source_url", "image_b64")
         if arguments.get(key)
     ]
+    if arguments.get("source_path"):
+        raise DocumentedImageSourceError(
+            "Local source_path is not supported for image_edit because image tools run on the controller. "
+            "Publish the file first with artifact_publish, then use source_artifact_id."
+        )
     if len(source_keys) != 1:
         raise DocumentedImageSourceError(
-            "Provide exactly one image source: image, source_artifact_id, source_path, source_url, or image_b64."
+            "Provide exactly one image source: image, source_artifact_id, source_url, or image_b64."
         )
     key = source_keys[0]
     value = str(arguments[key])
     if key == "image_b64":
         return value
-    if key == "source_path":
-        path = Path(value).expanduser().resolve()
-        if not path.is_file():
-            raise DocumentedImageSourceError(f"image source file not found: {value}")
-        return _encode_b64(path.read_bytes())
     if key == "source_url":
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.get(value)

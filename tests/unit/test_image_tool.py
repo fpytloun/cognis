@@ -112,7 +112,7 @@ async def test_image_edit_accepts_inline_base64_source() -> None:
 
 
 @pytest.mark.asyncio
-async def test_image_edit_accepts_source_path(tmp_path: Path) -> None:
+async def test_image_edit_rejects_source_path_with_helpful_error(tmp_path: Path) -> None:
     provider = MagicMock()
     provider.image_generate = AsyncMock(
         return_value=ImageGenerationResult(images=[], model="gpt-image-1")
@@ -127,9 +127,9 @@ async def test_image_edit_accepts_source_path(tmp_path: Path) -> None:
         artifact_store=None,
     )
 
-    assert not result.is_error
-    provider.image_generate.assert_awaited_once()
-    assert provider.image_generate.await_args.kwargs["image"] == "YWJj"
+    assert result.is_error
+    assert "artifact_publish" in result.output
+    provider.image_generate.assert_not_awaited()
 
 
 @pytest.mark.asyncio
