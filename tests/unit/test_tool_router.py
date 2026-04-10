@@ -576,3 +576,48 @@ async def test_tool_router_enriches_already_materialized_attachment_output() -> 
     raw_output = result.metadata["_raw_output"]
     assert '"artifact_id": "img_1"' in raw_output
     assert '"mime_type": "image/jpeg"' in raw_output
+
+
+@pytest.mark.asyncio
+async def test_tool_router_enriches_image_tool_output() -> None:
+    artifact_store = _ArtifactStore()
+    image_provider = AsyncMock(
+        image_generate=AsyncMock(
+            return_value=type(
+                "ImageResult",
+                (),
+                {
+                    "images": [
+                        type(
+                            "Image",
+                            (),
+                            {
+                                "b64_json": "YWJj",
+                                "content_type": "image/png",
+                                "revised_prompt": None,
+                            },
+                        )()
+                    ],
+                    "model": "test-model",
+                },
+            )()
+        )
+    )
+    router = ToolRouter(
+        guardrails=_Guardrails(),
+        artifact_store=artifact_store,
+        image_generation_provider=image_provider,
+    )
+
+    result = await router.execute(
+        ToolCall(call_id="9", name="image_generate", arguments={"prompt": "banner"}),
+        _session(),
+        _agent(),
+        ToolRegistry(),
+        None,
+    )
+
+    assert result.metadata is not None
+    raw_output = result.metadata["_raw_output"]
+    assert '"artifact_id": "img_1"' in raw_output
+    assert '"mime_type": "image/png"' in raw_output

@@ -295,7 +295,17 @@ class ToolRouter:
                     arguments=dict(tool_call.arguments),
                     image_generation_provider=self.image_generation_provider,
                     artifact_store=self.artifact_store,
+                    session_factory=self._session_factory,
                 )
+                if result.attachments:
+                    result = result.model_copy(
+                        update={
+                            "output": self._enrich_attachment_output(
+                                result.output,
+                                result.attachments,
+                            )
+                        }
+                    )
             outcome = "success" if not result.is_error else "failure"
             IMAGE_GENERATION_TOTAL.labels(
                 model=tool_call.arguments.get("model", "default"),

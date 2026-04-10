@@ -517,6 +517,16 @@ class SignalAdapter(BaseChannelAdapter):
                     logger.warning("signal adapter: media download failed", exc_info=True)
             if b64_attachments:
                 payload["base64_attachments"] = b64_attachments
+            logger.info(
+                "signal adapter: prepared rest media payload",
+                extra={
+                    "extra_data": {
+                        "account_id": self.account_id,
+                        "media_count": len(message.media),
+                        "encoded_attachment_count": len(b64_attachments),
+                    }
+                },
+            )
 
         resp = await self._client.post("/v2/send", json=payload)
         resp.raise_for_status()
@@ -583,6 +593,17 @@ class SignalAdapter(BaseChannelAdapter):
                     logger.warning("signal adapter: media download failed", exc_info=True)
             if attachments:
                 params["attachment"] = attachments
+            logger.info(
+                "signal adapter: prepared direct media payload",
+                extra={
+                    "extra_data": {
+                        "account_id": self.account_id,
+                        "media_count": len(message.media),
+                        "attachment_count": len(attachments),
+                        "has_temp_dir": self._temp_dir is not None,
+                    }
+                },
+            )
 
         try:
             result = await self._runtime.request("send", params)

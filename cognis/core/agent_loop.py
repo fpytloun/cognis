@@ -1241,7 +1241,8 @@ class AgentLoop:
         self._pending_events = events_to_record
         self._pending_events_ctx = ctx
         messages: list[dict[str, Any]] = []
-        assistant_content_parts: list[str] = []  # Accumulate full assistant output
+        assistant_content_parts: list[str] = []  # User-visible assistant output only
+        assistant_memory_parts: list[str] = []  # Include attachment notes for memory/compaction
 
         # Build tool definitions for LLM (controller-injected tools)
         controller_tool_schemas = self._build_controller_tool_schemas(ctx)
@@ -1550,7 +1551,9 @@ class AgentLoop:
                             },
                         )
                     )
-                    assistant_content_parts.append(
+                    if partial_content:
+                        assistant_content_parts.append(partial_content)
+                    assistant_memory_parts.append(
                         merge_content_and_attachment_note(
                             partial_content,
                             _event_safe_attachments(collected_attachments),
@@ -1610,7 +1613,8 @@ class AgentLoop:
                 )
                 if content:
                     messages.append({"role": "assistant", "content": content})
-                assistant_content_parts.append(
+                    assistant_content_parts.append(content)
+                assistant_memory_parts.append(
                     merge_content_and_attachment_note(
                         content,
                         _event_safe_attachments(collected_attachments),
@@ -2184,7 +2188,10 @@ class AgentLoop:
         # Finalize step — pass assistant_content_parts so Mnemory remember
         # works even when events were already flushed incrementally.
         events_recorded = await self._finalize_step(
-            ctx, events_to_record, assistant_content_parts=assistant_content_parts
+            ctx,
+            events_to_record,
+            assistant_content_parts=assistant_content_parts,
+            assistant_memory_parts=assistant_memory_parts,
         )
 
         # Automatic compaction: if context assembly recommended compaction
@@ -3312,6 +3319,7 @@ class AgentLoop:
         events: list[SessionEvent],
         *,
         assistant_content_parts: list[str] | None = None,
+        assistant_memory_parts: list[str] | None = None,
     ) -> bool:
         """Record events to Intaris, update cache, dispatch remember.
 
@@ -3323,7 +3331,7 @@ class AgentLoop:
         if not events:
             # Events may have been flushed incrementally — still dispatch
             # Mnemory remember using the accumulated assistant content.
-            await self._dispatch_remember(ctx, assistant_content_parts)
+            await self._dispatch_remember(ctx, assistant_memory_parts)
             return True
 
         intaris_id = ctx.session.intaris_session_id or ctx.session.session_id
@@ -3369,10 +3377,10 @@ class AgentLoop:
                 },
             )
 
-        # Dispatch remember — use assistant_content_parts if provided
+        # Dispatch remember — use assistant_memory_parts if provided
         # (covers incrementally-flushed events), fall back to extracting
         # from the events list (covers the non-incremental path).
-        if assistant_content_parts is None:
+        if assistant_memory_parts is None:
             extracted = [
                 merge_content_and_attachment_note(
                     str(e.data.get("content", "")),
@@ -3384,7 +3392,7 @@ class AgentLoop:
             ]
             await self._dispatch_remember(ctx, extracted or None)
         else:
-            await self._dispatch_remember(ctx, assistant_content_parts)
+            await self._dispatch_remember(ctx, assistant_memory_parts)
 
         return events_recorded
 

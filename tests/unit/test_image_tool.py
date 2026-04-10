@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import base64
 import json
-from unittest.mock import AsyncMock, MagicMock
+from contextlib import asynccontextmanager
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -76,6 +79,93 @@ async def test_handle_image_tool_returns_channel_attachments() -> None:
             "mime_type": "image/png",
             "filename": "img_123.png",
             "size_bytes": 3,
+            "kind": "image",
+            "content_b64": "YWJj",
         }
     ]
     artifact_store.async_get_public_url.assert_awaited_once_with("images", "img_123", "image")
+
+
+@pytest.mark.asyncio
+async def test_image_edit_accepts_inline_base64_source() -> None:
+    provider = MagicMock()
+    provider.image_generate = AsyncMock(
+        return_value=ImageGenerationResult(images=[], model="gpt-image-1")
+    )
+
+    result = await handle_image_tool(
+        "image_edit",
+        {"prompt": "brighten", "image_b64": "YWJj"},
+        provider,
+        artifact_store=None,
+    )
+
+    assert not result.is_error
+    provider.image_generate.assert_awaited_once_with(
+        prompt="brighten",
+        model=None,
+        n=1,
+        size=None,
+        quality=None,
+        image="YWJj",
+    )
+
+
+@pytest.mark.asyncio
+async def test_image_edit_accepts_source_path(tmp_path: Path) -> None:
+    provider = MagicMock()
+    provider.image_generate = AsyncMock(
+        return_value=ImageGenerationResult(images=[], model="gpt-image-1")
+    )
+    image_path = tmp_path / "input.png"
+    image_path.write_bytes(b"abc")
+
+    result = await handle_image_tool(
+        "image_edit",
+        {"prompt": "brighten", "source_path": str(image_path)},
+        provider,
+        artifact_store=None,
+    )
+
+    assert not result.is_error
+    provider.image_generate.assert_awaited_once()
+    assert provider.image_generate.await_args.kwargs["image"] == "YWJj"
+
+
+@pytest.mark.asyncio
+async def test_image_edit_accepts_source_artifact_id() -> None:
+    provider = MagicMock()
+    provider.image_generate = AsyncMock(
+        return_value=ImageGenerationResult(images=[], model="gpt-image-1")
+    )
+    artifact_store = MagicMock()
+    artifact_store.async_load = AsyncMock(return_value=(b"artifact-bytes", "image/png"))
+
+    class _ArtifactRow:
+        status = "attached"
+        owner_email = None
+        namespace = "attachments"
+        object_id = "art_1"
+        filename = "input.png"
+
+    class _Session:
+        pass
+
+    @asynccontextmanager
+    async def session_factory() -> object:
+        yield _Session()
+
+    with patch("cognis.store.queries.get_artifact_record", AsyncMock(return_value=_ArtifactRow())):
+        result = await handle_image_tool(
+            "image_edit",
+            {"prompt": "brighten", "source_artifact_id": "art_1"},
+            provider,
+            artifact_store=artifact_store,
+            session_factory=session_factory,
+        )
+
+    assert not result.is_error
+    provider.image_generate.assert_awaited_once()
+    assert provider.image_generate.await_args.kwargs["image"] == base64.b64encode(
+        b"artifact-bytes"
+    ).decode("ascii")

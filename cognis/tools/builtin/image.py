@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import mimetypes
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -66,9 +67,9 @@ IMAGE_GENERATE_TOOL = ToolDefinition(
 IMAGE_EDIT_TOOL = ToolDefinition(
     name="image_edit",
     description=(
-        "Edit an existing image using a text prompt. Provide the image ID "
-        "(img_* format) of a previously generated or uploaded image and a "
-        "description of the desired changes."
+        "Edit an existing image using a text prompt. Provide one image source: "
+        "an existing image/artifact id, a local filesystem path, a remote URL, "
+        "or an inline base64 payload."
     ),
     parameters={
         "type": "object",
@@ -80,9 +81,25 @@ IMAGE_EDIT_TOOL = ToolDefinition(
             "image": {
                 "type": "string",
                 "description": (
-                    "Image ID (img_* format) of the image to edit. "
-                    "Must be a previously generated or uploaded image."
+                    "Existing image or artifact id to edit. Supports img_* generated images "
+                    "and other Cognis artifact ids when artifact storage is available."
                 ),
+            },
+            "source_artifact_id": {
+                "type": "string",
+                "description": "Artifact id of an existing stored image to edit.",
+            },
+            "source_path": {
+                "type": "string",
+                "description": "Local filesystem path to an image file to edit.",
+            },
+            "source_url": {
+                "type": "string",
+                "description": "Remote HTTP(S) image URL to edit.",
+            },
+            "image_b64": {
+                "type": "string",
+                "description": "Inline base64-encoded image payload to edit.",
             },
             "model": {
                 "type": "string",
@@ -93,7 +110,7 @@ IMAGE_EDIT_TOOL = ToolDefinition(
                 "description": "Output image size.",
             },
         },
-        "required": ["prompt", "image"],
+        "required": ["prompt"],
     },
     source=_SOURCE,
     category="image",
@@ -120,6 +137,7 @@ async def handle_image_tool(
     arguments: dict[str, Any],
     image_generation_provider: Any,
     artifact_store: Any | None = None,
+    session_factory: Any | None = None,
 ) -> ToolResult:
     """Handle an image generation or edit tool call.
 
@@ -139,28 +157,14 @@ async def handle_image_tool(
     image_b64: str | None = None
 
     if tool_name == "image_edit":
-        image_ref = arguments.get("image", "")
-        if not image_ref:
-            return ToolResult(output="Error: image ID is required for editing.", is_error=True)
-
-        # Resolve image ID to base64 from artifact store
-        if not image_ref.startswith("img_"):
-            return ToolResult(
-                output="Error: image must be an image ID (img_* format), not raw base64.",
-                is_error=True,
-            )
-        if artifact_store is None:
-            return ToolResult(
-                output="Error: artifact store not available for image resolution.",
-                is_error=True,
-            )
         try:
-            content, _ct = await artifact_store.async_load("images", image_ref, "image")
-            import base64
-
-            image_b64 = base64.b64encode(content).decode("ascii")
-        except FileNotFoundError:
-            return ToolResult(output=f"Error: image {image_ref} not found.", is_error=True)
+            image_b64 = await _resolve_edit_source_to_b64(
+                arguments,
+                artifact_store=artifact_store,
+                session_factory=session_factory,
+            )
+        except DocumentedImageSourceError as exc:
+            return ToolResult(output=f"Error: {exc}", is_error=True)
 
     try:
         result: ImageGenerationResult = await image_generation_provider.image_generate(
@@ -208,6 +212,8 @@ async def handle_image_tool(
                             "mime_type": img.content_type,
                             "filename": filename,
                             "size_bytes": len(image_bytes),
+                            "kind": "image",
+                            "content_b64": _encode_b64(image_bytes),
                         }
                     )
             except Exception:
@@ -270,3 +276,65 @@ async def _image_bytes(img: Any) -> bytes:
             response.raise_for_status()
             return response.content
     raise ValueError("Generated image does not contain base64 data or URL")
+
+
+class DocumentedImageSourceError(ValueError):
+    pass
+
+
+async def _resolve_edit_source_to_b64(
+    arguments: dict[str, Any],
+    *,
+    artifact_store: Any | None,
+    session_factory: Any | None,
+) -> str:
+    source_keys = [
+        key
+        for key in ("image", "source_artifact_id", "source_path", "source_url", "image_b64")
+        if arguments.get(key)
+    ]
+    if len(source_keys) != 1:
+        raise DocumentedImageSourceError(
+            "Provide exactly one image source: image, source_artifact_id, source_path, source_url, or image_b64."
+        )
+    key = source_keys[0]
+    value = str(arguments[key])
+    if key == "image_b64":
+        return value
+    if key == "source_path":
+        path = Path(value).expanduser().resolve()
+        if not path.is_file():
+            raise DocumentedImageSourceError(f"image source file not found: {value}")
+        return _encode_b64(path.read_bytes())
+    if key == "source_url":
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(value)
+            response.raise_for_status()
+            return _encode_b64(response.content)
+    if artifact_store is None:
+        raise DocumentedImageSourceError("artifact store not available for image resolution.")
+    if key == "image" and value.startswith("img_"):
+        try:
+            content, _ct = await artifact_store.async_load("images", value, "image")
+        except FileNotFoundError as exc:
+            raise DocumentedImageSourceError(f"image {value} not found.") from exc
+        return _encode_b64(content)
+    artifact_id = value if key == "image" else str(arguments["source_artifact_id"])
+    if session_factory is None:
+        raise DocumentedImageSourceError(
+            "artifact resolution requires database access for non-image artifact ids."
+        )
+    from cognis.store.queries import get_artifact_record
+
+    async with session_factory() as session:
+        row = await get_artifact_record(session, artifact_id)
+    if row is None or row.status == "deleted":
+        raise DocumentedImageSourceError(f"artifact {artifact_id} not found.")
+    content, _ct = await artifact_store.async_load(row.namespace, row.object_id, row.filename)
+    return _encode_b64(content)
+
+
+def _encode_b64(content: bytes) -> str:
+    import base64
+
+    return base64.b64encode(content).decode("ascii")
