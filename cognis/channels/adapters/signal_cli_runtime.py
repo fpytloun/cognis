@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import json
 import os
 import shutil
@@ -269,7 +270,7 @@ class SignalCliRuntime:
 
         try:
             while self._running:
-                line_bytes = await self._process.stdout.readline()
+                line_bytes = await self._read_stream_line(self._process.stdout)
                 if not line_bytes:
                     # EOF — process exited
                     break
@@ -349,7 +350,7 @@ class SignalCliRuntime:
 
         try:
             while self._running:
-                line_bytes = await self._process.stderr.readline()
+                line_bytes = await self._read_stream_line(self._process.stderr)
                 if not line_bytes:
                     break
                 self._stderr_line_count += 1
@@ -380,6 +381,32 @@ class SignalCliRuntime:
             return
         except Exception:
             pass
+
+    async def _read_stream_line(self, stream: asyncio.StreamReader) -> bytes:
+        """Read one logical line even when it exceeds StreamReader's limit."""
+        readuntil = getattr(stream, "readuntil", None)
+        if not callable(readuntil):
+            return await stream.readline()
+
+        probe = readuntil(b"\n")
+        if not inspect.isawaitable(probe):
+            return await stream.readline()
+
+        chunks: list[bytes] = []
+        while True:
+            try:
+                chunk = await probe if not chunks else await readuntil(b"\n")
+                if not chunks:
+                    return chunk
+                chunks.append(chunk)
+                return b"".join(chunks)
+            except asyncio.LimitOverrunError as exc:
+                consumed = await stream.readexactly(exc.consumed)
+                chunks.append(consumed)
+            except asyncio.IncompleteReadError as exc:
+                if exc.partial:
+                    chunks.append(exc.partial)
+                return b"".join(chunks)
 
     def _process_exit_message(self) -> str:
         returncode = None

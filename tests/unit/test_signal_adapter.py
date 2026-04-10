@@ -149,6 +149,30 @@ class FakeProcess:
         except (TimeoutError, asyncio.CancelledError):
             return b""
 
+
+class _LimitOverrunStream:
+    def __init__(self, payload: bytes) -> None:
+        self._payload = payload
+        self._offset = 0
+
+    async def readuntil(self, separator: bytes) -> bytes:
+        del separator
+        remaining = self._payload[self._offset :]
+        newline_index = remaining.find(b"\n")
+        if newline_index == -1:
+            self._offset = len(self._payload)
+            raise asyncio.IncompleteReadError(partial=remaining, expected=None)
+        if len(remaining[: newline_index + 1]) > 10:
+            raise asyncio.LimitOverrunError("chunk exceeded", consumed=10)
+        chunk = remaining[: newline_index + 1]
+        self._offset += len(chunk)
+        return chunk
+
+    async def readexactly(self, n: int) -> bytes:
+        chunk = self._payload[self._offset : self._offset + n]
+        self._offset += len(chunk)
+        return chunk
+
     def terminate(self) -> None:
         self.returncode = -15
 
@@ -384,6 +408,15 @@ class TestSignalCliRuntime:
             and call.args[1] == "java failure line"
             for call in warning.call_args_list
         )
+
+    @pytest.mark.asyncio
+    async def test_read_stream_line_handles_limit_overrun(self) -> None:
+        runtime = SignalCliRuntime(account_number="+1234567890")
+        payload = json.dumps({"jsonrpc": "2.0", "result": {"ok": True}, "id": 1}).encode() + b"\n"
+
+        line = await runtime._read_stream_line(_LimitOverrunStream(payload))
+
+        assert json.loads(line) == {"jsonrpc": "2.0", "result": {"ok": True}, "id": 1}
 
 
 # ---------------------------------------------------------------------------
