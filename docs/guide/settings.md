@@ -60,7 +60,19 @@ This is also where you decide whether local executor modes should remain enabled
 Executor cards also include **Browser Automation** settings for Playwright-based
 browser tools. These control whether browser automation is enabled on the
 executor, whether browser binaries may be auto-installed, whether headed mode is
-allowed, and how many concurrent browser sessions the executor should allow.
+allowed, whether persistent local profiles are enabled, and how many concurrent
+browser sessions the executor should allow.
+
+For a human-like local browser setup, the main browser settings to look at are:
+
+- `Persistent local profiles`: keeps Playwright user data on that executor so cookies and local storage persist across runs
+- `Default profile mode`: choose whether normal `browser_open` calls default to `persistent_local` or `ephemeral`
+- `Realistic launch defaults`: uses a stable desktop-like viewport and reduced automation signals
+- `Auto-start Xvfb`: on Linux, starts a virtual X server for headed browser launches when no real `DISPLAY` is available
+
+Use `persistent_local` defaults on sticky local executors that should behave
+more like a human browser. Use `ephemeral` defaults on temporary executors or
+when you want a clean context for every run.
 
 ## Tools and MCP servers
 

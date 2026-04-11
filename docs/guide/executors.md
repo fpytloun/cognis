@@ -48,7 +48,8 @@ Open `Settings` and use the executors section to inspect:
 
 If browser automation is enabled on an executor, the same settings area also
 lets you configure browser runtime behavior such as auto-install, engine,
-headed-mode allowance, session limits, and idle timeout.
+headed-mode allowance, persistent local profiles, Xvfb fallback for headed
+Linux launches, session limits, and idle timeout.
 
 ### Runtime states
 
@@ -91,7 +92,11 @@ In `Settings -> Executors`, the browser section stores executor config like:
   "browser": {
     "enabled": true,
     "auto_install": true,
-    "headed_allowed": false,
+    "headed_allowed": true,
+    "persistent_profiles_enabled": true,
+    "profile_mode_default": "persistent_local",
+    "realistic_launch": true,
+    "xvfb_auto": true,
     "engine": "chromium",
     "max_sessions": 4,
     "idle_timeout_seconds": 600
@@ -99,10 +104,46 @@ In `Settings -> Executors`, the browser section stores executor config like:
 }
 ```
 
-Saved browser auth state is stored in Cognis as an encrypted credential record,
-not as an unmanaged browser profile on the executor. This keeps the controller
-as the durable source of truth while still allowing temporary executors to
-rehydrate browser sessions when a site permits it.
+The default human-like setup for a sticky local executor is now:
+
+- `profile_mode_default = "persistent_local"`
+- `persistent_profiles_enabled = true`
+- `realistic_launch = true`
+- `xvfb_auto = true` for headed Linux executors without a real display
+
+This keeps cookies, local storage, and other profile state in a local
+Playwright user data directory on that executor. It is best for sites that are
+hostile to clean ephemeral contexts, but it is explicitly executor-local.
+
+Saved browser auth state can still be stored in Cognis as an encrypted
+credential record. Use that when you need controller-owned, portable auth state
+instead of sticky local browser identity.
+
+### How agents should use profile mode
+
+`browser_open` now supports:
+
+- `profile_mode = "default"`
+- `profile_mode = "ephemeral"`
+- `profile_mode = "persistent_local"`
+
+Recommended agent behavior:
+
+- use `default` for most browser opens
+- use `ephemeral` only when a fresh clean session is specifically needed
+- use `persistent_local` for sticky local browser identity or when a site blocks fresh contexts
+
+`profile_id` is optional when `persistent_local` is used. If omitted, Cognis
+derives a stable site-scoped local profile automatically from the target URL.
+
+### Headed Linux browsers and Xvfb
+
+On Linux executors, a headed browser without a real `DISPLAY` needs a virtual
+X server. When `xvfb_auto = true`, Cognis starts `Xvfb` automatically for
+headed launches that need it.
+
+`Xvfb` must already be installed on the executor host. Cognis does not install
+OS packages for you.
 
 ## MCP stdio command format
 

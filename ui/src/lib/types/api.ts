@@ -508,6 +508,15 @@ export interface ExecutorBrowserConfig {
   engine?: string;
   max_sessions?: number;
   idle_timeout_seconds?: number;
+  persistent_profiles_enabled?: boolean;
+  profile_mode_default?: 'ephemeral' | 'persistent_local';
+  profile_base_dir?: string;
+  realistic_launch?: boolean;
+  xvfb_auto?: boolean;
+  locale?: string;
+  timezone_id?: string;
+  viewport_width?: number;
+  viewport_height?: number;
 }
 
 export interface ExecutorRuntimeConfig {

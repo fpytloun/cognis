@@ -2094,6 +2094,9 @@
             {@const browserConfig = ((exec.config || {}).browser || {}) as Record<string, unknown>}
             {@const browserEnabled = browserConfig.enabled !== false}
             {@const browserAutoInstall = browserConfig.auto_install === true}
+            {@const browserPersistentProfilesEnabled = browserConfig.persistent_profiles_enabled !== false}
+            {@const browserRealisticLaunch = browserConfig.realistic_launch !== false}
+            {@const browserXvfbAuto = browserConfig.xvfb_auto !== false}
             <details class="group">
               <summary class="cursor-pointer text-xs uppercase tracking-wider text-slate-400 hover:text-slate-300 select-none">
                 Browser Automation
@@ -2126,6 +2129,18 @@
                       }}
                     />
                     Auto-install Playwright browser
+                  </label>
+                  <label class="flex items-center gap-2 text-sm text-slate-300">
+                    <input type="checkbox" checked={browserPersistentProfilesEnabled} disabled={!browserEnabled}
+                      class="rounded border-slate-600 bg-slate-800 text-emerald-500 focus:ring-emerald-500/30 disabled:opacity-40"
+                      onchange={async (e) => {
+                        const checked = e.currentTarget.checked;
+                        const cfg = { ...(exec.config || {}), browser: { ...browserConfig, persistent_profiles_enabled: checked } };
+                        await api.executor.update(exec.executor_id, { config: cfg });
+                        await refreshPageState();
+                      }}
+                    />
+                    Enable persistent local profiles
                   </label>
                 </div>
                 <div class="grid gap-3 md:grid-cols-3">
@@ -2167,6 +2182,84 @@
                       }}
                     />
                   </label>
+                  <label class="space-y-1 text-sm text-slate-300">
+                    <span class="text-xs text-slate-400">Default profile mode</span>
+                    <select class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+                      value={String(browserConfig.profile_mode_default ?? 'persistent_local')}
+                      onchange={async (e) => {
+                        const value = e.currentTarget.value as 'ephemeral' | 'persistent_local';
+                        const cfg = { ...(exec.config || {}), browser: { ...browserConfig, profile_mode_default: value } };
+                        await api.executor.update(exec.executor_id, { config: cfg });
+                        await refreshPageState();
+                      }}>
+                      <option value="persistent_local">Persistent local</option>
+                      <option value="ephemeral">Ephemeral</option>
+                    </select>
+                  </label>
+                </div>
+                <div class="grid gap-3 md:grid-cols-3">
+                  <label class="space-y-1 text-sm text-slate-300">
+                    <span class="text-xs text-slate-400">Profile base dir</span>
+                    <Input value={String(browserConfig.profile_base_dir ?? '')}
+                      placeholder="~/.cognis/browser-profiles"
+                      onchange={async (e) => {
+                        const value = e.currentTarget.value.trim();
+                        const cfg = { ...(exec.config || {}), browser: { ...browserConfig, profile_base_dir: value || undefined } };
+                        await api.executor.update(exec.executor_id, { config: cfg });
+                        await refreshPageState();
+                      }}
+                    />
+                  </label>
+                  <label class="space-y-1 text-sm text-slate-300">
+                    <span class="text-xs text-slate-400">Locale</span>
+                    <Input value={String(browserConfig.locale ?? 'en-US')}
+                      onchange={async (e) => {
+                        const cfg = { ...(exec.config || {}), browser: { ...browserConfig, locale: e.currentTarget.value || 'en-US' } };
+                        await api.executor.update(exec.executor_id, { config: cfg });
+                        await refreshPageState();
+                      }}
+                    />
+                  </label>
+                  <label class="space-y-1 text-sm text-slate-300">
+                    <span class="text-xs text-slate-400">Timezone</span>
+                    <Input value={String(browserConfig.timezone_id ?? '')}
+                      placeholder="America/New_York"
+                      onchange={async (e) => {
+                        const value = e.currentTarget.value.trim();
+                        const cfg = { ...(exec.config || {}), browser: { ...browserConfig, timezone_id: value || undefined } };
+                        await api.executor.update(exec.executor_id, { config: cfg });
+                        await refreshPageState();
+                      }}
+                    />
+                  </label>
+                </div>
+                <div class="grid gap-3 md:grid-cols-3">
+                  <label class="space-y-1 text-sm text-slate-300">
+                    <span class="text-xs text-slate-400">Viewport width</span>
+                    <Input value={Number(browserConfig.viewport_width ?? 1365)} disabled={!browserEnabled}
+                      type="number" min="800" max="3840" step="1"
+                      onchange={async (e) => {
+                        const val = parseInt(e.currentTarget.value, 10);
+                        if (isNaN(val)) return;
+                        const cfg = { ...(exec.config || {}), browser: { ...browserConfig, viewport_width: val } };
+                        await api.executor.update(exec.executor_id, { config: cfg });
+                        await refreshPageState();
+                      }}
+                    />
+                  </label>
+                  <label class="space-y-1 text-sm text-slate-300">
+                    <span class="text-xs text-slate-400">Viewport height</span>
+                    <Input value={Number(browserConfig.viewport_height ?? 900)} disabled={!browserEnabled}
+                      type="number" min="600" max="2160" step="1"
+                      onchange={async (e) => {
+                        const val = parseInt(e.currentTarget.value, 10);
+                        if (isNaN(val)) return;
+                        const cfg = { ...(exec.config || {}), browser: { ...browserConfig, viewport_height: val } };
+                        await api.executor.update(exec.executor_id, { config: cfg });
+                        await refreshPageState();
+                      }}
+                    />
+                  </label>
                 </div>
                 <label class="flex items-center gap-2 text-sm text-slate-300">
                   <input type="checkbox" checked={browserConfig.headed_allowed === true} disabled={!browserEnabled}
@@ -2179,6 +2272,30 @@
                     }}
                   />
                   Allow headed mode on this executor
+                </label>
+                <label class="flex items-center gap-2 text-sm text-slate-300">
+                  <input type="checkbox" checked={browserXvfbAuto} disabled={!browserEnabled}
+                    class="rounded border-slate-600 bg-slate-800 text-emerald-500 focus:ring-emerald-500/30 disabled:opacity-40"
+                    onchange={async (e) => {
+                      const checked = e.currentTarget.checked;
+                      const cfg = { ...(exec.config || {}), browser: { ...browserConfig, xvfb_auto: checked } };
+                      await api.executor.update(exec.executor_id, { config: cfg });
+                      await refreshPageState();
+                    }}
+                  />
+                  Auto-start Xvfb for headed Linux browser launches without DISPLAY
+                </label>
+                <label class="flex items-center gap-2 text-sm text-slate-300">
+                  <input type="checkbox" checked={browserRealisticLaunch} disabled={!browserEnabled}
+                    class="rounded border-slate-600 bg-slate-800 text-emerald-500 focus:ring-emerald-500/30 disabled:opacity-40"
+                    onchange={async (e) => {
+                      const checked = e.currentTarget.checked;
+                      const cfg = { ...(exec.config || {}), browser: { ...browserConfig, realistic_launch: checked } };
+                      await api.executor.update(exec.executor_id, { config: cfg });
+                      await refreshPageState();
+                    }}
+                  />
+                  Use realistic launch defaults (persistent profile friendly desktop viewport and reduced automation signals)
                 </label>
               </div>
             </details>

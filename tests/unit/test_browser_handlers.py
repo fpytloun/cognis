@@ -12,6 +12,7 @@ from cognis.models.tool import ExecutorHandle
 from cognis.tools.executor.browser import handlers as browser_handlers
 from cognis.tools.executor.browser.handlers import (
     handle_browser_fill,
+    handle_browser_open,
     handle_browser_save_auth_state,
     handle_browser_snapshot,
 )
@@ -65,10 +66,18 @@ class _FakePage:
 
 class _FakeManager:
     def __init__(self) -> None:
+        self.open_calls: list[dict[str, Any]] = []
         self.session = SimpleNamespace(
             ref_map={"e1": "#password"},
             page=_FakePage(),
+            session_id="sess-1",
+            profile_mode="persistent_local",
+            profile_id="www-reddit-com",
         )
+
+    async def open_session(self, **kwargs: Any) -> Any:
+        self.open_calls.append(kwargs)
+        return self.session
 
     def get_session(self, session_id: str) -> Any:
         assert session_id == "sess-1"
@@ -133,6 +142,26 @@ async def test_browser_snapshot_uses_smaller_default_limit(
     assert result.output is not None
     assert manager.session.page.last_evaluate_args == (40,)
     assert '"elements"' in result.output
+
+
+@pytest.mark.asyncio
+async def test_browser_open_uses_default_profile_mode_and_reports_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _FakeManager()
+    monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
+    result = await handle_browser_open(
+        {
+            "session_id": "sess-1",
+            "url": "https://www.reddit.com/r/openwebui/new/",
+            "headless": False,
+        },
+        _context(),
+    )
+    assert manager.open_calls[0]["profile_mode"] == "default"
+    assert manager.open_calls[0]["profile_id"] is None
+    assert '"profile_mode": "persistent_local"' in result.output
+    assert '"profile_id": "www-reddit-com"' in result.output
 
 
 class _FakeCredentialsProvider:

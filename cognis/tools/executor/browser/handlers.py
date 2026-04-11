@@ -30,6 +30,19 @@ def _browser_config(runtime_metadata: dict[str, Any]) -> dict[str, Any]:
         "idle_timeout_seconds": runtime_metadata.get(
             "browser_idle_timeout_seconds", BROWSER_DEFAULT_IDLE_TIMEOUT_SECONDS
         ),
+        "persistent_profiles_enabled": runtime_metadata.get(
+            "browser_persistent_profiles_enabled", True
+        ),
+        "profile_mode_default": runtime_metadata.get(
+            "browser_profile_mode_default", "persistent_local"
+        ),
+        "profile_base_dir": runtime_metadata.get("browser_profile_base_dir"),
+        "realistic_launch": runtime_metadata.get("browser_realistic_launch", True),
+        "xvfb_auto": runtime_metadata.get("browser_xvfb_auto", True),
+        "locale": runtime_metadata.get("browser_locale", "en-US"),
+        "timezone_id": runtime_metadata.get("browser_timezone_id"),
+        "viewport_width": runtime_metadata.get("browser_viewport_width", 1365),
+        "viewport_height": runtime_metadata.get("browser_viewport_height", 900),
     }
 
 
@@ -47,6 +60,17 @@ def _get_manager(context: ToolExecutionContext) -> BrowserManager:
         idle_timeout_seconds=int(
             cfg.get("idle_timeout_seconds", BROWSER_DEFAULT_IDLE_TIMEOUT_SECONDS)
         ),
+        persistent_profiles_enabled=bool(cfg.get("persistent_profiles_enabled", True)),
+        profile_mode_default=str(cfg.get("profile_mode_default", "persistent_local")),
+        profile_base_dir=(
+            str(cfg.get("profile_base_dir")) if cfg.get("profile_base_dir") else None
+        ),
+        realistic_launch=bool(cfg.get("realistic_launch", True)),
+        xvfb_auto=bool(cfg.get("xvfb_auto", True)),
+        locale=str(cfg.get("locale", "en-US")),
+        timezone_id=(str(cfg.get("timezone_id")) if cfg.get("timezone_id") else None),
+        viewport_width=int(cfg.get("viewport_width", 1365)),
+        viewport_height=int(cfg.get("viewport_height", 900)),
     )
     context.runtime_metadata[BROWSER_MANAGER_KEY] = manager
     return manager
@@ -63,6 +87,8 @@ async def handle_browser_open(
         auth_state=(
             arguments.get("auth_state") if isinstance(arguments.get("auth_state"), dict) else None
         ),
+        profile_mode=str(arguments.get("profile_mode", "default") or "default"),
+        profile_id=(str(arguments.get("profile_id")) if arguments.get("profile_id") else None),
     )
     return ToolResult(
         output=json.dumps(
@@ -71,6 +97,8 @@ async def handle_browser_open(
                 "url": session.page.url,
                 "title": await session.page.title(),
                 "headless": bool(arguments.get("headless", True)),
+                "profile_mode": session.profile_mode,
+                "profile_id": session.profile_id,
             }
         )
     )

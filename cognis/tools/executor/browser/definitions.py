@@ -11,16 +11,29 @@ def browser_tool_definitions() -> list[ToolDefinition]:
     return [
         ToolDefinition(
             name="browser_open",
-            description="Open or reuse a browser session and navigate to a URL.",
+            description=(
+                "Open or reuse a browser session and navigate to a URL. "
+                "Use profile_mode='default' unless you specifically need a fresh one-off session. "
+                "When persistent_local mode is used, you may omit profile_id and Cognis will derive a stable site profile automatically."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
                     "url": {"type": "string"},
                     "session_id": {"type": "string"},
                     "headless": {"type": "boolean"},
+                    "profile_mode": {
+                        "type": "string",
+                        "enum": ["default", "ephemeral", "persistent_local"],
+                        "description": "Browser profile strategy. Use 'default' unless you specifically need a fresh session.",
+                    },
+                    "profile_id": {
+                        "type": "string",
+                        "description": "Optional persistent local profile ID. Only use with persistent_local. Omit to let Cognis derive a stable site profile automatically.",
+                    },
                     "auth_state_ref": {
                         "type": "string",
-                        "description": "Optional $credential:<id> or $credential:<id>.<field> ref for saved browser auth state.",
+                        "description": "Optional $credential:<id> or $credential:<id>.<field> ref for saved browser auth state. Omit entirely if you do not have one.",
                     },
                 },
                 "required": ["url", "session_id"],
