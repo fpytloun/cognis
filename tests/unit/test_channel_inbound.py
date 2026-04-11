@@ -10,6 +10,8 @@ from cognis.channels.inbound import (
     InboundPipeline,
     _fallback_attachment_content,
     _filter_turn_attachments_for_voice_input,
+    _prepare_audio_for_stt,
+    _stt_passthrough_target,
 )
 from cognis.core.commands import CommandResult
 from cognis.core.turn_scheduler import TurnResult
@@ -301,6 +303,38 @@ def test_filter_turn_attachments_for_voice_input_removes_audio() -> None:
     filtered = _filter_turn_attachments_for_voice_input(message, attachments)
 
     assert [attachment.artifact_id for attachment in filtered] == ["att-image"]
+
+
+def test_stt_passthrough_target_normalizes_filename_extension() -> None:
+    assert _stt_passthrough_target("audio/mpeg", "voice-note") == ("audio/mpeg", "voice-note.mp3")
+    assert _stt_passthrough_target("audio/ogg", "voice.ogg") == ("audio/ogg", "voice.ogg")
+
+
+@pytest.mark.asyncio
+async def test_prepare_audio_for_stt_requires_ffmpeg_for_aac(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("cognis.channels.inbound.shutil.which", lambda _: None)
+
+    with pytest.raises(RuntimeError, match="ffmpeg"):
+        await _prepare_audio_for_stt(
+            b"audio-bytes",
+            mime_type="audio/aac",
+            filename="voice.aac",
+        )
+
+
+@pytest.mark.asyncio
+async def test_prepare_audio_for_stt_passthroughs_supported_audio() -> None:
+    content, mime_type, filename = await _prepare_audio_for_stt(
+        b"audio-bytes",
+        mime_type="audio/ogg",
+        filename="voice.ogg",
+    )
+
+    assert content == b"audio-bytes"
+    assert mime_type == "audio/ogg"
+    assert filename == "voice.ogg"
 
 
 @pytest.mark.asyncio
