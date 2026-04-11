@@ -11,6 +11,7 @@ into its native format (WS JSON, REST response, CLI output, etc.).
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -613,31 +614,43 @@ class CommandDispatcher:
         pending_pauses = self._pause_waiter.list_pending(conversation_id=conversation_id)
         for pause in pending_pauses:
             if pause.pause_type == "step_question" and pause.task_id is None:
+                resolved = False
                 if self._notification_service is not None:
-                    await self._notification_service.resolve(
+                    resolved = await self._notification_service.resolve(
                         pause.pause_id,
                         "cancel",
                         {"reason": "user_stop"},
                     )
-                else:
-                    self._pause_waiter.resolve(
-                        pause.pause_id,
-                        PauseResolution(decision="cancel", data={"reason": "user_stop"}),
-                    )
-                stopped_anything = True
+                if not resolved and self._notification_service is not None:
+                    with contextlib.suppress(Exception):
+                        await self._notification_service.mark_orphaned(
+                            pause.pause_id,
+                            reason="user_stop_recovery",
+                        )
+                if resolved or self._pause_waiter.resolve(
+                    pause.pause_id,
+                    PauseResolution(decision="cancel", data={"reason": "user_stop"}),
+                ):
+                    stopped_anything = True
             elif pause.pause_type == "escalation":
+                resolved = False
                 if self._notification_service is not None:
-                    await self._notification_service.resolve(
+                    resolved = await self._notification_service.resolve(
                         pause.pause_id,
                         "deny",
                         {"note": "Stopped by user"},
                     )
-                else:
-                    self._pause_waiter.resolve(
-                        pause.pause_id,
-                        PauseResolution(decision="deny", data={"note": "Stopped by user"}),
-                    )
-                stopped_anything = True
+                if not resolved and self._notification_service is not None:
+                    with contextlib.suppress(Exception):
+                        await self._notification_service.mark_orphaned(
+                            pause.pause_id,
+                            reason="user_stop_recovery",
+                        )
+                if resolved or self._pause_waiter.resolve(
+                    pause.pause_id,
+                    PauseResolution(decision="deny", data={"note": "Stopped by user"}),
+                ):
+                    stopped_anything = True
 
         if not stopped_anything:
             return CommandResult(

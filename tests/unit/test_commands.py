@@ -11,6 +11,7 @@ from cognis.models.session import ConversationContext, ConversationModel, Sessio
 class _NotificationService:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, dict[str, object]]] = []
+        self.orphaned: list[tuple[str, str]] = []
         self.resolve_result = True
 
     async def resolve(
@@ -23,6 +24,10 @@ class _NotificationService:
     ) -> bool:
         self.calls.append((notification_id, decision, data))
         return self.resolve_result
+
+    async def mark_orphaned(self, notification_id: str, *, reason: str) -> bool:
+        self.orphaned.append((notification_id, reason))
+        return True
 
 
 class _TurnScheduler:
@@ -157,6 +162,45 @@ async def test_help_lists_stop_and_alias_commands() -> None:
     assert "/cancel" in (result.text or "")
     assert "/summarize" in (result.text or "")
     assert "/reset" in (result.text or "")
+
+
+@pytest.mark.asyncio
+async def test_stop_recovers_local_pause_when_notification_resolution_fails() -> None:
+    pause_waiter = PauseWaiter()
+    pause_waiter.register(
+        PendingPause(
+            pause_id="esc-1",
+            pause_type="escalation",
+            conversation_id="conv-1",
+            session_id="sess-1",
+        )
+    )
+    notifications = _NotificationService()
+    notifications.resolve_result = False
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=None,
+        session_cache=None,
+        compaction_strategy=None,
+        providers=None,
+        pause_waiter=pause_waiter,
+        notification_service=notifications,
+        turn_scheduler=_TurnScheduler(cancelled=False),
+    )
+
+    result = await dispatcher.dispatch(
+        "/stop",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert result is not None
+    assert result.type == "system_message"
+    assert "Stopped the current work" in (result.text or "")
+    assert notifications.orphaned == [("esc-1", "user_stop_recovery")]
+    assert pause_waiter.find_pending(conversation_id="conv-1", pause_type="escalation") is None
 
 
 @pytest.mark.asyncio

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -129,6 +131,65 @@ async def test_submit_turn_ignores_task_backed_step_questions() -> None:
     )
 
     assert error is None
+
+
+@pytest.mark.asyncio
+async def test_submit_turn_only_notifies_once_per_pending_escalation() -> None:
+    pause_waiter = PauseWaiter()
+    pause_waiter.register(
+        PendingPause(
+            pause_id="esc-1",
+            pause_type="escalation",
+            conversation_id="conv-1",
+            session_id="sess-1",
+        )
+    )
+
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=pause_waiter,
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+
+    async def _runtime(_: str, **__: object) -> tuple[object, object, object, bool]:
+        return (
+            SimpleNamespace(
+                conversation_id="conv-1", user_email="user@example.com", status="active"
+            ),
+            SimpleNamespace(session_id="sess-1", status=SessionStatus.ACTIVE),
+            SimpleNamespace(agent_id="agent-1"),
+            False,
+        )
+
+    async def _attachments(**_: object) -> tuple[list[object], object]:
+        return [], None
+
+    async def _notice(**_: object) -> None:
+        return None
+
+    scheduler._load_conversation_runtime = _runtime  # type: ignore[method-assign]
+    scheduler._resolve_attachments_for_turn = _attachments  # type: ignore[method-assign]
+    scheduler._build_attachment_notice = _notice  # type: ignore[method-assign]
+    scheduler._notify_observers_system_message = AsyncMock()  # type: ignore[method-assign]
+
+    first = await scheduler.submit_turn("conv-1", "hello", user_email="user@example.com")
+    second = await scheduler.submit_turn("conv-1", "hello again", user_email="user@example.com")
+
+    assert first is None
+    assert second is None
+    scheduler._notify_observers_system_message.assert_awaited_once()
+    assert len(scheduler._queued_messages["conv-1"]) == 2
 
 
 @pytest.mark.asyncio
@@ -339,3 +400,43 @@ async def test_run_turn_publishes_effective_user_message_content() -> None:
     ]
     assert len(user_events) == 1
     assert user_events[0].data["content"] == "User attached an audio file."
+
+
+@pytest.mark.asyncio
+async def test_cancel_turn_cancels_active_task() -> None:
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(cancel_children=AsyncMock(return_value=0)),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+
+    started = asyncio.Event()
+
+    async def _hang() -> None:
+        started.set()
+        await asyncio.Future()
+
+    task = asyncio.create_task(_hang())
+    scheduler._active_turns["conv-1"] = task
+    scheduler._turn_controls["conv-1"] = asyncio.Event()
+    scheduler._turn_sessions["conv-1"] = "sess-1"
+
+    await started.wait()
+
+    cancelled = await scheduler.cancel_turn("conv-1")
+    assert cancelled is True
+
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    assert task.cancelled() is True

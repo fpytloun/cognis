@@ -148,6 +148,35 @@ class TestSignalVoiceInference:
         )
 
 
+class TestSignalInboundDeduplication:
+    @pytest.mark.asyncio
+    async def test_replayed_envelope_is_ignored(self) -> None:
+        adapter = SignalAdapter()
+        adapter._config = ChannelAccountConfig(
+            account_id="acc-1",
+            channel_type="signal",
+            display_name="Signal",
+            credential_refs={},
+            agent_id="agent-1",
+            user_email="user@example.com",
+        )
+        adapter._dispatch_inbound = AsyncMock()  # type: ignore[method-assign]
+
+        envelope = {
+            "source": "+1234567890",
+            "sourceName": "Alice",
+            "dataMessage": {
+                "timestamp": 1710000000000,
+                "message": "hello",
+            },
+        }
+
+        await adapter._process_envelope(envelope, envelope["dataMessage"])
+        await adapter._process_envelope(envelope, envelope["dataMessage"])
+
+        adapter._dispatch_inbound.assert_awaited_once()
+
+
 class TestSignalDirectAttachmentResult:
     def test_extracts_inline_base64_attachment_payload(self) -> None:
         attachment = MediaAttachment(mime_type="audio/ogg", filename="voice.ogg")

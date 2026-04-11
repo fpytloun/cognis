@@ -22,6 +22,7 @@ import json
 import mimetypes
 import os
 import tempfile
+from collections import deque
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -280,6 +281,9 @@ class SignalAdapter(BaseChannelAdapter):
         self._api_url: str = ""
         self._temp_dir: tempfile.TemporaryDirectory[str] | None = None
         self._degraded_capabilities: set[str] = set()
+        self._seen_inbound_message_keys: set[str] = set()
+        self._seen_inbound_message_order: deque[str] = deque()
+        self._seen_inbound_message_keys_max = 2048
 
     # ------------------------------------------------------------------
     # Lifecycle (overrides BaseChannelAdapter hooks)
@@ -853,6 +857,10 @@ class SignalAdapter(BaseChannelAdapter):
             chat_type = "direct"
             chat_name = source_name
 
+        dedupe_key = f"{source}|{chat_id}|{timestamp}"
+        if self._remember_inbound_message_key(dedupe_key):
+            return
+
         raw_attachments = list(data_message.get("attachments", []))
         voice_input = _infer_signal_voice_input(body, raw_attachments)
         if _SIGNAL_DEBUG_ENABLED:
@@ -923,6 +931,19 @@ class SignalAdapter(BaseChannelAdapter):
             message.platform_data["voice_input"] = True
 
         await self._dispatch_inbound(message)
+
+    def _remember_inbound_message_key(self, key: str) -> bool:
+        """Track inbound Signal messages so replayed events do not duplicate turns."""
+        if not key:
+            return False
+        if key in self._seen_inbound_message_keys:
+            return True
+        self._seen_inbound_message_keys.add(key)
+        self._seen_inbound_message_order.append(key)
+        while len(self._seen_inbound_message_order) > self._seen_inbound_message_keys_max:
+            expired = self._seen_inbound_message_order.popleft()
+            self._seen_inbound_message_keys.discard(expired)
+        return False
 
     # ------------------------------------------------------------------
     # Attachment download

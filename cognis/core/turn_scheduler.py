@@ -255,6 +255,7 @@ class TurnScheduler:
         self._turn_controls: dict[str, asyncio.Event] = {}
         self._turn_sessions: dict[str, str] = {}
         self._queued_messages: dict[str, deque[_QueuedMessage]] = defaultdict(deque)
+        self._escalation_notice_pause_ids: dict[str, str] = {}
 
         # Per-user concurrent turn limit
         self._user_turn_counts: dict[str, int] = defaultdict(int)
@@ -411,12 +412,16 @@ class TurnScheduler:
                         delivery_fallback_text=delivery_fallback_text,
                     )
                 )
-                await self._notify_observers_system_message(
-                    conversation_id,
-                    "Waiting for escalation resolution. "
-                    "Use /approve or /deny, or use the buttons above.",
-                )
+                last_notified_pause_id = self._escalation_notice_pause_ids.get(conversation_id)
+                if last_notified_pause_id != pending_esc.pause_id:
+                    self._escalation_notice_pause_ids[conversation_id] = pending_esc.pause_id
+                    await self._notify_observers_system_message(
+                        conversation_id,
+                        "Waiting for escalation resolution. "
+                        "Use /approve or /deny, or use the buttons above.",
+                    )
                 return None
+            self._escalation_notice_pause_ids.pop(conversation_id, None)
 
             pending_questions = self._pause_waiter.list_pending(
                 conversation_id=conversation_id,
@@ -496,6 +501,9 @@ class TurnScheduler:
         if control is None:
             return cleared_queue
         control.set()
+        active_task = self._active_turns.get(conversation_id)
+        if active_task is not None and not active_task.done():
+            active_task.cancel()
         # Also cancel child sub-sessions via the agent loop
         session_id = self._turn_sessions.get(conversation_id)
         if session_id:
@@ -982,6 +990,14 @@ class TurnScheduler:
             self._active_turns.pop(conversation_id, None)
             self._turn_controls.pop(conversation_id, None)
             self._turn_sessions.pop(conversation_id, None)
+            if (
+                self._pause_waiter.find_pending(
+                    pause_type="escalation",
+                    conversation_id=conversation_id,
+                )
+                is None
+            ):
+                self._escalation_notice_pause_ids.pop(conversation_id, None)
             if not system_initiated:
                 count = self._user_turn_counts.get(user_email, 1)
                 if count <= 1:
