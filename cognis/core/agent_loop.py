@@ -1643,13 +1643,16 @@ class AgentLoop:
                             {
                                 "role": "system",
                                 "content": (
+                                    "Internal controller reminder — this is not a new user message. "
+                                    "Do not write a filler acknowledgment just for this reminder.\n\n"
                                     f"You have {len(incomplete_todos)} incomplete todos:\n"
                                     f"{todo_list}\n\n"
                                     "These todos should represent only current-turn "
                                     "execution work that you still own. Continue working "
                                     "on that work, ask for input if needed, or cancel any "
                                     "todos that no longer apply to this turn via "
-                                    "step_todo_write."
+                                    "step_todo_write. Only produce normal assistant text if you "
+                                    "have a substantive user-facing update."
                                 ),
                             }
                         )
@@ -1674,8 +1677,10 @@ class AgentLoop:
                         {
                             "role": "system",
                             "content": (
-                                "You must call step_complete to finish this step. "
-                                "Please summarize what you have accomplished and call step_complete."
+                                "Internal controller reminder — this is not a new user message. "
+                                "Do not write a filler acknowledgment just for this reminder. "
+                                "If the step is finished, call step_complete now with your summary. "
+                                "Otherwise continue the work until it is actually complete."
                             ),
                         }
                     )
@@ -2378,8 +2383,11 @@ class AgentLoop:
                     {
                         "role": "system",
                         "content": (
+                            "Internal controller reminder — this is not a new user message. "
+                            "Do not write a filler acknowledgment just for this reminder. "
                             f"Tool call limit ({max_tool_calls}) reached. "
-                            "Please call step_complete to finish this step."
+                            "If the step is finished, call step_complete now. Otherwise continue "
+                            "only if you can finish without more tool calls."
                         ),
                     }
                 )

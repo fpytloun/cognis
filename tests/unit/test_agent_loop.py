@@ -522,4 +522,4 @@ async def test_step_complete_reprompt_is_system_message() -> None:
     )
     calls = await _run_reminder_capture(ctx)
     assert calls[1][-1]["role"] == "system"
-    assert "must call step_complete" in str(calls[1][-1]["content"])
+    assert "call step_complete now" in str(calls[1][-1]["content"])
