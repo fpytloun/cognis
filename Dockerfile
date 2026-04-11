@@ -28,4 +28,4 @@ EXPOSE 8080
 
 HEALTHCHECK CMD curl -f http://localhost:8080/api/health || exit 1
 
-CMD ["cognis", "serve"]
+CMD ["cognis-controller", "serve"]
