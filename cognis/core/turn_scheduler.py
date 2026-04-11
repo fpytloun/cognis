@@ -142,6 +142,7 @@ class _QueuedMessage:
     delivery_id: str | None = None
     delivery_fallback_text: str | None = None
     outbound_attachments: list[dict[str, Any]] | None = None
+    turn_observers: tuple[TurnObserver, ...] = ()
 
 
 class SessionCreationFailedError(Exception):
@@ -260,7 +261,7 @@ class TurnScheduler:
         # Per-user concurrent turn limit
         self._user_turn_counts: dict[str, int] = defaultdict(int)
 
-        # Per-conversation observers (multiple allowed — e.g. multiple browser tabs)
+        # Conversation-scoped observers (multiple allowed — e.g. multiple browser tabs)
         self._observers: dict[str, list[TurnObserver]] = defaultdict(list)
 
         # Per-conversation session creation locks (bootstrap + compaction recovery)
@@ -275,7 +276,7 @@ class TurnScheduler:
     # ------------------------------------------------------------------
 
     def add_observer(self, conversation_id: str, observer: TurnObserver) -> None:
-        """Register a streaming observer for a conversation."""
+        """Register a conversation-scoped streaming observer."""
         self._observers[conversation_id].append(observer)
 
     def remove_observer(self, conversation_id: str, observer: TurnObserver) -> None:
@@ -314,6 +315,7 @@ class TurnScheduler:
         channel_deliverable: bool = False,
         delivery_id: str | None = None,
         delivery_fallback_text: str | None = None,
+        turn_observers: list[TurnObserver] | tuple[TurnObserver, ...] | None = None,
     ) -> TurnError | None:
         """Submit a chat turn for execution.
 
@@ -410,6 +412,7 @@ class TurnScheduler:
                         channel_deliverable=channel_deliverable,
                         delivery_id=delivery_id,
                         delivery_fallback_text=delivery_fallback_text,
+                        turn_observers=tuple(turn_observers or ()),
                     )
                 )
                 last_notified_pause_id = self._escalation_notice_pause_ids.get(conversation_id)
@@ -464,10 +467,11 @@ class TurnScheduler:
                     channel_deliverable=channel_deliverable,
                     delivery_id=delivery_id,
                     delivery_fallback_text=delivery_fallback_text,
+                    turn_observers=tuple(turn_observers or ()),
                 )
             )
             # Notify observers that the message was queued
-            for observer in list(self._observers.get(conversation_id, [])):
+            for observer in self._iter_observers(conversation_id, turn_observers=turn_observers):
                 with contextlib.suppress(Exception):
                     await observer.on_queued(conversation_id, len(queue))
             return None
@@ -487,6 +491,7 @@ class TurnScheduler:
             delivery_id=delivery_id,
             delivery_fallback_text=delivery_fallback_text,
             bootstrap_wait_for_intention=bootstrap_wait_for_intention,
+            turn_observers=tuple(turn_observers or ()),
         )
         return None
 
@@ -714,6 +719,7 @@ class TurnScheduler:
         delivery_id: str | None = None,
         delivery_fallback_text: str | None = None,
         bootstrap_wait_for_intention: bool = False,
+        turn_observers: tuple[TurnObserver, ...] = (),
     ) -> None:
         """Launch a turn as a background asyncio.Task."""
         conversation_id = conversation.conversation_id
@@ -738,6 +744,7 @@ class TurnScheduler:
                 delivery_fallback_text=delivery_fallback_text,
                 bootstrap_wait_for_intention=bootstrap_wait_for_intention,
                 cancel_event=control,
+                turn_observers=turn_observers,
             )
         )
 
@@ -758,6 +765,7 @@ class TurnScheduler:
         delivery_fallback_text: str | None,
         bootstrap_wait_for_intention: bool,
         cancel_event: asyncio.Event,
+        turn_observers: tuple[TurnObserver, ...],
     ) -> None:
         """Execute a single chat turn."""
         conversation_id = conversation.conversation_id
@@ -771,7 +779,11 @@ class TurnScheduler:
             current_agent_id.set(agent.agent_id)
 
             if attachment_notice:
-                await self._notify_observers_system_message(conversation_id, attachment_notice)
+                await self._notify_observers_system_message(
+                    conversation_id,
+                    attachment_notice,
+                    turn_observers=turn_observers,
+                )
 
             logger.info(
                 "turn_scheduler: turn started",
@@ -847,6 +859,7 @@ class TurnScheduler:
                     "on_system_message",
                     conversation_id,
                     "Working on that in the background.",
+                    turn_observers=turn_observers,
                 )
 
                 result = TurnResult(
@@ -861,13 +874,13 @@ class TurnScheduler:
                     delivery_fallback_text=delivery_fallback_text,
                     attachments=outbound_attachments,
                 )
-                await self._publish_turn_completed(result)
+                await self._publish_turn_completed(result, turn_observers=turn_observers)
                 TURNS_TOTAL.labels(outcome="delegated").inc()
                 return
 
             # Build streaming callbacks from observers
             on_token, on_tool_call, on_tool_result = self._build_callbacks(
-                conversation_id, session.session_id, message_id
+                conversation_id, session.session_id, message_id, turn_observers=turn_observers
             )
 
             # Execute the turn
@@ -935,7 +948,7 @@ class TurnScheduler:
                 ]
                 or None,
             )
-            await self._publish_turn_completed(result)
+            await self._publish_turn_completed(result, turn_observers=turn_observers)
             TURNS_TOTAL.labels(outcome="completed").inc()
 
             logger.info(
@@ -963,6 +976,7 @@ class TurnScheduler:
                 channel_deliverable=channel_deliverable,
                 delivery_id=delivery_id,
                 delivery_fallback_text=delivery_fallback_text,
+                turn_observers=turn_observers,
             )
             TURNS_TOTAL.labels(outcome="cancelled").inc()
 
@@ -980,6 +994,7 @@ class TurnScheduler:
                 channel_deliverable=channel_deliverable,
                 delivery_id=delivery_id,
                 delivery_fallback_text=delivery_fallback_text,
+                turn_observers=turn_observers,
             )
             TURNS_TOTAL.labels(outcome="error").inc()
 
@@ -1020,6 +1035,7 @@ class TurnScheduler:
                         channel_deliverable=queued.channel_deliverable,
                         delivery_id=queued.delivery_id,
                         delivery_fallback_text=queued.delivery_fallback_text,
+                        turn_observers=queued.turn_observers,
                     )
                 except Exception:
                     logger.exception(
@@ -1036,11 +1052,13 @@ class TurnScheduler:
         conversation_id: str,
         session_id: str,
         message_id: str,
+        *,
+        turn_observers: tuple[TurnObserver, ...] = (),
     ) -> tuple[Any, Any, Any]:
         """Build streaming callbacks that fan out to registered observers."""
 
         async def on_token(delta: str) -> None:
-            for observer in list(self._observers.get(conversation_id, [])):
+            for observer in self._iter_observers(conversation_id, turn_observers=turn_observers):
                 with contextlib.suppress(Exception):
                     await observer.on_token(conversation_id, session_id, message_id, delta)
 
@@ -1049,7 +1067,7 @@ class TurnScheduler:
             call_id: str,
             arguments: dict[str, Any] | None = None,
         ) -> None:
-            for observer in list(self._observers.get(conversation_id, [])):
+            for observer in self._iter_observers(conversation_id, turn_observers=turn_observers):
                 with contextlib.suppress(Exception):
                     await observer.on_tool_call(
                         conversation_id, session_id, call_id, tool_name, arguments
@@ -1063,7 +1081,7 @@ class TurnScheduler:
             duration_ms: int | None,
             evaluation: dict[str, Any] | None = None,
         ) -> None:
-            for observer in list(self._observers.get(conversation_id, [])):
+            for observer in self._iter_observers(conversation_id, turn_observers=turn_observers):
                 with contextlib.suppress(Exception):
                     await observer.on_tool_result(
                         conversation_id,
@@ -1078,19 +1096,57 @@ class TurnScheduler:
 
         return on_token, on_tool_call, on_tool_result
 
-    async def _notify_observers(self, conversation_id: str, method: str, *args: Any) -> None:
+    def _iter_observers(
+        self,
+        conversation_id: str,
+        *,
+        turn_observers: list[TurnObserver] | tuple[TurnObserver, ...] | None = None,
+    ) -> list[TurnObserver]:
+        observers: list[TurnObserver] = list(self._observers.get(conversation_id, []))
+        for observer in turn_observers or ():
+            if observer not in observers:
+                observers.append(observer)
+        return observers
+
+    async def _notify_observers(
+        self,
+        conversation_id: str,
+        method: str,
+        *args: Any,
+        turn_observers: list[TurnObserver] | tuple[TurnObserver, ...] | None = None,
+    ) -> None:
         """Call a method on all observers for a conversation."""
-        for observer in list(self._observers.get(conversation_id, [])):
+        for observer in self._iter_observers(conversation_id, turn_observers=turn_observers):
             with contextlib.suppress(Exception):
                 await getattr(observer, method)(*args)
 
-    async def _notify_observers_system_message(self, conversation_id: str, text: str) -> None:
+    async def _notify_observers_system_message(
+        self,
+        conversation_id: str,
+        text: str,
+        *,
+        turn_observers: list[TurnObserver] | tuple[TurnObserver, ...] | None = None,
+    ) -> None:
         """Send a system message to all observers."""
-        await self._notify_observers(conversation_id, "on_system_message", conversation_id, text)
+        await self._notify_observers(
+            conversation_id,
+            "on_system_message",
+            conversation_id,
+            text,
+            turn_observers=turn_observers,
+        )
 
-    async def _publish_turn_completed(self, result: TurnResult) -> None:
+    async def _publish_turn_completed(
+        self,
+        result: TurnResult,
+        *,
+        turn_observers: list[TurnObserver] | tuple[TurnObserver, ...] | None = None,
+    ) -> None:
         """Notify observers and publish lifecycle event."""
-        for observer in list(self._observers.get(result.conversation_id, [])):
+        for observer in self._iter_observers(
+            result.conversation_id,
+            turn_observers=turn_observers,
+        ):
             with contextlib.suppress(Exception):
                 await observer.on_turn_complete(result)
 
@@ -1128,9 +1184,13 @@ class TurnScheduler:
         channel_deliverable: bool = False,
         delivery_id: str | None = None,
         delivery_fallback_text: str | None = None,
+        turn_observers: list[TurnObserver] | tuple[TurnObserver, ...] | None = None,
     ) -> None:
         """Notify observers and publish lifecycle event."""
-        for observer in list(self._observers.get(conversation_id, [])):
+        for observer in self._iter_observers(
+            conversation_id,
+            turn_observers=turn_observers,
+        ):
             with contextlib.suppress(Exception):
                 await observer.on_turn_error(conversation_id, error)
 

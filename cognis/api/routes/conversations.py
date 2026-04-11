@@ -493,15 +493,14 @@ async def send_message(
         from cognis.api.sse import SSETurnObserver
 
         observer = SSETurnObserver(conversation_id)
-        turn_scheduler.add_observer(conversation_id, observer)
         error = await turn_scheduler.submit_turn(
             conversation_id,
             payload.content,
             user_email=user.email,
             attachments=[item.model_dump(mode="json") for item in payload.attachments],
+            turn_observers=[observer],
         )
         if error is not None:
-            turn_scheduler.remove_observer(conversation_id, observer)
             raise _turn_error_to_http(error)
         try:
             async with request.app.state.session_factory() as session:

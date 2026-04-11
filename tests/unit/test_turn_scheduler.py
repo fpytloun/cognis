@@ -14,6 +14,58 @@ from cognis.models.artifact import ArtifactKind, AttachmentRef
 from cognis.models.session import SessionStatus
 
 
+class _RecordingObserver:
+    def __init__(self) -> None:
+        self.tokens: list[str] = []
+        self.system_messages: list[str] = []
+        self.completed: list[str] = []
+        self.queued: list[int] = []
+
+    async def on_token(
+        self,
+        conversation_id: str,
+        session_id: str,
+        message_id: str,
+        delta: str,
+    ) -> None:
+        self.tokens.append(delta)
+
+    async def on_tool_call(
+        self,
+        conversation_id: str,
+        session_id: str,
+        call_id: str,
+        tool_name: str,
+        arguments: dict[str, object] | None,
+    ) -> None:
+        return None
+
+    async def on_tool_result(
+        self,
+        conversation_id: str,
+        session_id: str,
+        call_id: str,
+        tool_name: str,
+        result: str,
+        is_error: bool,
+        duration_ms: int | None,
+        evaluation: dict[str, object] | None,
+    ) -> None:
+        return None
+
+    async def on_turn_complete(self, result: object) -> None:
+        self.completed.append(getattr(result, "message_id", ""))
+
+    async def on_turn_error(self, conversation_id: str, error: object) -> None:
+        return None
+
+    async def on_system_message(self, conversation_id: str, text: str) -> None:
+        self.system_messages.append(text)
+
+    async def on_queued(self, conversation_id: str, queued_count: int) -> None:
+        self.queued.append(queued_count)
+
+
 @pytest.mark.asyncio
 async def test_submit_turn_blocks_same_conversation_for_live_direct_question() -> None:
     pause_waiter = PauseWaiter()
@@ -190,6 +242,104 @@ async def test_submit_turn_only_notifies_once_per_pending_escalation() -> None:
     assert second is None
     scheduler._notify_observers_system_message.assert_awaited_once()
     assert len(scheduler._queued_messages["conv-1"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_queued_turn_observer_only_receives_its_own_turn() -> None:
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    turn_order: list[str] = []
+
+    async def _run_direct_turn(**kwargs: object) -> object:
+        user_message = kwargs["user_message"]
+        on_progress = kwargs["on_progress"]
+        assert callable(on_progress)
+        turn_order.append(str(user_message))
+        await on_progress(f"token:{user_message}")
+        if user_message == "first":
+            first_started.set()
+            await release_first.wait()
+        return SimpleNamespace(content=f"reply:{user_message}", attachments=[])
+
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(run_direct_turn=_run_direct_turn),
+        decision_engine=SimpleNamespace(
+            decide=AsyncMock(return_value=SimpleNamespace(decision="inline"))
+        ),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(
+            refresh=AsyncMock(return_value=SimpleNamespace(last_event_seq=1)),
+            get_context_usage=MagicMock(return_value=None),
+            get_entry=MagicMock(return_value=None),
+        ),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(cancel_children=AsyncMock(return_value=0)),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+    scheduler._publish_turn_completed = TurnScheduler._publish_turn_completed.__get__(
+        scheduler, TurnScheduler
+    )
+    scheduler._touch_conversation = AsyncMock()  # type: ignore[method-assign]
+
+    async def _runtime(_: str, **__: object) -> tuple[object, object, object, bool]:
+        return (
+            SimpleNamespace(
+                conversation_id="conv-1", user_email="user@example.com", title="", status="active"
+            ),
+            SimpleNamespace(session_id="sess-1", status=SessionStatus.ACTIVE),
+            SimpleNamespace(agent_id="agent-1"),
+            False,
+        )
+
+    async def _attachments(**_: object) -> tuple[list[object], object]:
+        return [], None
+
+    async def _notice(**_: object) -> None:
+        return None
+
+    scheduler._load_conversation_runtime = _runtime  # type: ignore[method-assign]
+    scheduler._resolve_attachments_for_turn = _attachments  # type: ignore[method-assign]
+    scheduler._build_attachment_notice = _notice  # type: ignore[method-assign]
+
+    first_observer = _RecordingObserver()
+    second_observer = _RecordingObserver()
+
+    first_error = await scheduler.submit_turn(
+        "conv-1",
+        "first",
+        user_email="user@example.com",
+        turn_observers=[first_observer],
+    )
+    assert first_error is None
+    await first_started.wait()
+
+    second_error = await scheduler.submit_turn(
+        "conv-1",
+        "second",
+        user_email="user@example.com",
+        turn_observers=[second_observer],
+    )
+    assert second_error is None
+    assert second_observer.tokens == []
+    assert second_observer.completed == []
+    assert second_observer.queued == [1]
+
+    release_first.set()
+    while scheduler.has_active_turn("conv-1") or scheduler.queued_count("conv-1"):
+        await asyncio.sleep(0.01)
+
+    assert turn_order == ["first", "second"]
+    assert first_observer.tokens == ["token:first"]
+    assert second_observer.tokens == ["token:second"]
+    assert len(first_observer.completed) == 1
+    assert len(second_observer.completed) == 1
 
 
 @pytest.mark.asyncio
@@ -393,6 +543,7 @@ async def test_run_turn_publishes_effective_user_message_content() -> None:
         delivery_fallback_text=None,
         bootstrap_wait_for_intention=False,
         cancel_event=AsyncMock(),
+        turn_observers=(),
     )
 
     user_events = [

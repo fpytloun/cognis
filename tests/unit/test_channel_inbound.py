@@ -44,7 +44,6 @@ async def test_channel_inbound_dispatches_approve_before_submit_turn() -> None:
     manager = _FakeManager(adapter)
     turn_scheduler = MagicMock()
     turn_scheduler.submit_turn = AsyncMock()
-    turn_scheduler.add_observer = MagicMock()
     turn_scheduler.has_active_turn = MagicMock(return_value=False)
 
     pipeline = InboundPipeline(
@@ -83,7 +82,6 @@ async def test_channel_inbound_dispatches_approve_before_submit_turn() -> None:
     await pipeline.process(message, config)
 
     turn_scheduler.submit_turn.assert_not_called()
-    turn_scheduler.add_observer.assert_not_called()
     adapter.send_message.assert_awaited_once()
     outbound = adapter.send_message.await_args.args[0]
     assert outbound.content == "User approved tool call"
@@ -96,7 +94,6 @@ async def test_channel_inbound_submits_normal_messages() -> None:
     manager = _FakeManager(adapter)
     turn_scheduler = MagicMock()
     turn_scheduler.submit_turn = AsyncMock(return_value=None)
-    turn_scheduler.add_observer = MagicMock()
     turn_scheduler.has_active_turn = MagicMock(return_value=False)
 
     pipeline = InboundPipeline(
@@ -133,8 +130,10 @@ async def test_channel_inbound_submits_normal_messages() -> None:
 
     await pipeline.process(message, config)
 
-    turn_scheduler.add_observer.assert_called_once()
     turn_scheduler.submit_turn.assert_awaited_once()
+    turn_observers = turn_scheduler.submit_turn.await_args.kwargs["turn_observers"]
+    assert len(turn_observers) == 1
+    assert isinstance(turn_observers[0], ChannelTurnObserver)
 
 
 @pytest.mark.asyncio
@@ -143,7 +142,6 @@ async def test_channel_inbound_transcribes_voice_input_before_submit() -> None:
     manager = _FakeManager(adapter)
     turn_scheduler = MagicMock()
     turn_scheduler.submit_turn = AsyncMock(return_value=None)
-    turn_scheduler.add_observer = MagicMock()
     llm_provider = MagicMock()
     llm_provider.transcribe = AsyncMock(
         return_value=SimpleNamespace(text="transcribed voice message")
@@ -206,7 +204,6 @@ async def test_channel_inbound_reports_voice_transcription_errors() -> None:
     manager = _FakeManager(adapter)
     turn_scheduler = MagicMock()
     turn_scheduler.submit_turn = AsyncMock(return_value=None)
-    turn_scheduler.add_observer = MagicMock()
     llm_provider = MagicMock()
     llm_provider.transcribe = AsyncMock(side_effect=RuntimeError("provider unavailable"))
 

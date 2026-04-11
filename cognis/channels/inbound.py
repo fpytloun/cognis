@@ -346,7 +346,6 @@ class InboundPipeline:
             channel_manager_ref=self._channel_manager_ref,
             assistant_delivery_mode=str(config.settings.get("assistant_delivery_mode", "final")),
         )
-        self._turn_scheduler.add_observer(conversation_id, observer)
 
         # 5. Submit turn
         error = await self._turn_scheduler.submit_turn(
@@ -354,11 +353,10 @@ class InboundPipeline:
             user_content,
             user_email=user_email,
             attachments=[item.model_dump(mode="json") for item in turn_attachments],
+            turn_observers=[observer],
         )
 
         if error is not None:
-            # Remove observer on immediate error
-            self._turn_scheduler.remove_observer(conversation_id, observer)
             # Send error back to channel
             await self._send_error(message, config, error.message)
 
