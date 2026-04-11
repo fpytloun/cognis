@@ -33,16 +33,20 @@ class _FakeLocator:
         self.visible = visible
         self.enabled = enabled
         self.editable = editable
-        self.children: list[_FakeLocator] = []
+        self.children: list[_FakeLocator] | None = None
 
     @property
     def first(self) -> _FakeLocator:
         return self
 
     async def count(self) -> int:
-        return len(self.children) if self.children else 1
+        return len(self.children) if self.children is not None else 1
 
     def nth(self, index: int) -> _FakeLocator:
+        if self.children is None:
+            if index == 0:
+                return self
+            raise IndexError(index)
         return self.children[index]
 
     async def is_visible(self) -> bool:
@@ -65,12 +69,13 @@ class _FakePage:
     def __init__(self) -> None:
         self.locator_calls: list[str] = []
         self.locator_obj = _FakeLocator()
+        self.locator_map: dict[str, _FakeLocator] = {}
         self.url = "https://github.com/settings"
         self.last_evaluate_args: tuple[object, ...] = ()
 
     def locator(self, selector: str) -> _FakeLocator:
         self.locator_calls.append(selector)
-        return self.locator_obj
+        return self.locator_map.get(selector, self.locator_obj)
 
     async def evaluate(self, script: str, *args: object) -> object:
         self.last_evaluate_args = args
@@ -79,6 +84,7 @@ class _FakePage:
             return [
                 {
                     "ref": f"e{i + 1}",
+                    "exact_selector": f'[data-cognis-ref="e{i + 1}"]',
                     "selector": f"button:nth-of-type({i + 1})",
                     "tag": "button",
                     "role": "",
@@ -108,7 +114,7 @@ class _FakeManager:
     def __init__(self) -> None:
         self.open_calls: list[dict[str, Any]] = []
         self.session = SimpleNamespace(
-            ref_map={"e1": "#password"},
+            ref_map={"e1": '[data-cognis-ref="e1"]'},
             page=_FakePage(),
             session_id="sess-1",
             profile_mode="persistent_local",
@@ -140,20 +146,17 @@ async def test_browser_fill_uses_ref_map_and_resolved_value(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager = _FakeManager()
-    hidden = _FakeLocator(visible=False, enabled=True, editable=True)
     visible = _FakeLocator(visible=True, enabled=True, editable=True)
-    aggregate = _FakeLocator()
-    aggregate.children = [hidden, visible]
-    manager.session.page.locator_obj = aggregate
+    manager.session.page.locator_map['[data-cognis-ref="e1"]'] = visible
     monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
     result = await handle_browser_fill(
         {"session_id": "sess-1", "ref": "e1", "value": "secret"},
         _context(),
     )
     assert result.is_error is False
-    assert manager.session.page.locator_calls == ["#password"]
-    assert hidden.filled is None
+    assert manager.session.page.locator_calls == ['[data-cognis-ref="e1"]']
     assert visible.filled == "secret"
+    assert result.output == "Filled exact ref e1."
 
 
 @pytest.mark.asyncio
@@ -161,14 +164,25 @@ async def test_browser_fill_errors_when_no_visible_editable_match(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager = _FakeManager()
-    aggregate = _FakeLocator()
-    aggregate.children = [
-        _FakeLocator(visible=False, enabled=True, editable=True),
-        _FakeLocator(visible=True, enabled=False, editable=True),
-    ]
-    manager.session.page.locator_obj = aggregate
+    manager.session.page.locator_map['[data-cognis-ref="e1"]'] = _FakeLocator(
+        visible=False, enabled=True, editable=True
+    )
     monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
-    with pytest.raises(ValueError, match="visible enabled editable"):
+    with pytest.raises(ValueError, match="visible enabled editable input"):
+        await handle_browser_fill(
+            {"session_id": "sess-1", "ref": "e1", "value": "secret"},
+            _context(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_browser_fill_errors_on_stale_ref(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = _FakeManager()
+    aggregate = _FakeLocator()
+    aggregate.children = []
+    manager.session.page.locator_map['[data-cognis-ref="e1"]'] = aggregate
+    monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
+    with pytest.raises(ValueError, match="stale"):
         await handle_browser_fill(
             {"session_id": "sess-1", "ref": "e1", "value": "secret"},
             _context(),
@@ -180,20 +194,17 @@ async def test_browser_click_prefers_visible_enabled_match(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager = _FakeManager()
-    hidden = _FakeLocator(visible=False, enabled=True, editable=False)
     visible = _FakeLocator(visible=True, enabled=True, editable=False)
-    aggregate = _FakeLocator()
-    aggregate.children = [hidden, visible]
-    manager.session.page.locator_obj = aggregate
+    manager.session.page.locator_map['[data-cognis-ref="e1"]'] = visible
     monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
     result = await handle_browser_click(
         {"session_id": "sess-1", "ref": "e1"},
         _context(),
     )
     assert result.is_error is False
-    assert manager.session.page.locator_calls == ["#password"]
-    assert hidden.clicked is False
+    assert manager.session.page.locator_calls == ['[data-cognis-ref="e1"]']
     assert visible.clicked is True
+    assert result.output == "Clicked exact ref e1."
 
 
 @pytest.mark.asyncio
@@ -201,14 +212,25 @@ async def test_browser_click_errors_when_no_visible_enabled_match(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager = _FakeManager()
-    aggregate = _FakeLocator()
-    aggregate.children = [
-        _FakeLocator(visible=False, enabled=True, editable=False),
-        _FakeLocator(visible=True, enabled=False, editable=False),
-    ]
-    manager.session.page.locator_obj = aggregate
+    manager.session.page.locator_map['[data-cognis-ref="e1"]'] = _FakeLocator(
+        visible=False, enabled=True, editable=False
+    )
     monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
-    with pytest.raises(ValueError, match="visible enabled"):
+    with pytest.raises(ValueError, match="visible enabled target"):
+        await handle_browser_click(
+            {"session_id": "sess-1", "ref": "e1"},
+            _context(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_browser_click_errors_on_stale_ref(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = _FakeManager()
+    aggregate = _FakeLocator()
+    aggregate.children = []
+    manager.session.page.locator_map['[data-cognis-ref="e1"]'] = aggregate
+    monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
+    with pytest.raises(ValueError, match="stale"):
         await handle_browser_click(
             {"session_id": "sess-1", "ref": "e1"},
             _context(),
@@ -247,6 +269,8 @@ async def test_browser_snapshot_uses_smaller_default_limit(
     assert result.output is not None
     assert manager.session.page.last_evaluate_args == (40,)
     assert '"elements"' in result.output
+    assert '"exact_selector"' in result.output
+    assert manager.session.ref_map["e1"] == '[data-cognis-ref="e1"]'
     assert '"visible": true' in result.output
     assert '"editable": false' in result.output
 

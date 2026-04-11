@@ -129,8 +129,11 @@ async def handle_browser_snapshot(
           };
           return nodes.map((el, idx) => {
             const type = (el.getAttribute && el.getAttribute('type')) || '';
+            const ref = `e${idx + 1}`;
+            el.setAttribute('data-cognis-ref', ref);
             return {
-              ref: `e${idx + 1}`,
+              ref,
+              exact_selector: `[data-cognis-ref="${ref}"]`,
               selector: makeSelector(el),
               tag: el.tagName.toLowerCase(),
               role: el.getAttribute('role') || '',
@@ -156,9 +159,9 @@ async def handle_browser_snapshot(
         max_elements,
     )
     session.ref_map = {
-        str(item.get("ref")): str(item.get("selector"))
+        str(item.get("ref")): str(item.get("exact_selector"))
         for item in elements
-        if isinstance(item, dict) and item.get("ref") and item.get("selector")
+        if isinstance(item, dict) and item.get("ref") and item.get("exact_selector")
     }
     title = await session.page.title()
     return ToolResult(
@@ -183,28 +186,40 @@ async def handle_browser_get_text(
     return ToolResult(output=str(text)[:max_chars])
 
 
-def _selector_from_args(arguments: dict[str, Any], session: Any) -> str:
+def _selector_from_args(arguments: dict[str, Any], session: Any) -> tuple[str, bool, str | None]:
     ref = arguments.get("ref")
     if isinstance(ref, str) and ref:
         selector = session.ref_map.get(ref)
         if selector:
-            return selector
+            return selector, True, ref
         raise ValueError(f"Unknown browser ref: {ref}")
     selector = arguments.get("selector")
     if isinstance(selector, str) and selector:
-        return selector
+        return selector, False, None
     raise ValueError("Provide either ref or selector")
 
 
-async def handle_browser_click(
-    arguments: dict[str, Any], context: ToolExecutionContext
-) -> ToolResult:
-    manager = _get_manager(context)
-    session = manager.get_session(str(arguments.get("session_id", "")))
-    locator = session.page.locator(_selector_from_args(arguments, session))
+async def _resolve_click_candidate(
+    selector: str, *, exact_ref: str | None, session: Any
+) -> tuple[Any, int | None]:
+    locator = session.page.locator(selector)
     count = await locator.count()
     if count <= 0:
+        if exact_ref is not None:
+            raise ValueError(
+                f"Browser ref {exact_ref} is stale; refresh browser_snapshot and retry"
+            )
         raise ValueError("No matching browser element found")
+    if exact_ref is not None:
+        if count != 1:
+            raise ValueError(
+                f"Browser ref {exact_ref} resolved ambiguously; refresh browser_snapshot and retry"
+            )
+        candidate = locator.nth(0)
+        if not await candidate.is_visible() or not await candidate.is_enabled():
+            raise ValueError(f"Browser ref {exact_ref} is no longer a visible enabled target")
+        return candidate, 0
+
     chosen = None
     chosen_index = None
     for index in range(count):
@@ -223,22 +238,36 @@ async def handle_browser_click(
         raise ValueError(
             "No visible enabled browser element matched; call browser_snapshot again and choose a visible ref"
         )
-    await chosen.click()
-    return ToolResult(output=f"Clicked element using visible enabled match #{chosen_index}.")
+    return chosen, chosen_index
 
 
-async def handle_browser_fill(
-    arguments: dict[str, Any], context: ToolExecutionContext
-) -> ToolResult:
-    manager = _get_manager(context)
-    session = manager.get_session(str(arguments.get("session_id", "")))
-    value = arguments.get("value")
-    if not isinstance(value, str):
-        raise ValueError("browser_fill requires a resolved string value")
-    locator = session.page.locator(_selector_from_args(arguments, session))
+async def _resolve_fill_candidate(
+    selector: str, *, exact_ref: str | None, session: Any
+) -> tuple[Any, int | None]:
+    locator = session.page.locator(selector)
     count = await locator.count()
     if count <= 0:
+        if exact_ref is not None:
+            raise ValueError(
+                f"Browser ref {exact_ref} is stale; refresh browser_snapshot and retry"
+            )
         raise ValueError("No matching browser input found")
+    if exact_ref is not None:
+        if count != 1:
+            raise ValueError(
+                f"Browser ref {exact_ref} resolved ambiguously; refresh browser_snapshot and retry"
+            )
+        candidate = locator.nth(0)
+        if (
+            not await candidate.is_visible()
+            or not await candidate.is_enabled()
+            or not await candidate.is_editable()
+        ):
+            raise ValueError(
+                f"Browser ref {exact_ref} is no longer a visible enabled editable input"
+            )
+        return candidate, 0
+
     chosen = None
     chosen_index = None
     for index in range(count):
@@ -259,7 +288,39 @@ async def handle_browser_fill(
         raise ValueError(
             "No visible enabled editable browser input matched; call browser_snapshot again and choose a visible ref"
         )
+    return chosen, chosen_index
+
+
+async def handle_browser_click(
+    arguments: dict[str, Any], context: ToolExecutionContext
+) -> ToolResult:
+    manager = _get_manager(context)
+    session = manager.get_session(str(arguments.get("session_id", "")))
+    selector, is_exact_ref, ref = _selector_from_args(arguments, session)
+    chosen, chosen_index = await _resolve_click_candidate(
+        selector, exact_ref=ref if is_exact_ref else None, session=session
+    )
+    await chosen.click()
+    if is_exact_ref:
+        return ToolResult(output=f"Clicked exact ref {ref}.")
+    return ToolResult(output=f"Clicked element using visible enabled match #{chosen_index}.")
+
+
+async def handle_browser_fill(
+    arguments: dict[str, Any], context: ToolExecutionContext
+) -> ToolResult:
+    manager = _get_manager(context)
+    session = manager.get_session(str(arguments.get("session_id", "")))
+    value = arguments.get("value")
+    if not isinstance(value, str):
+        raise ValueError("browser_fill requires a resolved string value")
+    selector, is_exact_ref, ref = _selector_from_args(arguments, session)
+    chosen, chosen_index = await _resolve_fill_candidate(
+        selector, exact_ref=ref if is_exact_ref else None, session=session
+    )
     await chosen.fill(value)
+    if is_exact_ref:
+        return ToolResult(output=f"Filled exact ref {ref}.")
     return ToolResult(output=f"Filled element using visible editable match #{chosen_index}.")
 
 
