@@ -18,7 +18,10 @@ def browser_tool_definitions() -> list[ToolDefinition]:
                     "url": {"type": "string"},
                     "session_id": {"type": "string"},
                     "headless": {"type": "boolean"},
-                    "auth_state_ref": {"type": "string"},
+                    "auth_state_ref": {
+                        "type": "string",
+                        "description": "Optional $credential:<id> or $credential:<id>.<field> ref for saved browser auth state.",
+                    },
                 },
                 "required": ["url", "session_id"],
             },
@@ -32,7 +35,13 @@ def browser_tool_definitions() -> list[ToolDefinition]:
             description="Return a compact structured snapshot of the current browser page.",
             parameters={
                 "type": "object",
-                "properties": {"session_id": {"type": "string"}},
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "max_elements": {
+                        "type": "integer",
+                        "description": "Maximum number of interactive elements to include in the snapshot.",
+                    },
+                },
                 "required": ["session_id"],
             },
             source=_SOURCE,

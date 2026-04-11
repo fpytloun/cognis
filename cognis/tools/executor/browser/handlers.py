@@ -81,10 +81,11 @@ async def handle_browser_snapshot(
 ) -> ToolResult:
     manager = _get_manager(context)
     session = manager.get_session(str(arguments.get("session_id", "")))
+    max_elements = max(1, min(int(arguments.get("max_elements", 40) or 40), 80))
     elements = await session.page.evaluate(
         """
-        () => {
-          const nodes = Array.from(document.querySelectorAll('a,button,input,textarea,select,[role="button"],[role="link"]')).slice(0, 80);
+        (maxElements) => {
+          const nodes = Array.from(document.querySelectorAll('a,button,input,textarea,select,[role="button"],[role="link"]')).slice(0, maxElements);
           const makeSelector = (el) => {
             if (el.id) return `#${CSS.escape(el.id)}`;
             const testid = el.getAttribute('data-testid');
@@ -98,12 +99,13 @@ async def handle_browser_snapshot(
             selector: makeSelector(el),
             tag: el.tagName.toLowerCase(),
             role: el.getAttribute('role') || '',
-            text: (el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').trim().slice(0, 160),
+            text: (el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').trim().slice(0, 120),
             type: el.getAttribute('type') || '',
             name: el.getAttribute('name') || '',
           }));
         }
-        """
+        """,
+        max_elements,
     )
     session.ref_map = {
         str(item.get("ref")): str(item.get("selector"))

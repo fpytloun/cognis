@@ -605,11 +605,15 @@ class ToolRouter:
         self, arguments: dict[str, Any], session: SessionModel, agent: AgentDefinition
     ) -> dict[str, Any]:
         resolved = dict(arguments)
-        if "value_ref" in resolved and isinstance(resolved.get("value_ref"), str):
-            cred = await self._resolve_credential_value(str(resolved["value_ref"]), session, agent)
+        value_ref = resolved.get("value_ref")
+        if isinstance(value_ref, str) and value_ref.strip():
+            cred = await self._resolve_credential_value(value_ref.strip(), session, agent)
             resolved["value"] = str(cred.value)
-        if "auth_state_ref" in resolved and isinstance(resolved.get("auth_state_ref"), str):
-            auth_state_ref = str(resolved["auth_state_ref"])
+        elif isinstance(value_ref, str):
+            resolved.pop("value_ref", None)
+        auth_state_ref_raw = resolved.get("auth_state_ref")
+        if isinstance(auth_state_ref_raw, str) and auth_state_ref_raw.strip():
+            auth_state_ref = auth_state_ref_raw.strip()
             cred = await self._resolve_credential_value(auth_state_ref, session, agent)
             credential_id = auth_state_ref[len("$credential:") :].split(".", 1)[0]
             record = await self.credentials_provider.get_credential(
@@ -638,6 +642,8 @@ class ToolRouter:
                     resolved["auth_state"] = cred.value["storage_state"]
                 else:
                     resolved["auth_state"] = cred.value
+        elif isinstance(auth_state_ref_raw, str):
+            resolved.pop("auth_state_ref", None)
         env = resolved.get("env")
         if isinstance(env, dict):
             new_env: dict[str, Any] = {}

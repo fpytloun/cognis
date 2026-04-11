@@ -13,6 +13,7 @@ from cognis.tools.executor.browser import handlers as browser_handlers
 from cognis.tools.executor.browser.handlers import (
     handle_browser_fill,
     handle_browser_save_auth_state,
+    handle_browser_snapshot,
 )
 from cognis.tools.registry import ToolExecutionContext
 
@@ -34,10 +35,32 @@ class _FakePage:
         self.locator_calls: list[str] = []
         self.locator_obj = _FakeLocator()
         self.url = "https://github.com/settings"
+        self.last_evaluate_args: tuple[object, ...] = ()
 
     def locator(self, selector: str) -> _FakeLocator:
         self.locator_calls.append(selector)
         return self.locator_obj
+
+    async def evaluate(self, script: str, *args: object) -> object:
+        self.last_evaluate_args = args
+        if "querySelectorAll" in script:
+            max_elements = int(args[0]) if args else 40
+            return [
+                {
+                    "ref": f"e{i + 1}",
+                    "selector": f"button:nth-of-type({i + 1})",
+                    "tag": "button",
+                    "role": "",
+                    "text": f"Button {i + 1}",
+                    "type": "",
+                    "name": "",
+                }
+                for i in range(max_elements)
+            ]
+        return ""
+
+    async def title(self) -> str:
+        return "Settings"
 
 
 class _FakeManager:
@@ -100,6 +123,18 @@ async def test_browser_save_auth_state_returns_persistence_metadata(
     assert auth_state["payload"]["storage_state"]["cookies"][0]["name"] == "sid"
 
 
+@pytest.mark.asyncio
+async def test_browser_snapshot_uses_smaller_default_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _FakeManager()
+    monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
+    result = await handle_browser_snapshot({"session_id": "sess-1"}, _context())
+    assert result.output is not None
+    assert manager.session.page.last_evaluate_args == (40,)
+    assert '"elements"' in result.output
+
+
 class _FakeCredentialsProvider:
     def __init__(self, origin: str) -> None:
         self.origin = origin
@@ -159,3 +194,43 @@ async def test_tool_router_rejects_cross_origin_auth_state_ref() -> None:
                 permissions=AgentPermissions(allowed_credentials=["github_state"]),
             ),
         )
+
+
+@pytest.mark.asyncio
+async def test_tool_router_ignores_blank_auth_state_ref() -> None:
+    router = ToolRouter(
+        guardrails=SimpleNamespace(),
+        credentials_provider=_FakeCredentialsProvider("https://github.com"),
+    )
+    resolved = await router._resolve_credential_refs(  # noqa: SLF001
+        {"url": "https://github.com/settings", "auth_state_ref": "   "},
+        SimpleNamespace(user_email="user@example.com"),
+        AgentDefinition(
+            agent_id="agent-1",
+            owner_email="user@example.com",
+            name="Agent",
+            permissions=AgentPermissions(allowed_credentials=["github_state"]),
+        ),
+    )
+    assert "auth_state" not in resolved
+    assert "auth_state_ref" not in resolved
+
+
+@pytest.mark.asyncio
+async def test_tool_router_ignores_blank_value_ref() -> None:
+    router = ToolRouter(
+        guardrails=SimpleNamespace(),
+        credentials_provider=_FakeCredentialsProvider("https://github.com"),
+    )
+    resolved = await router._resolve_credential_refs(  # noqa: SLF001
+        {"value_ref": ""},
+        SimpleNamespace(user_email="user@example.com"),
+        AgentDefinition(
+            agent_id="agent-1",
+            owner_email="user@example.com",
+            name="Agent",
+            permissions=AgentPermissions(allowed_credentials=["github_state"]),
+        ),
+    )
+    assert "value" not in resolved
+    assert "value_ref" not in resolved
