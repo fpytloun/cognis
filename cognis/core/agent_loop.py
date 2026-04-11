@@ -102,6 +102,7 @@ STEP_COMPLETE = "step_complete"
 STEP_REQUEST_INPUT = "step_request_input"
 REQUEST_CREDENTIAL = "request_credential"
 REQUEST_AUTH_CHALLENGE = "request_auth_challenge"
+LIST_CREDENTIALS = "list_credentials"
 STEP_TODO_WRITE = "step_todo_write"
 STEP_TODO_LIST = "step_todo_list"
 CONTROLLER_TOOLS = {
@@ -109,6 +110,7 @@ CONTROLLER_TOOLS = {
     STEP_REQUEST_INPUT,
     REQUEST_CREDENTIAL,
     REQUEST_AUTH_CHALLENGE,
+    LIST_CREDENTIALS,
     STEP_TODO_WRITE,
     STEP_TODO_LIST,
     SEARCH_TOOLS_TOOL.name,
@@ -2091,6 +2093,59 @@ class AgentLoop:
                             await on_tool_result(
                                 tc.call_id, tc.name, timeout_content, True, None, None
                             )
+                    continue
+
+                elif tc.name == LIST_CREDENTIALS:
+                    _append_tool_call_event(events_to_record, tc, tool_id)
+                    rows = await self.providers.credentials.list_credentials(ctx.session.user_email)
+                    allowed = set(
+                        ctx.agent.permissions.allowed_credentials if ctx.agent.permissions else []
+                    )
+                    kind_filter = str(tc.arguments.get("kind", "")).strip().lower()
+                    domain_filter = str(tc.arguments.get("domain", "")).strip().lower()
+                    origin_filter = str(tc.arguments.get("origin", "")).strip().lower()
+                    label_filter = str(tc.arguments.get("label_contains", "")).strip().lower()
+                    matches: list[dict[str, Any]] = []
+                    for row in rows:
+                        if row.credential_id not in allowed:
+                            continue
+                        metadata = row.metadata or {}
+                        if kind_filter and str(row.kind).lower() != kind_filter:
+                            continue
+                        if (
+                            domain_filter
+                            and str(metadata.get("domain", "")).lower() != domain_filter
+                        ):
+                            continue
+                        if (
+                            origin_filter
+                            and str(metadata.get("origin", "")).lower() != origin_filter
+                        ):
+                            continue
+                        if label_filter and label_filter not in str(row.label).lower():
+                            continue
+                        matches.append(
+                            {
+                                "credential_id": row.credential_id,
+                                "kind": row.kind,
+                                "label": row.label,
+                                "description": row.description,
+                                "metadata": metadata,
+                                "status": row.status,
+                                "expires_at": row.expires_at.isoformat()
+                                if row.expires_at
+                                else None,
+                            }
+                        )
+                    result_content = json.dumps({"credentials": matches})
+                    messages.append(
+                        {"role": "tool", "tool_call_id": tc.call_id, "content": result_content}
+                    )
+                    _append_tool_result_event(
+                        events_to_record, tc, result_content, False, tool_id=tool_id
+                    )
+                    if on_tool_result:
+                        await on_tool_result(tc.call_id, tc.name, result_content, False, None, None)
                     continue
 
                 elif tc.name == SEARCH_TOOLS_TOOL.name:

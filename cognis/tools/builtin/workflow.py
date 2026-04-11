@@ -134,6 +134,29 @@ REQUEST_AUTH_CHALLENGE_TOOL = ToolDefinition(
     read_only=False,
 )
 
+LIST_CREDENTIALS_TOOL = ToolDefinition(
+    name="list_credentials",
+    description=(
+        "List credential metadata that the current agent is allowed to use. "
+        "Use this to discover available credential IDs before requesting or using one."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "kind": {"type": "string", "description": "Optional credential kind filter"},
+            "domain": {"type": "string", "description": "Optional domain filter"},
+            "origin": {"type": "string", "description": "Optional origin filter"},
+            "label_contains": {
+                "type": "string",
+                "description": "Optional case-insensitive label filter",
+            },
+        },
+    },
+    source=_SOURCE,
+    category="workflow",
+    read_only=True,
+)
+
 STEP_TODO_WRITE_TOOL = ToolDefinition(
     name="step_todo_write",
     description=(
@@ -191,6 +214,7 @@ def workflow_tools() -> list[ToolDefinition]:
         STEP_REQUEST_INPUT_TOOL,
         REQUEST_CREDENTIAL_TOOL,
         REQUEST_AUTH_CHALLENGE_TOOL,
+        LIST_CREDENTIALS_TOOL,
         STEP_TODO_WRITE_TOOL,
         STEP_TODO_LIST_TOOL,
     ]

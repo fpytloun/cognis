@@ -114,6 +114,11 @@ async def handle_browser_snapshot(
         """
         (maxElements) => {
           const nodes = Array.from(document.querySelectorAll('a,button,input,textarea,select,[role="button"],[role="link"]')).slice(0, maxElements);
+          const isVisible = (el) => {
+            const style = window.getComputedStyle(el);
+            const rect = el.getBoundingClientRect();
+            return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
+          };
           const makeSelector = (el) => {
             if (el.id) return `#${CSS.escape(el.id)}`;
             const testid = el.getAttribute('data-testid');
@@ -122,15 +127,30 @@ async def handle_browser_snapshot(
             if (name && ['INPUT','TEXTAREA','SELECT'].includes(el.tagName)) return `${el.tagName.toLowerCase()}[name="${name}"]`;
             return el.tagName.toLowerCase();
           };
-          return nodes.map((el, idx) => ({
-            ref: `e${idx + 1}`,
-            selector: makeSelector(el),
-            tag: el.tagName.toLowerCase(),
-            role: el.getAttribute('role') || '',
-            text: (el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').trim().slice(0, 120),
-            type: el.getAttribute('type') || '',
-            name: el.getAttribute('name') || '',
-          }));
+          return nodes.map((el, idx) => {
+            const type = (el.getAttribute && el.getAttribute('type')) || '';
+            return {
+              ref: `e${idx + 1}`,
+              selector: makeSelector(el),
+              tag: el.tagName.toLowerCase(),
+              role: el.getAttribute('role') || '',
+              text: (el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').trim().slice(0, 120),
+              type,
+              name: el.getAttribute('name') || '',
+              placeholder: el.getAttribute('placeholder') || '',
+              aria_label: el.getAttribute('aria-label') || '',
+              autocomplete: el.getAttribute('autocomplete') || '',
+              inputmode: el.getAttribute('inputmode') || '',
+              visible: isVisible(el),
+              enabled: !el.disabled,
+              editable: ['INPUT','TEXTAREA','SELECT'].includes(el.tagName) && !el.disabled && !el.readOnly && type !== 'hidden',
+              disabled: !!el.disabled,
+              read_only: !!el.readOnly,
+              value_state: (type === 'password' || type === 'hidden' || (el.getAttribute('autocomplete') || '').includes('one-time-code'))
+                ? 'redacted'
+                : ((el.value || '') ? 'non_empty' : 'empty'),
+            };
+          });
         }
         """,
         max_elements,
@@ -193,8 +213,32 @@ async def handle_browser_fill(
     value = arguments.get("value")
     if not isinstance(value, str):
         raise ValueError("browser_fill requires a resolved string value")
-    await session.page.locator(_selector_from_args(arguments, session)).first.fill(value)
-    return ToolResult(output="Filled element.")
+    locator = session.page.locator(_selector_from_args(arguments, session))
+    count = await locator.count()
+    if count <= 0:
+        raise ValueError("No matching browser input found")
+    chosen = None
+    chosen_index = None
+    for index in range(count):
+        candidate = locator.nth(index)
+        try:
+            if not await candidate.is_visible():
+                continue
+            if not await candidate.is_enabled():
+                continue
+            if not await candidate.is_editable():
+                continue
+        except Exception:
+            continue
+        chosen = candidate
+        chosen_index = index
+        break
+    if chosen is None:
+        raise ValueError(
+            "No visible enabled editable browser input matched; call browser_snapshot again and choose a visible ref"
+        )
+    await chosen.fill(value)
+    return ToolResult(output=f"Filled element using visible editable match #{chosen_index}.")
 
 
 async def handle_browser_press(

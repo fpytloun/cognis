@@ -20,12 +20,37 @@ from cognis.tools.registry import ToolExecutionContext
 
 
 class _FakeLocator:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        visible: bool = True,
+        enabled: bool = True,
+        editable: bool = True,
+    ) -> None:
         self.filled: str | None = None
+        self.visible = visible
+        self.enabled = enabled
+        self.editable = editable
+        self.children: list[_FakeLocator] = []
 
     @property
     def first(self) -> _FakeLocator:
         return self
+
+    async def count(self) -> int:
+        return len(self.children) if self.children else 1
+
+    def nth(self, index: int) -> _FakeLocator:
+        return self.children[index]
+
+    async def is_visible(self) -> bool:
+        return self.visible
+
+    async def is_enabled(self) -> bool:
+        return self.enabled
+
+    async def is_editable(self) -> bool:
+        return self.editable
 
     async def fill(self, value: str) -> None:
         self.filled = value
@@ -55,6 +80,16 @@ class _FakePage:
                     "text": f"Button {i + 1}",
                     "type": "",
                     "name": "",
+                    "placeholder": "",
+                    "aria_label": "",
+                    "autocomplete": "",
+                    "inputmode": "",
+                    "visible": True,
+                    "enabled": True,
+                    "editable": False,
+                    "disabled": False,
+                    "read_only": False,
+                    "value_state": "empty",
                 }
                 for i in range(max_elements)
             ]
@@ -100,6 +135,11 @@ async def test_browser_fill_uses_ref_map_and_resolved_value(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager = _FakeManager()
+    hidden = _FakeLocator(visible=False, enabled=True, editable=True)
+    visible = _FakeLocator(visible=True, enabled=True, editable=True)
+    aggregate = _FakeLocator()
+    aggregate.children = [hidden, visible]
+    manager.session.page.locator_obj = aggregate
     monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
     result = await handle_browser_fill(
         {"session_id": "sess-1", "ref": "e1", "value": "secret"},
@@ -107,7 +147,27 @@ async def test_browser_fill_uses_ref_map_and_resolved_value(
     )
     assert result.is_error is False
     assert manager.session.page.locator_calls == ["#password"]
-    assert manager.session.page.locator_obj.filled == "secret"
+    assert hidden.filled is None
+    assert visible.filled == "secret"
+
+
+@pytest.mark.asyncio
+async def test_browser_fill_errors_when_no_visible_editable_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _FakeManager()
+    aggregate = _FakeLocator()
+    aggregate.children = [
+        _FakeLocator(visible=False, enabled=True, editable=True),
+        _FakeLocator(visible=True, enabled=False, editable=True),
+    ]
+    manager.session.page.locator_obj = aggregate
+    monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
+    with pytest.raises(ValueError, match="visible enabled editable"):
+        await handle_browser_fill(
+            {"session_id": "sess-1", "ref": "e1", "value": "secret"},
+            _context(),
+        )
 
 
 @pytest.mark.asyncio
@@ -142,6 +202,8 @@ async def test_browser_snapshot_uses_smaller_default_limit(
     assert result.output is not None
     assert manager.session.page.last_evaluate_args == (40,)
     assert '"elements"' in result.output
+    assert '"visible": true' in result.output
+    assert '"editable": false' in result.output
 
 
 @pytest.mark.asyncio

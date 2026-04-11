@@ -45,7 +45,9 @@ def browser_tool_definitions() -> list[ToolDefinition]:
         ),
         ToolDefinition(
             name="browser_snapshot",
-            description="Return a compact structured snapshot of the current browser page.",
+            description=(
+                "Return a compact structured snapshot of the current browser page, including visibility and editability metadata for interactive elements."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
@@ -95,7 +97,10 @@ def browser_tool_definitions() -> list[ToolDefinition]:
         ),
         ToolDefinition(
             name="browser_fill",
-            description="Fill an input by ref or selector using literal value or value_ref.",
+            description=(
+                "Fill an input by ref or selector using literal value or value_ref. "
+                "This prefers the first visible, enabled, editable match and errors if none exist."
+            ),
             parameters={
                 "type": "object",
                 "properties": {

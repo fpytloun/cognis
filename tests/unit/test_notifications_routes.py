@@ -150,3 +150,84 @@ def test_credential_request_approve_requires_declared_fields(
         )
 
         assert response.status_code == 400
+
+
+def test_credential_request_parses_username_password_formats(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+
+        async def _seed_user() -> None:
+            async with client.app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=client.app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await session.commit()
+
+        async def _create_request() -> str:
+            notification = await client.app.state.notification_service.create(
+                notification_type="credential_request",
+                user_email="user@example.com",
+                conversation_id="conv-1",
+                payload={
+                    "credential_id": "reddit_login",
+                    "kind": "username_password",
+                    "label": "Reddit login",
+                    "required_fields": ["username", "password"],
+                },
+            )
+            return notification.notification_id
+
+        asyncio.run(_seed_user())
+
+        for response_text in [
+            "user@example.com:secret-pass",
+            "user@example.com\nsecret-pass",
+            "username: user@example.com\npassword: secret-pass",
+        ]:
+            notification_id = asyncio.run(_create_request())
+            response = client.post(
+                f"/api/v1/notifications/{notification_id}/resolve",
+                headers=_auth_headers(client.app, email="user@example.com"),
+                json={"decision": "approve", "response": response_text},
+            )
+            assert response.status_code == 200
+
+
+def test_credential_request_parses_token_reply(monkeypatch: object, tmp_path: Path) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+
+        async def _seed() -> str:
+            async with client.app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=client.app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await session.commit()
+            notification = await client.app.state.notification_service.create(
+                notification_type="credential_request",
+                user_email="user@example.com",
+                conversation_id="conv-1",
+                payload={
+                    "credential_id": "reddit_token",
+                    "kind": "token",
+                    "label": "Reddit token",
+                    "required_fields": ["token"],
+                },
+            )
+            return notification.notification_id
+
+        notification_id = asyncio.run(_seed())
+        response = client.post(
+            f"/api/v1/notifications/{notification_id}/resolve",
+            headers=_auth_headers(client.app, email="user@example.com"),
+            json={"decision": "approve", "response": "token: abc123"},
+        )
+        assert response.status_code == 200
