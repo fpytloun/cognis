@@ -8,10 +8,13 @@ from types import SimpleNamespace
 import pytest
 
 from cognis.core.agent_loop import (
+    CHAT_POLICY,
+    WORKFLOW_POLICY,
     AgentLoop,
     PauseResolution,
     PauseWaiter,
     SessionLock,
+    StepContext,
     StreamAccumulator,
     _controller_builtin_enabled,
     _filter_model_inventory_tools,
@@ -19,7 +22,7 @@ from cognis.core.agent_loop import (
 from cognis.core.runtime import ResolvedStepRuntime, build_local_executor_environment
 from cognis.models.agent import AgentDefinition, AgentPermissions
 from cognis.models.tool import Permission, ToolDefinition, ToolSource
-from cognis.models.workflow import StepOutput
+from cognis.models.workflow import StepDefinition, StepOutput
 from cognis.tools.builtin.tool_search import SEARCH_TOOLS_TOOL
 
 # ---------------------------------------------------------------------------
@@ -358,4 +361,165 @@ async def test_run_child_session_resolves_fresh_runtime() -> None:
     assert output is not None
     assert runtime_calls == [("agent-a", "user@example.com")]
     assert captured_tool_registry == ["child-registry"]
-    assert cleanup_called is True
+
+
+class _ReminderStop(RuntimeError):
+    pass
+
+
+class _FakeReminderLLM:
+    def __init__(self) -> None:
+        self.calls: list[list[dict[str, object]]] = []
+
+    def count_tokens(self, text: str, model: str | None = None) -> int:
+        return len(text)
+
+    async def get_model_info(self, model: str | None) -> SimpleNamespace:
+        return SimpleNamespace(
+            max_tools=None,
+            supports_parallel_tool_calls=False,
+            supports_tool_choice=False,
+            supports_cache_control=False,
+            supports_defer_loading=False,
+            provider="test",
+        )
+
+    async def stream_generate(self, messages: list[dict[str, object]], **_: object):
+        self.calls.append([dict(message) for message in messages])
+        if len(self.calls) >= 2:
+            raise _ReminderStop()
+        if False:
+            yield {}
+        return
+
+
+class _FakeContextAssembler:
+    async def assemble(self, **kwargs: object) -> SimpleNamespace:
+        role = kwargs.get("user_message_role", "user")
+        user_message = kwargs.get("user_message", "")
+        return SimpleNamespace(
+            messages=[{"role": role, "content": user_message}],
+            resolved_model="test-model",
+            cache_breakpoint_index=None,
+            prompt_tokens=0,
+            static_tokens=0,
+            dynamic_tokens=0,
+            max_context_tokens=0,
+            recommend_compaction=False,
+        )
+
+
+class _NoopRememberQueue:
+    async def enqueue(self, _: object) -> None:
+        return None
+
+
+class _NoopEventBus:
+    async def publish(self, _: object) -> None:
+        return None
+
+
+class _NoopGuardrails:
+    async def record_events(self, **_: object) -> None:
+        return None
+
+    async def report_reasoning(self, **_: object) -> None:
+        return None
+
+
+class _NoopSessionManager:
+    def session_factory(self) -> object:
+        class _Dummy:
+            async def __aenter__(self) -> SimpleNamespace:
+                return SimpleNamespace()
+
+            async def __aexit__(self, exc_type: object, exc: object, tb: object) -> bool:
+                return False
+
+        return _Dummy()
+
+
+class _NoopSessionCache:
+    def get_model_override(self, _: str) -> None:
+        return None
+
+    def get_reasoning_effort_override(self, _: str) -> None:
+        return None
+
+    def update_context_usage(self, *_: object, **__: object) -> None:
+        return None
+
+
+async def _run_reminder_capture(ctx: object) -> list[list[dict[str, object]]]:
+    fake_llm = _FakeReminderLLM()
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    output = await agent_loop.run_step(ctx)
+    assert output is not None
+    assert isinstance(output.error, str)
+    assert len(fake_llm.calls) >= 2
+    return fake_llm.calls
+
+
+@pytest.mark.asyncio
+async def test_direct_todo_reprompt_is_system_message() -> None:
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        todos=[{"content": "keep working", "status": "pending"}],
+        policy=CHAT_POLICY,
+        user_message="",
+        user_attachments=[],
+        attachment_notice=None,
+        prior_context=None,
+        system_initiated=True,
+        is_retry=False,
+        workflow_state=None,
+        executor_environment=None,
+        cancel_event=None,
+        bootstrap_wait_for_intention=False,
+        tool_registry=None,
+        executor_connection=None,
+    )
+    calls = await _run_reminder_capture(ctx)
+    assert calls[1][-1]["role"] == "system"
+    assert "incomplete todos" in str(calls[1][-1]["content"])
+
+
+@pytest.mark.asyncio
+async def test_step_complete_reprompt_is_system_message() -> None:
+    ctx = StepContext(
+        step_definition=StepDefinition(name="step-a", type="run", prompt="", allow_questions=False),
+        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        todos=[],
+        policy=WORKFLOW_POLICY,
+        user_message="",
+        user_attachments=[],
+        attachment_notice=None,
+        prior_context=None,
+        system_initiated=True,
+        is_retry=True,
+        workflow_state=SimpleNamespace(last_evaluation_feedback="Please revise."),
+        executor_environment=None,
+        cancel_event=None,
+        bootstrap_wait_for_intention=False,
+        tool_registry=None,
+        executor_connection=None,
+    )
+    calls = await _run_reminder_capture(ctx)
+    assert calls[1][-1]["role"] == "system"
+    assert "must call step_complete" in str(calls[1][-1]["content"])

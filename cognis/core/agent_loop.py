@@ -1641,7 +1641,7 @@ class AgentLoop:
                         )
                         messages.append(
                             {
-                                "role": "user",
+                                "role": "system",
                                 "content": (
                                     f"You have {len(incomplete_todos)} incomplete todos:\n"
                                     f"{todo_list}\n\n"
@@ -1672,7 +1672,7 @@ class AgentLoop:
                     reprompted = True
                     messages.append(
                         {
-                            "role": "user",
+                            "role": "system",
                             "content": (
                                 "You must call step_complete to finish this step. "
                                 "Please summarize what you have accomplished and call step_complete."
@@ -2376,7 +2376,7 @@ class AgentLoop:
                 )
                 messages.append(
                     {
-                        "role": "user",
+                        "role": "system",
                         "content": (
                             f"Tool call limit ({max_tool_calls}) reached. "
                             "Please call step_complete to finish this step."
