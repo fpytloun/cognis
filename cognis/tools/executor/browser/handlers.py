@@ -201,8 +201,30 @@ async def handle_browser_click(
 ) -> ToolResult:
     manager = _get_manager(context)
     session = manager.get_session(str(arguments.get("session_id", "")))
-    await session.page.locator(_selector_from_args(arguments, session)).first.click()
-    return ToolResult(output="Clicked element.")
+    locator = session.page.locator(_selector_from_args(arguments, session))
+    count = await locator.count()
+    if count <= 0:
+        raise ValueError("No matching browser element found")
+    chosen = None
+    chosen_index = None
+    for index in range(count):
+        candidate = locator.nth(index)
+        try:
+            if not await candidate.is_visible():
+                continue
+            if not await candidate.is_enabled():
+                continue
+        except Exception:
+            continue
+        chosen = candidate
+        chosen_index = index
+        break
+    if chosen is None:
+        raise ValueError(
+            "No visible enabled browser element matched; call browser_snapshot again and choose a visible ref"
+        )
+    await chosen.click()
+    return ToolResult(output=f"Clicked element using visible enabled match #{chosen_index}.")
 
 
 async def handle_browser_fill(

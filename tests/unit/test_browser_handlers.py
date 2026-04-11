@@ -11,6 +11,7 @@ from cognis.models.credential import CredentialRecord, CredentialResolution
 from cognis.models.tool import ExecutorHandle
 from cognis.tools.executor.browser import handlers as browser_handlers
 from cognis.tools.executor.browser.handlers import (
+    handle_browser_click,
     handle_browser_fill,
     handle_browser_open,
     handle_browser_save_auth_state,
@@ -28,6 +29,7 @@ class _FakeLocator:
         editable: bool = True,
     ) -> None:
         self.filled: str | None = None
+        self.clicked = False
         self.visible = visible
         self.enabled = enabled
         self.editable = editable
@@ -54,6 +56,9 @@ class _FakeLocator:
 
     async def fill(self, value: str) -> None:
         self.filled = value
+
+    async def click(self) -> None:
+        self.clicked = True
 
 
 class _FakePage:
@@ -166,6 +171,46 @@ async def test_browser_fill_errors_when_no_visible_editable_match(
     with pytest.raises(ValueError, match="visible enabled editable"):
         await handle_browser_fill(
             {"session_id": "sess-1", "ref": "e1", "value": "secret"},
+            _context(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_browser_click_prefers_visible_enabled_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _FakeManager()
+    hidden = _FakeLocator(visible=False, enabled=True, editable=False)
+    visible = _FakeLocator(visible=True, enabled=True, editable=False)
+    aggregate = _FakeLocator()
+    aggregate.children = [hidden, visible]
+    manager.session.page.locator_obj = aggregate
+    monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
+    result = await handle_browser_click(
+        {"session_id": "sess-1", "ref": "e1"},
+        _context(),
+    )
+    assert result.is_error is False
+    assert manager.session.page.locator_calls == ["#password"]
+    assert hidden.clicked is False
+    assert visible.clicked is True
+
+
+@pytest.mark.asyncio
+async def test_browser_click_errors_when_no_visible_enabled_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _FakeManager()
+    aggregate = _FakeLocator()
+    aggregate.children = [
+        _FakeLocator(visible=False, enabled=True, editable=False),
+        _FakeLocator(visible=True, enabled=False, editable=False),
+    ]
+    manager.session.page.locator_obj = aggregate
+    monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
+    with pytest.raises(ValueError, match="visible enabled"):
+        await handle_browser_click(
+            {"session_id": "sess-1", "ref": "e1"},
             _context(),
         )
 
