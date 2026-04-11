@@ -65,6 +65,24 @@ def browser_tool_definitions() -> list[ToolDefinition]:
             timeout_seconds=60,
         ),
         ToolDefinition(
+            name="browser_list_sessions",
+            description="List active browser sessions and their metadata so you can resume an existing session.",
+            parameters={"type": "object", "properties": {}},
+            source=_SOURCE,
+            category="browser",
+            read_only=True,
+            timeout_seconds=30,
+        ),
+        ToolDefinition(
+            name="browser_list_profiles",
+            description="List persistent local browser profiles available on this executor.",
+            parameters={"type": "object", "properties": {}},
+            source=_SOURCE,
+            category="browser",
+            read_only=True,
+            timeout_seconds=30,
+        ),
+        ToolDefinition(
             name="browser_get_text",
             description="Extract bounded visible text from the current page.",
             parameters={

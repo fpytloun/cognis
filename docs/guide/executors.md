@@ -132,9 +132,27 @@ Recommended agent behavior:
 - use `default` for most browser opens
 - use `ephemeral` only when a fresh clean session is specifically needed
 - use `persistent_local` for sticky local browser identity or when a site blocks fresh contexts
+- call `browser_list_sessions` first when you want to resume an already-open browser session
+- call `browser_list_profiles` when you want to reuse a persistent local profile but no live session is active
 
 `profile_id` is optional when `persistent_local` is used. If omitted, Cognis
 derives a stable site-scoped local profile automatically from the target URL.
+
+### Session and profile lifecycle
+
+Live browser sessions and persistent local profiles are different things:
+
+- a **browser session** is the active Playwright context/page currently running on the executor
+- a **persistent local profile** is the executor-local user data directory reused across sessions
+
+Cognis now exposes both through browser tools:
+
+- `browser_list_sessions` lists currently active sessions so the agent can resume one instead of opening a duplicate
+- `browser_list_profiles` lists persistent local profiles available on that executor
+
+Idle browser sessions are automatically closed after the executor's
+`idle_timeout_seconds`, but persistent local profile directories remain on disk
+for later reuse.
 
 ### Headed Linux browsers and Xvfb
 

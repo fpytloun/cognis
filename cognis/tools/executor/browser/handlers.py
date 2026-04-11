@@ -104,6 +104,24 @@ async def handle_browser_open(
     )
 
 
+async def handle_browser_list_sessions(
+    arguments: dict[str, Any], context: ToolExecutionContext
+) -> ToolResult:
+    del arguments
+    manager = _get_manager(context)
+    sessions = await manager.list_sessions()
+    return ToolResult(output=json.dumps({"sessions": sessions}))
+
+
+async def handle_browser_list_profiles(
+    arguments: dict[str, Any], context: ToolExecutionContext
+) -> ToolResult:
+    del arguments
+    manager = _get_manager(context)
+    profiles = await manager.list_profiles()
+    return ToolResult(output=json.dumps({"profiles": profiles}))
+
+
 async def handle_browser_snapshot(
     arguments: dict[str, Any], context: ToolExecutionContext
 ) -> ToolResult:

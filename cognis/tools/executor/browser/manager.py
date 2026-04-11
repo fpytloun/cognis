@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -35,6 +36,8 @@ class BrowserSession:
     profile_mode: str = "ephemeral"
     profile_id: str | None = None
     user_data_dir: str | None = None
+    headless: bool = True
+    display: str | None = None
     ref_map: dict[str, str] = field(default_factory=dict)
     last_used_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
@@ -84,10 +87,47 @@ class BrowserManager:
         self._xvfb_process: asyncio.subprocess.Process | None = None
         self._xvfb_display: str | None = None
         self._previous_display: str | None = None
+        self._claimed_displays: set[str] = set()
 
     @property
     def active_session_count(self) -> int:
         return len(self._sessions)
+
+    async def list_sessions(self) -> list[dict[str, Any]]:
+        await self._cleanup_idle_sessions()
+        sessions: list[dict[str, Any]] = []
+        for session in self._sessions.values():
+            sessions.append(
+                {
+                    "session_id": session.session_id,
+                    "url": getattr(session.page, "url", ""),
+                    "profile_mode": session.profile_mode,
+                    "profile_id": session.profile_id,
+                    "headless": session.headless,
+                    "display": session.display,
+                    "last_used_at": session.last_used_at.isoformat(),
+                    "auth_origin": session.auth_origin,
+                }
+            )
+        return sessions
+
+    async def list_profiles(self) -> list[dict[str, Any]]:
+        active_profile_ids = {
+            session.profile_id for session in self._sessions.values() if session.profile_id
+        }
+        profiles: list[dict[str, Any]] = []
+        for entry in sorted(self.profile_base_dir.iterdir(), key=lambda item: item.name):
+            if not entry.is_dir():
+                continue
+            stat = entry.stat()
+            profiles.append(
+                {
+                    "profile_id": entry.name,
+                    "currently_in_use": entry.name in active_profile_ids,
+                    "last_used_at": datetime.fromtimestamp(stat.st_mtime, tz=UTC).isoformat(),
+                }
+            )
+        return profiles
 
     async def ensure_runtime(self, *, headless: bool = True) -> None:
         if not self.enabled:
@@ -116,6 +156,7 @@ class BrowserManager:
         profile_mode: str = "default",
         profile_id: str | None = None,
     ) -> BrowserSession:
+        await self._cleanup_idle_sessions()
         if session_id in self._sessions:
             session = self._sessions[session_id]
             await session.page.goto(url)
@@ -143,6 +184,8 @@ class BrowserManager:
                 profile_mode=resolved_mode,
                 profile_id=resolved_profile_id,
                 user_data_dir=str(user_data_dir),
+                headless=headless,
+                display=(os.environ.get("DISPLAY") if not headless else None),
             )
         else:
             await self.ensure_runtime(headless=headless)
@@ -157,6 +200,8 @@ class BrowserManager:
                 auth_origin=url,
                 profile_mode=resolved_mode,
                 profile_id=resolved_profile_id,
+                headless=headless,
+                display=(self._xvfb_display if not headless else None) or os.environ.get("DISPLAY"),
             )
         self._sessions[session_id] = session
         return session
@@ -173,6 +218,11 @@ class BrowserManager:
         if session is None:
             return
         await session.context.close()
+        if not self._sessions and self._browser is not None:
+            await self._browser.close()
+            self._browser = None
+        if not any(not s.headless for s in self._sessions.values()):
+            await self._stop_virtual_display()
 
     async def cleanup(self) -> None:
         for session_id in list(self._sessions):
@@ -188,6 +238,18 @@ class BrowserManager:
     async def storage_state(self, session_id: str) -> dict[str, Any]:
         session = self.get_session(session_id)
         return await session.context.storage_state()
+
+    async def _cleanup_idle_sessions(self) -> None:
+        if self.idle_timeout_seconds <= 0:
+            return
+        cutoff = datetime.now(UTC).timestamp() - self.idle_timeout_seconds
+        stale = [
+            session_id
+            for session_id, session in self._sessions.items()
+            if session.last_used_at.timestamp() < cutoff
+        ]
+        for session_id in stale:
+            await self.close_session(session_id)
 
     def _resolve_profile_base_dir(self, configured: str | None) -> Path:
         if configured:
@@ -272,6 +334,7 @@ class BrowserManager:
         os.environ["DISPLAY"] = display
         self._xvfb_process = proc
         self._xvfb_display = display
+        self._claimed_displays.add(display)
         logger.info("browser: started xvfb display", extra={"extra_data": {"display": display}})
 
     async def _stop_virtual_display(self) -> None:
@@ -289,15 +352,19 @@ class BrowserManager:
                 os.environ["DISPLAY"] = self._previous_display
             else:
                 os.environ.pop("DISPLAY", None)
+            self._claimed_displays.discard(self._xvfb_display)
             self._xvfb_display = None
             self._previous_display = None
 
     def _allocate_display(self) -> str:
         x11_dir = Path("/tmp/.X11-unix")
-        for candidate in range(99, 120):
+        for candidate in range(99, 200):
+            display = f":{candidate}"
+            if display in self._claimed_displays:
+                continue
             if not (x11_dir / f"X{candidate}").exists():
-                return f":{candidate}"
-        return ":120"
+                return display
+        return f":{int(time.time()) % 1000 + 200}"
 
     def _launch_kwargs(self, *, headless: bool) -> dict[str, Any]:
         args: list[str] = []
@@ -353,11 +420,20 @@ class BrowserManager:
         browser_launcher = getattr(self._playwright, self.engine)
         user_data_dir = self.profile_base_dir / str(profile_id)
         user_data_dir.mkdir(parents=True, exist_ok=True)
-        context = await browser_launcher.launch_persistent_context(
-            str(user_data_dir),
-            **self._launch_kwargs(headless=headless),
-            **self._context_kwargs(),
-        )
+        previous_display = os.environ.get("DISPLAY")
+        if not headless and self._xvfb_display is not None:
+            os.environ["DISPLAY"] = self._xvfb_display
+        try:
+            context = await browser_launcher.launch_persistent_context(
+                str(user_data_dir),
+                **self._launch_kwargs(headless=headless),
+                **self._context_kwargs(),
+            )
+        finally:
+            if previous_display is not None:
+                os.environ["DISPLAY"] = previous_display
+            elif self._xvfb_display is not None:
+                os.environ.pop("DISPLAY", None)
         await self._apply_context_defaults(context)
         if auth_state and isinstance(auth_state.get("cookies"), list):
             await context.add_cookies(auth_state["cookies"])

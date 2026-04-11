@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import os
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 
 import pytest
 
@@ -82,3 +86,65 @@ async def test_browser_manager_restores_display_after_virtual_display_cleanup(
     await manager._stop_virtual_display()  # noqa: SLF001
 
     assert os.environ.get("DISPLAY") == ":5"
+
+
+@pytest.mark.asyncio
+async def test_browser_manager_lists_sessions_and_cleans_idle() -> None:
+    manager = BrowserManager(idle_timeout_seconds=60)
+
+    class _Context:
+        async def close(self) -> None:
+            return None
+
+    stale_session = SimpleNamespace(
+        session_id="sess-old",
+        page=SimpleNamespace(url="https://example.com"),
+        context=_Context(),
+        profile_mode="ephemeral",
+        profile_id=None,
+        headless=True,
+        display=None,
+        last_used_at=datetime.now(UTC) - timedelta(minutes=10),
+        auth_origin=None,
+    )
+    fresh_session = SimpleNamespace(
+        session_id="sess-new",
+        page=SimpleNamespace(url="https://reddit.com"),
+        context=_Context(),
+        profile_mode="persistent_local",
+        profile_id="www-reddit-com",
+        headless=False,
+        display=":99",
+        last_used_at=datetime.now(UTC),
+        auth_origin="https://reddit.com",
+    )
+    manager._sessions = {"sess-old": stale_session, "sess-new": fresh_session}  # noqa: SLF001
+
+    sessions = await manager.list_sessions()
+
+    assert [session["session_id"] for session in sessions] == ["sess-new"]
+    assert sessions[0]["profile_id"] == "www-reddit-com"
+
+
+@pytest.mark.asyncio
+async def test_browser_manager_lists_profiles_from_disk() -> None:
+    with TemporaryDirectory() as tmpdir:
+        base = Path(tmpdir)
+        (base / "www-reddit-com").mkdir()
+        (base / "github-com").mkdir()
+        manager = BrowserManager(profile_base_dir=str(base))
+        manager._sessions = {  # noqa: SLF001
+            "sess-1": SimpleNamespace(profile_id="www-reddit-com")
+        }
+
+        profiles = await manager.list_profiles()
+
+        assert [profile["profile_id"] for profile in profiles] == ["github-com", "www-reddit-com"]
+        assert profiles[1]["currently_in_use"] is True
+
+
+def test_browser_manager_allocate_display_skips_claimed_values() -> None:
+    manager = BrowserManager()
+    manager._claimed_displays = {":99", ":100"}  # noqa: SLF001
+    display = manager._allocate_display()  # noqa: SLF001
+    assert display not in manager._claimed_displays

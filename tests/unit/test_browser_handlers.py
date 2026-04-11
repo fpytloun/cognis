@@ -13,6 +13,8 @@ from cognis.tools.executor.browser import handlers as browser_handlers
 from cognis.tools.executor.browser.handlers import (
     handle_browser_click,
     handle_browser_fill,
+    handle_browser_list_profiles,
+    handle_browser_list_sessions,
     handle_browser_open,
     handle_browser_save_auth_state,
     handle_browser_snapshot,
@@ -132,6 +134,29 @@ class _FakeManager:
     async def storage_state(self, session_id: str) -> dict[str, Any]:
         assert session_id == "sess-1"
         return {"cookies": [{"name": "sid"}], "origins": []}
+
+    async def list_sessions(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "session_id": "sess-1",
+                "url": "https://github.com/settings",
+                "profile_mode": "persistent_local",
+                "profile_id": "github-com",
+                "headless": False,
+                "display": ":99",
+                "last_used_at": "2026-04-11T00:00:00+00:00",
+                "auth_origin": "https://github.com",
+            }
+        ]
+
+    async def list_profiles(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "profile_id": "github-com",
+                "currently_in_use": True,
+                "last_used_at": "2026-04-11T00:00:00+00:00",
+            }
+        ]
 
 
 def _context() -> ToolExecutionContext:
@@ -293,6 +318,23 @@ async def test_browser_open_uses_default_profile_mode_and_reports_profile(
     assert manager.open_calls[0]["profile_id"] is None
     assert '"profile_mode": "persistent_local"' in result.output
     assert '"profile_id": "www-reddit-com"' in result.output
+
+
+@pytest.mark.asyncio
+async def test_browser_list_sessions_returns_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = _FakeManager()
+    monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
+    result = await handle_browser_list_sessions({}, _context())
+    assert '"session_id": "sess-1"' in result.output
+    assert '"profile_id": "github-com"' in result.output
+
+
+@pytest.mark.asyncio
+async def test_browser_list_profiles_returns_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = _FakeManager()
+    monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
+    result = await handle_browser_list_profiles({}, _context())
+    assert '"profile_id": "github-com"' in result.output
 
 
 class _FakeCredentialsProvider:
