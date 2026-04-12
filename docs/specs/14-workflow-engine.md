@@ -532,6 +532,13 @@ For direct chat, the pause is transient: it blocks only new user turns in the
 same conversation while the question is live. If the controller restarts, the
 pending direct-chat question is marked orphaned rather than being resumed.
 
+Exception for managed external runtimes:
+
+- if the direct-chat turn is backed by a durable external runtime lease
+  (`runtime_runs`), the pending question may be resumed after controller
+  restart using the persisted runtime run state
+- otherwise the question remains transient and is orphaned on restart
+
 This is intended mainly for planning and research steps where ambiguity may
 appear during execution. Formal approvals should still be modeled as gate
 steps between workflow steps.
@@ -772,11 +779,26 @@ Note the distinction:
 
 When a step's evaluator returns "revise", the controller:
 1. Increments the step attempt counter
-2. Creates a new StepRun (new sub-session, context reset)
+2. Creates a new StepRun record for the new attempt
 3. Injects: original step prompt + evaluator feedback + previous attempt summary
 4. Agent runs the step again with the feedback
 
 This is bounded by `completion.max_attempts`.
+
+Runtime-specific attempt semantics:
+
+- `native` runtime may either continue the same underlying session or start a
+  fresh one depending on step/session policy
+- `claude_code` runtime continues the same managed external runtime session for
+  in-step revision attempts unless the runtime adapter explicitly declares the
+  session unrecoverable and rotates to a new one
+
+Clarification:
+
+- creating a new `StepRun` record for a new attempt does **not** require a new
+  underlying Intaris or external runtime session
+- `StepRun` tracks Cognis attempt metadata; runtime/session reuse is governed
+  by the runtime adapter and step retry policy
 
 ## Intaris Session Mapping
 
@@ -819,6 +841,14 @@ This is critical: the agent should not lose its own work when iterating.
 Only the first attempt assembles context from the step's `input` config.
 Subsequent attempts just see the evaluator's feedback added to their
 existing session.
+
+Question policy precedence:
+
+- workflow `interaction_mode` and `allow_questions` remain the primary policy
+  for whether a step may ask the user for input
+- runtime-emitted questions that arrive when questions are disallowed must be
+  converted into a step failure or formal gate/escalation according to runtime
+  policy; they must not silently bypass workflow interaction rules
 
 ## Main Chat As Workflow
 

@@ -6,9 +6,32 @@ Cognis integrates with external services through provider interfaces. This
 document specifies exact API contracts **verified against the current Mnemory
 and Intaris implementations**.
 
-Important: the controller is the sole client for Mnemory and Intaris. Executors
-never call these services directly — all communication is proxied through the
-controller.
+Important: the controller is the sole client for Mnemory and Intaris by
+default. Executors never call these services directly unless a specific runtime
+integration is explicitly declared as an approved exception with a documented
+trust boundary.
+
+Initial exception policy for agent runtimes:
+
+- `native` runtime: controller-only access to Mnemory and Intaris
+- `claude_code` runtime: may use approved native Claude Code integrations for
+  Intaris and Mnemory when configured as a Cognis-managed runtime host
+- any such exception must preserve Cognis audit linkage, notification flow,
+  and workflow ownership
+
+Approved-exception baseline for `claude_code`:
+
+- every native runtime-side Intaris or Mnemory interaction must carry a stable
+  Cognis `runtime_run_id`
+- every approval, question, memory session, and audit artifact created through
+  the native integration must be attributable to the Cognis user, agent, and
+  runtime run
+- runtime-side integrations must be replay-safe: reconnecting or retrying the
+  same runtime event must not duplicate approvals, audit records, or durable
+  memory writes
+- if a native integration cannot surface enough metadata for Cognis to restore
+  lineage and idempotency, it is out of scope for Claude v1 and must be routed
+  through the controller instead
 
 ## Memory Provider (Mnemory)
 

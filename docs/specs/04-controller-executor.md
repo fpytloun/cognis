@@ -2,10 +2,18 @@
 
 ## Overview
 
-The controller runs all agent loops — LLM interaction, memory injection,
-guardrails evaluation, session management. The executor is a **pure tool
-execution sandbox**: it receives tool calls and returns results. It has no
-knowledge of memory, guardrails, sessions, or the agent loop.
+The controller runs all workflow orchestration, session management, tool
+policy, task state, notifications, and delivery. Executors host two kinds of
+capability:
+
+1. **Tool execution** — the classic executor role
+2. **Runtime hosting** — long-lived, stateful external agent runtimes such as
+   Claude Code
+
+For native Cognis agents, an executor behaves like a tool sandbox. For
+external runtimes, the executor is a **runtime host** with bounded persistent
+state for that runtime only. It still does not own workflows, tasks, or Cognis
+conversation state.
 
 **Hard rule**: The controller NEVER executes tool calls. All tool execution
 goes through an executor, even in the MVP in-process executor.
@@ -139,7 +147,7 @@ The executor normalizes all inference output back into Cognis' canonical
 chat-like chunk/result shape before it crosses the WebSocket boundary, so the
 controller and executor paths remain behaviorally aligned.
 
-### Secret Lifecycle
+### Secret and Runtime State Lifecycle
 
 Secrets are injected into the executor at spawn time via
 `ExecutorConfig.secrets` (already decrypted by the controller from the
@@ -154,8 +162,8 @@ SecretsProvider). The executor never contacts the secrets store directly.
 | **Kubernetes** (planned) | K8s Secrets or environment | Pod lifetime | Pod terminated after work |
 
 Rules:
-- **No secret persistence on executor side.** Executors must not write
-  secrets to disk, logs, or shared storage.
+- **No controller-injected secret persistence on executor side.** Executors
+  must not write Cognis-injected secrets to disk, logs, or shared storage.
 - **Executor reuse:** In-process executor may be reused across sessions
   (MVP acceptable — same process anyway). Subprocess/Docker/K8s executors
   are per-delegation: new process/container per delegated task.
@@ -163,10 +171,24 @@ Rules:
   Vault/KMS integration where the executor pulls secrets at runtime using
   a short-lived token, rather than receiving plaintext from the controller.
 
-Note what is NOT in ExecutorConfig: no agent definition, no delegation info,
-no session IDs, no service tokens for Mnemory/Intaris. The executor knows
-nothing about agents, sessions, or external services. It executes tools and
-optionally provides LLM inference.
+Exception for runtime-hosted auth:
+
+- Executor-hosted runtimes such as `claude_code` may persist **runtime-native
+  auth and session state** inside an isolated runtime root owned by the
+  executor. This is not treated as Cognis secret persistence. It must remain
+  scoped to the owning user/runtime, never be written to logs, and be covered
+  by explicit retention and cleanup rules.
+
+Note what is NOT in ExecutorConfig for normal tool execution: no workflow
+graph, no task state authority, no delivery state, and no general-purpose
+service ownership for Mnemory or Intaris.
+
+Runtime-hosting exception:
+
+- a runtime host may know the runtime run ID, Cognis agent ID, and runtime
+  session metadata required to resume a managed external session
+- this does **not** make the executor the owner of workflows, tasks, or
+  conversation state
 
 ## JSON-RPC Protocol
 
@@ -220,6 +242,64 @@ For subprocess executors, steps 1-3 are automated: the controller spawns
     "arguments": dict,
     "timeout_seconds": int
 }
+
+# Start a runtime-backed turn or step
+"runtime.start" → {
+    "runtime_run_id": str,
+    "runtime_type": str,             # "claude_code"
+    "run_kind": str,                 # "direct_turn" | "workflow_step"
+    "agent_id": str,
+    "acting_user_email": str,
+    "conversation_id": str | null,
+    "task_id": str | null,
+    "step_run_id": str | null,
+    "last_event_seq": int,
+    "config": dict,
+    "input": dict
+}
+# → {"status": "started", "runtime_run_id": str, "external_session_id": str,
+#    "accepted_event_seq": int}
+
+# Resume an existing runtime lease
+"runtime.resume" → {
+    "runtime_run_id": str,
+    "runtime_type": str,
+    "acting_user_email": str,
+    "last_event_seq": int,
+    "response": dict | null
+}
+# → {"status": "resumed", "runtime_run_id": str, "accepted_event_seq": int}
+
+# Submit a response to a pending runtime question/approval
+"runtime.respond" → {
+    "runtime_run_id": str,
+    "request_id": str,
+    "response": dict
+}
+# → {"status": "accepted"}
+
+# Cancel a runtime lease
+"runtime.cancel" → {
+    "runtime_run_id": str,
+    "reason": str | null
+}
+# → {"status": "cancelled" | "already_completed"}
+
+# Inspect runtime status
+"runtime.status" → {
+    "runtime_run_id": str
+}
+# → {"status": str, "external_session_id": str | null,
+#    "last_event_seq": int, "pending_request_id": str | null,
+#    "recoverable": bool}
+
+# Collect buffered runtime events after seq
+"runtime.collect_events" → {
+    "runtime_run_id": str,
+    "after_seq": int
+}
+# → {"events": [{"seq": int, "type": str, "payload": dict, "ts": str}],
+#    "current_status": str, "has_more": bool}
 # → {"call_id": str, "output": str|dict, "is_error": bool, "duration_ms": int}
 
 # Cancel a running tool call
@@ -428,7 +508,8 @@ controlled by the user.
 | WebSocket disconnects during tool execution | Wait for reconnect (30s), then fail the tool call |
 | Tool exceeds timeout | Controller sends tool.cancel, waits 10s, force-kills |
 | Executor exceeds resource limits | Executor self-enforces and reports error |
-| Controller goes down | Executor detects disconnect, exits cleanly |
+| Controller goes down (tool-only run) | Executor detects disconnect, exits cleanly |
+| Controller goes down (runtime-hosted run) | Executor keeps the runtime lease for a grace period, buffers events locally, then marks the run orphaned if the controller does not reclaim it |
 
 ## Executor Implementations
 
@@ -477,6 +558,8 @@ CREATE TABLE executors (
     labels              JSON,              -- k8s-style labels for agent matching
     enabled_tools       JSON,              -- ["read", "glob"] or ["*"]
     enabled_tool_groups JSON,              -- ["filesystem", "search"]
+    supported_runtimes  JSON,              -- ["native", "claude_code"]
+    runtime_metadata    JSON,              -- runtime-specific capabilities
     config              JSON,              -- type-specific config
     status              TEXT NOT NULL DEFAULT 'active',
     is_default          INTEGER NOT NULL DEFAULT 0,
@@ -711,6 +794,15 @@ Examples:
 The controller still owns workflow progression, task state, memory policy,
 notifications, and guardrails orchestration. The executor hosts the runtime
 process and local state.
+
+Runtime protocol invariants:
+
+- event `seq` is monotonic per `runtime_run_id`
+- `runtime.start`, `runtime.resume`, `runtime.cancel`, and terminal event
+  handling must be idempotent
+- an executor must replay buffered events from `after_seq + 1`
+- terminal events must be replayable until the controller ACKs them via stored
+  `last_event_seq`
 
 ### Custom Executor Implementations
 

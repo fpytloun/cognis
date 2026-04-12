@@ -46,6 +46,28 @@ OpenCode should fit the same model.
 
 ## Core Model
 
+### Trust boundary
+
+The controller remains the source of truth for:
+
+- workflow state
+- task state
+- conversation/session lineage
+- notifications and user-visible pause reasons
+- delivery and audit linkage
+
+Executors may host runtime-native state for external runtimes, but they do not
+become workflow owners.
+
+For `claude_code`, the runtime host is an explicit exception to the historical
+"pure tool sandbox" model. That exception is narrow:
+
+- it may persist Claude-native auth/session state in an isolated runtime root
+- it may maintain runtime-native event buffers and lease metadata long enough
+  for recovery
+- it must not become the system of record for Cognis tasks, conversations, or
+  workflow transitions
+
 ### Agent runtime is first-class
 
 Each agent has a runtime configuration separate from executor placement.
@@ -120,9 +142,9 @@ Resolution outputs:
 Resolution order:
 
 1. resolve the agent for the turn or step
-2. resolve the executor from `agent.execution`
-3. resolve the runtime from `agent.runtime`
-4. validate that the selected executor supports the requested runtime
+2. resolve the requested runtime from `agent.runtime`
+3. co-resolve a compatible executor from `agent.execution`
+4. validate runtime support and runtime-specific capability metadata
 5. construct a runtime session handle for direct turn or workflow step use
 
 An executor may advertise supported runtimes, for example:
@@ -183,6 +205,13 @@ Required methods:
 - `runtime.cancel`
 - `runtime.status`
 - `runtime.collect_events`
+
+Runtime event collection must support:
+
+- monotonic event sequence numbers per runtime run
+- idempotent re-fetch after reconnect
+- acknowledgement or last-seen cursor from the controller
+- replay of buffered events after controller restart or reconnect
 
 This is intentionally separate from tool execution because external runtimes
 are long-lived, stateful, and interruptible. They are not modeled as a single
@@ -258,6 +287,17 @@ Supported auth methods for Cognis-managed Claude runtime:
 Auth is user-scoped and executor-local. Cognis does not proxy Claude Code
 inference through LiteLLM for `claude_code` runtime sessions.
 
+User-facing rules:
+
+- Claude auth is attached to the user on a specific executor runtime host
+- moving a Claude-backed agent to another executor requires separate Claude
+  auth on that executor unless migration support is explicitly implemented
+- the UI must show which executor currently holds Claude auth for the agent
+- auth expiry, invalidation, or required re-login must surface as a first-class
+  runtime status, not as a generic task failure
+- retention, revocation, and cleanup actions for executor-stored Claude auth
+  and transcripts must be explicit in the UI and auditable in Cognis
+
 ### Config and state isolation
 
 Cognis should run Claude Code with an isolated, Cognis-owned config root.
@@ -266,7 +306,7 @@ Suggested layout on the executor:
 
 ```text
 <executor-data>/runtimes/claude-code/
-  <owner_email>/
+  <acting_user_email>/
     settings.json
     state/
     sessions/
@@ -313,6 +353,18 @@ Design requirements:
 
 This keeps one approval model across native and Claude-backed agents.
 
+Claude v1 approved mode:
+
+- use the existing Claude Code <-> Intaris integration where available
+- Cognis still receives normalized approval/question events and remains the
+  user-facing orchestration layer
+- if native integration cannot preserve Cognis audit linkage or notification
+  flow for a given action type, that action type is out of scope for v1
+- native Intaris-side records must be attributable to `runtime_run_id`,
+  `acting_user_email`, and Cognis `agent_id`
+- approval/question replay after reconnect must not create duplicate Intaris
+  decisions or duplicated Cognis notifications
+
 ### Mnemory integration
 
 The Claude Code runtime should use the existing Claude Code <-> Mnemory
@@ -323,6 +375,14 @@ Controller-owned responsibilities remain:
 - which memories are in scope for the Cognis session
 - when auto-recall and remember are enabled for the agent type
 - how memory failures degrade the surrounding Cognis workflow
+
+Claude v1 approved mode:
+
+- use the existing Claude Code <-> Mnemory integration where available
+- Cognis remains the owner of agent identity, agent memory policy, and whether
+  a given agent class should auto-recall or auto-remember
+- native Mnemory writes must be replay-safe and attributable to the Cognis
+  `runtime_run_id`, `acting_user_email`, and `agent_id`
 
 ### Direct chat behavior
 
@@ -335,6 +395,13 @@ If that agent uses `runtime.type = "claude_code"`:
 - Cognis persists orchestration metadata and session lineage
 - Claude runtime session IDs are stored as runtime metadata, not as Cognis's
   primary session identity
+
+Claude v1 scope restriction:
+
+- direct chat is supported for active sessions
+- controller-restart recovery for direct-chat Claude runs requires durable
+  `runtime_runs` support; until that exists, direct chat should be behind a
+  feature flag or restricted to non-durable mode
 
 ### Workflow step behavior
 
@@ -349,6 +416,12 @@ For a step assigned to a Claude-backed agent:
   advance, retry, or fail the step
 
 Claude Code does not own workflow transitions.
+
+Claude v1 target scope:
+
+- full support for background task/workflow steps
+- direct chat support only once runtime recovery guarantees match workflow
+  expectations
 
 ### Structured completion contract
 
@@ -416,7 +489,7 @@ Each active external runtime run should have a lease with:
 - `runtime_run_id`
 - `runtime_type`
 - `executor_id`
-- `owner_email`
+- `acting_user_email`
 - `agent_id`
 - `conversation_id | null`
 - `task_id | null`
@@ -426,6 +499,53 @@ Each active external runtime run should have a lease with:
 - `last_event_at`
 - `last_heartbeat_at`
 - `pending_request_id | null`
+
+This lease must be persisted in Cognis storage as a first-class metadata row,
+for example:
+
+```sql
+CREATE TABLE runtime_runs (
+    runtime_run_id TEXT PRIMARY KEY,
+    runtime_type TEXT NOT NULL,
+    acting_user_email TEXT NOT NULL REFERENCES users(email),
+    agent_id TEXT NOT NULL,
+    executor_id TEXT NOT NULL REFERENCES executors(executor_id),
+    conversation_id TEXT,
+    task_id TEXT,
+    step_run_id TEXT,
+    status TEXT NOT NULL,
+    external_session_id TEXT,
+    external_run_id TEXT,
+    lease_owner TEXT,
+    last_event_seq BIGINT NOT NULL DEFAULT 0,
+    last_event_at TIMESTAMP WITH TIME ZONE,
+    last_heartbeat_at TIMESTAMP WITH TIME ZONE,
+    pending_request_id TEXT,
+    pending_request_kind TEXT,
+    recovery_policy JSON,
+    metadata JSON,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL
+);
+```
+
+Additional integrity requirements:
+
+- `agent_id` may reference either a DB-backed agent or a `system:*` agent ID;
+  do not enforce a DB foreign key that would reject system agents
+- at most one non-terminal `runtime_run` may exist for the same `step_run_id`
+- at most one non-terminal direct-turn `runtime_run` may exist for the same
+  `(conversation_id, agent_id, acting_user_email)` key
+- `lease_owner` changes must be compare-and-swap style to avoid split brain
+
+Required semantics:
+
+- one active lease owner at a time
+- idempotent `runtime.start` and `runtime.resume`
+- monotonic event sequence per `runtime_run_id`
+- controller stores `last_event_seq` after successful projection
+- replay after reconnect starts from `last_event_seq + 1`
+- completion and cancellation handling must be idempotent
 
 ### Stuck detection policy
 
@@ -443,6 +563,15 @@ Recovery actions:
 3. if waiting on human input, persist as paused and surface notification
 4. if unrecoverable, cancel and mark failed with structured reason
 5. optionally offer retry/resume using the same Claude session when safe
+
+Controller restart semantics:
+
+- task/workflow runs backed by `runtime_runs` must be reclaimable after
+  controller restart
+- pending questions and approvals tied to a `runtime_run_id` must remain
+  resolvable after restart
+- direct-chat recovery may be feature-flagged until the same guarantees are
+  proven for conversation turns
 
 ## Questions and Notifications
 
@@ -464,6 +593,15 @@ Flow:
 4. user responds in UI/API/channel
 5. Cognis calls `runtime.respond`
 6. runtime resumes
+
+User-visible states must distinguish at least:
+
+- `running`
+- `waiting_for_input`
+- `waiting_for_approval`
+- `recovering`
+- `stuck`
+- `failed`
 
 ## Data Ownership
 
@@ -503,6 +641,14 @@ Current Cognis agent loop. Default runtime.
 Executor-hosted native Claude Code runtime using Cognis-managed isolated config,
 native Claude auth, and existing Intaris/Mnemory integrations.
 
+Additional v1 constraints:
+
+- supported primarily on subprocess and remote WebSocket executors
+- internal/system control-plane agents remain `native`-only by default
+- background workflow/task execution is the primary supported path
+- direct chat rollout should stay behind a feature flag until restart recovery,
+  auth UX, and stuck detection are validated in production-like tests
+
 ### `opencode`
 
 Future executor-hosted runtime following the same contract.
@@ -519,10 +665,18 @@ Future executor-hosted runtime following the same contract.
 
 1. add first-class runtime config to agents and API models
 2. add runtime capability metadata to executors
-3. add runtime RPC alongside tool RPC
-4. wrap current behavior as `native` runtime adapter
-5. implement executor-side Claude runtime host
-6. implement controller-side Claude runtime adapter
-7. integrate direct chat, delegated tasks, and workflow steps
-8. add stuck detection, heartbeat monitoring, and orphan cleanup
-9. harden resume/cancel/question persistence paths
+3. add persisted `runtime_runs` schema and runtime event sequencing
+4. add runtime RPC alongside tool RPC
+5. wrap current behavior as `native` runtime adapter
+6. implement executor-side Claude runtime host
+7. implement controller-side Claude runtime adapter
+8. integrate background workflow/task execution first
+9. add stuck detection, heartbeat monitoring, restart recovery, and orphan cleanup
+10. enable direct chat once durability and UX requirements are met
+
+## Open Design Decisions Before Build-Out
+
+1. exact approved trust boundary for Claude↔Intaris and Claude↔Mnemory native integrations beyond the v1 baseline defined here
+2. runtime auth UX for login, expiry, revocation, and executor migration
+3. feature-flag policy for direct chat vs workflow-only rollout
+4. metrics and alerting required for production runtime hosting

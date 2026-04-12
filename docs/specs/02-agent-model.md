@@ -253,6 +253,18 @@ When a primary agent delegates to a secondary agent:
   memory tools in its tool config, the LLM decides whether to use them.
   No memory system instructions are injected into context.
 
+Runtime inheritance guardrails:
+
+- system/control-plane agents such as compaction, classification, evaluation,
+  and other Cognis-internal agents are `native`-only unless explicitly marked
+  otherwise
+- hidden secondary agents may inherit a caller's runtime only if that runtime
+  is listed as compatible for the agent definition
+- workflow-bound agents may further restrict runtime selection per step
+- runtime-scoped auth and session state must always be keyed to the **acting
+  user**, not only the agent owner, so shared/private agent future models do
+  not leak runtime credentials across users
+
 ## Pre-seeded System Agents
 
 Cognis ships with pre-seeded secondary agents for common tasks. These are
@@ -1075,6 +1087,7 @@ CREATE TABLE agents (
     tools JSON,
     permissions JSON,
     llm_config JSON,
+    runtime JSON,
     execution JSON,
     sync_metadata JSON DEFAULT '{}',
     avatar_url VARCHAR,
