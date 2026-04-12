@@ -126,8 +126,17 @@ async def handle_browser_snapshot(
     arguments: dict[str, Any], context: ToolExecutionContext
 ) -> ToolResult:
     manager = _get_manager(context)
-    session = manager.get_session(str(arguments.get("session_id", "")))
+    session = await manager.get_live_session(str(arguments.get("session_id", "")))
     max_elements = max(1, min(int(arguments.get("max_elements", 40) or 40), 80))
+    await session.page.evaluate(
+        """
+        () => {
+          for (const node of document.querySelectorAll('[data-cognis-ref]')) {
+            node.removeAttribute('data-cognis-ref');
+          }
+        }
+        """
+    )
     elements = await session.page.evaluate(
         """
         (maxElements) => {
@@ -198,7 +207,7 @@ async def handle_browser_get_text(
     arguments: dict[str, Any], context: ToolExecutionContext
 ) -> ToolResult:
     manager = _get_manager(context)
-    session = manager.get_session(str(arguments.get("session_id", "")))
+    session = await manager.get_live_session(str(arguments.get("session_id", "")))
     max_chars = int(arguments.get("max_chars", 4000) or 4000)
     text = await session.page.evaluate("() => (document.body?.innerText || '').trim()")
     return ToolResult(output=str(text)[:max_chars])
@@ -313,7 +322,7 @@ async def handle_browser_click(
     arguments: dict[str, Any], context: ToolExecutionContext
 ) -> ToolResult:
     manager = _get_manager(context)
-    session = manager.get_session(str(arguments.get("session_id", "")))
+    session = await manager.get_live_session(str(arguments.get("session_id", "")))
     selector, is_exact_ref, ref = _selector_from_args(arguments, session)
     chosen, chosen_index = await _resolve_click_candidate(
         selector, exact_ref=ref if is_exact_ref else None, session=session
@@ -328,7 +337,7 @@ async def handle_browser_fill(
     arguments: dict[str, Any], context: ToolExecutionContext
 ) -> ToolResult:
     manager = _get_manager(context)
-    session = manager.get_session(str(arguments.get("session_id", "")))
+    session = await manager.get_live_session(str(arguments.get("session_id", "")))
     value = arguments.get("value")
     if not isinstance(value, str):
         raise ValueError("browser_fill requires a resolved string value")
@@ -346,7 +355,7 @@ async def handle_browser_press(
     arguments: dict[str, Any], context: ToolExecutionContext
 ) -> ToolResult:
     manager = _get_manager(context)
-    session = manager.get_session(str(arguments.get("session_id", "")))
+    session = await manager.get_live_session(str(arguments.get("session_id", "")))
     await session.page.keyboard.press(str(arguments.get("key", "")))
     return ToolResult(output="Pressed key.")
 
@@ -355,7 +364,7 @@ async def handle_browser_wait_for(
     arguments: dict[str, Any], context: ToolExecutionContext
 ) -> ToolResult:
     manager = _get_manager(context)
-    session = manager.get_session(str(arguments.get("session_id", "")))
+    session = await manager.get_live_session(str(arguments.get("session_id", "")))
     selector = arguments.get("selector")
     timeout_ms = int(arguments.get("timeout_ms", 10000) or 10000)
     if isinstance(selector, str) and selector:
@@ -369,7 +378,7 @@ async def handle_browser_screenshot(
     arguments: dict[str, Any], context: ToolExecutionContext
 ) -> ToolResult:
     manager = _get_manager(context)
-    session = manager.get_session(str(arguments.get("session_id", "")))
+    session = await manager.get_live_session(str(arguments.get("session_id", "")))
     content = await session.page.screenshot(type="png")
     return ToolResult(
         output="Captured screenshot.",
@@ -398,7 +407,7 @@ async def handle_browser_save_auth_state(
     manager = _get_manager(context)
     session_id = str(arguments.get("session_id", ""))
     storage_state = await manager.storage_state(session_id)
-    session = manager.get_session(session_id)
+    session = await manager.get_live_session(session_id)
     current_url = getattr(session.page, "url", "")
     parsed = urlparse(str(current_url))
     origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else ""

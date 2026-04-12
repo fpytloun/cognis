@@ -152,7 +152,8 @@ Cognis now exposes both through browser tools:
 
 Idle browser sessions are automatically closed after the executor's
 `idle_timeout_seconds`, but persistent local profile directories remain on disk
-for later reuse.
+for later reuse. `browser_list_sessions` shows only non-expired live sessions;
+expired sessions are hidden and cleaned up by subsequent browser operations.
 
 ### Headed Linux browsers and Xvfb
 

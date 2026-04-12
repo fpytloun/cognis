@@ -89,11 +89,14 @@ async def test_browser_manager_restores_display_after_virtual_display_cleanup(
 
 
 @pytest.mark.asyncio
-async def test_browser_manager_lists_sessions_and_cleans_idle() -> None:
+async def test_browser_manager_list_sessions_hides_idle_without_closing() -> None:
     manager = BrowserManager(idle_timeout_seconds=60)
 
     class _Context:
+        closed = False
+
         async def close(self) -> None:
+            self.closed = True
             return None
 
     stale_session = SimpleNamespace(
@@ -124,6 +127,39 @@ async def test_browser_manager_lists_sessions_and_cleans_idle() -> None:
 
     assert [session["session_id"] for session in sessions] == ["sess-new"]
     assert sessions[0]["profile_id"] == "www-reddit-com"
+    assert stale_session.context.closed is False
+
+
+@pytest.mark.asyncio
+async def test_browser_manager_cleanup_idle_sessions_closes_stale() -> None:
+    manager = BrowserManager(idle_timeout_seconds=60)
+
+    class _Context:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+
+    stale_context = _Context()
+    manager._sessions = {  # noqa: SLF001
+        "sess-old": SimpleNamespace(
+            session_id="sess-old",
+            page=SimpleNamespace(url="https://example.com"),
+            context=stale_context,
+            profile_mode="ephemeral",
+            profile_id=None,
+            headless=True,
+            display=None,
+            last_used_at=datetime.now(UTC) - timedelta(minutes=10),
+            auth_origin=None,
+        )
+    }
+
+    await manager._cleanup_idle_sessions()  # noqa: SLF001
+
+    assert stale_context.closed is True
+    assert manager._sessions == {}
 
 
 @pytest.mark.asyncio
@@ -134,12 +170,20 @@ async def test_browser_manager_lists_profiles_from_disk() -> None:
         (base / "github-com").mkdir()
         manager = BrowserManager(profile_base_dir=str(base))
         manager._sessions = {  # noqa: SLF001
-            "sess-1": SimpleNamespace(profile_id="www-reddit-com")
+            "sess-1": SimpleNamespace(
+                profile_id="www-reddit-com",
+                last_used_at=datetime.now(UTC),
+            ),
+            "sess-2": SimpleNamespace(
+                profile_id="github-com",
+                last_used_at=datetime.now(UTC) - timedelta(days=1),
+            ),
         }
 
         profiles = await manager.list_profiles()
 
         assert [profile["profile_id"] for profile in profiles] == ["github-com", "www-reddit-com"]
+        assert profiles[0]["currently_in_use"] is False
         assert profiles[1]["currently_in_use"] is True
 
 
@@ -148,3 +192,33 @@ def test_browser_manager_allocate_display_skips_claimed_values() -> None:
     manager._claimed_displays = {":99", ":100"}  # noqa: SLF001
     display = manager._allocate_display()  # noqa: SLF001
     assert display not in manager._claimed_displays
+
+
+@pytest.mark.asyncio
+async def test_open_session_records_returned_display(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = BrowserManager(profile_mode_default="persistent_local")
+
+    async def _fake_open_persistent_context(**_: object):
+        return (
+            SimpleNamespace(),
+            SimpleNamespace(url="https://reddit.com", goto=lambda *_a, **_k: None),
+            Path("/tmp/p"),
+            ":101",
+        )
+
+    monkeypatch.setattr(manager, "_open_persistent_context", _fake_open_persistent_context)  # type: ignore[arg-type]
+    session = await manager.open_session(
+        session_id="sess-1",
+        url="https://reddit.com/login",
+        headless=False,
+        profile_mode="persistent_local",
+    )
+    assert session.display == ":101"
+
+
+@pytest.mark.asyncio
+async def test_browser_manager_reserve_profile_blocks_duplicate_use() -> None:
+    manager = BrowserManager()
+    await manager._reserve_profile_id("reddit")  # noqa: SLF001
+    with pytest.raises(RuntimeError, match="already in use"):
+        await manager._reserve_profile_id("reddit")  # noqa: SLF001

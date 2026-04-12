@@ -74,6 +74,7 @@ class _FakePage:
         self.locator_map: dict[str, _FakeLocator] = {}
         self.url = "https://github.com/settings"
         self.last_evaluate_args: tuple[object, ...] = ()
+        self.evaluate_scripts: list[str] = []
 
     def locator(self, selector: str) -> _FakeLocator:
         self.locator_calls.append(selector)
@@ -81,6 +82,7 @@ class _FakePage:
 
     async def evaluate(self, script: str, *args: object) -> object:
         self.last_evaluate_args = args
+        self.evaluate_scripts.append(script)
         if "querySelectorAll" in script:
             max_elements = int(args[0]) if args else 40
             return [
@@ -130,6 +132,9 @@ class _FakeManager:
     def get_session(self, session_id: str) -> Any:
         assert session_id == "sess-1"
         return self.session
+
+    async def get_live_session(self, session_id: str) -> Any:
+        return self.get_session(session_id)
 
     async def storage_state(self, session_id: str) -> dict[str, Any]:
         assert session_id == "sess-1"
@@ -293,6 +298,8 @@ async def test_browser_snapshot_uses_smaller_default_limit(
     result = await handle_browser_snapshot({"session_id": "sess-1"}, _context())
     assert result.output is not None
     assert manager.session.page.last_evaluate_args == (40,)
+    assert len(manager.session.page.evaluate_scripts) == 2
+    assert "removeAttribute('data-cognis-ref')" in manager.session.page.evaluate_scripts[0]
     assert '"elements"' in result.output
     assert '"exact_selector"' in result.output
     assert manager.session.ref_map["e1"] == '[data-cognis-ref="e1"]'

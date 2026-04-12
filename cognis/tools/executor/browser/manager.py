@@ -88,15 +88,17 @@ class BrowserManager:
         self._xvfb_display: str | None = None
         self._previous_display: str | None = None
         self._claimed_displays: set[str] = set()
+        self._reserved_profile_ids: set[str] = set()
 
     @property
     def active_session_count(self) -> int:
         return len(self._sessions)
 
     async def list_sessions(self) -> list[dict[str, Any]]:
-        await self._cleanup_idle_sessions()
         sessions: list[dict[str, Any]] = []
         for session in self._sessions.values():
+            if self._session_is_idle(session):
+                continue
             sessions.append(
                 {
                     "session_id": session.session_id,
@@ -113,7 +115,9 @@ class BrowserManager:
 
     async def list_profiles(self) -> list[dict[str, Any]]:
         active_profile_ids = {
-            session.profile_id for session in self._sessions.values() if session.profile_id
+            session.profile_id
+            for session in self._sessions.values()
+            if session.profile_id and not self._session_is_idle(session)
         }
         profiles: list[dict[str, Any]] = []
         for entry in sorted(self.profile_base_dir.iterdir(), key=lambda item: item.name):
@@ -170,12 +174,16 @@ class BrowserManager:
             url=url,
         )
         if resolved_mode == "persistent_local":
-            context, page, user_data_dir = await self._open_persistent_context(
-                url=url,
-                headless=headless,
-                auth_state=auth_state,
-                profile_id=resolved_profile_id,
-            )
+            await self._reserve_profile_id(str(resolved_profile_id))
+            try:
+                context, page, user_data_dir, display = await self._open_persistent_context(
+                    url=url,
+                    headless=headless,
+                    auth_state=auth_state,
+                    profile_id=resolved_profile_id,
+                )
+            finally:
+                self._reserved_profile_ids.discard(str(resolved_profile_id))
             session = BrowserSession(
                 session_id=session_id,
                 context=context,
@@ -185,7 +193,7 @@ class BrowserManager:
                 profile_id=resolved_profile_id,
                 user_data_dir=str(user_data_dir),
                 headless=headless,
-                display=(os.environ.get("DISPLAY") if not headless else None),
+                display=display,
             )
         else:
             await self.ensure_runtime(headless=headless)
@@ -210,8 +218,14 @@ class BrowserManager:
         session = self._sessions.get(session_id)
         if session is None:
             raise KeyError(f"Unknown browser session: {session_id}")
+        if self._session_is_idle(session):
+            raise KeyError(f"Browser session expired due to idleness: {session_id}")
         session.last_used_at = datetime.now(UTC)
         return session
+
+    async def get_live_session(self, session_id: str) -> BrowserSession:
+        await self._cleanup_idle_sessions()
+        return self.get_session(session_id)
 
     async def close_session(self, session_id: str) -> None:
         session = self._sessions.pop(session_id, None)
@@ -236,20 +250,37 @@ class BrowserManager:
         await self._stop_virtual_display()
 
     async def storage_state(self, session_id: str) -> dict[str, Any]:
-        session = self.get_session(session_id)
+        session = await self.get_live_session(session_id)
         return await session.context.storage_state()
 
     async def _cleanup_idle_sessions(self) -> None:
         if self.idle_timeout_seconds <= 0:
             return
-        cutoff = datetime.now(UTC).timestamp() - self.idle_timeout_seconds
         stale = [
             session_id
             for session_id, session in self._sessions.items()
-            if session.last_used_at.timestamp() < cutoff
+            if self._session_is_idle(session)
         ]
         for session_id in stale:
             await self.close_session(session_id)
+
+    async def _reserve_profile_id(self, profile_id: str) -> None:
+        async with self._lock:
+            if profile_id in self._reserved_profile_ids or any(
+                session.profile_mode == "persistent_local" and session.profile_id == profile_id
+                for session in self._sessions.values()
+            ):
+                raise RuntimeError(f"Browser profile already in use: {profile_id}")
+            self._reserved_profile_ids.add(profile_id)
+
+    def _session_is_idle(self, session: BrowserSession | Any) -> bool:
+        if self.idle_timeout_seconds <= 0:
+            return False
+        last_used_at = getattr(session, "last_used_at", None)
+        if last_used_at is None:
+            return False
+        cutoff = datetime.now(UTC).timestamp() - self.idle_timeout_seconds
+        return last_used_at.timestamp() < cutoff
 
     def _resolve_profile_base_dir(self, configured: str | None) -> Path:
         if configured:
@@ -337,6 +368,25 @@ class BrowserManager:
         self._claimed_displays.add(display)
         logger.info("browser: started xvfb display", extra={"extra_data": {"display": display}})
 
+    def _active_display(self, *, headless: bool) -> str | None:
+        if headless:
+            return None
+        return self._xvfb_display or os.environ.get("DISPLAY")
+
+    def _set_display_env(self, display: str | None) -> str | None:
+        previous_display = os.environ.get("DISPLAY")
+        if display is not None:
+            os.environ["DISPLAY"] = display
+        else:
+            os.environ.pop("DISPLAY", None)
+        return previous_display
+
+    def _restore_display_env(self, previous_display: str | None) -> None:
+        if previous_display is not None:
+            os.environ["DISPLAY"] = previous_display
+        else:
+            os.environ.pop("DISPLAY", None)
+
     async def _stop_virtual_display(self) -> None:
         proc = self._xvfb_process
         self._xvfb_process = None
@@ -410,33 +460,30 @@ class BrowserManager:
         headless: bool,
         auth_state: dict[str, Any] | None,
         profile_id: str | None,
-    ) -> tuple[Any, Any, Path]:
+    ) -> tuple[Any, Any, Path, str | None]:
         if any(
             session.profile_mode == "persistent_local" and session.profile_id == profile_id
             for session in self._sessions.values()
         ):
             raise RuntimeError(f"Browser profile already in use: {profile_id}")
-        await self._ensure_playwright_ready(headless=headless)
-        browser_launcher = getattr(self._playwright, self.engine)
         user_data_dir = self.profile_base_dir / str(profile_id)
         user_data_dir.mkdir(parents=True, exist_ok=True)
-        previous_display = os.environ.get("DISPLAY")
-        if not headless and self._xvfb_display is not None:
-            os.environ["DISPLAY"] = self._xvfb_display
-        try:
-            context = await browser_launcher.launch_persistent_context(
-                str(user_data_dir),
-                **self._launch_kwargs(headless=headless),
-                **self._context_kwargs(),
-            )
-        finally:
-            if previous_display is not None:
-                os.environ["DISPLAY"] = previous_display
-            elif self._xvfb_display is not None:
-                os.environ.pop("DISPLAY", None)
+        async with self._lock:
+            await self._ensure_playwright_ready(headless=headless)
+            browser_launcher = getattr(self._playwright, self.engine)
+            display = self._active_display(headless=headless)
+            previous_display = self._set_display_env(display)
+            try:
+                context = await browser_launcher.launch_persistent_context(
+                    str(user_data_dir),
+                    **self._launch_kwargs(headless=headless),
+                    **self._context_kwargs(),
+                )
+            finally:
+                self._restore_display_env(previous_display)
         await self._apply_context_defaults(context)
         if auth_state and isinstance(auth_state.get("cookies"), list):
             await context.add_cookies(auth_state["cookies"])
         page = context.pages[0] if context.pages else await context.new_page()
         await page.goto(url)
-        return context, page, user_data_dir
+        return context, page, user_data_dir, display
