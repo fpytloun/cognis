@@ -461,7 +461,8 @@ CREATE TABLE mcp_servers (
     command           TEXT,              -- Required for stdio
     url               TEXT,              -- Required for sse/streamable_http
     args              JSON,
-    env               JSON,              -- {"KEY": "value"} or {"KEY": "$secret:name"}
+    env               JSON,              -- stdio only: {"KEY": "value"} or {"KEY": "$secret:name"}
+    headers           JSON,              -- http only: {"Authorization": "value"} or "$secret:name"
     timeout_seconds   INTEGER NOT NULL DEFAULT 30,
     description       TEXT,
     owner_email       TEXT REFERENCES users(email),
@@ -478,15 +479,17 @@ reference servers owned by the same user as the executor.
 
 Local MCP servers run on the executor.  During ``executor.configure``, the
 controller resolves assigned MCP servers from the DB, resolves secrets, and
-sends the configs to the executor.  The executor starts stdio MCP clients,
-discovers tools, and includes them in ``tool.list``.
+sends the configs to the executor. The executor starts transport-specific MCP
+clients (``stdio``, ``sse``, or ``streamable_http``), discovers tools, and
+includes them in ``tool.list``.
 
 Flow: Controller evaluates via Intaris → approved → tool.execute to Executor →
 Executor calls local MCP server → result back to Controller.
 
-**Supported transports for executor-hosted MCP:** stdio only (current phase).
-Non-stdio transports (sse, streamable_http) are rejected during
-``executor.configure`` with a structured error.
+**Supported transports for executor-hosted MCP:** ``stdio``, ``sse``, and
+``streamable_http`` across websocket, subprocess, and in-process executor
+modes. Transport-specific configuration is strict: ``stdio`` uses ``env`` and
+HTTP transports use ``headers``.
 
 Note: Common developer tools (filesystem, shell, search) are executor-native
 and do not require MCP server configuration.  Local MCP is for specialized

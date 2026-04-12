@@ -36,12 +36,31 @@ def _auth_headers(app: object, *, email: str, role: str = "user") -> dict[str, s
 
 def test_mcp_server_config_validates_transport_fields() -> None:
     MCPServerConfig(name="stdio", transport="stdio", command="/bin/echo")
-    MCPServerConfig(name="sse", transport="sse", url="http://localhost/sse")
+    MCPServerConfig(
+        name="sse",
+        transport="sse",
+        url="http://localhost/sse",
+        headers={"Authorization": "$secret:demo"},
+    )
 
     with pytest.raises(ValueError, match="command is required"):
         MCPServerConfig(name="broken", transport="stdio")
     with pytest.raises(ValueError, match="url is required"):
         MCPServerConfig(name="broken", transport="sse")
+    with pytest.raises(ValueError, match="headers are not allowed"):
+        MCPServerConfig(
+            name="broken",
+            transport="stdio",
+            command="/bin/echo",
+            headers={"Authorization": "Bearer demo"},
+        )
+    with pytest.raises(ValueError, match="env is not allowed"):
+        MCPServerConfig(
+            name="broken",
+            transport="streamable_http",
+            url="http://localhost/mcp",
+            env={"API_TOKEN": "$secret:demo"},
+        )
 
 
 def test_select_static_tools_honors_disabled_categories_and_tools() -> None:
@@ -132,6 +151,56 @@ def test_admin_can_create_and_list_mcp_servers(monkeypatch: object, tmp_path: Pa
         assert list_response.status_code == 200
         listed = list_response.json()
         assert listed[0]["server_id"] == created["server_id"]
+
+
+def test_admin_can_create_http_mcp_server_with_headers(monkeypatch: object, tmp_path: Path) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        headers = _auth_headers(client.app, email="admin@example.com", role="admin")
+
+        import asyncio
+
+        async def _seed_user() -> None:
+            async with client.app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="admin@example.com",
+                    name="Admin",
+                    password_hash=client.app.state.password_hasher.hash("password123"),
+                    role="admin",
+                )
+                await session.commit()
+
+        asyncio.run(_seed_user())
+
+        create_response = client.post(
+            "/api/v1/mcp-servers",
+            headers=headers,
+            json={
+                "name": "remote-demo",
+                "transport": "sse",
+                "url": "http://localhost:3000/sse",
+                "headers": {"authorization": "$secret:DEMO_TOKEN"},
+            },
+        )
+        assert create_response.status_code == 200
+        created = create_response.json()
+        assert created["headers"]["Authorization"] == "$secret:DEMO_TOKEN"
+        assert created["env"] == {}
+
+
+def test_http_mcp_server_rejects_env_payload(monkeypatch: object, tmp_path: Path) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        response = client.post(
+            "/api/v1/mcp-servers",
+            headers=_auth_headers(client.app, email="admin@example.com", role="admin"),
+            json={
+                "name": "broken-http",
+                "transport": "streamable_http",
+                "url": "http://localhost:3000/mcp",
+                "env": {"API_TOKEN": "$secret:DEMO_TOKEN"},
+            },
+        )
+        assert response.status_code == 422
 
 
 def test_mcp_servers_are_user_scoped(monkeypatch: object, tmp_path: Path) -> None:
@@ -295,6 +364,83 @@ def test_effective_tools_live_state_includes_merged_intaris_tools_for_websocket(
         live_names = {tool["name"] for tool in payload["live_state"]["tools"]}
         assert "read" in live_names
         assert sanitize_mcp_tool_name("github", "search/issues") in live_names
+
+
+def test_effective_tools_preview_discovers_http_mcp_for_in_process_executor(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        import asyncio
+
+        async def _seed() -> None:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="alice@example.com",
+                    name="Alice",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_mcp_server(
+                    session,
+                    server_id="mcp_http_preview",
+                    name="http-preview",
+                    transport="sse",
+                    url="http://localhost:3000/sse",
+                    headers={"Authorization": "$secret:DEMO_TOKEN"},
+                    owner_email="alice@example.com",
+                )
+                await create_executor(
+                    session,
+                    executor_id="alice_exec",
+                    name="Alice exec",
+                    executor_type="in_process",
+                    config={MCP_SERVER_IDS_KEY: ["mcp_http_preview"]},
+                    owner_email="alice@example.com",
+                )
+                await session.commit()
+
+        asyncio.run(_seed())
+
+        class _FakeClient:
+            def __init__(self) -> None:
+                self.connected = False
+
+            async def connect(self) -> None:
+                self.connected = True
+
+            async def list_tools(self) -> list[dict[str, object]]:
+                return [
+                    {
+                        "name": "inspect",
+                        "description": "Inspect remote resource",
+                        "inputSchema": {"type": "object", "properties": {}},
+                    }
+                ]
+
+            async def call_tool(self, tool_name: str, arguments: dict[str, object]) -> str:
+                del tool_name, arguments
+                return "ok"
+
+            async def close(self) -> None:
+                self.connected = False
+
+        monkeypatch.setattr(
+            "cognis.api.routes.tools.build_mcp_client",
+            lambda server, secrets: _FakeClient(),
+        )
+
+        response = client.post(
+            "/api/v1/agents/effective-tools/preview",
+            headers=_auth_headers(client.app, email="alice@example.com", role="user"),
+            json={"execution": {"executor_id": "alice_exec"}},
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        configured_names = {tool["name"] for tool in payload["configured_state"]["tools"]}
+        assert sanitize_mcp_tool_name("http-preview", "inspect") in configured_names
 
 
 def test_effective_tools_live_state_skips_stale_websocket_executor(
@@ -583,6 +729,43 @@ def test_update_mcp_server_revalidates_transport(monkeypatch: object, tmp_path: 
             json={"transport": "sse", "command": None},
         )
         assert response.status_code == 422
+
+
+def test_invalid_http_mcp_server_is_flagged_in_list(monkeypatch: object, tmp_path: Path) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        import asyncio
+
+        async def _seed() -> None:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="admin@example.com",
+                    name="Admin",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="admin",
+                )
+                await create_mcp_server(
+                    session,
+                    server_id="mcp_invalid_http",
+                    name="invalid-http",
+                    transport="sse",
+                    url="http://localhost:3000/sse",
+                    env={"API_TOKEN": "$secret:DEMO_TOKEN"},
+                    owner_email="admin@example.com",
+                )
+                await session.commit()
+
+        asyncio.run(_seed())
+
+        response = client.get(
+            "/api/v1/mcp-servers",
+            headers=_auth_headers(client.app, email="admin@example.com", role="admin"),
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload[0]["invalid_reason"] is not None
 
 
 @pytest.mark.asyncio

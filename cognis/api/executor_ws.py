@@ -15,6 +15,7 @@ from cognis.logging import get_logger
 from cognis.models.tool import MCP_SERVER_IDS_KEY, ExecutorCapabilities, MCPServerConfig
 from cognis.providers.executor.websocket import WebSocketExecutorProvider
 from cognis.store.queries import get_executor_row, get_mcp_server, update_executor_runtime_state
+from cognis.tools.mcp import invalid_mcp_config_reason
 
 _logger = get_logger(__name__)
 
@@ -200,6 +201,19 @@ async def _resolve_executor_mcp_payload(
             mcp_row = await get_mcp_server(session, str(server_id), owner_email=row.owner_email)
             if mcp_row is None or mcp_row.status != "active":
                 continue
+            invalid_reason = invalid_mcp_config_reason(
+                transport=mcp_row.transport,
+                command=mcp_row.command,
+                url=mcp_row.url,
+                env=mcp_row.env,
+                headers=mcp_row.headers,
+            )
+            if invalid_reason is not None:
+                _logger.warning(
+                    "Skipping invalid MCP server config",
+                    extra={"extra_data": {"server_id": server_id, "reason": invalid_reason}},
+                )
+                continue
             servers.append(
                 MCPServerConfig(
                     name=mcp_row.name,
@@ -208,11 +222,12 @@ async def _resolve_executor_mcp_payload(
                     url=mcp_row.url,
                     args=mcp_row.args or [],
                     env=mcp_row.env or {},
+                    headers=mcp_row.headers or {},
                     timeout_seconds=mcp_row.timeout_seconds,
                     server_id=mcp_row.server_id,
                 )
             )
-            for value in (mcp_row.env or {}).values():
+            for value in [*(mcp_row.env or {}).values(), *(mcp_row.headers or {}).values()]:
                 if isinstance(value, str) and value.startswith("$secret:"):
                     secret_names.add(value[len("$secret:") :])
 

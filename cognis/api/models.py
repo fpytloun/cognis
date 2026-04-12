@@ -962,10 +962,12 @@ class MCPServerConfigResponse(BaseModel):
     url: str | None = None
     args: list[str] = Field(default_factory=list)
     env: dict[str, str] = Field(default_factory=dict)
+    headers: dict[str, str] = Field(default_factory=dict)
     timeout_seconds: int = 30
     description: str | None = None
     owner_email: str
     status: str = "active"
+    invalid_reason: str | None = None
     created_at: str | None = None
     updated_at: str | None = None
 
@@ -978,20 +980,38 @@ class MCPServerCreateRequest(BaseModel):
     url: str | None = None
     args: list[str] = Field(default_factory=list)
     env: dict[str, str] = Field(default_factory=dict)
+    headers: dict[str, str] = Field(default_factory=dict)
     timeout_seconds: int = 30
     description: str | None = None
 
     @model_validator(mode="after")
     def _validate_transport_fields(self) -> MCPServerCreateRequest:
-        if self.transport == "stdio" and not self.command:
+        if self.transport == "stdio":
+            if not self.command:
+                raise PydanticCustomError(
+                    "mcp_stdio_command_required",
+                    "command is required for stdio transport",
+                )
+            if self.headers:
+                raise PydanticCustomError(
+                    "mcp_stdio_headers_forbidden",
+                    "headers are not allowed for stdio transport",
+                )
+        elif self.transport in ("sse", "streamable_http"):
+            if not self.url:
+                raise PydanticCustomError(
+                    "mcp_url_required",
+                    f"url is required for {self.transport} transport",
+                )
+            if self.env:
+                raise PydanticCustomError(
+                    "mcp_http_env_forbidden",
+                    f"env is not allowed for {self.transport} transport; use headers",
+                )
+        else:
             raise PydanticCustomError(
-                "mcp_stdio_command_required",
-                "command is required for stdio transport",
-            )
-        if self.transport in ("sse", "streamable_http") and not self.url:
-            raise PydanticCustomError(
-                "mcp_url_required",
-                f"url is required for {self.transport} transport",
+                "mcp_transport_invalid",
+                f"unsupported MCP transport: {self.transport}",
             )
         return self
 
@@ -1003,6 +1023,7 @@ class MCPServerUpdateRequest(BaseModel):
     url: str | None = None
     args: list[str] | None = None
     env: dict[str, str] | None = None
+    headers: dict[str, str] | None = None
     timeout_seconds: int | None = None
     description: str | None = None
     status: str | None = None

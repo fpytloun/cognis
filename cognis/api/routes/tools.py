@@ -68,7 +68,13 @@ from cognis.store.queries import (
     list_mcp_servers as list_global_mcp_servers,
 )
 from cognis.tools.executor.definitions import executor_tool_definitions
-from cognis.tools.mcp import StdioMCPClient, mcp_tools_to_definitions, resolve_secret_refs
+from cognis.tools.mcp import (
+    MCPClient,
+    build_mcp_client,
+    canonicalize_mcp_headers,
+    invalid_mcp_config_reason,
+    mcp_tools_to_definitions,
+)
 
 router = APIRouter(tags=["tools"])
 
@@ -226,19 +232,19 @@ async def _discover_temp_mcp_tools(
     secret_names = {
         value[len("$secret:") :]
         for server in servers
-        for value in server.env.values()
+        for value in [*server.env.values(), *server.headers.values()]
         if isinstance(value, str) and value.startswith("$secret:")
     }
     secrets: dict[str, str] = {}
     for name in secret_names:
         with contextlib.suppress(Exception):
             secrets[name] = await providers.secrets.get_secret(name, user_email)
-    clients: list[StdioMCPClient] = []
+    clients: list[MCPClient] = []
     discovered: list[ToolDefinition] = []
     try:
         for server in servers:
-            client = StdioMCPClient(server, env=resolve_secret_refs(server.env, secrets))
-            await client.start()
+            client = build_mcp_client(server, secrets)
+            await client.connect()
             clients.append(client)
             tools = await client.list_tools()
             discovered.extend(
@@ -327,6 +333,17 @@ async def _resolve_effective_tools_response(
                     row = await get_mcp_server(session, str(server_id), owner_email=user_email)
                     if row is None or row.status != "active":
                         continue
+                    if (
+                        invalid_mcp_config_reason(
+                            transport=row.transport,
+                            command=row.command,
+                            url=row.url,
+                            env=row.env,
+                            headers=row.headers,
+                        )
+                        is not None
+                    ):
+                        continue
                     mcp_servers.append(
                         MCPServerConfig(
                             server_id=row.server_id,
@@ -336,6 +353,7 @@ async def _resolve_effective_tools_response(
                             url=row.url,
                             args=row.args or [],
                             env=row.env or {},
+                            headers=row.headers or {},
                             timeout_seconds=row.timeout_seconds,
                         )
                     )
@@ -665,21 +683,21 @@ async def test_agent_mcp_servers(request: Request, agent_id: str) -> MCPServerTe
 
 # --- Global MCP Server CRUD ---
 
-_SECRET_PATTERNS = {"KEY", "SECRET", "TOKEN", "PASSWORD", "CREDENTIAL"}
+_SECRET_PATTERNS = {"KEY", "SECRET", "TOKEN", "PASSWORD", "CREDENTIAL", "AUTHORIZATION"}
 
 
-def _redact_env(env: dict[str, str] | None) -> dict[str, str]:
-    """Redact environment variable values that look like secrets.
+def _redact_secret_mapping(values: dict[str, str] | None) -> dict[str, str]:
+    """Redact mapping values that look like secrets.
 
     ``$secret:NAME`` references are preserved as-is because they contain
     only the credential store reference name, not the actual secret value.
     The UI needs the prefix to distinguish "Credential store" entries from
     literal values on reload.
     """
-    if not env:
+    if not values:
         return {}
     redacted: dict[str, str] = {}
-    for key, value in env.items():
+    for key, value in values.items():
         if value.startswith("$secret:"):
             redacted[key] = value
         elif any(pat in key.upper() for pat in _SECRET_PATTERNS):
@@ -690,8 +708,16 @@ def _redact_env(env: dict[str, str] | None) -> dict[str, str]:
 
 
 def _mcp_row_to_response(row: Any) -> dict[str, Any]:
-    """Convert an MCPServerRow to a response dict with env redaction."""
+    """Convert an MCPServerRow to a response dict with secret redaction."""
     from cognis.api.models import MCPServerConfigResponse as MCPResp
+
+    invalid_reason = invalid_mcp_config_reason(
+        transport=row.transport,
+        command=row.command,
+        url=row.url,
+        env=row.env,
+        headers=row.headers,
+    )
 
     return MCPResp(
         server_id=row.server_id,
@@ -700,11 +726,13 @@ def _mcp_row_to_response(row: Any) -> dict[str, Any]:
         command=row.command,
         url=row.url,
         args=row.args or [],
-        env=_redact_env(row.env),
+        env=_redact_secret_mapping(row.env),
+        headers=_redact_secret_mapping(row.headers),
         timeout_seconds=row.timeout_seconds,
         description=row.description,
         owner_email=row.owner_email,
         status=row.status,
+        invalid_reason=invalid_reason,
         created_at=row.created_at.isoformat() if row.created_at else None,
         updated_at=row.updated_at.isoformat() if row.updated_at else None,
     ).model_dump()
@@ -734,6 +762,10 @@ async def create_mcp_server_route(request: Request, body: MCPServerCreateRequest
     # Normalize args: split any whitespace-containing entries so that
     # "npx -y @doist/todoist-ai" stored as a single arg becomes ["-y", "@doist/todoist-ai"].
     normalized_args = _normalize_mcp_args(body.args)
+    try:
+        headers = canonicalize_mcp_headers(body.headers)
+    except ValueError as exc:
+        raise api_exception(422, "validation_error", str(exc)) from exc
     async with request.app.state.session_factory() as session:
         row = await create_mcp_server(
             session,
@@ -744,6 +776,7 @@ async def create_mcp_server_route(request: Request, body: MCPServerCreateRequest
             url=body.url,
             args=normalized_args,
             env=body.env,
+            headers=headers,
             timeout_seconds=body.timeout_seconds,
             description=body.description,
             owner_email=user.email,
@@ -764,6 +797,11 @@ async def update_mcp_server_route(
         updates = body.model_dump(exclude_unset=True)
         if "args" in updates and isinstance(updates["args"], list):
             updates["args"] = _normalize_mcp_args(updates["args"])
+        if "headers" in updates and isinstance(updates["headers"], dict):
+            try:
+                updates["headers"] = canonicalize_mcp_headers(updates["headers"])
+            except ValueError as exc:
+                raise api_exception(422, "validation_error", str(exc)) from exc
         if isinstance(updates.get("env"), dict) and isinstance(existing.env, dict):
             preserved_env: dict[str, str] = {}
             for key, value in updates["env"].items():
@@ -771,6 +809,13 @@ async def update_mcp_server_route(
                     str(existing.env.get(key, "")) if value == "***" else str(value)
                 )
             updates["env"] = preserved_env
+        if isinstance(updates.get("headers"), dict) and isinstance(existing.headers, dict):
+            preserved_headers: dict[str, str] = {}
+            for key, value in updates["headers"].items():
+                preserved_headers[key] = (
+                    str(existing.headers.get(key, "")) if value == "***" else str(value)
+                )
+            updates["headers"] = preserved_headers
         merged = {
             "name": updates.get("name", existing.name),
             "transport": updates.get("transport", existing.transport),
@@ -778,6 +823,7 @@ async def update_mcp_server_route(
             "url": updates.get("url", existing.url),
             "args": updates.get("args", existing.args or []),
             "env": updates.get("env", existing.env or {}),
+            "headers": updates.get("headers", existing.headers or {}),
             "timeout_seconds": updates.get("timeout_seconds", existing.timeout_seconds),
         }
         try:

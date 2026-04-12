@@ -27,7 +27,12 @@ from cognis.tools.builtin.system import StatusProvider, build_system_tool_handle
 from cognis.tools.executor.browser.manager import BROWSER_MANAGER_KEY, BrowserManager
 from cognis.tools.executor.definitions import executor_tool_handlers
 from cognis.tools.executor.lsp import LSP_MANAGER_KEY, LSPManager
-from cognis.tools.mcp import StdioMCPClient, mcp_tools_to_definitions
+from cognis.tools.mcp import (
+    MCPClient,
+    build_mcp_client,
+    mcp_tools_to_definitions,
+    runtime_mcp_server_key,
+)
 from cognis.tools.registry import RegisteredTool, ToolExecutionContext, ToolRegistry
 
 _logger = get_logger(__name__)
@@ -48,7 +53,7 @@ EXECUTOR_SPAWN_DURATION = Histogram(
 class _ExecutorRuntime:
     handle: ExecutorHandle
     connection: InProcessExecutorConnection
-    mcp_clients: dict[str, StdioMCPClient] = field(default_factory=dict)
+    mcp_clients: dict[str, MCPClient] = field(default_factory=dict)
     lsp_manager: LSPManager | None = None
 
 
@@ -170,7 +175,7 @@ class InProcessExecutorProvider:
         )
         system_handlers = build_system_tool_handlers(self.session_factory, self.status_provider)
         native_handlers = executor_tool_handlers()
-        mcp_clients: dict[str, StdioMCPClient] = {}
+        mcp_clients: dict[str, MCPClient] = {}
         try:
             mcp_clients = await self.breaker.call(lambda: self._start_mcp_clients(config))
             discovered_tools = await self._discover_mcp_tools(config, mcp_clients)
@@ -314,14 +319,13 @@ class InProcessExecutorProvider:
             details={"active_executors": len(self._active)},
         )
 
-    async def _start_mcp_clients(self, config: ExecutorConfig) -> dict[str, StdioMCPClient]:
-        clients: dict[str, StdioMCPClient] = {}
+    async def _start_mcp_clients(self, config: ExecutorConfig) -> dict[str, MCPClient]:
+        clients: dict[str, MCPClient] = {}
         try:
             for server in config.mcp_servers:
-                resolved_env = _resolve_secret_refs(server.env, config.secrets)
-                client = StdioMCPClient(server, env={**resolved_env, **config.secrets})
-                await client.start()
-                clients[server.name] = client
+                client = build_mcp_client(server, config.secrets)
+                await client.connect()
+                clients[runtime_mcp_server_key(server)] = client
         except Exception:
             await _close_clients(clients)
             raise
@@ -330,13 +334,18 @@ class InProcessExecutorProvider:
     async def _discover_mcp_tools(
         self,
         config: ExecutorConfig,
-        clients: dict[str, StdioMCPClient],
+        clients: dict[str, MCPClient],
     ) -> list[Any]:
         discovered_tools: list[Any] = []
         for server in config.mcp_servers:
-            tools = await clients[server.name].list_tools()
+            tools = await clients[runtime_mcp_server_key(server)].list_tools()
             discovered_tools.extend(
-                mcp_tools_to_definitions(server.name, tools, timeout_seconds=server.timeout_seconds)
+                mcp_tools_to_definitions(
+                    server.name,
+                    tools,
+                    timeout_seconds=server.timeout_seconds,
+                    server_id=server.server_id,
+                )
             )
         return discovered_tools
 
@@ -344,7 +353,7 @@ class InProcessExecutorProvider:
 def _build_runtime_handler(
     tool: Any,
     system_handlers: dict[str, Callable[[dict[str, Any], ToolExecutionContext], Awaitable[Any]]],
-    mcp_clients: dict[str, StdioMCPClient],
+    mcp_clients: dict[str, MCPClient],
     native_handlers: dict[str, Any] | None = None,
 ) -> Callable[[dict[str, Any], ToolExecutionContext], Awaitable[Any]] | None:
     if tool.source.type == "executor" and native_handlers:
@@ -357,7 +366,7 @@ def _build_runtime_handler(
             arguments: dict[str, Any], context: ToolExecutionContext
         ) -> str:
             del context
-            client = mcp_clients[tool.source.server_name]
+            client = mcp_clients[runtime_mcp_server_key(tool.source)]
             raw_tool_name = tool.source.raw_tool_name or tool.name
             return await client.call_tool(raw_tool_name, arguments)
 
@@ -485,7 +494,7 @@ def _build_skill_handler(
     return skill_handler
 
 
-async def _close_clients(clients: dict[str, StdioMCPClient]) -> None:
+async def _close_clients(clients: dict[str, MCPClient]) -> None:
     for client in clients.values():
         await client.close()
 
@@ -500,23 +509,6 @@ def _normalize_tool_result(result: Any, duration_ms: int) -> ToolResult:
     else:
         output = str(result)
     return ToolResult(output=output, duration_ms=duration_ms)
-
-
-def _resolve_secret_refs(env: dict[str, str], secrets: dict[str, str]) -> dict[str, str]:
-    """Resolve ``$secret:NAME`` references in MCP server environment variables.
-
-    Values starting with ``$secret:`` are replaced with the corresponding
-    secret from the resolved secrets dict.  All other values pass through
-    unchanged.
-    """
-    resolved: dict[str, str] = {}
-    for key, value in env.items():
-        if value.startswith("$secret:"):
-            secret_name = value[len("$secret:") :]
-            resolved[key] = secrets.get(secret_name, "")
-        else:
-            resolved[key] = value
-    return resolved
 
 
 def _validate_unique_server_names(config: ExecutorConfig) -> None:

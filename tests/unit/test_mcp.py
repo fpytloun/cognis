@@ -5,8 +5,13 @@ from pathlib import Path
 
 import pytest
 
-from cognis.models.tool import MCPServerConfig, sanitize_mcp_tool_name
-from cognis.tools.mcp import StdioMCPClient, _strip_empty_optionals, mcp_tools_to_definitions
+from cognis.models.tool import MCPServerConfig, ToolSource, sanitize_mcp_tool_name
+from cognis.tools.mcp import (
+    StdioMCPClient,
+    _strip_empty_optionals,
+    mcp_tools_to_definitions,
+    runtime_mcp_server_key,
+)
 
 
 def _server_script() -> str:
@@ -228,6 +233,11 @@ def test_strip_empty_optionals_nested_object() -> None:
     args = {"config": {"host": "localhost", "port": ""}}
     result = _strip_empty_optionals(args, schema)
     assert result["config"] == {"host": "localhost"}
+
+
+def test_runtime_mcp_server_key_falls_back_safely() -> None:
+    assert runtime_mcp_server_key(MCPServerConfig(name="demo", command="/bin/echo")) == "demo"
+    assert runtime_mcp_server_key(ToolSource(type="local_mcp", server_name="demo")) == "demo"
 
 
 def test_strip_empty_optionals_preserves_zero_and_false() -> None:

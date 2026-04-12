@@ -88,7 +88,7 @@
   let mcpServerConfigs = $state<MCPServerConfigResponse[]>([]);
   let showMcpForm = $state(false);
   let editingMcpServer = $state<MCPServerConfigResponse | null>(null);
-  let mcpForm = $state({ name: '', transport: 'stdio', command: '', url: '', args: '', envVars: [] as MCPEnvVar[], timeout_seconds: 30, description: '' });
+  let mcpForm = $state({ name: '', transport: 'stdio', command: '', url: '', args: '', envVars: [] as MCPEnvVar[], headers: [] as MCPEnvVar[], timeout_seconds: 30, description: '' });
   let isAdmin = $state(false);
   let tabs = $derived(isAdmin ? ALL_TABS : ALL_TABS.filter((t) => t !== 'users' && t !== 'system'));
   let selectedProviderId = $state('');
@@ -431,17 +431,17 @@
     showSecretModal = true;
   }
 
-  function parseMcpEnvVars(env: Record<string, string>): MCPEnvVar[] {
-    return Object.entries(env).map(([key, value]) => ({
+  function parseMcpEntries(values: Record<string, string>): MCPEnvVar[] {
+    return Object.entries(values).map(([key, value]) => ({
       key,
       value: value.startsWith('$secret:') ? value.slice('$secret:'.length) : value,
       type: value.startsWith('$secret:') ? 'secret' : 'literal'
     }));
   }
 
-  function serializeMcpEnvVars(envVars: MCPEnvVar[]): Record<string, string> {
+  function serializeMcpEntries(entries: MCPEnvVar[]): Record<string, string> {
     return Object.fromEntries(
-      envVars
+      entries
         .filter((entry) => entry.key.trim() && entry.value.trim())
         .map((entry) => [entry.key.trim(), entry.type === 'secret' ? `$secret:${entry.value.trim()}` : entry.value.trim()])
     );
@@ -462,14 +462,20 @@
         agent_id: null,
         description: secretModalTarget === 'provider'
           ? `API key for provider ${providerForm.display_name || providerForm.provider_id}`
-          : `MCP environment secret for ${mcpSecretTargetKey || 'variable'}`
+          : `MCP config secret for ${mcpSecretTargetKey || 'entry'}`
       });
       if (secretModalTarget === 'provider') {
         providerForm.auth_secret_name = secretModalName;
       } else {
-        mcpForm.envVars = mcpForm.envVars.map((entry) =>
+        const targetEntries = mcpForm.transport === 'stdio' ? mcpForm.envVars : mcpForm.headers;
+        const nextEntries: MCPEnvVar[] = targetEntries.map((entry) =>
           entry.key === mcpSecretTargetKey ? { ...entry, type: 'secret', value: secretModalName } : entry
         );
+        if (mcpForm.transport === 'stdio') {
+          mcpForm.envVars = nextEntries;
+        } else {
+          mcpForm.headers = nextEntries;
+        }
       }
       secretModalValue = '';
       showSecretModal = false;
@@ -2529,7 +2535,7 @@
             </p>
           </div>
           <Button variant="primary" size="sm" onclick={() => {
-            mcpForm = { name: '', transport: 'stdio', command: '', url: '', args: '', envVars: [], timeout_seconds: 30, description: '' };
+            mcpForm = { name: '', transport: 'stdio', command: '', url: '', args: '', envVars: [], headers: [], timeout_seconds: 30, description: '' };
             editingMcpServer = null;
             showMcpForm = true;
           }}>New MCP server</Button>
@@ -2579,8 +2585,23 @@
               </label>
             {/if}
             <div class="space-y-1 text-sm text-slate-200">
-              <span>Environment variables</span>
-              <EnvVarEditor envVars={mcpForm.envVars} {secrets} onChange={(next) => (mcpForm.envVars = next)} onCreateSecret={openMcpSecretModal} />
+              <EnvVarEditor
+                envVars={mcpForm.transport === 'stdio' ? mcpForm.envVars : mcpForm.headers}
+                {secrets}
+                title={mcpForm.transport === 'stdio' ? 'Environment variables' : 'HTTP headers'}
+                emptyMessage={mcpForm.transport === 'stdio' ? 'No environment variables configured.' : 'No HTTP headers configured.'}
+                addLabel={mcpForm.transport === 'stdio' ? 'Add variable' : 'Add header'}
+                keyPlaceholder={mcpForm.transport === 'stdio' ? 'GITHUB_TOKEN' : 'Authorization'}
+                valuePlaceholder={mcpForm.transport === 'stdio' ? 'your-value' : 'Bearer token'}
+                onChange={(next) => {
+                  if (mcpForm.transport === 'stdio') {
+                    mcpForm.envVars = next;
+                  } else {
+                    mcpForm.headers = next;
+                  }
+                }}
+                onCreateSecret={openMcpSecretModal}
+              />
             </div>
             <label class="space-y-1 text-sm text-slate-200">
               <span>Description</span>
@@ -2590,7 +2611,8 @@
               <Button variant="secondary" size="sm" onclick={() => showMcpForm = false}>Cancel</Button>
               <Button variant="primary" size="sm" disabled={!mcpForm.name.trim() || (mcpForm.transport === 'stdio' && !!validateStdioCommand(mcpForm.command))} onclick={async () => {
                 const args = mcpForm.args.split('\n').flatMap(s => s.trim().split(/\s+/)).filter(Boolean);
-                const env = serializeMcpEnvVars(mcpForm.envVars);
+                const env = serializeMcpEntries(mcpForm.envVars);
+                const headers = serializeMcpEntries(mcpForm.headers);
                 try {
                   if (editingMcpServer) {
                     await api.tools.updateMcpServer(editingMcpServer.server_id, {
@@ -2598,8 +2620,9 @@
                       transport: mcpForm.transport,
                       command: mcpForm.transport === 'stdio' ? mcpForm.command : null,
                       url: mcpForm.transport !== 'stdio' ? mcpForm.url : null,
-                      args,
-                      env,
+                      args: mcpForm.transport === 'stdio' ? args : [],
+                      env: mcpForm.transport === 'stdio' ? env : {},
+                      headers: mcpForm.transport !== 'stdio' ? headers : {},
                       timeout_seconds: mcpForm.timeout_seconds,
                       description: mcpForm.description || null,
                     });
@@ -2609,8 +2632,9 @@
                       transport: mcpForm.transport,
                       command: mcpForm.transport === 'stdio' ? mcpForm.command : undefined,
                       url: mcpForm.transport !== 'stdio' ? mcpForm.url : undefined,
-                      args,
-                      env,
+                      args: mcpForm.transport === 'stdio' ? args : [],
+                      env: mcpForm.transport === 'stdio' ? env : {},
+                      headers: mcpForm.transport !== 'stdio' ? headers : {},
                       timeout_seconds: mcpForm.timeout_seconds,
                       description: mcpForm.description || undefined,
                     });
@@ -2641,7 +2665,8 @@
                     command: srv.command || '',
                     url: srv.url || '',
                     args: (srv.args || []).join('\n'),
-                    envVars: parseMcpEnvVars(srv.env || {}),
+                    envVars: parseMcpEntries(srv.env || {}),
+                    headers: parseMcpEntries(srv.headers || {}),
                     timeout_seconds: srv.timeout_seconds,
                     description: srv.description || '',
                   };
@@ -2666,6 +2691,9 @@
             {/if}
             {#if srv.description}
               <p class="text-sm text-slate-400">{srv.description}</p>
+            {/if}
+            {#if srv.invalid_reason}
+              <p class="text-sm text-amber-300">{srv.invalid_reason}</p>
             {/if}
             <div class="text-xs text-slate-500 font-mono">ID: {srv.server_id}</div>
           </Card>

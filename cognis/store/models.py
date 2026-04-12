@@ -482,6 +482,7 @@ class MCPServerRow(Base):
     url: Mapped[str | None] = mapped_column(Text, nullable=True)
     args: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
     env: Mapped[dict[str, str] | None] = mapped_column(JSON, nullable=True)
+    headers: Mapped[dict[str, str] | None] = mapped_column(JSON, nullable=True)
     timeout_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=30)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     owner_email: Mapped[str] = mapped_column(

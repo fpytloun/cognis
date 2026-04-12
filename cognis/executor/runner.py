@@ -26,10 +26,11 @@ from cognis.models.tool import (
 )
 from cognis.tools.executor.definitions import executor_tool_definitions, executor_tool_handlers
 from cognis.tools.mcp import (
+    MCPClient,
     MCPClientError,
-    StdioMCPClient,
+    build_mcp_client,
     mcp_tools_to_definitions,
-    resolve_secret_refs,
+    runtime_mcp_server_key,
     validate_unique_server_names,
 )
 
@@ -71,7 +72,7 @@ class ExecutorRunner:
         self._config_version = 0
         self._tool_handlers: dict[str, Any] = {}
         self._configured_tool_definitions: list[ToolDefinition] = []
-        self._mcp_clients: dict[str, StdioMCPClient] = {}
+        self._mcp_clients: dict[str, MCPClient] = {}
         self._inference_handler: Any | None = None
         self._channel_handler: Any | None = None
         self._runtime_metadata: dict[str, Any] = {}
@@ -260,11 +261,6 @@ class ExecutorRunner:
 
         try:
             mcp_servers = [MCPServerConfig.model_validate(item) for item in mcp_servers_raw]
-            for server in mcp_servers:
-                if server.transport != "stdio":
-                    raise ValueError(
-                        f"Executor-hosted MCP currently supports stdio only (server {server.name})"
-                    )
             validate_unique_server_names(mcp_servers)
             (
                 staged_mcp_clients,
@@ -707,6 +703,8 @@ class ExecutorRunner:
                                 "content": chunk.get("content"),
                                 "tool_calls": chunk.get("tool_calls"),
                                 "reasoning_content": chunk.get("reasoning_content"),
+                                "reasoning": chunk.get("reasoning"),
+                                "refusal": chunk.get("refusal"),
                                 "index": chunk.get("index", 0),
                             },
                         }
@@ -871,18 +869,18 @@ class ExecutorRunner:
 
     async def _start_mcp_clients(
         self, servers: list[MCPServerConfig], secrets: dict[str, str]
-    ) -> dict[str, StdioMCPClient]:
-        clients: dict[str, StdioMCPClient] = {}
+    ) -> dict[str, MCPClient]:
+        clients: dict[str, MCPClient] = {}
         for server in servers:
-            client = StdioMCPClient(server, env=resolve_secret_refs(server.env, secrets))
-            await client.start()
-            clients[server.name] = client
+            client = build_mcp_client(server, secrets)
+            await client.connect()
+            clients[runtime_mcp_server_key(server)] = client
         return clients
 
     async def _prepare_mcp_runtime(
         self, servers: list[MCPServerConfig], secrets: dict[str, str]
-    ) -> tuple[dict[str, StdioMCPClient], list[ToolDefinition], list[dict[str, Any]], list[str]]:
-        clients: dict[str, StdioMCPClient] = {}
+    ) -> tuple[dict[str, MCPClient], list[ToolDefinition], list[dict[str, Any]], list[str]]:
+        clients: dict[str, MCPClient] = {}
         discovered: list[ToolDefinition] = []
         statuses: list[dict[str, Any]] = []
         warnings: list[str] = []
@@ -894,15 +892,16 @@ class ExecutorRunner:
                 server.transport,
             )
             logger.debug(
-                "MCP: server %s full config: args=%s, env_keys=%s, timeout=%ds",
+                "MCP: server %s full config: args=%s, env_keys=%s, header_keys=%s, timeout=%ds",
                 server.name,
                 server.args,
                 sorted(server.env.keys()) if server.env else [],
+                sorted(server.headers.keys()) if server.headers else [],
                 server.timeout_seconds,
             )
-            client = StdioMCPClient(server, env=resolve_secret_refs(server.env, secrets))
+            client = build_mcp_client(server, secrets)
             try:
-                await client.start()
+                await client.connect()
                 tools = await client.list_tools()
             except MCPClientError as exc:
                 logger.warning(
@@ -951,7 +950,7 @@ class ExecutorRunner:
                 server.name,
                 len(tools),
             )
-            clients[server.name] = client
+            clients[runtime_mcp_server_key(server)] = client
             statuses.append(
                 {
                     "server_id": server.server_id,
@@ -974,7 +973,7 @@ class ExecutorRunner:
     async def _discover_mcp_tools(self, servers: list[MCPServerConfig]) -> list[ToolDefinition]:
         discovered: list[ToolDefinition] = []
         for server in servers:
-            tools = await self._mcp_clients[server.name].list_tools()
+            tools = await self._mcp_clients[runtime_mcp_server_key(server)].list_tools()
             discovered.extend(
                 mcp_tools_to_definitions(
                     server.name,
@@ -987,7 +986,7 @@ class ExecutorRunner:
 
     def _build_mcp_handler(self, tool: ToolDefinition) -> Any:
         async def _handler(arguments: dict[str, Any], _: Any) -> str:
-            client = self._mcp_clients[str(tool.source.server_name)]
+            client = self._mcp_clients[runtime_mcp_server_key(tool.source)]
             raw_tool_name = tool.source.raw_tool_name or tool.name
             return await client.call_tool(raw_tool_name, arguments)
 
@@ -997,7 +996,7 @@ class ExecutorRunner:
         await self._close_clients(self._mcp_clients)
         self._mcp_clients = {}
 
-    async def _close_clients(self, clients: dict[str, StdioMCPClient]) -> None:
+    async def _close_clients(self, clients: dict[str, MCPClient]) -> None:
         for client in clients.values():
             with contextlib.suppress(Exception):
                 await client.close()

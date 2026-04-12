@@ -41,6 +41,7 @@ from cognis.tools.builtin.system import build_system_tool_handlers, system_tools
 from cognis.tools.builtin.tool_output import tool_output_tools
 from cognis.tools.builtin.workflow import workflow_tools
 from cognis.tools.executor.definitions import executor_tool_definitions, executor_tool_handlers
+from cognis.tools.mcp import invalid_mcp_config_reason
 from cognis.tools.registry import RegisteredTool, ToolRegistry
 from cognis.tools.skills import (
     build_available_skills_metadata,
@@ -697,14 +698,29 @@ async def _resolve_executor_mcp_servers(
                 continue
             if row.status != "active":
                 continue
+            invalid_reason = invalid_mcp_config_reason(
+                transport=row.transport,
+                command=row.command,
+                url=row.url,
+                env=row.env,
+                headers=row.headers,
+            )
+            if invalid_reason is not None:
+                logger.warning(
+                    "Skipping invalid MCP server config",
+                    extra={"extra_data": {"server_id": sid, "reason": invalid_reason}},
+                )
+                continue
             servers.append(
                 MCPServerConfig(
+                    server_id=row.server_id,
                     name=row.name,
                     transport=row.transport,
                     command=row.command,
                     url=row.url,
                     args=row.args or [],
                     env=row.env or {},
+                    headers=row.headers or {},
                     timeout_seconds=row.timeout_seconds,
                 )
             )

@@ -170,6 +170,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_skill_versioning_columns)
         await conn.run_sync(_ensure_schedule_extended_columns)
         await conn.run_sync(_ensure_conversation_title_source_column)
+        await conn.run_sync(_ensure_mcp_server_headers_column)
 
 
 def _ensure_session_lifecycle_columns(sync_conn: object) -> None:
@@ -452,6 +453,20 @@ def _ensure_schedule_extended_columns(sync_conn: object) -> None:
 
     with contextlib.suppress(Exception):
         execute(text("ALTER TABLE schedules ALTER COLUMN cron_expr DROP NOT NULL"))
+
+
+def _ensure_mcp_server_headers_column(sync_conn: object) -> None:
+    """Add HTTP headers column for MCP server configs."""
+
+    inspector = cast(Any, inspect(sync_conn))
+    try:
+        columns = {column["name"] for column in inspector.get_columns("mcp_servers")}
+    except Exception:
+        return
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+
+    if "headers" not in columns:
+        execute(text("ALTER TABLE mcp_servers ADD COLUMN headers JSON"))
 
 
 _SYSTEM_USER_EMAIL = "system@cognis.local"

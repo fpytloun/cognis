@@ -8,6 +8,14 @@
   export let secrets: SecretMetadata[] = [];
   export let onChange: (next: MCPEnvVar[]) => void;
   export let onCreateSecret: (key: string) => void;
+  export let title = 'Environment variables';
+  export let emptyMessage = 'No environment variables configured.';
+  export let addLabel = 'Add variable';
+  export let keyLabel = 'Key';
+  export let valueLabel = 'Value';
+  export let keyPlaceholder = 'GITHUB_TOKEN';
+  export let valuePlaceholder = 'your-value';
+  export let secretPlaceholder = 'Select credential...';
 
   function updateAt(index: number, patch: Partial<MCPEnvVar>): void {
     const next = envVars.map((entry, current) => (current === index ? { ...entry, ...patch } : entry));
@@ -25,13 +33,13 @@
 
 <div class="space-y-3">
   <div class="flex items-center justify-between gap-3">
-    <span class="text-sm text-slate-200">Environment variables</span>
-    <Button size="sm" variant="secondary" type="button" onclick={addRow}>Add variable</Button>
+    <span class="text-sm text-slate-200">{title}</span>
+    <Button size="sm" variant="secondary" type="button" onclick={addRow}>{addLabel}</Button>
   </div>
 
   {#if envVars.length === 0}
     <div class="rounded-2xl border border-slate-800 bg-slate-950/40 px-4 py-3 text-sm text-slate-400">
-      No environment variables configured.
+      {emptyMessage}
     </div>
   {/if}
 
@@ -39,8 +47,8 @@
     <div class="rounded-2xl border border-slate-800 bg-slate-950/40 p-4 space-y-3">
       <div class="grid gap-3 md:grid-cols-[minmax(0,1fr)_160px]">
         <label class="space-y-1 text-sm text-slate-200">
-          <span>Key</span>
-          <Input value={entry.key} placeholder="GITHUB_TOKEN" oninput={(event) => updateAt(index, { key: (event.currentTarget as HTMLInputElement).value })} />
+          <span>{keyLabel}</span>
+          <Input value={entry.key} placeholder={keyPlaceholder} oninput={(event) => updateAt(index, { key: (event.currentTarget as HTMLInputElement).value })} />
         </label>
         <label class="space-y-1 text-sm text-slate-200">
           <span>Source</span>
@@ -56,7 +64,7 @@
         {@const currentInList = !entry.value || availableSecrets.some((s) => s.name === entry.value)}
         <div class="flex gap-2">
           <select class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" bind:value={entry.value} onchange={() => updateAt(index, { value: entry.value })}>
-            <option value="">Select credential...</option>
+            <option value="">{secretPlaceholder}</option>
             {#if !currentInList}
               <option value={entry.value}>{entry.value} (saved)</option>
             {/if}
@@ -68,8 +76,8 @@
         </div>
       {:else}
         <label class="space-y-1 text-sm text-slate-200 block">
-          <span>Value</span>
-          <Input value={entry.value} placeholder="your-value" oninput={(event) => updateAt(index, { value: (event.currentTarget as HTMLInputElement).value })} />
+          <span>{valueLabel}</span>
+          <Input value={entry.value} placeholder={valuePlaceholder} oninput={(event) => updateAt(index, { value: (event.currentTarget as HTMLInputElement).value })} />
         </label>
       {/if}
 

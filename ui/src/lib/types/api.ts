@@ -302,10 +302,12 @@ export interface MCPServerConfigResponse {
   url: string | null;
   args: string[];
   env: Record<string, string>;
+   headers: Record<string, string>;
   timeout_seconds: number;
   description: string | null;
   owner_email: string;
   status: string;
+   invalid_reason: string | null;
   created_at: string | null;
   updated_at: string | null;
 }
@@ -318,6 +320,7 @@ export interface MCPServerCreateRequest {
   url?: string | null;
   args?: string[];
   env?: Record<string, string>;
+  headers?: Record<string, string>;
   timeout_seconds?: number;
   description?: string | null;
 }
@@ -329,6 +332,7 @@ export interface MCPServerUpdateRequest {
   url?: string | null;
   args?: string[];
   env?: Record<string, string>;
+  headers?: Record<string, string>;
   timeout_seconds?: number;
   description?: string | null;
   status?: string;
