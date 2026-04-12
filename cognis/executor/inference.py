@@ -52,6 +52,7 @@ class InferenceHandler:
         llm_api = str(request_kwargs.pop("cognis_llm_api", "chat_completions"))
         usage: dict[str, Any] = {}
         finish_reason = "stop"
+        response_status = "completed"
         index = 0
 
         try:
@@ -74,6 +75,8 @@ class InferenceHandler:
                         return
                     if payload.get("usage"):
                         usage = payload["usage"]
+                    if payload.get("response_status"):
+                        response_status = str(payload["response_status"])
                     choices = payload.get("choices") or []
                     if not choices:
                         continue
@@ -84,12 +87,22 @@ class InferenceHandler:
                     content = delta.get("content")
                     tool_calls = delta.get("tool_calls")
                     reasoning_content = delta.get("reasoning_content")
-                    if content is None and tool_calls is None and reasoning_content is None:
+                    reasoning = delta.get("reasoning")
+                    refusal = delta.get("refusal")
+                    if (
+                        content is None
+                        and tool_calls is None
+                        and reasoning_content is None
+                        and reasoning is None
+                        and refusal is None
+                    ):
                         continue
                     yield {
                         "content": content,
                         "tool_calls": tool_calls,
                         "reasoning_content": reasoning_content,
+                        "reasoning": reasoning,
+                        "refusal": refusal,
                         "index": index,
                     }
                     index += 1
@@ -114,12 +127,22 @@ class InferenceHandler:
                     content = delta.get("content")
                     tool_calls = delta.get("tool_calls")
                     reasoning_content = delta.get("reasoning_content")
-                    if content is None and tool_calls is None and reasoning_content is None:
+                    reasoning = delta.get("reasoning")
+                    refusal = delta.get("refusal")
+                    if (
+                        content is None
+                        and tool_calls is None
+                        and reasoning_content is None
+                        and reasoning is None
+                        and refusal is None
+                    ):
                         continue
                     yield {
                         "content": content,
                         "tool_calls": tool_calls,
                         "reasoning_content": reasoning_content,
+                        "reasoning": reasoning,
+                        "refusal": refusal,
                         "index": index,
                     }
                     index += 1
@@ -131,7 +154,12 @@ class InferenceHandler:
             }
             return
 
-        yield {"done": True, "usage": usage, "finish_reason": finish_reason}
+        yield {
+            "done": True,
+            "usage": usage,
+            "finish_reason": finish_reason,
+            "response_status": response_status,
+        }
 
     async def generate(
         self,

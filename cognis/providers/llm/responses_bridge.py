@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
 from typing import Any
 
 from cognis.logging import get_logger
@@ -18,6 +19,22 @@ from cognis.models.config import ModelInfo
 RESPONSES_MODE_ENV = "COGNIS_OPENAI_RESPONSES_MODE"
 
 logger = get_logger(__name__)
+
+
+@dataclass(slots=True)
+class NormalizedResponseEnvelope:
+    """Internal normalized representation of a Responses API payload."""
+
+    content: str = ""
+    reasoning_content: str = ""
+    reasoning_summary: str = ""
+    refusal: str = ""
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    status: str = "completed"
+    finish_reason: str = "stop"
+    usage: dict[str, Any] = field(default_factory=dict)
+    content_source: str | None = None
+    reasoning_source: str | None = None
 
 
 def should_use_openai_responses(
@@ -126,19 +143,23 @@ def normalize_tool_call_id(
 def responses_to_chat_response(payload: dict[str, Any]) -> dict[str, Any]:
     """Normalize a Responses API payload into chat-completions-like shape."""
 
-    message_content, tool_calls = _extract_response_output(payload)
+    envelope = _extract_response_envelope(payload)
     normalized: dict[str, Any] = {
         "choices": [
             {
                 "message": {
                     "role": "assistant",
-                    "content": message_content or None,
-                    "tool_calls": tool_calls or None,
+                    "content": envelope.content or None,
+                    "tool_calls": envelope.tool_calls or None,
+                    "reasoning_content": envelope.reasoning_content or None,
+                    "reasoning": envelope.reasoning_summary or None,
+                    "refusal": envelope.refusal or None,
                 },
-                "finish_reason": _extract_finish_reason(payload),
+                "finish_reason": envelope.finish_reason,
             }
         ],
-        "usage": _extract_usage(payload),
+        "usage": envelope.usage,
+        "response_status": envelope.status,
     }
     return normalized
 
@@ -159,23 +180,58 @@ async def responses_stream_to_chat_chunks(
             if event_type == "response.output_text.delta":
                 delta = event.get("delta")
                 if isinstance(delta, str) and delta:
-                    state.note_text_emitted(delta)
+                    state.note_text_emitted("content", delta)
                     yield {"choices": [{"delta": {"content": delta}}]}
                 continue
             if event_type == "response.output_text.done":
                 text = event.get("text")
                 if isinstance(text, str) and text:
-                    final_text_chunk = state.final_text_delta(text)
+                    final_text_chunk = state.final_text_delta(text, field="content")
                     if final_text_chunk is not None:
                         yield final_text_chunk
                 continue
             if event_type in {"response.content_part.added", "response.content_part.done"}:
                 part = event.get("part")
-                part_text = _extract_part_text(part)
+                part_text = _extract_content_part_text(part)
                 if part_text:
-                    part_chunk = state.final_text_delta(part_text)
+                    part_chunk = state.final_text_delta(part_text, field="content")
                     if part_chunk is not None:
                         yield part_chunk
+                continue
+            if event_type in {
+                "response.reasoning_text.delta",
+                "response.reasoning_text.done",
+            }:
+                part_text = _extract_text_value(
+                    event.get("delta") or event.get("text") or event.get("part")
+                )
+                if part_text:
+                    reasoning_chunk = state.final_text_delta(part_text, field="reasoning_content")
+                    if reasoning_chunk is not None:
+                        yield reasoning_chunk
+                continue
+            if event_type in {
+                "response.reasoning_summary_text.delta",
+                "response.reasoning_summary_text.done",
+                "response.reasoning_summary_part.added",
+                "response.reasoning_summary_part.done",
+            }:
+                part_text = _extract_text_value(
+                    event.get("delta") or event.get("text") or event.get("part")
+                )
+                if part_text:
+                    reasoning_chunk = state.final_text_delta(part_text, field="reasoning")
+                    if reasoning_chunk is not None:
+                        yield reasoning_chunk
+                continue
+            if event_type in {"response.refusal.delta", "response.refusal.done"}:
+                refusal_text = _extract_text_value(
+                    event.get("delta") or event.get("text") or event.get("part")
+                )
+                if refusal_text:
+                    refusal_chunk = state.final_text_delta(refusal_text, field="refusal")
+                    if refusal_chunk is not None:
+                        yield refusal_chunk
                 continue
             if event_type == "response.output_item.added":
                 item = _get_output_item(event)
@@ -194,6 +250,13 @@ async def responses_stream_to_chat_chunks(
                 if chunk is not None:
                     yield chunk
                 continue
+            if event_type == "response.function_call_arguments.done":
+                item = _get_output_item(event)
+                if item is not None:
+                    final_chunk = state.finalize_item(item)
+                    if final_chunk is not None:
+                        yield final_chunk
+                continue
             if event_type == "response.output_item.done":
                 item = _get_output_item(event)
                 if item is None:
@@ -207,15 +270,15 @@ async def responses_stream_to_chat_chunks(
                 continue
             if event_type in {"response.completed", "response.completed.synthetic"}:
                 response_payload = _to_dict(event.get("response") or event)
-                fallback_text = state.final_message_fallback(response_payload)
-                if fallback_text is not None:
-                    yield fallback_text
+                for fallback_chunk in state.final_message_fallback(response_payload):
+                    yield fallback_chunk
                 state.completed_seen = True
                 yield {
                     "choices": [
                         {"delta": {}, "finish_reason": _extract_finish_reason(response_payload)}
                     ],
                     "usage": _extract_usage(response_payload),
+                    "response_status": str(response_payload.get("status") or "completed"),
                 }
                 continue
             if event_type == "response.failed":
@@ -244,7 +307,10 @@ class _ResponsesStreamState:
     def __init__(self) -> None:
         self._items: dict[str, dict[str, Any]] = {}
         self._next_tool_index = 0
-        self._emitted_text = ""
+        self._emitted_content = ""
+        self._emitted_reasoning = ""
+        self._emitted_reasoning_summary = ""
+        self._emitted_refusal = ""
         self.event_counts: dict[str, int] = {}
         self.text_emissions = 0
         self.tool_call_emissions = 0
@@ -254,9 +320,25 @@ class _ResponsesStreamState:
     def note_event(self, event_type: str) -> None:
         self.event_counts[event_type] = self.event_counts.get(event_type, 0) + 1
 
-    def note_text_emitted(self, text: str) -> None:
-        self._emitted_text += text
+    def note_text_emitted(self, field: str, text: str) -> None:
+        if field == "reasoning_content":
+            self._emitted_reasoning += text
+        elif field == "reasoning":
+            self._emitted_reasoning_summary += text
+        elif field == "refusal":
+            self._emitted_refusal += text
+        else:
+            self._emitted_content += text
         self.text_emissions += 1
+
+    def _emitted_value(self, field: str) -> str:
+        if field == "reasoning_content":
+            return self._emitted_reasoning
+        if field == "reasoning":
+            return self._emitted_reasoning_summary
+        if field == "refusal":
+            return self._emitted_refusal
+        return self._emitted_content
 
     def register_item(self, item: dict[str, Any]) -> None:
         item_id = str(item.get("id") or item.get("call_id") or "")
@@ -278,7 +360,7 @@ class _ResponsesStreamState:
         text = _extract_message_item_text(item)
         if not text:
             return None
-        self.note_text_emitted(text)
+        self.note_text_emitted("content", text)
         return {"choices": [{"delta": {"content": text}}]}
 
     def finalize_message_item(self, item: dict[str, Any]) -> dict[str, Any] | None:
@@ -287,47 +369,39 @@ class _ResponsesStreamState:
         text = _extract_message_item_text(item)
         if not text:
             return None
-        if self._emitted_text.endswith(text) or text == self._emitted_text:
-            return None
-        if text.startswith(self._emitted_text):
-            delta = text[len(self._emitted_text) :]
-            if not delta:
-                return None
-            self.note_text_emitted(delta)
-            return {"choices": [{"delta": {"content": delta}}]}
-        self.note_text_emitted(text)
-        return {"choices": [{"delta": {"content": text}}]}
+        return self.final_text_delta(text, field="content")
 
-    def final_message_fallback(self, response_payload: dict[str, Any]) -> dict[str, Any] | None:
-        fallback_text, _ = _extract_response_output(response_payload)
-        if not fallback_text:
-            return None
-        if fallback_text == self._emitted_text:
-            return None
-        if fallback_text.startswith(self._emitted_text):
-            delta = fallback_text[len(self._emitted_text) :]
-            if not delta:
-                return None
-            self.note_text_emitted(delta)
-            self.completed_fallback_used = True
-            return {"choices": [{"delta": {"content": delta}}]}
-        self.note_text_emitted(fallback_text)
-        self.completed_fallback_used = True
-        return {"choices": [{"delta": {"content": fallback_text}}]}
+    def final_message_fallback(self, response_payload: dict[str, Any]) -> list[dict[str, Any]]:
+        envelope = _extract_response_envelope(response_payload)
+        chunks: list[dict[str, Any]] = []
+        for field, fallback_text in (
+            ("content", envelope.content),
+            ("reasoning_content", envelope.reasoning_content),
+            ("reasoning", envelope.reasoning_summary),
+            ("refusal", envelope.refusal),
+        ):
+            if not fallback_text:
+                continue
+            chunk = self.final_text_delta(fallback_text, field=field)
+            if chunk is not None:
+                self.completed_fallback_used = True
+                chunks.append(chunk)
+        return chunks
 
-    def final_text_delta(self, text: str) -> dict[str, Any] | None:
+    def final_text_delta(self, text: str, *, field: str = "content") -> dict[str, Any] | None:
         if not text:
             return None
-        if text == self._emitted_text:
+        emitted = self._emitted_value(field)
+        if text == emitted:
             return None
-        if text.startswith(self._emitted_text):
-            delta = text[len(self._emitted_text) :]
+        if text.startswith(emitted):
+            delta = text[len(emitted) :]
             if not delta:
                 return None
-            self.note_text_emitted(delta)
-            return {"choices": [{"delta": {"content": delta}}]}
-        self.note_text_emitted(text)
-        return {"choices": [{"delta": {"content": text}}]}
+            self.note_text_emitted(field, delta)
+            return {"choices": [{"delta": {field: delta}}]}
+        self.note_text_emitted(field, text)
+        return {"choices": [{"delta": {field: text}}]}
 
     def initial_tool_delta(self, item: dict[str, Any]) -> dict[str, Any] | None:
         if str(item.get("type")) != "function_call":
@@ -413,9 +487,18 @@ class _ResponsesStreamState:
         }
 
 
-def _extract_response_output(payload: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
+def _extract_response_envelope(payload: dict[str, Any]) -> NormalizedResponseEnvelope:
+    envelope = NormalizedResponseEnvelope(
+        status=str(payload.get("status") or "completed"),
+        finish_reason=_extract_finish_reason(payload),
+        usage=_extract_usage(payload),
+    )
+
     content_parts: list[str] = []
-    tool_calls: list[dict[str, Any]] = []
+    reasoning_parts: list[str] = []
+    summary_parts: list[str] = []
+    refusal_parts: list[str] = []
+
     for index, item in enumerate(payload.get("output") or []):
         if not isinstance(item, dict):
             continue
@@ -424,8 +507,23 @@ def _extract_response_output(payload: dict[str, Any]) -> tuple[str, list[dict[st
             text = _extract_message_item_text(item)
             if text:
                 content_parts.append(text)
-        elif item_type == "function_call":
-            tool_calls.append(
+                envelope.content_source = envelope.content_source or "message"
+            continue
+        if item_type == "reasoning":
+            reasoning_text, summary_text = _extract_reasoning_item(item)
+            if reasoning_text:
+                reasoning_parts.append(reasoning_text)
+                envelope.reasoning_source = envelope.reasoning_source or "reasoning"
+            if summary_text:
+                summary_parts.append(summary_text)
+            continue
+        if item_type == "refusal":
+            refusal_text = _extract_text_value(item.get("content") or item.get("refusal") or item)
+            if refusal_text:
+                refusal_parts.append(refusal_text)
+            continue
+        if item_type == "function_call":
+            envelope.tool_calls.append(
                 {
                     "id": normalize_tool_call_id(item.get("call_id"), item.get("id"), index),
                     "type": "function",
@@ -435,15 +533,26 @@ def _extract_response_output(payload: dict[str, Any]) -> tuple[str, list[dict[st
                     },
                 }
             )
-    if not content_parts and isinstance(payload.get("output_text"), str):
-        content_parts.append(str(payload["output_text"]))
-    return "".join(content_parts), tool_calls
+
+    if not content_parts:
+        output_text = _extract_text_value(payload.get("output_text"))
+        if output_text:
+            content_parts.append(output_text)
+            envelope.content_source = envelope.content_source or "output_text"
+
+    envelope.content = "".join(content_parts)
+    envelope.reasoning_content = "".join(reasoning_parts)
+    envelope.reasoning_summary = "".join(summary_parts)
+    envelope.refusal = "".join(refusal_parts)
+    return envelope
 
 
 def _extract_finish_reason(payload: dict[str, Any]) -> str:
     status = str(payload.get("status") or "completed")
-    if status in {"completed", "incomplete"}:
+    if status == "completed":
         return "stop"
+    if status == "incomplete":
+        return "length"
     if status == "failed":
         return "error"
     return "stop"
@@ -467,21 +576,74 @@ def _extract_usage(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _extract_message_item_text(item: dict[str, Any]) -> str:
+    content = item.get("content")
+    if not isinstance(content, list):
+        return ""
     text_parts: list[str] = []
-    for part in item.get("content") or []:
-        part_text = _extract_part_text(part)
+    for part in content:
+        part_text = _extract_content_part_text(part)
         if part_text:
             text_parts.append(part_text)
     return "".join(text_parts)
 
 
-def _extract_part_text(part: Any) -> str:
+def _extract_reasoning_item(item: dict[str, Any]) -> tuple[str, str]:
+    content_text = _extract_text_value(item.get("content"))
+    summary_text = _extract_text_value(item.get("summary"))
+    if not summary_text:
+        summary_text = _extract_text_value(item.get("summary_text"))
+    return content_text, summary_text
+
+
+def _extract_content_part_text(part: Any) -> str:
     if not isinstance(part, dict):
         return ""
     if part.get("type") not in {"output_text", "text", "input_text"}:
         return ""
     text = part.get("text")
     return text if isinstance(text, str) else ""
+
+
+def _extract_part_text(part: Any) -> str:
+    if not isinstance(part, dict):
+        return ""
+    if part.get("type") not in {
+        "output_text",
+        "text",
+        "input_text",
+        "summary",
+        "reasoning_text",
+        "reasoning_summary_text",
+        "refusal",
+        "refusal_text",
+    }:
+        return ""
+    text = part.get("text")
+    return text if isinstance(text, str) else ""
+
+
+def _extract_text_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        text_parts: list[str] = []
+        for item in value:
+            part_text = _extract_text_value(item)
+            if part_text:
+                text_parts.append(part_text)
+        return "".join(text_parts)
+    if isinstance(value, dict):
+        direct = _extract_part_text(value)
+        if direct:
+            return direct
+        for key in ("content", "summary", "text", "refusal", "reasoning"):
+            part_text = _extract_text_value(value.get(key))
+            if part_text:
+                return part_text
+        return ""
+    return ""
 
 
 def _normalize_message_content(content: Any) -> Any:

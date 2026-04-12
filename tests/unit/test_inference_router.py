@@ -12,6 +12,14 @@ class _Connection:
         yield {"content": "Hello", "tool_calls": None, "reasoning_content": None, "index": 0}
         yield {
             "content": None,
+            "tool_calls": None,
+            "reasoning_content": '{"decision":"revise"}',
+            "reasoning": "Need tests",
+            "refusal": None,
+            "index": 1,
+        }
+        yield {
+            "content": None,
             "tool_calls": [
                 {
                     "id": "call_1",
@@ -57,8 +65,56 @@ async def test_inference_router_route_generate_reconstructs_normalized_response(
     )
 
     assert result["choices"][0]["message"]["content"] == "Hello"
+    assert result["choices"][0]["message"]["reasoning_content"] == '{"decision":"revise"}'
+    assert result["choices"][0]["message"]["reasoning"] == "Need tests"
     assert result["choices"][0]["message"]["tool_calls"][0]["id"] == "call_1"
     assert result["usage"]["total_tokens"] == 9
+
+
+class _StructuredConnection:
+    async def llm_complete_stream(self, **_: object):
+        yield {
+            "content": None,
+            "tool_calls": None,
+            "reasoning_content": {"decision": "revise", "feedback": "add tests"},
+            "reasoning": ["Need tests"],
+            "refusal": None,
+            "index": 0,
+        }
+        yield {
+            "done": True,
+            "usage": {"total_tokens": 3},
+            "finish_reason": "stop",
+            "response_status": "completed",
+        }
+
+
+class _StructuredProvider:
+    def __init__(self) -> None:
+        self.connection = _StructuredConnection()
+
+    async def list_active(self):
+        return [SimpleNamespace(executor_id="exec-1", metadata={"labels": {"location": "local"}})]
+
+    async def get_executor(self, handle: SimpleNamespace):
+        assert handle.executor_id == "exec-1"
+        return self.connection
+
+
+@pytest.mark.asyncio
+async def test_inference_router_route_generate_serializes_structured_reasoning_fields() -> None:
+    router = InferenceRouter(_StructuredProvider())
+
+    result = await router.route_generate(
+        messages=[{"role": "user", "content": "hi"}],
+        model="gpt-5.4",
+        executor_labels={"location": "local"},
+        request_kwargs={"cognis_llm_api": "responses"},
+    )
+
+    assert '"decision": "revise"' in result["choices"][0]["message"]["reasoning_content"]
+    assert result["choices"][0]["message"]["reasoning"] == '["Need tests"]'
+    assert result["response_status"] == "completed"
 
 
 @pytest.mark.asyncio

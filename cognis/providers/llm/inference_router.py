@@ -46,6 +46,7 @@ class InferenceRouter:
                             {"delta": {}, "finish_reason": chunk.get("finish_reason", "stop")}
                         ],
                         "usage": chunk.get("usage", {}),
+                        "response_status": chunk.get("response_status", "completed"),
                     }
                     return
                 yield {
@@ -55,6 +56,8 @@ class InferenceRouter:
                                 "content": chunk.get("content"),
                                 "tool_calls": chunk.get("tool_calls"),
                                 "reasoning_content": chunk.get("reasoning_content"),
+                                "reasoning": chunk.get("reasoning"),
+                                "refusal": chunk.get("refusal"),
                             }
                         }
                     ]
@@ -71,9 +74,13 @@ class InferenceRouter:
         request_kwargs: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        reasoning_summary_parts: list[str] = []
+        refusal_parts: list[str] = []
         tool_calls: list[Any] = []
         usage: dict[str, Any] = {}
         finish_reason = "stop"
+        response_status = "completed"
         async for chunk in self.route_stream(
             messages=messages,
             model=model,
@@ -84,14 +91,22 @@ class InferenceRouter:
                 raise RuntimeError(chunk.get("error", "Inference failed"))
             for choice in chunk.get("choices", []):
                 delta = choice.get("delta", {})
-                if delta.get("content"):
-                    content_parts.append(delta["content"])
+                if delta.get("content") is not None:
+                    content_parts.append(_coerce_text_field(delta.get("content")))
+                if delta.get("reasoning_content") is not None:
+                    reasoning_parts.append(_coerce_text_field(delta.get("reasoning_content")))
+                if delta.get("reasoning") is not None:
+                    reasoning_summary_parts.append(_coerce_text_field(delta.get("reasoning")))
+                if delta.get("refusal") is not None:
+                    refusal_parts.append(_coerce_text_field(delta.get("refusal")))
                 if delta.get("tool_calls"):
                     tool_calls.extend(delta["tool_calls"])
                 if choice.get("finish_reason"):
                     finish_reason = choice["finish_reason"]
             if chunk.get("usage"):
                 usage = chunk["usage"]
+            if chunk.get("response_status"):
+                response_status = str(chunk["response_status"])
         return {
             "choices": [
                 {
@@ -99,11 +114,15 @@ class InferenceRouter:
                         "role": "assistant",
                         "content": "".join(content_parts) or None,
                         "tool_calls": tool_calls or None,
+                        "reasoning_content": "".join(reasoning_parts) or None,
+                        "reasoning": "".join(reasoning_summary_parts) or None,
+                        "refusal": "".join(refusal_parts) or None,
                     },
                     "finish_reason": finish_reason,
                 }
             ],
             "usage": usage,
+            "response_status": response_status,
         }
 
     async def route_image_generate(
@@ -193,3 +212,18 @@ class InferenceRouter:
             except Exception:
                 continue
         return None
+
+
+def _coerce_text_field(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        import json
+
+        try:
+            return json.dumps(value, ensure_ascii=True, sort_keys=True)
+        except TypeError:
+            return str(value)
+    return str(value)

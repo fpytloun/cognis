@@ -38,6 +38,22 @@ class _LLM:
         return {"choices": [{"message": {"content": self._response}}]}
 
 
+class _SequenceLLM:
+    def __init__(self, responses: list[dict[str, object]]) -> None:
+        self._responses = list(responses)
+        self.calls = 0
+
+    async def generate(
+        self,
+        messages: list[dict[str, object]],
+        task_type: str = "default",
+        **kwargs: object,
+    ) -> dict[str, object]:
+        del messages, task_type, kwargs
+        self.calls += 1
+        return self._responses.pop(0)
+
+
 def _step_def(prompt: str = "Implement the feature") -> StepDefinition:
     return StepDefinition(
         name="implement",
@@ -204,7 +220,7 @@ async def test_evaluator_plain_text_failed_via_inference() -> None:
 
 
 @pytest.mark.asyncio
-async def test_evaluator_empty_response_defaults_to_approved() -> None:
+async def test_evaluator_empty_response_forces_revise() -> None:
     evaluator = StepEvaluator(llm=_LLM(response=""), evaluator_timeout_seconds=5.0)
 
     result = await evaluator.evaluate(
@@ -213,7 +229,110 @@ async def test_evaluator_empty_response_defaults_to_approved() -> None:
         step_inputs={},
     )
 
+    assert result.decision == "revise"
+    assert "no usable output" in result.reasoning.lower()
+
+
+@pytest.mark.asyncio
+async def test_evaluator_retries_empty_response_once() -> None:
+    llm = _SequenceLLM(
+        [
+            {"choices": [{"message": {"content": ""}}]},
+            {
+                "choices": [
+                    {"message": {"content": '{"decision": "approved", "reasoning": "Looks good"}'}}
+                ]
+            },
+        ]
+    )
+    evaluator = StepEvaluator(llm=llm, evaluator_timeout_seconds=5.0)
+
+    result = await evaluator.evaluate(
+        step_definition=_step_def(),
+        step_output=_step_output(),
+        step_inputs={},
+    )
+
+    assert llm.calls == 2
     assert result.decision == "approved"
+
+
+@pytest.mark.asyncio
+async def test_evaluator_incomplete_response_forces_revise() -> None:
+    llm = _SequenceLLM(
+        [
+            {
+                "choices": [
+                    {
+                        "message": {"content": '{"decision":'},
+                        "finish_reason": "length",
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "message": {"content": '{"decision":'},
+                        "finish_reason": "length",
+                    }
+                ]
+            },
+        ]
+    )
+    evaluator = StepEvaluator(llm=llm, evaluator_timeout_seconds=5.0)
+
+    result = await evaluator.evaluate(
+        step_definition=_step_def(),
+        step_output=_step_output(),
+        step_inputs={},
+    )
+
+    assert result.decision == "revise"
+    assert "incomplete" in result.reasoning.lower()
+
+
+@pytest.mark.asyncio
+async def test_evaluator_refusal_forces_revise() -> None:
+    llm = _SequenceLLM(
+        [
+            {
+                "choices": [
+                    {
+                        "message": {"content": None, "refusal": "Cannot comply"},
+                    }
+                ]
+            }
+        ]
+    )
+    evaluator = StepEvaluator(llm=llm, evaluator_timeout_seconds=5.0)
+
+    result = await evaluator.evaluate(
+        step_definition=_step_def(),
+        step_output=_step_output(),
+        step_inputs={},
+    )
+
+    assert result.decision == "revise"
+    assert "refused" in result.reasoning.lower()
+
+
+@pytest.mark.asyncio
+async def test_evaluator_retry_failure_after_empty_forces_revise() -> None:
+    llm = _SequenceLLM(
+        [
+            {"choices": [{"message": {"content": ""}}]},
+        ]
+    )
+    evaluator = StepEvaluator(llm=llm, evaluator_timeout_seconds=5.0)
+
+    result = await evaluator.evaluate(
+        step_definition=_step_def(),
+        step_output=_step_output(),
+        step_inputs={},
+    )
+
+    assert result.decision == "revise"
+    assert "retry failed" in result.reasoning.lower()
 
 
 @pytest.mark.asyncio

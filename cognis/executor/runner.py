@@ -687,6 +687,7 @@ class ExecutorRunner:
                                 "request_id": request_id,
                                 "usage": chunk.get("usage", {}),
                                 "finish_reason": chunk.get("finish_reason", "stop"),
+                                "response_status": chunk.get("response_status", "completed"),
                                 "error": chunk.get("error"),
                             },
                         }

@@ -114,6 +114,55 @@ class TestExtractTextFromResponse:
         }
         assert extract_text_from_response(response) == '{"decision": "approved"}'
 
+    def test_list_content_blocks_are_concatenated(self) -> None:
+        response = {
+            "choices": [
+                {
+                    "message": {
+                        "content": [
+                            {"type": "output_text", "text": '{"decision": '},
+                            {"type": "output_text", "text": '"approved"}'},
+                        ]
+                    }
+                }
+            ]
+        }
+        assert extract_text_from_response(response) == '{"decision": "approved"}'
+
+    def test_dict_reasoning_payload_is_serialized(self) -> None:
+        response = {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "reasoning_content": {"decision": "revise", "reason": "tests missing"},
+                    }
+                }
+            ]
+        }
+        extracted = extract_text_from_response(response)
+        assert '"decision": "revise"' in extracted
+        assert '"feedback": "add tests"' not in extracted
+
+    def test_structured_reasoning_object_keeps_full_json(self) -> None:
+        response = {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "reasoning_content": {
+                            "decision": "revise",
+                            "reasoning": "tests missing",
+                            "feedback": "add tests",
+                        },
+                    }
+                }
+            ]
+        }
+        extracted = extract_text_from_response(response)
+        assert '"decision": "revise"' in extracted
+        assert '"feedback": "add tests"' in extracted
+
 
 # ---------------------------------------------------------------------------
 # extract_json_object — Layer 1: direct parse

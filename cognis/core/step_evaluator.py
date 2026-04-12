@@ -114,7 +114,8 @@ class StepEvaluator:
         """Run semantic evaluation on a step's output.
 
         Returns StepEvaluation with decision: approved, revise, or failed.
-        On timeout or error, defaults to 'approved' (fail-open for evaluator).
+        On timeout or transport error, defaults to 'approved' (fail-open).
+        Empty or truncated evaluator output is treated as a revise.
         """
         prompt = self._build_prompt(step_definition, step_output, step_inputs, task_context)
 
@@ -137,18 +138,34 @@ class StepEvaluator:
                     "temperature": 0,
                     "response_format": {"type": "json_object"},
                 }
-                try:
-                    response = await asyncio.wait_for(
-                        self.llm.generate(messages, task_type="evaluator", **generate_kwargs),
-                        timeout=self.evaluator_timeout_seconds,
+                response = await self._generate_evaluator_response(messages, generate_kwargs)
+                if self._should_retry_response(response):
+                    logger.warning(
+                        "Evaluator returned empty or incomplete response, retrying once",
+                        extra={"extra_data": {"step": step_definition.name}},
                     )
-                except ValueError:
-                    # "evaluator" task type not configured — fall back to default
-                    logger.debug("Evaluator task_type not configured, falling back to default")
-                    response = await asyncio.wait_for(
-                        self.llm.generate(messages, task_type="default", **generate_kwargs),
-                        timeout=self.evaluator_timeout_seconds,
-                    )
+                    try:
+                        response = await self._generate_evaluator_response(
+                            messages, generate_kwargs
+                        )
+                    except TimeoutError:
+                        logger.warning(
+                            "Evaluator retry timed out after unusable response, forcing revise",
+                            extra={"extra_data": {"step": step_definition.name}},
+                        )
+                        return self._forced_revise(
+                            reasoning="Evaluator retry timed out after empty or incomplete output",
+                            feedback="Retry the step; evaluator could not return a usable response.",
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Evaluator retry failed after unusable response, forcing revise",
+                            extra={"extra_data": {"step": step_definition.name}},
+                        )
+                        return self._forced_revise(
+                            reasoning="Evaluator retry failed after empty or incomplete output",
+                            feedback="Retry the step; evaluator could not return a usable response.",
+                        )
                 evaluation = self._parse_response(response)
                 logger.info(
                     "Step evaluation complete",
@@ -228,7 +245,31 @@ class StepEvaluator:
         For capable models that respect ``response_format``, the first
         layer (direct parse) succeeds immediately with no overhead.
         """
+        refusal = self._extract_refusal_text(response)
+        if refusal:
+            logger.warning("Evaluator refused to answer, forcing revise")
+            evaluation = self._forced_revise(
+                reasoning="Evaluator refused to provide a usable judgment",
+                feedback="Retry the step; evaluator refused to answer.",
+            )
+            return evaluation
         content = extract_text_from_response(response)
+        finish_reason = self._extract_finish_reason(response)
+        if finish_reason == "length":
+            logger.warning(
+                "Evaluator response incomplete, forcing revise",
+                extra={"extra_data": {"content_length": len(content)}},
+            )
+            return self._forced_revise(
+                reasoning="Evaluator response was incomplete or truncated",
+                feedback="Retry the step; evaluator response was incomplete or truncated.",
+            )
+        if not content.strip():
+            logger.warning("Evaluator returned empty response, forcing revise")
+            return self._forced_revise(
+                reasoning="Evaluator returned no usable output",
+                feedback="Retry the step; evaluator response was empty.",
+            )
         try:
             payload = extract_json_object(content, label="evaluator")
         except ValueError:
@@ -257,3 +298,53 @@ class StepEvaluator:
 
         EVALUATIONS_TOTAL.labels(decision=evaluation.decision).inc()
         return evaluation
+
+    def _should_retry_response(self, response: dict[str, Any]) -> bool:
+        if self._extract_refusal_text(response):
+            return False
+        content = extract_text_from_response(response)
+        if not content.strip():
+            return True
+        return self._extract_finish_reason(response) == "length"
+
+    def _extract_finish_reason(self, response: dict[str, Any]) -> str:
+        choices = response.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return "stop"
+        finish_reason = choices[0].get("finish_reason")
+        return str(finish_reason or "stop")
+
+    def _extract_refusal_text(self, response: dict[str, Any]) -> str:
+        choices = response.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return ""
+        message = choices[0].get("message")
+        if not isinstance(message, dict):
+            return ""
+        refusal = message.get("refusal")
+        return refusal.strip() if isinstance(refusal, str) else ""
+
+    def _forced_revise(self, *, reasoning: str, feedback: str) -> StepEvaluation:
+        evaluation = StepEvaluation(
+            decision="revise",
+            reasoning=reasoning,
+            feedback=feedback,
+            evaluated_at=datetime.now(UTC),
+        )
+        EVALUATIONS_TOTAL.labels(decision=evaluation.decision).inc()
+        return evaluation
+
+    async def _generate_evaluator_response(
+        self, messages: list[dict[str, str]], generate_kwargs: dict[str, Any]
+    ) -> dict[str, Any]:
+        try:
+            return await asyncio.wait_for(
+                self.llm.generate(messages, task_type="evaluator", **generate_kwargs),
+                timeout=self.evaluator_timeout_seconds,
+            )
+        except ValueError:
+            logger.debug("Evaluator task_type not configured, falling back to default")
+            return await asyncio.wait_for(
+                self.llm.generate(messages, task_type="default", **generate_kwargs),
+                timeout=self.evaluator_timeout_seconds,
+            )

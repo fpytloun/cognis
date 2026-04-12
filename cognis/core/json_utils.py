@@ -54,22 +54,55 @@ def extract_text_from_response(response: dict[str, Any]) -> str:
         return ""
 
     # Primary: message.content (standard OpenAI format)
-    content = message.get("content")
-    if isinstance(content, str) and content.strip():
+    content = _extract_text_payload(message.get("content"), serialize_objects=False)
+    if content.strip():
         return content
 
     # Fallback: reasoning models — litellm client-side processing may
     # move content to reasoning_content, leaving content empty.
     for field in ("reasoning_content", "reasoning"):
-        fallback = message.get(field)
-        if isinstance(fallback, str) and fallback.strip():
+        fallback = _extract_text_payload(message.get(field), serialize_objects=True)
+        if fallback.strip():
             logger.info(
                 "Using reasoning field as response content",
                 extra={"extra_data": {"field": field, "content_length": len(fallback)}},
             )
             return fallback
 
-    return content if isinstance(content, str) else ""
+    return content
+
+
+def _extract_text_payload(value: Any, *, serialize_objects: bool) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            text = _extract_text_payload(item, serialize_objects=serialize_objects)
+            if text:
+                parts.append(text)
+        return "".join(parts)
+    if isinstance(value, dict):
+        if serialize_objects and any(
+            key in value for key in ("decision", "feedback", "workflow_id", "confidence", "reason")
+        ):
+            try:
+                return json.dumps(value, ensure_ascii=True, sort_keys=True)
+            except TypeError:
+                return str(value)
+        for key in ("text", "content", "summary", "reasoning", "value"):
+            text = _extract_text_payload(value.get(key), serialize_objects=serialize_objects)
+            if text:
+                return text
+        if serialize_objects:
+            try:
+                return json.dumps(value, ensure_ascii=True, sort_keys=True)
+            except TypeError:
+                return str(value)
+        return ""
+    return ""
 
 
 # ---------------------------------------------------------------------------

@@ -298,6 +298,38 @@ async def test_stream_complete_emits_content_part_done_text(
 
 
 @pytest.mark.asyncio
+async def test_stream_complete_emits_reasoning_and_refusal_deltas(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handler = InferenceHandler()
+
+    async def fake_stream():
+        yield {"type": "response.reasoning_text.delta", "delta": '{"decision":"revise"}'}
+        yield {"type": "response.refusal.delta", "delta": "Cannot comply"}
+        yield {
+            "type": "response.completed",
+            "response": {"status": "completed", "usage": {"total_tokens": 5}},
+        }
+
+    async def fake_aresponses(**_: object):
+        return fake_stream()
+
+    monkeypatch.setattr("cognis.executor.inference.litellm.aresponses", fake_aresponses)
+
+    chunks = [
+        chunk
+        async for chunk in handler.stream_complete(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "hi"}],
+            request_kwargs={"cognis_llm_api": "responses"},
+        )
+    ]
+
+    assert chunks[0]["reasoning_content"] == '{"decision":"revise"}'
+    assert chunks[1]["refusal"] == "Cannot comply"
+
+
+@pytest.mark.asyncio
 async def test_generate_normalizes_responses_payload(monkeypatch: pytest.MonkeyPatch) -> None:
     handler = InferenceHandler()
 
@@ -330,6 +362,39 @@ async def test_generate_normalizes_responses_payload(monkeypatch: pytest.MonkeyP
 
     assert result["choices"][0]["message"]["content"] == "hello"
     assert result["choices"][0]["message"]["tool_calls"][0]["id"] == "call_1"
+
+
+@pytest.mark.asyncio
+async def test_generate_preserves_reasoning_only_responses_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handler = InferenceHandler()
+
+    class Response:
+        def model_dump(self) -> dict[str, object]:
+            return {
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "reasoning",
+                        "content": [{"type": "reasoning_text", "text": '{"decision":"revise"}'}],
+                    }
+                ],
+            }
+
+    async def fake_aresponses(**_: object):
+        return Response()
+
+    monkeypatch.setattr("cognis.executor.inference.litellm.aresponses", fake_aresponses)
+
+    result = await handler.generate(
+        model="gpt-5.4",
+        messages=[{"role": "user", "content": "hi"}],
+        request_kwargs={"cognis_llm_api": "responses"},
+    )
+
+    assert result["choices"][0]["message"]["content"] is None
+    assert result["choices"][0]["message"]["reasoning_content"] == '{"decision":"revise"}'
 
 
 @pytest.mark.asyncio
