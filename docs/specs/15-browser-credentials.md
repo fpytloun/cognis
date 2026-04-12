@@ -613,6 +613,258 @@ Rules:
 
 Artifact-to-browser upload support may be added later.
 
+## Session Recording
+
+Browser and future desktop session recording should be modeled as an Intaris
+feature, not as durable controller state in Cognis.
+
+Ownership split:
+
+- Cognis owns orchestration, browser session metadata, takeover state, and
+  artifact references
+- Intaris owns durable recording timelines, replay metadata, retention,
+  review semantics, and the authoritative lifecycle for recording evidence
+- the artifact backend remains the binary store for screenshots, video chunks,
+  and related evidence blobs, but Intaris is the authority for retention,
+  delete/legal-hold policy, replay availability, and signed-access brokering for
+  recording evidence
+
+Important boundary:
+
+- generic browser tool artifacts (for example ordinary screenshots or downloads
+  returned directly to the user during a task) may continue to use the normal
+  Cognis artifact lifecycle
+- recording evidence artifacts belong to the Intaris recording lifecycle, even
+  if they share the same physical blob backend underneath
+
+This recording model should apply to both:
+
+- `browser` sessions
+- future `desktop` / computer-use sessions
+
+### Recording Modes
+
+Suggested recording modes:
+
+- `off` — no session recording
+- `audit` — event timeline only
+- `evidence` — event timeline plus key screenshots
+- `full` — event timeline plus richer media capture such as periodic screenshots
+  or video segments
+
+Recommended defaults:
+
+- browser-capable executors default to `audit`
+- `evidence` and `full` remain explicit opt-in modes
+
+### Recording Content
+
+Minimum event timeline for browser recording:
+
+- session opened / closed
+- navigation and redirect outcomes
+- click / fill / type / submit actions
+- browser errors and failed requests
+- auth challenge requested / resolved
+- human takeover requested / granted / released
+- agent resumed after takeover
+
+Key evidence artifacts for `evidence` and `full` modes:
+
+- page-open screenshots
+- post-navigation screenshots
+- auth challenge screenshots
+- submit/error screenshots
+- takeover start/end screenshots
+
+The event payload should contain metadata and artifact references, not raw media
+bytes.
+
+### Recording Model
+
+Suggested recording linkage fields:
+
+- `recording_type`: `browser` | `desktop`
+- `intaris_session_id`
+- `user_email`
+- `agent_id`
+- `conversation_id`
+- `task_id | null`
+- `step_run_id | null`
+- `browser_session_id | null`
+- `runtime_run_id | null`
+- `actor`: `agent` | `human` | `system`
+- `control_mode`: `agent` | `human`
+
+This keeps replay and auditing attributable even when control moves between the
+agent and a human operator.
+
+### Recording Flow
+
+1. The executor captures browser/desktop runtime events.
+2. Cognis enriches those events with stable session/task/user/agent lineage.
+3. Cognis forwards the event stream to Intaris.
+4. Intaris issues or governs the artifact linkage for recording evidence.
+5. Media is stored in the artifact backend and referenced from Intaris events.
+5. Intaris exposes replay/audit views over the resulting timeline.
+
+Concrete recording-evidence lifecycle contract:
+
+1. Cognis asks Intaris to reserve an evidence slot for a recording event.
+2. Intaris returns an upload target or artifact reservation token.
+3. Cognis or the executor uploads the media blob using that reservation.
+4. Cognis finalizes the corresponding recording event with the Intaris-issued
+   evidence reference and integrity metadata.
+5. Intaris becomes authoritative for replay access, retention, delete/legal
+   hold, and orphan cleanup for that evidence.
+
+Required properties of this flow:
+
+- idempotent reservation and finalize operations
+- deterministic event-to-artifact linkage
+- orphan cleanup for abandoned reservations/uploads
+- no direct durable replay references created by Cognis alone
+
+### Evidence Integrity
+
+Every recording artifact reference should carry immutable integrity metadata:
+
+- `artifact_id`
+- `sha256`
+- `size_bytes`
+- `content_type`
+- `captured_at`
+- `executor_id`
+- idempotent linkage back to the recording event
+
+Recording event ingestion and recording artifact linkage must be idempotent.
+Retries must not create duplicate replay entries or orphaned evidence blobs.
+
+### Human Takeover and Recording
+
+If browser takeover is enabled, the recording timeline must explicitly show:
+
+- takeover requested
+- takeover granted
+- human control started
+- human control ended
+- agent resumed
+
+This is required for mixed human/agent auditability.
+
+Mandatory lineage fields for every browser/desktop recording event:
+
+- `intaris_session_id`
+- `conversation_id`
+- `task_id | null`
+- `step_run_id | null`
+- `browser_session_id | desktop_session_id | null`
+- `runtime_run_id | null`
+- `executor_id`
+- `actor`
+- `actor_id`
+- `control_mode`
+
+Sanitization rules for recording payload metadata:
+
+- URLs should exclude query strings and fragments by default
+- known token- or code-shaped query parameters must be redacted if a full URL
+  must be retained by policy
+- page titles and metadata should be sanitized when they contain obvious secret,
+  email, or tenant identifiers not required for audit replay
+- profile identifiers included in recording events should be logical IDs only,
+  never raw filesystem paths
+
+### Privacy and Retention
+
+Recording policy must support:
+
+- secret redaction in event payloads
+- deny-by-default screenshot/video capture on sensitive auth pages unless policy
+  explicitly allows it
+- retention TTL by recording mode
+- delete/revoke behavior for sensitive evidence where allowed by policy
+
+Hard rules:
+
+- plaintext passwords, OTPs, and tokens must not appear in event payloads
+- screenshots/video during password, OTP, token entry, or human takeover on
+  sensitive auth pages are denied by default unless an explicit policy allows
+  capture and defines the masking/redaction behavior
+- recording mode must be visible and configurable per executor/runtime
+
+### Browser Takeover
+
+Browser takeover should be an optional executor capability, enabled per
+executor. A headed Linux executor may expose a noVNC-backed remote view so the
+user can complete login or MFA manually and then hand control back to the
+agent.
+
+Takeover access control requirements:
+
+- explicit separation between `view` and `control` permission
+- short-lived takeover/session tokens
+- exactly one active controller for a live session at a time
+- heartbeat or idle timeout for takeover sessions
+- explicit reconnect / expiry behavior
+- every takeover/view/control event must be auditable
+
+Transport security requirements for noVNC/browser takeover:
+
+- no direct public VNC/noVNC exposure from the executor host
+- takeover transport must be brokered by Cognis or another authenticated control
+  plane component
+- TLS is required end-to-end for takeover traffic outside trusted localhost
+  development paths
+- viewer/control access must be authorized explicitly per session
+- origin validation and short-lived access tokens are mandatory
+- executor-local display ports must not be reachable by unintended network
+  peers
+
+Recommended feature split:
+
+- Cognis control plane: takeover request, pause/resume, authorization, and
+  audit linkage
+- executor capability: headed browser + Xvfb/VNC/noVNC transport
+- Intaris recording: durable takeover timeline and evidence
+
+This should later extend naturally to desktop/computer-use sessions using the
+same recording model.
+
+### Takeover State Model
+
+Takeover state held by Cognis is operational state only and must be restart-safe
+enough to recover a consistent user experience:
+
+- `requested`
+- `granted`
+- `human_active`
+- `released`
+- `resumed`
+- `expired`
+
+If the controller or executor restarts mid-takeover, the session must recover
+to either:
+
+- a clearly resumed agent state, or
+- an explicit expired/orphaned takeover state requiring user confirmation
+
+Multiple-viewer semantics:
+
+- multiple read-only viewers may be allowed by policy
+- only one active controller may interact with the live session at a time
+- viewer joins/leaves and controller changes must be auditable
+
+### Recording and Takeover NFRs
+
+The implementation must define and enforce:
+
+- max concurrent headed takeover sessions per executor
+- storage/retention budget per recording mode
+- p95 takeover handoff latency target
+- replay availability target for retained evidence
+- bounded orphan cleanup for failed uploads and abandoned takeover sessions
+
 ## Quotas and Cleanup
 
 Browser workloads need explicit limits.

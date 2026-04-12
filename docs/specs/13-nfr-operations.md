@@ -189,6 +189,28 @@ cognis_task_lease_timeouts_total
 cognis_executor_heartbeat_age_seconds{executor_id}
 ```
 
+#### Browser Recording and Takeover
+
+```
+cognis_browser_takeovers_total{executor_id, outcome}
+cognis_browser_takeover_duration_seconds{executor_id}
+cognis_browser_recording_events_total{recording_type, mode, event_type}
+cognis_browser_recording_artifacts_total{recording_type, mode}
+cognis_browser_recording_orphan_artifacts_total
+cognis_browser_recording_upload_failures_total
+```
+
+Recording/takeover operational targets must include:
+
+- max concurrent headed takeover sessions per executor: default 2, configurable
+- p95 browser takeover handoff latency: <= 3s after approval/grant in normal
+  operation
+- replay availability target for retained evidence: 99.5%
+- orphan cleanup for failed recording uploads and abandoned takeover sessions:
+  <= 15 minutes
+- recording evidence storage budget: explicit per-mode quota with alerts at 80%
+  consumption
+
 #### Cost
 
 ```

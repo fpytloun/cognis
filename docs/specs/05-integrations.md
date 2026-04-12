@@ -430,10 +430,41 @@ Intaris event types for session recording. These must be in
 | `evaluation` | `{call_id, decision, risk, reasoning}` | Intaris (auto) |
 | `delegation` | `{mode, child_session_id, task, status, result_summary}` | Cognis |
 | `compaction_summary` | `{summary, tokens_before, tokens_after, turns_compacted}` | Cognis |
+| `browser_session` | `{browser_session_id, event, url, title, profile_mode, profile_id, actor, actor_id, control_mode, conversation_id, task_id, step_run_id, runtime_run_id, executor_id, artifact_refs, integrity}` | Cognis |
+| `desktop_session` | `{desktop_session_id, event, actor, actor_id, control_mode, conversation_id, task_id, step_run_id, runtime_run_id, executor_id, artifact_refs, integrity}` | Cognis |
+| `takeover` | `{session_type, session_id, event, actor, actor_id, control_mode, conversation_id, task_id, step_run_id, runtime_run_id, executor_id}` | Cognis |
 | `message` | Generic message (existing) | Any |
 | `reasoning` | Intention tracking (existing) | Intaris (auto) |
 | `checkpoint` | State checkpoint (existing) | Cognis |
 | `lifecycle` | Session lifecycle events (existing) | Any |
+
+Browser and desktop session recording should be modeled as Intaris-owned replay
+timelines. Cognis emits the event stream with stable lineage metadata and
+artifact references; Intaris owns durable storage, replay semantics, retention,
+review tooling, and the authoritative lifecycle for recording evidence.
+
+For recording evidence artifacts, Intaris is the authority for:
+
+- retention and expiry
+- delete and legal-hold policy
+- replay availability
+- signed access to retained evidence
+
+Cognis may still broker or attach generic artifacts for non-recording features,
+but recording evidence lifecycle must not be split across both services.
+
+Suggested Intaris evidence lifecycle flow for recording artifacts:
+
+1. `reserve_recording_evidence(...)` — reserve an evidence slot for a future
+   browser/desktop recording artifact and return upload linkage information.
+2. upload media blob using the Intaris-issued reservation.
+3. `finalize_recording_evidence(...)` — bind the uploaded blob to a specific
+   recording event with integrity metadata.
+4. `get_recording_evidence_access(...)` — Intaris-brokered replay access or
+   signed URL issuance.
+5. `delete_recording_evidence(...)` / legal-hold mutation under Intaris policy.
+
+These operations must be idempotent and replay-safe.
 
 ### Intaris HTTP Endpoints (Verified)
 
