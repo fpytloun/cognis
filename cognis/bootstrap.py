@@ -169,6 +169,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_executor_runtime_state_columns)
         await conn.run_sync(_ensure_skill_versioning_columns)
         await conn.run_sync(_ensure_schedule_extended_columns)
+        await conn.run_sync(_ensure_conversation_title_source_column)
 
 
 def _ensure_session_lifecycle_columns(sync_conn: object) -> None:
@@ -255,6 +256,29 @@ def _ensure_task_expected_output_column(sync_conn: object) -> None:
 
     if "expected_output" not in task_columns:
         execute(text("ALTER TABLE tasks ADD COLUMN expected_output TEXT"))
+
+
+def _ensure_conversation_title_source_column(sync_conn: object) -> None:
+    inspector = cast(Any, inspect(sync_conn))
+    try:
+        conversation_columns = {column["name"] for column in inspector.get_columns("conversations")}
+    except Exception:
+        return
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+
+    if "title_source" not in conversation_columns:
+        execute(
+            text(
+                "ALTER TABLE conversations ADD COLUMN title_source VARCHAR NOT NULL DEFAULT 'unset'"
+            )
+        )
+        execute(
+            text(
+                "UPDATE conversations SET title_source = CASE "
+                "WHEN title IS NULL OR TRIM(title) = '' THEN 'unset' "
+                "ELSE 'manual' END"
+            )
+        )
 
 
 def _ensure_step_run_conversation_id_column(sync_conn: object) -> None:

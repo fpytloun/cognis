@@ -535,6 +535,7 @@ class InboundPipeline:
                     },
                 ),
                 title=message.chat_name or f"{message.channel_type} chat",
+                title_source="channel_seed",
             )
             return conversation.conversation_id
         except Exception:

@@ -638,6 +638,7 @@ async def create_conversation(
     context_type: str,
     *,
     title: str | None = None,
+    title_source: str = "unset",
     context_ref: str | None = None,
     context_data: dict[str, object] | None = None,
     memory_labels: dict[str, object] | None = None,
@@ -650,6 +651,7 @@ async def create_conversation(
         user_email=user_email,
         agent_id=agent_id,
         title=title,
+        title_source=title_source,
         context_type=context_type,
         context_ref=context_ref,
         context_data=context_data,
@@ -767,6 +769,7 @@ async def update_conversation(
     conversation_id: str,
     *,
     title: str | None = None,
+    title_source: str | None = None,
 ) -> bool:
     """Update mutable conversation fields."""
     row = await get_conversation(session, conversation_id)
@@ -774,6 +777,8 @@ async def update_conversation(
         return False
     if title is not None:
         row.title = title
+    if title_source is not None:
+        row.title_source = title_source
     row.updated_at = datetime.now(UTC)
     await session.flush()
     return True

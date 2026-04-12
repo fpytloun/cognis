@@ -1323,11 +1323,7 @@ class TurnScheduler:
                                 False,
                             )
 
-                    intention = (
-                        user_message
-                        or conversation_row.title
-                        or f"Conversation with {agent_row.name}"
-                    )
+                    intention = user_message or f"Conversation with {agent_row.name}"
                     try:
                         root_session = await self._session_manager.ensure_root_session(
                             conversation_id=conversation_row.conversation_id,

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import uuid
 from collections.abc import Callable, Coroutine
@@ -27,6 +28,7 @@ from cognis.core.events import Event, EventBus, EventType
 from cognis.core.prompts import PromptContext
 from cognis.core.pruning import prune_tool_outputs
 from cognis.core.runtime import ExecutorEnvironmentSnapshot, ResolvedStepRuntime
+from cognis.core.title_policy import sync_intaris_title
 from cognis.core.tool_exposure import prepare_tool_exposure
 from cognis.core.truncation import middle_truncate
 from cognis.logging import get_logger
@@ -42,8 +44,9 @@ from cognis.models.tool import (
     stable_tool_id,
 )
 from cognis.models.workflow import StepDefinition, StepOutput, WorkflowState
+from cognis.providers.retry import is_retryable_http_error
 from cognis.runtime_context import scoped_runtime_context  # noqa: F401 — used in delegation
-from cognis.store.queries import get_setting_value, update_conversation
+from cognis.store.queries import get_setting_value
 from cognis.tools.builtin.orchestration import (
     OrchestrationMode,
     handle_delegate_tool_call,
@@ -56,6 +59,7 @@ from cognis.tools.builtin.tool_search import SEARCH_TOOLS_TOOL, search_inventory
 logger = get_logger(__name__)
 
 _BOOTSTRAP_INTENTION_WAIT_MS = 1500
+_INTARIS_RETRY_POLL_SECONDS = 5.0
 
 
 def _user_message_for_recording(content: str, attachments: list[AttachmentRef]) -> str:
@@ -1305,13 +1309,11 @@ class AgentLoop:
         # - system_initiated turns (lifecycle event provides the trail)
         # - retry turns (session already has the original prompt)
         # ---------------------------------------------------------------
-        _user_msg_recorded_early = False
         recorded_user_message = _user_message_for_recording(
             effective_user_message,
             ctx.user_attachments,
         )
         if recorded_user_message and not ctx.system_initiated and not ctx.is_retry:
-            intaris_id = ctx.session.intaris_session_id or ctx.session.session_id
             user_msg_event = SessionEvent(
                 type="user_message",
                 data={
@@ -1323,55 +1325,37 @@ class AgentLoop:
                 },
             )
             try:
-                await self.providers.guardrails.record_events(
-                    session_id=intaris_id,
-                    events=[user_msg_event],
-                    source="cognis",
+                await self._record_events_strict(
+                    ctx,
+                    [user_msg_event],
+                    reason="user_message",
+                    on_token=on_token,
                 )
-                _user_msg_recorded_early = True
             except Exception:
-                logger.warning(
+                logger.exception(
                     "agent: failed to record early user_message event",
                     extra={"extra_data": {"session_id": ctx.session.session_id}},
                 )
+                raise
 
-            # Trigger intention update. When the event was recorded
-            # successfully, use from_events to avoid re-sending content.
-            # Fall back to sending content directly if recording failed.
             try:
-                reasoning_result = None
-                if _user_msg_recorded_early:
-                    reasoning_result = await self.providers.guardrails.report_reasoning(
-                        session_id=intaris_id,
-                        from_events=True,
-                        wait_for_intention=ctx.bootstrap_wait_for_intention,
-                        wait_timeout_ms=_BOOTSTRAP_INTENTION_WAIT_MS,
-                    )
-                else:
-                    reasoning_result = await self.providers.guardrails.report_reasoning(
-                        session_id=intaris_id,
-                        content=f"User message: {recorded_user_message[:500]}",
-                        wait_for_intention=ctx.bootstrap_wait_for_intention,
-                        wait_timeout_ms=_BOOTSTRAP_INTENTION_WAIT_MS,
-                    )
-
+                reasoning_result = await self._report_reasoning_strict(ctx, on_token=on_token)
                 if reasoning_result and reasoning_result.updated_at:
                     updated = await self.session_cache.update_intention(
                         ctx.session.session_id,
                         reasoning_result.intention,
                         updated_at=reasoning_result.updated_at,
                     )
-                    if updated and reasoning_result.title and not ctx.conversation.title:
+                    if updated and reasoning_result.title:
                         try:
                             async with self.session_manager.session_factory() as db_session:
-                                ok = await update_conversation(
+                                ok = await sync_intaris_title(
                                     db_session,
-                                    ctx.conversation.conversation_id,
-                                    title=reasoning_result.title[:200],
+                                    ctx.conversation,
+                                    reasoning_result.title,
                                 )
                                 if ok:
                                     await db_session.commit()
-                                    ctx.conversation.title = reasoning_result.title[:200]
                         except Exception:
                             logger.debug(
                                 "agent: failed to sync bootstrap title from Intaris",
@@ -1383,11 +1367,11 @@ class AgentLoop:
                                 exc_info=True,
                             )
             except Exception:
-                logger.warning(
+                logger.exception(
                     "agent: failed to trigger intention update",
                     extra={"extra_data": {"session_id": ctx.session.session_id}},
-                    exc_info=True,
                 )
+                raise
 
         # ---------------------------------------------------------------
         # Step 3: Assemble context (reads Intaris history + memory)
@@ -1420,20 +1404,6 @@ class AgentLoop:
         # (task completion, delegation results) are NOT recorded — the
         # lifecycle event already provides the audit trail and the prompt
         # is an internal instruction, not user-visible content.
-        if recorded_user_message and not _user_msg_recorded_early and not ctx.system_initiated:
-            events_to_record.append(
-                SessionEvent(
-                    type="user_message",
-                    data={
-                        "content": recorded_user_message,
-                        "attachments": [
-                            item.model_dump(mode="json", exclude={"url"})
-                            for item in ctx.user_attachments
-                        ],
-                    },
-                )
-            )
-
         # Capture cache breakpoint for prompt caching (Anthropic cache_control)
         cache_breakpoint = getattr(context_result, "cache_breakpoint_index", None)
 
@@ -1587,6 +1557,13 @@ class AgentLoop:
                 )
                 if on_token:
                     await on_token(f"\n\n{error_notice}")
+                if events_to_record:
+                    await self._flush_events_incremental(
+                        ctx,
+                        events_to_record,
+                        reason="mid_stream_failure",
+                        on_token=on_token,
+                    )
                 break  # Exit while loop → _finalize_step runs normally
 
             content = accumulator.get_content()
@@ -1626,6 +1603,12 @@ class AgentLoop:
                 )
                 if memory_text.strip():
                     assistant_memory_parts.append(memory_text)
+                await self._flush_events_incremental(
+                    ctx,
+                    events_to_record,
+                    reason="assistant_message",
+                    on_token=on_token,
+                )
 
             # No tool calls — check if step is complete
             if not tool_calls:
@@ -1737,6 +1720,12 @@ class AgentLoop:
                 # Controller tool interception
                 if tc.name == STEP_COMPLETE:
                     _append_tool_call_event(events_to_record, tc, tool_id)
+                    await self._flush_events_incremental(
+                        ctx,
+                        events_to_record,
+                        reason="tool_call:step_complete",
+                        on_token=on_token,
+                    )
                     # Reject step_complete when it's not available (e.g. direct chat)
                     if not ctx.policy.step_complete_available:
                         err_content = json.dumps(
@@ -1753,6 +1742,12 @@ class AgentLoop:
                         )
                         _append_tool_result_event(
                             events_to_record, tc, err_content, True, tool_id=tool_id
+                        )
+                        await self._flush_events_incremental(
+                            ctx,
+                            events_to_record,
+                            reason="tool_result:step_complete",
+                            on_token=on_token,
                         )
                         if on_tool_result:
                             await on_tool_result(tc.call_id, tc.name, err_content, True, None, None)
@@ -1778,6 +1773,12 @@ class AgentLoop:
                         )
                         _append_tool_result_event(
                             events_to_record, tc, err_content, True, tool_id=tool_id
+                        )
+                        await self._flush_events_incremental(
+                            ctx,
+                            events_to_record,
+                            reason="tool_result:step_complete",
+                            on_token=on_token,
                         )
                         if on_tool_result:
                             await on_tool_result(tc.call_id, tc.name, err_content, True, None, None)
@@ -1810,6 +1811,12 @@ class AgentLoop:
                     _append_tool_result_event(
                         events_to_record, tc, result_content, False, tool_id=tool_id
                     )
+                    await self._flush_events_incremental(
+                        ctx,
+                        events_to_record,
+                        reason="tool_result:step_complete",
+                        on_token=on_token,
+                    )
                     if on_tool_result:
                         await on_tool_result(tc.call_id, tc.name, result_content, False, None, None)
                     break
@@ -1824,6 +1831,12 @@ class AgentLoop:
                     _append_tool_result_event(
                         events_to_record, tc, result_content, False, tool_id=tool_id
                     )
+                    await self._flush_events_incremental(
+                        ctx,
+                        events_to_record,
+                        reason="tool_result:step_todo_write",
+                        on_token=on_token,
+                    )
                     if on_tool_result:
                         await on_tool_result(tc.call_id, tc.name, result_content, False, None, None)
                     continue
@@ -1837,12 +1850,24 @@ class AgentLoop:
                     _append_tool_result_event(
                         events_to_record, tc, result_content, False, tool_id=tool_id
                     )
+                    await self._flush_events_incremental(
+                        ctx,
+                        events_to_record,
+                        reason="tool_result:step_todo_list",
+                        on_token=on_token,
+                    )
                     if on_tool_result:
                         await on_tool_result(tc.call_id, tc.name, result_content, False, None, None)
                     continue
 
                 elif tc.name == STEP_REQUEST_INPUT:
                     _append_tool_call_event(events_to_record, tc, tool_id)
+                    await self._flush_events_incremental(
+                        ctx,
+                        events_to_record,
+                        reason="tool_call:step_request_input",
+                        on_token=on_token,
+                    )
                     if (
                         ctx.interaction_mode != "step_requests"
                         or not ctx.step_definition.allow_questions
@@ -1855,6 +1880,12 @@ class AgentLoop:
                         )
                         _append_tool_result_event(
                             events_to_record, tc, err_content, True, tool_id=tool_id
+                        )
+                        await self._flush_events_incremental(
+                            ctx,
+                            events_to_record,
+                            reason="tool_result:step_request_input",
+                            on_token=on_token,
                         )
                         if on_tool_result:
                             await on_tool_result(tc.call_id, tc.name, err_content, True, None, None)
@@ -1869,6 +1900,12 @@ class AgentLoop:
                         )
                         _append_tool_result_event(
                             events_to_record, tc, rec_content, False, tool_id=tool_id
+                        )
+                        await self._flush_events_incremental(
+                            ctx,
+                            events_to_record,
+                            reason="tool_result:step_request_input",
+                            on_token=on_token,
                         )
                         if on_tool_result:
                             await on_tool_result(
@@ -1936,6 +1973,12 @@ class AgentLoop:
                         _append_tool_result_event(
                             events_to_record, tc, resp_content, False, tool_id=tool_id
                         )
+                        await self._flush_events_incremental(
+                            ctx,
+                            events_to_record,
+                            reason="tool_result:step_request_input",
+                            on_token=on_token,
+                        )
                         if on_tool_result:
                             await on_tool_result(
                                 tc.call_id, tc.name, resp_content, False, None, None
@@ -1954,6 +1997,12 @@ class AgentLoop:
                         _append_tool_result_event(
                             events_to_record, tc, timeout_content, True, tool_id=tool_id
                         )
+                        await self._flush_events_incremental(
+                            ctx,
+                            events_to_record,
+                            reason="tool_result:step_request_input",
+                            on_token=on_token,
+                        )
                         if on_tool_result:
                             await on_tool_result(
                                 tc.call_id, tc.name, timeout_content, True, None, None
@@ -1962,6 +2011,12 @@ class AgentLoop:
 
                 elif tc.name in {REQUEST_CREDENTIAL, REQUEST_AUTH_CHALLENGE}:
                     _append_tool_call_event(events_to_record, tc, tool_id)
+                    await self._flush_events_incremental(
+                        ctx,
+                        events_to_record,
+                        reason=f"tool_call:{tc.name}",
+                        on_token=on_token,
+                    )
                     pause_id = f"auth_{uuid.uuid4().hex[:12]}"
                     timeout_seconds = int(tc.arguments.get("timeout_seconds", 600) or 600)
                     payload = {
@@ -2034,6 +2089,12 @@ class AgentLoop:
                             _append_tool_result_event(
                                 events_to_record, tc, err_content, True, tool_id=tool_id
                             )
+                            await self._flush_events_incremental(
+                                ctx,
+                                events_to_record,
+                                reason=f"tool_result:{tc.name}",
+                                on_token=on_token,
+                            )
                             if on_tool_result:
                                 await on_tool_result(
                                     tc.call_id, tc.name, err_content, True, None, None
@@ -2049,6 +2110,12 @@ class AgentLoop:
                             )
                             _append_tool_result_event(
                                 events_to_record, tc, err_content, True, tool_id=tool_id
+                            )
+                            await self._flush_events_incremental(
+                                ctx,
+                                events_to_record,
+                                reason=f"tool_result:{tc.name}",
+                                on_token=on_token,
                             )
                             if on_tool_result:
                                 await on_tool_result(
@@ -2072,6 +2139,12 @@ class AgentLoop:
                         _append_tool_result_event(
                             events_to_record, tc, resp_content, False, tool_id=tool_id
                         )
+                        await self._flush_events_incremental(
+                            ctx,
+                            events_to_record,
+                            reason=f"tool_result:{tc.name}",
+                            on_token=on_token,
+                        )
                         if on_tool_result:
                             await on_tool_result(
                                 tc.call_id, tc.name, resp_content, False, None, None
@@ -2094,6 +2167,12 @@ class AgentLoop:
                         _append_tool_result_event(
                             events_to_record, tc, timeout_content, True, tool_id=tool_id
                         )
+                        await self._flush_events_incremental(
+                            ctx,
+                            events_to_record,
+                            reason=f"tool_result:{tc.name}",
+                            on_token=on_token,
+                        )
                         if on_tool_result:
                             await on_tool_result(
                                 tc.call_id, tc.name, timeout_content, True, None, None
@@ -2102,6 +2181,12 @@ class AgentLoop:
 
                 elif tc.name == LIST_CREDENTIALS:
                     _append_tool_call_event(events_to_record, tc, tool_id)
+                    await self._flush_events_incremental(
+                        ctx,
+                        events_to_record,
+                        reason="tool_call:list_credentials",
+                        on_token=on_token,
+                    )
                     rows = await self.providers.credentials.list_credentials(ctx.session.user_email)
                     allowed = set(
                         ctx.agent.permissions.allowed_credentials if ctx.agent.permissions else []
@@ -2149,12 +2234,24 @@ class AgentLoop:
                     _append_tool_result_event(
                         events_to_record, tc, result_content, False, tool_id=tool_id
                     )
+                    await self._flush_events_incremental(
+                        ctx,
+                        events_to_record,
+                        reason="tool_result:list_credentials",
+                        on_token=on_token,
+                    )
                     if on_tool_result:
                         await on_tool_result(tc.call_id, tc.name, result_content, False, None, None)
                     continue
 
                 elif tc.name == SEARCH_TOOLS_TOOL.name:
                     _append_tool_call_event(events_to_record, tc, tool_id)
+                    await self._flush_events_incremental(
+                        ctx,
+                        events_to_record,
+                        reason="tool_call:search_tools",
+                        on_token=on_token,
+                    )
                     matches = search_inventory(
                         inventory_tools,
                         str(tc.arguments.get("query", "")),
@@ -2190,6 +2287,12 @@ class AgentLoop:
                     _append_tool_result_event(
                         events_to_record, tc, result_content, False, tool_id=tool_id
                     )
+                    await self._flush_events_incremental(
+                        ctx,
+                        events_to_record,
+                        reason="tool_result:search_tools",
+                        on_token=on_token,
+                    )
                     if on_tool_result:
                         await on_tool_result(tc.call_id, tc.name, result_content, False, None, None)
                     continue
@@ -2197,6 +2300,12 @@ class AgentLoop:
                 elif is_orchestration_tool(tc.name):
                     # Orchestration tool — intercept as controller directive
                     _append_tool_call_event(events_to_record, tc, tool_id)
+                    await self._flush_events_incremental(
+                        ctx,
+                        events_to_record,
+                        reason=f"tool_call:{tc.name}",
+                        on_token=on_token,
+                    )
                     orch_result = await self._handle_orchestration_tool(
                         tc,
                         ctx=ctx,
@@ -2218,6 +2327,12 @@ class AgentLoop:
                         orch_result.output,
                         orch_result.is_error,
                         tool_id=tool_id,
+                    )
+                    await self._flush_events_incremental(
+                        ctx,
+                        events_to_record,
+                        reason=f"tool_result:{tc.name}",
+                        on_token=on_token,
                     )
                     if on_tool_result:
                         await on_tool_result(
@@ -2262,6 +2377,12 @@ class AgentLoop:
                                 ),
                             },
                         )
+                    )
+                    await self._flush_events_incremental(
+                        ctx,
+                        events_to_record,
+                        reason=f"tool_call:{tool_id}",
+                        on_token=on_token,
                     )
 
                     result = await self.tool_router.execute(
@@ -2312,6 +2433,12 @@ class AgentLoop:
                             },
                         )
                     )
+                    await self._flush_events_incremental(
+                        ctx,
+                        events_to_record,
+                        reason=f"tool_result:{tool_id}",
+                        on_token=on_token,
+                    )
                     ws_preview = _truncate_tool_data(result.output)
                     if on_tool_result:
                         await on_tool_result(
@@ -2347,11 +2474,6 @@ class AgentLoop:
                             },
                         )
                     )
-
-            # Flush events incrementally when the policy says so (workflow
-            # steps). Direct chat uses batch recording at turn end.
-            if ctx.policy.event_flush_strategy == "incremental" and events_to_record:
-                await self._flush_events_incremental(ctx, events_to_record)
 
             # Check if step_complete was called in this batch
             if step_output is not None:
@@ -3429,34 +3551,15 @@ class AgentLoop:
         """
         if not events:
             return
+        pending_count = len(events)
         try:
-            intaris_id = ctx.session.intaris_session_id or ctx.session.session_id
-            append_result = await self.providers.guardrails.record_events(
-                session_id=intaris_id,
-                events=list(events),
-                source="cognis",
-            )
-            if append_result.ok:
-                await self.session_cache.append_recorded_events(
-                    ctx.session, list(events), append_result
-                )
-                events.clear()
+            if await self._record_events_strict(ctx, events, reason="emergency_flush"):
                 logger.info(
                     "agent: emergency flush persisted events",
                     extra={
                         "extra_data": {
                             "session_id": ctx.session.session_id,
-                            "event_count": append_result.last_seq,
-                        }
-                    },
-                )
-            else:
-                logger.warning(
-                    "agent: emergency flush returned ok=False — events may be lost",
-                    extra={
-                        "extra_data": {
-                            "session_id": ctx.session.session_id,
-                            "event_count": len(events),
+                            "event_count": pending_count,
                         }
                     },
                 )
@@ -3477,6 +3580,137 @@ class AgentLoop:
             self._pending_events_ctx = None
 
     @staticmethod
+    def _intaris_batch_idempotency_key(
+        session_id: str,
+        events: list[SessionEvent],
+        *,
+        reason: str,
+    ) -> str:
+        payload = json.dumps(
+            [{"type": event.type, "data": event.data} for event in events],
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:24]  # noqa: S324
+        return f"{session_id}:{reason}:{digest}"
+
+    async def _wait_for_intaris_recovery(
+        self,
+        ctx: StepContext,
+        *,
+        operation: str,
+        on_token: TokenCallback | None = None,
+    ) -> None:
+        notified = False
+        while True:
+            self._raise_if_cancelled(ctx)
+            try:
+                health = await self.providers.guardrails.health()
+            except Exception:
+                health = None
+            if health is not None and health.status == "healthy":
+                return
+            if not notified:
+                logger.warning(
+                    "agent: pausing for Intaris recovery",
+                    extra={
+                        "extra_data": {
+                            "session_id": ctx.session.session_id,
+                            "operation": operation,
+                        }
+                    },
+                )
+                if on_token is not None:
+                    await on_token("\n\n[Paused waiting for Intaris to recover.]\n\n")
+                notified = True
+            if ctx.cancel_event is None:
+                await asyncio.sleep(_INTARIS_RETRY_POLL_SECONDS)
+                continue
+            try:
+                await asyncio.wait_for(ctx.cancel_event.wait(), timeout=_INTARIS_RETRY_POLL_SECONDS)
+            except TimeoutError:
+                continue
+            self._raise_if_cancelled(ctx)
+
+    async def _record_events_strict(
+        self,
+        ctx: StepContext,
+        events: list[SessionEvent],
+        *,
+        reason: str,
+        on_token: TokenCallback | None = None,
+    ) -> bool:
+        if not events:
+            return False
+        batch = list(events)
+        intaris_id = ctx.session.intaris_session_id or ctx.session.session_id
+        idempotency_key = self._intaris_batch_idempotency_key(intaris_id, batch, reason=reason)
+        while True:
+            self._raise_if_cancelled(ctx)
+            try:
+                append_result = await self.providers.guardrails.record_events(
+                    session_id=intaris_id,
+                    events=batch,
+                    source="cognis",
+                    idempotency_key=idempotency_key,
+                )
+                if not append_result.ok:
+                    raise RuntimeError(f"Intaris did not persist {reason}")
+                await self.session_cache.append_recorded_events(ctx.session, batch, append_result)
+                events.clear()
+                return True
+            except Exception as exc:
+                if not is_retryable_http_error(exc):
+                    raise
+                logger.warning(
+                    "agent: Intaris write failed, waiting to retry",
+                    extra={
+                        "extra_data": {
+                            "session_id": ctx.session.session_id,
+                            "operation": reason,
+                            "error_type": type(exc).__name__,
+                        }
+                    },
+                    exc_info=True,
+                )
+                await self._wait_for_intaris_recovery(ctx, operation=reason, on_token=on_token)
+
+    async def _report_reasoning_strict(
+        self,
+        ctx: StepContext,
+        *,
+        on_token: TokenCallback | None = None,
+    ) -> Any:
+        intaris_id = ctx.session.intaris_session_id or ctx.session.session_id
+        while True:
+            self._raise_if_cancelled(ctx)
+            try:
+                return await self.providers.guardrails.report_reasoning(
+                    session_id=intaris_id,
+                    from_events=True,
+                    wait_for_intention=ctx.bootstrap_wait_for_intention,
+                    wait_timeout_ms=_BOOTSTRAP_INTENTION_WAIT_MS,
+                )
+            except Exception as exc:
+                if not is_retryable_http_error(exc):
+                    raise
+                logger.warning(
+                    "agent: Intaris reasoning failed, waiting to retry",
+                    extra={
+                        "extra_data": {
+                            "session_id": ctx.session.session_id,
+                            "error_type": type(exc).__name__,
+                        }
+                    },
+                    exc_info=True,
+                )
+                await self._wait_for_intaris_recovery(
+                    ctx,
+                    operation="report_reasoning",
+                    on_token=on_token,
+                )
+
+    @staticmethod
     def _get_incomplete_todos(ctx: StepContext) -> list[dict[str, Any]]:
         """Return todos that are not done or cancelled."""
         return [t for t in ctx.todos if t.get("status") not in ("done", "cancelled")]
@@ -3485,40 +3719,14 @@ class AgentLoop:
         self,
         ctx: StepContext,
         events: list[SessionEvent],
+        *,
+        reason: str = "incremental",
+        on_token: TokenCallback | None = None,
     ) -> None:
-        """Flush accumulated events to Intaris without finalizing the step.
-
-        Used for workflow steps to make events visible in session logs
-        during execution instead of waiting for the entire step to complete.
-        Events are moved out of the list (cleared) on success so they are
-        not recorded again by ``_finalize_step``.
-        """
+        """Flush accumulated events to Intaris immediately."""
         if not events:
             return
-        batch = list(events)
-        intaris_id = ctx.session.intaris_session_id or ctx.session.session_id
-        try:
-            append_result = await self.providers.guardrails.record_events(
-                session_id=intaris_id,
-                events=batch,
-                source="cognis",
-            )
-            if append_result.ok:
-                await self.session_cache.append_recorded_events(ctx.session, batch, append_result)
-                events.clear()
-            else:
-                logger.debug(
-                    "agent: incremental flush returned ok=False, will retry at finalize",
-                    extra={"extra_data": {"session_id": ctx.session.session_id}},
-                )
-        except Exception:
-            # Non-fatal — events stay in the list and will be retried
-            # by _finalize_step at the end of the step.
-            logger.debug(
-                "agent: incremental flush failed, will retry at finalize",
-                extra={"extra_data": {"session_id": ctx.session.session_id}},
-                exc_info=True,
-            )
+        await self._record_events_strict(ctx, events, reason=reason, on_token=on_token)
 
     async def _finalize_step(
         self,
@@ -3541,48 +3749,7 @@ class AgentLoop:
             await self._dispatch_remember(ctx, assistant_memory_parts)
             return True
 
-        intaris_id = ctx.session.intaris_session_id or ctx.session.session_id
-        idempotency_key = f"{intaris_id}:step_{uuid.uuid4().hex[:8]}"
-
-        events_recorded = False
-        try:
-            append_result = await self.providers.guardrails.record_events(
-                session_id=ctx.session.intaris_session_id or ctx.session.session_id,
-                events=events,
-                source="cognis",
-                idempotency_key=idempotency_key,
-            )
-            if append_result.ok:
-                # Update session cache with recorded events
-                await self.session_cache.append_recorded_events(ctx.session, events, append_result)
-                events_recorded = True
-                logger.info(
-                    "agent: events recorded",
-                    extra={
-                        "extra_data": {
-                            "session_id": ctx.session.session_id,
-                            "event_count": len(events),
-                            "last_seq": append_result.last_seq,
-                        }
-                    },
-                )
-            else:
-                logger.warning(
-                    "agent: record_events returned ok=False, events not persisted",
-                    extra={
-                        "extra_data": {
-                            "session_id": ctx.session.session_id,
-                            "event_count": len(events),
-                        }
-                    },
-                )
-        except Exception:
-            logger.exception(
-                "agent: failed to record events to Intaris",
-                extra={
-                    "extra_data": {"session_id": ctx.session.session_id, "event_count": len(events)}
-                },
-            )
+        events_recorded = await self._record_events_strict(ctx, events, reason="finalize")
 
         # Dispatch remember — use assistant_memory_parts if provided
         # (covers incrementally-flushed events), fall back to extracting

@@ -1717,6 +1717,7 @@ class WorkflowEngine:
             agent_id=agent.agent_id,
             context=context,
             title=f"Task: {task.title} / Step: {step_def.name}",
+            title_source="manual",
             intention=f"Task: {task.title} — Step: {step_def.name} — {step_def.description or step_def.prompt[:100]}",
         )
         return conversation, session

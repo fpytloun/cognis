@@ -21,6 +21,7 @@ from cognis.core.agent_loop import (
 )
 from cognis.core.runtime import ResolvedStepRuntime, build_local_executor_environment
 from cognis.models.agent import AgentDefinition, AgentPermissions
+from cognis.models.session import EventAppendResult, ReasoningReportResult
 from cognis.models.tool import Permission, ToolDefinition, ToolSource
 from cognis.models.workflow import StepDefinition, StepOutput
 from cognis.tools.builtin.tool_search import SEARCH_TOOLS_TOOL
@@ -420,11 +421,14 @@ class _NoopEventBus:
 
 
 class _NoopGuardrails:
-    async def record_events(self, **_: object) -> None:
-        return None
+    async def record_events(self, **_: object) -> EventAppendResult:
+        return EventAppendResult(ok=True, count=1, first_seq=1, last_seq=1)
 
-    async def report_reasoning(self, **_: object) -> None:
-        return None
+    async def report_reasoning(self, **_: object) -> ReasoningReportResult:
+        return ReasoningReportResult(ok=True)
+
+    async def health(self) -> SimpleNamespace:
+        return SimpleNamespace(status="healthy")
 
 
 class _NoopSessionManager:
@@ -448,6 +452,12 @@ class _NoopSessionCache:
 
     def update_context_usage(self, *_: object, **__: object) -> None:
         return None
+
+    async def append_recorded_events(self, *_: object, **__: object) -> None:
+        return None
+
+    async def update_intention(self, *_: object, **__: object) -> bool:
+        return False
 
 
 async def _run_reminder_capture(ctx: object) -> list[list[dict[str, object]]]:
@@ -523,3 +533,122 @@ async def test_step_complete_reprompt_is_system_message() -> None:
     calls = await _run_reminder_capture(ctx)
     assert calls[1][-1]["role"] == "system"
     assert "call step_complete now" in str(calls[1][-1]["content"])
+
+
+@pytest.mark.asyncio
+async def test_user_message_is_persisted_before_reasoning_and_tool_execution() -> None:
+    order: list[str] = []
+
+    class _Guardrails:
+        async def record_events(self, **kwargs: object) -> EventAppendResult:
+            events = kwargs["events"]
+            order.extend(f"record:{event.type}" for event in events)
+            return EventAppendResult(ok=True, count=len(events), first_seq=1, last_seq=len(events))
+
+        async def report_reasoning(self, **_: object) -> ReasoningReportResult:
+            order.append("reasoning")
+            return ReasoningReportResult(
+                ok=True, intention="fresh", updated_at="2026-04-12T00:00:00+00:00"
+            )
+
+        async def health(self) -> SimpleNamespace:
+            return SimpleNamespace(status="healthy")
+
+    class _LLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def get_model_info(self, model: str | None) -> SimpleNamespace:
+            del model
+            return SimpleNamespace(
+                max_tools=None,
+                supports_parallel_tool_calls=False,
+                supports_tool_choice=False,
+                supports_cache_control=False,
+                supports_defer_loading=False,
+                provider="test",
+            )
+
+        def count_tokens(self, text: str, model: str | None = None) -> int:
+            del model
+            return len(text)
+
+        async def stream_generate(self, messages: list[dict[str, object]], **_: object):
+            del messages
+            self.calls += 1
+            if self.calls == 1:
+                yield {
+                    "choices": [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_1",
+                                        "function": {"name": "bash", "arguments": "{}"},
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }
+                return
+            yield {"choices": [{"delta": {"content": "done"}}]}
+
+    class _ToolRouter:
+        async def execute(self, *args: object, **kwargs: object) -> SimpleNamespace:
+            del args, kwargs
+            order.append("execute")
+            return SimpleNamespace(
+                output="ok",
+                is_error=False,
+                duration_ms=1,
+                metadata={},
+                attachments=[],
+            )
+
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-1",
+            intaris_session_id="sess-1",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(
+            conversation_id="conv-1",
+            title=None,
+            title_source="unset",
+        ),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+        user_message="run something",
+        user_attachments=[],
+        system_initiated=False,
+    )
+
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=_LLM(), guardrails=_Guardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=_ToolRouter(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+
+    output = await agent_loop.run_step(ctx)
+
+    assert output is not None
+    assert order[:4] == [
+        "record:user_message",
+        "reasoning",
+        "record:tool_call",
+        "execute",
+    ]
+    assert "record:tool_result" in order
+    assert "record:assistant_message" in order

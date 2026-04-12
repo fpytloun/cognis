@@ -102,6 +102,7 @@ class SessionManager:
         agent_id: str,
         context: ConversationContext,
         title: str | None = None,
+        title_source: str = "unset",
         conversation_id: str | None = None,
     ) -> ConversationModel:
         """Create a conversation without creating a root session."""
@@ -114,6 +115,7 @@ class SessionManager:
                     agent_id=agent_id,
                     context_type=context.type,
                     title=title,
+                    title_source=title_source,
                     context_ref=context.ref,
                     context_data=context.platform_data,
                     memory_labels=dict(context.memory_labels),
@@ -248,6 +250,7 @@ class SessionManager:
         agent_id: str,
         context: ConversationContext,
         title: str | None = None,
+        title_source: str = "unset",
         intention: str | None = None,
     ) -> tuple[ConversationModel, SessionModel]:
         """Create a conversation and root session atomically."""
@@ -261,6 +264,7 @@ class SessionManager:
                     agent_id=agent_id,
                     context_type=context.type,
                     title=title,
+                    title_source=title_source,
                     context_ref=context.ref,
                     context_data=context.platform_data,
                     memory_labels=dict(context.memory_labels),
@@ -852,8 +856,6 @@ class SessionManager:
         )
 
     def _build_root_intention(self, agent: AgentDefinition, title: str | None) -> str:
-        if title:
-            return title
         return f"Conversation with {agent.name}"
 
     def _build_child_intention(self, agent: AgentDefinition, task_description: str) -> str:
@@ -895,6 +897,7 @@ def _to_conversation_model(row: Any) -> ConversationModel:
         user_email=row.user_email,
         agent_id=row.agent_id,
         title=row.title,
+        title_source=getattr(row, "title_source", "unset") or "unset",
         context=ConversationContext(
             type=row.context_type,
             ref=row.context_ref,

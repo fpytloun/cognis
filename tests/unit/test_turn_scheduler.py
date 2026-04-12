@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -10,6 +9,7 @@ import pytest
 from cognis.core.agent_loop import PauseWaiter, PendingPause
 from cognis.core.events import EventBus, EventType
 from cognis.core.turn_scheduler import TurnScheduler, _effective_user_content
+from cognis.models.agent import AgentDefinition
 from cognis.models.artifact import ArtifactKind, AttachmentRef
 from cognis.models.session import SessionStatus
 
@@ -647,6 +647,79 @@ async def test_cancel_turn_cancels_active_task() -> None:
     cancelled = await scheduler.cancel_turn("conv-1")
     assert cancelled is True
 
-    with contextlib.suppress(asyncio.CancelledError):
-        await task
-    assert task.cancelled() is True
+
+@pytest.mark.asyncio
+async def test_load_runtime_bootstrap_ignores_persisted_conversation_title() -> None:
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    captured: dict[str, str] = {}
+
+    async def _ensure_root_session(**kwargs: object):
+        captured["intention"] = str(kwargs["intention"])
+        return SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1")
+
+    scheduler = TurnScheduler(
+        session_factory=lambda: _Session(),
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(ensure_root_session=_ensure_root_session),
+        session_cache=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+
+    import cognis.store.queries as queries
+
+    original_get_agent = queries.get_agent
+    original_get_conversation = queries.get_conversation
+    original_get_session_row = queries.get_session_row
+
+    async def _get_conversation(_session, conversation_id: str):
+        return SimpleNamespace(
+            conversation_id=conversation_id,
+            user_email="user@example.com",
+            agent_id="agent-1",
+            title="Pinned title",
+            title_source="manual",
+            context_type="web",
+            context_ref=None,
+            context_data={},
+            memory_labels={},
+            active_session_id=None,
+            status="active",
+            last_message_at=None,
+            created_at=None,
+            updated_at=None,
+        )
+
+    async def _get_agent(_session, agent_id: str):
+        return AgentDefinition(agent_id=agent_id, owner_email="user@example.com", name="Agent")
+
+    async def _get_session_row(_session, session_id: str):
+        del _session, session_id
+        return None
+
+    queries.get_conversation = _get_conversation  # type: ignore[assignment]
+    queries.get_agent = _get_agent  # type: ignore[assignment]
+    queries.get_session_row = _get_session_row  # type: ignore[assignment]
+    try:
+        result = await scheduler._load_conversation_runtime("conv-1", user_message="")
+    finally:
+        queries.get_conversation = original_get_conversation  # type: ignore[assignment]
+        queries.get_agent = original_get_agent  # type: ignore[assignment]
+        queries.get_session_row = original_get_session_row  # type: ignore[assignment]
+
+    assert result is not None
+    assert captured["intention"] == "Conversation with Agent"

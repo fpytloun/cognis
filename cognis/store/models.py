@@ -138,6 +138,7 @@ class Conversation(Base):
     user_email: Mapped[str] = mapped_column(String, ForeignKey("users.email"), nullable=False)
     agent_id: Mapped[str] = mapped_column(String, ForeignKey("agents.agent_id"), nullable=False)
     title: Mapped[str | None] = mapped_column(String, nullable=True)
+    title_source: Mapped[str] = mapped_column(String, nullable=False, default="unset")
     context_type: Mapped[str] = mapped_column(String, nullable=False)
     context_ref: Mapped[str | None] = mapped_column(String, nullable=True)
     context_data: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)

@@ -137,6 +137,7 @@ async def create_conversation(
             memory_labels=payload.context.memory_labels,
         ),
         title=payload.title,
+        title_source="manual" if payload.title else "unset",
     )
     return conversation_to_response(conversation)
 
@@ -170,6 +171,7 @@ async def update_conversation(
             row.status = "active"
         if payload.title is not None:
             row.title = payload.title
+            row.title_source = "manual" if payload.title.strip() else "unset"
         await session.commit()
         await session.refresh(row)
         return conversation_to_response(row)

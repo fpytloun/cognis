@@ -14,13 +14,14 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from cognis.core.attachment_utils import attachment_note as _attachment_note
 from cognis.core.prompts import PromptContext, build_system_instructions
 from cognis.core.runtime import ExecutorEnvironmentSnapshot, build_local_executor_environment
+from cognis.core.title_policy import sync_intaris_title
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.artifact import ArtifactKind
 from cognis.models.session import ConversationModel, SessionModel
 from cognis.models.tool import ToolDefinition
 from cognis.runtime_context import scoped_runtime_context
-from cognis.store.queries import get_setting_value, update_conversation
+from cognis.store.queries import get_setting_value
 
 logger = get_logger(__name__)
 
@@ -366,23 +367,14 @@ class ContextAssembler:
                 cache_entry.intention = intention_result.intention
                 cache_entry.intention_updated_at = intention_result.updated_at
 
-            # Sync Intaris-generated title to conversation. Only writes
-            # to DB when the title has actually changed to avoid churn.
-            if (
-                intention_result.title
-                and not conversation.title
-                and self.session_factory is not None
-            ):
+            if intention_result.title and self.session_factory is not None:
                 try:
                     async with self.session_factory() as db_session:
-                        ok = await update_conversation(
-                            db_session,
-                            conversation.conversation_id,
-                            title=intention_result.title,
+                        ok = await sync_intaris_title(
+                            db_session, conversation, intention_result.title
                         )
                         if ok:
                             await db_session.commit()
-                            conversation.title = intention_result.title
                 except Exception:
                     logger.debug(
                         "context: failed to sync title from Intaris",

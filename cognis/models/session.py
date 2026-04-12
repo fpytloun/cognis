@@ -49,6 +49,7 @@ class ConversationModel(BaseModel):
     user_email: str
     agent_id: str
     title: str | None = None
+    title_source: str = "unset"
     context: ConversationContext
     active_session_id: str | None = None
     status: str = "active"
