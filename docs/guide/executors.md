@@ -149,11 +149,21 @@ Cognis now exposes both through browser tools:
 
 - `browser_list_sessions` lists currently active sessions so the agent can resume one instead of opening a duplicate
 - `browser_list_profiles` lists persistent local profiles available on that executor
+- `browser_query` inspects matching page elements with rich metadata for debugging and exact targeting
+- `browser_eval` runs arbitrary JSON-returning page-context JavaScript as a privileged debug/control tool
+- `browser_get_console` and `browser_get_network` expose recent runtime diagnostics for the active browser session
 
 Idle browser sessions are automatically closed after the executor's
 `idle_timeout_seconds`, but persistent local profile directories remain on disk
 for later reuse. `browser_list_sessions` shows only non-expired live sessions;
 expired sessions are hidden and cleaned up by subsequent browser operations.
+
+For difficult auth or MFA flows, prefer the low-level inspection/debug path:
+
+1. `browser_snapshot` or `browser_query` to inspect actionable candidates
+2. `browser_focus` and `browser_type` when real key events are more reliable than `browser_fill`
+3. `browser_get_console` / `browser_get_network` to diagnose silent submit failures
+4. `browser_submit_form` when clicking a button is not enough
 
 ### Headed Linux browsers and Xvfb
 

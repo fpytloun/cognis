@@ -83,6 +83,80 @@ def browser_tool_definitions() -> list[ToolDefinition]:
             timeout_seconds=30,
         ),
         ToolDefinition(
+            name="browser_query",
+            description="Query page elements by selector and return detailed candidate metadata. Returned refs can be used by later browser actions.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "selector": {"type": "string"},
+                    "mode": {
+                        "type": "string",
+                        "enum": ["all", "actionable", "clickable", "fillable"],
+                    },
+                    "limit": {"type": "integer"},
+                    "include_computed": {"type": "boolean"},
+                },
+                "required": ["session_id", "selector"],
+            },
+            source=_SOURCE,
+            category="browser",
+            read_only=True,
+            timeout_seconds=60,
+        ),
+        ToolDefinition(
+            name="browser_eval",
+            description="Evaluate arbitrary JSON-returning JavaScript in the current page context. This is a powerful debug/control tool and can mutate page state.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "script": {"type": "string"},
+                    "args": {"type": "array"},
+                },
+                "required": ["session_id", "script"],
+            },
+            source=_SOURCE,
+            category="browser",
+            read_only=False,
+            non_bypassable=True,
+            timeout_seconds=60,
+        ),
+        ToolDefinition(
+            name="browser_get_console",
+            description="Get recent console and page-error events for the current session.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "level": {"type": "string"},
+                    "limit": {"type": "integer"},
+                },
+                "required": ["session_id"],
+            },
+            source=_SOURCE,
+            category="browser",
+            read_only=True,
+            timeout_seconds=30,
+        ),
+        ToolDefinition(
+            name="browser_get_network",
+            description="Get recent network events for the current session.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "limit": {"type": "integer"},
+                    "resource_types": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["session_id"],
+            },
+            source=_SOURCE,
+            category="browser",
+            read_only=True,
+            timeout_seconds=30,
+        ),
+        ToolDefinition(
             name="browser_get_text",
             description="Extract bounded visible text from the current page.",
             parameters={
@@ -97,7 +171,7 @@ def browser_tool_definitions() -> list[ToolDefinition]:
         ),
         ToolDefinition(
             name="browser_click",
-            description="Click an element by ref or selector.",
+            description="Click an element by exact ref or by selector. Selector mode fails if multiple viable candidates match.",
             parameters={
                 "type": "object",
                 "properties": {
@@ -116,8 +190,8 @@ def browser_tool_definitions() -> list[ToolDefinition]:
         ToolDefinition(
             name="browser_fill",
             description=(
-                "Fill an input by ref or selector using literal value or value_ref. "
-                "This prefers the first visible, enabled, editable match and errors if none exist."
+                "Fill an input by exact ref or by selector using literal value or value_ref. "
+                "Selector mode fails if multiple viable candidates match."
             ),
             parameters={
                 "type": "object",
@@ -127,6 +201,63 @@ def browser_tool_definitions() -> list[ToolDefinition]:
                     "selector": {"type": "string"},
                     "value": {"type": "string"},
                     "value_ref": {"type": "string"},
+                },
+                "required": ["session_id"],
+            },
+            source=_SOURCE,
+            category="browser",
+            read_only=False,
+            non_bypassable=True,
+            timeout_seconds=60,
+        ),
+        ToolDefinition(
+            name="browser_focus",
+            description="Focus an element by exact ref or by selector. Selector mode fails if multiple viable candidates match.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "ref": {"type": "string"},
+                    "selector": {"type": "string"},
+                },
+                "required": ["session_id"],
+            },
+            source=_SOURCE,
+            category="browser",
+            read_only=False,
+            non_bypassable=True,
+            timeout_seconds=30,
+        ),
+        ToolDefinition(
+            name="browser_type",
+            description="Focus and type text into an input using key events. Useful for OTP/MFA flows.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "ref": {"type": "string"},
+                    "selector": {"type": "string"},
+                    "text": {"type": "string"},
+                    "delay_ms": {"type": "integer"},
+                },
+                "required": ["session_id", "text"],
+            },
+            source=_SOURCE,
+            category="browser",
+            read_only=False,
+            non_bypassable=True,
+            timeout_seconds=60,
+        ),
+        ToolDefinition(
+            name="browser_submit_form",
+            description="Submit a form relative to an exact ref or selector using native or event mode.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "ref": {"type": "string"},
+                    "selector": {"type": "string"},
+                    "mode": {"type": "string", "enum": ["native", "event"]},
                 },
                 "required": ["session_id"],
             },

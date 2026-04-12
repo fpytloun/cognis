@@ -12,12 +12,19 @@ from cognis.models.tool import ExecutorHandle
 from cognis.tools.executor.browser import handlers as browser_handlers
 from cognis.tools.executor.browser.handlers import (
     handle_browser_click,
+    handle_browser_eval,
     handle_browser_fill,
+    handle_browser_focus,
+    handle_browser_get_console,
+    handle_browser_get_network,
     handle_browser_list_profiles,
     handle_browser_list_sessions,
     handle_browser_open,
+    handle_browser_query,
     handle_browser_save_auth_state,
     handle_browser_snapshot,
+    handle_browser_submit_form,
+    handle_browser_type,
 )
 from cognis.tools.registry import ToolExecutionContext
 
@@ -32,6 +39,9 @@ class _FakeLocator:
     ) -> None:
         self.filled: str | None = None
         self.clicked = False
+        self.focused = False
+        self.typed: tuple[str, int | None] | None = None
+        self.evaluated: str | None = None
         self.visible = visible
         self.enabled = enabled
         self.editable = editable
@@ -66,6 +76,15 @@ class _FakeLocator:
     async def click(self) -> None:
         self.clicked = True
 
+    async def focus(self) -> None:
+        self.focused = True
+
+    async def press_sequentially(self, text: str, delay: int | None = None) -> None:
+        self.typed = (text, delay)
+
+    async def evaluate(self, script: str) -> None:
+        self.evaluated = script
+
 
 class _FakePage:
     def __init__(self) -> None:
@@ -83,12 +102,126 @@ class _FakePage:
     async def evaluate(self, script: str, *args: object) -> object:
         self.last_evaluate_args = args
         self.evaluate_scripts.append(script)
+        if "browser_eval script must evaluate to a function" in script:
+            payload = args[0] if args else {}
+            if isinstance(payload, dict) and payload.get("script") == "() => ({ ok: true })":
+                return {"ok": True}
+            raise RuntimeError("browser_eval script must evaluate to a function")
         if "querySelectorAll" in script:
-            max_elements = int(args[0]) if args else 40
+            payload = args[0] if args else 40
+            max_elements = (
+                int(payload.get("maxResults", 40)) if isinstance(payload, dict) else int(payload)
+            )
+            selector = payload.get("selector") if isinstance(payload, dict) else None
+            mode = payload.get("mode", "actionable") if isinstance(payload, dict) else "actionable"
+            assign_attr = (
+                payload.get("assignAttr") if isinstance(payload, dict) else "data-cognis-ref"
+            )
+            include_computed = (
+                bool(payload.get("includeComputed", False)) if isinstance(payload, dict) else False
+            )
+            if selector == "input":
+                items = [
+                    {
+                        "ref": "e1",
+                        "exact_selector": f'[{assign_attr}="e1"]' if assign_attr else None,
+                        "selector": selector,
+                        "tag": "input",
+                        "role": "",
+                        "text": "",
+                        "type": "text",
+                        "name": "username",
+                        "placeholder": "Username",
+                        "aria_label": "",
+                        "label_text": "Username or email",
+                        "autocomplete": "username",
+                        "inputmode": "text",
+                        "visible": True,
+                        "enabled": True,
+                        "editable": True,
+                        "disabled": False,
+                        "read_only": False,
+                        "value_state": "empty",
+                        "is_clickable": False,
+                        "is_fillable": True,
+                        "purpose_score": 0,
+                        "bounding_box": {"x": 0, "y": 0, "width": 100, "height": 20},
+                        "frame_url": self.url,
+                        "frame_name": "",
+                        "in_shadow_dom": False,
+                        "computed": {"display": "block", "visibility": "visible", "opacity": "1"}
+                        if include_computed
+                        else None,
+                    }
+                ]
+                if mode == "clickable":
+                    return []
+                return items[:max_elements]
+            if selector == ".ambiguous":
+                return [
+                    {
+                        "ref": "e1",
+                        "exact_selector": f'[{assign_attr}="e1"]' if assign_attr else None,
+                        "selector": selector,
+                        "tag": "input",
+                        "role": "",
+                        "text": "",
+                        "type": "text",
+                        "name": "otp1",
+                        "placeholder": "Code",
+                        "aria_label": "",
+                        "label_text": "Code",
+                        "autocomplete": "one-time-code",
+                        "inputmode": "numeric",
+                        "visible": True,
+                        "enabled": True,
+                        "editable": True,
+                        "disabled": False,
+                        "read_only": False,
+                        "value_state": "redacted",
+                        "is_clickable": False,
+                        "is_fillable": True,
+                        "purpose_score": 120,
+                        "bounding_box": {"x": 0, "y": 0, "width": 20, "height": 20},
+                        "frame_url": self.url,
+                        "frame_name": "",
+                        "in_shadow_dom": False,
+                        "computed": None,
+                    },
+                    {
+                        "ref": "e2",
+                        "exact_selector": f'[{assign_attr}="e2"]' if assign_attr else None,
+                        "selector": selector,
+                        "tag": "input",
+                        "role": "",
+                        "text": "",
+                        "type": "text",
+                        "name": "otp2",
+                        "placeholder": "Code",
+                        "aria_label": "",
+                        "label_text": "Code",
+                        "autocomplete": "one-time-code",
+                        "inputmode": "numeric",
+                        "visible": True,
+                        "enabled": True,
+                        "editable": True,
+                        "disabled": False,
+                        "read_only": False,
+                        "value_state": "redacted",
+                        "is_clickable": False,
+                        "is_fillable": True,
+                        "purpose_score": 120,
+                        "bounding_box": {"x": 25, "y": 0, "width": 20, "height": 20},
+                        "frame_url": self.url,
+                        "frame_name": "",
+                        "in_shadow_dom": False,
+                        "computed": None,
+                    },
+                ]
             return [
                 {
                     "ref": f"e{i + 1}",
-                    "exact_selector": f'[data-cognis-ref="e{i + 1}"]',
+                    "exact_selector": f'[{assign_attr}="e{i + 1}"]' if assign_attr else None,
                     "selector": f"button:nth-of-type({i + 1})",
                     "tag": "button",
                     "role": "",
@@ -97,6 +230,7 @@ class _FakePage:
                     "name": "",
                     "placeholder": "",
                     "aria_label": "",
+                    "label_text": "",
                     "autocomplete": "",
                     "inputmode": "",
                     "visible": True,
@@ -105,6 +239,16 @@ class _FakePage:
                     "disabled": False,
                     "read_only": False,
                     "value_state": "empty",
+                    "is_clickable": True,
+                    "is_fillable": False,
+                    "purpose_score": 0,
+                    "bounding_box": {"x": i * 10, "y": 0, "width": 40, "height": 20},
+                    "frame_url": self.url,
+                    "frame_name": "",
+                    "in_shadow_dom": False,
+                    "computed": {"display": "block", "visibility": "visible", "opacity": "1"}
+                    if include_computed
+                    else None,
                 }
                 for i in range(max_elements)
             ]
@@ -123,6 +267,8 @@ class _FakeManager:
             session_id="sess-1",
             profile_mode="persistent_local",
             profile_id="www-reddit-com",
+            console_events=[{"level": "error", "text": "boom"}],
+            network_events=[{"resource_type": "xhr", "status": 400}],
         )
 
     async def open_session(self, **kwargs: Any) -> Any:
@@ -163,6 +309,22 @@ class _FakeManager:
             }
         ]
 
+    async def get_console_events(
+        self, session_id: str, *, level: str = "all", limit: int = 100
+    ) -> list[dict[str, Any]]:
+        assert session_id == "sess-1"
+        return self.session.console_events[:limit]
+
+    async def get_network_events(
+        self,
+        session_id: str,
+        *,
+        limit: int = 100,
+        resource_types: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        assert session_id == "sess-1"
+        return self.session.network_events[:limit]
+
 
 def _context() -> ToolExecutionContext:
     return ToolExecutionContext(
@@ -186,7 +348,8 @@ async def test_browser_fill_uses_ref_map_and_resolved_value(
     assert result.is_error is False
     assert manager.session.page.locator_calls == ['[data-cognis-ref="e1"]']
     assert visible.filled == "secret"
-    assert result.output == "Filled exact ref e1."
+    assert '"action": "fill"' in result.output
+    assert '"source": "ref"' in result.output
 
 
 @pytest.mark.asyncio
@@ -234,7 +397,8 @@ async def test_browser_click_prefers_visible_enabled_match(
     assert result.is_error is False
     assert manager.session.page.locator_calls == ['[data-cognis-ref="e1"]']
     assert visible.clicked is True
-    assert result.output == "Clicked exact ref e1."
+    assert '"action": "click"' in result.output
+    assert '"source": "ref"' in result.output
 
 
 @pytest.mark.asyncio
@@ -297,9 +461,16 @@ async def test_browser_snapshot_uses_smaller_default_limit(
     monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
     result = await handle_browser_snapshot({"session_id": "sess-1"}, _context())
     assert result.output is not None
-    assert manager.session.page.last_evaluate_args == (40,)
-    assert len(manager.session.page.evaluate_scripts) == 2
-    assert "removeAttribute('data-cognis-ref')" in manager.session.page.evaluate_scripts[0]
+    assert manager.session.page.last_evaluate_args == (
+        {
+            "mode": "actionable",
+            "selector": None,
+            "maxResults": 40,
+            "assignAttr": "data-cognis-ref",
+            "includeComputed": False,
+        },
+    )
+    assert len(manager.session.page.evaluate_scripts) == 1
     assert '"elements"' in result.output
     assert '"exact_selector"' in result.output
     assert manager.session.ref_map["e1"] == '[data-cognis-ref="e1"]'
@@ -342,6 +513,155 @@ async def test_browser_list_profiles_returns_metadata(monkeypatch: pytest.Monkey
     monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
     result = await handle_browser_list_profiles({}, _context())
     assert '"profile_id": "github-com"' in result.output
+
+
+@pytest.mark.asyncio
+async def test_browser_query_returns_candidate_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = _FakeManager()
+    monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
+    result = await handle_browser_query(
+        {
+            "session_id": "sess-1",
+            "selector": "input",
+            "mode": "fillable",
+            "include_computed": True,
+        },
+        _context(),
+    )
+    assert '"name": "username"' in result.output
+    assert '"label_text": "Username or email"' in result.output
+    assert manager.session.ref_map["e1"] == '[data-cognis-query-ref="e1"]'
+
+
+@pytest.mark.asyncio
+async def test_browser_query_ref_is_usable_by_later_action(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = _FakeManager()
+    visible = _FakeLocator(visible=True, enabled=True, editable=True)
+    manager.session.page.locator_map['[data-cognis-query-ref="e1"]'] = visible
+    monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
+    await handle_browser_query(
+        {"session_id": "sess-1", "selector": "input", "mode": "fillable"},
+        _context(),
+    )
+    result = await handle_browser_fill(
+        {"session_id": "sess-1", "ref": "e1", "value": "secret"},
+        _context(),
+    )
+    assert visible.filled == "secret"
+    assert '"source": "ref"' in result.output
+
+
+@pytest.mark.asyncio
+async def test_selector_actions_do_not_overwrite_query_refs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _FakeManager()
+    query_target = _FakeLocator(visible=True, enabled=True, editable=True)
+    action_target = _FakeLocator(visible=True, enabled=True, editable=True)
+    manager.session.page.locator_map['[data-cognis-query-ref="e1"]'] = query_target
+    manager.session.page.locator_map['[data-cognis-action-ref="e1"]'] = action_target
+    monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
+    await handle_browser_query(
+        {"session_id": "sess-1", "selector": "input", "mode": "fillable"},
+        _context(),
+    )
+    await handle_browser_fill(
+        {"session_id": "sess-1", "selector": "input", "value": "abc"},
+        _context(),
+    )
+    assert manager.session.ref_map["e1"] == '[data-cognis-query-ref="e1"]'
+
+
+@pytest.mark.asyncio
+async def test_browser_eval_returns_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = _FakeManager()
+    monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
+    result = await handle_browser_eval(
+        {"session_id": "sess-1", "script": "() => ({ ok: true })"},
+        _context(),
+    )
+    assert '"ok": true' in result.output
+
+
+@pytest.mark.asyncio
+async def test_browser_eval_requires_function_script(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = _FakeManager()
+    monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
+    with pytest.raises(RuntimeError, match="must evaluate to a function"):
+        await handle_browser_eval(
+            {"session_id": "sess-1", "script": "({ ok: true })"},
+            _context(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_browser_get_console_returns_events(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = _FakeManager()
+    monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
+    result = await handle_browser_get_console({"session_id": "sess-1"}, _context())
+    assert '"boom"' in result.output
+
+
+@pytest.mark.asyncio
+async def test_browser_get_network_returns_events(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = _FakeManager()
+    monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
+    result = await handle_browser_get_network({"session_id": "sess-1"}, _context())
+    assert '"status": 400' in result.output
+
+
+@pytest.mark.asyncio
+async def test_browser_focus_targets_ref(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = _FakeManager()
+    visible = _FakeLocator(visible=True, enabled=True, editable=True)
+    manager.session.page.locator_map['[data-cognis-ref="e1"]'] = visible
+    monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
+    result = await handle_browser_focus({"session_id": "sess-1", "ref": "e1"}, _context())
+    assert visible.focused is True
+    assert '"action": "focus"' in result.output
+
+
+@pytest.mark.asyncio
+async def test_browser_type_uses_key_events(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = _FakeManager()
+    visible = _FakeLocator(visible=True, enabled=True, editable=True)
+    manager.session.page.locator_map['[data-cognis-ref="e1"]'] = visible
+    monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
+    result = await handle_browser_type(
+        {"session_id": "sess-1", "ref": "e1", "text": "123456", "delay_ms": 20},
+        _context(),
+    )
+    assert visible.focused is True
+    assert visible.typed == ("123456", 20)
+    assert '"action": "type"' in result.output
+
+
+@pytest.mark.asyncio
+async def test_browser_submit_form_supports_native(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = _FakeManager()
+    visible = _FakeLocator(visible=True, enabled=True, editable=False)
+    manager.session.page.locator_map['[data-cognis-ref="e1"]'] = visible
+    monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
+    result = await handle_browser_submit_form(
+        {"session_id": "sess-1", "ref": "e1", "mode": "native"},
+        _context(),
+    )
+    assert visible.evaluated is not None
+    assert "requestSubmit" in visible.evaluated
+    assert '"action": "submit_form"' in result.output
+
+
+@pytest.mark.asyncio
+async def test_browser_fill_selector_errors_on_ambiguous_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _FakeManager()
+    monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
+    with pytest.raises(ValueError, match="multiple viable candidates"):
+        await handle_browser_fill(
+            {"session_id": "sess-1", "selector": ".ambiguous", "value": "123456"},
+            _context(),
+        )
 
 
 class _FakeCredentialsProvider:

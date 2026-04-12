@@ -25,6 +25,7 @@ BROWSER_DEFAULT_MAX_SESSIONS = 4
 BROWSER_DEFAULT_PROFILE_MODE = "persistent_local"
 BROWSER_DEFAULT_VIEWPORT_WIDTH = 1365
 BROWSER_DEFAULT_VIEWPORT_HEIGHT = 900
+BROWSER_DIAGNOSTIC_EVENT_LIMIT = 200
 
 
 @dataclass
@@ -39,6 +40,9 @@ class BrowserSession:
     headless: bool = True
     display: str | None = None
     ref_map: dict[str, str] = field(default_factory=dict)
+    ref_metadata: dict[str, dict[str, Any]] = field(default_factory=dict)
+    console_events: list[dict[str, Any]] = field(default_factory=list)
+    network_events: list[dict[str, Any]] = field(default_factory=list)
     last_used_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
@@ -109,6 +113,8 @@ class BrowserManager:
                     "display": session.display,
                     "last_used_at": session.last_used_at.isoformat(),
                     "auth_origin": session.auth_origin,
+                    "console_event_count": len(getattr(session, "console_events", [])),
+                    "network_event_count": len(getattr(session, "network_events", [])),
                 }
             )
         return sessions
@@ -195,12 +201,18 @@ class BrowserManager:
                 headless=headless,
                 display=display,
             )
+            self._sessions[session_id] = session
+            try:
+                await self._attach_session_observers(session)
+                await page.goto(url)
+            except Exception:
+                await self.close_session(session_id)
+                raise
         else:
             await self.ensure_runtime(headless=headless)
             context = await self._browser.new_context(**self._context_kwargs(auth_state=auth_state))
             await self._apply_context_defaults(context)
             page = await context.new_page()
-            await page.goto(url)
             session = BrowserSession(
                 session_id=session_id,
                 context=context,
@@ -211,7 +223,13 @@ class BrowserManager:
                 headless=headless,
                 display=(self._xvfb_display if not headless else None) or os.environ.get("DISPLAY"),
             )
-        self._sessions[session_id] = session
+            self._sessions[session_id] = session
+            try:
+                await self._attach_session_observers(session)
+                await page.goto(url)
+            except Exception:
+                await self.close_session(session_id)
+                raise
         return session
 
     def get_session(self, session_id: str) -> BrowserSession:
@@ -252,6 +270,34 @@ class BrowserManager:
     async def storage_state(self, session_id: str) -> dict[str, Any]:
         session = await self.get_live_session(session_id)
         return await session.context.storage_state()
+
+    async def get_console_events(
+        self, session_id: str, *, level: str = "all", limit: int = 100
+    ) -> list[dict[str, Any]]:
+        session = await self.get_live_session(session_id)
+        events = session.console_events
+        if level != "all":
+            normalized = level.lower()
+            events = [
+                event for event in events if str(event.get("level", "")).lower() == normalized
+            ]
+        return events[-max(1, limit) :]
+
+    async def get_network_events(
+        self,
+        session_id: str,
+        *,
+        limit: int = 100,
+        resource_types: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        session = await self.get_live_session(session_id)
+        events = session.network_events
+        if resource_types:
+            allowed = {item.lower() for item in resource_types}
+            events = [
+                event for event in events if str(event.get("resource_type", "")).lower() in allowed
+            ]
+        return events[-max(1, limit) :]
 
     async def _cleanup_idle_sessions(self) -> None:
         if self.idle_timeout_seconds <= 0:
@@ -485,5 +531,86 @@ class BrowserManager:
         if auth_state and isinstance(auth_state.get("cookies"), list):
             await context.add_cookies(auth_state["cookies"])
         page = context.pages[0] if context.pages else await context.new_page()
-        await page.goto(url)
         return context, page, user_data_dir, display
+
+    async def _attach_session_observers(self, session: BrowserSession) -> None:
+        def _push_console(event: dict[str, Any]) -> None:
+            session.console_events.append(event)
+            del session.console_events[:-BROWSER_DIAGNOSTIC_EVENT_LIMIT]
+
+        def _push_network(event: dict[str, Any]) -> None:
+            session.network_events.append(event)
+            del session.network_events[:-BROWSER_DIAGNOSTIC_EVENT_LIMIT]
+
+        page = session.page
+
+        def _attach_page_observers(observed_page: Any) -> None:
+            if not hasattr(observed_page, "on"):
+                return
+            observed_page.on("console", _console_listener)
+            observed_page.on("pageerror", _page_error_listener)
+            observed_page.on("request", _request_listener)
+            observed_page.on("response", _response_listener)
+            observed_page.on("requestfailed", _request_failed_listener)
+
+        def _console_listener(message: Any) -> None:
+            _push_console(
+                {
+                    "type": "console",
+                    "level": getattr(message, "type", "log"),
+                    "text": getattr(message, "text", ""),
+                    "timestamp": datetime.now(UTC).isoformat(),
+                }
+            )
+
+        def _page_error_listener(error: Exception) -> None:
+            _push_console(
+                {
+                    "type": "pageerror",
+                    "level": "error",
+                    "text": str(error),
+                    "timestamp": datetime.now(UTC).isoformat(),
+                }
+            )
+
+        def _request_listener(request: Any) -> None:
+            _push_network(
+                {
+                    "phase": "request",
+                    "url": request.url,
+                    "method": request.method,
+                    "resource_type": request.resource_type,
+                    "timestamp": datetime.now(UTC).isoformat(),
+                }
+            )
+
+        def _response_listener(response: Any) -> None:
+            request = response.request
+            _push_network(
+                {
+                    "phase": "response",
+                    "url": response.url,
+                    "method": request.method,
+                    "resource_type": request.resource_type,
+                    "status": response.status,
+                    "ok": response.ok,
+                    "timestamp": datetime.now(UTC).isoformat(),
+                }
+            )
+
+        def _request_failed_listener(request: Any) -> None:
+            failure = request.failure
+            _push_network(
+                {
+                    "phase": "request_failed",
+                    "url": request.url,
+                    "method": request.method,
+                    "resource_type": request.resource_type,
+                    "failure": failure.get("errorText") if isinstance(failure, dict) else None,
+                    "timestamp": datetime.now(UTC).isoformat(),
+                }
+            )
+
+        _attach_page_observers(page)
+        if hasattr(session.context, "on"):
+            session.context.on("page", _attach_page_observers)

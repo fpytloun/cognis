@@ -198,10 +198,13 @@ def test_browser_manager_allocate_display_skips_claimed_values() -> None:
 async def test_open_session_records_returned_display(monkeypatch: pytest.MonkeyPatch) -> None:
     manager = BrowserManager(profile_mode_default="persistent_local")
 
+    async def _goto(*_a: object, **_k: object) -> None:
+        return None
+
     async def _fake_open_persistent_context(**_: object):
         return (
             SimpleNamespace(),
-            SimpleNamespace(url="https://reddit.com", goto=lambda *_a, **_k: None),
+            SimpleNamespace(url="https://reddit.com", goto=_goto),
             Path("/tmp/p"),
             ":101",
         )
@@ -222,3 +225,35 @@ async def test_browser_manager_reserve_profile_blocks_duplicate_use() -> None:
     await manager._reserve_profile_id("reddit")  # noqa: SLF001
     with pytest.raises(RuntimeError, match="already in use"):
         await manager._reserve_profile_id("reddit")  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_open_session_rolls_back_when_initial_navigation_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = BrowserManager(profile_mode_default="persistent_local")
+
+    class _Context:
+        async def close(self) -> None:
+            return None
+
+    async def _goto(*_a: object, **_k: object) -> None:
+        raise RuntimeError("nav failed")
+
+    async def _fake_open_persistent_context(**_: object):
+        return (
+            _Context(),
+            SimpleNamespace(url="https://reddit.com", goto=_goto),
+            Path("/tmp/p"),
+            ":101",
+        )
+
+    monkeypatch.setattr(manager, "_open_persistent_context", _fake_open_persistent_context)  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="nav failed"):
+        await manager.open_session(
+            session_id="sess-1",
+            url="https://reddit.com/login",
+            headless=False,
+            profile_mode="persistent_local",
+        )
+    assert manager._sessions == {}  # noqa: SLF001
