@@ -47,6 +47,7 @@ primary agents wear for specific work.
 | Orchestration tools | None (`OrchestrationMode.NONE`) |
 | Mnemory bootstrap | No |
 | LLM config | Optional override; inherits caller's config at runtime |
+| Runtime | Optional override; inherits caller's runtime at runtime |
 | Executor | Optional override; inherits caller's executor at runtime |
 | Hidden | Can be hidden from UI (invoked only by agents/workflows) |
 
@@ -106,8 +107,9 @@ class AgentDefinition(BaseModel):
     # LLM Configuration
     llm_config: AgentLLMConfig | None = None
 
-    # Execution
-    execution: dict[str, Any] | None = None  # Executor assignment
+    # Runtime + execution
+    runtime: AgentRuntimeConfig | None = None # How the agent runs
+    execution: dict[str, Any] | None = None   # Executor placement
 
     # Metadata
     status: str = "active"                 # draft | active | suspended | archived
@@ -136,6 +138,8 @@ Notes:
 
 - `mcp_servers` is **legacy inline configuration** kept for backward
   compatibility. New MCP servers are stored globally and assigned to executors.
+- `runtime.type` controls how the agent executes (`native`, `claude_code`,
+  future external runtimes).
 - Agents inherit all tools exposed by their executor by default.
 - Effective tool set = executor enabled tools/groups **minus** agent
   `disabled_categories` / `disabled_tools`, then `tool_permissions` controls
@@ -175,6 +179,22 @@ For secondary agents, LLM config is optional. At runtime, if not set,
 the secondary agent inherits the calling primary agent's LLM config.
 This allows cost optimization — a committer agent can use a cheap model
 while a code review agent uses a capable one.
+
+### Runtime Configuration
+
+```python
+class AgentRuntimeConfig(BaseModel):
+    type: Literal["native", "claude_code", "opencode"] = "native"
+    config: dict[str, Any] | None = None
+```
+
+Runtime and executor are separate:
+
+- `runtime` selects how the agent executes a direct turn or workflow step
+- `execution` selects where that runtime runs
+
+For delegated secondary agents, runtime is inherited from the calling agent if
+the secondary does not override it explicitly.
 
 ## System Agent Namespace
 
@@ -225,6 +245,8 @@ When a primary agent delegates to a secondary agent:
 
 - **LLM config**: secondary agent's own config if set, otherwise inherited
   from the calling primary agent
+- **Runtime**: secondary agent's own runtime if set, otherwise inherited from
+  the calling primary agent
 - **Executor**: secondary agent's own executor config if set, otherwise
   inherited from the calling primary agent
 - **Memory**: no automatic recall/remember. If the secondary agent has

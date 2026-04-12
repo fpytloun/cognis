@@ -698,17 +698,32 @@ back.
 └─────────────────────┘         └──────────────────────────┘
 ```
 
+### Executor-Hosted Runtimes
+
+Executors host more than tools. They may also host full agent runtimes.
+
+Examples:
+
+- `native` runtime with Cognis tool execution
+- `claude_code` runtime using native Claude Code on the executor
+- future `opencode` runtime
+
+The controller still owns workflow progression, task state, memory policy,
+notifications, and guardrails orchestration. The executor hosts the runtime
+process and local state.
+
 ### Custom Executor Implementations
 
 Anyone can build a custom executor that provides both tool execution and LLM
 inference. Examples:
 
 ```python
-class ClaudeCodeExecutor(ExecutorProvider):
-    """Claude Code as executor. Uses user's Claude subscription."""
-    # Implements tool.execute (via Claude Code's built-in tools)
-    # Implements llm.complete (via Claude API with user's subscription)
-    # Cognis controller handles memory, guardrails, sessions
+class ClaudeCodeRuntimeHost:
+    """Executor-side host for the claude_code agent runtime."""
+    # Starts/resumes native Claude Code sessions
+    # Uses user's Claude subscription auth on the executor
+    # Streams runtime events back to the controller
+    # Cognis controller still owns workflow/task orchestration
     ...
 
 class OpencodeExecutor(ExecutorProvider):
@@ -759,9 +774,9 @@ class OpencodeExecutor(ExecutorProvider):
         ...
 ```
 
-The controller doesn't care how the executor works internally — only that it
-implements the JSON-RPC protocol for `tool.execute` (and optionally
-`llm.complete`).
+For external runtimes, the controller also expects a runtime RPC surface such
+as `runtime.start`, `runtime.resume`, `runtime.respond`, and `runtime.cancel`.
+Tool RPC remains separate from runtime RPC.
 
 ## Scalability Path
 

@@ -2,6 +2,8 @@
 
 Cognis ships with embedded in-app docs under `/docs` and keeps the same guides in this repository for local reading and review.
 
+Architecture and implementation specs live in [`docs/specs/`](specs/README.md).
+
 ## Getting Started
 
 | Document | Description |

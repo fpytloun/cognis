@@ -975,15 +975,9 @@ llm_providers:
       - model_id: "chatgpt-4o"
         tier: standard
 
-  # Custom executor (Claude Code with user's subscription)
-  - provider_id: "claude-code"
-    display_name: "Claude Code"
-    location: executor
-    backend: executor
-    executor_labels: {"type": "claude-code"}
-    models:
-      - model_id: "claude-sonnet-4"
-        tier: standard
+  # Claude Code is a first-class agent runtime, not only an LLM provider.
+  # Native Claude subscription auth and config live on the selected executor.
+  # Cognis still orchestrates workflows, notifications, Intaris, and Mnemory.
 
 model_routing:
   classifier: "gpt-4.1-nano"

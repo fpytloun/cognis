@@ -38,6 +38,11 @@ when the agent explicitly signals completion via a controller tool. This
 prevents premature advancement and makes the completion contract machine-
 verifiable.
 
+For external runtimes such as `claude_code`, the runtime adapter may translate
+native runtime completion into the controller's structured `StepOutput`
+without requiring the external runtime to literally call the native
+`step_complete` tool. The controller still decides whether the step is done.
+
 ### 4. Evaluation is semantic, not mechanical
 
 Step evaluation checks whether the completion claim satisfies the step's
