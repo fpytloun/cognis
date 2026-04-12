@@ -112,7 +112,11 @@ def browser_tool_definitions() -> list[ToolDefinition]:
                 "properties": {
                     "session_id": {"type": "string"},
                     "script": {"type": "string"},
-                    "args": {"type": "array"},
+                    "args": {
+                        "type": "array",
+                        "items": {},
+                        "description": "Optional JSON-serializable arguments passed to the evaluated function.",
+                    },
                 },
                 "required": ["session_id", "script"],
             },
