@@ -9,7 +9,7 @@ from cognis.core.session import SessionManager, _map_cognis_to_intaris_status
 from cognis.models.session import ConversationContext
 from cognis.store.database import create_engine, create_session_factory
 from cognis.store.models import Agent, Conversation, Session, User
-from cognis.store.queries import list_conversation_sessions
+from cognis.store.queries import get_session_row, list_conversation_sessions
 
 
 class _Guardrails:
@@ -443,6 +443,43 @@ async def test_mark_completed_syncs_to_intaris(tmp_path) -> None:
     assert sid == root.session_id
     assert status == "completed"
     assert reason == "completion_reason=compacted"
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_mark_active_syncs_to_intaris_and_clears_idle(tmp_path) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    providers = _Providers()
+    manager = SessionManager(session_factory, providers, _Cache())
+
+    conversation = await manager.create_conversation(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context=ConversationContext(type="web"),
+        title="Active test",
+    )
+    root = await manager.create_root_session(
+        conversation_id=conversation.conversation_id,
+        user_email="user@example.com",
+        agent_id="agent-1",
+        intention="test",
+    )
+
+    await manager.mark_idle(root.session_id)
+    await manager.mark_active(root.session_id)
+
+    async with session_factory() as db_session:
+        row = await get_session_row(db_session, root.session_id)
+        assert row is not None
+        assert row.status == "active"
+        assert row.idle_since is None
+
+    assert len(providers.guardrails.status_calls) == 2
+    sid, status, reason = providers.guardrails.status_calls[-1]
+    assert sid == root.session_id
+    assert status == "active"
+    assert reason is None
 
     await engine.dispose()
 

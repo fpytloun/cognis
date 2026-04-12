@@ -1049,6 +1049,19 @@ async def set_session_idle(
     )
 
 
+async def set_session_active(session: AsyncSession, session_id: str) -> bool:
+    """Mark a session active again after it was idle."""
+
+    session_row = await get_session_row(session, session_id)
+    if session_row is None:
+        return False
+    session_row.status = "active"
+    session_row.idle_since = None
+    session_row.updated_at = datetime.now(UTC)
+    await session.flush()
+    return True
+
+
 async def list_child_sessions(session: AsyncSession, parent_session_id: str) -> list[Session]:
     """List all direct child sessions for a parent session."""
 

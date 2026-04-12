@@ -245,6 +245,65 @@ async def test_submit_turn_only_notifies_once_per_pending_escalation() -> None:
 
 
 @pytest.mark.asyncio
+async def test_submit_turn_reactivates_idle_session_before_launch() -> None:
+    session_manager = SimpleNamespace(mark_active=AsyncMock(return_value=True))
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=session_manager,
+        session_cache=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+
+    idle_session = SimpleNamespace(
+        session_id="sess-1",
+        status=SessionStatus.IDLE,
+        idle_since="2026-04-12T10:00:00Z",
+    )
+
+    async def _runtime(_: str, **__: object) -> tuple[object, object, object, bool]:
+        return (
+            SimpleNamespace(
+                conversation_id="conv-1", user_email="user@example.com", status="active"
+            ),
+            idle_session,
+            SimpleNamespace(agent_id="agent-1"),
+            False,
+        )
+
+    async def _attachments(**_: object) -> tuple[list[object], object]:
+        return [], None
+
+    async def _notice(**_: object) -> None:
+        return None
+
+    scheduler._load_conversation_runtime = _runtime  # type: ignore[method-assign]
+    scheduler._resolve_attachments_for_turn = _attachments  # type: ignore[method-assign]
+    scheduler._build_attachment_notice = _notice  # type: ignore[method-assign]
+    scheduler._launch_turn = lambda **_: None  # type: ignore[assignment]
+
+    error = await scheduler.submit_turn(
+        "conv-1",
+        "hello",
+        user_email="user@example.com",
+    )
+
+    assert error is None
+    session_manager.mark_active.assert_awaited_once_with("sess-1")
+    assert idle_session.status == SessionStatus.ACTIVE
+    assert idle_session.idle_since is None
+
+
+@pytest.mark.asyncio
 async def test_queued_turn_observer_only_receives_its_own_turn() -> None:
     first_started = asyncio.Event()
     release_first = asyncio.Event()

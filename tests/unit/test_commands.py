@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from cognis.core.agent_loop import PauseWaiter, PendingPause
 from cognis.core.commands import CommandDispatcher
 from cognis.models.agent import AgentDefinition
-from cognis.models.session import ConversationContext, ConversationModel, SessionModel
+from cognis.models.session import (
+    ConversationContext,
+    ConversationModel,
+    IntarisSession,
+    SessionModel,
+)
 
 
 class _NotificationService:
@@ -38,6 +45,48 @@ class _TurnScheduler:
     async def cancel_turn(self, conversation_id: str) -> bool:
         self.calls.append(conversation_id)
         return self.cancelled
+
+
+class _SessionCache:
+    def get_context_usage(self, _: str) -> None:
+        return None
+
+    def get_reasoning_effort_override(self, _: str) -> None:
+        return None
+
+
+class _GuardrailsProvider:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail = fail
+
+    async def get_session(self, session_id: str) -> IntarisSession:
+        if self.fail:
+            raise RuntimeError("boom")
+        return IntarisSession(
+            session_id=session_id,
+            user_id="user@example.com",
+            agent_id="agent-1",
+            status="completed",
+            intention="Investigate issue",
+            total_calls=4,
+            approved_count=3,
+            denied_count=1,
+            escalated_count=0,
+            created_at="2026-04-12T10:00:00Z",
+            updated_at="2026-04-12T10:05:00Z",
+        )
+
+
+class _SessionFactory:
+    class _Context:
+        async def __aenter__(self) -> object:
+            return object()
+
+        async def __aexit__(self, exc_type: object, exc: object, tb: object) -> bool:
+            return False
+
+    def __call__(self) -> _Context:
+        return self._Context()
 
 
 def _conversation() -> ConversationModel:
@@ -238,3 +287,104 @@ async def test_approve_reports_failure_when_notification_service_cannot_resolve(
     assert result is not None
     assert result.type == "error"
     assert result.data["code"] == "escalation_resolve_failed"
+
+
+@pytest.mark.asyncio
+async def test_info_renders_runtime_intaris_and_subsession_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = SessionModel(
+        session_id="sess-1",
+        conversation_id="conv-1",
+        user_email="user@example.com",
+        agent_id="agent-1",
+        status="idle",
+        previous_session_id="sess-0",
+    )
+    child = SessionModel(
+        session_id="sess-child-1",
+        conversation_id="conv-1",
+        user_email="user@example.com",
+        agent_id="agent-2",
+        parent_session_id="sess-1",
+        delegation_mode="delegate",
+        delegation_task="Research the root cause",
+        status="completed",
+        result_summary="Prepared the investigation summary",
+        completion_reason="completed",
+    )
+
+    async def _get_session_row(_: object, __: str) -> SessionModel:
+        return parent
+
+    async def _list_child_sessions(_: object, __: str) -> list[SessionModel]:
+        return [child]
+
+    monkeypatch.setattr("cognis.store.queries.get_session_row", _get_session_row)
+    monkeypatch.setattr("cognis.store.queries.list_child_sessions", _list_child_sessions)
+    monkeypatch.setattr("cognis.core.session._to_session_model", lambda row: row)
+
+    dispatcher = CommandDispatcher(
+        session_factory=_SessionFactory(),
+        session_manager=None,
+        session_cache=_SessionCache(),
+        compaction_strategy=None,
+        providers=SimpleNamespace(
+            guardrails=_GuardrailsProvider(),
+            llm=SimpleNamespace(get_model_info=None),
+        ),
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+    )
+
+    result = await dispatcher.dispatch(
+        "/info",
+        conversation=_conversation(),
+        session=parent,
+        agent=_agent(),
+        user_email="user@example.com",
+        has_active_turn=True,
+    )
+
+    assert result is not None
+    assert result.type == "system_message"
+    assert result.text is not None
+    assert "Status: running" in result.text
+    assert "Session lifecycle: idle" in result.text
+    assert "Previous session: sess-0" in result.text
+    assert "Intaris status: completed" in result.text
+    assert "Sub-sessions: 1" in result.text
+    assert "sess-child-1 (completed, agent=agent-2)" in result.text
+    assert "Delegation mode: delegate" in result.text
+    assert "Task summary: Research the root cause" in result.text
+    assert "Result summary: Prepared the investigation summary" in result.text
+    assert "Completion reason: completed" in result.text
+
+
+@pytest.mark.asyncio
+async def test_info_uses_unavailable_when_intaris_fetch_fails() -> None:
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=None,
+        session_cache=_SessionCache(),
+        compaction_strategy=None,
+        providers=SimpleNamespace(
+            guardrails=_GuardrailsProvider(fail=True),
+            llm=SimpleNamespace(get_model_info=None),
+        ),
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+    )
+
+    result = await dispatcher.dispatch(
+        "/info",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert result is not None
+    assert result.text is not None
+    assert "Intaris status: unavailable" in result.text
+    assert "Intaris stats: unavailable" in result.text

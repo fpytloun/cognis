@@ -122,7 +122,7 @@ class CommandDispatcher:
 
         # /info
         if stripped == "/info":
-            return await self._handle_info(session)
+            return await self._handle_info(session, has_active_turn=has_active_turn)
 
         # /model [name]
         if stripped == "/model" or stripped.startswith("/model "):
@@ -301,17 +301,34 @@ class CommandDispatcher:
         )
         return CommandResult(type="system_message", text="\n".join(lines))
 
-    async def _handle_info(self, session: SessionModel) -> CommandResult:
+    async def _handle_info(
+        self, session: SessionModel, *, has_active_turn: bool = False
+    ) -> CommandResult:
         """Handle /info — display session details and statistics."""
+        from cognis.core.session import _to_session_model
+        from cognis.store.queries import get_session_row, list_child_sessions
+
+        current_session = session
+        child_sessions: list[SessionModel] = []
+        if self._session_factory is not None:
+            async with self._session_factory() as db_session:
+                session_row = await get_session_row(db_session, session.session_id)
+                if session_row is not None:
+                    current_session = _to_session_model(session_row)
+                child_rows = await list_child_sessions(db_session, session.session_id)
+                child_sessions = [_to_session_model(row) for row in child_rows]
+
         lines: list[str] = []
 
-        # Session metadata
-        lines.append(f"Session: {session.session_id}")
-        lines.append(f"Agent: {session.agent_id}")
-        lines.append(f"Status: {session.status}")
+        display_status = "running" if has_active_turn else current_session.status
+        lines.append(f"Session: {current_session.session_id}")
+        lines.append(f"Agent: {current_session.agent_id}")
+        lines.append(f"Status: {display_status}")
+        lines.append(f"Session lifecycle: {current_session.status}")
+        self._append_session_metadata(lines, current_session)
 
         # Context usage + model + reasoning effort
-        usage = self._session_cache.get_context_usage(session.session_id)
+        usage = self._session_cache.get_context_usage(current_session.session_id)
         if usage:
             lines.append(f"Model: {usage['model']}")
             try:
@@ -323,14 +340,16 @@ class CommandDispatcher:
             lines.append(
                 f"Current usage: {usage['prompt_tokens']:,} tokens ({usage['percentage']}% of session cap)"
             )
-        reasoning = self._session_cache.get_reasoning_effort_override(session.session_id)
+        reasoning = self._session_cache.get_reasoning_effort_override(current_session.session_id)
         if reasoning:
             lines.append(f"Reasoning effort: {reasoning}")
 
         # Intaris session stats
-        intaris_sid = session.intaris_session_id or session.session_id
+        intaris_sid = current_session.intaris_session_id or current_session.session_id
+        lines.append(f"Intaris session: {intaris_sid}")
         try:
             intaris_session = await self._providers.guardrails.get_session(intaris_sid)
+            lines.append(f"Intaris status: {intaris_session.status}")
             if intaris_session.intention:
                 lines.append(f"Intention: {intaris_session.intention}")
             stats_parts = [f"{intaris_session.total_calls} total"]
@@ -342,12 +361,43 @@ class CommandDispatcher:
                 stats_parts.append(f"{intaris_session.escalated_count} escalated")
             lines.append(f"Tool calls: {', '.join(stats_parts)}")
         except Exception:
+            lines.append("Intaris status: unavailable")
             lines.append("Intaris stats: unavailable")
 
-        if session.started_at:
-            lines.append(f"Started: {session.started_at}")
+        if child_sessions:
+            lines.append(f"Sub-sessions: {len(child_sessions)}")
+            for index, child_session in enumerate(child_sessions, start=1):
+                lines.append(
+                    f"  [{index}] {child_session.session_id} ({child_session.status}, agent={child_session.agent_id})"
+                )
+                self._append_session_metadata(lines, child_session, indent="  ")
+
+        if current_session.started_at:
+            lines.append(f"Started: {current_session.started_at}")
 
         return CommandResult(type="system_message", text="\n".join(lines))
+
+    def _append_session_metadata(
+        self,
+        lines: list[str],
+        session: SessionModel,
+        *,
+        indent: str = "",
+    ) -> None:
+        """Append operator-facing session metadata when it exists."""
+
+        if session.parent_session_id:
+            lines.append(f"{indent}Parent session: {session.parent_session_id}")
+        if session.previous_session_id:
+            lines.append(f"{indent}Previous session: {session.previous_session_id}")
+        if session.delegation_mode:
+            lines.append(f"{indent}Delegation mode: {session.delegation_mode}")
+        if session.delegation_task:
+            lines.append(f"{indent}Task summary: {session.delegation_task}")
+        if session.result_summary:
+            lines.append(f"{indent}Result summary: {session.result_summary}")
+        if session.completion_reason:
+            lines.append(f"{indent}Completion reason: {session.completion_reason}")
 
     async def _handle_model(self, session: SessionModel, arg: str) -> CommandResult:
         """Handle /model [name] — list or switch LLM model."""

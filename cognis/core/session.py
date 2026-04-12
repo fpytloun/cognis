@@ -441,6 +441,20 @@ class SessionManager:
             await self._sync_intaris_status(session_id, "idle")
         return updated
 
+    async def mark_active(self, session_id: str) -> bool:
+        """Mark a session active again when a new turn starts."""
+
+        async with self.session_factory() as db_session:
+            try:
+                updated = await queries.set_session_active(db_session, session_id)
+                await db_session.commit()
+            except Exception:
+                await db_session.rollback()
+                raise
+        if updated:
+            await self._sync_intaris_status(session_id, "active")
+        return updated
+
     async def mark_completed(
         self,
         session_id: str,

@@ -476,6 +476,24 @@ class TurnScheduler:
                     await observer.on_queued(conversation_id, len(queue))
             return None
 
+        if session.status == SessionStatus.IDLE:
+            try:
+                updated = await self._session_manager.mark_active(session.session_id)
+                if updated:
+                    session.status = SessionStatus.ACTIVE
+                    session.idle_since = None
+            except Exception:
+                logger.warning(
+                    "turn_scheduler: failed to reactivate idle session",
+                    extra={
+                        "extra_data": {
+                            "conversation_id": conversation_id,
+                            "session_id": session.session_id,
+                        }
+                    },
+                    exc_info=True,
+                )
+
         # Launch the turn
         self._launch_turn(
             conversation=conversation,
