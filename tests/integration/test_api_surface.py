@@ -51,6 +51,7 @@ def test_workflow_list_includes_system_workflows(
     workflow_ids = {item["workflow_id"] for item in items}
 
     assert "system:direct" in workflow_ids
+    assert "system:general-task" in workflow_ids
     assert "system:research" in workflow_ids
     assert "system:software-development" in workflow_ids
 

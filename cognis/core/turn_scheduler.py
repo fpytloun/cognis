@@ -1318,7 +1318,9 @@ class TurnScheduler:
         if not available_workflows:
             default_workflow_id = execution.get("default_workflow_id")
             return (
-                default_workflow_id if isinstance(default_workflow_id, str) else "system:research"
+                default_workflow_id
+                if isinstance(default_workflow_id, str)
+                else "system:general-task"
             )
         from cognis.core.decision import select_workflow
 
@@ -1333,7 +1335,7 @@ class TurnScheduler:
                 }
                 for workflow in available_workflows
             ],
-            default_workflow_id=execution.get("default_workflow_id", "system:research"),
+            default_workflow_id=execution.get("default_workflow_id", "system:general-task"),
             selection_mode=execution.get("workflow_selection_mode", "automatic"),
         )
         return selection.workflow_id

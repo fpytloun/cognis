@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from cognis.core.decision import DecisionEngine
+from cognis.core.decision import DecisionEngine, select_workflow
 from cognis.models.agent import AgentDefinition, AgentLLMConfig, AgentPermissions
 
 
@@ -18,6 +18,26 @@ class _LLM:
     ) -> dict[str, object]:
         del messages, model, task_type, kwargs
         return {"choices": [{"message": {"content": "{}"}}]}
+
+
+class _InvalidWorkflowLLM:
+    async def generate(
+        self,
+        messages: list[dict[str, object]],
+        model: str | None = None,
+        task_type: str = "default",
+        **kwargs: object,
+    ) -> dict[str, object]:
+        del messages, model, task_type, kwargs
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": '{"workflow_id": "system:unknown", "confidence": 0.9, "reason": "bad pick"}'
+                    }
+                }
+            ]
+        }
 
 
 def _agent(can_delegate: bool = True, max_depth: int = 5) -> AgentDefinition:
@@ -113,3 +133,38 @@ async def test_decision_engine_conversational_is_inline() -> None:
 
     assert result.decision == "inline"
     assert result.confidence == 0.85
+
+
+@pytest.mark.asyncio
+async def test_select_workflow_uses_general_task_when_no_workflows_available() -> None:
+    result = await select_workflow(
+        llm=_LLM(),
+        task_description="Do something useful",
+        available_workflows=[],
+        default_workflow_id=None,
+    )
+
+    assert result.workflow_id == "system:general-task"
+
+
+@pytest.mark.asyncio
+async def test_select_workflow_invalid_classifier_pick_falls_back_to_default() -> None:
+    result = await select_workflow(
+        llm=_InvalidWorkflowLLM(),
+        task_description="Implement slash command",
+        available_workflows=[
+            {
+                "workflow_id": "system:general-task",
+                "name": "General Task",
+                "criteria": "Generic execution",
+            },
+            {
+                "workflow_id": "system:software-development",
+                "name": "Software Development",
+                "criteria": "Implementation work",
+            },
+        ],
+        default_workflow_id="system:general-task",
+    )
+
+    assert result.workflow_id == "system:general-task"

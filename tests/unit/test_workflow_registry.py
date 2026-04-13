@@ -6,6 +6,8 @@ import pytest
 
 from cognis.core.workflow_registry import (
     DIRECT_WORKFLOW,
+    GENERAL_TASK_WORKFLOW,
+    SOFTWARE_DEVELOPMENT_WORKFLOW,
     SYSTEM_WORKFLOWS,
     _validate_workflow,
 )
@@ -18,6 +20,7 @@ from cognis.models.workflow import (
 
 def test_system_workflows_are_registered() -> None:
     assert "system:direct" in SYSTEM_WORKFLOWS
+    assert "system:general-task" in SYSTEM_WORKFLOWS
     assert "system:research" in SYSTEM_WORKFLOWS
     assert "system:software-development" in SYSTEM_WORKFLOWS
     assert "system:creative" in SYSTEM_WORKFLOWS
@@ -29,6 +32,21 @@ def test_direct_workflow_has_single_step_no_evaluation() -> None:
     assert w.steps[0].name == "execute"
     assert w.steps[0].completion is not None
     assert w.steps[0].completion.evaluate is False
+
+
+def test_general_task_workflow_has_single_step_with_evaluation() -> None:
+    w = GENERAL_TASK_WORKFLOW
+    assert len(w.steps) == 1
+    assert w.steps[0].name == "execute"
+    assert w.steps[0].completion is not None
+    assert w.steps[0].completion.evaluate is True
+
+
+def test_software_development_workflow_uses_implement_specialist() -> None:
+    implement_step = next(
+        step for step in SOFTWARE_DEVELOPMENT_WORKFLOW.steps if step.name == "implement"
+    )
+    assert implement_step.agent_override == "system:implement"
 
 
 def test_validate_workflow_accepts_valid_definition() -> None:

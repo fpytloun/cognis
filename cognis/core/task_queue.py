@@ -631,19 +631,19 @@ class TaskQueue:
     async def _select_workflow_for_task(self, task: TaskModel) -> str:
         """Auto-select a workflow using the LLM classifier.
 
-        Falls back to ``system:direct`` if the classifier is unavailable
-        or no workflows match.  Persists the selection to the DB so the
-        user can see which workflow was chosen.
+        Falls back to ``system:general-task`` if the classifier is unavailable
+        or no workflows match. Persists the selection to the DB so the user can
+        see which workflow was chosen.
         """
         if self._llm_provider is None:
-            return "system:direct"
+            return "system:general-task"
 
         from cognis.core.decision import select_workflow
 
         try:
             available = await self._workflow_registry.list_all()
             if not available:
-                return "system:direct"
+                return "system:general-task"
 
             selection = await select_workflow(
                 llm=self._llm_provider,
@@ -656,7 +656,7 @@ class TaskQueue:
                     }
                     for w in available
                 ],
-                default_workflow_id="system:research",
+                default_workflow_id="system:general-task",
             )
             workflow_id = selection.workflow_id
             logger.info(
@@ -672,11 +672,11 @@ class TaskQueue:
             )
         except Exception:
             logger.warning(
-                "Workflow auto-selection failed, falling back to system:direct",
+                "Workflow auto-selection failed, falling back to system:general-task",
                 extra={"extra_data": {"task_id": task.task_id}},
                 exc_info=True,
             )
-            workflow_id = "system:direct"
+            workflow_id = "system:general-task"
 
         # Persist the selected workflow on the task for visibility
         task.workflow_id = workflow_id

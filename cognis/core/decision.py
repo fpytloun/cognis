@@ -253,7 +253,7 @@ async def select_workflow(
 
     if not available_workflows:
         return WorkflowSelectionResult(
-            workflow_id=default_workflow_id or "system:direct",
+            workflow_id=default_workflow_id or "system:general-task",
             confidence=0.5,
             reason="No workflows available, using default",
             source="default",
@@ -303,7 +303,7 @@ async def select_workflow(
         # Validate the selected workflow exists
         valid_ids = {w["workflow_id"] for w in available_workflows}
         if workflow_id not in valid_ids:
-            workflow_id = default_workflow_id or "system:direct"
+            workflow_id = default_workflow_id or "system:general-task"
 
         return WorkflowSelectionResult(
             workflow_id=workflow_id,
@@ -318,7 +318,7 @@ async def select_workflow(
             extra={"extra_data": {"default": default_workflow_id}},
         )
         return WorkflowSelectionResult(
-            workflow_id=default_workflow_id or "system:direct",
+            workflow_id=default_workflow_id or "system:general-task",
             confidence=0.3,
             reason="Classifier timeout fallback",
             source="default",
@@ -330,7 +330,7 @@ async def select_workflow(
             exc_info=True,
         )
         return WorkflowSelectionResult(
-            workflow_id=default_workflow_id or "system:direct",
+            workflow_id=default_workflow_id or "system:general-task",
             confidence=0.3,
             reason="Classifier fallback",
             source="default",

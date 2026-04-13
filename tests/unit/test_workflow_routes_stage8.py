@@ -45,6 +45,7 @@ def test_workflow_list_includes_system_workflows(monkeypatch: object, tmp_path: 
         assert response.status_code == 200
         workflow_ids = {item["workflow_id"] for item in response.json()["items"]}
         assert "system:direct" in workflow_ids
+        assert "system:general-task" in workflow_ids
         assert "system:research" in workflow_ids
 
 

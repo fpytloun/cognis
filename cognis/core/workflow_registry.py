@@ -46,6 +46,29 @@ DIRECT_WORKFLOW = Workflow(
     is_system=True,
 )
 
+GENERAL_TASK_WORKFLOW = Workflow(
+    workflow_id="system:general-task",
+    name="General Task",
+    description="Single-step task execution with semantic evaluation.",
+    criteria="Generic background tasks that need direct execution with evaluation but no specialized pipeline.",
+    tags=["task", "general", "evaluated"],
+    interaction=InteractionMode(mode="step_requests"),
+    defaults=WorkflowDefaults(evaluate=True),
+    steps=[
+        StepDefinition(
+            name="execute",
+            type="run",
+            prompt=(
+                "Execute the requested task directly. Use tools as needed, keep "
+                "the work focused, and verify the result before completing the step."
+            ),
+            input=StepInputConfig(type="null"),
+            completion=CompletionConfig(evaluate=True, max_attempts=3),
+        ),
+    ],
+    is_system=True,
+)
+
 RESEARCH_WORKFLOW = Workflow(
     workflow_id="system:research",
     name="Research",
@@ -107,9 +130,9 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
             name="plan",
             type="run",
             prompt=(
-                "Explore the codebase to understand the relevant areas. "
-                "Launch multiple explore sub-sessions in parallel to "
-                "efficiently understand different aspects of the codebase.\n\n"
+                "Explore the codebase only as needed to understand the relevant "
+                "areas. Use focused exploration first, and parallelize only when "
+                "the task is broad enough to justify it.\n\n"
                 "Then produce a detailed implementation plan covering:\n"
                 "- Files to create/modify (with rationale)\n"
                 "- Specific changes per file\n"
@@ -137,6 +160,7 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
         StepDefinition(
             name="implement",
             type="run",
+            agent_override="system:implement",
             prompt=(
                 "Implement the approved plan. Follow the plan step by step. "
                 "After implementation, run relevant tests and linters to "
@@ -144,16 +168,15 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
             ),
             input=StepInputConfig(type="last", source=["plan", "architect_review"]),
             completion=CompletionConfig(evaluate=True, max_attempts=3),
-            # Primary agent — needs memory and full tool access
         ),
         StepDefinition(
             name="update_docs",
             type="run",
             prompt=(
-                "Review and update documentation affected by the changes: "
-                "README, API docs, CHANGELOG, inline comments, architecture "
-                "documents, configuration examples. If no documentation "
-                "updates are needed, explicitly note this."
+                "Update only the documentation directly affected by the changes, "
+                "such as README sections, API docs, configuration examples, or "
+                "inline comments. If no documentation updates are needed, "
+                "explicitly note that."
             ),
             input=StepInputConfig(type="last", source="implement"),
             completion=CompletionConfig(evaluate=False),
@@ -222,7 +245,13 @@ CREATIVE_WORKFLOW = Workflow(
 
 SYSTEM_WORKFLOWS: dict[str, Workflow] = {
     w.workflow_id: w
-    for w in [DIRECT_WORKFLOW, RESEARCH_WORKFLOW, SOFTWARE_DEVELOPMENT_WORKFLOW, CREATIVE_WORKFLOW]
+    for w in [
+        DIRECT_WORKFLOW,
+        GENERAL_TASK_WORKFLOW,
+        RESEARCH_WORKFLOW,
+        SOFTWARE_DEVELOPMENT_WORKFLOW,
+        CREATIVE_WORKFLOW,
+    ]
 }
 
 
