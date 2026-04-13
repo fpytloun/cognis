@@ -428,7 +428,10 @@ class ChannelDeliveryService:
                     idx += 1
             if option_lines:
                 lines.append("\n".join(option_lines))
-        lines.append("_Reply /approve or /deny to continue._")
+        lines.append(
+            "_Use the task board to choose one of the workflow options above. "
+            "/approve and /deny only apply to tool escalations._"
+        )
         return "\n\n".join(lines)
 
     def _render_escalation_notification(self, payload: dict[str, Any]) -> str:

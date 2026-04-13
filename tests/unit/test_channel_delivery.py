@@ -55,6 +55,28 @@ def test_render_escalation_notification_includes_required_details() -> None:
     assert "optionally add a note" in content
 
 
+def test_render_gate_notification_lists_real_options_and_task_board_instruction() -> None:
+    service = _make_service()
+
+    content = service._render_gate_notification(
+        {
+            "message": "Step 'plan' has exhausted its retry limit.",
+            "options": [
+                {"label": "Retry step", "action": "revise(plan)"},
+                {"label": "Continue", "action": "continue"},
+            ],
+        }
+    )
+
+    assert "*[gate]* Step 'plan' has exhausted its retry limit." in content
+    assert "1. Retry step" in content
+    assert "2. Continue" in content
+    assert "task board" in content
+    assert "/approve" in content
+    assert "/deny" in content
+    assert "tool escalations" in content
+
+
 @pytest.mark.asyncio
 async def test_notification_event_delivers_rich_escalation_text() -> None:
     service = _make_service()

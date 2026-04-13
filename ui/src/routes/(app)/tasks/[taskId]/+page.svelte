@@ -622,6 +622,7 @@
                   {#if (task.pending_pause.options ?? []).length === 0}
                     <Button size="sm" onclick={() => respondToGate('continue')}>Continue</Button>
                   {/if}
+                  <Button size="sm" variant="secondary" onclick={cancelTask}>Cancel task</Button>
                 </div>
               {:else}
                 <textarea bind:value={stepResponse} class="min-h-[110px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500" placeholder="Provide the answer that resumes the current step"></textarea>
