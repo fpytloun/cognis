@@ -18,12 +18,15 @@ from cognis.core.json_utils import (
     extract_json_object,
     extract_text_from_response,
     infer_evaluation_from_text,
+    maybe_fallback_to_plain_json_response,
 )
 from cognis.logging import get_logger
 from cognis.models.workflow import StepDefinition, StepEvaluation, StepOutput
 from cognis.store.queries import get_setting_value
 
 logger = get_logger(__name__)
+
+EVALUATOR_MALFUNCTION_REASON_PREFIX = "Evaluator malfunction:"
 
 EVALUATIONS_TOTAL = Counter(
     "cognis_evaluations_total",
@@ -115,7 +118,7 @@ class StepEvaluator:
 
         Returns StepEvaluation with decision: approved, revise, or failed.
         On timeout or transport error, defaults to 'approved' (fail-open).
-        Empty or truncated evaluator output is treated as a revise.
+        Empty or truncated evaluator output is treated as an evaluator failure.
         """
         prompt = self._build_prompt(step_definition, step_output, step_inputs, task_context)
 
@@ -150,22 +153,50 @@ class StepEvaluator:
                         )
                     except TimeoutError:
                         logger.warning(
-                            "Evaluator retry timed out after unusable response, forcing revise",
+                            "Evaluator retry timed out after unusable response, failing evaluation",
                             extra={"extra_data": {"step": step_definition.name}},
                         )
-                        return self._forced_revise(
-                            reasoning="Evaluator retry timed out after empty or incomplete output",
-                            feedback="Retry the step; evaluator could not return a usable response.",
+                        return self._forced_failed(
+                            reasoning="retry timed out after empty or incomplete output",
+                            feedback="Evaluator could not return a usable response after retry.",
                         )
                     except Exception:
                         logger.exception(
-                            "Evaluator retry failed after unusable response, forcing revise",
+                            "Evaluator retry failed after unusable response, failing evaluation",
                             extra={"extra_data": {"step": step_definition.name}},
                         )
-                        return self._forced_revise(
-                            reasoning="Evaluator retry failed after empty or incomplete output",
-                            feedback="Retry the step; evaluator could not return a usable response.",
+                        return self._forced_failed(
+                            reasoning="retry failed after empty or incomplete output",
+                            feedback="Evaluator could not return a usable response after retry.",
                         )
+                try:
+                    response = await maybe_fallback_to_plain_json_response(
+                        response,
+                        generate_response=lambda kwargs: self._generate_evaluator_response(
+                            messages, kwargs
+                        ),
+                        label="evaluator",
+                        logger_obj=logger,
+                        warning_context={"step": step_definition.name},
+                    )
+                except TimeoutError:
+                    logger.warning(
+                        "Evaluator plain-text JSON fallback timed out",
+                        extra={"extra_data": {"step": step_definition.name}},
+                    )
+                    return self._forced_failed(
+                        reasoning="plain-text JSON fallback timed out after unusable output",
+                        feedback="Evaluator fallback could not return a usable response.",
+                    )
+                except Exception:
+                    logger.exception(
+                        "Evaluator plain-text JSON fallback failed",
+                        extra={"extra_data": {"step": step_definition.name}},
+                    )
+                    return self._forced_failed(
+                        reasoning="plain-text JSON fallback failed after unusable output",
+                        feedback="Evaluator fallback could not return a usable response.",
+                    )
                 evaluation = self._parse_response(response)
                 logger.info(
                     "Step evaluation complete",
@@ -257,18 +288,18 @@ class StepEvaluator:
         finish_reason = self._extract_finish_reason(response)
         if finish_reason == "length":
             logger.warning(
-                "Evaluator response incomplete, forcing revise",
+                "Evaluator response incomplete, failing evaluation",
                 extra={"extra_data": {"content_length": len(content)}},
             )
-            return self._forced_revise(
-                reasoning="Evaluator response was incomplete or truncated",
-                feedback="Retry the step; evaluator response was incomplete or truncated.",
+            return self._forced_failed(
+                reasoning="response was incomplete or truncated",
+                feedback="Evaluator response was incomplete or truncated.",
             )
         if not content.strip():
-            logger.warning("Evaluator returned empty response, forcing revise")
-            return self._forced_revise(
-                reasoning="Evaluator returned no usable output",
-                feedback="Retry the step; evaluator response was empty.",
+            logger.warning("Evaluator returned empty response, failing evaluation")
+            return self._forced_failed(
+                reasoning="returned no usable output",
+                feedback="Evaluator response was empty.",
             )
         try:
             payload = extract_json_object(content, label="evaluator")
@@ -334,6 +365,16 @@ class StepEvaluator:
         EVALUATIONS_TOTAL.labels(decision=evaluation.decision).inc()
         return evaluation
 
+    def _forced_failed(self, *, reasoning: str, feedback: str) -> StepEvaluation:
+        evaluation = StepEvaluation(
+            decision="failed",
+            reasoning=f"{EVALUATOR_MALFUNCTION_REASON_PREFIX} {reasoning}",
+            feedback=feedback,
+            evaluated_at=datetime.now(UTC),
+        )
+        EVALUATIONS_TOTAL.labels(decision=evaluation.decision).inc()
+        return evaluation
+
     async def _generate_evaluator_response(
         self, messages: list[dict[str, str]], generate_kwargs: dict[str, Any]
     ) -> dict[str, Any]:
@@ -348,3 +389,9 @@ class StepEvaluator:
                 self.llm.generate(messages, task_type="default", **generate_kwargs),
                 timeout=self.evaluator_timeout_seconds,
             )
+
+
+def is_evaluator_malfunction(evaluation: StepEvaluation) -> bool:
+    """Return True when failure came from evaluator unusable output, not the step itself."""
+
+    return evaluation.reasoning.startswith(EVALUATOR_MALFUNCTION_REASON_PREFIX)

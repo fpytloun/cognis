@@ -13,7 +13,11 @@ from typing import Any, Literal
 from prometheus_client import Counter, Histogram
 from pydantic import BaseModel, Field, model_validator
 
-from cognis.core.json_utils import extract_json_object, extract_text_from_response
+from cognis.core.json_utils import (
+    extract_json_object,
+    extract_text_from_response,
+    maybe_fallback_to_plain_json_response,
+)
 from cognis.logging import get_logger
 
 logger = get_logger(__name__)
@@ -429,14 +433,25 @@ class FollowUpPolicy:
 
         started_at = monotonic()
         try:
-            response = await asyncio.wait_for(
-                self._llm.generate(
-                    prompt,
-                    task_type="classifier",
-                    temperature=0,
-                    response_format={"type": "json_object"},
-                ),
-                timeout=self._classifier_timeout_seconds,
+
+            async def _generate(generate_kwargs: dict[str, Any]) -> dict[str, Any]:
+                return await asyncio.wait_for(
+                    self._llm.generate(
+                        prompt,
+                        task_type="classifier",
+                        temperature=0,
+                        **generate_kwargs,
+                    ),
+                    timeout=self._classifier_timeout_seconds,
+                )
+
+            response = await _generate({"response_format": {"type": "json_object"}})
+            response = await maybe_fallback_to_plain_json_response(
+                response,
+                generate_response=_generate,
+                label="follow_up_classifier",
+                logger_obj=logger,
+                warning_context={"conversation_id": conversation_id},
             )
             content = extract_text_from_response(response)
             if not content or not content.strip():

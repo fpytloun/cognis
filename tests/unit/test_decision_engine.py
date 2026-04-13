@@ -40,6 +40,23 @@ class _InvalidWorkflowLLM:
         }
 
 
+class _SequenceWorkflowLLM:
+    def __init__(self, responses: list[dict[str, object]]) -> None:
+        self._responses = list(responses)
+        self.calls = 0
+
+    async def generate(
+        self,
+        messages: list[dict[str, object]],
+        model: str | None = None,
+        task_type: str = "default",
+        **kwargs: object,
+    ) -> dict[str, object]:
+        del messages, model, task_type, kwargs
+        self.calls += 1
+        return self._responses.pop(0)
+
+
 def _agent(can_delegate: bool = True, max_depth: int = 5) -> AgentDefinition:
     return AgentDefinition(
         agent_id="agent-1",
@@ -168,3 +185,42 @@ async def test_select_workflow_invalid_classifier_pick_falls_back_to_default() -
     )
 
     assert result.workflow_id == "system:general-task"
+
+
+@pytest.mark.asyncio
+async def test_select_workflow_classifier_falls_back_to_plain_json_text() -> None:
+    llm = _SequenceWorkflowLLM(
+        [
+            {"choices": [{"message": {"content": ""}}]},
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"workflow_id": "system:software-development", "confidence": 0.8, "reason": "implementation work"}'
+                        }
+                    }
+                ]
+            },
+        ]
+    )
+
+    result = await select_workflow(
+        llm=llm,
+        task_description="Implement slash command",
+        available_workflows=[
+            {
+                "workflow_id": "system:general-task",
+                "name": "General Task",
+                "criteria": "Generic execution",
+            },
+            {
+                "workflow_id": "system:software-development",
+                "name": "Software Development",
+                "criteria": "Implementation work",
+            },
+        ],
+        default_workflow_id="system:general-task",
+    )
+
+    assert llm.calls == 2
+    assert result.workflow_id == "system:software-development"

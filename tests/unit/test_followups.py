@@ -37,6 +37,17 @@ class _LLM:
         return {"choices": [{"message": {"content": f'{{"mode":"{self.mode}","reason":"ok"}}'}}]}
 
 
+class _SequenceLLM:
+    def __init__(self, responses: list[dict[str, object]]) -> None:
+        self._responses = list(responses)
+        self.calls = 0
+
+    async def generate(self, messages: list[dict[str, object]], **_: object) -> dict[str, object]:
+        del messages
+        self.calls += 1
+        return self._responses.pop(0)
+
+
 @pytest.mark.asyncio
 async def test_follow_up_policy_notifies_cross_conversation_task_result() -> None:
     policy = FollowUpPolicy(llm=None)
@@ -110,6 +121,35 @@ async def test_follow_up_policy_falls_back_to_notify_on_classifier_failure() -> 
     )
 
     assert follow_up.mode is FollowUpMode.NOTIFY
+
+
+@pytest.mark.asyncio
+async def test_follow_up_policy_classifier_falls_back_to_plain_json_text() -> None:
+    llm = _SequenceLLM(
+        [
+            {"choices": [{"message": {"content": ""}}]},
+            {"choices": [{"message": {"content": '{"mode":"integrate","reason":"ok"}'}}]},
+        ]
+    )
+    policy = FollowUpPolicy(llm=llm)
+
+    follow_up = await policy.build_task_result_follow_up(
+        conversation_id="conv-1",
+        task_id="task-1",
+        task_title="Implement auth",
+        status="completed",
+        source_type="chat",
+        delivery_mode="same_conversation",
+        result_summary="Done",
+        description="Auth task",
+        session_id="sess-1",
+        session_cache=_SessionCache(
+            [{"type": "user_message", "data": {"content": "Please implement auth refresh."}}]
+        ),
+    )
+
+    assert llm.calls == 2
+    assert follow_up.mode is FollowUpMode.INTEGRATE
 
 
 def test_build_follow_up_id_is_stable_for_same_inputs() -> None:

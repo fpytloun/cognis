@@ -16,7 +16,11 @@ from prometheus_client import Counter
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from cognis.core.json_utils import extract_json_object, extract_text_from_response
+from cognis.core.json_utils import (
+    extract_json_object,
+    extract_text_from_response,
+    maybe_fallback_to_plain_json_response,
+)
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.store.queries import get_setting_value
@@ -285,14 +289,25 @@ async def select_workflow(
     ]
 
     try:
-        response = await asyncio.wait_for(
-            llm.generate(
-                prompt,
-                task_type="classifier",
-                temperature=0,
-                response_format={"type": "json_object"},
-            ),
-            timeout=classifier_timeout_seconds,
+
+        async def _generate(generate_kwargs: dict[str, Any]) -> dict[str, Any]:
+            return await asyncio.wait_for(
+                llm.generate(
+                    prompt,
+                    task_type="classifier",
+                    temperature=0,
+                    **generate_kwargs,
+                ),
+                timeout=classifier_timeout_seconds,
+            )
+
+        response = await _generate({"response_format": {"type": "json_object"}})
+        response = await maybe_fallback_to_plain_json_response(
+            response,
+            generate_response=_generate,
+            label="classifier",
+            logger_obj=logger,
+            warning_context={"mode": "workflow_selection"},
         )
         content = extract_text_from_response(response)
         if not content or not content.strip():

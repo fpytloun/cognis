@@ -7,7 +7,7 @@ import json
 
 import pytest
 
-from cognis.core.step_evaluator import StepEvaluator
+from cognis.core.step_evaluator import StepEvaluator, is_evaluator_malfunction
 from cognis.models.workflow import CompletionConfig, StepDefinition, StepOutput
 
 
@@ -220,7 +220,7 @@ async def test_evaluator_plain_text_failed_via_inference() -> None:
 
 
 @pytest.mark.asyncio
-async def test_evaluator_empty_response_forces_revise() -> None:
+async def test_evaluator_empty_response_fails_evaluation() -> None:
     evaluator = StepEvaluator(llm=_LLM(response=""), evaluator_timeout_seconds=5.0)
 
     result = await evaluator.evaluate(
@@ -229,7 +229,8 @@ async def test_evaluator_empty_response_forces_revise() -> None:
         step_inputs={},
     )
 
-    assert result.decision == "revise"
+    assert result.decision == "failed"
+    assert is_evaluator_malfunction(result) is True
     assert "no usable output" in result.reasoning.lower()
 
 
@@ -258,9 +259,47 @@ async def test_evaluator_retries_empty_response_once() -> None:
 
 
 @pytest.mark.asyncio
-async def test_evaluator_incomplete_response_forces_revise() -> None:
+async def test_evaluator_falls_back_to_plain_json_text_after_structured_retry() -> None:
     llm = _SequenceLLM(
         [
+            {"choices": [{"message": {"content": ""}}]},
+            {"choices": [{"message": {"content": ""}}]},
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"decision": "revise", "reasoning": "Tests missing", "feedback": "Add tests"}'
+                        }
+                    }
+                ]
+            },
+        ]
+    )
+    evaluator = StepEvaluator(llm=llm, evaluator_timeout_seconds=5.0)
+
+    result = await evaluator.evaluate(
+        step_definition=_step_def("Implement with tests"),
+        step_output=_step_output(claims=["Implemented feature"]),
+        step_inputs={},
+    )
+
+    assert llm.calls == 3
+    assert result.decision == "revise"
+    assert result.feedback == "Add tests"
+
+
+@pytest.mark.asyncio
+async def test_evaluator_incomplete_response_fails_evaluation() -> None:
+    llm = _SequenceLLM(
+        [
+            {
+                "choices": [
+                    {
+                        "message": {"content": '{"decision":'},
+                        "finish_reason": "length",
+                    }
+                ]
+            },
             {
                 "choices": [
                     {
@@ -287,7 +326,8 @@ async def test_evaluator_incomplete_response_forces_revise() -> None:
         step_inputs={},
     )
 
-    assert result.decision == "revise"
+    assert result.decision == "failed"
+    assert is_evaluator_malfunction(result) is True
     assert "incomplete" in result.reasoning.lower()
 
 
@@ -317,7 +357,7 @@ async def test_evaluator_refusal_forces_revise() -> None:
 
 
 @pytest.mark.asyncio
-async def test_evaluator_retry_failure_after_empty_forces_revise() -> None:
+async def test_evaluator_retry_failure_after_empty_fails_evaluation() -> None:
     llm = _SequenceLLM(
         [
             {"choices": [{"message": {"content": ""}}]},
@@ -331,7 +371,8 @@ async def test_evaluator_retry_failure_after_empty_forces_revise() -> None:
         step_inputs={},
     )
 
-    assert result.decision == "revise"
+    assert result.decision == "failed"
+    assert is_evaluator_malfunction(result) is True
     assert "retry failed" in result.reasoning.lower()
 
 

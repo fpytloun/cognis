@@ -31,7 +31,7 @@ from cognis.core.agent_loop import (
 from cognis.core.events import Event, EventBus, EventType
 from cognis.core.followups import FollowUpMetadata, FollowUpPolicy
 from cognis.core.runtime import ResolvedStepRuntime
-from cognis.core.step_evaluator import StepEvaluator
+from cognis.core.step_evaluator import StepEvaluator, is_evaluator_malfunction
 from cognis.core.workflow_registry import WorkflowRegistry
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
@@ -394,6 +394,19 @@ class WorkflowEngine:
                         continue
 
                     elif evaluation.decision == "failed":
+                        if is_evaluator_malfunction(evaluation):
+                            logger.error(
+                                "Evaluator malfunction failed workflow",
+                                extra={
+                                    "extra_data": {
+                                        "task_id": task.task_id,
+                                        "step": step_def.name,
+                                        "reasoning": evaluation.reasoning,
+                                    }
+                                },
+                            )
+                            state.status = "failed"
+                            break
                         exhausted_action = self._get_on_exhausted(step_def, workflow)
                         handled = await self._handle_exhausted(
                             task, step_def, state, workflow, exhausted_action
