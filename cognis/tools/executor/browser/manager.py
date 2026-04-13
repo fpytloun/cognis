@@ -405,14 +405,31 @@ class BrowserManager:
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )
-        await asyncio.sleep(0.2)
-        if proc.returncode is not None:
-            raise RuntimeError("Failed to start Xvfb for headed browser mode")
+        await self._wait_for_virtual_display_ready(display=display, proc=proc)
         os.environ["DISPLAY"] = display
         self._xvfb_process = proc
         self._xvfb_display = display
         self._claimed_displays.add(display)
         logger.info("browser: started xvfb display", extra={"extra_data": {"display": display}})
+
+    async def _wait_for_virtual_display_ready(
+        self,
+        *,
+        display: str,
+        proc: asyncio.subprocess.Process,
+        timeout_seconds: float = 5.0,
+        poll_interval_seconds: float = 0.05,
+    ) -> None:
+        display_number = display.removeprefix(":").split(".", 1)[0]
+        socket_path = Path("/tmp/.X11-unix") / f"X{display_number}"
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            if proc.returncode is not None:
+                raise RuntimeError("Failed to start Xvfb for headed browser mode")
+            if socket_path.exists():
+                return
+            await asyncio.sleep(poll_interval_seconds)
+        raise RuntimeError(f"Timed out waiting for Xvfb display {display} to become ready")
 
     def _active_display(self, *, headless: bool) -> str | None:
         if headless:

@@ -89,6 +89,29 @@ async def test_browser_manager_restores_display_after_virtual_display_cleanup(
 
 
 @pytest.mark.asyncio
+async def test_browser_manager_waits_for_virtual_display_socket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Proc:
+        returncode = None
+
+    manager = BrowserManager(xvfb_auto=True)
+    checks = {"count": 0}
+
+    def _fake_exists(self: Path) -> bool:
+        if str(self) != "/tmp/.X11-unix/X99":
+            return False
+        checks["count"] += 1
+        return checks["count"] >= 3
+
+    monkeypatch.setattr(Path, "exists", _fake_exists)
+
+    await manager._wait_for_virtual_display_ready(display=":99", proc=_Proc())  # noqa: SLF001
+
+    assert checks["count"] == 3
+
+
+@pytest.mark.asyncio
 async def test_browser_manager_list_sessions_hides_idle_without_closing() -> None:
     manager = BrowserManager(idle_timeout_seconds=60)
 
