@@ -43,6 +43,7 @@ TASK_TOOL_NAMES = {
     "update_task",
     "cancel_task",
     "retry_task",
+    "resolve_task_pause",
 }
 ORCHESTRATION_TOOL_NAMES = SUBSESSION_TOOL_NAMES | TASK_TOOL_NAMES
 
@@ -398,6 +399,41 @@ RETRY_TASK_TOOL = ToolDefinition(
     read_only=False,
 )
 
+RESOLVE_TASK_PAUSE_TOOL = ToolDefinition(
+    name="resolve_task_pause",
+    description=(
+        "Resolve a paused workflow task gate. Use this when a task is paused and a human "
+        "wants to retry the blocked step, continue anyway, or cancel the task. An optional "
+        "note is passed into the next step as a one-shot operator instruction for retry or "
+        "continue actions."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": "ID of the paused task.",
+            },
+            "action": {
+                "type": "string",
+                "enum": ["retry", "continue", "cancel"],
+                "description": "How to resolve the paused workflow gate.",
+            },
+            "note": {
+                "type": "string",
+                "description": (
+                    "Optional human instruction to carry into the next step when retrying or "
+                    "continuing."
+                ),
+            },
+        },
+        "required": ["task_id", "action"],
+    },
+    source=ToolSource(type="builtin"),
+    category="orchestration",
+    read_only=False,
+)
+
 
 # ---------------------------------------------------------------------------
 # Tool collections by orchestration mode
@@ -419,6 +455,7 @@ _ALL_TASK_TOOLS = [
     UPDATE_TASK_TOOL,
     CANCEL_TASK_TOOL,
     RETRY_TASK_TOOL,
+    RESOLVE_TASK_PAUSE_TOOL,
 ]
 
 # Sync-only delegate for task steps (no wait parameter exposed — always sync)

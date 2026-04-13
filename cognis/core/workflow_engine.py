@@ -247,7 +247,8 @@ class WorkflowEngine:
                 if step_def.type == "gate":
                     gate_result = await self._handle_gate_step(task, step_def, state, workflow)
                     if gate_result == "cancel":
-                        state.status = "failed"
+                        state.status = "cancelled"
+                        state.last_operator_instruction = None
                         break
                     revise_target = _parse_revise_action(gate_result)
                     if revise_target is not None:
@@ -475,6 +476,7 @@ class WorkflowEngine:
                 state.pending_pause_payload = None
                 state.last_evaluation_feedback = None
                 state.last_revision_context = None
+                state.last_operator_instruction = None
                 state.current_step_index += 1
                 await self._persist_workflow_state(task)
 
@@ -785,7 +787,7 @@ class WorkflowEngine:
             step_definition=step_def,
             step_output=step_output,
             step_inputs=step_inputs,
-            task_context=task.description,
+            task_context=self._build_step_task_context(task, state),
         )
 
     async def _handle_gate_step(
@@ -928,6 +930,9 @@ class WorkflowEngine:
         try:
             resolution = await self._pause_waiter.wait(pause_id, timeout=3600.0)
             action = resolution.decision
+            instruction = str(
+                resolution.data.get("note") or resolution.data.get("feedback") or ""
+            ).strip()
         except TimeoutError:
             logger.warning(
                 "Gate timed out after 3600s, defaulting to continue",
@@ -940,6 +945,7 @@ class WorkflowEngine:
                 },
             )
             action = "continue"
+            instruction = ""
 
         GATES_TOTAL.labels(action=action).inc()
 
@@ -948,6 +954,8 @@ class WorkflowEngine:
         state.current_step_status = "running"
         state.pending_pause_type = None
         state.pending_pause_payload = None
+        if instruction and action != "cancel":
+            state.last_operator_instruction = instruction
         task.status = TaskStatus.RUNNING
         await self._persist_workflow_state(task, sync_status=True)
 
@@ -1115,6 +1123,7 @@ class WorkflowEngine:
         if route is None:
             state.last_evaluation_feedback = None
             state.last_revision_context = None
+            state.last_operator_instruction = None
             return "continue"
         action = route.action
 
@@ -1133,6 +1142,7 @@ class WorkflowEngine:
         if action == "continue":
             state.last_evaluation_feedback = None
             state.last_revision_context = None
+            state.last_operator_instruction = None
             return "continue"
         if action == "fail":
             return "failed"
@@ -1303,6 +1313,18 @@ class WorkflowEngine:
             parts.append(f"\n\nReviewer Claims:\n{claims_text}")
         return "".join(parts)
 
+    def _build_step_task_context(self, task: TaskModel, state: WorkflowState) -> str:
+        """Build evaluator task context with any one-shot operator instruction."""
+
+        parts: list[str] = []
+        if task.description:
+            parts.append(task.description)
+        if state.last_operator_instruction:
+            parts.append(
+                f"Operator instruction for this step: {state.last_operator_instruction.strip()}"
+            )
+        return "\n\n".join(part for part in parts if part).strip()
+
     async def _record_evaluation_feedback(
         self,
         task: TaskModel,
@@ -1387,6 +1409,7 @@ class WorkflowEngine:
             # Skip and advance — record the skipped step so the final
             # task status reflects that not all steps succeeded.
             state.skipped_steps.append(step_def.name)
+            state.last_operator_instruction = None
             logger.warning(
                 "Step skipped due to exhaustion",
                 extra={
@@ -1430,7 +1453,11 @@ class WorkflowEngine:
                 await self._persist_workflow_state(task)
                 return True
             elif result == "cancel":
-                return False
+                state.status = "cancelled"
+                state.last_operator_instruction = None
+                state.current_step_index = len(workflow.steps)
+                await self._persist_workflow_state(task)
+                return True
             revise_target = _parse_revise_action(result)
             if revise_target is not None:
                 target_idx = self._find_step_index(workflow, revise_target)

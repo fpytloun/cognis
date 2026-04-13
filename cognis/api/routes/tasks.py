@@ -260,8 +260,7 @@ async def gate_response(
 ) -> TaskActionResponse:
     forbid_mutation_for_viewer(request)
     task = await _require_task(request, task_id)
-    if payload.feedback:
-        await _update_last_feedback(request, task_id, task.workflow_state, payload.feedback)
+    note = (payload.feedback or "").strip()
 
     # Try the unified notification service first
     svc = getattr(request.app.state, "notification_service", None)
@@ -274,9 +273,11 @@ async def gate_response(
             ok = await svc_typed.resolve(
                 notif.notification_id,
                 payload.action,
-                {"feedback": payload.feedback or ""},
+                {"note": note},
             )
             if ok:
+                if _should_store_operator_instruction(payload.action, note):
+                    await _update_operator_instruction(request, task_id, task.workflow_state, note)
                 return TaskActionResponse(ok=True, task_id=task_id, status=str(task.status))
             raise api_exception(409, "conflict", "Gate has already been resolved")
         # Check if there's a recently resolved gate (409 vs 404)
@@ -304,10 +305,12 @@ async def gate_response(
         raise api_exception(404, "not_found", "No pending gate for task")
     ok = request.app.state.pause_waiter.resolve(
         pause.pause_id,
-        PauseResolution(decision=payload.action, data={"feedback": payload.feedback or ""}),
+        PauseResolution(decision=payload.action, data={"note": note}),
     )
     if not ok:
         raise api_exception(409, "conflict", "Pause has already been resolved")
+    if _should_store_operator_instruction(payload.action, note):
+        await _update_operator_instruction(request, task_id, task.workflow_state, note)
     return TaskActionResponse(ok=True, task_id=task_id, status=str(task.status))
 
 
@@ -486,18 +489,26 @@ async def _validate_conversation_access(request: Request, conversation_id: str |
     require_owner_or_admin(request, row.user_email)
 
 
-async def _update_last_feedback(
+async def _update_operator_instruction(
     request: Request,
     task_id: str,
     workflow_state: WorkflowState | None,
-    feedback: str,
+    instruction: str,
 ) -> None:
     if workflow_state is None:
         return
-    workflow_state.last_evaluation_feedback = feedback
+    workflow_state.last_operator_instruction = instruction
     async with request.app.state.session_factory() as session:
         await update_task_workflow_state(session, task_id, workflow_state.model_dump(mode="json"))
         await session.commit()
+
+
+def _should_store_operator_instruction(action: str, note: str) -> bool:
+    """Return whether a resolved gate action should persist a one-shot instruction."""
+
+    if not note:
+        return False
+    return action == "continue" or action.startswith("revise(")
 
 
 async def _build_workflow_run_response(

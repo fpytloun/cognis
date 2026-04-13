@@ -233,6 +233,7 @@ class WorkflowState(BaseModel):
     skipped_steps: list[str] = Field(default_factory=list)  # Steps skipped due to exhaustion
     last_evaluation_feedback: str | None = None  # Feedback from evaluator for retries
     last_revision_context: str | None = None  # Full reviewer output for backward revisions
+    last_operator_instruction: str | None = None  # One-shot human instruction for next step
     pending_pause_type: (
         Literal["gate", "step_input", "credential_request", "auth_challenge"] | None
     ) = None

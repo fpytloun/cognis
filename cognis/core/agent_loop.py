@@ -207,6 +207,12 @@ def _find_gate_revise_action(pause: PendingPause) -> str | None:
     return None
 
 
+def _extract_operator_note(arguments: dict[str, Any]) -> str:
+    """Extract an optional human operator note from task-pause tool arguments."""
+
+    return str(arguments.get("note") or arguments.get("feedback") or "").strip()
+
+
 def _append_tool_call_event(
     events: list[SessionEvent],
     tc: ToolCall,
@@ -3370,13 +3376,24 @@ class AgentLoop:
                 ),
             )
 
-        elif tc.name == "retry_task":
+        elif tc.name in {"retry_task", "resolve_task_pause"}:
             task_id = tc.arguments.get("task_id", "")
             task_queue = self._task_queue
             if task_queue is None:
                 return ToolResult(
                     output=json.dumps({"error": "Task queue is not available."}), is_error=True
                 )
+            requested_action = (
+                "retry" if tc.name == "retry_task" else str(tc.arguments.get("action", "retry"))
+            )
+            if requested_action not in {"retry", "continue", "cancel"}:
+                return ToolResult(
+                    output=json.dumps(
+                        {"error": ("Unsupported action. Use one of: retry, continue, cancel.")}
+                    ),
+                    is_error=True,
+                )
+            note = _extract_operator_note(tc.arguments)
             async with self.session_manager.session_factory() as db:
                 task_row = await get_task(db, task_id)
                 if task_row is None:
@@ -3404,35 +3421,56 @@ class AgentLoop:
                     pause = pauses[0]
 
                     if pause.pause_type == "gate":
-                        # For gates: use the gate's revise action if available
-                        # (contains the correct original step name, not the
-                        # synthetic gate name like "research_exhausted")
-                        gate_action = _find_gate_revise_action(pause)
-                        if gate_action:
-                            self.pause_waiter.resolve(
-                                pause.pause_id,
-                                PauseResolution(decision=gate_action, data={}),
-                            )
+                        if requested_action == "retry":
+                            gate_action = _find_gate_revise_action(pause)
+                            if gate_action:
+                                self.pause_waiter.resolve(
+                                    pause.pause_id,
+                                    PauseResolution(
+                                        decision=gate_action,
+                                        data={"note": note},
+                                    ),
+                                )
+                                return ToolResult(
+                                    output=json.dumps(
+                                        {
+                                            "status": "retrying",
+                                            "task_id": task_id,
+                                            "message": f"Retrying: resolved gate with '{gate_action}'.",
+                                            "note_applied": bool(note),
+                                        }
+                                    ),
+                                )
                             return ToolResult(
                                 output=json.dumps(
                                     {
-                                        "status": "retrying",
-                                        "task_id": task_id,
-                                        "message": f"Retrying: resolved gate with '{gate_action}'.",
+                                        "error": (
+                                            "This paused gate does not offer a retry action. "
+                                            "Use continue or cancel instead."
+                                        )
                                     }
                                 ),
+                                is_error=True,
                             )
-                        # No revise option — resolve with "continue" (skip step)
+
+                        gate_decision = "continue" if requested_action == "continue" else "cancel"
                         self.pause_waiter.resolve(
                             pause.pause_id,
-                            PauseResolution(decision="continue", data={}),
+                            PauseResolution(decision=gate_decision, data={"note": note}),
                         )
                         return ToolResult(
                             output=json.dumps(
                                 {
-                                    "status": "continuing",
+                                    "status": (
+                                        "continuing" if gate_decision == "continue" else "cancelled"
+                                    ),
                                     "task_id": task_id,
-                                    "message": "Gate resolved with 'continue' (step skipped).",
+                                    "message": (
+                                        "Gate resolved with 'continue'."
+                                        if gate_decision == "continue"
+                                        else "Gate resolved with 'cancel'."
+                                    ),
+                                    "note_applied": bool(note),
                                 }
                             ),
                         )
@@ -4139,6 +4177,14 @@ class AgentLoop:
         if revision_context:
             parts.append(f"\n\n## Revision Context\n\n{revision_context}")
             ctx.workflow_state.last_revision_context = None
+
+        operator_instruction = getattr(ctx.workflow_state, "last_operator_instruction", None)
+        if operator_instruction:
+            parts.append(
+                "\n\n## Operator Instruction\n\n"
+                "A human explicitly chose to continue or retry the workflow with this "
+                f"instruction:\n\n{operator_instruction}"
+            )
 
         parts.append(
             "\n\n---\n"

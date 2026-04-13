@@ -1700,8 +1700,9 @@ def _build_follow_up_prompt(
             lines.append(
                 "\nExplain to the user why the task paused and what their options "
                 "are. If the task exhausted its retry attempts, explain what went "
-                "wrong. The user can retry the step (use `retry_task`), or cancel "
-                "the task. Do NOT retry automatically — let the user decide."
+                "wrong. The user can resolve the paused gate with `resolve_task_pause` "
+                "(retry, continue, or cancel). Do NOT choose automatically — let the "
+                "user decide."
             )
             return "\n".join(lines)
 

@@ -54,6 +54,25 @@ def _build_engine() -> WorkflowEngine:
     )
 
 
+def test_build_step_task_context_includes_operator_instruction() -> None:
+    engine = _build_engine()
+
+    task_context = engine._build_step_task_context(
+        TaskModel(
+            task_id="task-1",
+            title="Task",
+            description="Build feature",
+            created_by="user@example.com",
+            agent_id="agent-1",
+        ),
+        WorkflowState(last_operator_instruction="Incorporate the review and continue."),
+    )
+
+    assert "Build feature" in task_context
+    assert "Operator instruction for this step" in task_context
+    assert "Incorporate the review and continue." in task_context
+
+
 @pytest.mark.asyncio
 async def test_handle_step_outcome_routes_rejected_step_to_prior_step(
     monkeypatch: pytest.MonkeyPatch,
@@ -498,3 +517,37 @@ async def test_execute_workflow_preserves_cancelled_status_from_outcome_gate(
     assert result.status == "cancelled"
     assert result.workflow_state is not None
     assert result.workflow_state.status == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_handle_exhausted_gate_cancel_marks_task_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _build_engine()
+    task = TaskModel(
+        task_id="task-1", title="Task", created_by="user@example.com", agent_id="agent-1"
+    )
+    workflow = Workflow(
+        workflow_id="wf:test", name="Test", steps=[StepDefinition(name="plan", type="run")]
+    )
+    state = WorkflowState(current_step_index=0)
+
+    async def _handle_gate_step(*args: object, **kwargs: object) -> str:
+        del args, kwargs
+        return "cancel"
+
+    persisted: list[tuple[str, int]] = []
+
+    async def _persist(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        persisted.append((state.status, state.current_step_index))
+
+    monkeypatch.setattr(engine, "_handle_gate_step", _handle_gate_step)
+    monkeypatch.setattr(engine, "_persist_workflow_state", _persist)
+
+    handled = await engine._handle_exhausted(task, workflow.steps[0], state, workflow, "gate")
+
+    assert handled is True
+    assert state.status == "cancelled"
+    assert state.current_step_index == len(workflow.steps)
+    assert persisted == [("cancelled", len(workflow.steps))]

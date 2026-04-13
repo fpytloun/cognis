@@ -614,7 +614,12 @@
               </div>
 
               {#if task.pending_pause.pause_type === 'gate'}
-                <textarea bind:value={gateFeedback} class="min-h-[110px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500" placeholder="Optional review feedback"></textarea>
+                <div class="space-y-2">
+                  <p class="text-sm text-slate-400">
+                    Optional instruction for the next step. This is applied when you retry or continue.
+                  </p>
+                  <textarea bind:value={gateFeedback} class="min-h-[110px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500" placeholder="Optional instruction, for example: incorporate the last review and continue with implementation"></textarea>
+                </div>
                 <div class="flex flex-wrap gap-2">
                   {#each task.pending_pause.options ?? [] as option}
                     <Button size="sm" onclick={() => respondToGate(String(option.action ?? 'continue'))}>{String(option.label ?? option.action ?? 'continue')}</Button>
@@ -622,7 +627,7 @@
                   {#if (task.pending_pause.options ?? []).length === 0}
                     <Button size="sm" onclick={() => respondToGate('continue')}>Continue</Button>
                   {/if}
-                  <Button size="sm" variant="secondary" onclick={cancelTask}>Cancel task</Button>
+                  <Button size="sm" variant="secondary" onclick={() => respondToGate('cancel')}>Cancel task</Button>
                 </div>
               {:else}
                 <textarea bind:value={stepResponse} class="min-h-[110px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500" placeholder="Provide the answer that resumes the current step"></textarea>

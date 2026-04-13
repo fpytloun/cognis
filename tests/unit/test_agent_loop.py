@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
@@ -13,6 +14,7 @@ from cognis.core.agent_loop import (
     AgentLoop,
     PauseResolution,
     PauseWaiter,
+    PendingPause,
     SessionLock,
     StepContext,
     StreamAccumulator,
@@ -22,7 +24,7 @@ from cognis.core.agent_loop import (
 from cognis.core.runtime import ResolvedStepRuntime, build_local_executor_environment
 from cognis.models.agent import AgentDefinition, AgentPermissions
 from cognis.models.session import EventAppendResult, ReasoningReportResult
-from cognis.models.tool import Permission, ToolDefinition, ToolSource
+from cognis.models.tool import Permission, ToolCall, ToolDefinition, ToolSource
 from cognis.models.workflow import StepDefinition, StepOutput, WorkflowState
 from cognis.tools.builtin.tool_search import SEARCH_TOOLS_TOOL
 
@@ -804,3 +806,108 @@ def test_build_step_prompt_includes_revision_context() -> None:
     assert "## Revision Context" in prompt
     assert "Full review text." in prompt
     assert workflow_state.last_revision_context is None
+
+
+def test_build_step_prompt_includes_operator_instruction() -> None:
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=SimpleNamespace(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    workflow_state = WorkflowState(last_operator_instruction="Incorporate the review and continue.")
+    ctx = StepContext(
+        step_definition=StepDefinition(name="implement", type="run", prompt="Implement the plan."),
+        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=WORKFLOW_POLICY,
+        workflow_state=workflow_state,
+        workflow_steps=[StepDefinition(name="implement", type="run")],
+        step_index=0,
+    )
+
+    prompt = agent_loop._build_step_prompt(ctx)
+
+    assert "## Operator Instruction" in prompt
+    assert "Incorporate the review and continue." in prompt
+
+
+@pytest.mark.asyncio
+async def test_resolve_task_pause_tool_retries_gate_with_note() -> None:
+    pause_waiter = PauseWaiter()
+    pause_waiter.register(
+        PendingPause(
+            pause_id="gate-1",
+            pause_type="gate",
+            task_id="task-1",
+            step_name="review",
+            options=[{"label": "Retry step", "action": "revise(plan)"}],
+        )
+    )
+
+    class _TaskSessionManager(_NoopSessionManager):
+        def session_factory(self) -> object:
+            class _Dummy:
+                async def __aenter__(self) -> SimpleNamespace:
+                    return SimpleNamespace()
+
+                async def __aexit__(self, exc_type: object, exc: object, tb: object) -> bool:
+                    return False
+
+            return _Dummy()
+
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=SimpleNamespace(), guardrails=_NoopGuardrails()),
+        session_manager=_TaskSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=pause_waiter,
+    )
+    agent_loop._task_queue = SimpleNamespace()
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+    )
+
+    async def _get_task(*args: object, **kwargs: object) -> SimpleNamespace:
+        del args, kwargs
+        return SimpleNamespace(task_id="task-1", agent_id="agent-1", status="paused")
+
+    from unittest.mock import patch
+
+    with patch("cognis.store.queries.get_task", _get_task):
+        result = await agent_loop._handle_orchestration_tool(
+            ToolCall(
+                call_id="call-1",
+                name="resolve_task_pause",
+                arguments={
+                    "task_id": "task-1",
+                    "action": "retry",
+                    "note": "Incorporate the review and continue.",
+                },
+            ),
+            ctx=ctx,
+            events_to_record=[],
+        )
+
+    payload = json.loads(result.output)
+    assert payload["status"] == "retrying"
+    assert payload["note_applied"] is True
+    resolution = await pause_waiter.wait("gate-1", timeout=0.01)
+    assert resolution.decision == "revise(plan)"
+    assert resolution.data == {"note": "Incorporate the review and continue."}
