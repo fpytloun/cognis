@@ -23,7 +23,7 @@ from cognis.core.runtime import ResolvedStepRuntime, build_local_executor_enviro
 from cognis.models.agent import AgentDefinition, AgentPermissions
 from cognis.models.session import EventAppendResult, ReasoningReportResult
 from cognis.models.tool import Permission, ToolDefinition, ToolSource
-from cognis.models.workflow import StepDefinition, StepOutput
+from cognis.models.workflow import StepDefinition, StepOutput, WorkflowState
 from cognis.tools.builtin.tool_search import SEARCH_TOOLS_TOOL
 
 # ---------------------------------------------------------------------------
@@ -770,3 +770,37 @@ async def test_step_complete_validation_reprompts_and_accepts_corrected_payload(
     second_prompt = str(fake_llm.calls[1][-1]["content"])
     assert "invalid_step_complete_arguments" in second_prompt
     assert "outcome.reason" in second_prompt
+
+
+def test_build_step_prompt_includes_revision_context() -> None:
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=SimpleNamespace(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    workflow_state = WorkflowState(
+        last_revision_context="The previous step `architect_review` requested revisions.\n\nReviewer Output:\nFull review text."
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="plan", type="run", prompt="Produce a plan."),
+        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=WORKFLOW_POLICY,
+        workflow_state=workflow_state,
+        workflow_steps=[StepDefinition(name="plan", type="run")],
+        step_index=0,
+    )
+
+    prompt = agent_loop._build_step_prompt(ctx)
+
+    assert "## Revision Context" in prompt
+    assert "Full review text." in prompt
+    assert workflow_state.last_revision_context is None

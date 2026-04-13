@@ -4135,6 +4135,11 @@ class AgentLoop:
         if feedback:
             parts.append(f"\n\n## Revision Feedback\n\n{feedback}")
 
+        revision_context = getattr(ctx.workflow_state, "last_revision_context", None)
+        if revision_context:
+            parts.append(f"\n\n## Revision Context\n\n{revision_context}")
+            ctx.workflow_state.last_revision_context = None
+
         parts.append(
             "\n\n---\n"
             "When you have completed the objective, write out your findings and "

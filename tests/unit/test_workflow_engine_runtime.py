@@ -84,6 +84,7 @@ async def test_handle_step_outcome_routes_rejected_step_to_prior_step(
     state = WorkflowState(current_step_index=1, loop_iterations={"attempts:plan": 2})
     step_result = StepOutput(
         summary="review complete",
+        content="Full architect review with verdict REQUEST REWORK",
         outputs={"verdict": "REQUEST REWORK"},
         claims=["Completed review"],
         outcome=StepOutcome(status="rejected", reason="Plan needs revision."),
@@ -108,6 +109,9 @@ async def test_handle_step_outcome_routes_rejected_step_to_prior_step(
     assert state.current_step_index == 0
     assert "attempts:plan" not in state.loop_iterations
     assert state.last_evaluation_feedback == "Plan needs revision."
+    assert state.last_revision_context is not None
+    assert "Reviewer Output:" in state.last_revision_context
+    assert "REQUEST REWORK" in state.last_revision_context
     assert persisted == [0]
 
 

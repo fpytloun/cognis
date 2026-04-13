@@ -474,6 +474,7 @@ class WorkflowEngine:
                 state.pending_pause_type = None
                 state.pending_pause_payload = None
                 state.last_evaluation_feedback = None
+                state.last_revision_context = None
                 state.current_step_index += 1
                 await self._persist_workflow_state(task)
 
@@ -1113,6 +1114,7 @@ class WorkflowEngine:
         route = self._resolve_outcome_route(step_def, outcome_status)
         if route is None:
             state.last_evaluation_feedback = None
+            state.last_revision_context = None
             return "continue"
         action = route.action
 
@@ -1130,6 +1132,7 @@ class WorkflowEngine:
 
         if action == "continue":
             state.last_evaluation_feedback = None
+            state.last_revision_context = None
             return "continue"
         if action == "fail":
             return "failed"
@@ -1163,6 +1166,7 @@ class WorkflowEngine:
             )
             if gate_result == "continue":
                 state.last_evaluation_feedback = None
+                state.last_revision_context = None
                 state.current_step_index += 1
                 await self._persist_workflow_state(task)
                 return "routed"
@@ -1190,6 +1194,7 @@ class WorkflowEngine:
             state.current_step_index = target_idx
             state.loop_iterations.pop(f"attempts:{revise_target}", None)
             state.last_evaluation_feedback = outcome.reason if outcome else None
+            state.last_revision_context = self._build_revision_context(step_def, step_result)
             await self._persist_workflow_state(task)
             return "routed"
 
@@ -1223,6 +1228,7 @@ class WorkflowEngine:
             state.current_step_index = target_idx
             state.loop_iterations.pop(f"attempts:{revise_target}", None)
             state.last_evaluation_feedback = outcome.reason if outcome else None
+            state.last_revision_context = self._build_revision_context(step_def, step_result)
             await self._persist_workflow_state(task)
             return "routed"
 
@@ -1277,6 +1283,25 @@ class WorkflowEngine:
         if outcome_status == "success":
             return None
         return SimpleNamespace(action="fail", max_loop_iterations=None, on_exhausted="fail")
+
+    def _build_revision_context(self, step_def: StepDefinition, step_result: StepOutput) -> str:
+        """Build revision context from the rejecting step's final assistant output."""
+
+        parts = [
+            f"The previous step `{step_def.name}` completed successfully but requested revisions."
+        ]
+        if step_result.outcome is not None:
+            parts.append(f"\n\nOutcome: {step_result.outcome.status}")
+            if step_result.outcome.reason:
+                parts.append(f"\nReason: {step_result.outcome.reason}")
+        if step_result.summary:
+            parts.append(f"\n\nSummary:\n{step_result.summary}")
+        if step_result.content:
+            parts.append(f"\n\nReviewer Output:\n{step_result.content}")
+        elif step_result.claims:
+            claims_text = "\n".join(f"- {claim}" for claim in step_result.claims)
+            parts.append(f"\n\nReviewer Claims:\n{claims_text}")
+        return "".join(parts)
 
     async def _record_evaluation_feedback(
         self,
