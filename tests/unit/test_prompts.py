@@ -6,9 +6,18 @@ from cognis.core.prompts import PromptContext, build_system_instructions
 def test_chat_prompt_describes_turn_local_todos() -> None:
     instructions = build_system_instructions(PromptContext.CHAT)
     assert instructions is not None
-    assert "Chat todos are optional" in instructions
+    assert "Chat todos are optional, rare" in instructions
     assert "Do not create todos while only presenting a plan" in instructions
     assert "current turn" in instructions
+    assert "Prefer delegation for non-trivial work" in instructions
+    assert '"explore", "analyze", "research", "synthesize", or "write the answer"' in instructions
+
+
+def test_chat_prompt_discourages_ceremonial_todos() -> None:
+    instructions = build_system_instructions(PromptContext.CHAT)
+    assert instructions is not None
+    assert "If the work is simple enough to keep in working memory" in instructions
+    assert "delegate or create a task instead of using chat todos" in instructions
 
 
 def test_task_step_prompt_requires_todos_for_non_trivial_work() -> None:

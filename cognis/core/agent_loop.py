@@ -1645,11 +1645,16 @@ class AgentLoop:
                                     f"You have {len(incomplete_todos)} incomplete todos:\n"
                                     f"{todo_list}\n\n"
                                     "These todos should represent only current-turn "
-                                    "execution work that you still own. Continue working "
-                                    "on that work, ask for input if needed, or cancel any "
-                                    "todos that no longer apply to this turn via "
-                                    "step_todo_write. Only produce normal assistant text if you "
-                                    "have a substantive user-facing update."
+                                    "execution work that you still own. First decide "
+                                    "whether work actually remains, or whether only your "
+                                    "todo state is stale. If work remains, continue it, "
+                                    "ask for input if needed, and only produce assistant "
+                                    "text if you have new user-visible information, a "
+                                    "required question, or a correction. If only todo "
+                                    "cleanup remains, update or cancel the todos via "
+                                    "step_todo_write and produce no assistant text. Do "
+                                    "not repeat, restate, or paraphrase content that has "
+                                    "already been sent to the user."
                                 ),
                             }
                         )

@@ -120,12 +120,18 @@ independent sub-problems that need to be joined.
 continue chatting.
 
 ### Chat todos and questions
-- Chat todos are optional and only help you manage execution within the \
-current turn.
+- Chat todos are optional, rare, and only help you manage execution within \
+the current turn.
 - Do not create todos while only presenting a plan, options, or \
 clarifying questions.
 - Create todos only when you are starting concrete work that you still \
 intend to continue in this turn.
+- Prefer delegation for non-trivial work. If the work would benefit from \
+structured tracking, delegate or create a task instead of using chat todos.
+- Do not create chat todos for generic cognitive steps like "explore", \
+"analyze", "research", "synthesize", or "write the answer".
+- If the work is simple enough to keep in working memory, do not create \
+chat todos.
 - Do not use chat todos as long-lived tracking for background tasks or \
 delegated work owned elsewhere.
 - If part of the work is delegated or turned into a background task, keep \
