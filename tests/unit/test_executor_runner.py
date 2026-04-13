@@ -238,3 +238,23 @@ async def test_failed_reconfigure_preserves_previous_config(
     assert "read" in runner._tool_handlers
     assert "glob" not in runner._tool_handlers
     assert ws.sent[-1]["error"]["message"].startswith("Executor configure failed")
+
+
+@pytest.mark.asyncio
+async def test_runner_shutdown_cleans_browser_manager() -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    cleaned: list[str] = []
+
+    class _BrowserManager:
+        async def cleanup(self) -> None:
+            cleaned.append("cleanup")
+
+    async def _fake_connect_and_serve() -> None:
+        runner._runtime_metadata["browser_manager"] = _BrowserManager()
+        runner._running = False
+
+    runner._connect_and_serve = _fake_connect_and_serve  # type: ignore[method-assign]
+
+    await runner.run()
+
+    assert cleaned == ["cleanup"]

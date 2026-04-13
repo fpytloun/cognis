@@ -44,6 +44,7 @@ class BrowserSession:
     console_events: list[dict[str, Any]] = field(default_factory=list)
     network_events: list[dict[str, Any]] = field(default_factory=list)
     last_used_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    runtime_generation: int = 0
 
 
 class BrowserManager:
@@ -90,9 +91,12 @@ class BrowserManager:
         self._lock = asyncio.Lock()
         self._xvfb_process: asyncio.subprocess.Process | None = None
         self._xvfb_display: str | None = None
-        self._previous_display: str | None = None
         self._claimed_displays: set[str] = set()
         self._reserved_profile_ids: set[str] = set()
+        self._runtime_generation = 0
+        self._playwright_display: str | None = None
+        self._headed_open_in_flight = 0
+        self._open_in_flight = 0
 
     @property
     def active_session_count(self) -> int:
@@ -145,16 +149,15 @@ class BrowserManager:
         if not headless and not self.headed_allowed:
             raise RuntimeError("Headed browser mode is not enabled on this executor")
         async with self._lock:
+            if self._browser is not None and self._launch_headless == headless:
+                return
             if self._browser is not None:
-                if self._launch_headless != headless:
+                if self._has_live_sessions_for_generation_locked(self._runtime_generation):
                     raise RuntimeError(
                         "Browser runtime already initialized with a different headless mode"
                     )
-                return
-            await self._ensure_playwright_ready(headless=headless)
-            browser_launcher = getattr(self._playwright, self.engine)
-            self._browser = await browser_launcher.launch(**self._launch_kwargs(headless=headless))
-            self._launch_headless = headless
+                await self._close_shared_browser_locked()
+            await self._launch_shared_browser_locked(headless=headless)
 
     async def open_session(
         self,
@@ -167,69 +170,126 @@ class BrowserManager:
         profile_id: str | None = None,
     ) -> BrowserSession:
         await self._cleanup_idle_sessions()
-        if session_id in self._sessions:
-            session = self._sessions[session_id]
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is not None and not self._session_is_idle(session):
+                session.last_used_at = datetime.now(UTC)
+        if session is not None and not self._session_is_idle(session):
             await session.page.goto(url)
-            session.last_used_at = datetime.now(UTC)
             return session
-        if len(self._sessions) >= self.max_sessions:
-            raise RuntimeError("Browser session limit exceeded")
         resolved_mode, resolved_profile_id = self._resolve_profile_settings(
             profile_mode=profile_mode,
             profile_id=profile_id,
             url=url,
         )
-        if resolved_mode == "persistent_local":
-            await self._reserve_profile_id(str(resolved_profile_id))
-            try:
-                context, page, user_data_dir, display = await self._open_persistent_context(
+        async with self._lock:
+            if len(self._sessions) + self._open_in_flight >= self.max_sessions:
+                raise RuntimeError("Browser session limit exceeded")
+            self._open_in_flight += 1
+            if not headless:
+                self._headed_open_in_flight += 1
+        try:
+            if resolved_mode == "persistent_local":
+                await self._reserve_profile_id(str(resolved_profile_id))
+                (
+                    context,
+                    page,
+                    user_data_dir,
+                    display,
+                    runtime_generation,
+                ) = await self._open_persistent_context(
                     url=url,
                     headless=headless,
                     auth_state=auth_state,
                     profile_id=resolved_profile_id,
                 )
-            finally:
-                self._reserved_profile_ids.discard(str(resolved_profile_id))
-            session = BrowserSession(
-                session_id=session_id,
-                context=context,
-                page=page,
-                auth_origin=url,
-                profile_mode=resolved_mode,
-                profile_id=resolved_profile_id,
-                user_data_dir=str(user_data_dir),
-                headless=headless,
-                display=display,
-            )
-            self._sessions[session_id] = session
+                session = BrowserSession(
+                    session_id=session_id,
+                    context=context,
+                    page=page,
+                    auth_origin=url,
+                    profile_mode=resolved_mode,
+                    profile_id=resolved_profile_id,
+                    user_data_dir=str(user_data_dir),
+                    headless=headless,
+                    display=display,
+                    runtime_generation=runtime_generation,
+                )
+                try:
+                    async with self._lock:
+                        self._register_session_locked(session)
+                        self._reserved_profile_ids.discard(str(resolved_profile_id))
+                except Exception:
+                    await context.close()
+                    raise
+                self._log_lifecycle(
+                    "browser_session_open",
+                    outcome="success",
+                    session=session,
+                )
+                try:
+                    await self._attach_session_observers(session)
+                    await page.goto(url)
+                except Exception:
+                    await self.close_session(session_id)
+                    raise
+            else:
+                await self.ensure_runtime(headless=headless)
+                browser = self._browser
+                runtime_generation = self._runtime_generation
+                display = self._active_display(headless=headless)
+                context = await browser.new_context(**self._context_kwargs(auth_state=auth_state))
+                await self._apply_context_defaults(context)
+                page = await context.new_page()
+                session = BrowserSession(
+                    session_id=session_id,
+                    context=context,
+                    page=page,
+                    auth_origin=url,
+                    profile_mode=resolved_mode,
+                    profile_id=resolved_profile_id,
+                    headless=headless,
+                    display=display,
+                    runtime_generation=runtime_generation,
+                )
+                try:
+                    async with self._lock:
+                        self._register_session_locked(session)
+                    self._log_lifecycle(
+                        "browser_session_open",
+                        outcome="success",
+                        session=session,
+                    )
+                except Exception:
+                    await context.close()
+                    raise
+                try:
+                    await self._attach_session_observers(session)
+                    await page.goto(url)
+                except Exception:
+                    await self.close_session(session_id)
+                    raise
+        finally:
             try:
-                await self._attach_session_observers(session)
-                await page.goto(url)
-            except Exception:
-                await self.close_session(session_id)
-                raise
-        else:
-            await self.ensure_runtime(headless=headless)
-            context = await self._browser.new_context(**self._context_kwargs(auth_state=auth_state))
-            await self._apply_context_defaults(context)
-            page = await context.new_page()
-            session = BrowserSession(
-                session_id=session_id,
-                context=context,
-                page=page,
-                auth_origin=url,
-                profile_mode=resolved_mode,
-                profile_id=resolved_profile_id,
-                headless=headless,
-                display=(self._xvfb_display if not headless else None) or os.environ.get("DISPLAY"),
-            )
-            self._sessions[session_id] = session
-            try:
-                await self._attach_session_observers(session)
-                await page.goto(url)
-            except Exception:
-                await self.close_session(session_id)
-                raise
+                async with self._lock:
+                    if resolved_mode == "persistent_local":
+                        self._reserved_profile_ids.discard(str(resolved_profile_id))
+                    self._open_in_flight -= 1
+                    if (
+                        self._open_in_flight == 0
+                        and not self._sessions
+                        and self._browser is not None
+                    ):
+                        await self._close_shared_browser_locked()
+                    if not headless:
+                        self._headed_open_in_flight -= 1
+                        if (
+                            self._headed_open_in_flight == 0
+                            and not self._has_live_headed_sessions_locked()
+                        ):
+                            await self._stop_virtual_display_locked()
+            except RuntimeError:
+                pass
         return session
 
     def get_session(self, session_id: str) -> BrowserSession:
@@ -246,26 +306,24 @@ class BrowserManager:
         return self.get_session(session_id)
 
     async def close_session(self, session_id: str) -> None:
-        session = self._sessions.pop(session_id, None)
-        if session is None:
-            return
+        async with self._lock:
+            session = self._sessions.pop(session_id, None)
+            if session is None:
+                return
         await session.context.close()
-        if not self._sessions and self._browser is not None:
-            await self._browser.close()
-            self._browser = None
-        if not any(not s.headless for s in self._sessions.values()):
-            await self._stop_virtual_display()
+        self._log_lifecycle("browser_session_close", outcome="success", session=session)
+        async with self._lock:
+            if not self._sessions and self._open_in_flight == 0 and self._browser is not None:
+                await self._close_shared_browser_locked()
+            if self._headed_open_in_flight == 0 and not self._has_live_headed_sessions_locked():
+                await self._stop_virtual_display_locked()
 
     async def cleanup(self) -> None:
         for session_id in list(self._sessions):
             await self.close_session(session_id)
-        if self._browser is not None:
-            await self._browser.close()
-            self._browser = None
-        if self._playwright is not None:
-            await self._playwright.stop()
-            self._playwright = None
-        await self._stop_virtual_display()
+        async with self._lock:
+            await self._stop_playwright_locked()
+            await self._stop_virtual_display_locked()
 
     async def storage_state(self, session_id: str) -> dict[str, Any]:
         session = await self.get_live_session(session_id)
@@ -364,17 +422,34 @@ class BrowserManager:
         return re.sub(r"[^a-z0-9]+", "-", host.lower()).strip("-") or "default"
 
     async def _ensure_playwright_ready(self, *, headless: bool) -> None:
+        async with self._lock:
+            await self._ensure_playwright_ready_locked(headless=headless)
+
+    async def _ensure_playwright_ready_locked(self, *, headless: bool) -> str | None:
         ok, reason = await ensure_playwright_browser(
             auto_install=self.auto_install, engine=self.engine
         )
         if not ok:
             raise RuntimeError(f"Browser runtime unavailable: {reason}")
         if self._needs_virtual_display(headless=headless):
-            await self._ensure_virtual_display()
+            await self._ensure_virtual_display_locked()
+        display = self._active_display(headless=headless)
+        if self._playwright is not None and self._playwright_display != display:
+            if self._has_live_sessions_for_generation_locked(self._runtime_generation):
+                raise RuntimeError("Browser runtime already active for a different display")
+            await self._stop_playwright_locked()
         if self._playwright is None:
             from playwright.async_api import async_playwright
 
             self._playwright = await async_playwright().start()
+            self._playwright_display = display
+            self._runtime_generation += 1
+            self._log_lifecycle(
+                "playwright_start",
+                outcome="success",
+                display=display,
+            )
+        return display
 
     def _needs_virtual_display(self, *, headless: bool) -> bool:
         return (
@@ -385,6 +460,10 @@ class BrowserManager:
         )
 
     async def _ensure_virtual_display(self) -> None:
+        async with self._lock:
+            await self._ensure_virtual_display_locked()
+
+    async def _ensure_virtual_display_locked(self) -> None:
         if self._xvfb_process is not None:
             return
         xvfb_binary = shutil.which("Xvfb")
@@ -393,7 +472,6 @@ class BrowserManager:
                 "Headed browser mode on Linux without DISPLAY requires Xvfb to be installed"
             )
         display = self._allocate_display()
-        self._previous_display = os.environ.get("DISPLAY")
         proc = await asyncio.create_subprocess_exec(
             xvfb_binary,
             display,
@@ -406,11 +484,10 @@ class BrowserManager:
             stderr=asyncio.subprocess.DEVNULL,
         )
         await self._wait_for_virtual_display_ready(display=display, proc=proc)
-        os.environ["DISPLAY"] = display
         self._xvfb_process = proc
         self._xvfb_display = display
         self._claimed_displays.add(display)
-        logger.info("browser: started xvfb display", extra={"extra_data": {"display": display}})
+        self._log_lifecycle("xvfb_start", outcome="success", display=display)
 
     async def _wait_for_virtual_display_ready(
         self,
@@ -436,21 +513,11 @@ class BrowserManager:
             return None
         return self._xvfb_display or os.environ.get("DISPLAY")
 
-    def _set_display_env(self, display: str | None) -> str | None:
-        previous_display = os.environ.get("DISPLAY")
-        if display is not None:
-            os.environ["DISPLAY"] = display
-        else:
-            os.environ.pop("DISPLAY", None)
-        return previous_display
-
-    def _restore_display_env(self, previous_display: str | None) -> None:
-        if previous_display is not None:
-            os.environ["DISPLAY"] = previous_display
-        else:
-            os.environ.pop("DISPLAY", None)
-
     async def _stop_virtual_display(self) -> None:
+        async with self._lock:
+            await self._stop_virtual_display_locked()
+
+    async def _stop_virtual_display_locked(self) -> None:
         proc = self._xvfb_process
         self._xvfb_process = None
         if proc is not None:
@@ -461,13 +528,9 @@ class BrowserManager:
                 proc.kill()
                 await proc.wait()
         if self._xvfb_display is not None:
-            if self._previous_display is not None:
-                os.environ["DISPLAY"] = self._previous_display
-            else:
-                os.environ.pop("DISPLAY", None)
             self._claimed_displays.discard(self._xvfb_display)
+            self._log_lifecycle("xvfb_stop", outcome="success", display=self._xvfb_display)
             self._xvfb_display = None
-            self._previous_display = None
 
     def _allocate_display(self) -> str:
         x11_dir = Path("/tmp/.X11-unix")
@@ -479,7 +542,7 @@ class BrowserManager:
                 return display
         return f":{int(time.time()) % 1000 + 200}"
 
-    def _launch_kwargs(self, *, headless: bool) -> dict[str, Any]:
+    def _launch_kwargs(self, *, headless: bool, display: str | None = None) -> dict[str, Any]:
         args: list[str] = []
         if self.realistic_launch:
             args.extend(
@@ -491,7 +554,7 @@ class BrowserManager:
             )
             if not headless:
                 args.append("--start-maximized")
-        kwargs: dict[str, Any] = {"headless": headless}
+        kwargs: dict[str, Any] = {"headless": headless, "env": self._launch_env(display)}
         if args:
             kwargs["args"] = args
         return kwargs
@@ -523,32 +586,190 @@ class BrowserManager:
         headless: bool,
         auth_state: dict[str, Any] | None,
         profile_id: str | None,
-    ) -> tuple[Any, Any, Path, str | None]:
-        if any(
-            session.profile_mode == "persistent_local" and session.profile_id == profile_id
-            for session in self._sessions.values()
-        ):
-            raise RuntimeError(f"Browser profile already in use: {profile_id}")
+    ) -> tuple[Any, Any, Path, str | None, int]:
         user_data_dir = self.profile_base_dir / str(profile_id)
         user_data_dir.mkdir(parents=True, exist_ok=True)
-        async with self._lock:
-            await self._ensure_playwright_ready(headless=headless)
-            browser_launcher = getattr(self._playwright, self.engine)
-            display = self._active_display(headless=headless)
-            previous_display = self._set_display_env(display)
+        retry_count = 0
+        while True:
+            async with self._lock:
+                display = await self._ensure_playwright_ready_locked(headless=headless)
+                runtime_generation = self._runtime_generation
+                browser_launcher = getattr(self._playwright, self.engine)
+                launch_kwargs = self._launch_kwargs(headless=headless, display=display)
             try:
                 context = await browser_launcher.launch_persistent_context(
                     str(user_data_dir),
-                    **self._launch_kwargs(headless=headless),
+                    **launch_kwargs,
                     **self._context_kwargs(),
                 )
-            finally:
-                self._restore_display_env(previous_display)
+                break
+            except Exception as exc:
+                failure_category = self._classify_launch_failure(exc, phase="persistent_launch")
+                if retry_count >= 1 or failure_category is None:
+                    self._log_lifecycle(
+                        "browser_launch",
+                        outcome="failure",
+                        display=display,
+                        failure_category=failure_category or "non_retryable",
+                        retry_count=retry_count,
+                    )
+                    raise
+                retry_count += 1
+                async with self._lock:
+                    await self._recover_retryable_launch_failure_locked(
+                        failure_category=failure_category,
+                        retry_count=retry_count,
+                    )
         await self._apply_context_defaults(context)
         if auth_state and isinstance(auth_state.get("cookies"), list):
             await context.add_cookies(auth_state["cookies"])
         page = context.pages[0] if context.pages else await context.new_page()
-        return context, page, user_data_dir, display
+        self._log_lifecycle(
+            "browser_launch",
+            outcome="success",
+            display=display,
+            retry_count=retry_count,
+        )
+        return context, page, user_data_dir, display, runtime_generation
+
+    def _launch_env(self, display: str | None) -> dict[str, str]:
+        env = dict(os.environ)
+        if display is None:
+            env.pop("DISPLAY", None)
+        else:
+            env["DISPLAY"] = display
+        return env
+
+    def _register_session_locked(self, session: BrowserSession) -> None:
+        if session.session_id in self._sessions:
+            raise RuntimeError(f"Browser session already exists: {session.session_id}")
+        if len(self._sessions) >= self.max_sessions:
+            raise RuntimeError("Browser session limit exceeded")
+        self._sessions[session.session_id] = session
+
+    def _has_live_headed_sessions_locked(self) -> bool:
+        return any(not session.headless for session in self._sessions.values())
+
+    def _has_live_sessions_for_generation_locked(self, generation: int) -> bool:
+        return any(session.runtime_generation == generation for session in self._sessions.values())
+
+    async def _close_shared_browser_locked(self) -> None:
+        if self._browser is None:
+            return
+        await self._browser.close()
+        self._browser = None
+
+    async def _stop_playwright_locked(self) -> None:
+        if self._browser is not None:
+            await self._close_shared_browser_locked()
+        if self._playwright is not None:
+            await self._playwright.stop()
+            self._playwright = None
+            self._log_lifecycle("playwright_stop", outcome="success")
+        self._playwright_display = None
+
+    async def _launch_shared_browser_locked(self, *, headless: bool) -> None:
+        retry_count = 0
+        while True:
+            display = await self._ensure_playwright_ready_locked(headless=headless)
+            browser_launcher = getattr(self._playwright, self.engine)
+            try:
+                self._browser = await browser_launcher.launch(
+                    **self._launch_kwargs(headless=headless, display=display)
+                )
+                self._launch_headless = headless
+                self._log_lifecycle(
+                    "browser_launch",
+                    outcome="success",
+                    headless=headless,
+                    display=display,
+                    retry_count=retry_count,
+                )
+                return
+            except Exception as exc:
+                failure_category = self._classify_launch_failure(exc, phase="browser_launch")
+                if retry_count >= 1 or failure_category is None:
+                    self._log_lifecycle(
+                        "browser_launch",
+                        outcome="failure",
+                        headless=headless,
+                        display=display,
+                        failure_category=failure_category or "non_retryable",
+                        retry_count=retry_count,
+                    )
+                    raise
+                retry_count += 1
+                await self._recover_retryable_launch_failure_locked(
+                    failure_category=failure_category,
+                    retry_count=retry_count,
+                )
+
+    async def _recover_retryable_launch_failure_locked(
+        self,
+        *,
+        failure_category: str,
+        retry_count: int,
+    ) -> None:
+        if self._has_live_sessions_for_generation_locked(self._runtime_generation):
+            raise RuntimeError("Cannot recover browser launch while live sessions exist")
+        if self._open_in_flight > 1:
+            raise RuntimeError("Cannot recover browser launch while live sessions exist")
+        self._log_lifecycle(
+            "browser_recover",
+            outcome="retry",
+            failure_category=failure_category,
+            retry_count=retry_count,
+        )
+        await self._stop_playwright_locked()
+        await self._stop_virtual_display_locked()
+
+    def _classify_launch_failure(self, exc: Exception, *, phase: str) -> str | None:
+        if phase not in {"browser_launch", "persistent_launch"}:
+            return None
+        if type(exc).__name__ in {"AssertionError", "ValueError", "TypeError"}:
+            return None
+        return "display_bootstrap"
+
+    def _log_lifecycle(
+        self,
+        action: str,
+        *,
+        outcome: str,
+        session: BrowserSession | None = None,
+        headless: bool | None = None,
+        display: str | None = None,
+        failure_category: str | None = None,
+        retry_count: int | None = None,
+    ) -> None:
+        extra_data: dict[str, Any] = {
+            "action": action,
+            "outcome": outcome,
+            "runtime_generation": self._runtime_generation,
+            "playwright_display": self._playwright_display,
+            "xvfb_managed": self._xvfb_process is not None,
+            "active_session_count": len(self._sessions),
+            "headed_session_count": sum(1 for item in self._sessions.values() if not item.headless),
+            "engine": self.engine,
+        }
+        if session is not None:
+            extra_data.update(
+                {
+                    "session_id": session.session_id,
+                    "profile_mode": session.profile_mode,
+                    "headless": session.headless,
+                    "display": session.display,
+                }
+            )
+        else:
+            if headless is not None:
+                extra_data["headless"] = headless
+            if display is not None:
+                extra_data["display"] = display
+        if failure_category is not None:
+            extra_data["failure_category"] = failure_category
+        if retry_count is not None:
+            extra_data["retry_count"] = retry_count
+        logger.info("browser: lifecycle", extra={"extra_data": extra_data})
 
     async def _attach_session_observers(self, session: BrowserSession) -> None:
         def _push_console(event: dict[str, Any]) -> None:

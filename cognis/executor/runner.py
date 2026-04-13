@@ -93,6 +93,10 @@ class ExecutorRunner:
                 reconnect_delay = min(reconnect_delay * 2, _RECONNECT_MAX)
         finally:
             logger.info("Executor shutting down, cleaning up resources")
+            browser_manager = self._runtime_metadata.get("browser_manager")
+            if browser_manager is not None:
+                with contextlib.suppress(Exception):
+                    await browser_manager.cleanup()
             await self._close_mcp_clients()
             if self._channel_handler is not None:
                 with contextlib.suppress(Exception):
