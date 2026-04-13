@@ -16,6 +16,7 @@ from cognis.tools.executor.filesystem import (
     handle_edit,
     handle_list_directory,
     handle_multiedit,
+    handle_patch,
     handle_read,
     handle_write,
 )
@@ -202,6 +203,43 @@ class TestMultieditTool:
         content = f.read_text()
         assert "AAA" in content
         assert "CCC" in content
+
+
+class TestPatchTool:
+    """Test the patch filesystem tool."""
+
+    @pytest.mark.asyncio()
+    async def test_patch_rejects_apply_patch_format(self, tmp_path: Path) -> None:
+        target = tmp_path / "test.txt"
+        target.write_text("hello\n")
+
+        result = await handle_patch(
+            {
+                "patch_text": (
+                    f"*** Begin Patch\n*** Update File: {target}\n@@\n-hello\n+hi\n*** End Patch\n"
+                )
+            },
+            _DUMMY_CONTEXT,
+        )
+
+        assert result.is_error
+        assert "Unsupported patch format" in result.output
+
+    @pytest.mark.asyncio()
+    async def test_patch_reports_missing_apply_patch_target(self, tmp_path: Path) -> None:
+        missing = tmp_path / "missing.txt"
+
+        result = await handle_patch(
+            {
+                "patch_text": (
+                    f"*** Begin Patch\n*** Update File: {missing}\n@@\n-hello\n+hi\n*** End Patch\n"
+                )
+            },
+            _DUMMY_CONTEXT,
+        )
+
+        assert result.is_error
+        assert f"Update File target does not exist: {missing}" in result.output
 
 
 class TestGlobTool:

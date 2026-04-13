@@ -268,10 +268,36 @@ async def handle_patch(arguments: dict[str, Any], context: ToolExecutionContext)
     if not patch_text.strip():
         return ToolResult(output="Empty patch text.", is_error=True)
 
+    patch_files = _parse_unified_diff(patch_text)
+    if not patch_files:
+        apply_patch_targets = _extract_apply_patch_update_targets(patch_text)
+        if apply_patch_targets:
+            missing_targets = [
+                file_path
+                for file_path in apply_patch_targets
+                if not _resolve_path(file_path).is_file()
+            ]
+            if missing_targets:
+                missing_text = "\n".join(
+                    f"Update File target does not exist: {file_path}"
+                    for file_path in missing_targets
+                )
+                return ToolResult(output=missing_text, is_error=True)
+            return ToolResult(
+                output=(
+                    "Unsupported patch format: patch expects unified diff "
+                    "(`---`/`+++`/`@@`), not apply_patch format (`*** Begin Patch`)."
+                ),
+                is_error=True,
+            )
+        return ToolResult(
+            output="Patch did not contain any unified diff file entries.", is_error=True
+        )
+
     files_patched: list[str] = []
     errors: list[str] = []
 
-    for file_path, hunks in _parse_unified_diff(patch_text):
+    for file_path, hunks in patch_files:
         path = _resolve_path(file_path)
         if not path.is_file():
             errors.append(f"File not found: {file_path}")
@@ -452,6 +478,18 @@ def _parse_unified_diff(
         files.append((current_file, hunks))
 
     return files
+
+
+def _extract_apply_patch_update_targets(patch_text: str) -> list[str]:
+    """Return ``*** Update File:`` targets from apply_patch-style input."""
+    targets: list[str] = []
+    prefix = "*** Update File: "
+    for line in patch_text.splitlines():
+        if line.startswith(prefix):
+            target = line[len(prefix) :].strip()
+            if target:
+                targets.append(target)
+    return targets
 
 
 def _apply_hunks(lines: list[str], hunks: list[tuple[int, list[str], list[str]]]) -> list[str]:
