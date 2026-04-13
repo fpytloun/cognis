@@ -23,6 +23,11 @@ from cognis.models.tool import (
     ToolResult,
 )
 from cognis.providers.circuit_breaker import CircuitBreaker, CircuitBreakerError
+from cognis.tools.executor.lsp.runtime import (
+    LSP_STATUS_CAPABILITY,
+    LSPStatusReport,
+    build_lsp_unavailable_report,
+)
 
 _logger = get_logger(__name__)
 
@@ -56,6 +61,7 @@ EXECUTOR_WS_RECONNECTIONS = Counter(
 _RPC_TIMEOUT_SECONDS = 300  # default per-call timeout
 _HEARTBEAT_INTERVAL = 15  # seconds between executor heartbeats
 _HEARTBEAT_TIMEOUT = 45  # mark unhealthy after this many seconds
+_LSP_STATUS_TIMEOUT_SECONDS = 5.0
 
 
 class ExecutorDisconnectedError(RuntimeError):
@@ -322,6 +328,10 @@ class WebSocketExecutorConnection:
             },
             timeout=300.0,
         )
+
+    async def lsp_status(self) -> dict[str, Any]:
+        """Fetch normalized LSP status from a remote executor."""
+        return await self.rpc_call("lsp.status", {}, timeout=_LSP_STATUS_TIMEOUT_SECONDS)
 
     # ------------------------------------------------------------------
     # Background receiver
@@ -660,6 +670,64 @@ class WebSocketExecutorProvider:
         if conn is not None and conn.connected:
             return conn
         return None
+
+    async def get_lsp_status(
+        self,
+        handle: ExecutorHandle,
+        *,
+        source: dict[str, Any] | None = None,
+    ) -> LSPStatusReport:
+        """Return normalized LSP status for a websocket-backed executor."""
+        runtime_metadata = (handle.metadata or {}).get("runtime_metadata") or {}
+        configure_capabilities = runtime_metadata.get("configure_capabilities") or []
+        config_source = source or {}
+        if not bool(config_source.get("lsp_enabled", True)):
+            return build_lsp_unavailable_report(
+                executor_id=handle.executor_id,
+                executor_type=handle.executor_type,
+                source=config_source,
+                state="disabled",
+            )
+        conn = self.get_connection(handle.executor_id)
+        if conn is None:
+            return build_lsp_unavailable_report(
+                executor_id=handle.executor_id,
+                executor_type=handle.executor_type,
+                source=config_source,
+                state="unavailable",
+                warning="Executor is not connected.",
+            )
+        if LSP_STATUS_CAPABILITY not in configure_capabilities:
+            return build_lsp_unavailable_report(
+                executor_id=handle.executor_id,
+                executor_type=handle.executor_type,
+                source=config_source,
+                state="unsupported",
+                warning="Executor does not support LSP status.",
+                supported=False,
+            )
+        try:
+            result = await conn.lsp_status()
+            report = LSPStatusReport.model_validate(result)
+            return report.model_copy(
+                update={
+                    "executor_id": handle.executor_id,
+                    "executor_type": handle.executor_type,
+                }
+            )
+        except Exception:
+            _logger.debug(
+                "executor_ws: lsp.status failed",
+                extra={"extra_data": {"executor_id": handle.executor_id}},
+                exc_info=True,
+            )
+            return build_lsp_unavailable_report(
+                executor_id=handle.executor_id,
+                executor_type=handle.executor_type,
+                source=config_source,
+                state="unavailable",
+                warning="Timed out or failed to fetch LSP status.",
+            )
 
     def owns_connection(self, executor_id: str, connection: WebSocketExecutorConnection) -> bool:
         """Return whether the given connection is still current for an executor."""

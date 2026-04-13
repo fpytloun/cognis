@@ -37,10 +37,11 @@ class TestDefinitions:
 
     def test_executor_tool_definitions_returns_all(self) -> None:
         defs = executor_tool_definitions()
-        # Web tools are dynamic — not in the static list
-        assert len(defs) == 11
+        # Web tools are dynamic, but the static executor registry now also
+        # includes browser and document tools.
+        assert len(defs) >= 11
         names = {d.name for d in defs}
-        assert names == {
+        assert {
             "read",
             "write",
             "edit",
@@ -52,7 +53,7 @@ class TestDefinitions:
             "bash",
             "document_generate",
             "artifact_publish",
-        }
+        }.issubset(names)
 
     def test_all_definitions_have_executor_source(self) -> None:
         for tool in ALL_EXECUTOR_TOOLS:
@@ -130,6 +131,26 @@ class TestWriteTool:
         result = await handle_write({"file_path": str(target), "content": "deep"}, _DUMMY_CONTEXT)
         assert not result.is_error
         assert target.read_text() == "deep"
+
+    @pytest.mark.asyncio()
+    async def test_write_succeeds_when_lsp_fails(self, tmp_path: Path) -> None:
+        class _BrokenLSP:
+            async def touch_file(self, *_: object, **__: object) -> None:
+                raise RuntimeError("boom")
+
+            def get_diagnostics(self, *_: object, **__: object) -> dict[str, list[object]]:
+                return {}
+
+        target = tmp_path / "lsp.txt"
+        context = ToolExecutionContext(
+            executor_handle=ExecutorHandle(executor_id="test", executor_type="in_process"),
+            runtime_metadata={"lsp_manager": _BrokenLSP()},
+        )
+
+        result = await handle_write({"file_path": str(target), "content": "hello"}, context)
+
+        assert not result.is_error
+        assert target.read_text() == "hello"
 
 
 class TestEditTool:

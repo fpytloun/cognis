@@ -18,9 +18,25 @@ from __future__ import annotations
 
 from cognis.tools.executor.lsp.diagnostics import format_diagnostics_for_llm
 from cognis.tools.executor.lsp.manager import LSP_MANAGER_KEY, LSPManager
+from cognis.tools.executor.lsp.runtime import (
+    LSP_STATUS_CAPABILITY,
+    LSPStatusReport,
+    build_lsp_manager,
+    build_lsp_status_report,
+    build_lsp_unavailable_report,
+    cleanup_lsp_manager,
+    resolve_lsp_runtime_config,
+)
 
 __all__ = [
     "LSP_MANAGER_KEY",
+    "LSP_STATUS_CAPABILITY",
     "LSPManager",
+    "LSPStatusReport",
+    "build_lsp_manager",
+    "build_lsp_status_report",
+    "build_lsp_unavailable_report",
+    "cleanup_lsp_manager",
     "format_diagnostics_for_llm",
+    "resolve_lsp_runtime_config",
 ]

@@ -204,8 +204,8 @@ Bidirectional JSON-RPC 2.0 over WebSocket between controller and executor.
 5. Executor sends executor.ready with JWT token + platform info + optional environment snapshot
 6. Controller validates JWT (aud=cognis-executor, sub=executor_id)
 7. Controller looks up executor config from DB
-8. Controller increments desired config version and sends executor.configure with enabled tools/groups, executor-assigned MCP servers, and scoped secrets
-9. Executor applies the config, starts/refreshes MCP clients, discovers tools, and ACKs with applied version + observed tool manifest + refreshed environment snapshot
+8. Controller increments desired config version and sends executor.configure with enabled tools/groups, executor-assigned MCP servers, scoped secrets, and executor runtime config (including LSP/browser settings)
+9. Executor applies the config, starts/refreshes MCP clients, refreshes executor-local runtime helpers such as LSP managers, and ACKs with applied version + observed tool manifest + refreshed environment snapshot
 10. Controller persists the observed manifest and marks executor as ready
 11. Controller dispatches tool.execute / llm.complete as needed
 12. Executor sends executor.heartbeat every 15 seconds
@@ -242,6 +242,23 @@ For subprocess executors, steps 1-3 are automated: the controller spawns
     "arguments": dict,
     "timeout_seconds": int
 }
+
+# Inspect executor-local LSP status (best-effort, read-only)
+"lsp.status" → {}
+# → {
+#   "supported": bool,
+#   "enabled": bool,
+#   "executor_id": str | null,
+#   "executor_type": str | null,
+#   "state": "ready" | "disabled" | "unsupported" | "unavailable",
+#   "config": {...},
+#   "active_servers": [...],
+#   "broken_servers": [...],
+#   "spawning_count": int,
+#   "totals": {...},
+#   "available_servers": [...],
+#   "warnings": list[str]
+# }
 
 # Start a runtime-backed turn or step
 "runtime.start" → {
@@ -351,7 +368,14 @@ For subprocess executors, steps 1-3 are automated: the controller spawns
 
 # executor.configure result also includes the normalized environment
 # snapshot when available so the controller can refresh prompt/runtime
-# guidance after configuration or reconnect.
+# guidance after configuration or reconnect. The runtime metadata may
+# advertise configure capabilities such as:
+# - mcp_runtime_status_v1
+# - lsp_status_v1
+#
+# The controller must only call lsp.status when lsp_status_v1 is advertised.
+# If the capability is absent, the executor is treated as unsupported for
+# LSP status reporting.
 
 # Tool execution result (response to tool.execute)
 # Returned as JSON-RPC response to the tool.execute request

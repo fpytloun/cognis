@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -13,6 +14,7 @@ from cognis.models.session import (
     IntarisSession,
     SessionModel,
 )
+from cognis.tools.executor.lsp.runtime import LSPStatusConfig, LSPStatusReport, LSPStatusTotals
 
 
 class _NotificationService:
@@ -388,3 +390,66 @@ async def test_info_uses_unavailable_when_intaris_fetch_fails() -> None:
     assert result.text is not None
     assert "Intaris status: unavailable" in result.text
     assert "Intaris stats: unavailable" in result.text
+
+
+@pytest.mark.asyncio
+async def test_lsp_renders_normalized_statuses() -> None:
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=None,
+        session_cache=None,
+        compaction_strategy=None,
+        providers=SimpleNamespace(
+            executor=SimpleNamespace(
+                get_lsp_statuses=AsyncMock(
+                    return_value=[
+                        LSPStatusReport(
+                            supported=True,
+                            enabled=True,
+                            executor_id="exec-1",
+                            executor_type="websocket",
+                            state="ready",
+                            config=LSPStatusConfig(
+                                enabled=True,
+                                auto_install=False,
+                                diagnostics_timeout_ms=10000,
+                                idle_timeout_seconds=600,
+                                max_concurrent_servers=8,
+                            ),
+                            totals=LSPStatusTotals(active_server_count=1, files_tracked=2),
+                        ),
+                        LSPStatusReport(
+                            supported=True,
+                            enabled=False,
+                            executor_id="exec-2",
+                            executor_type="subprocess",
+                            state="disabled",
+                            config=LSPStatusConfig(
+                                enabled=False,
+                                auto_install=False,
+                                diagnostics_timeout_ms=10000,
+                                idle_timeout_seconds=600,
+                                max_concurrent_servers=8,
+                            ),
+                            totals=LSPStatusTotals(),
+                        ),
+                    ]
+                )
+            )
+        ),
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+    )
+
+    result = await dispatcher.dispatch(
+        "/lsp",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert result is not None
+    assert result.text is not None
+    assert "exec-1 (websocket) - ready" in result.text
+    assert "exec-2 (subprocess) - disabled" in result.text

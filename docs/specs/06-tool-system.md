@@ -331,6 +331,12 @@ the Tavily backend.
 Write operations always go through Intaris evaluation regardless of agent
 permissions. Read-only tools can be auto-approved by agent permission matrix.
 
+Filesystem edit tools may append executor-local LSP diagnostics after a file is
+changed. This is best-effort feedback from the selected executor runtime: the
+edit still succeeds if LSP is disabled, unavailable, or times out during first
+server startup. `read` may warm LSP in the background, but it does not block on
+diagnostics.
+
 ## Built-in Orchestration Tools
 
 These are handled by the controller directly — they are not tool executions

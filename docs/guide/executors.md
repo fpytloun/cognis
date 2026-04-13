@@ -31,6 +31,7 @@ Executors can also be used to:
 
 - attach MCP servers
 - expose only selected tool groups
+- run LSP diagnostics for filesystem edit tools
 - host Playwright-backed browser automation
 - host channel adapters that need local services
 - route provider calls to executor-side inference when supported
@@ -78,6 +79,31 @@ WebSocket executors can report several runtime states:
 - confirm the agent is bound to the expected executor or label selector
 - confirm any required secrets or MCP servers are assigned correctly
 - confirm browser automation is enabled if browser tools are expected
+
+## LSP diagnostics
+
+LSP diagnostics are executor-local, just like filesystem tools. Cognis now uses
+the same LSP flow on all executor types:
+
+- `in_process`
+- `subprocess`
+- `websocket`
+
+`read` still warms matching language servers in the background. `write`,
+`edit`, `patch`, and `multiedit` wait briefly for first-use diagnostics when
+LSP is enabled, but diagnostics remain best-effort: the file operation still
+succeeds if server startup or diagnostics collection times out.
+
+Use `/lsp` in chat to inspect the current LSP state for the active user's
+executors. The command reports normalized executor-local status:
+
+- `ready` - LSP status was collected successfully
+- `disabled` - executor config has LSP disabled
+- `unsupported` - the connected executor is older and does not expose LSP status
+- `unavailable` - executor is disconnected or status collection timed out
+
+`/lsp` is read-only. It does not auto-install language servers or trigger any
+network fetches.
 
 ## Browser automation
 

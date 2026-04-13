@@ -136,7 +136,7 @@ class CommandDispatcher:
 
         # /lsp
         if stripped == "/lsp":
-            return await self._handle_lsp()
+            return await self._handle_lsp(user_email=user_email)
 
         # /help
         if stripped == "/help":
@@ -506,87 +506,90 @@ class CommandDispatcher:
             text=f"Reasoning effort set to: {arg}\nTakes effect on next message.",
         )
 
-    async def _handle_lsp(self) -> CommandResult:
+    async def _handle_lsp(self, *, user_email: str | None = None) -> CommandResult:
         """Handle /lsp — display LSP diagnostics subsystem status."""
         lines: list[str] = []
 
         executor = self._providers.executor
-        lsp_managers = executor.get_lsp_managers() if hasattr(executor, "get_lsp_managers") else []
+        statuses = (
+            await executor.get_lsp_statuses(owner_email=user_email)
+            if hasattr(executor, "get_lsp_statuses")
+            else []
+        )
 
-        if not lsp_managers:
+        if not statuses:
             lines.append("LSP Diagnostics")
-            lines.append("  Status: no active LSP managers")
+            lines.append("  Status: no executor LSP status available")
             return CommandResult(type="system_message", text="\n".join(lines))
 
-        for lsp_mgr in lsp_managers:
-            status = lsp_mgr.status()
-            cfg = status["config"]
-            totals = status["totals"]
+        lines.append("LSP Diagnostics")
+        for status in statuses:
+            cfg = status.config
+            totals = status.totals
+            lines.append("")
+            lines.append(
+                f"{status.executor_id or 'unknown'} ({status.executor_type or 'unknown'}) - {status.state}"
+            )
+            lines.append(f"  Enabled: {'yes' if status.enabled else 'no'}")
+            lines.append(f"  Auto-install: {'yes' if cfg.auto_install else 'no'}")
+            lines.append(f"  Timeout: {cfg.diagnostics_timeout_ms}ms")
+            lines.append(f"  Max servers: {cfg.max_concurrent_servers}")
+            if status.warnings:
+                for warning in status.warnings:
+                    lines.append(f"  Warning: {warning}")
+            if status.state != "ready":
+                continue
 
-            lines.append("LSP Diagnostics")
-            lines.append(f"  Status: {'enabled' if cfg['enabled'] else 'disabled'}")
-            lines.append(f"  Auto-install: {'enabled' if cfg['auto_install'] else 'disabled'}")
-            lines.append(f"  Timeout: {cfg['diagnostics_timeout_ms']}ms")
-            lines.append(f"  Max servers: {cfg['max_concurrent_servers']}")
-
-            active = status["active_servers"]
+            active = status.active_servers
             if active:
                 lines.append(
-                    f"\nActive servers ({totals['active_server_count']}/{cfg['max_concurrent_servers']}):"
+                    f"  Active servers ({totals.active_server_count}/{cfg.max_concurrent_servers}):"
                 )
                 for srv in active:
-                    pid_str = f"PID {srv['pid']}" if srv["pid"] else "no PID"
-                    alive_str = "" if srv["alive"] else " [dead]"
-                    lines.append(f"  {srv['server_name']} ({pid_str}{alive_str})")
-                    lines.append(f"    Root: {srv['root_path']}")
+                    alive_str = "" if srv.alive else " [dead]"
+                    lines.append(f"    {srv.server_name}{alive_str}")
                     lines.append(
-                        f"    Files: {srv['file_count']}, "
-                        f"diagnostics: {srv['error_count']} errors, "
-                        f"{srv['warning_count']} warnings"
+                        f"      Files: {srv.file_count}, diagnostics: {srv.error_count} errors, {srv.warning_count} warnings"
                     )
-                    idle = srv["idle_seconds"]
+                    idle = srv.idle_seconds
                     if idle >= 60:
-                        lines.append(f"    Idle: {idle // 60}m {idle % 60}s")
+                        lines.append(f"      Idle: {idle // 60}m {idle % 60}s")
                     else:
-                        lines.append(f"    Idle: {idle}s")
+                        lines.append(f"      Idle: {idle}s")
             else:
-                lines.append("\nNo active servers")
+                lines.append("  No active servers")
 
-            broken = status["broken_servers"]
+            broken = status.broken_servers
             if broken:
-                lines.append(f"\nBroken servers ({len(broken)}):")
+                lines.append(f"  Broken servers ({len(broken)}):")
                 for brk in broken:
-                    retry = brk["retry_in_seconds"]
+                    retry = brk.retry_in_seconds
                     retry_str = f"{retry // 60}m {retry % 60}s" if retry >= 60 else f"{retry}s"
-                    lines.append(f"  {brk['client_key']} (retry in {retry_str})")
+                    lines.append(f"    {brk.client_key} (retry in {retry_str})")
 
-            if status["spawning_count"] > 0:
-                lines.append(f"\nSpawning: {status['spawning_count']} server(s)")
+            if status.spawning_count > 0:
+                lines.append(f"  Spawning: {status.spawning_count} server(s)")
 
             lines.append(
-                f"\nTotals: {totals['files_tracked']} files tracked, "
-                f"{totals['total_errors']} errors, {totals['total_warnings']} warnings"
+                f"  Totals: {totals.files_tracked} files tracked, {totals.total_errors} errors, {totals.total_warnings} warnings"
             )
 
-            # Available servers
-            try:
-                avail = await lsp_mgr.available_servers()
-                if avail:
-                    lines.append("\nAvailable servers:")
-                    for srv in avail:
-                        if srv["active"]:
-                            status_str = "active"
-                        elif srv["available"]:
-                            status_str = srv["path"]
-                        elif srv["has_auto_install"]:
-                            status_str = "not found (auto-install available)"
-                        else:
-                            status_str = "not found"
-                        lines.append(f"  {srv['server_id']} ({srv['extensions']}) — {status_str}")
-            except Exception:
-                pass  # Best-effort
+            if status.available_servers:
+                lines.append("  Available servers:")
+                for srv in status.available_servers:
+                    if srv.active:
+                        status_str = "active"
+                    elif srv.available:
+                        status_str = "installed"
+                    elif srv.has_auto_install:
+                        status_str = "not found (auto-install available)"
+                    else:
+                        status_str = "not found"
+                    lines.append(f"    {srv.server_id} ({srv.extensions}) - {status_str}")
 
-        return CommandResult(type="system_message", text="\n".join(lines))
+        return CommandResult(
+            type="system_message", text="\n".join(line for line in lines if line is not None)
+        )
 
     def _handle_help(self) -> CommandResult:
         """Handle /help — show available slash commands."""

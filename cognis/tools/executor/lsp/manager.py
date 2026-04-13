@@ -7,8 +7,8 @@ diagnostics for tool result injection.
 Design properties:
 - **Graceful degradation**: LSP failures never break file operations.
 - **Lazy spawning**: Servers start on first file access, not at boot.
-- **Non-blocking first spawn**: First edit returns empty diagnostics;
-  the server warms in the background for subsequent edits.
+- **Bounded waiting**: ``wait=True`` waits for first-use diagnostics within
+  bounded spawn and diagnostics timeouts.
 - **Bounded resources**: ``max_concurrent_servers`` caps memory usage.
 - **Idle timeout**: Unused servers are shut down automatically.
 """
@@ -209,21 +209,10 @@ class LSPManager:
                     self._spawning[client_key] = spawn_task
 
                 if wait:
-                    # For wait=True, we need the client ready now.
-                    # But first spawn should be non-blocking per architect guidance.
-                    # If this is the very first spawn for this server, make it
-                    # non-blocking (return empty diagnostics).
-                    if client_key not in self._last_access:
-                        # First time — don't block, let it warm in background
-                        logger.debug(
-                            "lsp: first spawn non-blocking",
-                            extra={"extra_data": {"client_key": client_key}},
-                        )
-                        continue
-                    # Subsequent access — wait for spawn
                     try:
                         client = await asyncio.wait_for(spawn_task, timeout=15.0)
                     except (TimeoutError, Exception):
+                        LSP_ERRORS_TOTAL.labels(error_type="spawn_wait").inc()
                         continue
                 else:
                     continue

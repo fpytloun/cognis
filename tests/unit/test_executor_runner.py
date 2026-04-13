@@ -10,6 +10,7 @@ import pytest
 
 from cognis.executor.runner import ExecutorRunner, _normalize_result
 from cognis.models.tool import ExecutorConfig, ToolDefinition, ToolResult, ToolSource
+from cognis.tools.executor.lsp import LSP_MANAGER_KEY, LSP_STATUS_CAPABILITY
 
 
 class DummyWebSocket:
@@ -258,3 +259,63 @@ async def test_runner_shutdown_cleans_browser_manager() -> None:
     await runner.run()
 
     assert cleaned == ["cleanup"]
+
+
+@pytest.mark.asyncio
+async def test_handle_configure_creates_lsp_manager() -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    ws = DummyWebSocket()
+
+    await runner._handle_configure(
+        ws,
+        "cfg-1",
+        {"enabled_tools": ["read"], "config": {"lsp_enabled": True}},
+    )
+
+    assert runner._runtime_metadata.get(LSP_MANAGER_KEY) is not None
+    caps = ws.sent[-1]["result"]["runtime_metadata"]["configure_capabilities"]
+    assert LSP_STATUS_CAPABILITY in caps
+
+
+@pytest.mark.asyncio
+async def test_handle_lsp_status_returns_disabled_when_manager_missing() -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    ws = DummyWebSocket()
+    await runner._handle_configure(
+        ws,
+        "cfg-1",
+        {"enabled_tools": [], "config": {"lsp_enabled": False}},
+    )
+    ws.sent.clear()
+
+    await runner._handle_lsp_status(ws, "lsp-1", {})
+
+    assert ws.sent[-1]["result"]["state"] == "disabled"
+    assert ws.sent[-1]["result"]["enabled"] is False
+
+
+@pytest.mark.asyncio
+async def test_handle_configure_degrades_when_lsp_manager_init_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    ws = DummyWebSocket()
+
+    def _broken_build_lsp_manager(_: object) -> object:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("cognis.executor.runner.build_lsp_manager", _broken_build_lsp_manager)
+
+    await runner._handle_configure(
+        ws,
+        "cfg-1",
+        {"enabled_tools": ["read"], "config": {"lsp_enabled": True}},
+    )
+
+    assert runner._configured is True
+    assert runner._runtime_metadata.get(LSP_MANAGER_KEY) is None
+    assert runner._runtime_metadata["lsp_init_failed"] is True
+
+    ws.sent.clear()
+    await runner._handle_lsp_status(ws, "lsp-2", {})
+    assert ws.sent[-1]["result"]["state"] == "unavailable"

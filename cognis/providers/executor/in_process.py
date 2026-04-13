@@ -26,7 +26,15 @@ from cognis.providers.circuit_breaker import CircuitBreaker
 from cognis.tools.builtin.system import StatusProvider, build_system_tool_handlers
 from cognis.tools.executor.browser.manager import BROWSER_MANAGER_KEY, BrowserManager
 from cognis.tools.executor.definitions import executor_tool_handlers
-from cognis.tools.executor.lsp import LSP_MANAGER_KEY, LSPManager
+from cognis.tools.executor.lsp import (
+    LSP_MANAGER_KEY,
+    LSPManager,
+    LSPStatusReport,
+    build_lsp_manager,
+    build_lsp_status_report,
+    build_lsp_unavailable_report,
+    cleanup_lsp_manager,
+)
 from cognis.tools.mcp import (
     MCPClient,
     build_mcp_client,
@@ -187,51 +195,24 @@ class InProcessExecutorProvider:
                     tool, system_handlers, mcp_clients, native_handlers
                 )
                 registry.register(RegisteredTool(definition=tool, handler=cast(Any, handler)))
-            # LSP manager (best-effort, non-fatal)
-            # Read config from env vars via CognisConfig. The metadata dict
-            # may override these (e.g. in tests), but env vars are the
-            # primary source — this avoids requiring callers to thread
-            # config through ExecutorConfig.metadata.
             lsp_manager: LSPManager | None = None
             runtime_metadata = dict(config.metadata)
-            from cognis.config import load_config as _load_config
-
-            _cfg = _load_config()
-            lsp_enabled = config.metadata.get("lsp_enabled", _cfg.lsp_enabled)
-            if lsp_enabled:
-                try:
-                    lsp_manager = LSPManager(
-                        enabled=True,
-                        auto_install=bool(
-                            config.metadata.get("lsp_auto_install", _cfg.lsp_auto_install)
-                        ),
-                        diagnostics_timeout_ms=int(
-                            config.metadata.get(
-                                "lsp_diagnostics_timeout_ms", _cfg.lsp_diagnostics_timeout_ms
-                            )
-                        ),
-                        idle_timeout_seconds=int(
-                            config.metadata.get(
-                                "lsp_idle_timeout_seconds", _cfg.lsp_idle_timeout_seconds
-                            )
-                        ),
-                        max_concurrent_servers=int(
-                            config.metadata.get(
-                                "lsp_max_concurrent_servers", _cfg.lsp_max_concurrent_servers
-                            )
-                        ),
-                    )
+            try:
+                lsp_manager = build_lsp_manager(config.metadata)
+                if lsp_manager is not None:
                     runtime_metadata[LSP_MANAGER_KEY] = lsp_manager
                     _logger.info(
                         "lsp: manager created for executor",
                         extra={"extra_data": {"executor_id": config.executor_id}},
                     )
-                except Exception:
-                    _logger.warning(
-                        "lsp: failed to create manager, continuing without LSP",
-                        extra={"extra_data": {"executor_id": config.executor_id}},
-                        exc_info=True,
-                    )
+            except Exception:
+                runtime_metadata["lsp_init_failed"] = True
+                runtime_metadata["lsp_warning"] = "LSP manager initialization failed."
+                _logger.warning(
+                    "lsp: failed to create manager, continuing without LSP",
+                    extra={"extra_data": {"executor_id": config.executor_id}},
+                    exc_info=True,
+                )
 
             connection = InProcessExecutorConnection(
                 handle,
@@ -276,14 +257,7 @@ class InProcessExecutorProvider:
         if runtime is None:
             return
         await _close_clients(runtime.mcp_clients)
-        if runtime.lsp_manager is not None:
-            try:
-                await runtime.lsp_manager.cleanup()
-            except Exception:
-                _logger.debug(
-                    "lsp: cleanup error during executor cancel",
-                    extra={"extra_data": {"executor_id": handle.executor_id}},
-                )
+        await cleanup_lsp_manager(runtime.lsp_manager, executor_id=handle.executor_id)
         browser_manager = runtime.connection.runtime_metadata.get(BROWSER_MANAGER_KEY)
         if isinstance(browser_manager, BrowserManager):
             try:
@@ -299,9 +273,35 @@ class InProcessExecutorProvider:
 
         return [runtime.handle for runtime in self._active.values()]
 
-    def get_lsp_managers(self) -> list[LSPManager]:
-        """Return all active LSP managers across executor runtimes."""
-        return [rt.lsp_manager for rt in self._active.values() if rt.lsp_manager is not None]
+    async def get_lsp_statuses(self, *, owner_email: str | None = None) -> list[LSPStatusReport]:
+        """Return normalized LSP status for active in-process runtimes."""
+        reports: list[LSPStatusReport] = []
+        for runtime in self._active.values():
+            runtime_owner = runtime.connection.runtime_metadata.get("user_email")
+            if owner_email is not None and runtime_owner != owner_email:
+                continue
+            try:
+                report = await build_lsp_status_report(
+                    manager=runtime.lsp_manager,
+                    executor_id=runtime.handle.executor_id,
+                    executor_type=runtime.handle.executor_type,
+                    source=runtime.connection.runtime_metadata,
+                )
+            except Exception:
+                _logger.debug(
+                    "lsp: failed to build in-process status",
+                    extra={"extra_data": {"executor_id": runtime.handle.executor_id}},
+                    exc_info=True,
+                )
+                report = build_lsp_unavailable_report(
+                    executor_id=runtime.handle.executor_id,
+                    executor_type=runtime.handle.executor_type,
+                    source=runtime.connection.runtime_metadata,
+                    state="unavailable",
+                    warning="Failed to collect in-process LSP status.",
+                )
+            reports.append(report)
+        return reports
 
     async def cleanup(self) -> None:
         """Close all active executor runtimes."""

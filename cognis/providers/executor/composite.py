@@ -7,6 +7,7 @@ Dispatches ``spawn``, ``get_executor``, ``cancel``, etc. based on the
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -22,6 +23,8 @@ from cognis.models.tool import ExecutorConfig, ExecutorHandle
 from cognis.providers.executor.in_process import InProcessExecutorProvider
 from cognis.providers.executor.subprocess import SubprocessExecutorProvider
 from cognis.providers.executor.websocket import WebSocketExecutorProvider
+from cognis.store.queries import list_executors
+from cognis.tools.executor.lsp.runtime import LSPStatusReport, build_lsp_unavailable_report
 
 _logger = get_logger(__name__)
 
@@ -140,9 +143,82 @@ class CompositeExecutorProvider:
     # Extra methods (not on protocol)
     # ------------------------------------------------------------------
 
-    def get_lsp_managers(self) -> list[Any]:
-        """Delegate to in-process provider (only it has LSP managers)."""
-        return self._in_process.get_lsp_managers()
+    async def get_lsp_statuses(self, *, owner_email: str | None = None) -> list[LSPStatusReport]:
+        """Return normalized LSP status across executor types."""
+        reports = await self._in_process.get_lsp_statuses(owner_email=owner_email)
+        reports_by_id = {report.executor_id: report for report in reports if report.executor_id}
+
+        if self._session_factory is None:
+            for handle in await self._websocket.list_active():
+                if handle.executor_id in reports_by_id:
+                    continue
+                reports.append(await self._websocket.get_lsp_status(handle))
+            return sorted(
+                reports, key=lambda item: ((item.executor_type or ""), (item.executor_id or ""))
+            )
+
+        async with self._session_factory() as session:
+            rows = await list_executors(session, owner_email=owner_email)
+
+        remote_tasks: list[Any] = []
+        for row in rows:
+            if row.executor_id in reports_by_id:
+                continue
+            if row.executor_type == "in_process":
+                state = (
+                    "disabled"
+                    if not bool((row.config or {}).get("lsp_enabled", True))
+                    else "unavailable"
+                )
+                warning = None if state == "disabled" else "Executor has no active local runtime."
+                reports.append(
+                    build_lsp_unavailable_report(
+                        executor_id=row.executor_id,
+                        executor_type=row.executor_type,
+                        source=row.config or {},
+                        state=state,
+                        warning=warning,
+                    )
+                )
+                continue
+            if row.executor_type not in {"websocket", "subprocess"}:
+                continue
+            handle = self._websocket._handles.get(row.executor_id)
+            if handle is not None:
+                handle.executor_type = row.executor_type
+                remote_tasks.append(self._websocket.get_lsp_status(handle, source=row.config or {}))
+                continue
+            state = (
+                "disabled"
+                if not bool((row.config or {}).get("lsp_enabled", True))
+                else "unavailable"
+            )
+            warning = None if state == "disabled" else "Executor is configured but not connected."
+            reports.append(
+                build_lsp_unavailable_report(
+                    executor_id=row.executor_id,
+                    executor_type=row.executor_type,
+                    source=row.config or {},
+                    state=state,
+                    warning=warning,
+                )
+            )
+
+        if remote_tasks:
+            remote_results = await asyncio.gather(*remote_tasks, return_exceptions=True)
+            for result in remote_results:
+                if isinstance(result, Exception):
+                    _logger.debug("executor: failed to gather remote LSP status: %s", result)
+                    continue
+                reports.append(result)
+
+        unique: dict[str, LSPStatusReport] = {}
+        for report in reports:
+            key = report.executor_id or f"{report.executor_type}:{len(unique)}"
+            unique[key] = report
+        return sorted(
+            unique.values(), key=lambda item: ((item.executor_type or ""), (item.executor_id or ""))
+        )
 
     # ------------------------------------------------------------------
     # Internal

@@ -8,6 +8,7 @@ import pytest
 
 from cognis.models.tool import ExecutorCapabilities, ExecutorConfig, ExecutorHandle
 from cognis.providers.executor.composite import CompositeExecutorProvider
+from cognis.tools.executor.lsp.runtime import LSPStatusConfig, LSPStatusReport, LSPStatusTotals
 
 
 def _make_mock_provider(executor_type: str = "in_process") -> MagicMock:
@@ -145,18 +146,50 @@ async def test_health_aggregates() -> None:
     assert health.status == "healthy"
 
 
-def test_get_lsp_managers_delegates_to_in_process() -> None:
-    """get_lsp_managers delegates to the in-process sub-provider."""
+@pytest.mark.asyncio
+async def test_get_lsp_statuses_delegates_to_in_process_when_no_session_factory() -> None:
+    """get_lsp_statuses includes in-process statuses."""
     ip = _make_mock_provider()
     ws = _make_mock_provider()
     sp = _make_mock_provider()
 
-    ip.get_lsp_managers = MagicMock(return_value=["manager1"])
+    ip.get_lsp_statuses = AsyncMock(
+        return_value=[
+            LSPStatusReport(
+                supported=True,
+                enabled=True,
+                executor_id="manager1",
+                executor_type="in_process",
+                state="ready",
+                config=LSPStatusConfig(
+                    enabled=True,
+                    auto_install=False,
+                    diagnostics_timeout_ms=1000,
+                    idle_timeout_seconds=60,
+                    max_concurrent_servers=2,
+                ),
+                totals=LSPStatusTotals(),
+            )
+        ]
+    )
 
     composite = CompositeExecutorProvider(ip, ws, sp)
-    managers = composite.get_lsp_managers()
-    assert managers == ["manager1"]
-    ip.get_lsp_managers.assert_called_once()
+    statuses = await composite.get_lsp_statuses()
+    assert [status.executor_id for status in statuses] == ["manager1"]
+    ip.get_lsp_statuses.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_get_lsp_statuses_passes_owner_email() -> None:
+    ip = _make_mock_provider()
+    ws = _make_mock_provider()
+    sp = _make_mock_provider()
+    ip.get_lsp_statuses = AsyncMock(return_value=[])
+
+    composite = CompositeExecutorProvider(ip, ws, sp)
+    await composite.get_lsp_statuses(owner_email="user@example.com")
+
+    ip.get_lsp_statuses.assert_awaited_once_with(owner_email="user@example.com")
 
 
 @pytest.mark.asyncio

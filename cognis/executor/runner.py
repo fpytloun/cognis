@@ -25,6 +25,14 @@ from cognis.models.tool import (
     ToolSource,
 )
 from cognis.tools.executor.definitions import executor_tool_definitions, executor_tool_handlers
+from cognis.tools.executor.lsp import (
+    LSP_MANAGER_KEY,
+    LSP_STATUS_CAPABILITY,
+    build_lsp_manager,
+    build_lsp_status_report,
+    cleanup_lsp_manager,
+    resolve_lsp_runtime_config,
+)
 from cognis.tools.mcp import (
     MCPClient,
     MCPClientError,
@@ -97,6 +105,10 @@ class ExecutorRunner:
             if browser_manager is not None:
                 with contextlib.suppress(Exception):
                     await browser_manager.cleanup()
+            lsp_manager = self._runtime_metadata.get(LSP_MANAGER_KEY)
+            if lsp_manager is not None:
+                with contextlib.suppress(Exception):
+                    await cleanup_lsp_manager(lsp_manager, executor_id=self.config.executor_id)
             await self._close_mcp_clients()
             if self._channel_handler is not None:
                 with contextlib.suppress(Exception):
@@ -224,6 +236,8 @@ class ExecutorRunner:
                 asyncio.create_task(self._handle_channel_mark_read(ws, msg_id, params))
             elif method == "channel.sync_profile":
                 asyncio.create_task(self._handle_channel_sync_profile(ws, msg_id, params))
+            elif method == "lsp.status":
+                asyncio.create_task(self._handle_lsp_status(ws, msg_id, params))
             elif method == "executor.cancel":
                 logger.info("Received executor.cancel, shutting down")
                 self._running = False
@@ -262,6 +276,7 @@ class ExecutorRunner:
         previous_tool_handlers = dict(self._tool_handlers)
         previous_tool_definitions = list(self._configured_tool_definitions)
         previous_runtime_metadata = dict(self._runtime_metadata)
+        previous_lsp_manager = previous_runtime_metadata.get(LSP_MANAGER_KEY)
 
         try:
             mcp_servers = [MCPServerConfig.model_validate(item) for item in mcp_servers_raw]
@@ -304,10 +319,18 @@ class ExecutorRunner:
         # Store web runtime metadata for handler context
         runtime_state = "degraded" if mcp_warnings else "active"
         try:
+            effective_lsp_config = resolve_lsp_runtime_config(
+                config if isinstance(config, dict) else {}
+            )
             self._runtime_metadata = {
                 "schema_version": _RUNTIME_METADATA_SCHEMA_VERSION,
-                "configure_capabilities": ["mcp_runtime_status_v1"],
+                "configure_capabilities": ["mcp_runtime_status_v1", LSP_STATUS_CAPABILITY],
                 "legacy_metadata": False,
+                "lsp_enabled": effective_lsp_config.enabled,
+                "lsp_auto_install": effective_lsp_config.auto_install,
+                "lsp_diagnostics_timeout_ms": effective_lsp_config.diagnostics_timeout_ms,
+                "lsp_idle_timeout_seconds": effective_lsp_config.idle_timeout_seconds,
+                "lsp_max_concurrent_servers": effective_lsp_config.max_concurrent_servers,
                 "web_backend": web_config_raw.get("web_backend", "direct"),
                 "web_available_backends": web_backends,
                 "web_secrets": secrets,
@@ -316,6 +339,17 @@ class ExecutorRunner:
                 "mcp_servers": mcp_statuses,
                 "warnings": mcp_warnings,
             }
+            try:
+                lsp_manager = build_lsp_manager(config if isinstance(config, dict) else {})
+            except Exception:
+                self._runtime_metadata["lsp_init_failed"] = True
+                self._runtime_metadata["lsp_warning"] = "LSP manager initialization failed."
+                logger.warning(
+                    "Failed to initialize LSP manager for executor runtime", exc_info=True
+                )
+                lsp_manager = None
+            if lsp_manager is not None:
+                self._runtime_metadata[LSP_MANAGER_KEY] = lsp_manager
 
             self._configured_tool_definitions = [*native_defs, *web_defs, *discovered_tools]
             native_handlers = executor_tool_handlers()
@@ -359,10 +393,13 @@ class ExecutorRunner:
             ):
                 with contextlib.suppress(Exception):
                     await old_browser_manager.cleanup()
+            if previous_lsp_manager is not self._runtime_metadata.get(LSP_MANAGER_KEY):
+                await cleanup_lsp_manager(previous_lsp_manager, executor_id=self.config.executor_id)
         except Exception as exc:
             logger.warning(
                 "Configure v%d failed during tool/handler setup: %s", requested_version, exc
             )
+            current_lsp_manager = self._runtime_metadata.get(LSP_MANAGER_KEY)
             await self._close_clients(staged_mcp_clients)
             self._mcp_clients = previous_clients
             self._tool_handlers = previous_tool_handlers
@@ -370,6 +407,8 @@ class ExecutorRunner:
             self._runtime_metadata = previous_runtime_metadata
             self._configured = previous_configured
             self._runtime_state = "blocked" if not previous_configured else previous_runtime_state
+            if current_lsp_manager is not previous_lsp_manager:
+                await cleanup_lsp_manager(current_lsp_manager, executor_id=self.config.executor_id)
             await self._send_rpc_error(ws, msg_id, -32021, f"Executor configure failed: {exc}")
             return
 
@@ -572,6 +611,16 @@ class ExecutorRunner:
             return output
 
         return handler
+
+    async def _handle_lsp_status(self, ws: Any, msg_id: str | None, _: dict[str, Any]) -> None:
+        report = await build_lsp_status_report(
+            manager=self._runtime_metadata.get(LSP_MANAGER_KEY),
+            executor_id=self.config.executor_id,
+            executor_type="websocket",
+            source=self._runtime_metadata,
+            warnings=list(self._runtime_metadata.get("warnings") or []),
+        )
+        await self._send_rpc_result(ws, msg_id, report.model_dump(mode="json"))
 
     async def _handle_tool_list(self, ws: Any, msg_id: str | None) -> None:
         if msg_id is None:
@@ -1010,6 +1059,7 @@ class ExecutorRunner:
         metadata = dict(self._runtime_metadata)
         metadata.pop("web_secrets", None)
         metadata.pop("browser_manager", None)
+        metadata.pop(LSP_MANAGER_KEY, None)
         return metadata
 
     async def _send_rpc_result(self, ws: Any, msg_id: str | None, result: dict[str, Any]) -> None:

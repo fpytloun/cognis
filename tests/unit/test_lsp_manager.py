@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from time import monotonic
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -149,6 +149,39 @@ class TestBrokenRetry:
 
         # The broken entry should have been cleared or no longer present
         # (since no server matches, nothing re-breaks it)
+
+
+class TestFirstTouchWait:
+    """Test first-touch wait semantics."""
+
+    @pytest.mark.asyncio()
+    async def test_first_touch_waits_for_spawn_and_diagnostics(self, tmp_path: Path) -> None:
+        file_path = tmp_path / "app.py"
+        file_path.write_text("x = 1\n")
+
+        manager = LSPManager(enabled=True)
+        fake_client = MagicMock()
+        fake_client.is_alive = True
+        fake_client.process = MagicMock()
+        fake_client.process.pid = 123
+        fake_client.server_id = "pyright"
+        fake_client.server_name = "Pyright"
+        fake_client.did_open = AsyncMock()
+        fake_client.did_change = AsyncMock()
+        fake_client.wait_for_diagnostics = AsyncMock(return_value=[])
+        fake_client.get_diagnostics = MagicMock(return_value={})
+
+        with patch("cognis.tools.executor.lsp.manager.get_servers_for_extension") as mock_servers:
+            mock_server = MagicMock()
+            mock_server.server_id = "pyright"
+            mock_server.root_markers = ()
+            mock_server.language_id.return_value = "python"
+            mock_servers.return_value = [mock_server]
+            with patch.object(manager, "_spawn_client", AsyncMock(return_value=fake_client)):
+                await manager.touch_file(str(file_path), wait=True)
+
+        fake_client.did_open.assert_awaited_once()
+        fake_client.wait_for_diagnostics.assert_awaited_once()
 
 
 class TestLSPManagerStatus:
