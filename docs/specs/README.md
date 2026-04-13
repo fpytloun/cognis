@@ -22,3 +22,4 @@
 | `17-agent-runtimes.md` | First-class agent runtimes, including executor-hosted Claude Code |
 | `18-runtime-contract.md` | Normative runtime lifecycle, event, projection, and tool contract |
 | `19-runtime-implementation-plan.md` | Phased implementation plan for first-class runtimes |
+| `20-auto-routing-implementation-plan.md` | Deterministic agent/workflow auto-routing, execution envelopes, classifier fallback, and rollout plan |
