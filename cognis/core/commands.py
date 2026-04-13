@@ -721,16 +721,8 @@ class CommandDispatcher:
                 type="system_message",
                 text="No pending workflow gate to resolve.",
             )
-        if len(pending_gates) > 1:
-            return CommandResult(
-                type="error",
-                text=(
-                    "There are multiple paused workflow gates in this conversation. "
-                    "Use the task board to choose the correct task."
-                ),
-                data={"code": "multiple_pending_gates"},
-            )
-        pending = pending_gates[0]
+        # Resolve the most recently registered pending gate for this conversation.
+        pending = pending_gates[-1]
 
         decision = action
         if action == "retry":

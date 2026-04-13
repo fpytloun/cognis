@@ -551,3 +551,37 @@ async def test_handle_exhausted_gate_cancel_marks_task_cancelled(
     assert state.status == "cancelled"
     assert state.current_step_index == len(workflow.steps)
     assert persisted == [("cancelled", len(workflow.steps))]
+
+
+@pytest.mark.asyncio
+async def test_handle_exhausted_gate_continue_does_not_mark_step_skipped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _build_engine()
+    task = TaskModel(
+        task_id="task-1", title="Task", created_by="user@example.com", agent_id="agent-1"
+    )
+    workflow = Workflow(
+        workflow_id="wf:test", name="Test", steps=[StepDefinition(name="plan", type="run")]
+    )
+    state = WorkflowState(current_step_index=0, skipped_steps=["architect_review"])
+
+    async def _handle_gate_step(*args: object, **kwargs: object) -> str:
+        del args, kwargs
+        return "continue"
+
+    persisted: list[tuple[list[str], int]] = []
+
+    async def _persist(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        persisted.append((list(state.skipped_steps), state.current_step_index))
+
+    monkeypatch.setattr(engine, "_handle_gate_step", _handle_gate_step)
+    monkeypatch.setattr(engine, "_persist_workflow_state", _persist)
+
+    handled = await engine._handle_exhausted(task, workflow.steps[0], state, workflow, "gate")
+
+    assert handled is True
+    assert state.current_step_index == len(workflow.steps)
+    assert state.skipped_steps == ["architect_review"]
+    assert persisted == [(["architect_review"], len(workflow.steps))]

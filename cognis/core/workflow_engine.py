@@ -1448,7 +1448,8 @@ class WorkflowEngine:
                 workflow,
             )
             if result == "continue":
-                state.skipped_steps.append(step_def.name)
+                state.last_evaluation_feedback = None
+                state.last_revision_context = None
                 state.current_step_index += 1
                 await self._persist_workflow_state(task)
                 return True

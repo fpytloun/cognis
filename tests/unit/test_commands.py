@@ -479,7 +479,7 @@ async def test_continue_reports_when_gate_does_not_offer_continue() -> None:
 
 
 @pytest.mark.asyncio
-async def test_gate_commands_fail_when_multiple_pending_gates_exist() -> None:
+async def test_gate_commands_target_latest_pending_gate_in_conversation() -> None:
     pause_waiter = PauseWaiter()
     pause_waiter.register(
         PendingPause(
@@ -520,8 +520,9 @@ async def test_gate_commands_fail_when_multiple_pending_gates_exist() -> None:
     )
 
     assert result is not None
-    assert result.type == "error"
-    assert result.data == {"code": "multiple_pending_gates"}
+    assert result.type == "system_message"
+    notifications = dispatcher._notification_service
+    assert notifications.calls == [("gate-2", "revise(plan)", {"note": ""})]
 
 
 @pytest.mark.asyncio
