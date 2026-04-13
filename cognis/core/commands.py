@@ -2,7 +2,8 @@
 
 CommandDispatcher handles all slash commands (``/compact``, ``/new``,
 ``/model``, ``/thinking``, ``/context``, ``/info``, ``/lsp``, ``/help``,
-``/approve``, ``/deny``) without any dependency on WebSocket or other
+``/approve``, ``/deny``, ``/retry``, ``/continue``) without any dependency on
+WebSocket or other
 transport layers.
 
 Each command returns a ``CommandResult`` that the transport layer renders
@@ -21,6 +22,30 @@ from cognis.models.agent import AgentDefinition
 from cognis.models.session import ConversationModel, SessionModel
 
 logger = get_logger(__name__)
+
+
+def _find_gate_revise_action(pause: Any) -> str | None:
+    """Return the first revise(...) action available on a pending gate."""
+
+    for option in pause.options or []:
+        if not isinstance(option, dict):
+            continue
+        action = option.get("action")
+        if isinstance(action, str) and action.startswith("revise(") and action.endswith(")"):
+            return action
+    return None
+
+
+def _gate_offers_action(pause: Any, action: str) -> bool:
+    """Return whether a pending gate explicitly offers an action."""
+
+    for option in pause.options or []:
+        if not isinstance(option, dict):
+            continue
+        option_action = option.get("action")
+        if option_action == action:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -149,8 +174,26 @@ class CommandDispatcher:
             note = stripped[len(cmd_word) :].strip() or None
             return await self._handle_approve_deny(conversation, is_approve, note, user_email)
 
-        # /stop or /cancel
-        if stripped in ("/stop", "/cancel"):
+        # /retry [note]
+        if stripped == "/retry" or stripped.startswith("/retry "):
+            note = stripped[len("/retry") :].strip() or None
+            return await self._handle_gate_resolution(conversation, "retry", note, user_email)
+
+        # /continue [note]
+        if stripped == "/continue" or stripped.startswith("/continue "):
+            note = stripped[len("/continue") :].strip() or None
+            return await self._handle_gate_resolution(conversation, "continue", note, user_email)
+
+        # /stop or /cancel [note]
+        if stripped == "/stop" or stripped.startswith("/stop "):
+            return await self._handle_stop(conversation)
+        if stripped == "/cancel" or stripped.startswith("/cancel "):
+            note = stripped[len("/cancel") :].strip() or None
+            gate_result = await self._handle_gate_resolution(
+                conversation, "cancel", note, user_email, allow_missing=True
+            )
+            if gate_result is not None:
+                return gate_result
             return await self._handle_stop(conversation)
 
         # Not a recognized command
@@ -656,6 +699,97 @@ class CommandDispatcher:
             text=f"User {verb} {tool_name}{note_suffix}",
         )
 
+    async def _handle_gate_resolution(
+        self,
+        conversation: ConversationModel,
+        action: str,
+        note: str | None,
+        user_email: str,
+        *,
+        allow_missing: bool = False,
+    ) -> CommandResult | None:
+        """Resolve a pending workflow gate for the current conversation."""
+
+        pending_gates = self._pause_waiter.list_pending(
+            pause_type="gate",
+            conversation_id=conversation.conversation_id,
+        )
+        if not pending_gates:
+            if allow_missing:
+                return None
+            return CommandResult(
+                type="system_message",
+                text="No pending workflow gate to resolve.",
+            )
+        if len(pending_gates) > 1:
+            return CommandResult(
+                type="error",
+                text=(
+                    "There are multiple paused workflow gates in this conversation. "
+                    "Use the task board to choose the correct task."
+                ),
+                data={"code": "multiple_pending_gates"},
+            )
+        pending = pending_gates[0]
+
+        decision = action
+        if action == "retry":
+            decision = _find_gate_revise_action(pending) or ""
+            if not decision:
+                return CommandResult(
+                    type="error",
+                    text="This paused workflow gate does not offer a retry action.",
+                    data={"code": "gate_retry_unavailable", "pause_id": pending.pause_id},
+                )
+        elif action in {"continue", "cancel"} and not _gate_offers_action(pending, action):
+            return CommandResult(
+                type="error",
+                text=f"This paused workflow gate does not offer a {action} action.",
+                data={"code": "gate_action_unavailable", "pause_id": pending.pause_id},
+            )
+
+        resolution_data = {"note": note or ""}
+        if self._notification_service is not None:
+            resolved = await self._notification_service.resolve(
+                pending.pause_id,
+                decision,
+                resolution_data,
+                user_email=user_email,
+            )
+            if not resolved:
+                return CommandResult(
+                    type="error",
+                    text="Could not resolve the pending workflow gate. It may already be resolved.",
+                    data={"code": "gate_resolve_failed", "pause_id": pending.pause_id},
+                )
+        else:
+            ok = self._pause_waiter.resolve(
+                pending.pause_id,
+                PauseResolution(decision=decision, data=resolution_data),
+            )
+            if not ok:
+                return CommandResult(
+                    type="error",
+                    text="Could not resolve the pending workflow gate. It may already be resolved.",
+                    data={"code": "gate_resolve_failed", "pause_id": pending.pause_id},
+                )
+
+        note_suffix = f": {note}" if note else ""
+        if action == "retry":
+            return CommandResult(
+                type="system_message",
+                text=f"Retrying the paused workflow step{note_suffix}",
+            )
+        if action == "continue":
+            return CommandResult(
+                type="system_message",
+                text=f"Continuing the paused workflow{note_suffix}",
+            )
+        return CommandResult(
+            type="system_message",
+            text=f"Cancelled the paused workflow{note_suffix}",
+        )
+
     async def _handle_stop(self, conversation: ConversationModel) -> CommandResult:
         """Handle /stop or /cancel by aborting active work immediately."""
         conversation_id = conversation.conversation_id
@@ -737,7 +871,10 @@ Available commands:
   /stop              Stop the current work immediately
   /cancel            Alias for /stop
   /approve [note]    Approve pending tool escalation
-  /deny [note]       Deny pending tool escalation"""
+  /deny [note]       Deny pending tool escalation
+  /retry [note]      Retry paused workflow gate using its revise action
+  /continue [note]   Continue paused workflow gate
+  /cancel [note]     Cancel paused workflow gate, or stop active work"""
 
 
 _DEFAULT_REASONING_EFFORTS: dict[str, list[str]] = {

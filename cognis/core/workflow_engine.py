@@ -2185,6 +2185,8 @@ def _build_exhaustion_gate(step_def: StepDefinition, last_error: str | None = No
         input=[],
         options=[
             GateOption(label="Retry step", action=f"revise({step_def.name})"),
+            GateOption(label="Continue anyway", action="continue"),
+            GateOption(label="Cancel task", action="cancel"),
         ],
     )
 

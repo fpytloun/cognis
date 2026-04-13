@@ -429,7 +429,8 @@ class ChannelDeliveryService:
             if option_lines:
                 lines.append("\n".join(option_lines))
         lines.append(
-            "_Use the task board to choose one of the workflow options above. "
+            "_Use the matching /retry, /continue, or /cancel command for one of the "
+            "workflow options above, or use the task board. "
             "/approve and /deny only apply to tool escalations._"
         )
         return "\n\n".join(lines)

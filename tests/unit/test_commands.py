@@ -292,6 +292,268 @@ async def test_approve_reports_failure_when_notification_service_cannot_resolve(
 
 
 @pytest.mark.asyncio
+async def test_retry_resolves_pending_gate_with_note() -> None:
+    pause_waiter = PauseWaiter()
+    pause_waiter.register(
+        PendingPause(
+            pause_id="gate-1",
+            pause_type="gate",
+            conversation_id="conv-1",
+            task_id="task-1",
+            step_name="review",
+            options=[{"label": "Retry step", "action": "revise(plan)"}],
+        )
+    )
+    notifications = _NotificationService()
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=None,
+        session_cache=None,
+        compaction_strategy=None,
+        providers=None,
+        pause_waiter=pause_waiter,
+        notification_service=notifications,
+    )
+
+    result = await dispatcher.dispatch(
+        "/retry incorporate the review",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert result is not None
+    assert result.type == "system_message"
+    assert result.text == "Retrying the paused workflow step: incorporate the review"
+    assert notifications.calls == [("gate-1", "revise(plan)", {"note": "incorporate the review"})]
+
+
+@pytest.mark.asyncio
+async def test_continue_resolves_pending_gate_with_note() -> None:
+    pause_waiter = PauseWaiter()
+    pause_waiter.register(
+        PendingPause(
+            pause_id="gate-1",
+            pause_type="gate",
+            conversation_id="conv-1",
+            task_id="task-1",
+            step_name="review",
+            options=[{"label": "Continue", "action": "continue"}],
+        )
+    )
+    notifications = _NotificationService()
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=None,
+        session_cache=None,
+        compaction_strategy=None,
+        providers=None,
+        pause_waiter=pause_waiter,
+        notification_service=notifications,
+    )
+
+    result = await dispatcher.dispatch(
+        "/continue continue anyway",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert result is not None
+    assert result.text == "Continuing the paused workflow: continue anyway"
+    assert notifications.calls == [("gate-1", "continue", {"note": "continue anyway"})]
+
+
+@pytest.mark.asyncio
+async def test_cancel_prefers_pending_gate_over_stop() -> None:
+    pause_waiter = PauseWaiter()
+    pause_waiter.register(
+        PendingPause(
+            pause_id="gate-1",
+            pause_type="gate",
+            conversation_id="conv-1",
+            task_id="task-1",
+            step_name="review",
+            options=[{"label": "Cancel", "action": "cancel"}],
+        )
+    )
+    notifications = _NotificationService()
+    scheduler = _TurnScheduler(cancelled=False)
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=None,
+        session_cache=None,
+        compaction_strategy=None,
+        providers=None,
+        pause_waiter=pause_waiter,
+        notification_service=notifications,
+        turn_scheduler=scheduler,
+    )
+
+    result = await dispatcher.dispatch(
+        "/cancel stop the task",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert result is not None
+    assert result.text == "Cancelled the paused workflow: stop the task"
+    assert notifications.calls == [("gate-1", "cancel", {"note": "stop the task"})]
+    assert scheduler.calls == []
+
+
+@pytest.mark.asyncio
+async def test_retry_reports_when_pending_gate_has_no_retry_action() -> None:
+    pause_waiter = PauseWaiter()
+    pause_waiter.register(
+        PendingPause(
+            pause_id="gate-1",
+            pause_type="gate",
+            conversation_id="conv-1",
+            task_id="task-1",
+            step_name="review",
+            options=[{"label": "Continue", "action": "continue"}],
+        )
+    )
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=None,
+        session_cache=None,
+        compaction_strategy=None,
+        providers=None,
+        pause_waiter=pause_waiter,
+        notification_service=_NotificationService(),
+    )
+
+    result = await dispatcher.dispatch(
+        "/retry",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert result is not None
+    assert result.type == "error"
+    assert result.data == {"code": "gate_retry_unavailable", "pause_id": "gate-1"}
+
+
+@pytest.mark.asyncio
+async def test_continue_reports_when_gate_does_not_offer_continue() -> None:
+    pause_waiter = PauseWaiter()
+    pause_waiter.register(
+        PendingPause(
+            pause_id="gate-1",
+            pause_type="gate",
+            conversation_id="conv-1",
+            task_id="task-1",
+            step_name="review",
+            options=[{"label": "Retry step", "action": "revise(plan)"}],
+        )
+    )
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=None,
+        session_cache=None,
+        compaction_strategy=None,
+        providers=None,
+        pause_waiter=pause_waiter,
+        notification_service=_NotificationService(),
+    )
+
+    result = await dispatcher.dispatch(
+        "/continue",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert result is not None
+    assert result.type == "error"
+    assert result.data == {"code": "gate_action_unavailable", "pause_id": "gate-1"}
+
+
+@pytest.mark.asyncio
+async def test_gate_commands_fail_when_multiple_pending_gates_exist() -> None:
+    pause_waiter = PauseWaiter()
+    pause_waiter.register(
+        PendingPause(
+            pause_id="gate-1",
+            pause_type="gate",
+            conversation_id="conv-1",
+            task_id="task-1",
+            step_name="review-1",
+            options=[{"label": "Retry step", "action": "revise(plan)"}],
+        )
+    )
+    pause_waiter.register(
+        PendingPause(
+            pause_id="gate-2",
+            pause_type="gate",
+            conversation_id="conv-1",
+            task_id="task-2",
+            step_name="review-2",
+            options=[{"label": "Retry step", "action": "revise(plan)"}],
+        )
+    )
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=None,
+        session_cache=None,
+        compaction_strategy=None,
+        providers=None,
+        pause_waiter=pause_waiter,
+        notification_service=_NotificationService(),
+    )
+
+    result = await dispatcher.dispatch(
+        "/retry",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert result is not None
+    assert result.type == "error"
+    assert result.data == {"code": "multiple_pending_gates"}
+
+
+@pytest.mark.asyncio
+async def test_cancel_without_pending_gate_falls_back_to_stop() -> None:
+    notifications = _NotificationService()
+    scheduler = _TurnScheduler(cancelled=True)
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=None,
+        session_cache=None,
+        compaction_strategy=None,
+        providers=None,
+        pause_waiter=PauseWaiter(),
+        notification_service=notifications,
+        turn_scheduler=scheduler,
+    )
+
+    result = await dispatcher.dispatch(
+        "/cancel",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert result is not None
+    assert result.type == "system_message"
+    assert "Stopped the current work" in (result.text or "")
+    assert scheduler.calls == ["conv-1"]
+
+
+@pytest.mark.asyncio
 async def test_info_renders_runtime_intaris_and_subsession_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
