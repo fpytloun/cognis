@@ -589,19 +589,22 @@ class WorkflowEngine:
         # Session handling: reuse only when the latest prior session is still
         # reusable (active/idle). Re-entering an already approved step must
         # create a fresh session instead of reopening a completed one.
-        has_reusable_prior_run = False
+        has_prior_run = False
         if not is_retry:
-            has_reusable_prior_run = await self._has_reusable_prior_step_session(task, step_def)
+            has_prior_run = await self._has_prior_step_session(task, step_def)
 
-        if is_retry or has_reusable_prior_run:
-            conversation, session = await self._reuse_or_create_step_session(task, step_def, agent)
+        seeded_from_prior = False
+        if is_retry or has_prior_run:
+            conversation, session, seeded_from_prior = await self._reuse_or_create_step_session(
+                task, step_def, agent
+            )
         else:
             conversation, session = await self._create_step_session(task, step_def, agent)
 
         # For type="full" input, fork the source step's events into the new
         # session so the conversation appears as natural history.  Skipped on
         # retry (the session already has events from the prior attempt).
-        if not is_retry and not has_reusable_prior_run:
+        if not is_retry and not seeded_from_prior:
             effective_input = resolve_effective_input(step_def, step_index, workflow.steps)
             if effective_input.type == "full":
                 await self._fork_source_events(
@@ -1779,7 +1782,7 @@ class WorkflowEngine:
         source_name: str | None,
         target_session: Any,
         state: WorkflowState,
-    ) -> None:
+    ) -> bool:
         """Copy events from a source step's session into the target session.
 
         This implements the ``type="full"`` fork behaviour: the new step
@@ -1791,26 +1794,40 @@ class WorkflowEngine:
         prompt still includes a structured summary from
         ``_build_step_prompt`` as a fallback.
         """
-        from cognis.core.session_cache import CachedEvent
-
         if source_name is None:
-            return
+            return False
 
         raw_output = state.step_outputs.get(source_name, {})
-        cognis_session_id = raw_output.get("session_id")
-        intaris_session_id = raw_output.get("intaris_session_id")
+        return await self._fork_session_events(
+            source_cognis_session_id=raw_output.get("session_id"),
+            source_intaris_session_id=raw_output.get("intaris_session_id"),
+            target_session=target_session,
+            source_label=source_name,
+        )
+
+    async def _fork_session_events(
+        self,
+        *,
+        source_cognis_session_id: str | None,
+        source_intaris_session_id: str | None,
+        target_session: Any,
+        source_label: str,
+    ) -> bool:
+        """Copy events from one session into another session."""
+
+        from cognis.core.session_cache import CachedEvent
 
         # Read source events — try session cache first, then Intaris
         source_events: list[CachedEvent] = []
-        if cognis_session_id:
-            cache_entry = self._session_cache.get_entry(cognis_session_id)
+        if source_cognis_session_id:
+            cache_entry = self._session_cache.get_entry(source_cognis_session_id)
             if cache_entry is not None and cache_entry.initialized and cache_entry.events:
                 source_events = list(cache_entry.events)
 
-        if not source_events and intaris_session_id:
+        if not source_events and source_intaris_session_id:
             try:
                 event_read = await self._providers.guardrails.read_events(
-                    session_id=intaris_session_id,
+                    session_id=source_intaris_session_id,
                     after_seq=0,
                 )
                 for raw_event in sorted(event_read.events, key=lambda e: int(e.get("seq", 0))):
@@ -1826,16 +1843,16 @@ class WorkflowEngine:
             except Exception:
                 logger.warning(
                     "workflow: failed to read source events for fork",
-                    extra={"extra_data": {"source_step": source_name}},
+                    extra={"extra_data": {"source_step": source_label}},
                     exc_info=True,
                 )
 
         if not source_events:
             logger.debug(
                 "workflow: no source events to fork",
-                extra={"extra_data": {"source_step": source_name}},
+                extra={"extra_data": {"source_step": source_label}},
             )
-            return
+            return False
 
         # Write source events to the new Intaris session
         target_intaris_id = target_session.intaris_session_id or target_session.session_id
@@ -1854,19 +1871,21 @@ class WorkflowEngine:
                 "workflow: forked source events into step session",
                 extra={
                     "extra_data": {
-                        "source_step": source_name,
+                        "source_step": source_label,
                         "target_session": target_session.session_id,
                         "event_count": len(source_events),
                         "last_seq": append_result.last_seq,
                     }
                 },
             )
+            return True
         except Exception:
             logger.warning(
                 "workflow: failed to fork source events into step session",
-                extra={"extra_data": {"source_step": source_name}},
+                extra={"extra_data": {"source_step": source_label}},
                 exc_info=True,
             )
+            return False
 
     async def _resolve_step_runtime(
         self,
@@ -1950,7 +1969,7 @@ class WorkflowEngine:
         task: TaskModel,
         step_def: StepDefinition,
         agent: AgentDefinition,
-    ) -> tuple[Any, Any]:
+    ) -> tuple[Any, Any, bool]:
         """Reuse the prior step session on retry, or create a new one.
 
         On retry, the spec requires continuing the same Intaris session
@@ -1975,7 +1994,29 @@ class WorkflowEngine:
                         if conv_row is not None:
                             conversation = _to_conversation_model(conv_row)
                             session = _to_session_model(session_row)
-                            return conversation, session
+                            return conversation, session, True
+                    if session_row is not None:
+                        conv_row = await get_conversation(db_session, session_row.conversation_id)
+                        if conv_row is not None:
+                            conversation = _to_conversation_model(conv_row)
+                            resumed_session = await self._session_manager.create_root_session(
+                                conversation_id=session_row.conversation_id,
+                                user_email=task.created_by,
+                                agent_id=agent.agent_id,
+                                intention=(
+                                    f"Task: {task.title} — Step: {step_def.name} — "
+                                    f"{step_def.description or step_def.prompt[:100]}"
+                                ),
+                            )
+                            seeded_from_prior = await self._fork_session_events(
+                                source_cognis_session_id=prior_run.session_id,
+                                source_intaris_session_id=(
+                                    prior_run.intaris_session_id or session_row.intaris_session_id
+                                ),
+                                target_session=resumed_session,
+                                source_label=f"{step_def.name}:resume",
+                            )
+                            return conversation, resumed_session, seeded_from_prior
         except Exception:
             logger.warning(
                 "Could not reuse prior step session, creating new one",
@@ -1989,27 +2030,21 @@ class WorkflowEngine:
             )
 
         # Fallback — create a fresh session
-        return await self._create_step_session(task, step_def, agent)
+        conversation, session = await self._create_step_session(task, step_def, agent)
+        return conversation, session, False
 
-    async def _has_reusable_prior_step_session(
+    async def _has_prior_step_session(
         self,
         task: TaskModel,
         step_def: StepDefinition,
     ) -> bool:
-        """Return whether the latest prior step run has a reusable session."""
-
-        from cognis.store.queries import get_session_row
+        """Return whether the latest prior step run exists."""
 
         async with self._session_factory() as db_session:
             prior_run = await get_latest_step_run_for_task_step(
                 db_session, task.task_id, step_def.name
             )
-            if prior_run is None or prior_run.session_id is None:
-                return False
-            session_row = await get_session_row(db_session, prior_run.session_id)
-            if session_row is None:
-                return False
-            return self._is_reusable_step_session_status(session_row.status)
+            return prior_run is not None and prior_run.session_id is not None
 
     def _is_reusable_step_session_status(self, status: str | None) -> bool:
         """Return whether a step session can be safely reused."""

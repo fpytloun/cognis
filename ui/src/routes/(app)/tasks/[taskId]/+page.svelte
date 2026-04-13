@@ -123,6 +123,42 @@
     return typeof val === 'string' ? val : '';
   }
 
+  function stepOutcomeStatus(stepRun: StepRun): string {
+    const outcome = stepRun.output?.outcome;
+    if (!outcome || typeof outcome !== 'object') return 'success';
+    const status = (outcome as Record<string, unknown>).status;
+    return typeof status === 'string' ? status : 'success';
+  }
+
+  function stepOutcomeReason(stepRun: StepRun): string {
+    const outcome = stepRun.output?.outcome;
+    if (!outcome || typeof outcome !== 'object') return '';
+    const reason = (outcome as Record<string, unknown>).reason;
+    return typeof reason === 'string' ? reason : '';
+  }
+
+  function displayStepStatus(stepRun: StepRun): string {
+    const outcomeStatus = stepOutcomeStatus(stepRun);
+    if (stepRun.status === 'approved' && outcomeStatus === 'rejected') {
+      return 'rejected';
+    }
+    if (stepRun.status === 'approved' && outcomeStatus === 'failed') {
+      return 'failed';
+    }
+    return stepRun.status;
+  }
+
+  function displayStepStatusHint(stepRun: StepRun): string {
+    const outcomeStatus = stepOutcomeStatus(stepRun);
+    if (stepRun.status === 'approved' && outcomeStatus === 'rejected') {
+      return 'Step output was evaluator-approved, but the completed step rejected prior work';
+    }
+    if (stepRun.status === 'approved' && outcomeStatus === 'failed') {
+      return 'Step output was evaluator-approved, but the completed step reported an operational failure';
+    }
+    return statusHints[stepRun.status] ?? stepRun.status;
+  }
+
   function stepEvalFeedback(stepRun: StepRun): string {
     const val = stepRun.evaluation?.feedback;
     return typeof val === 'string' ? val : '';
@@ -166,11 +202,12 @@
   let diagramStepStatuses = $derived.by(() => {
     if (!task) return {};
     const map: Record<string, string> = {};
+    const latestAttempts: Record<string, number> = {};
     for (const sr of task.step_runs) {
-      // Keep the latest attempt's status for each step
-      const existing = map[sr.step_name];
-      if (!existing || sr.attempt > (task.step_runs.find((s) => s.step_name === sr.step_name && s.status === existing)?.attempt ?? 0)) {
-        map[sr.step_name] = sr.status;
+      const nextStatus = displayStepStatus(sr);
+      if (!(sr.step_name in latestAttempts) || sr.attempt >= latestAttempts[sr.step_name]) {
+        latestAttempts[sr.step_name] = sr.attempt;
+        map[sr.step_name] = nextStatus;
       }
     }
     return map;
@@ -206,7 +243,9 @@
     const runs = task.step_runs;
     const totalAttempts = runs.length;
     const completedSteps = new Set(
-      runs.filter((r) => ['approved', 'completed'].includes(r.status)).map((r) => r.step_name)
+      runs
+        .filter((r) => ['approved', 'completed'].includes(r.status) && stepOutcomeStatus(r) === 'success')
+        .map((r) => r.step_name)
     ).size;
     const evalRevisions = runs.filter((r) => r.evaluation && String(r.evaluation.decision) === 'revise').length;
     const evalFailures = runs.filter((r) => r.evaluation && String(r.evaluation.decision) === 'failed').length;
@@ -616,6 +655,9 @@
                 {@const content = stepOutputContent(stepRun)}
                 {@const claims = stepOutputClaims(stepRun)}
                 {@const stepError = stepOutputError(stepRun)}
+                {@const outcomeStatus = stepOutcomeStatus(stepRun)}
+                {@const outcomeReason = stepOutcomeReason(stepRun)}
+                {@const visibleStatus = displayStepStatus(stepRun)}
                 {@const feedback = stepEvalFeedback(stepRun)}
                 {@const isExpanded = expandedSteps.has(stepRun.step_run_id)}
 
@@ -648,13 +690,26 @@
                       {#if stepRun.output?.session_id || stepRun.session_id}
                         <Button size="sm" variant="ghost" onclick={() => openSessionLogs(stepRun)}>Logs</Button>
                       {/if}
-                      <Tooltip text={statusHints[stepRun.status] ?? stepRun.status}>
-                        <span class="cursor-help rounded-full border px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wider {statusColors[stepRun.status] ?? 'border-slate-600 text-slate-400'}">
-                          {stepRun.status}
+                      <Tooltip text={displayStepStatusHint(stepRun)}>
+                        <span class="cursor-help rounded-full border px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wider {statusColors[visibleStatus] ?? 'border-slate-600 text-slate-400'}">
+                          {visibleStatus}
                         </span>
                       </Tooltip>
                     </div>
                   </div>
+
+                  {#if outcomeStatus !== 'success'}
+                    <div class="mt-3 rounded-xl border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-sm text-amber-100">
+                      <p class="font-medium uppercase tracking-wide text-[11px] text-amber-300">Outcome</p>
+                      <p class="mt-1">
+                        This step finished properly but reported
+                        <span class="font-semibold uppercase"> {outcomeStatus}</span>
+                        {#if outcomeReason}
+                          : {outcomeReason}
+                        {/if}
+                      </p>
+                    </div>
+                  {/if}
 
                   <!-- Error -->
                   {#if stepError}

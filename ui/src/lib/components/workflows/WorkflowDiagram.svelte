@@ -33,6 +33,7 @@
     fromIndex: number;
     toIndex: number;
     maxLoops: number;
+    label: string;
   }
 
   function getRejectArcs(steps: WorkflowStepFormState[]): RejectArc[] {
@@ -40,10 +41,48 @@
     const nameToIndex = new Map(steps.map((s, i) => [s.name, i]));
     for (let i = 0; i < steps.length; i++) {
       const step = steps[i];
-      if (step.rejectTarget) {
-        const targetIdx = nameToIndex.get(step.rejectTarget);
+      if (step.evaluatorRejectTarget) {
+        const targetIdx = nameToIndex.get(step.evaluatorRejectTarget);
         if (targetIdx !== undefined && targetIdx < i) {
-          arcs.push({ fromIndex: i, toIndex: targetIdx, maxLoops: step.rejectMaxLoops || 2 });
+          arcs.push({
+            fromIndex: i,
+            toIndex: targetIdx,
+            maxLoops: step.evaluatorRejectMaxLoops || 2,
+            label: 'eval revise'
+          });
+        }
+      }
+      if (step.outcomeSuccessAction === 'revise' && step.outcomeSuccessTarget) {
+        const targetIdx = nameToIndex.get(step.outcomeSuccessTarget);
+        if (targetIdx !== undefined && targetIdx < i) {
+          arcs.push({
+            fromIndex: i,
+            toIndex: targetIdx,
+            maxLoops: step.outcomeSuccessMaxLoops || 2,
+            label: 'success route'
+          });
+        }
+      }
+      if (step.outcomeRejectedAction === 'revise' && step.outcomeRejectedTarget) {
+        const targetIdx = nameToIndex.get(step.outcomeRejectedTarget);
+        if (targetIdx !== undefined && targetIdx < i) {
+          arcs.push({
+            fromIndex: i,
+            toIndex: targetIdx,
+            maxLoops: step.outcomeRejectedMaxLoops || 2,
+            label: 'rejected outcome'
+          });
+        }
+      }
+      if (step.outcomeFailedAction === 'revise' && step.outcomeFailedTarget) {
+        const targetIdx = nameToIndex.get(step.outcomeFailedTarget);
+        if (targetIdx !== undefined && targetIdx < i) {
+          arcs.push({
+            fromIndex: i,
+            toIndex: targetIdx,
+            maxLoops: step.outcomeFailedMaxLoops || 2,
+            label: 'failed outcome'
+          });
         }
       }
     }
@@ -163,7 +202,7 @@
           text-anchor="middle"
           class="fill-amber-500 text-[10px]"
         >
-          reject (max {arc.maxLoops})
+          {arc.label} (max {arc.maxLoops})
         </text>
       {/each}
 

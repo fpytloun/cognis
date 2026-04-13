@@ -194,7 +194,7 @@ async def test_handle_step_outcome_defaults_failed_without_route() -> None:
 
 
 @pytest.mark.asyncio
-async def test_has_reusable_prior_step_session_rejects_completed_sessions(
+async def test_has_prior_step_session_accepts_completed_sessions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     engine = _build_engine()
@@ -213,18 +213,18 @@ async def test_has_reusable_prior_step_session_rejects_completed_sessions(
     )
     monkeypatch.setattr("cognis.store.queries.get_session_row", _get_session_row)
 
-    reusable = await engine._has_reusable_prior_step_session(
+    reusable = await engine._has_prior_step_session(
         TaskModel(
             task_id="task-1", title="Task", created_by="user@example.com", agent_id="agent-1"
         ),
         StepDefinition(name="plan", type="run"),
     )
 
-    assert reusable is False
+    assert reusable is True
 
 
 @pytest.mark.asyncio
-async def test_has_reusable_prior_step_session_accepts_idle_sessions(
+async def test_has_prior_step_session_accepts_idle_sessions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     engine = _build_engine()
@@ -243,7 +243,7 @@ async def test_has_reusable_prior_step_session_accepts_idle_sessions(
     )
     monkeypatch.setattr("cognis.store.queries.get_session_row", _get_session_row)
 
-    reusable = await engine._has_reusable_prior_step_session(
+    reusable = await engine._has_prior_step_session(
         TaskModel(
             task_id="task-1", title="Task", created_by="user@example.com", agent_id="agent-1"
         ),
@@ -251,6 +251,154 @@ async def test_has_reusable_prior_step_session_accepts_idle_sessions(
     )
 
     assert reusable is True
+
+
+@pytest.mark.asyncio
+async def test_reuse_or_create_step_session_resumes_completed_step_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _build_engine()
+    resumed_session = SimpleNamespace(session_id="sess-2", intaris_session_id="sess-2")
+    fork_calls: list[tuple[str | None, str | None, str]] = []
+
+    async def _latest_step_run(*args: object, **kwargs: object) -> SimpleNamespace:
+        del args, kwargs
+        return SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1")
+
+    async def _get_session_row(*args: object, **kwargs: object) -> SimpleNamespace:
+        del args, kwargs
+        return SimpleNamespace(
+            session_id="sess-1",
+            conversation_id="conv-1",
+            status="completed",
+            intaris_session_id="sess-1",
+        )
+
+    async def _get_conversation(*args: object, **kwargs: object) -> SimpleNamespace:
+        del args, kwargs
+        return SimpleNamespace(
+            conversation_id="conv-1",
+            user_email="user@example.com",
+            agent_id="agent-1",
+            title="Task: Task / Step: plan",
+            title_source="manual",
+            context_type="task",
+            context_ref="task-1",
+            context_data={},
+            memory_labels={},
+            active_session_id="sess-1",
+            status="active",
+            last_message_at=None,
+            created_at=None,
+            updated_at=None,
+        )
+
+    async def _create_root_session(*args: object, **kwargs: object) -> SimpleNamespace:
+        del args, kwargs
+        return resumed_session
+
+    async def _fork_session_events(**kwargs: object) -> bool:
+        fork_calls.append(
+            (
+                str(kwargs.get("source_cognis_session_id") or "") or None,
+                str(kwargs.get("source_intaris_session_id") or "") or None,
+                str(kwargs.get("source_label") or ""),
+            )
+        )
+        return True
+
+    monkeypatch.setattr(
+        "cognis.core.workflow_engine.get_latest_step_run_for_task_step",
+        _latest_step_run,
+    )
+    monkeypatch.setattr("cognis.store.queries.get_session_row", _get_session_row)
+    monkeypatch.setattr("cognis.store.queries.get_conversation", _get_conversation)
+    monkeypatch.setattr(
+        engine._session_manager, "create_root_session", _create_root_session, raising=False
+    )
+    monkeypatch.setattr(engine, "_fork_session_events", _fork_session_events)
+
+    conversation, session, seeded = await engine._reuse_or_create_step_session(
+        TaskModel(
+            task_id="task-1", title="Task", created_by="user@example.com", agent_id="agent-1"
+        ),
+        StepDefinition(name="plan", type="run", prompt="Plan"),
+        SimpleNamespace(agent_id="agent-1"),
+    )
+
+    assert conversation.conversation_id == "conv-1"
+    assert session is resumed_session
+    assert seeded is True
+    assert fork_calls == [("sess-1", "sess-1", "plan:resume")]
+
+
+@pytest.mark.asyncio
+async def test_reuse_or_create_step_session_reports_unseeded_resume_when_fork_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _build_engine()
+    resumed_session = SimpleNamespace(session_id="sess-2", intaris_session_id="sess-2")
+
+    async def _latest_step_run(*args: object, **kwargs: object) -> SimpleNamespace:
+        del args, kwargs
+        return SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1")
+
+    async def _get_session_row(*args: object, **kwargs: object) -> SimpleNamespace:
+        del args, kwargs
+        return SimpleNamespace(
+            session_id="sess-1",
+            conversation_id="conv-1",
+            status="completed",
+            intaris_session_id="sess-1",
+        )
+
+    async def _get_conversation(*args: object, **kwargs: object) -> SimpleNamespace:
+        del args, kwargs
+        return SimpleNamespace(
+            conversation_id="conv-1",
+            user_email="user@example.com",
+            agent_id="agent-1",
+            title="Task: Task / Step: plan",
+            title_source="manual",
+            context_type="task",
+            context_ref="task-1",
+            context_data={},
+            memory_labels={},
+            active_session_id="sess-1",
+            status="active",
+            last_message_at=None,
+            created_at=None,
+            updated_at=None,
+        )
+
+    async def _create_root_session(*args: object, **kwargs: object) -> SimpleNamespace:
+        del args, kwargs
+        return resumed_session
+
+    async def _fork_session_events(**kwargs: object) -> bool:
+        del kwargs
+        return False
+
+    monkeypatch.setattr(
+        "cognis.core.workflow_engine.get_latest_step_run_for_task_step",
+        _latest_step_run,
+    )
+    monkeypatch.setattr("cognis.store.queries.get_session_row", _get_session_row)
+    monkeypatch.setattr("cognis.store.queries.get_conversation", _get_conversation)
+    monkeypatch.setattr(
+        engine._session_manager, "create_root_session", _create_root_session, raising=False
+    )
+    monkeypatch.setattr(engine, "_fork_session_events", _fork_session_events)
+
+    _, _, seeded = await engine._reuse_or_create_step_session(
+        TaskModel(
+            task_id="task-1", title="Task", created_by="user@example.com", agent_id="agent-1"
+        ),
+        StepDefinition(name="plan", type="run", prompt="Plan"),
+        SimpleNamespace(agent_id="agent-1"),
+    )
+
+    assert seeded is False
 
 
 @pytest.mark.asyncio

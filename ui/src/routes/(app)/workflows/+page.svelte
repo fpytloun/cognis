@@ -215,7 +215,7 @@
     }
   }
 
-  /** Collect step names preceding a given index for reject-target dropdown */
+  /** Collect step names preceding a given index for loop-back dropdowns */
   function previousStepNames(index: number): string[] {
     return form.steps.slice(0, index).map((s) => s.name).filter(Boolean);
   }
@@ -543,19 +543,19 @@
                   </label>
                 {/if}
 
-                <!-- Review loop (only shown when evaluate is on or step has a reject target) -->
-                {#if step.evaluate || step.rejectTarget}
-                  <details class="mt-4" open={!!step.rejectTarget}>
+                <!-- Evaluator retry loop -->
+                {#if step.evaluate || step.evaluatorRejectTarget}
+                  <details class="mt-4" open={!!step.evaluatorRejectTarget}>
                     <summary class="cursor-pointer text-sm font-medium text-slate-300 hover:text-slate-100">
-                      Review loop
-                      <Tooltip text="Configure a review loop: when the evaluator rejects this step, it loops back to a previous step for revision. Without a reject target, rejected steps simply retry in place.">
+                      Evaluator retry loop
+                      <Tooltip text="Configure what happens when the evaluator says the step output is incomplete. Without a target, the agent retries in place within the same step.">
                         <span class="cursor-help text-slate-500">(?)</span>
                       </Tooltip>
                     </summary>
                     <div class="mt-3 grid gap-4 md:grid-cols-3">
                       <label class="space-y-2 text-sm font-medium text-slate-200">
-                        <span>Reject target</span>
-                        <select bind:value={step.rejectTarget} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}>
+                        <span>Evaluator reject target</span>
+                        <select bind:value={step.evaluatorRejectTarget} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}>
                           <option value="">None (retry in place)</option>
                           {#each previousStepNames(index) as prevName}
                             <option value={prevName}>{prevName}</option>
@@ -563,17 +563,135 @@
                         </select>
                       </label>
                       <label class="space-y-2 text-sm font-medium text-slate-200">
-                        <span>Max review loops</span>
-                        <Input bind:value={step.rejectMaxLoops} disabled={!!selectedWorkflow?.is_system || !step.rejectTarget} type="number" />
+                        <span>Max evaluator loops</span>
+                        <Input bind:value={step.evaluatorRejectMaxLoops} disabled={!!selectedWorkflow?.is_system || !step.evaluatorRejectTarget} type="number" />
                       </label>
                       <label class="space-y-2 text-sm font-medium text-slate-200">
-                        <span>On loops exhausted</span>
-                        <select bind:value={step.rejectOnExhausted} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system || !step.rejectTarget}>
+                        <span>On evaluator loops exhausted</span>
+                        <select bind:value={step.evaluatorRejectOnExhausted} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system || !step.evaluatorRejectTarget}>
                           <option value="continue">Continue anyway</option>
                           <option value="fail">Fail task</option>
                           <option value="gate">Ask human</option>
                         </select>
                       </label>
+                    </div>
+                  </details>
+                {/if}
+
+                <!-- Outcome routing -->
+                {#if step.type === 'run'}
+                  <details class="mt-4" open={step.outcomeSuccessAction !== 'none' || step.outcomeRejectedAction !== 'none' || step.outcomeFailedAction !== 'none'}>
+                    <summary class="cursor-pointer text-sm font-medium text-slate-300 hover:text-slate-100">
+                      Outcome routing
+                      <Tooltip text="Configure what happens after a valid step completion reports a business outcome. This is separate from evaluator retries: an approved review can still report outcome.status='rejected' and send work back.">
+                        <span class="cursor-help text-slate-500">(?)</span>
+                      </Tooltip>
+                    </summary>
+                    <div class="mt-3 space-y-4">
+                      <div class="grid gap-4 md:grid-cols-4">
+                        <label class="space-y-2 text-sm font-medium text-slate-200">
+                          <span>On success</span>
+                          <select bind:value={step.outcomeSuccessAction} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}>
+                            <option value="none">Default continue</option>
+                            <option value="continue">Continue explicitly</option>
+                            <option value="fail">Fail task</option>
+                            <option value="gate">Ask human</option>
+                            <option value="cancel">Cancel task</option>
+                            <option value="revise">Loop back to step</option>
+                          </select>
+                        </label>
+                        <label class="space-y-2 text-sm font-medium text-slate-200">
+                          <span>On success: target</span>
+                          <select bind:value={step.outcomeSuccessTarget} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system || step.outcomeSuccessAction !== 'revise'}>
+                            <option value="">None</option>
+                            {#each previousStepNames(index) as prevName}
+                              <option value={prevName}>{prevName}</option>
+                            {/each}
+                          </select>
+                        </label>
+                        <label class="space-y-2 text-sm font-medium text-slate-200">
+                          <span>Success max loops</span>
+                          <Input bind:value={step.outcomeSuccessMaxLoops} disabled={!!selectedWorkflow?.is_system || step.outcomeSuccessAction !== 'revise' || !step.outcomeSuccessTarget} type="number" />
+                        </label>
+                        <label class="space-y-2 text-sm font-medium text-slate-200">
+                          <span>On success loops exhausted</span>
+                          <select bind:value={step.outcomeSuccessOnExhausted} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system || step.outcomeSuccessAction !== 'revise' || !step.outcomeSuccessTarget}>
+                            <option value="continue">Continue anyway</option>
+                            <option value="fail">Fail task</option>
+                            <option value="gate">Ask human</option>
+                          </select>
+                        </label>
+                      </div>
+                      <div class="grid gap-4 md:grid-cols-4">
+                        <label class="space-y-2 text-sm font-medium text-slate-200">
+                          <span>On rejected</span>
+                          <select bind:value={step.outcomeRejectedAction} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}>
+                            <option value="none">No special route</option>
+                            <option value="fail">Fail task</option>
+                            <option value="gate">Ask human</option>
+                            <option value="continue">Continue anyway</option>
+                            <option value="cancel">Cancel task</option>
+                            <option value="revise">Loop back to step</option>
+                          </select>
+                        </label>
+                        <label class="space-y-2 text-sm font-medium text-slate-200">
+                          <span>On rejected: target</span>
+                          <select bind:value={step.outcomeRejectedTarget} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system || step.outcomeRejectedAction !== 'revise'}>
+                            <option value="">None</option>
+                            {#each previousStepNames(index) as prevName}
+                              <option value={prevName}>{prevName}</option>
+                            {/each}
+                          </select>
+                        </label>
+                        <label class="space-y-2 text-sm font-medium text-slate-200">
+                          <span>Rejected max loops</span>
+                          <Input bind:value={step.outcomeRejectedMaxLoops} disabled={!!selectedWorkflow?.is_system || step.outcomeRejectedAction !== 'revise' || !step.outcomeRejectedTarget} type="number" />
+                        </label>
+                        <label class="space-y-2 text-sm font-medium text-slate-200">
+                          <span>On rejected loops exhausted</span>
+                          <select bind:value={step.outcomeRejectedOnExhausted} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system || step.outcomeRejectedAction !== 'revise' || !step.outcomeRejectedTarget}>
+                            <option value="continue">Continue anyway</option>
+                            <option value="fail">Fail task</option>
+                            <option value="gate">Ask human</option>
+                          </select>
+                        </label>
+                      </div>
+                      <div class="grid gap-4 md:grid-cols-4">
+                        <label class="space-y-2 text-sm font-medium text-slate-200">
+                          <span>On failed</span>
+                          <select bind:value={step.outcomeFailedAction} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}>
+                            <option value="none">Default fail</option>
+                            <option value="fail">Fail task</option>
+                            <option value="gate">Ask human</option>
+                            <option value="continue">Continue anyway</option>
+                            <option value="cancel">Cancel task</option>
+                            <option value="revise">Loop back to step</option>
+                          </select>
+                        </label>
+                        {#if step.outcomeFailedAction === 'revise'}
+                          <label class="space-y-2 text-sm font-medium text-slate-200">
+                            <span>Failed target</span>
+                            <select bind:value={step.outcomeFailedTarget} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}>
+                              <option value="">Select earlier step</option>
+                              {#each previousStepNames(index) as prevName}
+                                <option value={prevName}>{prevName}</option>
+                              {/each}
+                            </select>
+                          </label>
+                          <label class="space-y-2 text-sm font-medium text-slate-200">
+                            <span>Failed max loops</span>
+                            <Input bind:value={step.outcomeFailedMaxLoops} disabled={!!selectedWorkflow?.is_system || !step.outcomeFailedTarget} type="number" />
+                          </label>
+                          <label class="space-y-2 text-sm font-medium text-slate-200">
+                            <span>On failed loops exhausted</span>
+                            <select bind:value={step.outcomeFailedOnExhausted} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system || !step.outcomeFailedTarget}>
+                              <option value="continue">Continue anyway</option>
+                              <option value="fail">Fail task</option>
+                              <option value="gate">Ask human</option>
+                            </select>
+                          </label>
+                        {/if}
+                      </div>
                     </div>
                   </details>
                 {/if}

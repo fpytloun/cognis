@@ -745,6 +745,7 @@ export interface WorkflowStep {
   completion?: Record<string, unknown> | null;
   gate?: Record<string, unknown> | null;
   on_reject?: Record<string, unknown> | null;
+  outcome_routes?: Array<Record<string, unknown>> | null;
 }
 
 export interface Workflow {
