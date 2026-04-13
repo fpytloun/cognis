@@ -8,6 +8,13 @@ import pytest
 
 from cognis.core.agent_loop import PauseWaiter, PendingPause
 from cognis.core.events import EventBus, EventType
+from cognis.core.followups import (
+    FollowUpMode,
+    FollowUpOriginKind,
+    FollowUpRequiredAction,
+    FollowUpStatus,
+    TaskResultFollowUp,
+)
 from cognis.core.turn_scheduler import TurnScheduler, _effective_user_content
 from cognis.models.agent import AgentDefinition
 from cognis.models.artifact import ArtifactKind, AttachmentRef
@@ -404,6 +411,21 @@ async def test_queued_turn_observer_only_receives_its_own_turn() -> None:
 @pytest.mark.asyncio
 async def test_follow_up_event_threads_channel_delivery_metadata() -> None:
     session_factory = SimpleNamespace()
+    follow_up = TaskResultFollowUp(
+        follow_up_id="fup_1",
+        mode=FollowUpMode.NOTIFY,
+        origin_kind=FollowUpOriginKind.TASK_RESULT,
+        relevance_hint="unknown",
+        required_action=FollowUpRequiredAction.PRESENT_UPDATE,
+        topic_ref="task-1",
+        status=FollowUpStatus.COMPLETED,
+        task_id="task-1",
+        task_title="Background task",
+        source_type="api",
+        delivery_mode="latest_active_for_agent",
+        result_summary="Done",
+        description="",
+    )
 
     class _Session:
         async def __aenter__(self):
@@ -445,7 +467,7 @@ async def test_follow_up_event_threads_channel_delivery_metadata() -> None:
             SimpleNamespace(
                 data={
                     "conversation_id": "conv-1",
-                    "status": "completed",
+                    "follow_up": follow_up.model_dump(mode="json"),
                     "delivery_id": "cdel_1",
                     "channel_deliverable": True,
                     "delivery_fallback_text": "fallback",
@@ -457,6 +479,7 @@ async def test_follow_up_event_threads_channel_delivery_metadata() -> None:
 
     scheduler.submit_turn.assert_awaited_once()
     assert scheduler.submit_turn.await_args.kwargs["system_initiated"] is True
+    assert scheduler.submit_turn.await_args.kwargs["follow_up"] == follow_up
     assert scheduler.submit_turn.await_args.kwargs["channel_deliverable"] is True
     assert scheduler.submit_turn.await_args.kwargs["delivery_id"] == "cdel_1"
     assert scheduler.submit_turn.await_args.kwargs["delivery_fallback_text"] == "fallback"
@@ -464,6 +487,22 @@ async def test_follow_up_event_threads_channel_delivery_metadata() -> None:
 
 @pytest.mark.asyncio
 async def test_follow_up_event_publishes_turn_error_on_immediate_rejection() -> None:
+    follow_up = TaskResultFollowUp(
+        follow_up_id="fup_1",
+        mode=FollowUpMode.NOTIFY,
+        origin_kind=FollowUpOriginKind.TASK_RESULT,
+        relevance_hint="unknown",
+        required_action=FollowUpRequiredAction.PRESENT_UPDATE,
+        topic_ref="task-1",
+        status=FollowUpStatus.COMPLETED,
+        task_id="task-1",
+        task_title="Background task",
+        source_type="api",
+        delivery_mode="latest_active_for_agent",
+        result_summary="Done",
+        description="",
+    )
+
     class _Session:
         async def __aenter__(self):
             return self
@@ -509,7 +548,7 @@ async def test_follow_up_event_publishes_turn_error_on_immediate_rejection() -> 
             SimpleNamespace(
                 data={
                     "conversation_id": "conv-1",
-                    "status": "completed",
+                    "follow_up": follow_up.model_dump(mode="json"),
                     "delivery_id": "cdel_1",
                     "channel_deliverable": True,
                     "delivery_fallback_text": "fallback",
@@ -520,6 +559,177 @@ async def test_follow_up_event_publishes_turn_error_on_immediate_rejection() -> 
         queries.get_conversation = original  # type: ignore[assignment]
 
     scheduler._publish_turn_error.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_follow_up_event_suppresses_duplicate_follow_up_id() -> None:
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    scheduler = TurnScheduler(
+        session_factory=lambda: _Session(),
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+    scheduler.submit_turn = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+    async def _get_conversation(_session, conversation_id: str):
+        return SimpleNamespace(conversation_id=conversation_id, user_email="user@example.com")
+
+    import cognis.store.queries as queries
+
+    original = queries.get_conversation
+    queries.get_conversation = _get_conversation  # type: ignore[assignment]
+    follow_up = TaskResultFollowUp(
+        follow_up_id="fup_1",
+        mode=FollowUpMode.NOTIFY,
+        origin_kind=FollowUpOriginKind.TASK_RESULT,
+        relevance_hint="unknown",
+        required_action=FollowUpRequiredAction.PRESENT_UPDATE,
+        topic_ref="task-1",
+        status=FollowUpStatus.COMPLETED,
+        task_id="task-1",
+        task_title="Background task",
+        source_type="api",
+        delivery_mode="latest_active_for_agent",
+        result_summary="Done",
+        description="",
+    )
+    try:
+        event = SimpleNamespace(
+            data={"conversation_id": "conv-1", "follow_up": follow_up.model_dump(mode="json")}
+        )
+        await scheduler._handle_follow_up_event(event)
+        await scheduler._handle_follow_up_event(event)
+    finally:
+        queries.get_conversation = original  # type: ignore[assignment]
+
+    scheduler.submit_turn.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_follow_up_event_retries_after_immediate_rejection() -> None:
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    scheduler = TurnScheduler(
+        session_factory=lambda: _Session(),
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+    scheduler.submit_turn = AsyncMock(
+        return_value=SimpleNamespace(code="queue_full", message="full", recoverable=True)
+    )  # type: ignore[method-assign]
+    scheduler._publish_turn_error = AsyncMock()  # type: ignore[method-assign]
+
+    async def _get_conversation(_session, conversation_id: str):
+        return SimpleNamespace(
+            conversation_id=conversation_id,
+            user_email="user@example.com",
+            active_session_id="sess-1",
+        )
+
+    import cognis.store.queries as queries
+
+    original = queries.get_conversation
+    queries.get_conversation = _get_conversation  # type: ignore[assignment]
+    follow_up = TaskResultFollowUp(
+        follow_up_id="fup_1",
+        mode=FollowUpMode.NOTIFY,
+        origin_kind=FollowUpOriginKind.TASK_RESULT,
+        relevance_hint="unknown",
+        required_action=FollowUpRequiredAction.PRESENT_UPDATE,
+        topic_ref="task-1",
+        status=FollowUpStatus.COMPLETED,
+        task_id="task-1",
+        task_title="Background task",
+        source_type="api",
+        delivery_mode="latest_active_for_agent",
+        result_summary="Done",
+        description="",
+    )
+    try:
+        event = SimpleNamespace(
+            data={"conversation_id": "conv-1", "follow_up": follow_up.model_dump(mode="json")}
+        )
+        await scheduler._handle_follow_up_event(event)
+        await scheduler._handle_follow_up_event(event)
+    finally:
+        queries.get_conversation = original  # type: ignore[assignment]
+
+    assert scheduler.submit_turn.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_cancel_turn_clears_pending_queued_follow_up() -> None:
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(cancel_children=AsyncMock(return_value=0)),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+    follow_up = TaskResultFollowUp(
+        follow_up_id="fup_1",
+        mode=FollowUpMode.NOTIFY,
+        origin_kind=FollowUpOriginKind.TASK_RESULT,
+        relevance_hint="unknown",
+        required_action=FollowUpRequiredAction.PRESENT_UPDATE,
+        topic_ref="task-1",
+        status=FollowUpStatus.COMPLETED,
+        task_id="task-1",
+        task_title="Background task",
+        source_type="api",
+        delivery_mode="latest_active_for_agent",
+        result_summary="Done",
+        description="",
+    )
+    scheduler._pending_follow_ups.add(("conv-1", "fup_1"))
+    scheduler._queued_messages["conv-1"].append(SimpleNamespace(follow_up=follow_up))
+
+    cleared = await scheduler.cancel_turn("conv-1")
+
+    assert cleared is True
+    assert ("conv-1", "fup_1") not in scheduler._pending_follow_ups
 
 
 def test_effective_user_content_describes_audio_only_turns() -> None:
@@ -610,6 +820,90 @@ async def test_run_turn_publishes_effective_user_message_content() -> None:
     ]
     assert len(user_events) == 1
     assert user_events[0].data["content"] == "User attached an audio file."
+
+
+@pytest.mark.asyncio
+async def test_run_turn_clears_pending_follow_up_when_queued_relaunch_fails() -> None:
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(run_direct_turn=AsyncMock(return_value=SimpleNamespace())),
+        decision_engine=SimpleNamespace(
+            decide=AsyncMock(return_value=SimpleNamespace(decision="inline"))
+        ),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(
+            refresh=AsyncMock(return_value=SimpleNamespace(last_event_seq=0)),
+            get_context_usage=MagicMock(return_value=None),
+            get_entry=MagicMock(return_value=None),
+        ),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+    scheduler._publish_turn_completed = AsyncMock()  # type: ignore[method-assign]
+    scheduler._touch_conversation = AsyncMock()  # type: ignore[method-assign]
+    scheduler.submit_turn = AsyncMock(
+        return_value=SimpleNamespace(code="queue_full", message="full", recoverable=True)
+    )  # type: ignore[method-assign]
+    follow_up = TaskResultFollowUp(
+        follow_up_id="fup_queued",
+        mode=FollowUpMode.NOTIFY,
+        origin_kind=FollowUpOriginKind.TASK_RESULT,
+        relevance_hint="unknown",
+        required_action=FollowUpRequiredAction.PRESENT_UPDATE,
+        topic_ref="task-1",
+        status=FollowUpStatus.COMPLETED,
+        task_id="task-1",
+        task_title="Background task",
+        source_type="api",
+        delivery_mode="latest_active_for_agent",
+        result_summary="Done",
+        description="",
+    )
+    scheduler._pending_follow_ups.add(("conv-1", "fup_queued"))
+    scheduler._queued_messages["conv-1"].append(
+        SimpleNamespace(
+            content="",
+            user_email="user@example.com",
+            attachments=None,
+            outbound_attachments=None,
+            system_initiated=True,
+            follow_up=follow_up,
+            channel_deliverable=False,
+            delivery_id=None,
+            delivery_fallback_text=None,
+            turn_observers=(),
+        )
+    )
+
+    await scheduler._run_turn(
+        conversation=SimpleNamespace(
+            conversation_id="conv-1", title="", user_email="user@example.com"
+        ),
+        session=SimpleNamespace(session_id="sess-1"),
+        agent=SimpleNamespace(agent_id="agent-1"),
+        content="hello",
+        user_email="user@example.com",
+        attachments=[],
+        outbound_attachments=None,
+        attachment_notice=None,
+        system_initiated=False,
+        follow_up=None,
+        channel_deliverable=False,
+        delivery_id=None,
+        delivery_fallback_text=None,
+        bootstrap_wait_for_intention=False,
+        cancel_event=AsyncMock(),
+        turn_observers=(),
+    )
+
+    assert ("conv-1", "fup_queued") not in scheduler._pending_follow_ups
 
 
 @pytest.mark.asyncio

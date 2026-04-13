@@ -126,6 +126,27 @@ Delivery behavior:
 - **Active conversation**: synthetic task event is queued like any inbound
   message and processed on the next turn after the current one completes
 
+System-initiated follow-up turns are classified before prompt assembly so the
+agent knows how to treat the notification relative to the existing
+conversation:
+
+- **`integrate`** — the follow-up belongs to the same active work thread and
+  should continue that thread naturally (for example a same-conversation task
+  result that is still relevant, or a delegation result returning to its
+  parent conversation)
+- **`notify`** — the follow-up should be presented as a separate update and
+  must not resume an older thread by default (for example scheduled briefs,
+  gate pauses, and cross-conversation task delivery)
+
+Prompt framing rules for follow-up turns:
+
+- prior conversation turns stay in context as history
+- a controller-injected boundary marks those turns as historical context, not
+  pending requests
+- a structured follow-up block becomes the active instruction for the turn
+- follow-up-specific system instructions are static and mode-based so dynamic
+  follow-up data stays in the mutable prompt suffix
+
 ## Session Model
 
 Runtime session hierarchy:

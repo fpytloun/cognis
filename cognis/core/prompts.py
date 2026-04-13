@@ -26,6 +26,12 @@ class PromptContext(Enum):
     DELEGATION = "delegation"
     """Running a sub-session (delegate/worker/fork). Focused on returning results."""
 
+    FOLLOW_UP_INTEGRATE = "follow_up_integrate"
+    """System-initiated follow-up that should continue the same work thread."""
+
+    FOLLOW_UP_NOTIFY = "follow_up_notify"
+    """System-initiated follow-up that should be presented as a separate update."""
+
 
 # ---------------------------------------------------------------------------
 # Instruction sections
@@ -165,6 +171,28 @@ a summary. Do not finish until remaining todos are `done` or `cancelled`.
 - Delegate further only if the task genuinely requires it — prefer doing \
 the work directly."""
 
+_FOLLOW_UP_INTEGRATE = """\
+## Follow-up integration
+
+You are handling a system-initiated follow-up for work that belongs to the same thread as the recent conversation.
+
+- Prior messages are historical context, not pending requests by default.
+- The active instruction is the follow-up event block later in the prompt.
+- Use the follow-up result to continue the same thread naturally.
+- Do not re-answer an older user message literally; continue from the current project state.
+- If the follow-up indicates failure or pause, explain that clearly and focus on the next relevant action."""
+
+_FOLLOW_UP_NOTIFY = """\
+## Follow-up notification
+
+You are handling a system-initiated follow-up that should be presented as a separate update.
+
+- Prior messages are historical context, not pending requests by default.
+- The active instruction is the follow-up event block later in the prompt.
+- Do not resume or continue an older conversation thread unless the follow-up explicitly requires it.
+- Present the update clearly and concisely as a new notification.
+- If the follow-up indicates failure or pause, explain the issue and any user options without pretending the old thread is still active."""
+
 
 # ---------------------------------------------------------------------------
 # Hidden agent prompt overrides (evaluator, classifier, compaction)
@@ -214,5 +242,9 @@ def build_system_instructions(
         sections.append(_STEP_EXECUTION)
     elif context == PromptContext.DELEGATION:
         sections.append(_DELEGATION_FOCUS)
+    elif context == PromptContext.FOLLOW_UP_INTEGRATE:
+        sections.append(_FOLLOW_UP_INTEGRATE)
+    elif context == PromptContext.FOLLOW_UP_NOTIFY:
+        sections.append(_FOLLOW_UP_NOTIFY)
 
     return "\n\n".join(sections)

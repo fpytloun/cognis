@@ -12,6 +12,11 @@ from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cognis.core.attachment_utils import attachment_note as _attachment_note
+from cognis.core.followups import (
+    FollowUpMetadata,
+    build_history_boundary_message,
+    render_follow_up_block,
+)
 from cognis.core.prompts import PromptContext, build_system_instructions
 from cognis.core.runtime import ExecutorEnvironmentSnapshot, build_local_executor_environment
 from cognis.core.title_policy import sync_intaris_title
@@ -243,6 +248,7 @@ class ContextAssembler:
         tool_definitions: list[ToolDefinition] | None = None,
         active_delegations: list[dict[str, Any]] | None = None,
         prior_context: list[dict[str, Any]] | None = None,
+        follow_up: FollowUpMetadata | None = None,
         skip_user_message: bool = False,
         skip_memory: bool = False,
         prompt_context: PromptContext = PromptContext.CHAT,
@@ -279,6 +285,7 @@ class ContextAssembler:
                 tool_definitions=tool_definitions,
                 active_delegations=active_delegations,
                 prior_context=prior_context,
+                follow_up=follow_up,
                 skip_user_message=skip_user_message,
                 prompt_context=prompt_context,
                 executor_environment=executor_environment,
@@ -591,6 +598,22 @@ class ContextAssembler:
                 extra={"extra_data": {"message_count": len(prior_context)}},
             )
 
+        if follow_up is not None:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": build_history_boundary_message(),
+                    "_follow_up_context": True,
+                }
+            )
+            messages.append(
+                {
+                    "role": "system",
+                    "content": render_follow_up_block(follow_up),
+                    "_follow_up_context": True,
+                }
+            )
+
         if not skip_user_message:
             if attachment_notice:
                 messages.append({"role": "system", "content": attachment_notice})
@@ -619,7 +642,8 @@ class ContextAssembler:
                 if user_attachments:
                     note = _attachment_note(user_attachments)
                     content = f"{user_message}\n\n{note}" if user_message.strip() else note
-                messages.append({"role": user_message_role, "content": content})
+                if content or user_message_role != "system":
+                    messages.append({"role": user_message_role, "content": content})
 
         messages = self._prune_messages(
             messages=messages,
@@ -632,6 +656,7 @@ class ContextAssembler:
         # Strip internal markers before sending to LLM
         for msg in messages:
             msg.pop("_prior_context", None)
+            msg.pop("_follow_up_context", None)
 
         # Recompute cache breakpoint after pruning (immutable messages may have shifted)
         cache_breakpoint_index = _find_cache_breakpoint(messages)
@@ -682,6 +707,7 @@ class ContextAssembler:
         tool_definitions: list[ToolDefinition] | None = None,
         active_delegations: list[dict[str, Any]] | None = None,
         prior_context: list[dict[str, Any]] | None = None,
+        follow_up: FollowUpMetadata | None = None,
         skip_user_message: bool = False,
         prompt_context: PromptContext = PromptContext.TASK_STEP,
         executor_environment: ExecutorEnvironmentSnapshot | None = None,
@@ -780,6 +806,22 @@ class ContextAssembler:
                 msg["_prior_context"] = True
             messages.extend(prior_context)
 
+        if follow_up is not None:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": build_history_boundary_message(),
+                    "_follow_up_context": True,
+                }
+            )
+            messages.append(
+                {
+                    "role": "system",
+                    "content": render_follow_up_block(follow_up),
+                    "_follow_up_context": True,
+                }
+            )
+
         if not skip_user_message:
             if attachment_notice:
                 messages.append({"role": "system", "content": attachment_notice})
@@ -808,7 +850,8 @@ class ContextAssembler:
                 if user_attachments:
                     note = _attachment_note(user_attachments)
                     content = f"{user_message}\n\n{note}" if user_message.strip() else note
-                messages.append({"role": user_message_role, "content": content})
+                if content or user_message_role != "system":
+                    messages.append({"role": user_message_role, "content": content})
 
         messages = self._prune_messages(
             messages=messages,
@@ -820,6 +863,7 @@ class ContextAssembler:
 
         for msg in messages:
             msg.pop("_prior_context", None)
+            msg.pop("_follow_up_context", None)
 
         cache_breakpoint_index = _find_cache_breakpoint(messages)
         prompt_tokens = (
@@ -1213,6 +1257,8 @@ def _find_oldest_droppable_group(
         if i == last_idx:
             continue  # Never drop the last message (current user turn)
         if _is_immutable_prefix_message(msg, system_prompt):
+            continue
+        if msg.get("_follow_up_context"):
             continue
 
         # If this is an assistant message with tool_calls, collect the

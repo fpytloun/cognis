@@ -29,6 +29,7 @@ from cognis.core.agent_loop import (
     ToolResultCallback,
 )
 from cognis.core.events import Event, EventBus, EventType
+from cognis.core.followups import FollowUpMetadata, FollowUpPolicy
 from cognis.core.runtime import ResolvedStepRuntime
 from cognis.core.step_evaluator import StepEvaluator
 from cognis.core.workflow_registry import WorkflowRegistry
@@ -122,6 +123,9 @@ class WorkflowEngine:
         self._session_cache = session_cache
         self._shared_executor_connection = shared_executor_connection
         self._notification_service = notification_service
+        self._follow_up_policy = FollowUpPolicy(
+            llm=getattr(providers, "llm", None),
+        )
 
     async def run_direct_turn(
         self,
@@ -133,6 +137,7 @@ class WorkflowEngine:
         user_attachments: list[AttachmentRef] | None = None,
         attachment_notice: str | None = None,
         system_initiated: bool = False,
+        follow_up: FollowUpMetadata | None = None,
         on_progress: ProgressCallback | None = None,
         on_tool_call: ToolCallCallback | None = None,
         on_tool_result: ToolResultCallback | None = None,
@@ -166,6 +171,7 @@ class WorkflowEngine:
             user_attachments=user_attachments or [],
             attachment_notice=attachment_notice,
             system_initiated=system_initiated,
+            follow_up=follow_up,
             interaction_mode="step_requests",
             tool_registry=runtime.tool_registry,
             executor_connection=runtime.executor_connection,
@@ -864,17 +870,21 @@ class WorkflowEngine:
                     exc_info=True,
                 )
 
+            follow_up = self._follow_up_policy.build_gate_follow_up(
+                conversation_id=task.source_ref,
+                pause_id=pause_id,
+                task_id=task.task_id,
+                task_title=task.title,
+                gate_message=gate.message,
+                gate_options=gate_options,
+            )
+
             await self._event_bus.publish(
                 Event(
                     type=EventType.FOLLOW_UP_TURN_REQUESTED,
                     data={
                         "conversation_id": task.source_ref,
-                        "task_id": task.task_id,
-                        "task_title": task.title,
-                        "status": "paused",
-                        "result_summary": gate.message,
-                        "gate_message": gate.message,
-                        "gate_options": gate_options,
+                        "follow_up": follow_up.model_dump(mode="json"),
                         "delivery_id": delivery_id,
                         "channel_deliverable": channel_deliverable,
                         "delivery_fallback_text": delivery_fallback_text,
@@ -1421,19 +1431,24 @@ class WorkflowEngine:
 
         # Always request a follow-up turn so the agent can process the
         # result even if Intaris recording failed (degraded mode).
+        follow_up = await self._follow_up_policy.build_task_result_follow_up(
+            conversation_id=target_conversation_id,
+            task_id=task.task_id,
+            task_title=task.title,
+            status=str(task.status),
+            source_type=task.source_type,
+            delivery_mode=task.delivery.mode,
+            result_summary=task.result_summary,
+            description=task.description,
+            session_id=delivery_session_id,
+            session_cache=self._session_cache,
+        )
         await self._event_bus.publish(
             Event(
                 type=EventType.FOLLOW_UP_TURN_REQUESTED,
                 data={
                     "conversation_id": target_conversation_id,
-                    "task_id": task.task_id,
-                    "task_title": task.title,
-                    "agent_id": task.agent_id,
-                    "user_email": task.created_by,
-                    "status": str(task.status),
-                    "result_summary": task.result_summary,
-                    "description": task.description,
-                    "source_type": task.source_type,
+                    "follow_up": follow_up.model_dump(mode="json"),
                     "delivery_id": delivery_id,
                     "channel_deliverable": channel_deliverable,
                     "delivery_fallback_text": delivery_fallback_text,

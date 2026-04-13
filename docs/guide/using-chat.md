@@ -36,6 +36,14 @@ Some work is better handled through delegated or structured execution instead of
 
 The main conversation stays responsive while the sub-session or workflow continues.
 
+When background work finishes, Cognis classifies the follow-up before the agent
+responds:
+
+- results that still belong to the active work thread can be integrated back
+  into that thread naturally
+- scheduled briefs, pauses, and unrelated completions are shown as separate
+  updates instead of pretending an older chat topic is still active
+
 ## Session management and compaction
 
 Long conversations may be compacted so the active context stays usable. When that happens, the timeline can show a compaction card and Cognis continues from the new active session with the compacted summary included in context.

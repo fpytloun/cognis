@@ -42,6 +42,16 @@ Some workflows pause for human input. When that happens, Cognis records the paus
 
 Task results are delivered back into the target conversation instead of talking directly to external channels. This keeps user-facing communication inside the normal conversation model.
 
+Task follow-ups are not all phrased the same way:
+
+- if the result clearly belongs to the same conversation thread, Cognis can
+  integrate it back into that thread
+- if the result is scheduled, unrelated, paused, or delivered into another
+  conversation, Cognis presents it as a separate notification-style update
+
+If the controller is unsure whether a same-conversation task result still
+belongs to the active thread, it falls back to a separate update.
+
 ## When to use tasks instead of chat
 
 Prefer tasks when the work needs:

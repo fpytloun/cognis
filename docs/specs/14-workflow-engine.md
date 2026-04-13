@@ -193,6 +193,27 @@ For conversational delivery modes, the controller:
 5. If the conversation is active, enqueue the synthetic event like any other
    inbound message; the agent picks it up on the next turn
 
+Before that follow-up turn is submitted, Cognis classifies how the result
+should relate to the target conversation:
+
+- **`notify`** is the default for scheduled output, gate pauses, and task
+  results delivered outside their source conversation
+- **`integrate`** is used for delegation results returning to the parent
+  conversation and for same-conversation task results when the bounded
+  classifier determines the current thread is still about that work
+- if the classifier times out, fails, or is unsure, Cognis falls back to
+  **`notify`**
+
+The follow-up contract is typed and semantic. Publishers provide facts such as
+task identity, origin, status, and delivery mode; a centralized follow-up
+policy selects the mode and emits validated metadata. Prompt rendering happens
+later, inside context assembly, so producers do not generate follow-up prose.
+
+For MVP, duplicate follow-up suppression is in-memory and scoped to a single
+controller instance. Operators should run one controller replica when relying
+on this dedupe behavior; restart or multi-replica replay guarantees are out of
+scope for this phase.
+
 This keeps task communication inside the normal conversation/session model.
 Tasks do not speak directly to channels; they route back into conversations,
 and the conversation's channel connector delivers to Signal/Slack/web/etc.

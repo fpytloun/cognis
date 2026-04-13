@@ -170,6 +170,13 @@ Responsibilities:
 - Escalation-pending blocking (queue messages when escalation is pending)
 - Per-user concurrent turn limits
 
+Follow-up turns use typed controller metadata rather than ad hoc prompt text.
+The scheduler receives a semantic follow-up payload, deduplicates repeated
+follow-up IDs in memory, and submits a system-initiated turn that keeps
+historical messages in context while marking the new follow-up event as the
+active instruction. For MVP, this dedupe is single-controller only and does
+not provide replay across restart or multi-replica deployments.
+
 Streaming design: **Hybrid** — `TurnObserver` callbacks for real-time
 streaming (no EventBus overhead per token), EventBus lifecycle events
 (`TURN_STARTED`, `TURN_COMPLETED`, `TURN_ERROR`) for non-streaming

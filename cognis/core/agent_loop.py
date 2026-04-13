@@ -25,6 +25,7 @@ from prometheus_client import Counter, Histogram
 from cognis.core.attachment_utils import merge_content_and_attachment_note
 from cognis.core.compaction import ROTATION_TOTAL
 from cognis.core.events import Event, EventBus, EventType
+from cognis.core.followups import FollowUpMetadata, FollowUpMode, FollowUpPolicy
 from cognis.core.prompts import PromptContext
 from cognis.core.pruning import prune_tool_outputs
 from cognis.core.runtime import ExecutorEnvironmentSnapshot, ResolvedStepRuntime
@@ -714,6 +715,7 @@ class StepContext:
     step_index: int = 0  # Index of current step in workflow
     cancel_event: asyncio.Event | None = None
     system_initiated: bool = False
+    follow_up: FollowUpMetadata | None = None
     bootstrap_wait_for_intention: bool = False
     orchestration_mode: OrchestrationMode = OrchestrationMode.FULL
 
@@ -757,6 +759,7 @@ class AgentLoop:
         self.notification_service: Any = None
         self._task_queue: Any = None
         self._step_runtime_factory = step_runtime_factory
+        self._follow_up_policy = FollowUpPolicy(llm=getattr(providers, "llm", None))
         # Emergency event flush support — tracks pending events across
         # _execute_step and run_step for exception-path persistence.
         self._pending_events: list[SessionEvent] | None = None
@@ -1215,14 +1218,20 @@ class AgentLoop:
                 exc_info=True,
             )
 
+        follow_up = self._follow_up_policy.build_delegation_follow_up(
+            conversation_id=conversation_id,
+            child_session_id=child_session_id,
+            status=status,
+            result_summary=result_summary,
+        )
+
         # Trigger a follow-up turn in the parent conversation
         await self.event_bus.publish(
             Event(
                 type=EventType.FOLLOW_UP_TURN_REQUESTED,
                 data={
                     "conversation_id": conversation_id,
-                    "status": status,
-                    "result_summary": result_summary,
+                    "follow_up": follow_up.model_dump(mode="json"),
                     "delivery_id": delivery_id,
                     "channel_deliverable": channel_deliverable,
                     "delivery_fallback_text": delivery_fallback_text,
@@ -1381,6 +1390,10 @@ class AgentLoop:
             _prompt_ctx = PromptContext.TASK_STEP
         elif ctx.policy is DELEGATION_POLICY:
             _prompt_ctx = PromptContext.DELEGATION
+        elif ctx.follow_up is not None and ctx.follow_up.mode is FollowUpMode.INTEGRATE:
+            _prompt_ctx = PromptContext.FOLLOW_UP_INTEGRATE
+        elif ctx.follow_up is not None:
+            _prompt_ctx = PromptContext.FOLLOW_UP_NOTIFY
         else:
             _prompt_ctx = PromptContext.CHAT
 
@@ -1393,6 +1406,7 @@ class AgentLoop:
             attachment_notice=ctx.attachment_notice,
             user_message_role="system" if ctx.system_initiated else "user",
             prior_context=ctx.prior_context,
+            follow_up=ctx.follow_up,
             skip_memory=ctx.policy.skip_memory,
             prompt_context=_prompt_ctx,
             executor_environment=ctx.executor_environment,

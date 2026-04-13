@@ -26,6 +26,7 @@ import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from time import monotonic
 from typing import Any, Protocol, runtime_checkable
 
 import httpx
@@ -34,6 +35,10 @@ from prometheus_client import Counter, Histogram
 from cognis.api.error_sanitizer import sanitize_client_error_detail
 from cognis.core.compaction import ROTATION_TOTAL
 from cognis.core.events import Event, EventBus, EventType
+from cognis.core.followups import (
+    FollowUpMetadata,
+    parse_follow_up_metadata,
+)
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.artifact import ArtifactKind, AttachmentRef
@@ -58,6 +63,11 @@ TURN_DURATION = Histogram(
     ["type"],  # user, system
     buckets=(0.5, 1, 2, 5, 10, 30, 60, 120, 300),
 )
+FOLLOW_UP_DEDUPE_TOTAL = Counter(
+    "cognis_follow_up_dedupe_total",
+    "Suppressed duplicate follow-up turn requests",
+    ["reason"],
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -66,6 +76,7 @@ TURN_DURATION = Histogram(
 MAX_QUEUED_MESSAGES = 5
 DEFAULT_TURN_LIMIT = 3
 _MAX_DEFERRED_LOCKS = 200
+FOLLOW_UP_DEDUPE_TTL_SECONDS = 600.0
 
 
 def _effective_user_content(content: str, attachments: list[AttachmentRef]) -> str:
@@ -141,6 +152,7 @@ class _QueuedMessage:
     channel_deliverable: bool = False
     delivery_id: str | None = None
     delivery_fallback_text: str | None = None
+    follow_up: FollowUpMetadata | None = None
     outbound_attachments: list[dict[str, Any]] | None = None
     turn_observers: tuple[TurnObserver, ...] = ()
 
@@ -257,6 +269,8 @@ class TurnScheduler:
         self._turn_sessions: dict[str, str] = {}
         self._queued_messages: dict[str, deque[_QueuedMessage]] = defaultdict(deque)
         self._escalation_notice_pause_ids: dict[str, str] = {}
+        self._pending_follow_ups: set[tuple[str, str]] = set()
+        self._handled_follow_ups: dict[tuple[str, str], float] = {}
 
         # Per-user concurrent turn limit
         self._user_turn_counts: dict[str, int] = defaultdict(int)
@@ -270,6 +284,9 @@ class TurnScheduler:
         # Register for follow-up turn events
         event_bus.subscribe(EventType.FOLLOW_UP_TURN_REQUESTED, self._handle_follow_up_event)
         logger.info("turn_scheduler: registered on EventBus")
+        logger.info(
+            "turn_scheduler: follow-up dedupe is in-memory only; run a single controller instance for reliable suppression"
+        )
 
     # ------------------------------------------------------------------
     # Observer management
@@ -312,6 +329,7 @@ class TurnScheduler:
         attachments: list[dict[str, Any]] | None = None,
         outbound_attachments: list[dict[str, Any]] | None = None,
         system_initiated: bool = False,
+        follow_up: FollowUpMetadata | None = None,
         channel_deliverable: bool = False,
         delivery_id: str | None = None,
         delivery_fallback_text: str | None = None,
@@ -409,6 +427,7 @@ class TurnScheduler:
                             item.model_dump(mode="json") for item in normalized_attachments
                         ],
                         outbound_attachments=outbound_attachments,
+                        follow_up=follow_up,
                         channel_deliverable=channel_deliverable,
                         delivery_id=delivery_id,
                         delivery_fallback_text=delivery_fallback_text,
@@ -464,6 +483,7 @@ class TurnScheduler:
                     attachments=[item.model_dump(mode="json") for item in normalized_attachments],
                     outbound_attachments=outbound_attachments,
                     system_initiated=system_initiated,
+                    follow_up=follow_up,
                     channel_deliverable=channel_deliverable,
                     delivery_id=delivery_id,
                     delivery_fallback_text=delivery_fallback_text,
@@ -505,6 +525,7 @@ class TurnScheduler:
             outbound_attachments=outbound_attachments,
             attachment_notice=attachment_notice,
             system_initiated=system_initiated,
+            follow_up=follow_up,
             channel_deliverable=channel_deliverable,
             delivery_id=delivery_id,
             delivery_fallback_text=delivery_fallback_text,
@@ -520,6 +541,9 @@ class TurnScheduler:
         cleared_queue = False
         if queue is not None:
             cleared_queue = bool(queue)
+            for queued in queue:
+                if queued.follow_up is not None:
+                    self._clear_follow_up_pending(conversation_id, queued.follow_up.follow_up_id)
             queue.clear()
         if control is None:
             return cleared_queue
@@ -547,6 +571,36 @@ class TurnScheduler:
         """Return the number of queued messages for a conversation."""
         return len(self._queued_messages.get(conversation_id, []))
 
+    def _purge_expired_follow_ups(self) -> None:
+        now = monotonic()
+        expired = [
+            key
+            for key, handled_at in self._handled_follow_ups.items()
+            if now - handled_at >= FOLLOW_UP_DEDUPE_TTL_SECONDS
+        ]
+        for key in expired:
+            self._handled_follow_ups.pop(key, None)
+
+    def _register_follow_up(self, conversation_id: str, follow_up_id: str) -> bool:
+        self._purge_expired_follow_ups()
+        key = (conversation_id, follow_up_id)
+        if key in self._pending_follow_ups:
+            FOLLOW_UP_DEDUPE_TOTAL.labels(reason="pending").inc()
+            return False
+        if key in self._handled_follow_ups:
+            FOLLOW_UP_DEDUPE_TOTAL.labels(reason="handled").inc()
+            return False
+        self._pending_follow_ups.add(key)
+        return True
+
+    def _mark_follow_up_handled(self, conversation_id: str, follow_up_id: str) -> None:
+        key = (conversation_id, follow_up_id)
+        self._pending_follow_ups.discard(key)
+        self._handled_follow_ups[key] = monotonic()
+
+    def _clear_follow_up_pending(self, conversation_id: str, follow_up_id: str) -> None:
+        self._pending_follow_ups.discard((conversation_id, follow_up_id))
+
     # ------------------------------------------------------------------
     # Follow-up turn handling (EventBus subscriber)
     # ------------------------------------------------------------------
@@ -558,30 +612,24 @@ class TurnScheduler:
             logger.warning("turn_scheduler: follow-up event missing conversation_id, dropping")
             return
 
-        prompt = _build_follow_up_prompt(
-            event.data.get("status") if isinstance(event.data.get("status"), str) else None,
-            task_id=event.data.get("task_id")
-            if isinstance(event.data.get("task_id"), str)
-            else None,
-            task_title=event.data.get("task_title")
-            if isinstance(event.data.get("task_title"), str)
-            else None,
-            result_summary=event.data.get("result_summary")
-            if isinstance(event.data.get("result_summary"), str)
-            else None,
-            description=event.data.get("description")
-            if isinstance(event.data.get("description"), str)
-            else None,
-            source_type=event.data.get("source_type")
-            if isinstance(event.data.get("source_type"), str)
-            else None,
-            gate_message=event.data.get("gate_message")
-            if isinstance(event.data.get("gate_message"), str)
-            else None,
-            gate_options=event.data.get("gate_options")
-            if isinstance(event.data.get("gate_options"), list)
-            else None,
-        )
+        raw_follow_up = event.data.get("follow_up")
+        if not isinstance(raw_follow_up, dict):
+            logger.warning(
+                "turn_scheduler: follow-up event missing typed metadata, dropping",
+                extra={"extra_data": {"conversation_id": conversation_id}},
+            )
+            return
+        try:
+            follow_up = parse_follow_up_metadata(raw_follow_up)
+        except Exception:
+            logger.warning(
+                "turn_scheduler: invalid follow-up metadata, dropping",
+                extra={"extra_data": {"conversation_id": conversation_id}},
+                exc_info=True,
+            )
+            return
+        if not self._register_follow_up(conversation_id, follow_up.follow_up_id):
+            return
 
         # Use submit_turn for unified serialization
         # Determine user_email from the conversation
@@ -590,6 +638,7 @@ class TurnScheduler:
 
             row = await get_conversation(db_session, conversation_id)
         if row is None:
+            self._clear_follow_up_pending(conversation_id, follow_up.follow_up_id)
             logger.warning(
                 "turn_scheduler: follow-up conversation not found",
                 extra={"extra_data": {"conversation_id": conversation_id}},
@@ -598,7 +647,7 @@ class TurnScheduler:
 
         error = await self.submit_turn(
             conversation_id,
-            prompt,
+            "",
             user_email=row.user_email,
             attachments=event.data.get("attachments")
             if isinstance(event.data.get("attachments"), list)
@@ -607,6 +656,7 @@ class TurnScheduler:
             if isinstance(event.data.get("attachments"), list)
             else None,
             system_initiated=True,
+            follow_up=follow_up,
             channel_deliverable=bool(event.data.get("channel_deliverable")),
             delivery_id=event.data.get("delivery_id")
             if isinstance(event.data.get("delivery_id"), str)
@@ -629,6 +679,7 @@ class TurnScheduler:
                 if isinstance(event.data.get("delivery_fallback_text"), str)
                 else None,
             )
+            self._clear_follow_up_pending(conversation_id, follow_up.follow_up_id)
 
     # ------------------------------------------------------------------
     # Turn execution
@@ -733,6 +784,7 @@ class TurnScheduler:
         outbound_attachments: list[dict[str, Any]] | None = None,
         attachment_notice: str | None = None,
         system_initiated: bool = False,
+        follow_up: FollowUpMetadata | None = None,
         channel_deliverable: bool = False,
         delivery_id: str | None = None,
         delivery_fallback_text: str | None = None,
@@ -757,6 +809,7 @@ class TurnScheduler:
                 outbound_attachments=outbound_attachments,
                 attachment_notice=attachment_notice,
                 system_initiated=system_initiated,
+                follow_up=follow_up,
                 channel_deliverable=channel_deliverable,
                 delivery_id=delivery_id,
                 delivery_fallback_text=delivery_fallback_text,
@@ -778,6 +831,7 @@ class TurnScheduler:
         outbound_attachments: list[dict[str, Any]] | None,
         attachment_notice: str | None,
         system_initiated: bool,
+        follow_up: FollowUpMetadata | None = None,
         channel_deliverable: bool,
         delivery_id: str | None,
         delivery_fallback_text: str | None,
@@ -791,6 +845,7 @@ class TurnScheduler:
         _pre_turn_title = conversation.title
         start_time = asyncio.get_running_loop().time()
         turn_type = "system" if system_initiated else "user"
+        turn_succeeded = False
 
         try:
             current_user_email.set(user_email)
@@ -894,6 +949,7 @@ class TurnScheduler:
                 )
                 await self._publish_turn_completed(result, turn_observers=turn_observers)
                 TURNS_TOTAL.labels(outcome="delegated").inc()
+                turn_succeeded = True
                 return
 
             # Build streaming callbacks from observers
@@ -910,6 +966,7 @@ class TurnScheduler:
                 user_attachments=attachments,
                 attachment_notice=attachment_notice,
                 system_initiated=system_initiated,
+                follow_up=follow_up,
                 on_progress=on_token,
                 on_tool_call=on_tool_call,
                 on_tool_result=on_tool_result,
@@ -968,6 +1025,7 @@ class TurnScheduler:
             )
             await self._publish_turn_completed(result, turn_observers=turn_observers)
             TURNS_TOTAL.labels(outcome="completed").inc()
+            turn_succeeded = True
 
             logger.info(
                 "turn_scheduler: turn completed",
@@ -1020,6 +1078,12 @@ class TurnScheduler:
             duration = asyncio.get_running_loop().time() - start_time
             TURN_DURATION.labels(type=turn_type).observe(duration)
 
+            if follow_up is not None:
+                if turn_succeeded:
+                    self._mark_follow_up_handled(conversation_id, follow_up.follow_up_id)
+                else:
+                    self._clear_follow_up_pending(conversation_id, follow_up.follow_up_id)
+
             self._active_turns.pop(conversation_id, None)
             self._turn_controls.pop(conversation_id, None)
             self._turn_sessions.pop(conversation_id, None)
@@ -1043,19 +1107,28 @@ class TurnScheduler:
             if queue:
                 queued = queue.popleft()
                 try:
-                    await self.submit_turn(
+                    error = await self.submit_turn(
                         conversation_id,
                         queued.content,
                         user_email=queued.user_email,
                         attachments=queued.attachments,
                         outbound_attachments=queued.outbound_attachments,
                         system_initiated=queued.system_initiated,
+                        follow_up=queued.follow_up,
                         channel_deliverable=queued.channel_deliverable,
                         delivery_id=queued.delivery_id,
                         delivery_fallback_text=queued.delivery_fallback_text,
                         turn_observers=queued.turn_observers,
                     )
+                    if error is not None and queued.follow_up is not None:
+                        self._clear_follow_up_pending(
+                            conversation_id, queued.follow_up.follow_up_id
+                        )
                 except Exception:
+                    if queued.follow_up is not None:
+                        self._clear_follow_up_pending(
+                            conversation_id, queued.follow_up.follow_up_id
+                        )
                     logger.exception(
                         "turn_scheduler: failed to load runtime for queued message",
                         extra={"extra_data": {"conversation_id": conversation_id}},

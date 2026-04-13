@@ -159,6 +159,12 @@ async def test_deliver_task_result_uses_source_ref_for_specific_conversation(
     engine, session_factory = await _runtime(tmp_path)
     guardrails = _Guardrails()
     event_bus = EventBus()
+    captured: list[object] = []
+
+    async def _capture(event: object) -> None:
+        captured.append(event)
+
+    event_bus.subscribe_all(_capture)
     workflow_engine = WorkflowEngine(
         session_factory=session_factory,
         providers=SimpleNamespace(guardrails=guardrails),
@@ -216,6 +222,10 @@ async def test_deliver_task_result_uses_source_ref_for_specific_conversation(
     )
 
     assert guardrails.recorded[0][0] == "intaris-specific"
+    follow_up = next(
+        event for event in captured if event.type == EventType.FOLLOW_UP_TURN_REQUESTED
+    )
+    assert follow_up.data["follow_up"]["mode"] == "notify"
     await engine.dispose()
 
 
@@ -297,6 +307,7 @@ async def test_deliver_task_result_creates_channel_follow_up_outbox(tmp_path: ob
     delivery_id = follow_up.data.get("delivery_id")
     assert isinstance(delivery_id, str)
     assert follow_up.data.get("channel_deliverable") is True
+    assert follow_up.data["follow_up"]["origin_kind"] == "task_result"
 
     async with session_factory() as session:
         row = await get_channel_delivery_outbox(session, delivery_id)

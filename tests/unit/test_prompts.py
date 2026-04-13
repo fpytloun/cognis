@@ -26,3 +26,19 @@ def test_delegation_prompt_mentions_todos_and_questions() -> None:
     assert instructions is not None
     assert "create step todos" in instructions
     assert "use `step_request_input`" in instructions
+
+
+def test_follow_up_integrate_prompt_marks_history_as_inactive() -> None:
+    instructions = build_system_instructions(PromptContext.FOLLOW_UP_INTEGRATE)
+    assert instructions is not None
+    assert "historical context" in instructions
+    assert "active instruction is the follow-up event block" in instructions
+    assert "Do not re-answer an older user message literally" in instructions
+
+
+def test_follow_up_notify_prompt_keeps_updates_separate() -> None:
+    instructions = build_system_instructions(PromptContext.FOLLOW_UP_NOTIFY)
+    assert instructions is not None
+    assert "historical context" in instructions
+    assert "separate update" in instructions
+    assert "Do not resume or continue an older conversation thread" in instructions

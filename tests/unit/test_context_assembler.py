@@ -7,6 +7,14 @@ from time import monotonic
 import pytest
 
 from cognis.core.context import ContextAssembler, _build_environment_info
+from cognis.core.followups import (
+    FollowUpMode,
+    FollowUpOriginKind,
+    FollowUpRequiredAction,
+    FollowUpStatus,
+    TaskResultFollowUp,
+)
+from cognis.core.prompts import PromptContext
 from cognis.core.runtime import ExecutorEnvironmentSnapshot
 from cognis.models.agent import AgentDefinition, AgentLLMConfig
 from cognis.models.config import ModelInfo
@@ -572,3 +580,135 @@ async def test_context_assembler_preserves_core_memories_on_partial_refresh() ->
     assert len(core_in_second) == 1, (
         "Core memories must survive partial recall — they are part of the immutable prefix"
     )
+
+
+@pytest.mark.asyncio
+async def test_context_assembler_renders_follow_up_boundary_and_active_block() -> None:
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=_SessionCache(),
+        session_manager=_SessionManager(),
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+
+    follow_up = TaskResultFollowUp(
+        follow_up_id="fup_1",
+        mode=FollowUpMode.NOTIFY,
+        origin_kind=FollowUpOriginKind.TASK_RESULT,
+        relevance_hint="unknown",
+        required_action=FollowUpRequiredAction.PRESENT_UPDATE,
+        topic_ref="task-1",
+        status=FollowUpStatus.COMPLETED,
+        task_id="task-1",
+        task_title="Daily brief",
+        source_type="scheduler",
+        delivery_mode="same_conversation",
+        result_summary="Daily summary is ready.",
+        description="Daily schedule",
+    )
+
+    result = await assembler.assemble(
+        session=_session(),
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="",
+        user_message_role="system",
+        follow_up=follow_up,
+        tool_definitions=[],
+    )
+
+    contents = [str(message.get("content", "")) for message in result.messages]
+    assert any("historical conversation context" in content for content in contents)
+    assert any('<follow_up_event mode="notify"' in content for content in contents)
+    assert all(message.get("content") != "" for message in result.messages)
+
+
+@pytest.mark.asyncio
+async def test_context_assembler_keeps_follow_up_data_out_of_immutable_prefix() -> None:
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=_SessionCache(),
+        session_manager=_SessionManager(),
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+    follow_up = TaskResultFollowUp(
+        follow_up_id="fup_1",
+        mode=FollowUpMode.INTEGRATE,
+        origin_kind=FollowUpOriginKind.TASK_RESULT,
+        relevance_hint="same_thread",
+        required_action=FollowUpRequiredAction.INTEGRATE_RESULT,
+        topic_ref="task-1",
+        status=FollowUpStatus.COMPLETED,
+        task_id="task-1",
+        task_title="Implement auth",
+        source_type="chat",
+        delivery_mode="same_conversation",
+        result_summary="Refresh token support implemented.",
+        description="Auth work",
+    )
+
+    result = await assembler.assemble(
+        session=_session(),
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="",
+        user_message_role="system",
+        follow_up=follow_up,
+        tool_definitions=[],
+        prompt_context=PromptContext.FOLLOW_UP_INTEGRATE,
+    )
+
+    breakpoint = result.cache_breakpoint_index
+    assert breakpoint is not None
+    immutable_contents = "\n".join(
+        str(message.get("content", "")) for message in result.messages[: breakpoint + 1]
+    )
+    assert "Implement auth" not in immutable_contents
+    assert "Refresh token support implemented." not in immutable_contents
+
+
+@pytest.mark.asyncio
+async def test_context_assembler_clears_follow_up_markers_in_skip_memory_path() -> None:
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=_SessionCache(),
+        session_manager=_SessionManager(),
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+    follow_up = TaskResultFollowUp(
+        follow_up_id="fup_1",
+        mode=FollowUpMode.NOTIFY,
+        origin_kind=FollowUpOriginKind.TASK_RESULT,
+        relevance_hint="unknown",
+        required_action=FollowUpRequiredAction.PRESENT_UPDATE,
+        topic_ref="task-1",
+        status=FollowUpStatus.COMPLETED,
+        task_id="task-1",
+        task_title="Daily brief",
+        source_type="scheduler",
+        delivery_mode="same_conversation",
+        result_summary="Done",
+        description="daily schedule",
+    )
+
+    result = await assembler.assemble(
+        session=_session(),
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="",
+        user_message_role="system",
+        follow_up=follow_up,
+        tool_definitions=[],
+        skip_memory=True,
+    )
+
+    assert all(not any(str(key).startswith("_") for key in message) for message in result.messages)
