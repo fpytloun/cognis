@@ -51,6 +51,7 @@ Agent's completion claim:
   Summary: {summary}
   Claims: {claims}
   Outputs: {outputs}
+  Outcome: {outcome}
 
 Agent's last response:
 {content}
@@ -63,6 +64,9 @@ Evaluation checklist:
 2. For each claim, is there evidence in the response content?
 3. Are there obvious errors, missing pieces, or incomplete work?
 4. If the objective mentions tests/validation, are they present and passing?
+5. A proper step completion may still report an outcome of "rejected" or "failed".
+   Judge whether the step was completed correctly, not whether the business
+   result was positive.
 
 Decide:
 - "approved" — the step objective is satisfactorily met based on actual \
@@ -249,6 +253,11 @@ class StepEvaluator:
 
         formatted_outputs = json.dumps(step_output.outputs, default=str)[:2000]
         formatted_claims = "\n".join(f"  - {c}" for c in step_output.claims) or "(none)"
+        formatted_outcome = (
+            step_output.outcome.model_dump_json()
+            if step_output.outcome is not None
+            else "(implicit success)"
+        )
 
         # Include the agent's actual response content so the evaluator can
         # verify claims against evidence.  Use the tail of the content since
@@ -265,6 +274,7 @@ class StepEvaluator:
             summary=step_output.summary,
             claims=formatted_claims,
             outputs=formatted_outputs,
+            outcome=formatted_outcome,
             content=formatted_content,
             task_context=task_context or "(none)",
         )

@@ -200,10 +200,13 @@ todos before substantial work begins.
 - Use step todos to track the work you are actively performing. Keep them \
 current throughout the step.
 - When finished, write out your findings and deliverables as a detailed \
-text response. Then call `step_complete` with a summary, structured \
-outputs, and verifiable claims.
+ text response. Then call `step_complete` with a summary, structured \
+ outputs, verifiable claims, and an `outcome` when the completed step should \
+ explicitly report rejection or failure.
 - The evaluator checks your work against your written output and claims — \
-be thorough and specific. Vague summaries get rejected.
+ be thorough and specific. Vague summaries get rejected.
+- A step can still finish properly with `outcome.status="rejected"` or \
+ `"failed"` if that accurately reflects the result of the completed work.
 - If you need clarification, use `step_request_input` (when available) \
 rather than guessing.
 - Do not call `step_complete` until every remaining todo is `done` or \
@@ -224,7 +227,9 @@ before substantial work, and keep them updated as you proceed.
 - If you need input from the caller to continue, use `step_request_input` \
 when available rather than guessing or stopping early.
 - Write a comprehensive result when done, then call `step_complete` with \
-a summary. Do not finish until remaining todos are `done` or `cancelled`.
+ a summary and include an `outcome` if the delegated work properly concluded \
+ with rejection or failure. Do not finish until remaining todos are `done` or \
+ `cancelled`.
 - Delegate further only if the task genuinely requires it — prefer doing \
 the work directly."""
 

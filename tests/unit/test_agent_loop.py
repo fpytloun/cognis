@@ -410,6 +410,74 @@ class _FakeContextAssembler:
         )
 
 
+class _StepCompleteValidationLLM:
+    def __init__(self) -> None:
+        self.calls: list[list[dict[str, object]]] = []
+
+    def count_tokens(self, text: str, model: str | None = None) -> int:
+        del model
+        return len(text)
+
+    async def get_model_info(self, model: str | None) -> SimpleNamespace:
+        del model
+        return SimpleNamespace(
+            max_tools=None,
+            supports_parallel_tool_calls=False,
+            supports_tool_choice=False,
+            supports_cache_control=False,
+            supports_defer_loading=False,
+            provider="test",
+        )
+
+    async def stream_generate(self, messages: list[dict[str, object]], **_: object):
+        self.calls.append([dict(message) for message in messages])
+        if len(self.calls) == 1:
+            yield {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_invalid",
+                                    "function": {
+                                        "name": "step_complete",
+                                        "arguments": (
+                                            '{"summary":"done","outcome":{"status":"failed"}}'
+                                        ),
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+            return
+
+        yield {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_valid",
+                                "function": {
+                                    "name": "step_complete",
+                                    "arguments": (
+                                        '{"summary":"done","claims":["Reported the failure"],'
+                                        '"outcome":{"status":"failed","reason":"git identity missing"}}'
+                                    ),
+                                },
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+        return
+
+
 class _NoopRememberQueue:
     async def enqueue(self, _: object) -> None:
         return None
@@ -654,3 +722,51 @@ async def test_user_message_is_persisted_before_reasoning_and_tool_execution() -
     ]
     assert "record:tool_result" in order
     assert "record:assistant_message" in order
+
+
+@pytest.mark.asyncio
+async def test_step_complete_validation_reprompts_and_accepts_corrected_payload() -> None:
+    fake_llm = _StepCompleteValidationLLM()
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="commit", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-1",
+            intaris_session_id="sess-1",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(
+            conversation_id="conv-1",
+            title=None,
+            title_source="unset",
+        ),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=WORKFLOW_POLICY,
+        user_message="create a commit",
+        user_attachments=[],
+        system_initiated=False,
+    )
+
+    output = await agent_loop.run_step(ctx)
+
+    assert output is not None
+    assert output.outcome is not None
+    assert output.outcome.status == "failed"
+    assert output.outcome.reason == "git identity missing"
+    assert len(fake_llm.calls) == 2
+    second_prompt = str(fake_llm.calls[1][-1]["content"])
+    assert "invalid_step_complete_arguments" in second_prompt
+    assert "outcome.reason" in second_prompt

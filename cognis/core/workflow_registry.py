@@ -10,7 +10,7 @@ from cognis.logging import get_logger
 from cognis.models.workflow import (
     CompletionConfig,
     InteractionMode,
-    OnRejectConfig,
+    OutcomeRoute,
     StepDefinition,
     StepInputConfig,
     Workflow,
@@ -148,14 +148,22 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
             name="architect_review",
             type="run",
             agent_override="system:architect",
-            prompt="Review this implementation plan as an ARB reviewer.",
+            prompt=(
+                "Review this implementation plan as an ARB reviewer. If the review is "
+                "complete and the plan needs revision, report that via "
+                "step_complete.outcome.status='rejected' with a concise reason. If the "
+                "review itself could not be completed, use outcome.status='failed'."
+            ),
             input=StepInputConfig(type="last", source="plan"),
             completion=CompletionConfig(evaluate=True, max_attempts=3),
-            on_reject=OnRejectConfig(
-                target="plan",
-                max_loop_iterations=3,
-                on_exhausted="gate",
-            ),
+            outcome_routes=[
+                OutcomeRoute(
+                    status="rejected",
+                    action="revise(plan)",
+                    max_loop_iterations=3,
+                    on_exhausted="gate",
+                )
+            ],
         ),
         StepDefinition(
             name="implement",
@@ -186,24 +194,38 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
             name="code_review",
             type="run",
             agent_override="system:code-review",
-            prompt="Review all changes made during implementation.",
+            prompt=(
+                "Review all changes made during implementation. If the review is complete "
+                "but fixes are required before approval, report that via "
+                "step_complete.outcome.status='rejected' with a concise reason. If the "
+                "review itself could not be completed, use outcome.status='failed'."
+            ),
             input=StepInputConfig(
                 type="last",
                 source=["plan", "implement", "update_docs"],
             ),
             completion=CompletionConfig(evaluate=True, max_attempts=3),
-            on_reject=OnRejectConfig(
-                target="implement",
-                max_loop_iterations=3,
-                on_exhausted="gate",
-            ),
+            outcome_routes=[
+                OutcomeRoute(
+                    status="rejected",
+                    action="revise(implement)",
+                    max_loop_iterations=3,
+                    on_exhausted="gate",
+                )
+            ],
         ),
         StepDefinition(
             name="commit",
             type="run",
             agent_override="system:committer",
-            prompt="Create a conventional commit for all changes.",
+            prompt=(
+                "Create a conventional commit for all changes. If the commit cannot be "
+                "created due to an operational problem such as missing git identity or a "
+                "hook failure, report that via step_complete.outcome.status='failed' with "
+                "a concise reason instead of pretending success."
+            ),
             completion=CompletionConfig(evaluate=False),
+            outcome_routes=[OutcomeRoute(status="failed", action="gate")],
         ),
         StepDefinition(
             name="remember",
@@ -317,7 +339,7 @@ class WorkflowRegistry:
 
 
 def _validate_workflow(workflow: Workflow) -> None:
-    """Validate workflow definition: step references, input sources, on_reject targets."""
+    """Validate workflow definition: step references, input sources, and routing targets."""
     seen_names: set[str] = set()
     step_names = [s.name for s in workflow.steps]
 
@@ -345,6 +367,28 @@ def _validate_workflow(workflow: Workflow) -> None:
                     f"Step {step.name!r} on_reject.target must reference an earlier "
                     f"step, but {step.on_reject.target!r} is at index {target_idx} "
                     f"(current step is at index {i})"
+                )
+
+        # Validate outcome routes point to valid actions or earlier steps.
+        for route in step.outcome_routes:
+            action = route.action
+            if action in {"continue", "fail", "gate", "cancel"}:
+                continue
+            if action.startswith("revise(") and action.endswith(")"):
+                target = action[7:-1]
+            else:
+                raise ValueError(
+                    f"Step {step.name!r} has unsupported outcome route action: {action!r}"
+                )
+            if target not in step_names:
+                raise ValueError(
+                    f"Step {step.name!r} outcome route references unknown step: {target!r}"
+                )
+            target_idx = step_names.index(target)
+            if target_idx >= i:
+                raise ValueError(
+                    f"Step {step.name!r} outcome route must reference an earlier step, "
+                    f"but {target!r} is at index {target_idx} (current step is at index {i})"
                 )
 
         # Validate gate steps have gate config

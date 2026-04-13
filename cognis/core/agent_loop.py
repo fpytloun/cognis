@@ -21,6 +21,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from prometheus_client import Counter, Histogram
+from pydantic import ValidationError
 
 from cognis.core.attachment_utils import merge_content_and_attachment_note
 from cognis.core.compaction import ROTATION_TOTAL
@@ -151,6 +152,43 @@ def _event_safe_attachments(attachments: list[dict[str, Any]]) -> list[dict[str,
             continue
         safe.append({k: v for k, v in attachment.items() if k != "content_b64"})
     return safe
+
+
+def _step_complete_example_payload() -> dict[str, Any]:
+    """Return a minimal valid ``step_complete`` payload example."""
+
+    return {
+        "summary": "Summarize what the step accomplished.",
+        "outputs": {"key": "value"},
+        "claims": ["State the verifiable deliverables from the written output."],
+        "outcome": {
+            "status": "success",
+        },
+    }
+
+
+def _build_step_complete_validation_error(arguments: dict[str, Any], exc: ValidationError) -> str:
+    """Build a structured validation error for malformed ``step_complete`` calls."""
+
+    issues: list[str] = []
+    for error in exc.errors():
+        location = ".".join(str(item) for item in error.get("loc", ())) or "payload"
+        message = str(error.get("msg", "invalid value"))
+        issues.append(f"{location}: {message}")
+
+    return json.dumps(
+        {
+            "status": "rejected",
+            "reason": "invalid_step_complete_arguments",
+            "message": (
+                "step_complete arguments did not match the required schema. "
+                "Call step_complete again with corrected arguments."
+            ),
+            "issues": issues,
+            "received": arguments,
+            "example": _step_complete_example_payload(),
+        }
+    )
 
 
 def _find_gate_revise_action(pause: PendingPause) -> str | None:
@@ -1803,16 +1841,37 @@ class AgentLoop:
                             await on_tool_result(tc.call_id, tc.name, err_content, True, None, None)
                         continue
 
-                    step_output = StepOutput(
-                        summary=tc.arguments.get("summary", ""),
-                        content="\n\n".join(assistant_content_parts),
-                        outputs=tc.arguments.get("outputs", {}),
-                        claims=tc.arguments.get("claims", []),
-                        attachments=list(collected_attachments),
-                        session_id=ctx.session.session_id,
-                        intaris_session_id=ctx.session.intaris_session_id or ctx.session.session_id,
-                        completed_at=datetime.now(UTC),
-                    )
+                    try:
+                        step_output = StepOutput(
+                            summary=tc.arguments.get("summary", ""),
+                            content="\n\n".join(assistant_content_parts),
+                            outputs=tc.arguments.get("outputs", {}),
+                            claims=tc.arguments.get("claims", []),
+                            outcome=tc.arguments.get("outcome"),
+                            attachments=list(collected_attachments),
+                            session_id=ctx.session.session_id,
+                            intaris_session_id=ctx.session.intaris_session_id
+                            or ctx.session.session_id,
+                            completed_at=datetime.now(UTC),
+                        )
+                    except ValidationError as exc:
+                        err_content = _build_step_complete_validation_error(tc.arguments, exc)
+                        messages.append(
+                            {"role": "tool", "tool_call_id": tc.call_id, "content": err_content}
+                        )
+                        _append_tool_result_event(
+                            events_to_record, tc, err_content, True, tool_id=tool_id
+                        )
+                        await self._flush_events_incremental(
+                            ctx,
+                            events_to_record,
+                            reason="tool_result:step_complete",
+                            on_token=on_token,
+                        )
+                        if on_tool_result:
+                            await on_tool_result(tc.call_id, tc.name, err_content, True, None, None)
+                        continue
+
                     events_to_record.append(
                         SessionEvent(
                             type="lifecycle",
@@ -1820,6 +1879,9 @@ class AgentLoop:
                                 "event": "step_complete",
                                 "status": "completed",
                                 "summary": step_output.summary,
+                                "outcome_status": (
+                                    step_output.outcome.status if step_output.outcome else "success"
+                                ),
                             },
                         )
                     )
@@ -4069,11 +4131,17 @@ class AgentLoop:
                 content = todo.get("content", "")
                 parts.append(f"- [{status}] {content}")
 
+        feedback = getattr(ctx.workflow_state, "last_evaluation_feedback", None)
+        if feedback:
+            parts.append(f"\n\n## Revision Feedback\n\n{feedback}")
+
         parts.append(
             "\n\n---\n"
             "When you have completed the objective, write out your findings and "
             "deliverables as a detailed text response. Then call step_complete "
-            "with a summary, structured outputs, and verifiable claims."
+            "with a summary, structured outputs, verifiable claims, and an "
+            "outcome when the completed step should explicitly report rejection "
+            "or failure."
         )
 
         return "".join(parts)
@@ -4167,6 +4235,27 @@ class AgentLoop:
                                         "accomplished. Each claim should be independently "
                                         "checkable against your written output above."
                                     ),
+                                },
+                                "outcome": {
+                                    "type": "object",
+                                    "description": (
+                                        "Optional business outcome for this step. Use "
+                                        "'rejected' when the step completed properly but "
+                                        "the reviewed work should go back for revision, or "
+                                        "'failed' when the step itself could not complete "
+                                        "successfully."
+                                    ),
+                                    "properties": {
+                                        "status": {
+                                            "type": "string",
+                                            "enum": ["success", "rejected", "failed"],
+                                        },
+                                        "reason": {
+                                            "type": "string",
+                                            "description": "Required for rejected or failed outcomes.",
+                                        },
+                                    },
+                                    "required": ["status"],
                                 },
                             },
                             "required": ["summary"],

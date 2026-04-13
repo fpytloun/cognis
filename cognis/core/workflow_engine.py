@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import uuid
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any, cast
 
 from prometheus_client import Counter, Histogram
@@ -436,6 +437,29 @@ class WorkflowEngine:
                             },
                         )
 
+                await self._event_bus.publish(
+                    Event(
+                        type=EventType.STEP_COMPLETED,
+                        data={
+                            "task_id": task.task_id,
+                            "step_name": step_def.name,
+                            "step_index": state.current_step_index,
+                        },
+                    )
+                )
+
+                routed = await self._handle_step_outcome(
+                    task, step_def, step_result, state, workflow
+                )
+                if routed == "failed":
+                    state.status = "failed"
+                    break
+                if routed == "cancelled":
+                    state.status = "cancelled"
+                    break
+                if routed == "routed":
+                    continue
+
                 logger.info(
                     "Step approved, advancing",
                     extra={
@@ -449,19 +473,9 @@ class WorkflowEngine:
                 state.current_step_status = None
                 state.pending_pause_type = None
                 state.pending_pause_payload = None
+                state.last_evaluation_feedback = None
                 state.current_step_index += 1
                 await self._persist_workflow_state(task)
-
-                await self._event_bus.publish(
-                    Event(
-                        type=EventType.STEP_COMPLETED,
-                        data={
-                            "task_id": task.task_id,
-                            "step_name": step_def.name,
-                            "step_index": state.current_step_index - 1,
-                        },
-                    )
-                )
 
             # Workflow completed — determine final status.
             # If any steps were skipped due to exhaustion, the task failed.
@@ -469,7 +483,13 @@ class WorkflowEngine:
             state.pending_pause_type = None
             state.pending_pause_payload = None
 
-            if state.status == "failed" or state.skipped_steps:
+            if state.status == "cancelled":
+                task.status = TaskStatus.CANCELLED
+                task.result_summary = (
+                    self._build_result_summary(state, workflow) or "Workflow cancelled"
+                )
+                task.completed_at = datetime.now(UTC)
+            elif state.status == "failed" or state.skipped_steps:
                 state.status = "failed"
                 task.status = TaskStatus.FAILED
                 if state.skipped_steps:
@@ -566,19 +586,14 @@ class WorkflowEngine:
         # Determine step index
         step_index = self._find_step_index(workflow, step_def.name) or 0
 
-        # Session handling: reuse existing conversation on retry OR when a
-        # prior step_run exists (gate-revise resets the attempt counter but
-        # we still want to reuse the conversation so session logs remain
-        # accessible for all attempts).
-        has_prior_run = False
+        # Session handling: reuse only when the latest prior session is still
+        # reusable (active/idle). Re-entering an already approved step must
+        # create a fresh session instead of reopening a completed one.
+        has_reusable_prior_run = False
         if not is_retry:
-            async with self._session_factory() as db_session:
-                prior_run = await get_latest_step_run_for_task_step(
-                    db_session, task.task_id, step_def.name
-                )
-                has_prior_run = prior_run is not None
+            has_reusable_prior_run = await self._has_reusable_prior_step_session(task, step_def)
 
-        if is_retry or has_prior_run:
+        if is_retry or has_reusable_prior_run:
             conversation, session = await self._reuse_or_create_step_session(task, step_def, agent)
         else:
             conversation, session = await self._create_step_session(task, step_def, agent)
@@ -586,7 +601,7 @@ class WorkflowEngine:
         # For type="full" input, fork the source step's events into the new
         # session so the conversation appears as natural history.  Skipped on
         # retry (the session already has events from the prior attempt).
-        if not is_retry and not has_prior_run:
+        if not is_retry and not has_reusable_prior_run:
             effective_input = resolve_effective_input(step_def, step_index, workflow.steps)
             if effective_input.type == "full":
                 await self._fork_source_events(
@@ -1079,6 +1094,186 @@ class WorkflowEngine:
         await self._persist_workflow_state(task)
         # Stay on the same step — the main loop will re-execute it
         return True
+
+    async def _handle_step_outcome(
+        self,
+        task: TaskModel,
+        step_def: StepDefinition,
+        step_result: StepOutput,
+        state: WorkflowState,
+        workflow: Workflow,
+    ) -> str:
+        """Apply post-approval routing based on the completed step outcome."""
+
+        outcome = step_result.outcome
+        outcome_status = outcome.status if outcome is not None else "success"
+        route = self._resolve_outcome_route(step_def, outcome_status)
+        if route is None:
+            state.last_evaluation_feedback = None
+            return "continue"
+        action = route.action
+
+        logger.info(
+            "Applying step outcome route",
+            extra={
+                "extra_data": {
+                    "task_id": task.task_id,
+                    "step": step_def.name,
+                    "outcome_status": outcome_status,
+                    "action": action,
+                }
+            },
+        )
+
+        if action == "continue":
+            state.last_evaluation_feedback = None
+            return "continue"
+        if action == "fail":
+            return "failed"
+        if action == "cancel":
+            return "cancelled"
+        if action == "gate":
+            if workflow.interaction.mode == "none":
+                logger.warning(
+                    "Outcome gate requested in autonomous mode, failing workflow",
+                    extra={
+                        "extra_data": {
+                            "task_id": task.task_id,
+                            "step": step_def.name,
+                            "outcome_status": outcome_status,
+                        }
+                    },
+                )
+                return "failed"
+
+            gate_result = await self._handle_gate_step(
+                task,
+                StepDefinition(
+                    name=f"{step_def.name}_outcome_gate",
+                    type="gate",
+                    gate=_build_outcome_gate(
+                        step_def, outcome_reason=outcome.reason if outcome else None
+                    ),
+                ),
+                state,
+                workflow,
+            )
+            if gate_result == "continue":
+                state.last_evaluation_feedback = None
+                state.current_step_index += 1
+                await self._persist_workflow_state(task)
+                return "routed"
+            if gate_result == "cancel":
+                return "cancelled"
+            revise_target = _parse_revise_action(gate_result)
+            if revise_target is None:
+                logger.error(
+                    "Outcome gate returned unsupported action",
+                    extra={"extra_data": {"task_id": task.task_id, "action": gate_result}},
+                )
+                return "failed"
+            target_idx = self._find_step_index(workflow, revise_target)
+            if target_idx is None:
+                logger.error(
+                    "Outcome gate revise target step not found",
+                    extra={
+                        "extra_data": {
+                            "task_id": task.task_id,
+                            "revise_target": revise_target,
+                        }
+                    },
+                )
+                return "failed"
+            state.current_step_index = target_idx
+            state.loop_iterations.pop(f"attempts:{revise_target}", None)
+            state.last_evaluation_feedback = outcome.reason if outcome else None
+            await self._persist_workflow_state(task)
+            return "routed"
+
+        revise_target = _parse_revise_action(action)
+        if revise_target is not None:
+            loop_result = await self._handle_outcome_review_loop(
+                task,
+                step_def,
+                state,
+                workflow,
+                route.max_loop_iterations,
+                route.on_exhausted,
+                action,
+                outcome.reason if outcome else None,
+            )
+            if loop_result is not None:
+                return loop_result
+            target_idx = self._find_step_index(workflow, revise_target)
+            if target_idx is None:
+                logger.error(
+                    "Outcome route target step not found",
+                    extra={
+                        "extra_data": {
+                            "task_id": task.task_id,
+                            "step": step_def.name,
+                            "revise_target": revise_target,
+                        }
+                    },
+                )
+                return "failed"
+            state.current_step_index = target_idx
+            state.loop_iterations.pop(f"attempts:{revise_target}", None)
+            state.last_evaluation_feedback = outcome.reason if outcome else None
+            await self._persist_workflow_state(task)
+            return "routed"
+
+        logger.error(
+            "Unsupported outcome route action",
+            extra={
+                "extra_data": {"task_id": task.task_id, "step": step_def.name, "action": action}
+            },
+        )
+        return "failed"
+
+    async def _handle_outcome_review_loop(
+        self,
+        task: TaskModel,
+        step_def: StepDefinition,
+        state: WorkflowState,
+        workflow: Workflow,
+        max_iterations: int | None,
+        on_exhausted: str,
+        action: str,
+        feedback: str | None,
+    ) -> str | None:
+        """Apply loop limits for outcome routes that jump back to earlier steps."""
+
+        if max_iterations is None:
+            return None
+
+        loop_key = f"outcome:{step_def.name}:{action}"
+        current_iterations = state.loop_iterations.get(loop_key, 0)
+        if current_iterations >= max_iterations:
+            handled = await self._handle_exhausted(
+                task,
+                step_def,
+                state,
+                workflow,
+                on_exhausted,
+                last_error=feedback,
+            )
+            if not handled:
+                return "failed"
+            return "routed"
+
+        state.loop_iterations[loop_key] = current_iterations + 1
+        return None
+
+    def _resolve_outcome_route(self, step_def: StepDefinition, outcome_status: str) -> Any | None:
+        """Resolve the configured route for a completed step outcome."""
+
+        for route in step_def.outcome_routes:
+            if route.status == outcome_status:
+                return route
+        if outcome_status == "success":
+            return None
+        return SimpleNamespace(action="fail", max_loop_iterations=None, on_exhausted="fail")
 
     async def _record_evaluation_feedback(
         self,
@@ -1773,7 +1968,9 @@ class WorkflowEngine:
 
                 async with self._session_factory() as db_session:
                     session_row = await get_session_row(db_session, prior_run.session_id)
-                    if session_row is not None:
+                    if session_row is not None and self._is_reusable_step_session_status(
+                        session_row.status
+                    ):
                         conv_row = await get_conversation(db_session, session_row.conversation_id)
                         if conv_row is not None:
                             conversation = _to_conversation_model(conv_row)
@@ -1793,6 +1990,31 @@ class WorkflowEngine:
 
         # Fallback — create a fresh session
         return await self._create_step_session(task, step_def, agent)
+
+    async def _has_reusable_prior_step_session(
+        self,
+        task: TaskModel,
+        step_def: StepDefinition,
+    ) -> bool:
+        """Return whether the latest prior step run has a reusable session."""
+
+        from cognis.store.queries import get_session_row
+
+        async with self._session_factory() as db_session:
+            prior_run = await get_latest_step_run_for_task_step(
+                db_session, task.task_id, step_def.name
+            )
+            if prior_run is None or prior_run.session_id is None:
+                return False
+            session_row = await get_session_row(db_session, prior_run.session_id)
+            if session_row is None:
+                return False
+            return self._is_reusable_step_session_status(session_row.status)
+
+    def _is_reusable_step_session_status(self, status: str | None) -> bool:
+        """Return whether a step session can be safely reused."""
+
+        return status in {"active", "idle"}
 
     def _resolve_completion(
         self, step_def: StepDefinition, workflow: Workflow
@@ -1876,6 +2098,27 @@ def _build_exhaustion_gate(step_def: StepDefinition, last_error: str | None = No
         input=[],
         options=[
             GateOption(label="Retry step", action=f"revise({step_def.name})"),
+        ],
+    )
+
+
+def _build_outcome_gate(step_def: StepDefinition, outcome_reason: str | None = None) -> Any:
+    """Build a gate config for an approved step that reported a failed outcome."""
+
+    from cognis.models.workflow import GateConfig, GateOption
+
+    message = f"Step '{step_def.name}' completed but reported a failed outcome."
+    if outcome_reason:
+        message += f"\n\nReason: {outcome_reason[:500]}"
+    message += "\n\nYou can retry the step or continue anyway."
+
+    return GateConfig(
+        message=message,
+        input=[],
+        options=[
+            GateOption(label="Retry step", action=f"revise({step_def.name})"),
+            GateOption(label="Continue", action="continue"),
+            GateOption(label="Cancel", action="cancel"),
         ],
     )
 

@@ -33,6 +33,26 @@ STEP_COMPLETE_TOOL = ToolDefinition(
                 "items": {"type": "string"},
                 "description": "Claims about what was achieved, for evaluation.",
             },
+            "outcome": {
+                "type": "object",
+                "description": (
+                    "Optional business outcome for this step. Use status 'rejected' when the "
+                    "step completed properly but the reviewed work should go back for revision, "
+                    "or 'failed' when the step itself could not complete successfully."
+                ),
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "enum": ["success", "rejected", "failed"],
+                        "description": "Outcome status for workflow routing.",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Required for rejected or failed outcomes.",
+                    },
+                },
+                "required": ["status"],
+            },
         },
         "required": ["summary"],
     },

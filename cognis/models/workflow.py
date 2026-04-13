@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class InteractionMode(BaseModel):
@@ -58,6 +58,28 @@ class OnRejectConfig(BaseModel):
     target: str  # step name to re-run
     max_loop_iterations: int = 3
     on_exhausted: Literal["continue", "fail", "gate"] = "gate"
+
+
+class OutcomeRoute(BaseModel):
+    """Route to apply when a completed step reports a non-success outcome."""
+
+    status: Literal["success", "rejected", "failed"]
+    action: str
+    max_loop_iterations: int | None = None
+    on_exhausted: Literal["continue", "fail", "gate"] = "gate"
+
+
+class StepOutcome(BaseModel):
+    """Business outcome reported by ``step_complete`` after proper step execution."""
+
+    status: Literal["success", "rejected", "failed"] = "success"
+    reason: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_reason_requirement(self) -> StepOutcome:
+        if self.status in {"rejected", "failed"} and not (self.reason or "").strip():
+            raise ValueError("outcome.reason is required when outcome.status is rejected or failed")
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +146,7 @@ class StepDefinition(BaseModel):
     allow_questions: bool = False
     gate: GateConfig | None = None
     on_reject: OnRejectConfig | None = None
+    outcome_routes: list[OutcomeRoute] = Field(default_factory=list)
 
     @field_validator("input", mode="before")
     @classmethod
@@ -175,11 +198,19 @@ class StepOutput(BaseModel):
     content: str = ""  # Full assistant output (for delegation result delivery)
     outputs: dict[str, Any] = {}
     claims: list[str] = []
+    outcome: StepOutcome | None = None
     error: str | None = None  # Set when the step failed with an exception
     completed_at: datetime | None = None
     session_id: str | None = None
     intaris_session_id: str | None = None
     attachments: list[dict[str, Any]] = Field(default_factory=list)
+
+    @field_validator("summary")
+    @classmethod
+    def _validate_summary(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("summary must not be empty")
+        return value
 
 
 class StepEvaluation(BaseModel):
