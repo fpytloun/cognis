@@ -100,6 +100,10 @@ each agent. If an active conversation matching the (user, agent, context_type)
 triple exists, it is returned. Otherwise a new one is created with
 `context_ref=web:user:<email>:default`.
 
+For external runtimes, conversation history is a normalized projection over raw
+runtime trace plus Cognis overlay events. The REST API still exposes a single
+conversation history surface regardless of runtime.
+
 For web conversations, `active_session_id` may be `null` until the first user
 message is sent. Sending the first message lazily creates the root session.
 

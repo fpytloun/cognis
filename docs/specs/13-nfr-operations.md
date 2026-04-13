@@ -133,6 +133,17 @@ Circuit breaker state should be visible at `/api/health` per provider.
 
 ### Metrics (Prometheus)
 
+Runtime observability requirements for first-class runtimes:
+
+- runtime run count by runtime type/state
+- projection lag
+- replay failure count
+- capability mismatch count
+- policy translation failure count
+- stuck runtime detection count
+
+These are in addition to the existing provider/session metrics.
+
 #### Request-Level
 
 ```

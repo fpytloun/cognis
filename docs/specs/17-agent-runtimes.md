@@ -9,6 +9,10 @@ controller-owned.
 The first external runtime is **Claude Code**. Future runtimes such as
 OpenCode should fit the same model.
 
+The normative low-level runtime contract is defined in
+`18-runtime-contract.md`. This document focuses on runtime strategy and the
+Claude-specific direction.
+
 ## Design Goals
 
 1. **Agent identity stays in Cognis**
@@ -67,6 +71,10 @@ For `claude_code`, the runtime host is an explicit exception to the historical
   for recovery
 - it must not become the system of record for Cognis tasks, conversations, or
   workflow transitions
+
+For Claude-backed sessions, raw low-level session trace durability belongs to
+Intaris. Cognis consumes a normalized projection rather than duplicating the
+raw Claude session log as a second low-level store.
 
 ### Agent runtime is first-class
 
@@ -164,6 +172,8 @@ An executor may advertise supported runtimes, for example:
 ## Runtime Adapter Contract
 
 The controller talks to runtimes through a normalized adapter contract.
+See `18-runtime-contract.md` for the normative lifecycle, event, capability,
+projection, and tool-contract details.
 
 ```python
 class AgentRuntimeAdapter(Protocol):
@@ -602,6 +612,10 @@ User-visible states must distinguish at least:
 - `recovering`
 - `stuck`
 - `failed`
+
+Normalized conversation history and user-facing transcript views are derived by
+projection. Raw runtime trace, approvals, and low-level tool events remain
+available for support and audit but are not the product transcript directly.
 
 ## Data Ownership
 

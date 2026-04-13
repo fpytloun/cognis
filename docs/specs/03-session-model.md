@@ -9,6 +9,9 @@
 | **Turn** | One user message plus all agent work (LLM calls, tool calls, delegations) until final response. |
 | **Message** | A single message (user, assistant, system). Stored in Intaris events. |
 | **Context** | Environment where a conversation takes place: web UI, Slack channel, Discord, API, scheduled task. |
+| **Runtime session** | Opaque durable session handle owned by the selected runtime. |
+| **Execution** | One active run/attempt within a runtime session. |
+| **Projection** | Normalized Cognis-visible session history derived from raw runtime trace plus Cognis overlay events. |
 
 ## Data Ownership
 
@@ -16,6 +19,10 @@ Session **metadata** (status, IDs, correlation refs) is in Cognis DB.
 Session **content** (messages, tool calls, events) is in Intaris event store.
 Intaris-derived state (event seq, compaction summary, intention) is in the
 **session cache** (in-memory / Redis) — NOT in Cognis DB.
+
+For external runtimes, see `18-runtime-contract.md` for the distinction
+between raw runtime trace, runtime session identity, and normalized transcript
+projection.
 
 ```
 Cognis DB                  Session Cache (L1 memory)   Intaris Event Store
@@ -120,6 +127,17 @@ Delivery behavior:
   message and processed on the next turn after the current one completes
 
 ## Session Model
+
+Runtime session hierarchy:
+
+```text
+conversation -> cognis_session -> runtime_session -> execution
+```
+
+For `native`, the runtime session is effectively the Cognis session itself.
+For external runtimes such as `claude_code`, the runtime session is an opaque
+durable handle and user-visible history is reconstructed from a normalized
+projection.
 
 ```python
 class Session(BaseModel):
@@ -479,6 +497,7 @@ explicit `history_gap` events instead of being silently dropped.
 
 Workflow execution creates sessions at the step level, not the workflow level.
 See [14-workflow-engine.md](14-workflow-engine.md) for the full workflow spec.
+For runtime-level step/session boundaries, see `18-runtime-contract.md`.
 
 ### Mapping to Intaris sessions
 

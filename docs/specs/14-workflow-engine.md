@@ -43,6 +43,9 @@ native runtime completion into the controller's structured `StepOutput`
 without requiring the external runtime to literally call the native
 `step_complete` tool. The controller still decides whether the step is done.
 
+The authoritative lifecycle and capability contract for runtime-backed step
+execution is defined in `18-runtime-contract.md`.
+
 ### 4. Evaluation is semantic, not mechanical
 
 Step evaluation checks whether the completion claim satisfies the step's

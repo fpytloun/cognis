@@ -6,6 +6,10 @@ Tools are how agents interact with the world. The controller's **Tool Router**
 categorizes each tool call and routes it to the appropriate handler. The
 executor handles all actual tool execution — the controller never runs tools.
 
+For runtime-backed agents, tool handling is part of the runtime contract. See
+`18-runtime-contract.md` for the shared policy model and runtime translation
+rules.
+
 ## Tool Sources
 
 Tools come from five sources, each with a priority for deduplication:
@@ -554,6 +558,19 @@ provider-native tool search or the generic ``search_tools`` builtin.  See
 the "Tool Exposure Architecture" section for details.
 
 ## Tool Permission Evaluation
+
+Shared tool semantics are runtime-neutral:
+
+- `allow`
+- `deny`
+- `evaluate`
+- `non_bypassable`
+- timeout
+- cancel
+
+The `native` runtime enforces these through the existing controller-driven tool
+loop. External runtimes must translate the same semantics to native runtime
+enforcement without changing user-facing policy behavior.
 
 ```python
 async def evaluate_tool_call(self, tool_call, agent, session):

@@ -20,3 +20,5 @@
 | `15-browser-credentials.md` | Browser automation, credential records, auth request flows, and cloud-native executor behavior |
 | `16-document-generation.md` | Internal document-generation pipeline and artifact flow |
 | `17-agent-runtimes.md` | First-class agent runtimes, including executor-hosted Claude Code |
+| `18-runtime-contract.md` | Normative runtime lifecycle, event, projection, and tool contract |
+| `19-runtime-implementation-plan.md` | Phased implementation plan for first-class runtimes |
