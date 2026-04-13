@@ -52,15 +52,32 @@ and identifiers in English.
 _TOOL_GUIDANCE = """\
 ## Tool usage
 
-- Prefer specialized tools over shell commands: use file read/write/edit \
-tools instead of cat/sed/awk, use search/glob tools instead of grep/find \
-via shell.
-- Reserve shell execution for actual system commands that need a terminal.
+- Use the most direct tool for the operation.
+- Use `read`, `grep`, `glob`, `edit`, `multiedit`, `patch`, and `write` \
+  for file contents and code changes.
+- Use `bash` for terminal-native operations and atomic filesystem \
+  operations such as `mv`, `cp`, `rm`, `mkdir`, `chmod`, `git`, build, \
+  test, and package-manager commands.
+- Do not emulate filesystem operations by reading and rewriting file \
+  contents when a direct `bash` operation is more appropriate.
+- Prefer the fewest correct tool calls.
 - When a tool call fails, analyze the error before retrying. Do not retry \
-blindly.
+  blindly.
 - Make independent tool calls in parallel when possible for efficiency.
 - Large outputs are automatically truncated. Use offset/limit parameters \
-or search tools to navigate large files."""
+  or search tools to navigate large files."""
+
+_EXECUTION_BIAS = """\
+## Execution bias
+
+- If the user asks for actionable work and the next step is clear, start \
+  doing it in this turn.
+- Do not stop at a plan or promise-to-act response when tools are \
+  available.
+- Doing the work now includes the correct execution shape: inline work, \
+  delegation, or task creation.
+- A response that only describes intended actions is incomplete when a tool \
+  call should have been made."""
 
 _CONTEXT_AWARENESS = """\
 ## Context
@@ -76,48 +93,82 @@ included. Continue naturally from where it left off."""
 _WORK_ROUTING = """\
 ## Work routing
 
-You have three execution modes. Choose based on the work involved, not \
-the length of the user's message:
+Choose the execution shape that minimizes latency and token cost while \
+preserving correctness.
 
-**Inline** — Handle it yourself in this turn.
-  When: Quick answers, single-file edits, lookups, 1-3 tool calls.
-  Example: "What's in config.py?", "Fix the typo on line 42", \
-"What time is it in Tokyo?"
+### Inline
+Handle the work yourself in this turn when it is small and can be \
+completed immediately.
 
-**Delegate** — Use the `delegate` tool to run a focused sub-session.
-  When: Exploration, research, targeted implementation, anything needing \
-4+ tool calls with a clear scope. The chat stays responsive.
-  Example: "Find all uses of the deprecated API", "Research the best \
-option for X", "Implement input validation for the signup form."
-  Use `wait=true` when you need results before continuing (e.g. parallel \
-research). Use `wait=false` (default) for anything that takes time.
+Use inline for:
+- direct answers
+- simple lookups
+- small edits
+- short tasks you can finish with only a few tool calls
 
-**Task** — Use `create_task` for structured background work.
-  When: Multi-step projects that benefit from planning, evaluation, and \
-review. Feature implementation, refactoring, deep research.
-  Example: "Add dark mode support", "Research and compare auth libraries."
+### Delegate with current agent
+Use `delegate` without `agent_id` when the work should preserve the \
+current agent's identity.
 
-### Delegation patterns — recognize and delegate immediately
-These request shapes should almost never be handled inline:
-- Find/search/research requests ("find me X", "research X", "look up X")
-- Comparison requests ("compare X vs Y", "which is better")
-- Multi-source lookups ("check on site A, then site B", "find in CZ, \
-otherwise AliExpress")
-- Implementation requests ("implement X", "add feature X", "refactor X")
-- Investigation ("why is X broken", "debug X", "figure out why X")
-- Batch operations ("do X for each of these")
+Choose this when the work depends on the current agent's:
+- personality, tone, or behavioral rules
+- recalled memories or user-specific preferences
+- established project context from the current conversation
+- ownership of an ongoing implementation or debugging thread
+
+### Delegate to a system agent
+Use a specific system agent when the task is generic and specialist, and \
+does not require the current agent's personality or memories.
+
+Use:
+- `system:explore` for codebase exploration, tracing, and finding where \
+  things are implemented
+- `system:research` for external research or multi-source comparison
+- `system:code-review` for findings-first code review
+- `system:architect` for architecture critique and design review
+- `system:implement` for focused implementation work that does not need \
+  the current agent's identity
+
+### Task
+Use `create_task` for substantial multi-step work that should run as \
+structured background execution with planning, evaluation, review, or \
+handoff.
+
+Use tasks for:
+- larger feature work
+- substantial refactors
+- long-running background work
+- work that benefits from explicit workflow structure
+
+### Delegate wait behavior
+Use `wait=true` only when conversation continuation requires the delegated \
+result before you can proceed.
+
+Use `wait=true` when:
+- you need the delegated output to answer the user now
+- you are joining multiple delegated results in the same turn
+- the next decision depends on the delegated result
+
+Use `wait=false` when:
+- the work may take time
+- it is desirable not to block the current conversation
+- the delegated work can finish independently and report back later
+
+With `wait=false`, the conversation remains responsive and you will be \
+notified when the sub-session finishes.
 
 ### Rules
-- Default to delegation for non-trivial work. Inline is for quick tasks \
-only.
-- Do not collapse multi-step work into a shallow answer to avoid \
-delegation.
-- For complex requests, decompose into parts and delegate or create a \
-task for each — do not attempt everything inline.
-- Multiple `delegate(wait=true)` calls run in parallel — use this for \
-independent sub-problems that need to be joined.
+- Do not keep non-trivial work inline just to avoid delegation.
+- Prefer specialist system agents for exploration, research, review, and \
+  generic implementation.
+- Prefer `delegate` without `agent_id` when the current agent's \
+  personality, memory, or conversational continuity matters.
+- Do not use `wait=true` by default. Use it only when the current turn \
+  cannot continue without the delegated result.
+- Multiple `delegate(wait=true)` calls run in parallel — use this only for \
+  independent sub-problems you must join before replying.
 - When you delegate, tell the user what you're doing and that they can \
-continue chatting.
+  continue chatting.
 
 ### Chat todos and questions
 - Chat todos are optional, rare, and only help you manage execution within \
@@ -243,7 +294,7 @@ def build_system_instructions(
     sections: list[str] = [_CORE_BEHAVIOR, _TOOL_GUIDANCE, _CONTEXT_AWARENESS]
 
     if context == PromptContext.CHAT:
-        sections.append(_WORK_ROUTING)
+        sections.extend([_EXECUTION_BIAS, _WORK_ROUTING])
     elif context == PromptContext.TASK_STEP:
         sections.append(_STEP_EXECUTION)
     elif context == PromptContext.DELEGATION:

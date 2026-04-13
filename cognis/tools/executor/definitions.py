@@ -252,7 +252,12 @@ GREP_TOOL = ToolDefinition(
 
 BASH_TOOL = ToolDefinition(
     name="bash",
-    description="Execute a shell command and return its output.",
+    description=(
+        "Execute a shell command and return its output. Use for terminal-native "
+        "operations such as git, build/test/package-manager commands, and atomic "
+        "filesystem operations like mv, cp, rm, and mkdir. Prefer dedicated file "
+        "tools for reading and editing file contents."
+    ),
     parameters={
         "type": "object",
         "properties": {
