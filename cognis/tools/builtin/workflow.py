@@ -180,8 +180,11 @@ LIST_CREDENTIALS_TOOL = ToolDefinition(
 STEP_TODO_WRITE_TOOL = ToolDefinition(
     name="step_todo_write",
     description=(
-        "Track progress within this step. Todos survive compaction and "
-        "help maintain context across long conversations."
+        "Track progress within this step. Use todos for multi-step work, "
+        "break complex tasks into concrete actionable items, keep only one "
+        "item in progress at a time, and mark items completed or cancelled "
+        "as soon as their status changes. Todos survive compaction and help "
+        "maintain context across long conversations."
     ),
     parameters={
         "type": "object",

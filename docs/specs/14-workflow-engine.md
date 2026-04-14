@@ -574,7 +574,7 @@ Inside a step, the agent also has access to step-scoped task/todo tools:
 ```json
 {
   "name": "step_todo_write",
-  "description": "Track your progress within this step. These todos help you stay organized, especially during long execution with compaction. They are advisory — the workflow advances based on step_complete, not todo status."
+  "description": "Track your progress within this step. Use todos for complex multi-step work, break substantial tasks into concrete actionable items instead of a few broad buckets, keep exactly one item in progress, and mark items completed or cancelled immediately as status changes. These todos help you stay organized, especially during long execution with compaction. They are advisory — the workflow advances based on step_complete, not todo status."
 }
 ```
 

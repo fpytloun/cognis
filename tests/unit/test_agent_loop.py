@@ -679,6 +679,56 @@ async def test_step_complete_reprompt_is_system_message() -> None:
     assert "call step_complete now" in str(calls[1][-1]["content"])
 
 
+def test_get_incomplete_todos_treats_done_as_completed() -> None:
+    ctx = SimpleNamespace(
+        todos=[
+            {"content": "legacy", "status": "done"},
+            {"content": "current", "status": "completed"},
+            {"content": "pending", "status": "pending"},
+        ]
+    )
+
+    incomplete = AgentLoop._get_incomplete_todos(ctx)
+
+    assert incomplete == [{"content": "pending", "status": "pending"}]
+
+
+def test_todo_schema_uses_completed_status() -> None:
+    loop = object.__new__(AgentLoop)
+    ctx = StepContext(
+        step_definition=StepDefinition(name="step-a", type="run", prompt=""),
+        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        todos=[],
+        policy=WORKFLOW_POLICY,
+        user_message="",
+        user_attachments=[],
+        attachment_notice=None,
+        prior_context=None,
+        system_initiated=True,
+        is_retry=False,
+        workflow_state=None,
+        executor_environment=None,
+        cancel_event=None,
+        bootstrap_wait_for_intention=False,
+        tool_registry=None,
+        executor_connection=None,
+    )
+
+    tools = loop._build_controller_tool_schemas(ctx)
+    todo_tool = next(tool for tool in tools if tool["function"]["name"] == "step_todo_write")
+    statuses = todo_tool["function"]["parameters"]["properties"]["todos"]["items"]["properties"][
+        "status"
+    ]["enum"]
+
+    assert statuses == ["pending", "in_progress", "completed", "cancelled"]
+    assert (
+        "Break substantial work into specific, actionable items"
+        in todo_tool["function"]["description"]
+    )
+
+
 @pytest.mark.asyncio
 async def test_agent_loop_passes_routing_reminder_for_eligible_chat_turn() -> None:
     assembler = _FakeContextAssembler()

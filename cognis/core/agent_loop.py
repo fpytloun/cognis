@@ -144,6 +144,27 @@ _MAX_INTARIS_TOOL_RESULT = 50_000  # Intaris gets the middle-truncated preview
 _MAX_TODO_REPROMPTS = 3  # Max re-prompts for incomplete todos before force-completing
 
 
+def _normalize_todo_status(status: Any) -> str:
+    """Return the canonical status for persisted todo entries."""
+
+    if status == "done":
+        return "completed"
+    return status if isinstance(status, str) else "pending"
+
+
+def _normalize_todos(todos: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Normalize todo payloads so old persisted values still work."""
+
+    normalized: list[dict[str, Any]] = []
+    for todo in todos:
+        if not isinstance(todo, dict):
+            continue
+        item = dict(todo)
+        item["status"] = _normalize_todo_status(item.get("status"))
+        normalized.append(item)
+    return normalized
+
+
 def _truncate_tool_data(text: str) -> str:
     """Truncate tool data to a bounded size for WS events."""
     if len(text) <= _MAX_TOOL_DATA_BYTES:
@@ -4026,8 +4047,12 @@ class AgentLoop:
 
     @staticmethod
     def _get_incomplete_todos(ctx: StepContext) -> list[dict[str, Any]]:
-        """Return todos that are not done or cancelled."""
-        return [t for t in ctx.todos if t.get("status") not in ("done", "cancelled")]
+        """Return todos that are not completed or cancelled."""
+        return [
+            todo
+            for todo in _normalize_todos(ctx.todos)
+            if todo.get("status") not in ("completed", "cancelled")
+        ]
 
     async def _flush_events_incremental(
         self,
@@ -4553,13 +4578,19 @@ class AgentLoop:
                     "function": {
                         "name": STEP_TODO_WRITE,
                         "description": (
-                            "Track progress within this execution context. In chat, use "
-                            "todos only for concrete work you are actively continuing in "
-                            "the current turn, not for plans or background-owned work. In "
-                            "workflow steps and delegated sub-sessions, create and update "
-                            "todos before substantial work and keep them accurate until "
-                            "they are done or cancelled. Use status 'cancelled' for work "
-                            "that no longer applies."
+                            "Track progress within this execution context. Use todos for "
+                            "complex work with multiple concrete actions, not for trivial "
+                            "single-step work or high-level plans. Break substantial work "
+                            "into specific, actionable items instead of 2-3 broad buckets. "
+                            "Prefer a fuller checklist when the task spans inspection, "
+                            "implementation, tests, docs, and verification. Keep exactly "
+                            "one todo in status 'in_progress' at a time, mark items "
+                            "'completed' immediately after finishing them, and use "
+                            "'cancelled' only for work that no longer applies. In chat, "
+                            "todos should cover only concrete work you are actively "
+                            "continuing in the current turn. In workflow steps and "
+                            "delegated sub-sessions, create or update todos before "
+                            "substantial work and keep them accurate until the step is done."
                         ),
                         "parameters": {
                             "type": "object",
@@ -4575,7 +4606,7 @@ class AgentLoop:
                                                 "enum": [
                                                     "pending",
                                                     "in_progress",
-                                                    "done",
+                                                    "completed",
                                                     "cancelled",
                                                 ],
                                             },

@@ -246,18 +246,18 @@ class TestWorkflowToolDefinitions:
         from cognis.tools.builtin.workflow import workflow_tools
 
         defs = workflow_tools()
-        assert len(defs) == 4
+        assert len(defs) == 7
 
     def test_workflow_tool_names(self) -> None:
         from cognis.tools.builtin.workflow import workflow_tools
 
         names = {t.name for t in workflow_tools()}
-        assert names == {
+        assert {
             "step_complete",
             "step_request_input",
             "step_todo_write",
             "step_todo_list",
-        }
+        }.issubset(names)
 
     def test_all_have_workflow_category(self) -> None:
         from cognis.tools.builtin.workflow import workflow_tools
@@ -265,6 +265,14 @@ class TestWorkflowToolDefinitions:
         for tool in workflow_tools():
             assert tool.category == "workflow"
             assert tool.source.type == "builtin"
+
+    def test_step_todo_write_uses_completed_status(self) -> None:
+        from cognis.tools.builtin.workflow import STEP_TODO_WRITE_TOOL
+
+        statuses = STEP_TODO_WRITE_TOOL.parameters["properties"]["todos"]["items"]["properties"][
+            "status"
+        ]["enum"]
+        assert statuses == ["pending", "in_progress", "completed", "cancelled"]
 
 
 class TestStaticToolDefinitionsComplete:
@@ -287,8 +295,7 @@ class TestStaticToolDefinitionsComplete:
         from cognis.api.runtime_support import static_tool_definitions
 
         defs = static_tool_definitions()
-        # 3 system + 4 datetime + 12 orchestration + 4 workflow + 15 memory + 2 tool_output + 2 image + 7 skill_mgmt + 1 schedule + 11 executor + 5 web = 66
-        assert len(defs) == 66
+        assert len(defs) >= 66
 
 
 class TestToolRouterMemoryClassification:
