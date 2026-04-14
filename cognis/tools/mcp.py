@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import threading
 from collections.abc import Sequence
 from contextlib import AsyncExitStack, suppress
@@ -26,6 +27,13 @@ logger = get_logger(__name__)
 _MAX_SAFE_STDERR_LENGTH = 240
 _HTTP_READ_TIMEOUT_SECONDS = 300
 HTTP_MCP_TRANSPORTS = {"sse", "streamable_http"}
+_SENSITIVE_FRAGMENT_PATTERNS = [
+    re.compile(r"(?i)\b(bearer)\s+([^\s,;]+)"),
+    re.compile(r"(?i)\b(authorization)\b\s*([:=])\s*((?:basic|bearer|token)\s+)?([^\s,;]+)"),
+    re.compile(r"(?i)\b(api[_-]?key|token|secret|password)\b\s*([:=])\s*([^\s,;]+)"),
+    re.compile(r"\b(sk|pk)_[A-Za-z0-9_-]{8,}\b"),
+    re.compile(r"\b[A-Za-z0-9+/=_-]{24,}\b"),
+]
 
 
 class MCPClientError(RuntimeError):
@@ -74,6 +82,8 @@ class _StderrLogger(io.RawIOBase):
     def __init__(self, server_name: str) -> None:
         super().__init__()
         self._server_name = server_name
+        self._recent_lines: list[str] = []
+        self._lock = threading.Lock()
         self._read_fd, self._write_fd = os.pipe()
         self._thread = threading.Thread(
             target=self._reader_loop,
@@ -88,10 +98,13 @@ class _StderrLogger(io.RawIOBase):
                 for line in f:
                     stripped = line.rstrip()
                     if stripped:
+                        with self._lock:
+                            self._recent_lines.append(stripped)
+                            self._recent_lines = self._recent_lines[-3:]
                         logger.debug(
                             "MCP stdio: %s stderr: %s",
                             self._server_name,
-                            stripped[:_MAX_SAFE_STDERR_LENGTH],
+                            _safe_message(stripped),
                         )
         except Exception:
             pass
@@ -104,6 +117,12 @@ class _StderrLogger(io.RawIOBase):
 
     def write(self, b: bytes | bytearray) -> int:
         return os.write(self._write_fd, b)
+
+    def summary(self) -> str | None:
+        with self._lock:
+            if not self._recent_lines:
+                return None
+            return _safe_message(" | ".join(self._recent_lines))
 
     def close(self) -> None:
         with suppress(OSError):
@@ -242,6 +261,9 @@ class StdioMCPClient(_SessionMCPClient):
                 stdio_client(params, errlog=self._stderr_logger)
             )
         except Exception as exc:
+            stderr_summary = (
+                self._stderr_logger.summary() if self._stderr_logger is not None else None
+            )
             if self._stderr_logger is not None:
                 self._stderr_logger.close()
                 self._stderr_logger = None
@@ -257,6 +279,7 @@ class StdioMCPClient(_SessionMCPClient):
                 _safe_message(str(exc)),
                 error_class=_error_class(exc),
                 timed_out=_is_timeout(exc),
+                safe_stderr=stderr_summary,
             ) from exc
 
     async def connect(self) -> None:
@@ -499,7 +522,23 @@ def _normalize_call_result(result: Any) -> str:
 
 
 def _safe_message(message: str, *, limit: int = _MAX_SAFE_STDERR_LENGTH) -> str:
-    return " ".join(message.split())[:limit]
+    collapsed = " ".join(message.split())
+    redacted = collapsed
+    for pattern in _SENSITIVE_FRAGMENT_PATTERNS:
+        redacted = pattern.sub(_redact_match, redacted)
+    return redacted[:limit]
+
+
+def _redact_match(match: re.Match[str]) -> str:
+    groups = match.groups()
+    if len(groups) == 2:
+        return f"{groups[0]} [redacted]"
+    if len(groups) == 3:
+        return f"{groups[0]}{groups[1]}[redacted]"
+    if len(groups) == 4:
+        scheme = groups[2] or ""
+        return f"{groups[0]}{groups[1]}{scheme}[redacted]"
+    return "[redacted]"
 
 
 def _is_timeout(exc: Exception) -> bool:

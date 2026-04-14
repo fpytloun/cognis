@@ -8,6 +8,7 @@ import pytest
 from cognis.models.tool import MCPServerConfig, ToolSource, sanitize_mcp_tool_name
 from cognis.tools.mcp import (
     StdioMCPClient,
+    _safe_message,
     _strip_empty_optionals,
     mcp_tools_to_definitions,
     runtime_mcp_server_key,
@@ -213,6 +214,17 @@ def test_strip_empty_optionals_no_schema() -> None:
     """With no schema, arguments should pass through unchanged."""
     args = {"foo": "", "bar": []}
     assert _strip_empty_optionals(args, {}) == args
+
+
+def test_safe_message_redacts_sensitive_fragments() -> None:
+    raw = "Authorization=Bearer sk-secret-token Authorization: Basic abc123 password=hunter2 api_key=abcdef1234567890"
+    safe = _safe_message(raw)
+
+    assert "sk-secret-token" not in safe
+    assert "abc123" not in safe
+    assert "hunter2" not in safe
+    assert "abcdef1234567890" not in safe
+    assert "[redacted]" in safe
 
 
 def test_strip_empty_optionals_nested_object() -> None:

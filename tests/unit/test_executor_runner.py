@@ -185,6 +185,8 @@ async def test_handle_configure_reports_degraded_when_some_mcp_servers_fail(
                     "phase": "initialize",
                     "error_class": "timeout",
                     "timed_out": True,
+                    "message": "github startup timed out",
+                    "stderr_summary": "npm error: missing token",
                 },
             ],
             ["MCP server github failed during initialize."],
@@ -213,7 +215,33 @@ async def test_handle_configure_reports_degraded_when_some_mcp_servers_fail(
     assert runner._runtime_state == "degraded"
     assert ws.sent[-1]["result"]["runtime_state"] == "degraded"
     assert ws.sent[-1]["result"]["runtime_metadata"]["warnings"]
-    assert "message" not in ws.sent[-1]["result"]["runtime_metadata"]["mcp_servers"][1]
+    degraded_server = ws.sent[-1]["result"]["runtime_metadata"]["mcp_servers"][1]
+    assert degraded_server["message"] == "github startup timed out"
+    assert degraded_server["stderr_summary"] == "npm error: missing token"
+
+
+@pytest.mark.asyncio
+async def test_handle_tool_execute_allows_degraded_runtime() -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    ws = DummyWebSocket()
+    await runner._handle_configure(ws, "cfg-1", {"enabled_tools": ["read"], "config": {}})
+    runner._runtime_state = "degraded"
+
+    async def _handler(_: dict[str, object], context: object) -> ToolResult:
+        del context
+        return ToolResult(output="ok", is_error=False)
+
+    runner._tool_handlers["read"] = _handler
+    ws.sent.clear()
+
+    await runner._handle_tool_execute(
+        ws,
+        "tool-1",
+        {"call_id": "call-1", "tool_name": "read", "arguments": {}},
+    )
+
+    assert ws.sent[-1]["result"]["is_error"] is False
+    assert ws.sent[-1]["result"]["output"] == "ok"
 
 
 @pytest.mark.asyncio

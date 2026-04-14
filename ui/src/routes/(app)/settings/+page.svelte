@@ -22,6 +22,7 @@
   import { blockNavigationIfDirty, installBeforeUnloadGuard } from '$lib/navigation/unsaved';
   import { auth } from '$lib/stores/auth';
   import {
+    executorMcpFailureDetails,
     executorObservedNote,
     executorRuntimeBadgeStatus,
     executorRuntimeLabel,
@@ -1906,6 +1907,13 @@
             {/if}
             {#if executorRuntimeSummary(exec)}
               <div class="text-xs {exec.runtime_state === 'degraded' ? 'text-amber-300' : 'text-slate-500'}">{executorRuntimeSummary(exec)}</div>
+            {/if}
+            {#if executorMcpFailureDetails(exec).length > 0}
+              <div class="space-y-1 rounded-xl border border-amber-500/20 bg-amber-500/5 px-3 py-2 text-xs text-amber-100/90">
+                {#each executorMcpFailureDetails(exec) as failure}
+                  <p>{failure}</p>
+                {/each}
+              </div>
             {/if}
             {#if exec.desired_config_version !== exec.applied_config_version}
               <div class="text-xs text-amber-300">

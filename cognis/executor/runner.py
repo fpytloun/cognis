@@ -37,6 +37,7 @@ from cognis.tools.executor.lsp import (
 from cognis.tools.mcp import (
     MCPClient,
     MCPClientError,
+    _safe_message,
     build_mcp_client,
     mcp_tools_to_definitions,
     runtime_mcp_server_key,
@@ -637,13 +638,16 @@ class ExecutorRunner:
         self, ws: Any, msg_id: str | None, params: dict[str, Any]
     ) -> None:
         call_id = params.get("call_id", msg_id or uuid.uuid4().hex)
-        if not self._configured or self._runtime_state != "active":
+        if not self._configured or self._runtime_state not in {"active", "degraded"}:
             await self._send_rpc_result(
                 ws,
                 msg_id,
                 {
                     "call_id": call_id,
-                    "output": "Executor is not configured or ready yet.",
+                    "output": (
+                        "Executor is not configured or ready yet. "
+                        f"Current runtime state: {self._runtime_state}."
+                    ),
                     "is_error": True,
                     "duration_ms": 0,
                 },
@@ -982,6 +986,8 @@ class ExecutorRunner:
                         "status": "failed",
                         "error_class": exc.error_class,
                         "timed_out": exc.timed_out,
+                        "message": str(exc),
+                        "stderr_summary": exc.safe_stderr,
                     }
                 )
                 warnings.append(f"MCP server {server.name} failed during {exc.phase}.")
@@ -1001,6 +1007,7 @@ class ExecutorRunner:
                         "status": "failed",
                         "error_class": exc.__class__.__name__.lower(),
                         "timed_out": False,
+                        "message": _safe_message(str(exc)),
                     }
                 )
                 warnings.append(f"MCP server {server.name} failed to initialize.")

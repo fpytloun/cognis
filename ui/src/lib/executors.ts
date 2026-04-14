@@ -1,4 +1,4 @@
-import type { ExecutorConfig } from '$lib/types/api';
+import type { ExecutorConfig, ExecutorMCPServerRuntimeStatus } from '$lib/types/api';
 
 export function executorRuntimeBadgeStatus(executor: ExecutorConfig): 'healthy' | 'degraded' | 'unhealthy' {
   if (executor.status !== 'active') return 'degraded';
@@ -34,6 +34,21 @@ export function executorRuntimeSummary(executor: ExecutorConfig): string | null 
   }
   const warnings = executor.runtime_metadata.warnings ?? [];
   return warnings[0] ?? null;
+}
+
+function formatMcpFailure(server: ExecutorMCPServerRuntimeStatus): string {
+  const details = [server.phase, server.error_class, server.timed_out ? 'timed out' : null].filter(Boolean).join(' · ');
+  const summary = server.stderr_summary ?? server.message ?? null;
+  return summary ? `${server.name}: ${details}${details ? ' · ' : ''}${summary}` : `${server.name}: ${details || 'failed'}`;
+}
+
+export function executorMcpFailureDetails(executor: ExecutorConfig): string[] {
+  if (executor.runtime_metadata.legacy_metadata) {
+    return [];
+  }
+  return (executor.runtime_metadata.mcp_servers ?? [])
+    .filter((server) => server.status !== 'ready')
+    .map(formatMcpFailure);
 }
 
 export function validateStdioCommand(command: string): string | null {
