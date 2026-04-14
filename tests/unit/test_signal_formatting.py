@@ -56,3 +56,45 @@ def test_to_signal_text_styles_uses_utf16_offsets() -> None:
 
     assert len(chunks) == 1
     assert to_signal_text_styles(chunks[0].plain_text, chunks[0].styles) == ["6:5:BOLD"]
+
+
+def test_format_for_signal_preserves_intraword_underscores() -> None:
+    chunks = format_for_signal("Use `YOUTUBE_API_KEY` or snake_case_value.", 10000)
+
+    assert len(chunks) == 1
+    chunk = chunks[0]
+    assert chunk.plain_text == "Use YOUTUBE_API_KEY or snake_case_value."
+    assert chunk.markdown_text == "Use `YOUTUBE_API_KEY` or snake_case_value."
+    assert to_signal_text_styles(chunk.plain_text, chunk.styles) == ["4:15:MONOSPACE"]
+
+
+def test_format_for_signal_preserves_math_asterisks() -> None:
+    chunks = format_for_signal("Keep 2*3*4 literal.", 10000)
+
+    assert len(chunks) == 1
+    chunk = chunks[0]
+    assert chunk.plain_text == "Keep 2*3*4 literal."
+    assert chunk.markdown_text == "Keep 2\\*3\\*4 literal."
+    assert to_signal_text_styles(chunk.plain_text, chunk.styles) == []
+
+
+def test_format_for_signal_treats_inline_code_as_literal() -> None:
+    chunks = format_for_signal("Use `**kwargs` and `a_b` literally.", 10000)
+
+    assert len(chunks) == 1
+    chunk = chunks[0]
+    assert chunk.plain_text == "Use **kwargs and a_b literally."
+    assert chunk.markdown_text == "Use `**kwargs` and `a_b` literally."
+    assert to_signal_text_styles(chunk.plain_text, chunk.styles) == [
+        "4:8:MONOSPACE",
+        "17:3:MONOSPACE",
+    ]
+
+
+def test_format_for_signal_preserves_links_with_parentheses() -> None:
+    chunks = format_for_signal("See [wiki](https://example.com/Foo_(bar)).", 10000)
+
+    assert len(chunks) == 1
+    chunk = chunks[0]
+    assert chunk.plain_text == "See wiki (https://example.com/Foo_(bar))."
+    assert chunk.markdown_text == "See wiki (https://example.com/Foo_(bar))."

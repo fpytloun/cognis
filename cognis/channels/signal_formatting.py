@@ -236,6 +236,16 @@ def _parse_inline(text: str, start: int, stop: str | None) -> tuple[_RenderedTex
         token = _next_inline_token(text, i)
         if token is not None:
             style, delimiter = token
+            if style == "monospace":
+                code_span = _consume_code_span(text, i)
+                if code_span is not None:
+                    inner_text, next_i = code_span
+                    offset = len("".join(parts))
+                    parts.append(inner_text)
+                    if inner_text:
+                        spans.append(SignalStyleSpan(offset, offset + len(inner_text), style))
+                    i = next_i
+                    continue
             inner, next_i, closed = _parse_inline(text, i + len(delimiter), delimiter)
             if closed:
                 offset = len("".join(parts))
@@ -255,15 +265,15 @@ def _parse_inline(text: str, start: int, stop: str | None) -> tuple[_RenderedTex
 def _next_inline_token(text: str, index: int) -> tuple[str, str] | None:
     if text.startswith("`", index):
         return "monospace", "`"
-    if text.startswith("**", index):
+    if text.startswith("**", index) and _can_use_emphasis_delimiter(text, index, 2):
         return "bold", "**"
     if text.startswith("~~", index):
         return "strikethrough", "~~"
     if text.startswith("||", index):
         return "spoiler", "||"
-    if text[index] == "*":
+    if text[index] == "*" and _can_use_emphasis_delimiter(text, index, 1):
         return "italic", "*"
-    if text[index] == "_":
+    if text[index] == "_" and _can_use_emphasis_delimiter(text, index, 1):
         return "italic", "_"
     return None
 
@@ -275,7 +285,7 @@ def _consume_link(text: str, index: int) -> tuple[_RenderedText, int] | None:
     label_end = _find_unescaped(text, "]", label_start)
     if label_end == -1 or label_end + 1 >= len(text) or text[label_end + 1] != "(":
         return None
-    url_end = _find_unescaped(text, ")", label_end + 2)
+    url_end = _find_link_url_end(text, label_end + 2)
     if url_end == -1:
         return None
 
@@ -287,6 +297,54 @@ def _consume_link(text: str, index: int) -> tuple[_RenderedText, int] | None:
 
     suffix = "" if rendered.text.strip() == url else f" ({url})"
     return _append_text(rendered, suffix), url_end + 1
+
+
+def _consume_code_span(text: str, index: int) -> tuple[str, int] | None:
+    if text[index] != "`":
+        return None
+    end = _find_unescaped(text, "`", index + 1)
+    if end == -1:
+        return None
+    return text[index + 1 : end], end + 1
+
+
+def _can_use_emphasis_delimiter(text: str, index: int, delimiter_length: int) -> bool:
+    previous_char = text[index - 1] if index > 0 else ""
+    next_index = index + delimiter_length
+    next_char = text[next_index] if next_index < len(text) else ""
+
+    if delimiter_length == 1 and text[index] == "_":
+        if previous_char.isalnum() and next_char.isalnum():
+            return False
+
+    if delimiter_length == 1 and text[index] == "*":
+        if previous_char.isdigit() and next_char.isdigit():
+            return False
+
+    if not next_char:
+        return False
+    if next_char.isspace():
+        return False
+    if previous_char and previous_char.isspace() and next_char in ",.!?:;)]}":
+        return False
+    return True
+
+
+def _find_link_url_end(text: str, start: int) -> int:
+    depth = 0
+    index = start
+    while index < len(text):
+        if text[index] == "\\":
+            index += 2
+            continue
+        if text[index] == "(":
+            depth += 1
+        elif text[index] == ")":
+            if depth == 0:
+                return index
+            depth -= 1
+        index += 1
+    return -1
 
 
 def _find_unescaped(text: str, needle: str, start: int) -> int:
@@ -476,7 +534,9 @@ def _render_signal_markdown(text: str, spans: list[SignalStyleSpan]) -> str:
                 open_markers[index], key=lambda item: _STYLE_TO_PRIORITY[item[0].style]
             ):
                 result.append(marker)
-        result.append(_escape_signal_plain_text(char))
+        result.append(
+            _escape_signal_plain_text(char, in_monospace=_is_monospace_index(spans, index))
+        )
 
     final_index = len(text)
     if final_index in close_markers:
@@ -515,9 +575,15 @@ def _max_backtick_run(text: str) -> int:
     return max((len(run) for run in runs), default=0)
 
 
-def _escape_signal_plain_text(char: str) -> str:
+def _is_monospace_index(spans: list[SignalStyleSpan], index: int) -> bool:
+    return any(span.style == "monospace" and span.start <= index < span.end for span in spans)
+
+
+def _escape_signal_plain_text(char: str, *, in_monospace: bool = False) -> str:
+    if in_monospace:
+        return char
     if char == "\\":
-        return "\\\\"
+        return "\\"
     if char in {"*", "~", "|", "`"}:
-        return f"\\\\{char}"
+        return f"\\{char}"
     return char
