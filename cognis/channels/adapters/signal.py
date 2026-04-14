@@ -539,6 +539,17 @@ class SignalAdapter(BaseChannelAdapter):
                     b64_attachments.append(base64.b64encode(resp.content).decode("ascii"))
                 except Exception:
                     logger.warning("signal adapter: media download failed", exc_info=True)
+            if not b64_attachments:
+                logger.warning(
+                    "signal adapter: media send skipped because no attachments could be prepared",
+                    extra={
+                        "extra_data": {
+                            "account_id": self.account_id,
+                            "media_count": len(message.media),
+                        }
+                    },
+                )
+                return None
             if b64_attachments:
                 payload["base64_attachments"] = b64_attachments
             logger.info(
@@ -555,7 +566,10 @@ class SignalAdapter(BaseChannelAdapter):
         resp = await self._client.post("/v2/send", json=payload)
         resp.raise_for_status()
         result = resp.json()
-        return result.get("timestamp")
+        timestamp = result.get("timestamp")
+        if not isinstance(timestamp, str | int):
+            return None
+        return str(timestamp)
 
     async def _send_direct(self, message: OutboundMessage) -> str | None:
         """Send via direct signal-cli JSON-RPC."""
@@ -625,6 +639,17 @@ class SignalAdapter(BaseChannelAdapter):
                     temp_files.append(temp_path)
                 except Exception:
                     logger.warning("signal adapter: media download failed", exc_info=True)
+            if not attachments:
+                logger.warning(
+                    "signal adapter: media send skipped because no attachments could be prepared",
+                    extra={
+                        "extra_data": {
+                            "account_id": self.account_id,
+                            "media_count": len(message.media),
+                        }
+                    },
+                )
+                return None
             if attachments:
                 params["attachment"] = attachments
             logger.info(

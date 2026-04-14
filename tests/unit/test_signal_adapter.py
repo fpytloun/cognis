@@ -945,6 +945,54 @@ class TestDirectSendBehavior:
         assert payload["message"] == "\u200b"
         assert payload["base64_attachments"] == ["YWJj"]
 
+    @pytest.mark.asyncio
+    async def test_rest_send_normalizes_numeric_timestamp_to_string(self) -> None:
+        adapter = SignalAdapter()
+        adapter._signal_config = _SignalConfig({}, {"account_number": "+1"})
+        adapter._account_number = "+1"
+
+        client = AsyncMock()
+        response = MagicMock()
+        response.json.return_value = {"timestamp": 999}
+        response.raise_for_status.return_value = None
+        client.post = AsyncMock(return_value=response)
+        adapter._client = client
+
+        message = OutboundMessage(
+            channel_type="signal",
+            account_id="acct-1",
+            chat_id="+420111222333",
+            content="hello",
+        )
+
+        result = await adapter.send_message(message)
+
+        assert result == "999"
+
+    @pytest.mark.asyncio
+    async def test_rest_send_rejects_malformed_timestamp(self) -> None:
+        adapter = SignalAdapter()
+        adapter._signal_config = _SignalConfig({}, {"account_number": "+1"})
+        adapter._account_number = "+1"
+
+        client = AsyncMock()
+        response = MagicMock()
+        response.json.return_value = {"timestamp": {"bad": True}}
+        response.raise_for_status.return_value = None
+        client.post = AsyncMock(return_value=response)
+        adapter._client = client
+
+        message = OutboundMessage(
+            channel_type="signal",
+            account_id="acct-1",
+            chat_id="+420111222333",
+            content="hello",
+        )
+
+        result = await adapter.send_message(message)
+
+        assert result is None
+
 
 class TestRestSendBehavior:
     @pytest.mark.asyncio

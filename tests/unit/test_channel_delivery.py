@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -26,6 +27,9 @@ class _ArtifactStore:
 class _Manager:
     def __init__(self) -> None:
         self._artifact_store = _ArtifactStore()
+
+    def find_adapter_for_channel(self, channel_type: str, account_id: str) -> tuple[object, object]:
+        return MagicMock(), object()
 
 
 class _Session:
@@ -138,10 +142,11 @@ async def test_materialize_media_attachment_loads_artifact_bytes(
     async def session_factory() -> object:
         yield object()
 
+    manager = _Manager()
     service = ChannelDeliveryService(
         session_factory=session_factory,
         event_bus=EventBus(),
-        channel_manager_ref=lambda: _Manager(),
+        channel_manager_ref=lambda: manager,
     )
     monkeypatch.setattr(
         "cognis.store.queries.get_artifact_record",
@@ -154,12 +159,13 @@ async def test_materialize_media_attachment_loads_artifact_bytes(
                     "namespace": "documents",
                     "object_id": "doc_1",
                     "filename": "report.pdf",
+                    "mime_type": "application/pdf",
                 },
             )()
         ),
     )
 
-    media = await service._materialize_media_attachment(  # noqa: SLF001
+    media, fallback_text, materialized = await service._materialize_media_attachment(  # noqa: SLF001
         {
             "artifact_id": "doc_1",
             "url": "https://cognis.example.com/report.pdf",
@@ -169,7 +175,60 @@ async def test_materialize_media_attachment_loads_artifact_bytes(
         }
     )
 
+    assert materialized is True
+    assert fallback_text is None
     assert media.content_b64 == base64.b64encode(b"pdf-bytes").decode("ascii")
+
+
+@pytest.mark.asyncio
+async def test_materialize_media_attachment_falls_back_to_artifact_link_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    @asynccontextmanager
+    async def session_factory() -> object:
+        yield object()
+
+    manager = _Manager()
+    service = ChannelDeliveryService(
+        session_factory=session_factory,
+        event_bus=EventBus(),
+        channel_manager_ref=lambda: manager,
+    )
+    monkeypatch.setattr(
+        "cognis.store.queries.get_artifact_record",
+        AsyncMock(
+            return_value=type(
+                "ArtifactRow",
+                (),
+                {
+                    "status": "attached",
+                    "namespace": "attachments",
+                    "object_id": "img_1",
+                    "filename": "diagram.png",
+                    "mime_type": "image/png",
+                },
+            )()
+        ),
+    )
+
+    async def boom(namespace: str, object_id: str, filename: str) -> tuple[bytes, str]:
+        raise RuntimeError("artifact unavailable")
+
+    manager._artifact_store.async_load = boom  # type: ignore[method-assign]
+
+    media, fallback_text, materialized = await service._materialize_media_attachment(  # noqa: SLF001
+        {
+            "artifact_id": "img_1",
+            "url": "https://cognis.example.com/diagram.png",
+            "mime_type": "image/png",
+            "filename": "diagram.png",
+        }
+    )
+
+    assert media is not None
+    assert materialized is True
+    assert fallback_text is None
+    assert media.url == "https://cognis.example.com/diagram.png"
 
 
 @pytest.mark.asyncio
@@ -256,6 +315,165 @@ async def test_deliver_outbox_sends_attachment_only_follow_up(
 
     assert sent["content"] == ""
     assert sent["media"] is not None
+
+
+@pytest.mark.asyncio
+async def test_send_to_route_marks_signal_attachment_fallback_as_partial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Adapter:
+        capabilities = type("Caps", (), {"max_message_length": 4000})()
+
+        def __init__(self) -> None:
+            self.sent_message: object | None = None
+
+        async def send_message(self, message: object) -> str | None:
+            self.sent_message = message
+            return "ts-1"
+
+    adapter = _Adapter()
+
+    class _SignalManager(_Manager):
+        def find_adapter_for_channel(
+            self, channel_type: str, account_id: str
+        ) -> tuple[object, object]:
+            return adapter, object()
+
+    @asynccontextmanager
+    async def session_factory() -> object:
+        yield object()
+
+    service = ChannelDeliveryService(
+        session_factory=session_factory,
+        event_bus=EventBus(),
+        channel_manager_ref=lambda: _SignalManager(),
+    )
+    monkeypatch.setattr(
+        service,
+        "_prepare_media_attachments",
+        AsyncMock(return_value=([], ["https://cognis.example.com/image.png"], True)),
+    )
+
+    status = await service._send_to_route(  # noqa: SLF001
+        channel_type="signal",
+        account_id="acct-1",
+        chat_id="chat-1",
+        thread_id=None,
+        content="Artifact ready.",
+        media=[{"artifact_id": "img_1"}],
+    )
+
+    assert status == "partial"
+    assert adapter.sent_message is not None
+    assert adapter.sent_message.content == "Artifact ready.\n\nhttps://cognis.example.com/image.png"
+
+
+@pytest.mark.asyncio
+async def test_send_to_route_treats_missing_signal_message_id_as_failure() -> None:
+    class _Adapter:
+        capabilities = type("Caps", (), {"max_message_length": 4000})()
+
+        async def send_message(self, message: object) -> str | None:
+            return None
+
+    class _SignalManager(_Manager):
+        def find_adapter_for_channel(
+            self, channel_type: str, account_id: str
+        ) -> tuple[object, object]:
+            return _Adapter(), object()
+
+    @asynccontextmanager
+    async def session_factory() -> object:
+        yield object()
+
+    service = ChannelDeliveryService(
+        session_factory=session_factory,
+        event_bus=EventBus(),
+        channel_manager_ref=lambda: _SignalManager(),
+    )
+
+    status = await service._send_to_route(  # noqa: SLF001
+        channel_type="signal",
+        account_id="acct-1",
+        chat_id="chat-1",
+        thread_id=None,
+        content="hello",
+        media=None,
+    )
+
+    assert status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_send_to_route_treats_blank_signal_message_id_as_failure() -> None:
+    class _Adapter:
+        capabilities = type("Caps", (), {"max_message_length": 4000})()
+
+        async def send_message(self, message: object) -> str | None:
+            return ""
+
+    class _SignalManager(_Manager):
+        def find_adapter_for_channel(
+            self, channel_type: str, account_id: str
+        ) -> tuple[object, object]:
+            return _Adapter(), object()
+
+    @asynccontextmanager
+    async def session_factory() -> object:
+        yield object()
+
+    service = ChannelDeliveryService(
+        session_factory=session_factory,
+        event_bus=EventBus(),
+        channel_manager_ref=lambda: _SignalManager(),
+    )
+
+    status = await service._send_to_route(  # noqa: SLF001
+        channel_type="signal",
+        account_id="acct-1",
+        chat_id="chat-1",
+        thread_id=None,
+        content="hello",
+        media=None,
+    )
+
+    assert status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_send_to_route_allows_non_signal_media_send_without_message_id() -> None:
+    class _Adapter:
+        capabilities = type("Caps", (), {"max_message_length": 4000})()
+
+        async def send_message(self, message: object) -> str | None:
+            return None
+
+    class _MediaManager(_Manager):
+        def find_adapter_for_channel(
+            self, channel_type: str, account_id: str
+        ) -> tuple[object, object]:
+            return _Adapter(), object()
+
+    @asynccontextmanager
+    async def session_factory() -> object:
+        yield object()
+
+    service = ChannelDeliveryService(
+        session_factory=session_factory,
+        event_bus=EventBus(),
+        channel_manager_ref=lambda: _MediaManager(),
+    )
+
+    status = await service._send_to_route(  # noqa: SLF001
+        channel_type="telegram",
+        account_id="acct-1",
+        chat_id="chat-1",
+        thread_id=None,
+        content="",
+        media=[{"url": "https://cognis.example.com/file.pdf", "filename": "file.pdf"}],
+    )
+
+    assert status == "sent"
 
 
 @pytest.mark.asyncio

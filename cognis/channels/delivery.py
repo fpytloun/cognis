@@ -8,6 +8,7 @@ conversation's channel context in ``ConversationContext.platform_data``.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -25,6 +26,28 @@ from cognis.logging import get_logger
 from cognis.models.channel import MediaAttachment, OutboundMessage
 
 logger = get_logger(__name__)
+
+
+def _append_attachment_fallback(content: str, fallback_lines: list[str]) -> str:
+    if not fallback_lines:
+        return content
+    fallback_text = "\n\n".join(line for line in fallback_lines if line)
+    if not fallback_text:
+        return content
+    if not content.strip():
+        return fallback_text
+    return f"{content}\n\n{fallback_text}"
+
+
+def _attachment_fallback_text(raw: dict[str, Any]) -> str | None:
+    url = raw.get("url") if isinstance(raw.get("url"), str) else None
+    filename = raw.get("filename") if isinstance(raw.get("filename"), str) else None
+    mime_type = raw.get("mime_type") if isinstance(raw.get("mime_type"), str) else None
+    if url and mime_type and mime_type.startswith("image/"):
+        return url
+    if url and filename:
+        return f"{filename}\n{url}"
+    return url or filename
 
 
 class ChannelDeliveryService:
@@ -126,11 +149,18 @@ class ChannelDeliveryService:
 
         adapter, config = result
 
-        outbound_media = await self._prepare_media_attachments(media or [])
+        (
+            outbound_media,
+            attachment_fallback_lines,
+            had_attachment_failures,
+        ) = await self._prepare_media_attachments(media or [])
+        content = _append_attachment_fallback(content, attachment_fallback_lines)
+        if not content and not outbound_media:
+            return "failed"
 
         if channel_type == "signal":
             try:
-                await adapter.send_message(
+                message_id = await adapter.send_message(
                     OutboundMessage(
                         channel_type=channel_type,
                         account_id=account_id,
@@ -140,11 +170,19 @@ class ChannelDeliveryService:
                         media=outbound_media,
                     )
                 )
+                if (not isinstance(message_id, str) or not message_id.strip()) and (
+                    content or outbound_media
+                ):
+                    CHANNEL_DELIVERY_ERRORS.labels(
+                        channel_type=channel_type,
+                        account_id=account_id,
+                    ).inc()
+                    return "failed"
                 CHANNEL_OUTBOUND_TOTAL.labels(
                     channel_type=channel_type,
                     account_id=account_id,
                 ).inc()
-                return "sent"
+                return "partial" if had_attachment_failures else "sent"
             except Exception:
                 CHANNEL_DELIVERY_ERRORS.labels(
                     channel_type=channel_type,
@@ -168,7 +206,7 @@ class ChannelDeliveryService:
                     channel_type=channel_type,
                     account_id=account_id,
                 ).inc()
-                return "sent"
+                return "partial" if had_attachment_failures else "sent"
             except Exception:
                 CHANNEL_DELIVERY_ERRORS.labels(
                     channel_type=channel_type,
@@ -213,18 +251,26 @@ class ChannelDeliveryService:
 
     async def _prepare_media_attachments(
         self, media: list[dict[str, Any]]
-    ) -> list[MediaAttachment]:
+    ) -> tuple[list[MediaAttachment], list[str], bool]:
         prepared: list[MediaAttachment] = []
+        fallback_lines: list[str] = []
+        had_failures = False
         for item in media:
-            prepared.append(await self._materialize_media_attachment(item))
-        return prepared
+            attachment, fallback_line, materialized = await self._materialize_media_attachment(item)
+            if attachment is not None:
+                prepared.append(attachment)
+            if fallback_line:
+                fallback_lines.append(fallback_line)
+            if not materialized:
+                had_failures = True
+        return prepared, fallback_lines, had_failures
 
-    async def _materialize_media_attachment(self, raw: dict[str, Any]) -> MediaAttachment:
+    async def _materialize_media_attachment(
+        self, raw: dict[str, Any]
+    ) -> tuple[MediaAttachment | None, str | None, bool]:
         content_b64 = raw.get("content_b64") if isinstance(raw.get("content_b64"), str) else None
         artifact_id = raw.get("artifact_id")
         if content_b64 is None and isinstance(artifact_id, str) and artifact_id:
-            import base64
-
             from cognis.store.queries import get_artifact_record
 
             try:
@@ -237,15 +283,72 @@ class ChannelDeliveryService:
                         row.object_id,
                         row.filename,
                     )
-                    content_b64 = base64.b64encode(content).decode("ascii")
+                    return (
+                        MediaAttachment(
+                            url=raw.get("url") if isinstance(raw.get("url"), str) else None,
+                            mime_type=(
+                                raw.get("mime_type")
+                                if isinstance(raw.get("mime_type"), str)
+                                else None
+                            )
+                            or getattr(row, "mime_type", None),
+                            filename=(
+                                raw.get("filename")
+                                if isinstance(raw.get("filename"), str)
+                                else None
+                            )
+                            or row.filename,
+                            size_bytes=(
+                                raw.get("size_bytes")
+                                if isinstance(raw.get("size_bytes"), int)
+                                else None
+                            )
+                            or len(content),
+                            content_b64=base64.b64encode(content).decode("ascii"),
+                        ),
+                        None,
+                        True,
+                    )
             except Exception:
                 logger.warning("channel delivery: failed to materialize attachment", exc_info=True)
-        return MediaAttachment(
-            url=raw.get("url") if isinstance(raw.get("url"), str) else None,
-            mime_type=raw.get("mime_type") if isinstance(raw.get("mime_type"), str) else None,
-            filename=raw.get("filename") if isinstance(raw.get("filename"), str) else None,
-            size_bytes=raw.get("size_bytes") if isinstance(raw.get("size_bytes"), int) else None,
-            content_b64=content_b64,
+                if isinstance(raw.get("url"), str):
+                    return (
+                        MediaAttachment(
+                            url=raw["url"],
+                            mime_type=(
+                                raw.get("mime_type")
+                                if isinstance(raw.get("mime_type"), str)
+                                else None
+                            ),
+                            filename=(
+                                raw.get("filename")
+                                if isinstance(raw.get("filename"), str)
+                                else None
+                            ),
+                            size_bytes=(
+                                raw.get("size_bytes")
+                                if isinstance(raw.get("size_bytes"), int)
+                                else None
+                            ),
+                        ),
+                        None,
+                        True,
+                    )
+                return None, _attachment_fallback_text(raw), False
+        if content_b64 is None and not isinstance(raw.get("url"), str):
+            return None, _attachment_fallback_text(raw), False
+        return (
+            MediaAttachment(
+                url=raw.get("url") if isinstance(raw.get("url"), str) else None,
+                mime_type=raw.get("mime_type") if isinstance(raw.get("mime_type"), str) else None,
+                filename=raw.get("filename") if isinstance(raw.get("filename"), str) else None,
+                size_bytes=raw.get("size_bytes")
+                if isinstance(raw.get("size_bytes"), int)
+                else None,
+                content_b64=content_b64,
+            ),
+            None,
+            True,
         )
 
     # ------------------------------------------------------------------
