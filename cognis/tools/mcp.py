@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import os
@@ -211,8 +212,15 @@ class _SessionMCPClient:
 
         logger.debug("MCP: %s closing", self.config.name)
         if self._exit_stack is not None:
-            with suppress(Exception):
+            try:
                 await self._exit_stack.aclose()
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    raise
+                logger.debug("MCP: %s close cancelled during transport teardown", self.config.name)
+            except Exception:
+                pass
             self._exit_stack = None
             self._session = None
         logger.debug("MCP: %s closed", self.config.name)

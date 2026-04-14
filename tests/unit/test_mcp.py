@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -106,6 +108,52 @@ async def test_mcp_client_lists_and_calls_tools(tmp_path: Path) -> None:
     definitions = mcp_tools_to_definitions("filesystem", tools, timeout_seconds=2)
     assert definitions[0].name == sanitize_mcp_tool_name("filesystem", "inspect")
     assert definitions[0].source.raw_tool_name == "inspect"
+
+
+@pytest.mark.asyncio
+async def test_mcp_client_close_suppresses_cancelled_error() -> None:
+    client = StdioMCPClient(
+        MCPServerConfig(name="filesystem", command=sys.executable, args=[], timeout_seconds=10)
+    )
+
+    class _ExitStack:
+        async def aclose(self) -> None:
+            raise asyncio.CancelledError()
+
+    client._exit_stack = _ExitStack()
+    client._session = SimpleNamespace()
+
+    await client.close()
+
+    assert client._exit_stack is None
+    assert client._session is None
+
+
+@pytest.mark.asyncio
+async def test_mcp_client_close_propagates_task_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = StdioMCPClient(
+        MCPServerConfig(name="filesystem", command=sys.executable, args=[], timeout_seconds=10)
+    )
+
+    class _ExitStack:
+        async def aclose(self) -> None:
+            raise asyncio.CancelledError()
+
+    class _Task:
+        def cancelling(self) -> int:
+            return 1
+
+    client._exit_stack = _ExitStack()
+    client._session = SimpleNamespace()
+    monkeypatch.setattr(asyncio, "current_task", lambda: _Task())
+
+    with pytest.raises(asyncio.CancelledError):
+        await client.close()
+
+    assert client._exit_stack is not None
+    assert client._session is not None
 
 
 # ---------------------------------------------------------------------------
