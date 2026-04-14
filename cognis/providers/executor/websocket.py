@@ -215,6 +215,7 @@ class WebSocketExecutorConnection:
                     "call_id": tool_call.call_id,
                     "tool_name": tool_call.name,
                     "arguments": tool_call.arguments,
+                    "execution_scope_id": tool_call.execution_scope_id,
                     "timeout_seconds": timeout_seconds or 300,
                 },
                 timeout=float(timeout_seconds) if timeout_seconds else None,

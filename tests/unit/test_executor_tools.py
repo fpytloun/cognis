@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -30,6 +31,19 @@ _DUMMY_CONTEXT = ToolExecutionContext(
         executor_type="in_process",
     )
 )
+
+
+def _context(
+    scope_id: str = "scope-1", runtime_metadata: dict[str, Any] | None = None
+) -> ToolExecutionContext:
+    return ToolExecutionContext(
+        executor_handle=ExecutorHandle(
+            executor_id="test",
+            executor_type="in_process",
+        ),
+        runtime_metadata=runtime_metadata or {},
+        execution_scope_id=scope_id,
+    )
 
 
 class TestDefinitions:
@@ -121,16 +135,39 @@ class TestWriteTool:
     @pytest.mark.asyncio()
     async def test_write_new_file(self, tmp_path: Path) -> None:
         target = tmp_path / "new.txt"
-        result = await handle_write({"file_path": str(target), "content": "hello"}, _DUMMY_CONTEXT)
+        result = await handle_write({"file_path": str(target), "content": "hello"}, _context())
         assert not result.is_error
         assert target.read_text() == "hello"
 
     @pytest.mark.asyncio()
     async def test_write_creates_parents(self, tmp_path: Path) -> None:
         target = tmp_path / "a" / "b" / "c.txt"
-        result = await handle_write({"file_path": str(target), "content": "deep"}, _DUMMY_CONTEXT)
+        result = await handle_write({"file_path": str(target), "content": "deep"}, _context())
         assert not result.is_error
         assert target.read_text() == "deep"
+
+    @pytest.mark.asyncio()
+    async def test_write_existing_file_requires_prior_read(self, tmp_path: Path) -> None:
+        target = tmp_path / "existing.txt"
+        target.write_text("old")
+
+        result = await handle_write({"file_path": str(target), "content": "new"}, _context())
+
+        assert result.is_error
+        assert "Use the read tool first" in result.output
+
+    @pytest.mark.asyncio()
+    async def test_write_existing_file_fails_after_external_change(self, tmp_path: Path) -> None:
+        target = tmp_path / "existing.txt"
+        target.write_text("old")
+        context = _context()
+        await handle_read({"file_path": str(target)}, context)
+        target.write_text("user change")
+
+        result = await handle_write({"file_path": str(target), "content": "new"}, context)
+
+        assert result.is_error
+        assert "modified since it was last read" in result.output
 
     @pytest.mark.asyncio()
     async def test_write_succeeds_when_lsp_fails(self, tmp_path: Path) -> None:
@@ -164,24 +201,30 @@ class TestEditTool:
 
     @pytest.mark.asyncio()
     async def test_edit_single_match(self, tmp_file: Path) -> None:
+        context = _context()
+        await handle_read({"file_path": str(tmp_file)}, context)
         result = await handle_edit(
             {"file_path": str(tmp_file), "old_string": "foo bar", "new_string": "baz qux"},
-            _DUMMY_CONTEXT,
+            context,
         )
         assert not result.is_error
         assert "baz qux" in tmp_file.read_text()
 
     @pytest.mark.asyncio()
     async def test_edit_multiple_matches_fails(self, tmp_file: Path) -> None:
+        context = _context()
+        await handle_read({"file_path": str(tmp_file)}, context)
         result = await handle_edit(
             {"file_path": str(tmp_file), "old_string": "hello world", "new_string": "hi"},
-            _DUMMY_CONTEXT,
+            context,
         )
         assert result.is_error
         assert "2 matches" in result.output
 
     @pytest.mark.asyncio()
     async def test_edit_replace_all(self, tmp_file: Path) -> None:
+        context = _context()
+        await handle_read({"file_path": str(tmp_file)}, context)
         result = await handle_edit(
             {
                 "file_path": str(tmp_file),
@@ -189,18 +232,30 @@ class TestEditTool:
                 "new_string": "hi",
                 "replace_all": True,
             },
-            _DUMMY_CONTEXT,
+            context,
         )
         assert not result.is_error
         assert tmp_file.read_text().count("hi") == 2
 
     @pytest.mark.asyncio()
     async def test_edit_not_found(self, tmp_file: Path) -> None:
+        context = _context()
+        await handle_read({"file_path": str(tmp_file)}, context)
         result = await handle_edit(
             {"file_path": str(tmp_file), "old_string": "nonexistent", "new_string": "x"},
-            _DUMMY_CONTEXT,
+            context,
         )
         assert result.is_error
+
+    @pytest.mark.asyncio()
+    async def test_edit_requires_prior_read(self, tmp_file: Path) -> None:
+        result = await handle_edit(
+            {"file_path": str(tmp_file), "old_string": "foo bar", "new_string": "baz qux"},
+            _context(),
+        )
+
+        assert result.is_error
+        assert "Use the read tool first" in result.output
 
 
 class TestMultieditTool:
@@ -210,6 +265,8 @@ class TestMultieditTool:
     async def test_multiedit(self, tmp_path: Path) -> None:
         f = tmp_path / "multi.txt"
         f.write_text("aaa\nbbb\nccc\n")
+        context = _context()
+        await handle_read({"file_path": str(f)}, context)
         result = await handle_multiedit(
             {
                 "file_path": str(f),
@@ -218,12 +275,44 @@ class TestMultieditTool:
                     {"old_string": "ccc", "new_string": "CCC"},
                 ],
             },
-            _DUMMY_CONTEXT,
+            context,
         )
         assert not result.is_error
         content = f.read_text()
         assert "AAA" in content
         assert "CCC" in content
+
+    @pytest.mark.asyncio()
+    async def test_multiedit_stale_read_fails(self, tmp_path: Path) -> None:
+        f = tmp_path / "multi.txt"
+        f.write_text("aaa\nbbb\nccc\n")
+        context = _context()
+        await handle_read({"file_path": str(f)}, context)
+        f.write_text("user changed\n")
+
+        result = await handle_multiedit(
+            {
+                "file_path": str(f),
+                "edits": [{"old_string": "user", "new_string": "agent"}],
+            },
+            context,
+        )
+
+        assert result.is_error
+        assert "modified since it was last read" in result.output
+
+    @pytest.mark.asyncio()
+    async def test_freshness_is_scope_local(self, tmp_path: Path) -> None:
+        target = tmp_path / "scope.txt"
+        target.write_text("old")
+        context_a = _context("scope-a")
+        context_b = _context("scope-b")
+        await handle_read({"file_path": str(target)}, context_a)
+
+        result = await handle_write({"file_path": str(target), "content": "new"}, context_b)
+
+        assert result.is_error
+        assert "Use the read tool first" in result.output
 
 
 class TestPatchTool:
@@ -261,6 +350,19 @@ class TestPatchTool:
 
         assert result.is_error
         assert f"Update File target does not exist: {missing}" in result.output
+
+    @pytest.mark.asyncio()
+    async def test_patch_requires_prior_read(self, tmp_path: Path) -> None:
+        target = tmp_path / "test.txt"
+        target.write_text("hello\n")
+
+        result = await handle_patch(
+            {"patch_text": f"--- a/{target}\n+++ b/{target}\n@@ -1 +1 @@\n-hello\n+hi\n"},
+            _context(),
+        )
+
+        assert result.is_error
+        assert "Use the read tool first" in result.output
 
 
 class TestGlobTool:

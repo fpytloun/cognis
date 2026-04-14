@@ -470,9 +470,11 @@ class ToolRouter:
             return self._sanitize_result(
                 tool_call.name, ToolResult(output="Unknown tool.", is_error=True), 50_000
             )
+        scoped_tool_call = tool_call.model_copy(update={"execution_scope_id": session.session_id})
+
         if registered_tool.handler is not None:
             result = await self._execute_local_handler(
-                tool_call,
+                scoped_tool_call,
                 registered_tool=registered_tool,
                 executor=executor,
             )
@@ -496,7 +498,7 @@ class ToolRouter:
         try:
             result = await asyncio.wait_for(
                 executor.tool_execute(
-                    tool_call, timeout_seconds=registered_tool.definition.timeout_seconds
+                    scoped_tool_call, timeout_seconds=registered_tool.definition.timeout_seconds
                 ),
                 timeout=registered_tool.definition.timeout_seconds,
             )
@@ -543,6 +545,7 @@ class ToolRouter:
         executor_handle = self._executor_handle_for_local_tool(executor)
         context = ToolExecutionContext(
             executor_handle=executor_handle,
+            execution_scope_id=tool_call.execution_scope_id,
         )
         normalized_arguments = strip_empty_optional_values(
             tool_call.arguments,

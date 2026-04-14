@@ -25,6 +25,7 @@ class ToolExecutionContext:
 
     executor_handle: ExecutorHandle
     runtime_metadata: dict[str, Any] = field(default_factory=dict)
+    execution_scope_id: str | None = None
 
 
 type ToolHandlerResult = str | dict[str, Any] | list[Any] | ToolResult

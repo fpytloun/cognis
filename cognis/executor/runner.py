@@ -25,6 +25,7 @@ from cognis.models.tool import (
     ToolSource,
 )
 from cognis.tools.executor.definitions import executor_tool_definitions, executor_tool_handlers
+from cognis.tools.executor.file_freshness import _FILE_FRESHNESS_KEY, get_file_freshness_tracker
 from cognis.tools.executor.lsp import (
     LSP_MANAGER_KEY,
     LSP_STATUS_CAPABILITY,
@@ -339,6 +340,7 @@ class ExecutorRunner:
                 "mcp_servers": mcp_statuses,
                 "warnings": mcp_warnings,
             }
+            get_file_freshness_tracker(self._runtime_metadata)
             try:
                 lsp_manager = build_lsp_manager(config if isinstance(config, dict) else {})
             except Exception:
@@ -669,6 +671,10 @@ class ExecutorRunner:
                         executor_type="remote",
                     ),
                     runtime_metadata=self._runtime_metadata,
+                    execution_scope_id=str(
+                        params.get("execution_scope_id")
+                        or f"{self.config.executor_id}:{self._runtime_metadata.get('user_email', 'runtime')}"
+                    ),
                 )
 
                 async def _invoke() -> Any:
@@ -1060,6 +1066,7 @@ class ExecutorRunner:
         metadata.pop("web_secrets", None)
         metadata.pop("browser_manager", None)
         metadata.pop(LSP_MANAGER_KEY, None)
+        metadata.pop(_FILE_FRESHNESS_KEY, None)
         return metadata
 
     async def _send_rpc_result(self, ws: Any, msg_id: str | None, result: dict[str, Any]) -> None:

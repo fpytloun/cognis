@@ -26,6 +26,7 @@ from cognis.providers.circuit_breaker import CircuitBreaker
 from cognis.tools.builtin.system import StatusProvider, build_system_tool_handlers
 from cognis.tools.executor.browser.manager import BROWSER_MANAGER_KEY, BrowserManager
 from cognis.tools.executor.definitions import executor_tool_handlers
+from cognis.tools.executor.file_freshness import get_file_freshness_tracker
 from cognis.tools.executor.lsp import (
     LSP_MANAGER_KEY,
     LSPManager,
@@ -125,6 +126,7 @@ class InProcessExecutorConnection:
             context = ToolExecutionContext(
                 executor_handle=self.handle,
                 runtime_metadata=self.runtime_metadata,
+                execution_scope_id=tool_call.execution_scope_id or self.handle.executor_id,
             )
             result = await handler(tool_call.arguments, context)
             duration_ms = int((perf_counter() - start) * 1000)
@@ -197,6 +199,7 @@ class InProcessExecutorProvider:
                 registry.register(RegisteredTool(definition=tool, handler=cast(Any, handler)))
             lsp_manager: LSPManager | None = None
             runtime_metadata = dict(config.metadata)
+            get_file_freshness_tracker(runtime_metadata)
             try:
                 lsp_manager = build_lsp_manager(config.metadata)
                 if lsp_manager is not None:

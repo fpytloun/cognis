@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import re
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from cognis.logging import get_logger
 from cognis.models.tool import ToolResult
+from cognis.tools.executor.file_freshness import get_file_freshness_tracker
 from cognis.tools.executor.paths import resolve_path
 from cognis.tools.registry import ToolExecutionContext
 
@@ -29,6 +31,31 @@ def _resolve_path(raw: str) -> Path:
 
 # Canonical key for LSPManager in ToolExecutionContext.runtime_metadata
 _LSP_MANAGER_KEY = "lsp_manager"  # Must match LSP_MANAGER_KEY from lsp package
+
+
+async def _record_read(context: ToolExecutionContext, path: Path) -> None:
+    tracker = get_file_freshness_tracker(context.runtime_metadata)
+    await tracker.record_read(tracker.scope_id(context), path)
+
+
+async def _record_write(context: ToolExecutionContext, path: Path) -> None:
+    tracker = get_file_freshness_tracker(context.runtime_metadata)
+    await tracker.record_write(tracker.scope_id(context), path)
+
+
+async def _assert_can_modify_existing(context: ToolExecutionContext, path: Path) -> None:
+    tracker = get_file_freshness_tracker(context.runtime_metadata)
+    await tracker.assert_can_modify_existing(tracker.scope_id(context), path)
+
+
+async def _with_file_lock(
+    context: ToolExecutionContext,
+    path: Path,
+    operation: Callable[[], Awaitable[ToolResult]],
+) -> ToolResult:
+    tracker = get_file_freshness_tracker(context.runtime_metadata)
+    async with tracker.lock_for(path):
+        return await operation()
 
 
 async def _collect_lsp_diagnostics(
@@ -170,6 +197,7 @@ async def handle_read(arguments: dict[str, Any], context: ToolExecutionContext) 
 
     # Warm LSP for subsequent edits (non-blocking)
     if path.is_file():
+        await _record_read(context, path)
         _warm_lsp(context, str(path))
 
     return ToolResult(output=result)
@@ -197,20 +225,28 @@ async def handle_write(arguments: dict[str, Any], context: ToolExecutionContext)
     content = arguments.get("content", "")
 
     path = _resolve_path(file_path)
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
-    except (OSError, PermissionError) as exc:
-        return ToolResult(output=f"Cannot write file: {exc}", is_error=True)
 
-    output = f"Wrote {len(content)} bytes to {file_path}"
+    async def _write() -> ToolResult:
+        exists = path.exists()
+        if exists:
+            try:
+                await _assert_can_modify_existing(context, path)
+            except RuntimeError as exc:
+                return ToolResult(output=str(exc), is_error=True)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+            await _record_write(context, path)
+        except (OSError, PermissionError) as exc:
+            return ToolResult(output=f"Cannot write file: {exc}", is_error=True)
 
-    # LSP diagnostics (best-effort)
-    diagnostics_text = await _collect_lsp_diagnostics(context, file_path)
-    if diagnostics_text:
-        output += f"\n\n{diagnostics_text}"
+        output = f"Wrote {len(content)} bytes to {file_path}"
+        diagnostics_text = await _collect_lsp_diagnostics(context, file_path)
+        if diagnostics_text:
+            output += f"\n\n{diagnostics_text}"
+        return ToolResult(output=output)
 
-    return ToolResult(output=output)
+    return await _with_file_lock(context, path, _write)
 
 
 async def handle_edit(arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
@@ -227,39 +263,44 @@ async def handle_edit(arguments: dict[str, Any], context: ToolExecutionContext) 
     if not path.is_file():
         return ToolResult(output=f"File not found: {file_path}", is_error=True)
 
-    try:
-        content = path.read_text(encoding="utf-8")
-    except (OSError, PermissionError) as exc:
-        return ToolResult(output=f"Cannot read file: {exc}", is_error=True)
+    async def _edit() -> ToolResult:
+        try:
+            await _assert_can_modify_existing(context, path)
+        except RuntimeError as exc:
+            return ToolResult(output=str(exc), is_error=True)
+        try:
+            content = path.read_text(encoding="utf-8")
+        except (OSError, PermissionError) as exc:
+            return ToolResult(output=f"Cannot read file: {exc}", is_error=True)
 
-    count = content.count(old_string)
-    if count == 0:
-        return ToolResult(output="oldString not found in content.", is_error=True)
-    if count > 1 and not replace_all:
-        return ToolResult(
-            output=f"Found {count} matches for oldString. Use replace_all=true or provide more context to make the match unique.",
-            is_error=True,
+        count = content.count(old_string)
+        if count == 0:
+            return ToolResult(output="oldString not found in content.", is_error=True)
+        if count > 1 and not replace_all:
+            return ToolResult(
+                output=f"Found {count} matches for oldString. Use replace_all=true or provide more context to make the match unique.",
+                is_error=True,
+            )
+
+        new_content = (
+            content.replace(old_string, new_string)
+            if replace_all
+            else content.replace(old_string, new_string, 1)
         )
+        try:
+            path.write_text(new_content, encoding="utf-8")
+            await _record_write(context, path)
+        except (OSError, PermissionError) as exc:
+            return ToolResult(output=f"Cannot write file: {exc}", is_error=True)
 
-    if replace_all:
-        new_content = content.replace(old_string, new_string)
-    else:
-        new_content = content.replace(old_string, new_string, 1)
+        replacements = count if replace_all else 1
+        output = f"Replaced {replacements} occurrence(s) in {file_path}"
+        diagnostics_text = await _collect_lsp_diagnostics(context, file_path)
+        if diagnostics_text:
+            output += f"\n\n{diagnostics_text}"
+        return ToolResult(output=output)
 
-    try:
-        path.write_text(new_content, encoding="utf-8")
-    except (OSError, PermissionError) as exc:
-        return ToolResult(output=f"Cannot write file: {exc}", is_error=True)
-
-    replacements = count if replace_all else 1
-    output = f"Replaced {replacements} occurrence(s) in {file_path}"
-
-    # LSP diagnostics (best-effort)
-    diagnostics_text = await _collect_lsp_diagnostics(context, file_path)
-    if diagnostics_text:
-        output += f"\n\n{diagnostics_text}"
-
-    return ToolResult(output=output)
+    return await _with_file_lock(context, path, _edit)
 
 
 async def handle_patch(arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
@@ -302,14 +343,31 @@ async def handle_patch(arguments: dict[str, Any], context: ToolExecutionContext)
         if not path.is_file():
             errors.append(f"File not found: {file_path}")
             continue
-        try:
-            content = path.read_text(encoding="utf-8")
-            lines = content.splitlines(keepends=True)
-            new_lines = _apply_hunks(lines, hunks)
-            path.write_text("".join(new_lines), encoding="utf-8")
-            files_patched.append(file_path)
-        except Exception as exc:
-            errors.append(f"Failed to patch {file_path}: {exc}")
+
+        async def _patch_one(
+            *,
+            target_path: Path = path,
+            target_hunks: list[tuple[int, list[str], list[str]]] = hunks,
+            target_file_path: str = file_path,
+        ) -> ToolResult:
+            try:
+                await _assert_can_modify_existing(context, target_path)
+                content = target_path.read_text(encoding="utf-8")
+                lines = content.splitlines(keepends=True)
+                new_lines = _apply_hunks(lines, target_hunks)
+                target_path.write_text("".join(new_lines), encoding="utf-8")
+                await _record_write(context, target_path)
+                return ToolResult(output="ok")
+            except Exception as exc:
+                return ToolResult(
+                    output=f"Failed to patch {target_file_path}: {exc}", is_error=True
+                )
+
+        result = await _with_file_lock(context, path, _patch_one)
+        if result.is_error:
+            errors.append(result.output)
+            continue
+        files_patched.append(file_path)
 
     parts: list[str] = []
     if files_patched:
@@ -340,49 +398,53 @@ async def handle_multiedit(arguments: dict[str, Any], context: ToolExecutionCont
     if not path.is_file():
         return ToolResult(output=f"File not found: {file_path}", is_error=True)
 
-    try:
-        content = path.read_text(encoding="utf-8")
-    except (OSError, PermissionError) as exc:
-        return ToolResult(output=f"Cannot read file: {exc}", is_error=True)
+    async def _multiedit() -> ToolResult:
+        try:
+            await _assert_can_modify_existing(context, path)
+            content = path.read_text(encoding="utf-8")
+        except RuntimeError as exc:
+            return ToolResult(output=str(exc), is_error=True)
+        except (OSError, PermissionError) as exc:
+            return ToolResult(output=f"Cannot read file: {exc}", is_error=True)
 
-    applied = 0
-    for i, edit in enumerate(edits):
-        old_string = edit.get("old_string", "")
-        new_string = edit.get("new_string", "")
-        replace_all = bool(edit.get("replace_all", False))
+        applied = 0
+        for i, edit in enumerate(edits):
+            old_string = edit.get("old_string", "")
+            new_string = edit.get("new_string", "")
+            replace_all = bool(edit.get("replace_all", False))
 
-        if old_string == new_string:
-            continue
-        count = content.count(old_string)
-        if count == 0:
-            return ToolResult(
-                output=f"Edit {i + 1}: oldString not found in content.",
-                is_error=True,
+            if old_string == new_string:
+                continue
+            count = content.count(old_string)
+            if count == 0:
+                return ToolResult(
+                    output=f"Edit {i + 1}: oldString not found in content.", is_error=True
+                )
+            if count > 1 and not replace_all:
+                return ToolResult(
+                    output=f"Edit {i + 1}: Found {count} matches. Use replace_all or provide more context.",
+                    is_error=True,
+                )
+            content = (
+                content.replace(old_string, new_string)
+                if replace_all
+                else content.replace(old_string, new_string, 1)
             )
-        if count > 1 and not replace_all:
-            return ToolResult(
-                output=f"Edit {i + 1}: Found {count} matches. Use replace_all or provide more context.",
-                is_error=True,
-            )
-        if replace_all:
-            content = content.replace(old_string, new_string)
-        else:
-            content = content.replace(old_string, new_string, 1)
-        applied += 1
+            applied += 1
 
-    try:
-        path.write_text(content, encoding="utf-8")
-    except (OSError, PermissionError) as exc:
-        return ToolResult(output=f"Cannot write file: {exc}", is_error=True)
+        try:
+            path.write_text(content, encoding="utf-8")
+            await _record_write(context, path)
+        except (OSError, PermissionError) as exc:
+            return ToolResult(output=f"Cannot write file: {exc}", is_error=True)
 
-    output = f"Applied {applied} edit(s) to {file_path}"
+        output = f"Applied {applied} edit(s) to {file_path}"
+        diagnostics_text = await _collect_lsp_diagnostics(context, file_path)
+        if diagnostics_text:
+            output += f"\n\n{diagnostics_text}"
+        return ToolResult(output=output)
 
-    # LSP diagnostics (best-effort)
-    diagnostics_text = await _collect_lsp_diagnostics(context, file_path)
-    if diagnostics_text:
-        output += f"\n\n{diagnostics_text}"
-
-    return ToolResult(output=output)
+    return await _with_file_lock(context, path, _multiedit)
 
 
 async def handle_list_directory(

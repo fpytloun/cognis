@@ -295,6 +295,35 @@ async def test_handle_lsp_status_returns_disabled_when_manager_missing() -> None
 
 
 @pytest.mark.asyncio
+async def test_tool_execute_passes_execution_scope_id() -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    ws = DummyWebSocket()
+    await runner._handle_configure(ws, "cfg-1", {"enabled_tools": ["read"], "config": {}})
+
+    seen_scope: dict[str, str | None] = {}
+
+    async def _handler(_: dict[str, object], context: object) -> dict[str, object]:
+        seen_scope["value"] = getattr(context, "execution_scope_id", None)
+        return {"output": "ok", "is_error": False}
+
+    runner._tool_handlers["read"] = _handler
+    ws.sent.clear()
+
+    await runner._handle_tool_execute(
+        ws,
+        "tool-1",
+        {
+            "call_id": "call-1",
+            "tool_name": "read",
+            "arguments": {},
+            "execution_scope_id": "session-123",
+        },
+    )
+
+    assert seen_scope["value"] == "session-123"
+
+
+@pytest.mark.asyncio
 async def test_handle_configure_degrades_when_lsp_manager_init_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
