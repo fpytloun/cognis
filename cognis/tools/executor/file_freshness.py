@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -42,6 +43,18 @@ class FileFreshnessTracker:
     async def record_write(self, scope_id: str, path: Path) -> None:
         self._reads.setdefault(scope_id, {})[self._normalize(path)] = self._stamp(path)
 
+    def remove_path(self, scope_id: str, path: Path) -> None:
+        reads = self._reads.get(scope_id)
+        if reads is None:
+            return
+        reads.pop(self._normalize(path), None)
+        if not reads:
+            self._reads.pop(scope_id, None)
+
+    async def move_path(self, scope_id: str, source: Path, destination: Path) -> None:
+        self.remove_path(scope_id, source)
+        await self.record_write(scope_id, destination)
+
     async def assert_can_modify_existing(self, scope_id: str, path: Path) -> None:
         normalized = self._normalize(path)
         stamp = self._reads.get(scope_id, {}).get(normalized)
@@ -62,6 +75,18 @@ class FileFreshnessTracker:
             lock = asyncio.Lock()
             self._locks[normalized] = lock
         return lock
+
+    @asynccontextmanager
+    async def locks_for(self, paths: Iterable[Path]):
+        normalized_paths = sorted({self._normalize(path) for path in paths})
+        async with AsyncExitStack() as stack:
+            for normalized in normalized_paths:
+                lock = self._locks.get(normalized)
+                if lock is None:
+                    lock = asyncio.Lock()
+                    self._locks[normalized] = lock
+                await stack.enter_async_context(lock)
+            yield
 
     @staticmethod
     def _normalize(path: Path) -> str:

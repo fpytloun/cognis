@@ -131,11 +131,14 @@ EDIT_TOOL = ToolDefinition(
 
 PATCH_TOOL = ToolDefinition(
     name="patch",
-    description="Apply a unified diff patch to one or more files.",
+    description="Apply a strict apply_patch or unified diff patch to one or more text files.",
     parameters={
         "type": "object",
         "properties": {
-            "patch_text": {"type": "string", "description": "Unified diff patch text"},
+            "patch_text": {
+                "type": "string",
+                "description": "Patch text in strict apply_patch syntax or the supported unified diff update subset",
+            },
         },
         "required": ["patch_text"],
     },

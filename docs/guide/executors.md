@@ -94,6 +94,10 @@ the same LSP flow on all executor types:
 LSP is enabled, but diagnostics remain best-effort: the file operation still
 succeeds if server startup or diagnostics collection times out.
 
+The filesystem `patch` tool now accepts strict `apply_patch` syntax as well as
+the supported unified diff update subset. Existing-file patch updates, deletes,
+and moves still require a prior `read`; `Add File` does not.
+
 Use `/lsp` in chat to inspect the current LSP state for the active user's
 executors. The command reports normalized executor-local status:
 

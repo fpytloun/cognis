@@ -145,14 +145,17 @@ edit_tool = ToolDefinition(
     timeout_seconds=30,
 )
 
-# patch — Apply a unified diff patch
+# patch — Apply a strict text patch
 patch_tool = ToolDefinition(
     name="patch",
-    description="Apply a unified diff patch to one or more files.",
+    description="Apply a strict apply_patch patch or the supported unified diff update subset to one or more text files.",
     parameters={
         "type": "object",
         "properties": {
-            "patch_text": {"type": "string", "description": "Unified diff patch text"},
+            "patch_text": {
+                "type": "string",
+                "description": "Patch text in strict apply_patch syntax or the supported unified diff update subset",
+            },
         },
         "required": ["patch_text"],
     },
@@ -336,6 +339,15 @@ changed. This is best-effort feedback from the selected executor runtime: the
 edit still succeeds if LSP is disabled, unavailable, or times out during first
 server startup. `read` may warm LSP in the background, but it does not block on
 diagnostics.
+
+The `patch` tool accepts strict text-only patches in two forms:
+- full `apply_patch` syntax for `Add File`, `Update File`, `Delete File`, and `Move to`
+- the supported unified diff subset for updates to existing files
+
+Existing-file `patch` updates, deletes, and moves require a prior `read` of the
+source file in the same execution scope. `Add File` does not. Unsupported patch
+forms fail deterministically instead of falling back to fuzzy matching. EOF
+markers such as `\ No newline at end of file` are currently rejected.
 
 ## Built-in Orchestration Tools
 

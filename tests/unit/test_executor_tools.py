@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from cognis.models.tool import ExecutorHandle
+from cognis.tools.executor import filesystem as filesystem_module
 from cognis.tools.executor.definitions import (
     ALL_EXECUTOR_TOOLS,
     executor_tool_definitions,
@@ -319,9 +320,11 @@ class TestPatchTool:
     """Test the patch filesystem tool."""
 
     @pytest.mark.asyncio()
-    async def test_patch_rejects_apply_patch_format(self, tmp_path: Path) -> None:
+    async def test_patch_apply_patch_update_success(self, tmp_path: Path) -> None:
         target = tmp_path / "test.txt"
         target.write_text("hello\n")
+        context = _context()
+        await handle_read({"file_path": str(target)}, context)
 
         result = await handle_patch(
             {
@@ -329,27 +332,130 @@ class TestPatchTool:
                     f"*** Begin Patch\n*** Update File: {target}\n@@\n-hello\n+hi\n*** End Patch\n"
                 )
             },
-            _DUMMY_CONTEXT,
+            context,
         )
 
-        assert result.is_error
-        assert "Unsupported patch format" in result.output
+        assert not result.is_error
+        assert target.read_text() == "hi\n"
 
     @pytest.mark.asyncio()
-    async def test_patch_reports_missing_apply_patch_target(self, tmp_path: Path) -> None:
-        missing = tmp_path / "missing.txt"
+    async def test_patch_add_file_success(self, tmp_path: Path) -> None:
+        target = tmp_path / "new.txt"
 
         result = await handle_patch(
             {
                 "patch_text": (
-                    f"*** Begin Patch\n*** Update File: {missing}\n@@\n-hello\n+hi\n*** End Patch\n"
+                    f"*** Begin Patch\n*** Add File: {target}\n+hello\n+world\n*** End Patch\n"
                 )
             },
-            _DUMMY_CONTEXT,
+            _context(),
+        )
+
+        assert not result.is_error
+        assert target.read_text() == "hello\nworld\n"
+
+    @pytest.mark.asyncio()
+    async def test_patch_add_empty_file_success(self, tmp_path: Path) -> None:
+        target = tmp_path / "empty.txt"
+
+        result = await handle_patch(
+            {"patch_text": f"*** Begin Patch\n*** Add File: {target}\n*** End Patch\n"},
+            _context(),
+        )
+
+        assert not result.is_error
+        assert target.read_text() == ""
+
+    @pytest.mark.asyncio()
+    async def test_patch_add_file_fails_if_exists(self, tmp_path: Path) -> None:
+        target = tmp_path / "test.txt"
+        target.write_text("hello\n")
+
+        result = await handle_patch(
+            {"patch_text": f"*** Begin Patch\n*** Add File: {target}\n+hi\n*** End Patch\n"},
+            _context(),
         )
 
         assert result.is_error
-        assert f"Update File target does not exist: {missing}" in result.output
+        assert "already exists" in result.output
+
+    @pytest.mark.asyncio()
+    async def test_patch_delete_success(self, tmp_path: Path) -> None:
+        target = tmp_path / "delete.txt"
+        target.write_text("hello\n")
+        context = _context()
+        await handle_read({"file_path": str(target)}, context)
+
+        result = await handle_patch(
+            {"patch_text": f"*** Begin Patch\n*** Delete File: {target}\n*** End Patch\n"},
+            context,
+        )
+
+        assert not result.is_error
+        assert not target.exists()
+
+    @pytest.mark.asyncio()
+    async def test_patch_move_rename_only_success(self, tmp_path: Path) -> None:
+        source = tmp_path / "old.txt"
+        dest = tmp_path / "new.txt"
+        source.write_text("hello\n")
+        context = _context()
+        await handle_read({"file_path": str(source)}, context)
+
+        result = await handle_patch(
+            {
+                "patch_text": (
+                    f"*** Begin Patch\n*** Update File: {source}\n*** Move to: {dest}\n*** End Patch\n"
+                )
+            },
+            context,
+        )
+
+        assert not result.is_error
+        assert not source.exists()
+        assert dest.read_text() == "hello\n"
+
+    @pytest.mark.asyncio()
+    async def test_patch_move_with_content_edit_success(self, tmp_path: Path) -> None:
+        source = tmp_path / "old.txt"
+        dest = tmp_path / "new.txt"
+        source.write_text("hello\n")
+        context = _context()
+        await handle_read({"file_path": str(source)}, context)
+
+        result = await handle_patch(
+            {
+                "patch_text": (
+                    f"*** Begin Patch\n*** Update File: {source}\n*** Move to: {dest}\n@@\n-hello\n+hi\n*** End Patch\n"
+                )
+            },
+            context,
+        )
+
+        assert not result.is_error
+        assert not source.exists()
+        assert dest.read_text() == "hi\n"
+
+    @pytest.mark.asyncio()
+    async def test_patch_move_fails_if_destination_exists(self, tmp_path: Path) -> None:
+        source = tmp_path / "old.txt"
+        dest = tmp_path / "new.txt"
+        source.write_text("hello\n")
+        dest.write_text("existing\n")
+        context = _context()
+        await handle_read({"file_path": str(source)}, context)
+
+        result = await handle_patch(
+            {
+                "patch_text": (
+                    f"*** Begin Patch\n*** Update File: {source}\n*** Move to: {dest}\n*** End Patch\n"
+                )
+            },
+            context,
+        )
+
+        assert result.is_error
+        assert "destination already exists" in result.output
 
     @pytest.mark.asyncio()
     async def test_patch_requires_prior_read(self, tmp_path: Path) -> None:
@@ -357,12 +463,168 @@ class TestPatchTool:
         target.write_text("hello\n")
 
         result = await handle_patch(
-            {"patch_text": f"--- a/{target}\n+++ b/{target}\n@@ -1 +1 @@\n-hello\n+hi\n"},
+            {
+                "patch_text": f"*** Begin Patch\n*** Update File: {target}\n@@\n-hello\n+hi\n*** End Patch\n"
+            },
             _context(),
         )
 
         assert result.is_error
         assert "Use the read tool first" in result.output
+
+    @pytest.mark.asyncio()
+    async def test_patch_ambiguous_hunk_fails(self, tmp_path: Path) -> None:
+        target = tmp_path / "ambiguous.txt"
+        target.write_text("hello\nhello\n")
+        context = _context()
+        await handle_read({"file_path": str(target)}, context)
+
+        result = await handle_patch(
+            {
+                "patch_text": f"*** Begin Patch\n*** Update File: {target}\n@@\n-hello\n+hi\n*** End Patch\n"
+            },
+            context,
+        )
+
+        assert result.is_error
+        assert "multiple locations" in result.output
+
+    @pytest.mark.asyncio()
+    async def test_patch_no_write_on_prevalidation_failure(self, tmp_path: Path) -> None:
+        target = tmp_path / "new.txt"
+
+        result = await handle_patch(
+            {
+                "patch_text": (
+                    f"*** Begin Patch\n*** Add File: {target}\n+hello\n*** Delete File: {tmp_path / 'missing.txt'}\n*** End Patch\n"
+                )
+            },
+            _context(),
+        )
+
+        assert result.is_error
+        assert not target.exists()
+
+    @pytest.mark.asyncio()
+    async def test_patch_detects_phase_b_race(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        target = tmp_path / "race.txt"
+        target.write_text("hello\n")
+        context = _context()
+        await handle_read({"file_path": str(target)}, context)
+
+        original = filesystem_module._stage_patch_operations
+        calls = 0
+
+        async def _wrapped_stage(operations: object, ctx: object):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                target.write_text("changed\n")
+            return await original(operations, ctx)
+
+        monkeypatch.setattr(filesystem_module, "_stage_patch_operations", _wrapped_stage)
+
+        result = await handle_patch(
+            {
+                "patch_text": f"*** Begin Patch\n*** Update File: {target}\n@@\n-hello\n+hi\n*** End Patch\n"
+            },
+            context,
+        )
+
+        assert result.is_error
+        assert "modified since it was last read" in result.output
+        assert target.read_text() == "changed\n"
+
+    @pytest.mark.asyncio()
+    async def test_patch_unified_diff_regression_success(self, tmp_path: Path) -> None:
+        target = tmp_path / "test.txt"
+        target.write_text("hello\n")
+        context = _context()
+        await handle_read({"file_path": str(target)}, context)
+
+        result = await handle_patch(
+            {"patch_text": f"--- a/{target}\n+++ b/{target}\n@@ -1 +1 @@\n-hello\n+hi\n"},
+            context,
+        )
+
+        assert not result.is_error
+        assert target.read_text() == "hi\n"
+
+    @pytest.mark.asyncio()
+    async def test_patch_unified_diff_uses_hunk_location(self, tmp_path: Path) -> None:
+        target = tmp_path / "test.txt"
+        target.write_text("hello\nkeep\nhello\n")
+        context = _context()
+        await handle_read({"file_path": str(target)}, context)
+
+        result = await handle_patch(
+            {"patch_text": (f"--- a/{target}\n+++ b/{target}\n@@ -3 +3 @@\n-hello\n+hi\n")},
+            context,
+        )
+
+        assert not result.is_error
+        assert target.read_text() == "hello\nkeep\nhi\n"
+
+    @pytest.mark.asyncio()
+    async def test_patch_reports_read_failure_during_prevalidation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        target = tmp_path / "test.txt"
+        target.write_text("hello\n")
+        context = _context()
+        await handle_read({"file_path": str(target)}, context)
+
+        def _broken_read(_: Path) -> str:
+            raise OSError("denied")
+
+        monkeypatch.setattr(filesystem_module, "_read_text_file", _broken_read)
+
+        result = await handle_patch(
+            {
+                "patch_text": f"*** Begin Patch\n*** Update File: {target}\n@@\n-hello\n+hi\n*** End Patch\n"
+            },
+            context,
+        )
+
+        assert result.is_error
+        assert "denied" in result.output
+
+    @pytest.mark.asyncio()
+    async def test_patch_rejects_end_of_file_marker(self, tmp_path: Path) -> None:
+        target = tmp_path / "test.txt"
+        target.write_text("hello\n")
+        context = _context()
+        await handle_read({"file_path": str(target)}, context)
+
+        result = await handle_patch(
+            {
+                "patch_text": (
+                    f"*** Begin Patch\n*** Update File: {target}\n@@\n-hello\n+hi\n*** End of File\n*** End Patch\n"
+                )
+            },
+            context,
+        )
+
+        assert result.is_error
+        assert "*** End of File" in result.output
+
+    @pytest.mark.asyncio()
+    async def test_patch_rejects_unified_diff_rename_headers(self, tmp_path: Path) -> None:
+        source = tmp_path / "old.txt"
+        target = tmp_path / "new.txt"
+        source.write_text("hello\n")
+        context = _context()
+        await handle_read({"file_path": str(source)}, context)
+
+        result = await handle_patch(
+            {"patch_text": (f"--- a/{source}\n+++ b/{target}\n@@ -1 +1 @@\n-hello\n+hi\n")},
+            context,
+        )
+
+        assert result.is_error
+        assert "rename/add/delete operations are not supported" in result.output
 
 
 class TestGlobTool:
