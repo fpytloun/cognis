@@ -57,6 +57,46 @@ class TestNpmInstall:
             result = await strategy.install("pyright", tmp_path)
         assert result is None
 
+    @pytest.mark.asyncio()
+    async def test_install_includes_extra_packages(self, tmp_path: Path) -> None:
+        strategy = NpmInstall(
+            package="typescript-language-server",
+            version="4.3.3",
+            entry_point="node_modules/typescript-language-server/lib/cli.mjs",
+            extra_packages=("typescript",),
+        )
+        created_entry = (
+            tmp_path
+            / "typescript"
+            / "4.3.3"
+            / "node_modules"
+            / "typescript-language-server"
+            / "lib"
+            / "cli.mjs"
+        )
+
+        class _Proc:
+            returncode = 0
+
+            async def communicate(self) -> tuple[bytes, bytes]:
+                created_entry.parent.mkdir(parents=True, exist_ok=True)
+                created_entry.touch()
+                return (b"", b"")
+
+        with (
+            patch("cognis.tools.executor.lsp.install.shutil.which", return_value="/usr/bin/npm"),
+            patch(
+                "cognis.tools.executor.lsp.install.asyncio.create_subprocess_exec",
+                AsyncMock(return_value=_Proc()),
+            ) as mock_exec,
+        ):
+            result = await strategy.install("typescript", tmp_path)
+
+        assert result == created_entry
+        cmd = mock_exec.await_args.args
+        assert "typescript-language-server@4.3.3" in cmd
+        assert "typescript" in cmd
+
 
 class TestToolchainInstall:
     """Test toolchain installation strategy."""

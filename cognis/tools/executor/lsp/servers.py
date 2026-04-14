@@ -127,6 +127,7 @@ TYPESCRIPT = LSPServerDefinition(
         package="typescript-language-server",
         version="4.3.3",
         entry_point="node_modules/typescript-language-server/lib/cli.mjs",
+        extra_packages=("typescript",),
     ),
     npm_run=True,
 )

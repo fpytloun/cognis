@@ -81,6 +81,9 @@ class NpmInstall:
     entry_point: str
     """Relative path to the JS entry point within node_modules."""
 
+    extra_packages: tuple[str, ...] = ()
+    """Additional package specs installed alongside the main package."""
+
     async def detect(self, server_id: str, cache_dir: Path) -> Path | None:
         """Check if the npm package is already installed."""
         server_dir = cache_dir / server_id / self.version
@@ -114,14 +117,16 @@ class NpmInstall:
                     "server_id": server_id,
                     "package": self.package,
                     "version": self.version,
+                    "extra_packages": list(self.extra_packages),
                     "runner": npm_name,
                 }
             },
         )
 
         try:
+            packages = [f"{self.package}@{self.version}", *self.extra_packages]
             if npm_name == "bun":
-                cmd = [npm, "add", "--ignore-scripts", f"{self.package}@{self.version}"]
+                cmd = [npm, "add", "--ignore-scripts", *packages]
             else:
                 cmd = [
                     npm,
@@ -129,7 +134,7 @@ class NpmInstall:
                     "--prefix",
                     str(server_dir),
                     "--ignore-scripts",
-                    f"{self.package}@{self.version}",
+                    *packages,
                 ]
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
