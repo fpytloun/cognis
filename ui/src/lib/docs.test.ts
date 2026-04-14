@@ -49,6 +49,11 @@ describe('embedded docs registry', () => {
     expect(validateEmbeddedDocs()).toEqual([]);
   });
 
+  it('rewrites internal relative doc links to supported embedded or repo targets', () => {
+    expect(docsOverview.content).toContain('/blob/main/docs/specs/README.md');
+    expect(docsOverview.content).not.toContain('](specs/README.md)');
+  });
+
   it('builds internal onboarding doc links only', () => {
     const docs = getOnboardingDocs();
 

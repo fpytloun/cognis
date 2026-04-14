@@ -58,6 +58,22 @@ const DOC_ROUTE_RE = /^\/docs\/([a-z0-9-]+)$/;
 const ALLOWED_APP_ROUTE_RE = /^\/(docs(\/[a-z0-9-]+)?|settings(\?.*)?|agents(\/.*)?|chat(\/.*)?|tasks(\/.*)?|workflows(\/.*)?|tools(\/.*)?|channels(\/.*)?)$/;
 const MARKDOWN_LINK_RE = /!??\[[^\]]*\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g;
 
+const EMBEDDED_DOC_ROUTE_BY_SOURCE_PATH: Record<string, string> = {
+  'docs/README.md': '/docs',
+  'docs/guide/getting-started.md': '/docs/getting-started',
+  'docs/guide/architecture.md': '/docs/architecture',
+  'docs/guide/configuring-providers.md': '/docs/configuring-providers',
+  'docs/guide/creating-agents.md': '/docs/creating-agents',
+  'docs/guide/settings.md': '/docs/settings',
+  'docs/guide/using-chat.md': '/docs/using-chat',
+  'docs/guide/managing-tasks.md': '/docs/managing-tasks',
+  'docs/guide/workflows.md': '/docs/workflows',
+  'docs/guide/tools-and-skills.md': '/docs/tools-and-skills',
+  'docs/guide/channels.md': '/docs/channels',
+  'docs/guide/executors.md': '/docs/executors',
+  'docs/guide/troubleshooting.md': '/docs/troubleshooting'
+};
+
 const DOC_ASSET_URLS: Record<string, string> = {
   'docs/assets/images/cognis-agent-tool-inheritance.svg': agentToolInheritanceSvg,
   'docs/assets/images/cognis-channel-pairing-flow.svg': channelPairingFlowSvg,
@@ -104,28 +120,52 @@ function resolveDocRelativePath(sourcePath: string, target: string): string {
   return normalizeDocPath(`${dirname(sourcePath)}/${target}`);
 }
 
-function rewriteMarkdownAssets(sourcePath: string, markdown: string): string {
+function getGitHubRepoUrl(path: string): string {
+  const normalized = path.replace(/\/$/, '');
+  const isDir = path.endsWith('/') || !normalized.includes('.');
+  const segment = isDir ? 'tree' : 'blob';
+  return `${GITHUB_REPO_URL}/${segment}/main/${normalized}`;
+}
+
+function resolveRelativeMarkdownTarget(sourcePath: string, rawTarget: string): string | null {
+  if (
+    rawTarget.startsWith('#')
+    || rawTarget.startsWith('/')
+    || rawTarget.startsWith('http://')
+    || rawTarget.startsWith('https://')
+    || rawTarget.startsWith('mailto:')
+    || rawTarget.startsWith('data:')
+  ) {
+    return null;
+  }
+
+  const resolvedTarget = resolveDocRelativePath(sourcePath, rawTarget);
+  const bundledAsset = DOC_ASSET_URLS[resolvedTarget];
+  if (bundledAsset) {
+    return bundledAsset;
+  }
+
+  const embeddedDocRoute = EMBEDDED_DOC_ROUTE_BY_SOURCE_PATH[resolvedTarget];
+  if (embeddedDocRoute) {
+    return embeddedDocRoute;
+  }
+
+  const normalized = resolvedTarget.replace(/\/$/, '');
+  if (normalized.startsWith('docs/specs/') || DOC_REPO_URLS.has(normalized)) {
+    return getGitHubRepoUrl(resolvedTarget);
+  }
+
+  return null;
+}
+
+function rewriteMarkdownTargets(sourcePath: string, markdown: string): string {
   return markdown.replace(MARKDOWN_LINK_RE, (fullMatch, rawTarget: string) => {
-    if (!(rawTarget.startsWith('./') || rawTarget.startsWith('../'))) {
+    const rewrittenTarget = resolveRelativeMarkdownTarget(sourcePath, rawTarget);
+    if (!rewrittenTarget) {
       return fullMatch;
     }
 
-    const resolvedTarget = resolveDocRelativePath(sourcePath, rawTarget);
-
-    const bundledAsset = DOC_ASSET_URLS[resolvedTarget];
-    if (bundledAsset) {
-      return fullMatch.replace(rawTarget, bundledAsset);
-    }
-
-    // Strip trailing slash for set lookup (deploy/systemd/ -> deploy/systemd)
-    const normalized = resolvedTarget.replace(/\/$/, '');
-    if (DOC_REPO_URLS.has(normalized)) {
-      const isDir = resolvedTarget.endsWith('/') || !resolvedTarget.includes('.');
-      const segment = isDir ? 'tree' : 'blob';
-      return fullMatch.replace(rawTarget, `${GITHUB_REPO_URL}/${segment}/main/${normalized}`);
-    }
-
-    return fullMatch;
+    return fullMatch.replace(rawTarget, rewrittenTarget);
   });
 }
 
@@ -133,7 +173,7 @@ export const docsOverview: DocsOverview = {
   title: 'Documentation',
   sourcePath: 'docs/README.md',
   rawContent: docsOverviewMarkdown,
-  content: rewriteMarkdownAssets('docs/README.md', docsOverviewMarkdown)
+  content: rewriteMarkdownTargets('docs/README.md', docsOverviewMarkdown)
 };
 
 export const embeddedDocs: EmbeddedDoc[] = [
@@ -144,7 +184,7 @@ export const embeddedDocs: EmbeddedDoc[] = [
     category: 'getting-started',
     sourcePath: 'docs/guide/getting-started.md',
     rawContent: gettingStartedMarkdown,
-    content: rewriteMarkdownAssets('docs/guide/getting-started.md', gettingStartedMarkdown),
+    content: rewriteMarkdownTargets('docs/guide/getting-started.md', gettingStartedMarkdown),
     relatedSlugs: ['architecture', 'configuring-providers', 'creating-agents', 'using-chat']
   },
   {
@@ -154,7 +194,7 @@ export const embeddedDocs: EmbeddedDoc[] = [
     category: 'getting-started',
     sourcePath: 'docs/guide/architecture.md',
     rawContent: architectureMarkdown,
-    content: rewriteMarkdownAssets('docs/guide/architecture.md', architectureMarkdown),
+    content: rewriteMarkdownTargets('docs/guide/architecture.md', architectureMarkdown),
     relatedSlugs: ['executors', 'channels', 'workflows']
   },
   {
@@ -164,7 +204,7 @@ export const embeddedDocs: EmbeddedDoc[] = [
     category: 'getting-started',
     sourcePath: 'docs/guide/configuring-providers.md',
     rawContent: providersMarkdown,
-    content: rewriteMarkdownAssets('docs/guide/configuring-providers.md', providersMarkdown),
+    content: rewriteMarkdownTargets('docs/guide/configuring-providers.md', providersMarkdown),
     relatedSlugs: ['getting-started', 'settings', 'executors', 'creating-agents']
   },
   {
@@ -174,7 +214,7 @@ export const embeddedDocs: EmbeddedDoc[] = [
     category: 'workspace',
     sourcePath: 'docs/guide/creating-agents.md',
     rawContent: agentsMarkdown,
-    content: rewriteMarkdownAssets('docs/guide/creating-agents.md', agentsMarkdown),
+    content: rewriteMarkdownTargets('docs/guide/creating-agents.md', agentsMarkdown),
     relatedSlugs: ['configuring-providers', 'using-chat', 'executors', 'tools-and-skills']
   },
   {
@@ -184,7 +224,7 @@ export const embeddedDocs: EmbeddedDoc[] = [
     category: 'workspace',
     sourcePath: 'docs/guide/settings.md',
     rawContent: settingsMarkdown,
-    content: rewriteMarkdownAssets('docs/guide/settings.md', settingsMarkdown),
+    content: rewriteMarkdownTargets('docs/guide/settings.md', settingsMarkdown),
     relatedSlugs: ['configuring-providers', 'executors', 'tools-and-skills', 'troubleshooting']
   },
   {
@@ -194,7 +234,7 @@ export const embeddedDocs: EmbeddedDoc[] = [
     category: 'workspace',
     sourcePath: 'docs/guide/using-chat.md',
     rawContent: chatMarkdown,
-    content: rewriteMarkdownAssets('docs/guide/using-chat.md', chatMarkdown),
+    content: rewriteMarkdownTargets('docs/guide/using-chat.md', chatMarkdown),
     relatedSlugs: ['getting-started', 'managing-tasks', 'creating-agents']
   },
   {
@@ -204,7 +244,7 @@ export const embeddedDocs: EmbeddedDoc[] = [
     category: 'workspace',
     sourcePath: 'docs/guide/managing-tasks.md',
     rawContent: tasksMarkdown,
-    content: rewriteMarkdownAssets('docs/guide/managing-tasks.md', tasksMarkdown),
+    content: rewriteMarkdownTargets('docs/guide/managing-tasks.md', tasksMarkdown),
     relatedSlugs: ['workflows', 'using-chat']
   },
   {
@@ -214,7 +254,7 @@ export const embeddedDocs: EmbeddedDoc[] = [
     category: 'workspace',
     sourcePath: 'docs/guide/workflows.md',
     rawContent: workflowsMarkdown,
-    content: rewriteMarkdownAssets('docs/guide/workflows.md', workflowsMarkdown),
+    content: rewriteMarkdownTargets('docs/guide/workflows.md', workflowsMarkdown),
     relatedSlugs: ['managing-tasks', 'creating-agents']
   },
   {
@@ -224,7 +264,7 @@ export const embeddedDocs: EmbeddedDoc[] = [
     category: 'workspace',
     sourcePath: 'docs/guide/tools-and-skills.md',
     rawContent: toolsAndSkillsMarkdown,
-    content: rewriteMarkdownAssets('docs/guide/tools-and-skills.md', toolsAndSkillsMarkdown),
+    content: rewriteMarkdownTargets('docs/guide/tools-and-skills.md', toolsAndSkillsMarkdown),
     relatedSlugs: ['settings', 'creating-agents', 'executors']
   },
   {
@@ -234,7 +274,7 @@ export const embeddedDocs: EmbeddedDoc[] = [
     category: 'operations',
     sourcePath: 'docs/guide/channels.md',
     rawContent: channelsMarkdown,
-    content: rewriteMarkdownAssets('docs/guide/channels.md', channelsMarkdown),
+    content: rewriteMarkdownTargets('docs/guide/channels.md', channelsMarkdown),
     relatedSlugs: ['executors', 'troubleshooting']
   },
   {
@@ -244,7 +284,7 @@ export const embeddedDocs: EmbeddedDoc[] = [
     category: 'operations',
     sourcePath: 'docs/guide/executors.md',
     rawContent: executorsMarkdown,
-    content: rewriteMarkdownAssets('docs/guide/executors.md', executorsMarkdown),
+    content: rewriteMarkdownTargets('docs/guide/executors.md', executorsMarkdown),
     relatedSlugs: ['channels', 'configuring-providers', 'creating-agents']
   },
   {
@@ -254,7 +294,7 @@ export const embeddedDocs: EmbeddedDoc[] = [
     category: 'operations',
     sourcePath: 'docs/guide/troubleshooting.md',
     rawContent: troubleshootingMarkdown,
-    content: rewriteMarkdownAssets('docs/guide/troubleshooting.md', troubleshootingMarkdown),
+    content: rewriteMarkdownTargets('docs/guide/troubleshooting.md', troubleshootingMarkdown),
     relatedSlugs: ['getting-started', 'configuring-providers', 'executors']
   }
 ];
@@ -387,12 +427,8 @@ export function validateEmbeddedDocs(): string[] {
         continue;
       }
 
-      if (target.startsWith('./') || target.startsWith('../')) {
-        const resolvedTarget = resolveDocRelativePath(doc.sourcePath, target);
-        const normalized = resolvedTarget.replace(/\/$/, '');
-        if (!DOC_ASSET_URLS[resolvedTarget] && !DOC_REPO_URLS.has(normalized)) {
-          errors.push(`Relative link or asset is not allowlisted in ${doc.sourcePath}: ${target}`);
-        }
+      const rewrittenRelativeTarget = resolveRelativeMarkdownTarget(doc.sourcePath, target);
+      if (rewrittenRelativeTarget) {
         continue;
       }
 
