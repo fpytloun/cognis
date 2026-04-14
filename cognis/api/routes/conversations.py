@@ -31,12 +31,12 @@ from cognis.api.serializers import (
     serialize_event_rows,
     session_to_response,
 )
+from cognis.core.attachment_utils import hydrate_attachment_refs
 from cognis.core.turn_scheduler import TurnError
 from cognis.logging import get_logger
 from cognis.models.session import ConversationContext
 from cognis.store.queries import (
     get_agent,
-    get_artifact_record,
     get_conversation,
     get_latest_active_conversation_for_agent,
     get_root_session_chain,
@@ -48,6 +48,32 @@ from cognis.store.queries import (
 )
 
 logger = get_logger(__name__)
+
+
+async def _hydrate_event_attachments(
+    request: Request,
+    events: list[dict[str, Any]],
+    *,
+    conversation_id: str | None = None,
+    session_id: str | None = None,
+) -> None:
+    artifact_store = request.app.state.artifact_store
+    current_user = require_current_user(request)
+    async with request.app.state.session_factory() as artifact_session:
+        for event in events:
+            data = event.get("data") if isinstance(event, dict) else None
+            attachments = data.get("attachments") if isinstance(data, dict) else None
+            if not isinstance(attachments, list):
+                continue
+            data["attachments"] = await hydrate_attachment_refs(
+                artifact_session,
+                artifact_store,
+                attachments,
+                owner_email=current_user.email,
+                conversation_id=conversation_id,
+                session_id=session_id,
+            )
+
 
 router = APIRouter(prefix="/api/v1/conversations", tags=["conversations"])
 
@@ -400,38 +426,7 @@ async def conversation_messages(
         # session's seq space. Avoid single-session cursor semantics here.
         has_more = False
 
-    # Enrich attachment URLs
-    artifact_store = request.app.state.artifact_store
-    async with request.app.state.session_factory() as artifact_session:
-        for event in all_events:
-            data = event.get("data") if isinstance(event, dict) else None
-            attachments = data.get("attachments") if isinstance(data, dict) else None
-            if not isinstance(attachments, list):
-                continue
-            refreshed: list[dict[str, Any]] = []
-            for attachment in attachments:
-                if not isinstance(attachment, dict):
-                    continue
-                artifact_id = attachment.get("artifact_id")
-                if not isinstance(artifact_id, str):
-                    continue
-                artifact_row = await get_artifact_record(artifact_session, artifact_id)
-                if artifact_row is None or artifact_row.status == "deleted":
-                    continue
-                refreshed.append(
-                    {
-                        **attachment,
-                        "filename": artifact_row.filename,
-                        "mime_type": artifact_row.mime_type,
-                        "size_bytes": artifact_row.size_bytes,
-                        "url": await artifact_store.async_get_public_url(
-                            artifact_row.namespace,
-                            artifact_row.object_id,
-                            artifact_row.filename,
-                        ),
-                    }
-                )
-            data["attachments"] = refreshed
+    await _hydrate_event_attachments(request, all_events, conversation_id=conversation_id)
 
     return MessageHistoryResponse(
         items=serialize_event_rows(
@@ -697,6 +692,12 @@ async def session_events(
                 }
             },
         )
+    await _hydrate_event_attachments(
+        request,
+        event_result.events,
+        conversation_id=conversation_id,
+        session_id=session_id,
+    )
     return SessionEventsResponse(
         session_id=session_id,
         items=serialize_event_rows(

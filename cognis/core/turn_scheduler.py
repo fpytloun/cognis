@@ -33,6 +33,7 @@ import httpx
 from prometheus_client import Counter, Histogram
 
 from cognis.api.error_sanitizer import sanitize_client_error_detail
+from cognis.core.attachment_utils import normalize_attachment_refs, strip_attachment_payload_bytes
 from cognis.core.compaction import ROTATION_TOTAL
 from cognis.core.events import Event, EventBus, EventType
 from cognis.core.followups import (
@@ -91,17 +92,6 @@ def _effective_user_content(content: str, attachments: list[AttachmentRef]) -> s
         kind = next(iter(kinds))
         return f"User attached a {kind.value} file."
     return "User attached files."
-
-
-def _event_safe_attachments(attachments: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
-    if not attachments:
-        return []
-    safe: list[dict[str, Any]] = []
-    for attachment in attachments:
-        if not isinstance(attachment, dict):
-            continue
-        safe.append({k: v for k, v in attachment.items() if k != "content_b64"})
-    return safe
 
 
 # ---------------------------------------------------------------------------
@@ -945,7 +935,7 @@ class TurnScheduler:
                     channel_deliverable=channel_deliverable,
                     delivery_id=delivery_id,
                     delivery_fallback_text=delivery_fallback_text,
-                    attachments=outbound_attachments,
+                    attachments=normalize_attachment_refs(outbound_attachments or []),
                 )
                 await self._publish_turn_completed(result, turn_observers=turn_observers)
                 TURNS_TOTAL.labels(outcome="delegated").inc()
@@ -1017,11 +1007,15 @@ class TurnScheduler:
                 channel_deliverable=channel_deliverable,
                 delivery_id=delivery_id,
                 delivery_fallback_text=delivery_fallback_text,
-                attachments=[
-                    *(step_output.attachments if step_output else []),
-                    *(outbound_attachments or []),
-                ]
-                or None,
+                attachments=(
+                    normalize_attachment_refs(
+                        [
+                            *(step_output.attachments if step_output else []),
+                            *(outbound_attachments or []),
+                        ]
+                    )
+                    or None
+                ),
             )
             await self._publish_turn_completed(result, turn_observers=turn_observers)
             TURNS_TOTAL.labels(outcome="completed").inc()
@@ -1260,7 +1254,7 @@ class TurnScheduler:
                     "delivery_id": result.delivery_id,
                     "delivery_fallback_text": result.delivery_fallback_text,
                     "final_content": result.final_content,
-                    "attachments": _event_safe_attachments(result.attachments),
+                    "attachments": strip_attachment_payload_bytes(result.attachments or []),
                 },
             )
         )

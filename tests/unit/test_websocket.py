@@ -16,9 +16,10 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
-from cognis.api.websocket import AuthenticatedWebSocket
+from cognis.api.websocket import AuthenticatedWebSocket, WebSocketTurnObserver
 from cognis.core.turn_scheduler import (
     SessionCreationFailedError,
+    TurnResult,
     classify_turn_error,
 )
 from cognis.models.config import ProviderHealth
@@ -261,6 +262,41 @@ async def test_chunk_gap_frame_emitted_after_drops() -> None:
     assert gap_payload["dropped_count"] == 5
     # After sending gap, the dropped_chunks entry should be cleared
     assert "msg_1" not in connection.dropped_chunks
+
+
+@pytest.mark.asyncio
+async def test_turn_observer_strips_attachment_payload_bytes() -> None:
+    manager = AsyncMock()
+    observer = WebSocketTurnObserver(manager)
+
+    await observer.on_turn_complete(
+        TurnResult(
+            conversation_id="conv-1",
+            session_id="sess-1",
+            message_id="msg-1",
+            attachments=[
+                {
+                    "artifact_id": "img_1",
+                    "kind": "image",
+                    "mime_type": "image/png",
+                    "filename": "image.png",
+                    "size_bytes": 3,
+                    "content_b64": "YWJj",
+                }
+            ],
+        )
+    )
+
+    payload = manager.send_to_conversation.await_args.args[1]
+    assert payload["attachments"] == [
+        {
+            "artifact_id": "img_1",
+            "kind": "image",
+            "mime_type": "image/png",
+            "filename": "image.png",
+            "size_bytes": 3,
+        }
+    ]
 
 
 # ---------------------------------------------------------------------------

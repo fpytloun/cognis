@@ -23,7 +23,11 @@ from typing import Any
 from prometheus_client import Counter, Histogram
 from pydantic import ValidationError
 
-from cognis.core.attachment_utils import merge_content_and_attachment_note
+from cognis.core.attachment_utils import (
+    merge_content_and_attachment_note,
+    normalize_attachment_refs,
+    strip_attachment_payload_bytes,
+)
 from cognis.core.compaction import ROTATION_TOTAL
 from cognis.core.decision import build_routing_reminder
 from cognis.core.events import Event, EventBus, EventType
@@ -145,15 +149,6 @@ def _truncate_tool_data(text: str) -> str:
     if len(text) <= _MAX_TOOL_DATA_BYTES:
         return text
     return text[:_MAX_TOOL_DATA_BYTES] + f"\n... (truncated, {len(text)} bytes total)"
-
-
-def _event_safe_attachments(attachments: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    safe: list[dict[str, Any]] = []
-    for attachment in attachments:
-        if not isinstance(attachment, dict):
-            continue
-        safe.append({k: v for k, v in attachment.items() if k != "content_b64"})
-    return safe
 
 
 def _step_complete_example_payload() -> dict[str, Any]:
@@ -1636,7 +1631,9 @@ class AgentLoop:
                             type="assistant_message",
                             data={
                                 "content": partial_content,
-                                "attachments": _event_safe_attachments(collected_attachments),
+                                "attachments": strip_attachment_payload_bytes(
+                                    collected_attachments
+                                ),
                             },
                         )
                     )
@@ -1644,7 +1641,7 @@ class AgentLoop:
                         assistant_content_parts.append(partial_content)
                     memory_text = merge_content_and_attachment_note(
                         partial_content,
-                        _event_safe_attachments(collected_attachments),
+                        strip_attachment_payload_bytes(collected_attachments),
                     )
                     if memory_text.strip():
                         assistant_memory_parts.append(memory_text)
@@ -1703,7 +1700,7 @@ class AgentLoop:
                         type="assistant_message",
                         data={
                             "content": content,
-                            "attachments": _event_safe_attachments(collected_attachments),
+                            "attachments": strip_attachment_payload_bytes(collected_attachments),
                         },
                     )
                 )
@@ -1713,7 +1710,7 @@ class AgentLoop:
                     last_assistant_content = content
                 memory_text = merge_content_and_attachment_note(
                     content,
-                    _event_safe_attachments(collected_attachments),
+                    strip_attachment_payload_bytes(collected_attachments),
                 )
                 if memory_text.strip():
                     assistant_memory_parts.append(memory_text)
@@ -2593,7 +2590,7 @@ class AgentLoop:
                             eval_meta,
                         )
                     if result.attachments:
-                        collected_attachments.extend(result.attachments)
+                        collected_attachments.extend(normalize_attachment_refs(result.attachments))
                     messages.append(
                         {
                             "role": "tool",

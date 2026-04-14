@@ -59,15 +59,27 @@ async def test_handle_image_tool_returns_channel_attachments() -> None:
     artifact_store = MagicMock()
     artifact_store.generate_id.return_value = "img_123"
     artifact_store.async_save = AsyncMock()
+    artifact_store.async_delete = AsyncMock()
     artifact_store.async_get_public_url = AsyncMock(return_value="https://example.com/signed.png")
 
+    class _Session:
+        commit = AsyncMock()
+
+    @asynccontextmanager
+    async def session_factory() -> object:
+        yield _Session()
+
     with scoped_runtime_context(user_email="user@example.com"):
-        result = await handle_image_tool(
-            "image_generate",
-            {"prompt": "banner"},
-            provider,
-            artifact_store=artifact_store,
-        )
+        with patch(
+            "cognis.tools.builtin.image.create_artifact_record", AsyncMock()
+        ) as create_record:
+            result = await handle_image_tool(
+                "image_generate",
+                {"prompt": "banner"},
+                provider,
+                artifact_store=artifact_store,
+                session_factory=session_factory,
+            )
 
     payload = json.loads(result.output)
     assert payload["images"][0]["image_id"] == "img_123"
@@ -83,7 +95,95 @@ async def test_handle_image_tool_returns_channel_attachments() -> None:
             "content_b64": "YWJj",
         }
     ]
+    create_record.assert_awaited_once()
     artifact_store.async_get_public_url.assert_awaited_once_with("images", "img_123", "image")
+
+
+@pytest.mark.asyncio
+async def test_handle_image_tool_keeps_attachment_without_public_url() -> None:
+    provider = MagicMock()
+    provider.image_generate = AsyncMock(
+        return_value=ImageGenerationResult(
+            images=[GeneratedImage(b64_json="YWJj", content_type="image/png")],
+            model="gpt-image-1",
+        )
+    )
+    artifact_store = MagicMock()
+    artifact_store.generate_id.return_value = "img_124"
+    artifact_store.async_save = AsyncMock()
+    artifact_store.async_delete = AsyncMock()
+    artifact_store.async_get_public_url = AsyncMock(return_value=None)
+
+    class _Session:
+        commit = AsyncMock()
+
+    @asynccontextmanager
+    async def session_factory() -> object:
+        yield _Session()
+
+    with scoped_runtime_context(user_email="user@example.com"):
+        with patch("cognis.tools.builtin.image.create_artifact_record", AsyncMock()):
+            result = await handle_image_tool(
+                "image_generate",
+                {"prompt": "banner"},
+                provider,
+                artifact_store=artifact_store,
+                session_factory=session_factory,
+            )
+
+    payload = json.loads(result.output)
+    assert payload["images"][0]["url"] == "/api/v1/images/img_124"
+    assert result.attachments == [
+        {
+            "artifact_id": "img_124",
+            "mime_type": "image/png",
+            "filename": "img_124.png",
+            "size_bytes": 3,
+            "kind": "image",
+            "url": "/api/v1/images/img_124",
+            "content_b64": "YWJj",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_handle_image_tool_returns_error_when_artifact_registration_fails() -> None:
+    provider = MagicMock()
+    provider.image_generate = AsyncMock(
+        return_value=ImageGenerationResult(
+            images=[GeneratedImage(b64_json="YWJj", content_type="image/png")],
+            model="gpt-image-1",
+        )
+    )
+    artifact_store = MagicMock()
+    artifact_store.generate_id.return_value = "img_125"
+    artifact_store.async_save = AsyncMock()
+    artifact_store.async_delete = AsyncMock()
+    artifact_store.async_get_public_url = AsyncMock(return_value="https://example.com/signed.png")
+
+    class _Session:
+        commit = AsyncMock()
+
+    @asynccontextmanager
+    async def session_factory() -> object:
+        yield _Session()
+
+    with scoped_runtime_context(user_email="user@example.com"):
+        with patch(
+            "cognis.tools.builtin.image.create_artifact_record",
+            AsyncMock(side_effect=RuntimeError("db down")),
+        ):
+            result = await handle_image_tool(
+                "image_generate",
+                {"prompt": "banner"},
+                provider,
+                artifact_store=artifact_store,
+                session_factory=session_factory,
+            )
+
+    assert result.is_error
+    assert "registration failed" in result.output.lower()
+    artifact_store.async_delete.assert_awaited_once_with("images", "img_125", "image")
 
 
 @pytest.mark.asyncio

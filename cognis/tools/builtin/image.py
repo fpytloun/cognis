@@ -15,6 +15,7 @@ import httpx
 from cognis.models.config import ImageGenerationResult
 from cognis.models.tool import ToolDefinition, ToolResult, ToolSource
 from cognis.runtime_context import current_user_email
+from cognis.store.queries import create_artifact_record
 from cognis.tools.argument_normalization import strip_empty_optional_values
 
 _SOURCE = ToolSource(type="builtin")
@@ -181,7 +182,7 @@ async def handle_image_tool(
             image_id = artifact_store.generate_id("img")
             try:
                 image_bytes = await _image_bytes(img)
-                filename = _image_filename(image_id, img.content_type)
+                display_filename = _image_filename(image_id, img.content_type)
                 await artifact_store.async_save(
                     "images",
                     image_id,
@@ -190,6 +191,32 @@ async def handle_image_tool(
                     img.content_type,
                     owner_email=current_user_email.get(),
                 )
+                if session_factory is not None:
+                    try:
+                        async with session_factory() as session:
+                            await create_artifact_record(
+                                session,
+                                artifact_id=image_id,
+                                namespace="images",
+                                object_id=image_id,
+                                filename="image",
+                                owner_email=current_user_email.get(),
+                                purpose="tool_output",
+                                kind="image",
+                                mime_type=img.content_type,
+                                size_bytes=len(image_bytes),
+                                status="attached",
+                            )
+                            await session.commit()
+                    except Exception as exc:
+                        try:
+                            await artifact_store.async_delete("images", image_id, "image")
+                        except Exception:
+                            pass
+                        return ToolResult(
+                            output=f"Image artifact registration failed: {exc}",
+                            is_error=True,
+                        )
                 signed_url = await _resolve_image_url(artifact_store, image_id)
                 output_images.append(
                     {
@@ -199,18 +226,16 @@ async def handle_image_tool(
                         "revised_prompt": img.revised_prompt,
                     }
                 )
-                if signed_url:
-                    outbound_attachments.append(
-                        {
-                            "artifact_id": image_id,
-                            "url": signed_url,
-                            "mime_type": img.content_type,
-                            "filename": filename,
-                            "size_bytes": len(image_bytes),
-                            "kind": "image",
-                            "content_b64": _encode_b64(image_bytes),
-                        }
-                    )
+                attachment: dict[str, Any] = {
+                    "artifact_id": image_id,
+                    "mime_type": img.content_type,
+                    "filename": display_filename,
+                    "size_bytes": len(image_bytes),
+                    "kind": "image",
+                    "url": signed_url or f"/api/v1/images/{image_id}",
+                    "content_b64": _encode_b64(image_bytes),
+                }
+                outbound_attachments.append(attachment)
             except Exception:
                 # Fall back to inline base64 if save fails
                 output_images.append(

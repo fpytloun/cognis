@@ -26,6 +26,7 @@ from typing import Any
 
 from prometheus_client import Gauge
 
+from cognis.core.attachment_utils import strip_attachment_payload_bytes
 from cognis.core.turn_scheduler import TurnError, TurnResult
 from cognis.logging import get_logger
 
@@ -163,6 +164,7 @@ class SSETurnObserver:
                     "context_usage": result.context_usage,
                     "delegated": result.delegated,
                     "task_id": result.task_id,
+                    "attachments": strip_attachment_payload_bytes(result.attachments or []),
                 },
             }
         )

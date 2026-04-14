@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 from fastapi.testclient import TestClient
 
@@ -14,6 +15,7 @@ from cognis.models.task import TaskDelivery, TaskModel, TaskStatus
 from cognis.models.workflow import WorkflowState
 from cognis.store.queries import (
     create_agent,
+    create_artifact_record,
     create_conversation,
     create_session,
     create_task,
@@ -1286,6 +1288,216 @@ def test_session_events_route_returns_empty_when_stream_missing(
             "last_seq": 0,
             "has_more": False,
         }
+
+
+def test_conversation_messages_hydrates_assistant_attachments_and_preserves_legacy_fallback(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> tuple[str, str]:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                conversation = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                    title="Conversation",
+                )
+                session_row = await create_session(
+                    session,
+                    conversation_id=conversation.conversation_id,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                )
+                await set_session_intaris_session_id(
+                    session, session_row.session_id, session_row.session_id
+                )
+                await update_conversation_active_session(
+                    session, conversation.conversation_id, session_row.session_id
+                )
+                await create_artifact_record(
+                    session,
+                    artifact_id="img_1",
+                    namespace="images",
+                    object_id="img_1",
+                    filename="image",
+                    owner_email="user@example.com",
+                    purpose="tool_output",
+                    kind="image",
+                    mime_type="image/jpeg",
+                    size_bytes=123,
+                    status="attached",
+                )
+                await session.commit()
+                return conversation.conversation_id, session_row.session_id
+
+        conversation_id, _session_id = asyncio.run(_seed())
+
+        async def _fake_read_events(**_: object) -> EventReadResult:
+            return EventReadResult(
+                events=[
+                    {
+                        "seq": 1,
+                        "type": "assistant_message",
+                        "data": {
+                            "content": "done",
+                            "attachments": [
+                                {
+                                    "artifact_id": "img_1",
+                                },
+                                {
+                                    "artifact_id": "img_legacy",
+                                    "kind": "image",
+                                    "mime_type": "image/png",
+                                    "filename": "legacy.png",
+                                    "size_bytes": 456,
+                                    "url": "https://example.com/legacy.png",
+                                },
+                            ],
+                        },
+                    }
+                ],
+                last_seq=1,
+                has_more=False,
+                missing_stream_fallback_used=False,
+            )
+
+        app.state.providers.guardrails.read_events = _fake_read_events
+
+        response = client.get(
+            f"/api/v1/conversations/{conversation_id}/messages",
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+
+        assert response.status_code == 200
+        attachments = response.json()["items"][0]["data"]["attachments"]
+        assert attachments[0]["artifact_id"] == "img_1"
+        assert attachments[0]["filename"] == "img_1"
+        assert attachments[0]["url"]
+        assert attachments[1] == {
+            "artifact_id": "img_legacy",
+            "kind": "image",
+            "mime_type": "image/png",
+            "filename": "legacy.png",
+            "size_bytes": 456,
+            "url": "https://example.com/legacy.png",
+        }
+
+
+def test_conversation_messages_preserves_existing_attachment_url_when_signing_fails(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> tuple[str, str]:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                conversation = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                    title="Conversation",
+                )
+                session_row = await create_session(
+                    session,
+                    conversation_id=conversation.conversation_id,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                )
+                await set_session_intaris_session_id(
+                    session, session_row.session_id, session_row.session_id
+                )
+                await update_conversation_active_session(
+                    session, conversation.conversation_id, session_row.session_id
+                )
+                await create_artifact_record(
+                    session,
+                    artifact_id="img_2",
+                    namespace="images",
+                    object_id="img_2",
+                    filename="image",
+                    owner_email="user@example.com",
+                    purpose="tool_output",
+                    kind="image",
+                    mime_type="image/jpeg",
+                    size_bytes=123,
+                    status="attached",
+                )
+                await session.commit()
+                return conversation.conversation_id, session_row.session_id
+
+        conversation_id, _session_id = asyncio.run(_seed())
+
+        async def _fake_read_events(**_: object) -> EventReadResult:
+            return EventReadResult(
+                events=[
+                    {
+                        "seq": 1,
+                        "type": "assistant_message",
+                        "data": {
+                            "content": "done",
+                            "attachments": [
+                                {
+                                    "artifact_id": "img_2",
+                                    "kind": "image",
+                                    "mime_type": "image/jpeg",
+                                    "filename": "generated.jpg",
+                                    "size_bytes": 123,
+                                    "url": "/api/v1/images/img_2",
+                                }
+                            ],
+                        },
+                    }
+                ],
+                last_seq=1,
+                has_more=False,
+                missing_stream_fallback_used=False,
+            )
+
+        app.state.providers.guardrails.read_events = _fake_read_events
+        app.state.artifact_store.async_get_public_url = AsyncMock(
+            side_effect=RuntimeError("sign fail")
+        )
+
+        response = client.get(
+            f"/api/v1/conversations/{conversation_id}/messages",
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+
+        assert response.status_code == 200
+        attachments = response.json()["items"][0]["data"]["attachments"]
+        assert attachments[0]["url"] == "/api/v1/images/img_2"
 
 
 def test_websocket_queues_second_message_while_turn_active(

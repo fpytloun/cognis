@@ -33,6 +33,7 @@ from cognis.api.models import (
     WebSocketError,
     WebSocketPong,
 )
+from cognis.core.attachment_utils import hydrate_attachment_refs, strip_attachment_payload_bytes
 from cognis.core.events import Event, EventType
 from cognis.core.turn_scheduler import (
     SessionCreationFailedError as SessionCreationFailedError,  # noqa: F401 — re-export
@@ -226,11 +227,7 @@ class WebSocketTurnObserver:
             "token_usage": None,
             "context_usage": result.context_usage,
             "queued_count": 0,
-            "attachments": [
-                {k: v for k, v in attachment.items() if k != "content_b64"}
-                for attachment in (result.attachments or [])
-                if isinstance(attachment, dict)
-            ],
+            "attachments": strip_attachment_payload_bytes(result.attachments or []),
         }
         if result.delegated:
             payload["delegated"] = True
@@ -488,187 +485,196 @@ class WebSocketConnectionManager:
             allow_missing_stream=True,
         )
         replayed = 0
-        for item in result.events:
-            event_type = item.get("type")
-            data = item.get("data", {})
-            if event_type == "assistant_message":
-                message_id = f"replay_{item.get('seq', uuid.uuid4().hex)}"
-                content = str(data.get("content", ""))
-                attachments = (
-                    data.get("attachments") if isinstance(data.get("attachments"), list) else []
-                )
-                if content:
+        async with self.app.state.session_factory() as artifact_session:
+            artifact_store = self.app.state.artifact_store
+            for item in result.events:
+                event_type = item.get("type")
+                data = item.get("data", {})
+                if event_type == "assistant_message":
+                    message_id = f"replay_{item.get('seq', uuid.uuid4().hex)}"
+                    content = str(data.get("content", ""))
+                    attachments = await hydrate_attachment_refs(
+                        artifact_session,
+                        artifact_store,
+                        data.get("attachments")
+                        if isinstance(data.get("attachments"), list)
+                        else [],
+                        owner_email=connection.user_email,
+                        conversation_id=conversation_id,
+                        session_id=session.session_id,
+                    )
+                    if content:
+                        await connection.send_json(
+                            {
+                                "type": "chunk",
+                                "conversation_id": conversation_id,
+                                "session_id": session.session_id,
+                                "message_id": message_id,
+                                "content": content,
+                                "index": 0,
+                            }
+                        )
                     await connection.send_json(
                         {
-                            "type": "chunk",
+                            "type": "message_complete",
                             "conversation_id": conversation_id,
                             "session_id": session.session_id,
                             "message_id": message_id,
-                            "content": content,
-                            "index": 0,
+                            "seq": item.get("seq", 0),
+                            "token_usage": None,
+                            "queued_count": 0,
+                            "attachments": attachments,
                         }
                     )
-                await connection.send_json(
-                    {
-                        "type": "message_complete",
-                        "conversation_id": conversation_id,
-                        "session_id": session.session_id,
-                        "message_id": message_id,
-                        "seq": item.get("seq", 0),
-                        "token_usage": None,
-                        "queued_count": 0,
-                        "attachments": attachments,
-                    }
-                )
-                replayed += 1
-            elif event_type == "tool_call":
-                arguments = data.get("arguments")
-                if isinstance(arguments, str):
-                    with contextlib.suppress(Exception):
-                        arguments = json.loads(arguments)
-                await connection.send_json(
-                    {
-                        "type": "tool_call",
-                        "conversation_id": conversation_id,
-                        "session_id": session.session_id,
-                        "seq": item.get("seq"),
-                        "call_id": data.get("call_id"),
-                        "tool_name": data.get("name") or data.get("tool_name"),
-                        "status": data.get("status", "started"),
-                        "arguments": arguments,
-                    }
-                )
-                replayed += 1
-            elif event_type == "tool_result":
-                await connection.send_json(
-                    {
-                        "type": "tool_result",
-                        "conversation_id": conversation_id,
-                        "session_id": session.session_id,
-                        "seq": item.get("seq"),
-                        "call_id": data.get("call_id"),
-                        "tool_name": data.get("name") or data.get("tool_name"),
-                        "result": data.get("result", ""),
-                        "is_error": bool(data.get("is_error", False)),
-                        "duration_ms": data.get("duration_ms"),
-                        "evaluation": data.get("evaluation"),
-                    }
-                )
-                replayed += 1
-            elif event_type == "reasoning":
-                await connection.send_json(
-                    {
-                        "type": "reasoning",
-                        "conversation_id": conversation_id,
-                        "session_id": session.session_id,
-                        "seq": item.get("seq"),
-                        "message_id": data.get("message_id")
-                        or f"replay_reasoning_{item.get('seq', uuid.uuid4().hex)}",
-                        "content": data.get("content", ""),
-                    }
-                )
-                replayed += 1
-            elif event_type == "task_result":
-                await connection.send_json(
-                    {
-                        "type": "workflow_completed",
-                        "conversation_id": conversation_id,
-                        "task_id": data.get("task_id"),
-                        "result": data.get("result_summary"),
-                    }
-                )
-                replayed += 1
-            elif event_type == "task_failed":
-                await connection.send_json(
-                    {
-                        "type": "workflow_failed",
-                        "conversation_id": conversation_id,
-                        "task_id": data.get("task_id"),
-                        "reason": data.get("result_summary"),
-                    }
-                )
-                replayed += 1
-            elif event_type == "task_cancelled":
-                await connection.send_json(
-                    {
-                        "type": "workflow_cancelled",
-                        "conversation_id": conversation_id,
-                        "task_id": data.get("task_id"),
-                        "reason": data.get("result_summary") or "cancelled",
-                    }
-                )
-                replayed += 1
-            elif event_type == "delegation":
-                status = data.get("status")
-                if status == "completed":
+                    replayed += 1
+                elif event_type == "tool_call":
+                    arguments = data.get("arguments")
+                    if isinstance(arguments, str):
+                        with contextlib.suppress(Exception):
+                            arguments = json.loads(arguments)
                     await connection.send_json(
                         {
-                            "type": "delegation_completed",
+                            "type": "tool_call",
                             "conversation_id": conversation_id,
-                            "child_session_id": data.get("child_session_id"),
+                            "session_id": session.session_id,
+                            "seq": item.get("seq"),
+                            "call_id": data.get("call_id"),
+                            "tool_name": data.get("name") or data.get("tool_name"),
+                            "status": data.get("status", "started"),
+                            "arguments": arguments,
+                        }
+                    )
+                    replayed += 1
+                elif event_type == "tool_result":
+                    await connection.send_json(
+                        {
+                            "type": "tool_result",
+                            "conversation_id": conversation_id,
+                            "session_id": session.session_id,
+                            "seq": item.get("seq"),
+                            "call_id": data.get("call_id"),
+                            "tool_name": data.get("name") or data.get("tool_name"),
+                            "result": data.get("result", ""),
+                            "is_error": bool(data.get("is_error", False)),
+                            "duration_ms": data.get("duration_ms"),
+                            "evaluation": data.get("evaluation"),
+                        }
+                    )
+                    replayed += 1
+                elif event_type == "reasoning":
+                    await connection.send_json(
+                        {
+                            "type": "reasoning",
+                            "conversation_id": conversation_id,
+                            "session_id": session.session_id,
+                            "seq": item.get("seq"),
+                            "message_id": data.get("message_id")
+                            or f"replay_reasoning_{item.get('seq', uuid.uuid4().hex)}",
+                            "content": data.get("content", ""),
+                        }
+                    )
+                    replayed += 1
+                elif event_type == "task_result":
+                    await connection.send_json(
+                        {
+                            "type": "workflow_completed",
+                            "conversation_id": conversation_id,
+                            "task_id": data.get("task_id"),
                             "result": data.get("result_summary"),
                         }
                     )
-                elif status == "failed":
+                    replayed += 1
+                elif event_type == "task_failed":
                     await connection.send_json(
                         {
-                            "type": "delegation_failed",
+                            "type": "workflow_failed",
                             "conversation_id": conversation_id,
-                            "child_session_id": data.get("child_session_id"),
-                            "reason": data.get("error"),
+                            "task_id": data.get("task_id"),
+                            "reason": data.get("result_summary"),
                         }
                     )
-                else:
+                    replayed += 1
+                elif event_type == "task_cancelled":
                     await connection.send_json(
                         {
-                            "type": "delegation_started",
+                            "type": "workflow_cancelled",
                             "conversation_id": conversation_id,
-                            "parent_session_id": session.session_id,
-                            "child_session_id": data.get("child_session_id"),
-                            "mode": data.get("mode"),
-                            "agent_id": data.get("agent_id"),
-                            "task": data.get("task"),
+                            "task_id": data.get("task_id"),
+                            "reason": data.get("result_summary") or "cancelled",
                         }
                     )
-                replayed += 1
-            elif event_type == "lifecycle" and data.get("event") == "system_notice":
-                await connection.send_json(
-                    {
-                        "type": "system_message",
-                        "conversation_id": conversation_id,
-                        "seq": item.get("seq"),
-                        "text": str(data.get("message", "")),
-                    }
-                )
-                replayed += 1
-            elif event_type == "evaluation" and data.get("event") == "evaluation_feedback":
-                await connection.send_json(
-                    {
-                        "type": "history_notice",
-                        "conversation_id": conversation_id,
-                        "seq": item.get("seq"),
-                        "title": f"Step Evaluation (attempt {data.get('attempt', '?')})",
-                        "description": f"{data.get('decision', 'unknown')} — {data.get('feedback', '')}",
-                        "tone": "info"
-                        if data.get("decision") in {"approved", "approve"}
-                        else "error"
-                        if data.get("decision") in {"failed", "reject"}
-                        else "warning",
-                    }
-                )
-                replayed += 1
-            elif event_type == "history_gap":
-                await connection.send_json(
-                    {
-                        "type": "history_notice",
-                        "conversation_id": conversation_id,
-                        "seq": item.get("seq"),
-                        "title": "History incomplete",
-                        "description": f"History gap detected: {data.get('reason', 'unknown')}.",
-                        "tone": "warning",
-                    }
-                )
-                replayed += 1
+                    replayed += 1
+                elif event_type == "delegation":
+                    status = data.get("status")
+                    if status == "completed":
+                        await connection.send_json(
+                            {
+                                "type": "delegation_completed",
+                                "conversation_id": conversation_id,
+                                "child_session_id": data.get("child_session_id"),
+                                "result": data.get("result_summary"),
+                            }
+                        )
+                    elif status == "failed":
+                        await connection.send_json(
+                            {
+                                "type": "delegation_failed",
+                                "conversation_id": conversation_id,
+                                "child_session_id": data.get("child_session_id"),
+                                "reason": data.get("error"),
+                            }
+                        )
+                    else:
+                        await connection.send_json(
+                            {
+                                "type": "delegation_started",
+                                "conversation_id": conversation_id,
+                                "parent_session_id": session.session_id,
+                                "child_session_id": data.get("child_session_id"),
+                                "mode": data.get("mode"),
+                                "agent_id": data.get("agent_id"),
+                                "task": data.get("task"),
+                            }
+                        )
+                    replayed += 1
+                elif event_type == "lifecycle" and data.get("event") == "system_notice":
+                    await connection.send_json(
+                        {
+                            "type": "system_message",
+                            "conversation_id": conversation_id,
+                            "seq": item.get("seq"),
+                            "text": str(data.get("message", "")),
+                        }
+                    )
+                    replayed += 1
+                elif event_type == "evaluation" and data.get("event") == "evaluation_feedback":
+                    await connection.send_json(
+                        {
+                            "type": "history_notice",
+                            "conversation_id": conversation_id,
+                            "seq": item.get("seq"),
+                            "title": f"Step Evaluation (attempt {data.get('attempt', '?')})",
+                            "description": f"{data.get('decision', 'unknown')} — {data.get('feedback', '')}",
+                            "tone": "info"
+                            if data.get("decision") in {"approved", "approve"}
+                            else "error"
+                            if data.get("decision") in {"failed", "reject"}
+                            else "warning",
+                        }
+                    )
+                    replayed += 1
+                elif event_type == "history_gap":
+                    await connection.send_json(
+                        {
+                            "type": "history_notice",
+                            "conversation_id": conversation_id,
+                            "seq": item.get("seq"),
+                            "title": "History incomplete",
+                            "description": f"History gap detected: {data.get('reason', 'unknown')}.",
+                            "tone": "warning",
+                        }
+                    )
+                    replayed += 1
 
         pending_pauses = await _load_pending_task_prompts(self.app, conversation_id)
         for payload in pending_pauses:
