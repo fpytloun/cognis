@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import os
+import sys
 from unittest.mock import AsyncMock
 
 import pytest
 
+from cognis.executor import __main__ as executor_main
 from cognis.executor.runner import ExecutorRunner, _normalize_result
 from cognis.models.tool import ExecutorConfig, ToolDefinition, ToolResult, ToolSource
 from cognis.tools.executor.lsp import LSP_MANAGER_KEY, LSP_STATUS_CAPABILITY
@@ -290,6 +294,54 @@ async def test_runner_shutdown_cleans_browser_manager() -> None:
 
 
 @pytest.mark.asyncio
+async def test_runner_shutdown_suppresses_cancelled_cleanup() -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+
+    class _BrowserManager:
+        async def cleanup(self) -> None:
+            raise asyncio.CancelledError()
+
+    class _ChannelHandler:
+        async def stop_all(self) -> None:
+            raise asyncio.CancelledError()
+
+    class _InferenceHandler:
+        async def close(self) -> None:
+            raise asyncio.CancelledError()
+
+    async def _fake_connect_and_serve() -> None:
+        runner._runtime_metadata["browser_manager"] = _BrowserManager()
+        runner._channel_handler = _ChannelHandler()
+        runner._inference_handler = _InferenceHandler()
+        runner._running = False
+
+    async def _fake_close_mcp_clients() -> None:
+        raise asyncio.CancelledError()
+
+    runner._connect_and_serve = _fake_connect_and_serve  # type: ignore[method-assign]
+    runner._close_mcp_clients = _fake_close_mcp_clients  # type: ignore[method-assign]
+
+    await runner.run()
+
+
+@pytest.mark.asyncio
+async def test_runner_propagates_external_cancellation() -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+
+    async def _fake_connect_and_serve() -> None:
+        await asyncio.Future()
+
+    runner._connect_and_serve = _fake_connect_and_serve  # type: ignore[method-assign]
+
+    task = asyncio.create_task(runner.run())
+    await asyncio.sleep(0)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
 async def test_handle_configure_creates_lsp_manager() -> None:
     runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
     ws = DummyWebSocket()
@@ -376,3 +428,24 @@ async def test_handle_configure_degrades_when_lsp_manager_init_fails(
     ws.sent.clear()
     await runner._handle_lsp_status(ws, "lsp-2", {})
     assert ws.sent[-1]["result"]["state"] == "unavailable"
+
+
+def test_executor_main_suppresses_cancelled_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Runner:
+        def __init__(self, config: object) -> None:
+            self.config = config
+
+        async def run(self) -> None:
+            raise asyncio.CancelledError()
+
+    monkeypatch.setattr("cognis.executor.runner.ExecutorRunner", _Runner)
+    monkeypatch.setenv("COGNIS_CONTROLLER_URL", "ws://localhost:8080/api/executor/ws")
+    monkeypatch.setenv("COGNIS_EXECUTOR_TOKEN", "token")
+    monkeypatch.setattr(sys, "argv", ["cognis-executor"])
+    monkeypatch.setattr(sys, "stdin", open(os.devnull))
+
+    try:
+        executor_main.main()
+    finally:
+        with contextlib.suppress(Exception):
+            sys.stdin.close()

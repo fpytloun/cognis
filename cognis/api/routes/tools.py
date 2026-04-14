@@ -258,7 +258,7 @@ async def _discover_temp_mcp_tools(
     finally:
         for client in clients:
             with contextlib.suppress(Exception):
-                await client.close()
+                await client.close(suppress_cancelled=True)
     return discovered
 
 

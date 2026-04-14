@@ -123,16 +123,14 @@ async def test_mcp_client_close_suppresses_cancelled_error() -> None:
     client._exit_stack = _ExitStack()
     client._session = SimpleNamespace()
 
-    await client.close()
+    await client.close(suppress_cancelled=True)
 
     assert client._exit_stack is None
     assert client._session is None
 
 
 @pytest.mark.asyncio
-async def test_mcp_client_close_propagates_task_cancellation(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_mcp_client_close_propagates_task_cancellation() -> None:
     client = StdioMCPClient(
         MCPServerConfig(name="filesystem", command=sys.executable, args=[], timeout_seconds=10)
     )
@@ -141,13 +139,8 @@ async def test_mcp_client_close_propagates_task_cancellation(
         async def aclose(self) -> None:
             raise asyncio.CancelledError()
 
-    class _Task:
-        def cancelling(self) -> int:
-            return 1
-
     client._exit_stack = _ExitStack()
     client._session = SimpleNamespace()
-    monkeypatch.setattr(asyncio, "current_task", lambda: _Task())
 
     with pytest.raises(asyncio.CancelledError):
         await client.close()

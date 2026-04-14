@@ -105,18 +105,19 @@ class ExecutorRunner:
             logger.info("Executor shutting down, cleaning up resources")
             browser_manager = self._runtime_metadata.get("browser_manager")
             if browser_manager is not None:
-                with contextlib.suppress(Exception):
+                with contextlib.suppress(asyncio.CancelledError, Exception):
                     await browser_manager.cleanup()
             lsp_manager = self._runtime_metadata.get(LSP_MANAGER_KEY)
             if lsp_manager is not None:
-                with contextlib.suppress(Exception):
+                with contextlib.suppress(asyncio.CancelledError, Exception):
                     await cleanup_lsp_manager(lsp_manager, executor_id=self.config.executor_id)
-            await self._close_mcp_clients()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._close_mcp_clients()
             if self._channel_handler is not None:
-                with contextlib.suppress(Exception):
+                with contextlib.suppress(asyncio.CancelledError, Exception):
                     await self._channel_handler.stop_all()
             if self._inference_handler is not None:
-                with contextlib.suppress(Exception):
+                with contextlib.suppress(asyncio.CancelledError, Exception):
                     await self._inference_handler.close()
             logger.info("Executor shutdown complete")
 
@@ -386,9 +387,9 @@ class ExecutorRunner:
             self._channel_handler.set_executor_config(config)
 
             if old_clients is not previous_clients:
-                await self._close_clients(old_clients)
+                await self._close_clients(old_clients, suppress_cancelled=True)
             elif previous_clients is not staged_mcp_clients:
-                await self._close_clients(previous_clients)
+                await self._close_clients(previous_clients, suppress_cancelled=True)
             old_browser_manager = previous_runtime_metadata.get("browser_manager")
             if (
                 old_browser_manager is not None
@@ -403,7 +404,7 @@ class ExecutorRunner:
                 "Configure v%d failed during tool/handler setup: %s", requested_version, exc
             )
             current_lsp_manager = self._runtime_metadata.get(LSP_MANAGER_KEY)
-            await self._close_clients(staged_mcp_clients)
+            await self._close_clients(staged_mcp_clients, suppress_cancelled=True)
             self._mcp_clients = previous_clients
             self._tool_handlers = previous_tool_handlers
             self._configured_tool_definitions = previous_tool_definitions
@@ -977,7 +978,7 @@ class ExecutorRunner:
                 )
                 if exc.safe_stderr:
                     logger.warning("MCP: server %s stderr: %s", server.name, exc.safe_stderr)
-                await client.close()
+                await client.close(suppress_cancelled=True)
                 statuses.append(
                     {
                         "server_id": server.server_id,
@@ -998,7 +999,7 @@ class ExecutorRunner:
                     server.name,
                     exc,
                 )
-                await client.close()
+                await client.close(suppress_cancelled=True)
                 statuses.append(
                     {
                         "server_id": server.server_id,
@@ -1060,13 +1061,15 @@ class ExecutorRunner:
         return _handler
 
     async def _close_mcp_clients(self) -> None:
-        await self._close_clients(self._mcp_clients)
+        await self._close_clients(self._mcp_clients, suppress_cancelled=True)
         self._mcp_clients = {}
 
-    async def _close_clients(self, clients: dict[str, MCPClient]) -> None:
+    async def _close_clients(
+        self, clients: dict[str, MCPClient], *, suppress_cancelled: bool = False
+    ) -> None:
         for client in clients.values():
             with contextlib.suppress(Exception):
-                await client.close()
+                await client.close(suppress_cancelled=suppress_cancelled)
 
     def _public_runtime_metadata(self) -> dict[str, Any]:
         metadata = dict(self._runtime_metadata)

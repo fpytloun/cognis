@@ -499,7 +499,7 @@ def _build_skill_handler(
 
 async def _close_clients(clients: dict[str, MCPClient]) -> None:
     for client in clients.values():
-        await client.close()
+        await client.close(suppress_cancelled=True)
 
 
 def _normalize_tool_result(result: Any, duration_ms: int) -> ToolResult:

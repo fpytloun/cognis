@@ -84,7 +84,7 @@ def main() -> None:
         controller_token=tok,
     )
     runner = ExecutorRunner(config)
-    with contextlib.suppress(KeyboardInterrupt):
+    with contextlib.suppress(asyncio.CancelledError, KeyboardInterrupt):
         asyncio.run(runner.run())
 
 

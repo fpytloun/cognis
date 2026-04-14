@@ -69,7 +69,7 @@ class MCPClient(Protocol):
 
     async def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> str: ...
 
-    async def close(self) -> None: ...
+    async def close(self, *, suppress_cancelled: bool = False) -> None: ...
 
 
 class _StderrLogger(io.RawIOBase):
@@ -207,7 +207,7 @@ class _SessionMCPClient:
             raise _coerce_client_error(self.config.name, "call_tool", exc) from exc
         return _normalize_call_result(result)
 
-    async def close(self) -> None:
+    async def close(self, *, suppress_cancelled: bool = False) -> None:
         """Close the transport and client session."""
 
         logger.debug("MCP: %s closing", self.config.name)
@@ -215,8 +215,7 @@ class _SessionMCPClient:
             try:
                 await self._exit_stack.aclose()
             except asyncio.CancelledError:
-                current = asyncio.current_task()
-                if current is not None and current.cancelling():
+                if not suppress_cancelled:
                     raise
                 logger.debug("MCP: %s close cancelled during transport teardown", self.config.name)
             except Exception:
@@ -299,10 +298,10 @@ class StdioMCPClient(_SessionMCPClient):
 
         await self.connect()
 
-    async def close(self) -> None:
+    async def close(self, *, suppress_cancelled: bool = False) -> None:
         """Terminate the MCP server and clean up resources."""
 
-        await super().close()
+        await super().close(suppress_cancelled=suppress_cancelled)
         if self._stderr_logger is not None:
             self._stderr_logger.close()
             self._stderr_logger = None
