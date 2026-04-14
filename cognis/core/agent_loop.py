@@ -25,6 +25,7 @@ from pydantic import ValidationError
 
 from cognis.core.attachment_utils import merge_content_and_attachment_note
 from cognis.core.compaction import ROTATION_TOTAL
+from cognis.core.decision import build_routing_reminder
 from cognis.core.events import Event, EventBus, EventType
 from cognis.core.followups import FollowUpMetadata, FollowUpMode, FollowUpPolicy
 from cognis.core.prompts import PromptContext
@@ -1485,6 +1486,15 @@ class AgentLoop:
         else:
             _prompt_ctx = PromptContext.CHAT
 
+        routing_reminder = None
+        if (
+            ctx.policy is CHAT_POLICY
+            and _prompt_ctx is PromptContext.CHAT
+            and not ctx.system_initiated
+        ):
+            advice = build_routing_reminder(effective_user_message)
+            routing_reminder = advice.reminder if advice is not None else None
+
         context_result = await self.context_assembler.assemble(
             session=ctx.session,
             conversation=ctx.conversation,
@@ -1495,6 +1505,7 @@ class AgentLoop:
             user_message_role="system" if ctx.system_initiated else "user",
             prior_context=ctx.prior_context,
             follow_up=ctx.follow_up,
+            routing_reminder=routing_reminder,
             skip_memory=ctx.policy.skip_memory,
             prompt_context=_prompt_ctx,
             executor_environment=ctx.executor_environment,

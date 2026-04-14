@@ -38,6 +38,59 @@ DELEGATE_OVERRIDE_KEYWORDS = ("run in background", "background task", "delegate 
 DELEGATE_PREFIXES = ("/research", "/implement", "/delegate", "/task")
 CONVERSATIONAL_PREFIXES = ("hi", "hello", "hey", "thanks", "thank you", "what do you think")
 
+_ROUTING_REMINDER_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "review",
+        (
+            "code review",
+            "review this",
+            "review the",
+            "audit",
+            "pull request",
+            "pr review",
+            "inspect this diff",
+            "check this diff",
+        ),
+    ),
+    (
+        "research",
+        (
+            "research",
+            "investigate",
+            "compare",
+            "look up",
+            "latest ",
+            "current best",
+        ),
+    ),
+    (
+        "exploration",
+        (
+            "find where",
+            "trace",
+            "locate",
+            "explore the codebase",
+            "understand this codebase",
+            "survey the codebase",
+        ),
+    ),
+    (
+        "implementation",
+        (
+            "implement ",
+            "build a",
+            "build an",
+            "fix bug",
+            "fix the bug",
+            "fix this bug",
+            "refactor",
+            "add feature",
+            "change the code",
+            "write code",
+        ),
+    ),
+)
+
 
 class DecisionResult(BaseModel):
     """Normalized decision-engine output."""
@@ -48,6 +101,60 @@ class DecisionResult(BaseModel):
     predicted_tool_intensity: str
     override_source: str | None = None
     degraded: bool = False
+
+
+class RoutingReminderAdvice(BaseModel):
+    """Short advisory reminder for eligible chat turns.
+
+    This value is prompt guidance only. It must not influence controller-side
+    routing decisions or be persisted as session content.
+    """
+
+    category: str
+    reminder: str
+
+
+def build_routing_reminder(user_message: str) -> RoutingReminderAdvice | None:
+    """Return short turn-local routing advice for strongly matched user text.
+
+    The reminder is advisory only and is intended for mutable prompt suffix
+    injection immediately before the current user message.
+    """
+
+    text = user_message.strip()
+    if not text:
+        return None
+
+    lowered = text.lower()
+    if lowered.startswith("/"):
+        return None
+    if any(keyword in lowered for keyword in INLINE_OVERRIDE_KEYWORDS):
+        return None
+    if any(keyword in lowered for keyword in DELEGATE_OVERRIDE_KEYWORDS):
+        return None
+
+    for category, patterns in _ROUTING_REMINDER_PATTERNS:
+        if any(pattern in lowered for pattern in patterns):
+            return RoutingReminderAdvice(
+                category=category,
+                reminder=_render_routing_reminder(category),
+            )
+    return None
+
+
+def _render_routing_reminder(category: str) -> str:
+    labels = {
+        "implementation": "non-trivial implementation work",
+        "research": "research or investigation work",
+        "review": "code review or audit work",
+        "exploration": "codebase exploration work",
+    }
+    label = labels.get(category, "substantial work")
+    return (
+        f"Routing hint: this request looks like {label}.\n"
+        "Consider delegation or a background task before doing it inline.\n"
+        "If it is truly small enough to complete correctly in this turn, inline execution is fine."
+    )
 
 
 class DecisionEngine:

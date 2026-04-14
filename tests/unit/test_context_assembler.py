@@ -674,6 +674,69 @@ async def test_context_assembler_keeps_follow_up_data_out_of_immutable_prefix() 
 
 
 @pytest.mark.asyncio
+async def test_context_assembler_injects_routing_reminder_before_attachment_notice_and_user_message() -> (
+    None
+):
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=_SessionCache(),
+        session_manager=_SessionManager(),
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+
+    reminder = "Routing hint: this request looks like non-trivial implementation work."
+    result = await assembler.assemble(
+        session=_session(),
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="Implement auth",
+        attachment_notice="Attachment notice",
+        routing_reminder=reminder,
+        tool_definitions=[],
+    )
+
+    contents = [str(message.get("content", "")) for message in result.messages]
+    reminder_index = contents.index(reminder)
+    attachment_index = contents.index("Attachment notice")
+    user_index = contents.index("Implement auth")
+
+    assert reminder_index < attachment_index < user_index
+
+
+@pytest.mark.asyncio
+async def test_context_assembler_keeps_routing_reminder_out_of_immutable_prefix() -> None:
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=_SessionCache(),
+        session_manager=_SessionManager(),
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+
+    reminder = "Routing hint: this request looks like code review or audit work."
+    result = await assembler.assemble(
+        session=_session(),
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="Review this diff",
+        routing_reminder=reminder,
+        tool_definitions=[],
+    )
+
+    breakpoint = result.cache_breakpoint_index
+    assert breakpoint is not None
+    immutable_contents = "\n".join(
+        str(message.get("content", "")) for message in result.messages[: breakpoint + 1]
+    )
+    assert reminder not in immutable_contents
+
+
+@pytest.mark.asyncio
 async def test_context_assembler_clears_follow_up_markers_in_skip_memory_path() -> None:
     assembler = ContextAssembler(
         memory=_Memory(),

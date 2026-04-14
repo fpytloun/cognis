@@ -249,6 +249,7 @@ class ContextAssembler:
         active_delegations: list[dict[str, Any]] | None = None,
         prior_context: list[dict[str, Any]] | None = None,
         follow_up: FollowUpMetadata | None = None,
+        routing_reminder: str | None = None,
         skip_user_message: bool = False,
         skip_memory: bool = False,
         prompt_context: PromptContext = PromptContext.CHAT,
@@ -259,6 +260,10 @@ class ContextAssembler:
         ``prior_context`` is an optional list of messages to inject after
         session history and before the user message.  Used by the workflow
         engine to inject prior step output.  Chat turns pass ``None``.
+
+        ``routing_reminder`` is ephemeral turn-local system guidance for the
+        current chat turn only. It must not be persisted to session history,
+        DB state, or audit content.
 
         ``skip_memory`` skips Mnemory recall and memory instructions.
         Used for secondary agents that don't have memory integration.
@@ -286,6 +291,7 @@ class ContextAssembler:
                 active_delegations=active_delegations,
                 prior_context=prior_context,
                 follow_up=follow_up,
+                routing_reminder=routing_reminder,
                 skip_user_message=skip_user_message,
                 prompt_context=prompt_context,
                 executor_environment=executor_environment,
@@ -615,6 +621,14 @@ class ContextAssembler:
             )
 
         if not skip_user_message:
+            if routing_reminder:
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": routing_reminder,
+                        "_routing_reminder": True,
+                    }
+                )
             if attachment_notice:
                 messages.append({"role": "system", "content": attachment_notice})
             attachment_blocks, unsupported = _native_attachment_blocks(
@@ -657,6 +671,7 @@ class ContextAssembler:
         for msg in messages:
             msg.pop("_prior_context", None)
             msg.pop("_follow_up_context", None)
+            msg.pop("_routing_reminder", None)
 
         # Recompute cache breakpoint after pruning (immutable messages may have shifted)
         cache_breakpoint_index = _find_cache_breakpoint(messages)
@@ -708,6 +723,7 @@ class ContextAssembler:
         active_delegations: list[dict[str, Any]] | None = None,
         prior_context: list[dict[str, Any]] | None = None,
         follow_up: FollowUpMetadata | None = None,
+        routing_reminder: str | None = None,
         skip_user_message: bool = False,
         prompt_context: PromptContext = PromptContext.TASK_STEP,
         executor_environment: ExecutorEnvironmentSnapshot | None = None,
@@ -823,6 +839,14 @@ class ContextAssembler:
             )
 
         if not skip_user_message:
+            if routing_reminder:
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": routing_reminder,
+                        "_routing_reminder": True,
+                    }
+                )
             if attachment_notice:
                 messages.append({"role": "system", "content": attachment_notice})
             attachment_blocks, unsupported = _native_attachment_blocks(
@@ -864,6 +888,7 @@ class ContextAssembler:
         for msg in messages:
             msg.pop("_prior_context", None)
             msg.pop("_follow_up_context", None)
+            msg.pop("_routing_reminder", None)
 
         cache_breakpoint_index = _find_cache_breakpoint(messages)
         prompt_tokens = (

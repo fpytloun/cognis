@@ -10,6 +10,7 @@ import pytest
 
 from cognis.core.agent_loop import (
     CHAT_POLICY,
+    SECONDARY_POLICY,
     WORKFLOW_POLICY,
     AgentLoop,
     PauseResolution,
@@ -398,7 +399,11 @@ class _FakeReminderLLM:
 
 
 class _FakeContextAssembler:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
     async def assemble(self, **kwargs: object) -> SimpleNamespace:
+        self.calls.append(dict(kwargs))
         role = kwargs.get("user_message_role", "user")
         user_message = kwargs.get("user_message", "")
         return SimpleNamespace(
@@ -580,6 +585,23 @@ class _NoopSessionCache:
         return False
 
 
+async def _run_with_assembler(ctx: StepContext, assembler: _FakeContextAssembler) -> None:
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=_FinalAssistantContentLLM(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=assembler,
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    output = await agent_loop.run_step(ctx)
+    assert output is not None
+
+
 async def _run_reminder_capture(ctx: object) -> list[list[dict[str, object]]]:
     fake_llm = _FakeReminderLLM()
     agent_loop = AgentLoop(
@@ -655,6 +677,100 @@ async def test_step_complete_reprompt_is_system_message() -> None:
     calls = await _run_reminder_capture(ctx)
     assert calls[1][-1]["role"] == "system"
     assert "call step_complete now" in str(calls[1][-1]["content"])
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_passes_routing_reminder_for_eligible_chat_turn() -> None:
+    assembler = _FakeContextAssembler()
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-1",
+            intaris_session_id="sess-1",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-1", title=None, title_source="unset"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+        user_message="Implement refresh token support.",
+        user_attachments=[],
+        system_initiated=False,
+    )
+
+    await _run_with_assembler(ctx, assembler)
+
+    assert assembler.calls[0]["routing_reminder"] is not None
+    assert "background task" in str(assembler.calls[0]["routing_reminder"])
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_skips_routing_reminder_for_system_initiated_and_workflow_turns() -> None:
+    system_assembler = _FakeContextAssembler()
+    system_ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-1",
+            intaris_session_id="sess-1",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-1", title=None, title_source="unset"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+        user_message="Implement refresh token support.",
+        user_attachments=[],
+        system_initiated=True,
+    )
+    await _run_with_assembler(system_ctx, system_assembler)
+    assert system_assembler.calls[0]["routing_reminder"] is None
+
+    workflow_assembler = _FakeContextAssembler()
+    workflow_ctx = StepContext(
+        step_definition=StepDefinition(name="implement", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-1",
+            intaris_session_id="sess-1",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-1", title=None, title_source="unset"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=WORKFLOW_POLICY,
+        user_message="Implement refresh token support.",
+        user_attachments=[],
+        system_initiated=False,
+    )
+    await _run_with_assembler(workflow_ctx, workflow_assembler)
+    assert workflow_assembler.calls[0]["routing_reminder"] is None
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_skips_routing_reminder_for_secondary_policy_turns() -> None:
+    assembler = _FakeContextAssembler()
+    ctx = StepContext(
+        step_definition=StepDefinition(name="secondary", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-1",
+            intaris_session_id="sess-1",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-1", title=None, title_source="unset"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=SECONDARY_POLICY,
+        user_message="Implement refresh token support.",
+        user_attachments=[],
+        system_initiated=False,
+    )
+
+    await _run_with_assembler(ctx, assembler)
+
+    assert assembler.calls[0]["routing_reminder"] is None
 
 
 @pytest.mark.asyncio

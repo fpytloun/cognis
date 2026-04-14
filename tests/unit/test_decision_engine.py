@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from cognis.core.decision import DecisionEngine, select_workflow
+from cognis.core.decision import DecisionEngine, build_routing_reminder, select_workflow
 from cognis.models.agent import AgentDefinition, AgentLLMConfig, AgentPermissions
 
 
@@ -65,6 +65,27 @@ def _agent(can_delegate: bool = True, max_depth: int = 5) -> AgentDefinition:
         llm_config=AgentLLMConfig(model="test-model"),
         permissions=AgentPermissions(can_delegate=can_delegate, max_delegation_depth=max_depth),
     )
+
+
+def test_build_routing_reminder_matches_implementation_work() -> None:
+    reminder = build_routing_reminder("Implement refresh token support across the API.")
+
+    assert reminder is not None
+    assert reminder.category == "implementation"
+    assert "background task" in reminder.reminder
+    assert "inline execution is fine" in reminder.reminder
+
+
+def test_build_routing_reminder_skips_blank_and_explicit_override_messages() -> None:
+    assert build_routing_reminder("") is None
+    assert build_routing_reminder("/implement auth") is None
+    assert build_routing_reminder("Just answer this directly.") is None
+
+
+def test_build_routing_reminder_avoids_broad_false_positives() -> None:
+    assert build_routing_reminder("What is the current model setting?") is None
+    assert build_routing_reminder("Can you help me fix my explanation?") is None
+    assert build_routing_reminder("Can you build the argument for this approach?") is None
 
 
 @pytest.mark.asyncio
