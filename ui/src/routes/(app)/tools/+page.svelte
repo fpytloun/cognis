@@ -27,6 +27,7 @@
   import { api } from '$lib/api/client';
   import Badge from '$lib/components/ui/Badge.svelte';
   import Button from '$lib/components/ui/Button.svelte';
+  import { confirmAction } from '$lib/stores/confirm';
   import { addToast } from '$lib/stores/toasts';
   import {
     buildRegistryWarnings,
@@ -274,6 +275,10 @@
   }
 
   async function deleteSkill(skill: Skill) {
+    if (skill.is_system) {
+      addToast('System skills cannot be deleted', 'error');
+      return;
+    }
     if (skill.source !== 'db' && skill.source !== 'imported') {
       addToast('Cannot delete file-sourced skills', 'error');
       return;
@@ -284,6 +289,24 @@
       await loadData();
     } catch (err) {
       addToast('Failed to delete skill', 'error');
+    }
+  }
+
+  async function resetSkill(skill: Skill) {
+    const confirmed = await confirmAction({
+      title: 'Reset system skill?',
+      message: `Reset ${skill.name} to the shipped default content? This creates a new skill version and discards local edits to the current content.`,
+      confirmLabel: 'Reset skill',
+      cancelLabel: 'Keep current version',
+      variant: 'danger'
+    });
+    if (!confirmed) return;
+    try {
+      await api.skills.reset(skill.skill_id);
+      addToast('Skill reset to default', 'success');
+      await loadData();
+    } catch (err) {
+      addToast('Failed to reset skill', 'error');
     }
   }
 </script>
@@ -579,6 +602,7 @@
                     <BookOpen class="w-4 h-4 text-zinc-400" />
                     <span class="font-medium text-zinc-100">{skill.name}</span>
                     <Badge>{skill.source}</Badge>
+                    {#if skill.is_system}<Badge class="border-amber-500/30 bg-amber-500/10 text-amber-300">system</Badge>{/if}
                     {#if skill.auto_load}<Badge class="border-blue-500/30 bg-blue-500/10 text-blue-300">auto-load</Badge>{/if}
                   </div>
                   {#if skill.description}<p class="text-sm text-zinc-400 mt-1">{skill.description}</p>{/if}
@@ -587,8 +611,13 @@
                 <div class="flex gap-1">
                   <button class="p-1.5 text-zinc-400 hover:text-zinc-200 rounded" onclick={() => exportSkill(skill)} title="Export as SKILL.md"><Download class="w-4 h-4" /></button>
                   {#if skill.source === 'db' || skill.source === 'imported'}
-                    <button class="p-1.5 text-zinc-400 hover:text-zinc-200 rounded" onclick={() => openSkillForm(skill)} title="Edit"><Pencil class="w-4 h-4" /></button>
-                    <button class="p-1.5 text-zinc-400 hover:text-red-400 rounded" onclick={() => deleteSkill(skill)} title="Delete"><Trash2 class="w-4 h-4" /></button>
+                    {#if skill.is_system}
+                      <button class="p-1.5 text-zinc-400 hover:text-amber-300 rounded" onclick={() => resetSkill(skill)} title="Reset to default"><ShieldCheck class="w-4 h-4" /></button>
+                      <Badge>read-only</Badge>
+                    {:else}
+                      <button class="p-1.5 text-zinc-400 hover:text-zinc-200 rounded" onclick={() => openSkillForm(skill)} title="Edit"><Pencil class="w-4 h-4" /></button>
+                      <button class="p-1.5 text-zinc-400 hover:text-red-400 rounded" onclick={() => deleteSkill(skill)} title="Delete"><Trash2 class="w-4 h-4" /></button>
+                    {/if}
                   {:else}<Badge>read-only</Badge>{/if}
                 </div>
               </div>

@@ -1,0 +1,149 @@
+"""Canonical built-in system skill definitions."""
+
+from __future__ import annotations
+
+from typing import Final
+
+SYSTEM_SKILL_DEFAULTS: Final[dict[str, dict[str, object]]] = {
+    "cognis-task-manager": {
+        "skill_id": "cognis-task-manager",
+        "content": """---
+name: Cognis Task Manager
+description: Safe operating procedure for inspecting and managing Cognis tasks from main chat.
+tags:
+  - cognis
+  - management
+  - tasks
+---
+
+# Purpose
+
+Use this skill when the user wants the main chat agent to inspect, create, update, retry, continue, cancel, or otherwise manage Cognis tasks without leaving the conversation.
+
+# When To Use
+
+- Create a task from a conversational request.
+- Inspect a running or paused task.
+- Review task output or step output.
+- Resolve a task gate.
+- Answer a paused task question.
+- Update task metadata such as title, description, or workflow assignment.
+
+# Required Inspection Steps
+
+1. Use `get_task` before mutating an existing task.
+2. Read `pending_pause`, `workflow_run`, and recent `step_runs` before choosing an action.
+3. If the task is paused on a question, use `respond_task_input` instead of gate tools.
+4. If the task is paused on a gate, only choose actions that are explicitly offered.
+
+# Safe Mutation Rules
+
+- Preserve the user’s wording exactly when passing an operator instruction or note.
+- Do not guess hidden workflow state; inspect first.
+- Do not retry a gate unless a retry/revise action is actually offered.
+- Do not treat escalation pauses as task gates; escalation approval still uses `/approve` or `/deny`.
+- Prefer minimal updates to task metadata instead of rewriting unrelated fields.
+
+# Tool Usage
+
+- `create_task` to create a new task.
+- `list_tasks` to inspect matching tasks.
+- `get_task` for full task state, pause state, and workflow run metadata.
+- `get_task_output` and `get_task_step_output` for outputs.
+- `resolve_task_pause` to retry, continue, cancel, or resolve another offered gate action.
+- `respond_task_input` to answer a paused step question.
+- `update_task` and `cancel_task` for direct management.
+
+# Do Not Do
+
+- Do not mutate a task before inspecting it.
+- Do not invent missing pause actions.
+- Do not claim a paused task is unblocked until the tool confirms success.
+
+# Examples
+
+- "Inspect task `task_123` and tell me why it is paused."
+- "Continue the paused task and tell it to incorporate the last review."
+- "Answer the task’s pending question with the user’s reply."
+""",
+    },
+    "cognis-workflow-manager": {
+        "skill_id": "cognis-workflow-manager",
+        "content": """---
+name: Cognis Workflow Manager
+description: Safe operating procedure for inspecting and managing Cognis workflow definitions from main chat.
+tags:
+  - cognis
+  - management
+  - workflows
+---
+
+# Purpose
+
+Use this skill when the user wants the main chat agent to inspect or manage Cognis workflow definitions directly from conversation instead of the workflow editor.
+
+# When To Use
+
+- List available workflows.
+- Inspect a workflow definition before creating tasks against it.
+- Create a new user-owned workflow from a conversational specification.
+- Update, duplicate, or delete an existing user-owned workflow.
+
+# Required Inspection Steps
+
+1. Use `list_workflows` or `get_workflow` before mutating a workflow.
+2. Confirm whether the workflow is system-owned or user-owned.
+3. Inspect current steps, references, loop targets, and outcome routes before editing.
+4. If a workflow is referenced by active tasks, treat it as protected and avoid destructive edits.
+
+# Safe Mutation Rules
+
+- Keep changes minimal and explicit.
+- Preserve valid step names and references.
+- Do not attempt to modify system workflows.
+- Do not delete or overwrite a workflow referenced by active tasks.
+- Prefer duplicating a workflow before heavy edits when the user wants to preserve the original.
+
+# Tool Usage
+
+- `list_workflows` for discovery.
+- `get_workflow` for full definitions.
+- `create_workflow` for new definitions.
+- `update_workflow` for targeted edits.
+- `duplicate_workflow` to branch an existing workflow.
+- `delete_workflow` only when the user clearly wants removal and it is safe.
+
+# Do Not Do
+
+- Do not invent step references or route targets.
+- Do not mutate system workflows.
+- Do not force workflow changes when active tasks still depend on the current definition.
+
+# Examples
+
+- "Create a workflow that plans, implements, reviews, and commits changes."
+- "Duplicate the software-development workflow and tailor it for docs-only tasks."
+- "Inspect this workflow and explain why it loops back to plan."
+""",
+    },
+}
+
+
+def get_system_skill_default(skill_id: str) -> dict[str, object] | None:
+    """Return the canonical default definition for a system skill."""
+
+    from cognis.tools.skill_parser import parse_skill_md
+
+    default = SYSTEM_SKILL_DEFAULTS.get(skill_id)
+    if default is None:
+        return None
+    parsed = parse_skill_md(str(default["content"]))
+    return {
+        "skill_id": default["skill_id"],
+        "name": parsed["name"],
+        "description": parsed["description"],
+        "instructions": parsed["instructions"],
+        "tags": list(parsed["tags"]),
+        "tools": parsed["tools"],
+        "prompt_templates": parsed["prompt_templates"],
+    }

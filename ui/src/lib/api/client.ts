@@ -704,6 +704,10 @@ export const api = {
       return request<void>(`/api/v1/skills/${skillId}`, { method: 'DELETE' });
     },
 
+    reset(skillId: string): Promise<Skill> {
+      return request<Skill>(`/api/v1/skills/${skillId}/reset`, { method: 'POST' });
+    },
+
     versions(skillId: string): Promise<SkillVersion[]> {
       return request<SkillVersion[]>(`/api/v1/skills/${skillId}/versions`);
     },

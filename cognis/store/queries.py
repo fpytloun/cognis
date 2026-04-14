@@ -2032,6 +2032,7 @@ async def create_skill(
     prompt_templates: dict[str, Any] | None = None,
     tags: list[str] | None = None,
     auto_load: bool = False,
+    is_system: bool = False,
     source: str = "db",
     owner_email: str | None = None,
 ) -> SkillRow:
@@ -2045,6 +2046,7 @@ async def create_skill(
         prompt_templates=prompt_templates,
         tags=tags,
         auto_load=auto_load,
+        is_system=is_system,
         source=source,
         owner_email=owner_email,
     )
@@ -2074,12 +2076,43 @@ async def update_skill(
         return None
     if row.source not in ("db", "imported"):
         raise ValueError("Cannot update file-sourced skills")
+    if row.is_system:
+        raise ValueError("Cannot modify system skills directly")
     # Prevent non-owners from mutating global skills
     if owner_email is not None and row.owner_email is None:
         raise ValueError("Cannot modify global skills")
     for key, value in kwargs.items():
         if hasattr(row, key) and key != "owner_email":
             setattr(row, key, value)
+    await session.flush()
+    return row
+
+
+async def reset_skill_to_defaults(
+    session: AsyncSession,
+    skill_id: str,
+    *,
+    name: str,
+    description: str | None,
+    instructions: str,
+    tools: list[dict[str, Any]] | None,
+    prompt_templates: dict[str, Any] | None,
+    tags: list[str] | None,
+    auto_load: bool,
+) -> SkillRow | None:
+    """Reset a system skill row to canonical default content."""
+
+    row = await get_skill(session, skill_id)
+    if row is None:
+        return None
+    row.name = name
+    row.description = description
+    row.instructions = instructions
+    row.tools = tools
+    row.prompt_templates = prompt_templates
+    row.tags = tags
+    row.auto_load = auto_load
+    row.is_system = True
     await session.flush()
     return row
 
@@ -2101,6 +2134,8 @@ async def delete_skill(
         return False
     if row.source not in ("db", "imported"):
         raise ValueError("Cannot delete file-sourced skills")
+    if row.is_system:
+        raise ValueError("Cannot delete system skills")
     if owner_email is not None and row.owner_email is None:
         raise ValueError("Cannot delete global skills")
     await session.execute(delete(SkillRow).where(SkillRow.skill_id == skill_id))

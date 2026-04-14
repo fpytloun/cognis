@@ -15,6 +15,7 @@ from cognis.api.models import (
     SkillUpdateRequest,
     SkillVersionResponse,
 )
+from cognis.core.system_skills import get_system_skill_default
 from cognis.store.queries import (
     create_skill,
     create_skill_version,
@@ -24,6 +25,7 @@ from cognis.store.queries import (
     get_skill_version,
     list_skill_versions,
     list_skills,
+    reset_skill_to_defaults,
     set_current_version,
     update_skill,
 )
@@ -70,6 +72,7 @@ def _skill_to_response(row: Any, version_row: Any | None = None) -> SkillRespons
         prompt_templates=row.prompt_templates,
         tags=row.tags,
         auto_load=row.auto_load,
+        is_system=getattr(row, "is_system", False),
         source=row.source,
         current_version_id=row.current_version_id,
         current_version=current_version,
@@ -155,7 +158,10 @@ async def update_skill_route(
         try:
             row = await update_skill(session, skill_id, owner_email=user.email, **updates)
         except ValueError as exc:
-            raise api_exception(400, "validation_error", str(exc)) from exc
+            message = str(exc)
+            if message == "Cannot modify system skills directly":
+                raise api_exception(403, "forbidden", message) from exc
+            raise api_exception(400, "validation_error", message) from exc
         if row is None:
             raise api_exception(404, "not_found", "Skill not found")
 
@@ -201,6 +207,8 @@ async def delete_skill_route(request: Request, skill_id: str) -> None:
         row = await get_skill_scoped(session, skill_id, owner_email=user.email)
         if row is None:
             raise api_exception(404, "not_found", "Skill not found")
+        if row.is_system:
+            raise api_exception(403, "forbidden", "System skills cannot be deleted")
         try:
             deleted = await delete_skill(session, skill_id, owner_email=user.email)
         except ValueError as exc:
@@ -208,6 +216,70 @@ async def delete_skill_route(request: Request, skill_id: str) -> None:
         if not deleted:
             raise api_exception(404, "not_found", "Skill not found")
         await session.commit()
+
+
+@router.post("/api/v1/skills/{skill_id}/reset", response_model=SkillResponse)
+async def reset_skill_route(request: Request, skill_id: str) -> SkillResponse:
+    user = require_current_user(request)
+    if user.role != "admin":
+        raise api_exception(403, "forbidden", "Only admins can reset system skills")
+    async with request.app.state.session_factory() as session:
+        row = await get_skill_scoped(session, skill_id, owner_email=user.email)
+        if row is None:
+            raise api_exception(404, "not_found", "Skill not found")
+        if not row.is_system:
+            raise api_exception(403, "forbidden", "Only system skills can be reset")
+        defaults = get_system_skill_default(skill_id)
+        if defaults is None:
+            raise api_exception(404, "not_found", "System skill defaults not found")
+
+        current_hash = compute_content_hash(
+            row.instructions,
+            row.tools,
+            row.prompt_templates,
+        )
+        default_hash = compute_content_hash(
+            str(defaults["instructions"]),
+            defaults.get("tools"),
+            defaults.get("prompt_templates"),
+        )
+        if current_hash == default_hash:
+            version_row = None
+            if row.current_version_id:
+                version_row = await get_skill_version(session, row.current_version_id)
+            return _skill_to_response(row, version_row)
+
+        row = await reset_skill_to_defaults(
+            session,
+            skill_id,
+            name=str(defaults["name"]),
+            description=(
+                str(defaults["description"]) if defaults.get("description") is not None else None
+            ),
+            instructions=str(defaults["instructions"]),
+            tools=defaults.get("tools"),
+            prompt_templates=defaults.get("prompt_templates"),
+            tags=list(defaults["tags"]),
+            auto_load=False,
+        )
+        assert row is not None
+
+        content_hash = compute_content_hash(row.instructions, row.tools, row.prompt_templates)
+        next_num = await get_next_version_number(session, skill_id)
+        version_row = await create_skill_version(
+            session,
+            skill_id=skill_id,
+            version_number=next_num,
+            content_hash=content_hash,
+            instructions=row.instructions,
+            tools=row.tools,
+            prompt_templates=row.prompt_templates,
+            secret_placeholders=None,
+        )
+        await set_current_version(session, row.skill_id, version_row.version_id)
+        row.current_version_id = version_row.version_id
+        await session.commit()
+    return _skill_to_response(row, version_row)
 
 
 # --- Versions ---

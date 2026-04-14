@@ -843,6 +843,7 @@ class SkillResponse(BaseModel):
     prompt_templates: dict[str, Any] | None = None
     tags: list[str] | None = None
     auto_load: bool = False
+    is_system: bool = False
     source: str = "db"
     current_version_id: str | None = None
     current_version: SkillVersionResponse | None = None

@@ -594,6 +594,7 @@ export interface Skill {
   prompt_templates: Record<string, unknown> | null;
   tags: string[] | null;
   auto_load: boolean;
+  is_system: boolean;
   source: string;
   current_version_id: string | null;
   current_version: SkillVersion | null;

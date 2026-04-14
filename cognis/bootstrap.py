@@ -16,16 +16,21 @@ from sqlalchemy import inspect, select, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from cognis.config import CognisConfig
+from cognis.core.system_skills import SYSTEM_SKILL_DEFAULTS, get_system_skill_default
 from cognis.logging import get_logger
 from cognis.store.database import create_engine, create_session_factory
 from cognis.store.queries import (
     count_users,
     create_skill,
+    create_skill_version,
     create_user,
+    get_next_version_number,
     get_setting,
     get_skill,
+    set_current_version,
     upsert_setting,
 )
+from cognis.tools.skill_parser import compute_content_hash
 
 logger = get_logger(__name__)
 
@@ -55,35 +60,7 @@ DEFAULT_SETTINGS: Final[dict[str, tuple[str, object]]] = {
     "executors.allow_subprocess": ("executors", True),
 }
 
-_BUILTIN_MANAGEMENT_SKILLS: Final[list[dict[str, object]]] = [
-    {
-        "skill_id": "cognis-task-manager",
-        "name": "Cognis Task Manager",
-        "description": "Guidance for inspecting and managing Cognis tasks safely from main chat.",
-        "instructions": (
-            "Use Cognis task-management tools from main chat to inspect tasks before mutating them. "
-            "Prefer get_task first, then decide whether to resolve a pause, answer a step question, "
-            "retry, update, or cancel. Use only pause actions that are currently offered. Preserve "
-            "human operator notes exactly. These management actions are intended for main chat; "
-            "workflow steps and delegated sub-sessions may not have the required tools."
-        ),
-        "tags": ["cognis", "management", "tasks"],
-    },
-    {
-        "skill_id": "cognis-workflow-manager",
-        "name": "Cognis Workflow Manager",
-        "description": "Guidance for inspecting and managing Cognis workflow definitions safely from main chat.",
-        "instructions": (
-            "Use Cognis workflow-management tools from main chat to list, inspect, create, update, "
-            "duplicate, and delete workflows. Inspect the current workflow first, preserve valid step "
-            "references and route targets, and keep changes minimal. Do not attempt to modify system "
-            "workflows. If a workflow is referenced by active tasks, treat it as protected and adjust "
-            "plans accordingly. These management actions are intended for main chat; workflow steps and "
-            "delegated sub-sessions may not have the required tools."
-        ),
-        "tags": ["cognis", "management", "workflows"],
-    },
-]
+_BUILTIN_MANAGEMENT_SKILLS: Final[list[dict[str, object]]] = list(SYSTEM_SKILL_DEFAULTS.values())
 
 
 class SetupTokenManager:
@@ -205,6 +182,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_avatar_image_id_column)
         await conn.run_sync(_ensure_executor_runtime_state_columns)
         await conn.run_sync(_ensure_skill_versioning_columns)
+        await conn.run_sync(_ensure_skill_system_column)
         await conn.run_sync(_ensure_schedule_extended_columns)
         await conn.run_sync(_ensure_conversation_title_source_column)
         await conn.run_sync(_ensure_mcp_server_headers_column)
@@ -442,6 +420,18 @@ def _ensure_skill_versioning_columns(sync_conn: object) -> None:
         execute(text("ALTER TABLE skills ADD COLUMN current_version_id VARCHAR"))
 
 
+def _ensure_skill_system_column(sync_conn: object) -> None:
+    inspector = cast(Any, inspect(sync_conn))
+    try:
+        columns = {column["name"] for column in inspector.get_columns("skills")}
+    except Exception:
+        return
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+
+    if "is_system" not in columns:
+        execute(text("ALTER TABLE skills ADD COLUMN is_system BOOLEAN NOT NULL DEFAULT 0"))
+
+
 def _ensure_schedule_extended_columns(sync_conn: object) -> None:
     """Add schedule type, error tracking, and heartbeat columns."""
     inspector = cast(Any, inspect(sync_conn))
@@ -582,20 +572,76 @@ async def seed_builtin_management_skills(session: AsyncSession) -> None:
     """Seed first-party Cognis management skills if they do not exist."""
 
     for skill in _BUILTIN_MANAGEMENT_SKILLS:
+        defaults = get_system_skill_default(str(skill["skill_id"]))
+        assert defaults is not None
         existing = await get_skill(session, str(skill["skill_id"]))
         if existing is not None:
+            updates: dict[str, object] = {"is_system": True}
+            if existing.owner_email is None and existing.current_version_id is None:
+                updates.update(
+                    {
+                        "name": defaults["name"],
+                        "description": defaults["description"],
+                        "instructions": defaults["instructions"],
+                        "tools": defaults["tools"],
+                        "prompt_templates": defaults["prompt_templates"],
+                        "tags": defaults["tags"],
+                        "auto_load": False,
+                    }
+                )
+            for key, value in updates.items():
+                setattr(existing, key, value)
+            if existing.current_version_id is None:
+                content_hash = compute_content_hash(
+                    existing.instructions,
+                    existing.tools,
+                    existing.prompt_templates,
+                )
+                version_row = await create_skill_version(
+                    session,
+                    skill_id=existing.skill_id,
+                    version_number=await get_next_version_number(session, existing.skill_id),
+                    content_hash=content_hash,
+                    instructions=existing.instructions,
+                    tools=existing.tools,
+                    prompt_templates=existing.prompt_templates,
+                    secret_placeholders=None,
+                )
+                await set_current_version(session, existing.skill_id, version_row.version_id)
+                existing.current_version_id = version_row.version_id
             continue
-        await create_skill(
+        row = await create_skill(
             session,
             skill_id=str(skill["skill_id"]),
-            name=str(skill["name"]),
-            description=str(skill["description"]),
-            instructions=str(skill["instructions"]),
-            tags=list(skill["tags"]),
+            name=str(defaults["name"]),
+            description=(
+                str(defaults["description"]) if defaults.get("description") is not None else None
+            ),
+            instructions=str(defaults["instructions"]),
+            tools=defaults.get("tools"),
+            prompt_templates=defaults.get("prompt_templates"),
+            tags=list(defaults["tags"]),
             auto_load=False,
+            is_system=True,
             source="db",
             owner_email=None,
         )
+        version_row = await create_skill_version(
+            session,
+            skill_id=row.skill_id,
+            version_number=1,
+            content_hash=compute_content_hash(
+                row.instructions,
+                row.tools,
+                row.prompt_templates,
+            ),
+            instructions=row.instructions,
+            tools=row.tools,
+            prompt_templates=row.prompt_templates,
+            secret_placeholders=None,
+        )
+        await set_current_version(session, row.skill_id, version_row.version_id)
+        row.current_version_id = version_row.version_id
 
 
 async def maybe_seed_initial_admin(

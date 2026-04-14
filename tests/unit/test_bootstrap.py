@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -8,8 +9,8 @@ from sqlalchemy import inspect, text
 from cognis.bootstrap import DEFAULT_SETTINGS, bootstrap_runtime, run_schema_bootstrap
 from cognis.config import load_config
 from cognis.security import create_password_hasher
-from cognis.store.database import create_engine
-from cognis.store.queries import get_setting, get_skill, list_settings, upsert_setting
+from cognis.store.database import create_engine, create_session_factory
+from cognis.store.queries import create_skill, get_setting, get_skill, list_settings, upsert_setting
 
 
 @pytest.mark.asyncio
@@ -34,6 +35,50 @@ async def test_bootstrap_creates_keys_db_and_settings(monkeypatch: object, tmp_p
     assert workflow_skill is not None
     assert task_skill.auto_load is False
     assert workflow_skill.auto_load is False
+    assert task_skill.is_system is True
+    assert workflow_skill.is_system is True
+    assert task_skill.instructions.startswith("# Purpose")
+    assert workflow_skill.instructions.startswith("# Purpose")
+    assert task_skill.current_version_id is not None
+    assert workflow_skill.current_version_id is not None
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_backfills_existing_legacy_management_skill(tmp_path: Path) -> None:
+    config = load_config()
+    config = replace(config, database_url=f"sqlite+aiosqlite:///{tmp_path / 'legacy_skills.db'}")
+    engine = create_engine(config.database_url)
+    session_factory = create_session_factory(engine)
+    await run_schema_bootstrap(engine)
+
+    async with session_factory() as session:
+        await create_skill(
+            session,
+            skill_id="cognis-task-manager",
+            name="Legacy",
+            description="old",
+            instructions="legacy",
+            tags=["legacy"],
+            auto_load=False,
+            source="db",
+            owner_email=None,
+        )
+        await session.commit()
+
+    password_hasher = create_password_hasher()
+    _, _, session_factory_after, _ = await bootstrap_runtime(config, password_hasher)
+
+    async with session_factory_after() as session:
+        task_skill = await get_skill(session, "cognis-task-manager")
+
+    assert task_skill is not None
+    assert task_skill.is_system is True
+    assert task_skill.name == "Cognis Task Manager"
+    assert task_skill.instructions.startswith("# Purpose")
+    assert task_skill.tags == ["cognis", "management", "tasks"]
+    assert task_skill.current_version_id is not None
 
     await engine.dispose()
 
