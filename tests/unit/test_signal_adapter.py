@@ -1022,6 +1022,163 @@ class TestRestSendBehavior:
         assert payload["message"] == "**Heading**\n\n**Bold** and `code`"
         assert payload["text_mode"] == "styled"
 
+    @pytest.mark.asyncio
+    async def test_rest_send_includes_explicit_preview_fields(self) -> None:
+        adapter = SignalAdapter()
+        adapter._signal_config = _SignalConfig({}, {"account_number": "+1"})
+        adapter._account_number = "+1"
+
+        client = AsyncMock()
+        response = MagicMock()
+        response.json.return_value = {"timestamp": "999"}
+        response.raise_for_status.return_value = None
+        client.post = AsyncMock(return_value=response)
+        adapter._client = client
+
+        message = OutboundMessage(
+            channel_type="signal",
+            account_id="acct-1",
+            chat_id="+420111222333",
+            content="https://example.com/image.png",
+            platform_data={
+                "signal_preview": {
+                    "url": "https://example.com/image.png",
+                    "title": "banner.png",
+                    "image": "https://example.com/image.png",
+                }
+            },
+        )
+
+        result = await adapter.send_message(message)
+
+        assert result == "999"
+        payload = client.post.await_args.kwargs["json"]
+        assert payload["preview_url"] == "https://example.com/image.png"
+        assert payload["preview_title"] == "banner.png"
+        assert payload["preview_image"] == "https://example.com/image.png"
+
+    @pytest.mark.asyncio
+    async def test_rest_send_only_applies_preview_to_first_chunk(self) -> None:
+        adapter = SignalAdapter()
+        adapter._signal_config = _SignalConfig({}, {"account_number": "+1"})
+        adapter._account_number = "+1"
+        adapter.capabilities.max_message_length = 12
+
+        client = AsyncMock()
+        response = MagicMock()
+        response.json.return_value = {"timestamp": "999"}
+        response.raise_for_status.return_value = None
+        client.post = AsyncMock(return_value=response)
+        adapter._client = client
+
+        message = OutboundMessage(
+            channel_type="signal",
+            account_id="acct-1",
+            chat_id="+420111222333",
+            content="one two three four five six",
+            platform_data={
+                "signal_preview": {
+                    "url": "https://example.com/image.png",
+                    "title": "banner.png",
+                    "image": "https://example.com/image.png",
+                }
+            },
+        )
+
+        result = await adapter.send_message(message)
+
+        assert result == "999"
+        assert client.post.await_count > 1
+        first_payload = client.post.await_args_list[0].kwargs["json"]
+        second_payload = client.post.await_args_list[1].kwargs["json"]
+        assert first_payload["preview_url"] == "https://example.com/image.png"
+        assert "preview_url" not in second_payload
+
+    @pytest.mark.asyncio
+    async def test_send_message_returns_none_when_first_media_chunk_has_no_id(self) -> None:
+        adapter = SignalAdapter()
+        adapter._signal_config = _SignalConfig({}, {"account_number": "+1"})
+        adapter._account_number = "+1"
+        adapter.capabilities.max_message_length = 12
+        adapter._send_rest = AsyncMock(side_effect=[None, "later-id"])  # type: ignore[method-assign]
+
+        message = OutboundMessage(
+            channel_type="signal",
+            account_id="acct-1",
+            chat_id="+420111222333",
+            content="one two three four five six",
+            media=[
+                MediaAttachment(filename="image.jpg", mime_type="image/jpeg", content_b64="YWJj")
+            ],
+        )
+
+        result = await adapter.send_message(message)
+
+        assert result is None
+        assert adapter._send_rest.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_send_message_keeps_media_chunk_id_when_later_chunk_has_no_id(self) -> None:
+        adapter = SignalAdapter()
+        adapter._signal_config = _SignalConfig({}, {"account_number": "+1"})
+        adapter._account_number = "+1"
+        adapter.capabilities.max_message_length = 12
+        adapter._send_rest = AsyncMock(side_effect=["media-id", None, None, None])  # type: ignore[method-assign]
+
+        message = OutboundMessage(
+            channel_type="signal",
+            account_id="acct-1",
+            chat_id="+420111222333",
+            content="one two three four five six",
+            media=[
+                MediaAttachment(filename="image.jpg", mime_type="image/jpeg", content_b64="YWJj")
+            ],
+        )
+
+        result = await adapter.send_message(message)
+
+        assert result == "media-id"
+        assert adapter._send_rest.await_count >= 2
+
+
+class TestDirectPreviewBehavior:
+    @pytest.mark.asyncio
+    async def test_direct_send_includes_explicit_preview_fields(self) -> None:
+        adapter = SignalAdapter()
+        adapter._signal_config = _SignalConfig(
+            {"transport": "direct_jsonrpc"},
+            {"account_number": "+1"},
+        )
+        adapter._account_number = "+1"
+
+        mock_runtime = MagicMock()
+        mock_runtime.is_running = True
+        mock_runtime.single_account_mode = True
+        mock_runtime.request = AsyncMock(return_value={"timestamp": 12345})
+        adapter._runtime = mock_runtime
+
+        message = OutboundMessage(
+            channel_type="signal",
+            account_id="acct-1",
+            chat_id="+420111222333",
+            content="https://example.com/image.png",
+            platform_data={
+                "signal_preview": {
+                    "url": "https://example.com/image.png",
+                    "title": "banner.png",
+                    "image": "https://example.com/image.png",
+                }
+            },
+        )
+
+        result = await adapter._send_direct(message)
+
+        assert result == "12345"
+        called_params = mock_runtime.request.await_args.args[1]
+        assert called_params["previewUrl"] == "https://example.com/image.png"
+        assert called_params["previewTitle"] == "banner.png"
+        assert called_params["previewImage"] == "https://example.com/image.png"
+
 
 class TestDirectRuntimeFatalFailures:
     @pytest.mark.asyncio

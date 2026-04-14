@@ -891,11 +891,13 @@ class ChannelTurnObserver:
         """Send the accumulated response to the channel."""
         # Extract outbound attachments from the turn result
         outbound_media: list[MediaAttachment] = []
+        raw_result_attachments: list[dict[str, Any]] = []
         if result is not None:
             result_attachments = getattr(result, "attachments", None)
             if isinstance(result_attachments, list):
                 for att in result_attachments:
                     if isinstance(att, dict):
+                        raw_result_attachments.append(att)
                         outbound_media.append(
                             await _materialize_turn_attachment(att, self._channel_manager_ref())
                         )
@@ -917,7 +919,7 @@ class ChannelTurnObserver:
             return
 
         try:
-            await adapter.send_message(
+            delivery_id = await adapter.send_message(
                 OutboundMessage(
                     channel_type=self._channel_type,
                     account_id=self._account_id,
@@ -928,6 +930,29 @@ class ChannelTurnObserver:
                     media=outbound_media,
                 )
             )
+            if self._channel_type == "signal" and (
+                not isinstance(delivery_id, str) or not delivery_id.strip()
+            ):
+                logger.warning(
+                    "channel observer: primary Signal delivery returned no message id",
+                    extra={
+                        "extra_data": {
+                            "channel_type": self._channel_type,
+                            "account_id": self._account_id,
+                            "conversation_id": self._conversation_id,
+                            "has_text": bool(content),
+                            "media_count": len(outbound_media),
+                            "fallback_candidate_count": len(raw_result_attachments),
+                        }
+                    },
+                )
+                fallback_sent = await self._send_signal_image_fallback(
+                    adapter=adapter,
+                    text=content,
+                    attachments=raw_result_attachments,
+                )
+                if not fallback_sent:
+                    return
             CHANNEL_OUTBOUND_TOTAL.labels(
                 channel_type=self._channel_type,
                 account_id=self._account_id,
@@ -946,6 +971,62 @@ class ChannelTurnObserver:
                 },
                 exc_info=True,
             )
+
+    async def _send_signal_image_fallback(
+        self,
+        *,
+        adapter: BaseChannelAdapter,
+        text: str,
+        attachments: list[dict[str, Any]],
+    ) -> bool:
+        if self._channel_type != "signal":
+            return False
+        preview = _signal_image_preview_payload(attachments)
+        if preview is None:
+            return False
+        fallback_text = text.strip()
+        if preview["url"] not in fallback_text:
+            fallback_text = (
+                f"{fallback_text}\n\n{preview['url']}" if fallback_text else preview["url"]
+            )
+        logger.info(
+            "channel observer: using Signal image fallback preview",
+            extra={
+                "extra_data": {
+                    "channel_type": self._channel_type,
+                    "account_id": self._account_id,
+                    "conversation_id": self._conversation_id,
+                    "has_text": bool(text.strip()),
+                    "preview_url_present": True,
+                }
+            },
+        )
+        try:
+            fallback_id = await adapter.send_message(
+                OutboundMessage(
+                    channel_type=self._channel_type,
+                    account_id=self._account_id,
+                    chat_id=self._chat_id,
+                    content=fallback_text,
+                    reply_to_id=self._reply_to_id,
+                    thread_id=self._thread_id,
+                    platform_data={"signal_preview": preview},
+                )
+            )
+        except Exception:
+            logger.warning(
+                "channel observer: Signal image fallback failed",
+                extra={
+                    "extra_data": {
+                        "channel_type": self._channel_type,
+                        "account_id": self._account_id,
+                        "conversation_id": self._conversation_id,
+                    }
+                },
+                exc_info=True,
+            )
+            return False
+        return isinstance(fallback_id, str) and bool(fallback_id.strip())
 
     async def on_turn_error(self, conversation_id: str, error: Any) -> None:
         """Send error message to the channel."""
@@ -1088,3 +1169,22 @@ async def _materialize_turn_attachment(att: dict[str, Any], manager: Any) -> Med
         size_bytes=att.get("size_bytes"),
         content_b64=content_b64,
     )
+
+
+def _signal_image_preview_payload(attachments: list[dict[str, Any]]) -> dict[str, str] | None:
+    for attachment in attachments:
+        mime_type = attachment.get("mime_type")
+        url = attachment.get("url")
+        if not isinstance(mime_type, str) or not mime_type.startswith("image/"):
+            continue
+        if not isinstance(url, str) or not url:
+            continue
+        filename = attachment.get("filename")
+        preview = {
+            "url": url,
+            "image": url,
+        }
+        if isinstance(filename, str) and filename:
+            preview["title"] = filename
+        return preview
+    return None

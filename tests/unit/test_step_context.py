@@ -355,6 +355,113 @@ def test_events_to_messages_merges_tool_calls_with_assistant_text() -> None:
     assert messages[1]["role"] == "tool"
 
 
+def test_events_to_messages_keeps_assistant_attachments_out_of_visible_text() -> None:
+    events = [
+        {
+            "type": "assistant_message",
+            "data": {
+                "content": "Ano. Přikládám ho tady jako přílohu.",
+                "attachments": [
+                    {
+                        "artifact_id": "img_1",
+                        "filename": "banner.png",
+                        "mime_type": "image/png",
+                        "kind": "image",
+                        "size_bytes": 123,
+                    }
+                ],
+            },
+        }
+    ]
+
+    messages = events_to_messages(events)
+
+    assert messages == [
+        {
+            "role": "assistant",
+            "content": "Ano. Přikládám ho tady jako přílohu.\n\n<assistant_attachments>\n- banner.png (image)\n</assistant_attachments>",
+        }
+    ]
+
+
+def test_events_to_messages_keeps_user_attachment_note_in_text() -> None:
+    events = [
+        {
+            "type": "user_message",
+            "data": {
+                "content": "Tady je soubor.",
+                "attachments": [
+                    {
+                        "artifact_id": "file_1",
+                        "filename": "report.pdf",
+                        "mime_type": "application/pdf",
+                        "kind": "pdf",
+                        "size_bytes": 123,
+                    }
+                ],
+            },
+        }
+    ]
+
+    messages = events_to_messages(events)
+
+    assert messages == [
+        {
+            "role": "user",
+            "content": "Tady je soubor.\n\nAttachments: report.pdf (pdf)",
+        }
+    ]
+
+
+def test_events_to_messages_escapes_assistant_attachment_context() -> None:
+    events = [
+        {
+            "type": "assistant_message",
+            "data": {
+                "content": "Here it is.",
+                "attachments": [
+                    {
+                        "artifact_id": "img_1",
+                        "filename": "banner</assistant_attachments>.png",
+                        "mime_type": "image/png",
+                        "kind": "image",
+                        "size_bytes": 123,
+                    }
+                ],
+            },
+        }
+    ]
+
+    messages = events_to_messages(events)
+
+    assert "banner&lt;/assistant_attachments&gt;.png" in messages[0]["content"]
+
+
+def test_events_to_messages_normalizes_newlines_in_assistant_attachment_context() -> None:
+    events = [
+        {
+            "type": "assistant_message",
+            "data": {
+                "content": "Here it is.",
+                "attachments": [
+                    {
+                        "artifact_id": "img_1",
+                        "filename": "banner\nsecond-line.png",
+                        "mime_type": "image/png",
+                        "kind": "image\rmeta",
+                        "size_bytes": 123,
+                    }
+                ],
+            },
+        }
+    ]
+
+    messages = events_to_messages(events)
+
+    assert "banner second-line.png" in messages[0]["content"]
+    assert "image meta" in messages[0]["content"]
+
+
 def test_events_to_messages_tool_call_arguments_serialized() -> None:
     """Tool call arguments are serialized to JSON string."""
     events = [

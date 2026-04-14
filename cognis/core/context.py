@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import html
 import json
 import re
 from typing import Any
@@ -1061,6 +1062,22 @@ def events_to_messages(events: list[Any]) -> list[dict[str, Any]]:
                 }
             )
 
+    def _assistant_attachment_context(attachments: list[dict[str, Any]]) -> str:
+        lines: list[str] = []
+        for attachment in attachments:
+            filename = (
+                str(attachment.get("filename") or attachment.get("artifact_id") or "attachment")
+                .replace("\r", " ")
+                .replace("\n", " ")
+            )
+            kind = (
+                str(attachment.get("kind") or attachment.get("mime_type") or "file")
+                .replace("\r", " ")
+                .replace("\n", " ")
+            )
+            lines.append(f"- {html.escape(filename, quote=True)} ({html.escape(kind, quote=True)})")
+        return "<assistant_attachments>\n" + "\n".join(lines) + "\n</assistant_attachments>"
+
     for event in events:
         if isinstance(event, dict):
             event_type = str(event.get("type", ""))
@@ -1107,7 +1124,7 @@ def events_to_messages(events: list[Any]) -> list[dict[str, Any]]:
             if isinstance(content, str):
                 attachments = event_data.get("attachments")
                 if isinstance(attachments, list) and attachments:
-                    content = f"{content}\n\n{_attachment_note([a for a in attachments if isinstance(a, dict)])}"
+                    content = f"{content}\n\n{_assistant_attachment_context([a for a in attachments if isinstance(a, dict)])}"
                 messages.append({"role": "assistant", "content": content})
         elif event_type == "tool_result":
             # The agent loop stores tool output under key "result";

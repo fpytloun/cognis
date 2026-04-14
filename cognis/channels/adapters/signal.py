@@ -72,6 +72,18 @@ def _is_fatal_signal_error(message: str) -> bool:
     return any(marker in lowered for marker in fatal_markers)
 
 
+def _signal_preview_payload(platform_data: dict[str, Any]) -> dict[str, str]:
+    preview = platform_data.get("signal_preview")
+    if not isinstance(preview, dict):
+        return {}
+    normalized: dict[str, str] = {}
+    for key in ("url", "title", "description", "image"):
+        value = preview.get(key)
+        if isinstance(value, str) and value:
+            normalized[key] = value
+    return normalized
+
+
 # ---------------------------------------------------------------------------
 # Internal typed config
 # ---------------------------------------------------------------------------
@@ -481,12 +493,16 @@ class SignalAdapter(BaseChannelAdapter):
             return None
 
         last_message_id: str | None = None
+        media_chunk_message_id: str | None = None
         for index, chunk in enumerate(chunks or [None]):
+            platform_data = dict(message.platform_data)
+            if index > 0:
+                platform_data.pop("signal_preview", None)
             chunk_message = message.model_copy(
                 update={
                     "content": chunk.plain_text if chunk is not None else message.content,
                     "platform_data": {
-                        **message.platform_data,
+                        **platform_data,
                         "signal_markdown_text": chunk.markdown_text
                         if chunk is not None
                         else message.content,
@@ -498,10 +514,16 @@ class SignalAdapter(BaseChannelAdapter):
                 }
             )
             if self._signal_config and self._signal_config.is_direct:
-                last_message_id = await self._send_direct(chunk_message)
+                chunk_message_id = await self._send_direct(chunk_message)
             else:
-                last_message_id = await self._send_rest(chunk_message)
-        return last_message_id
+                chunk_message_id = await self._send_rest(chunk_message)
+            if index == 0 and message.media:
+                media_chunk_message_id = chunk_message_id
+                if not isinstance(chunk_message_id, str) or not chunk_message_id.strip():
+                    return None
+            if isinstance(chunk_message_id, str) and chunk_message_id.strip():
+                last_message_id = chunk_message_id
+        return media_chunk_message_id or last_message_id
 
     async def _send_rest(self, message: OutboundMessage) -> str | None:
         """Send via REST API."""
@@ -523,6 +545,17 @@ class SignalAdapter(BaseChannelAdapter):
 
         if message.reply_to_id:
             payload["quote_timestamp"] = message.reply_to_id
+
+        preview = _signal_preview_payload(message.platform_data)
+        if preview:
+            if "url" in preview:
+                payload["preview_url"] = preview["url"]
+            if "title" in preview:
+                payload["preview_title"] = preview["title"]
+            if "description" in preview:
+                payload["preview_description"] = preview["description"]
+            if "image" in preview:
+                payload["preview_image"] = preview["image"]
 
         if message.media:
             b64_attachments: list[str] = []
@@ -589,6 +622,17 @@ class SignalAdapter(BaseChannelAdapter):
         text_styles = message.platform_data.get("signal_text_styles")
         if isinstance(text_styles, list) and text_styles:
             params["textStyle"] = text_styles
+
+        preview = _signal_preview_payload(message.platform_data)
+        if preview:
+            if "url" in preview:
+                params["previewUrl"] = preview["url"]
+            if "title" in preview:
+                params["previewTitle"] = preview["title"]
+            if "description" in preview:
+                params["previewDescription"] = preview["description"]
+            if "image" in preview:
+                params["previewImage"] = preview["image"]
 
         if message.reply_to_id:
             logger.debug(

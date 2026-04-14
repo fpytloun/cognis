@@ -11,6 +11,7 @@ from cognis.channels.inbound import (
     _fallback_attachment_content,
     _filter_turn_attachments_for_voice_input,
     _prepare_audio_for_stt,
+    _signal_image_preview_payload,
     _stt_passthrough_target,
 )
 from cognis.core.commands import CommandResult
@@ -21,7 +22,7 @@ from cognis.models.channel import ChannelAccountConfig, InboundMessage, MediaAtt
 
 class _FakeAdapter:
     def __init__(self) -> None:
-        self.send_message = AsyncMock()
+        self.send_message = AsyncMock(return_value="msg-1")
         self.send_typing = AsyncMock()
         self.capabilities = MagicMock()
         self.capabilities.max_message_length = 4096
@@ -585,3 +586,110 @@ async def test_channel_turn_observer_logs_delivery_failure(
 
     adapter.send_message.assert_awaited_once()
     assert "final delivery failed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_channel_turn_observer_uses_signal_image_preview_fallback_on_missing_message_id() -> (
+    None
+):
+    adapter = _FakeAdapter()
+    adapter.send_message = AsyncMock(side_effect=[None, "fallback-1"])
+    manager = _FakeManager(adapter)
+    turn_scheduler = MagicMock()
+
+    observer = ChannelTurnObserver(
+        channel_type="signal",
+        account_id="acct-1",
+        chat_id="chat-1",
+        conversation_id="conv-1",
+        turn_scheduler=turn_scheduler,
+        reply_to_id="msg-1",
+        channel_manager_ref=lambda: manager,
+        assistant_delivery_mode="final",
+    )
+
+    await observer.on_token("conv-1", "sess-1", "msg-2", "Here is the banner")
+    await observer.on_turn_complete(
+        TurnResult(
+            conversation_id="conv-1",
+            session_id="sess-1",
+            message_id="msg-2",
+            attachments=[
+                {
+                    "url": "https://example.com/banner.png",
+                    "mime_type": "image/png",
+                    "filename": "banner.png",
+                    "size_bytes": 123,
+                }
+            ],
+        )
+    )
+
+    assert adapter.send_message.await_count == 2
+    fallback = adapter.send_message.await_args_list[1].args[0]
+    assert fallback.content == "Here is the banner\n\nhttps://example.com/banner.png"
+    assert fallback.platform_data["signal_preview"] == {
+        "url": "https://example.com/banner.png",
+        "image": "https://example.com/banner.png",
+        "title": "banner.png",
+    }
+
+
+def test_signal_image_preview_payload_prefers_first_image_with_url() -> None:
+    preview = _signal_image_preview_payload(
+        [
+            {
+                "url": "https://example.com/file.pdf",
+                "mime_type": "application/pdf",
+                "filename": "file.pdf",
+            },
+            {
+                "url": "https://example.com/banner.png",
+                "mime_type": "image/png",
+                "filename": "banner.png",
+            },
+        ]
+    )
+
+    assert preview == {
+        "url": "https://example.com/banner.png",
+        "image": "https://example.com/banner.png",
+        "title": "banner.png",
+    }
+
+
+@pytest.mark.asyncio
+async def test_channel_turn_observer_does_not_fallback_for_non_signal_missing_message_id() -> None:
+    adapter = _FakeAdapter()
+    adapter.send_message = AsyncMock(return_value=None)
+    manager = _FakeManager(adapter)
+    turn_scheduler = MagicMock()
+
+    observer = ChannelTurnObserver(
+        channel_type="telegram",
+        account_id="acct-1",
+        chat_id="chat-1",
+        conversation_id="conv-1",
+        turn_scheduler=turn_scheduler,
+        reply_to_id="msg-1",
+        channel_manager_ref=lambda: manager,
+        assistant_delivery_mode="final",
+    )
+
+    await observer.on_turn_complete(
+        TurnResult(
+            conversation_id="conv-1",
+            session_id="sess-1",
+            message_id="msg-2",
+            attachments=[
+                {
+                    "url": "https://example.com/banner.png",
+                    "mime_type": "image/png",
+                    "filename": "banner.png",
+                    "size_bytes": 123,
+                }
+            ],
+        )
+    )
+
+    adapter.send_message.assert_awaited_once()
