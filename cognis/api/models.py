@@ -729,6 +729,7 @@ class CredentialResponse(BaseModel):
     kind: str
     label: str
     metadata: dict[str, Any] = Field(default_factory=dict)
+    field_names: list[str] = Field(default_factory=list)
     scope: str = "user"
     agent_id: str | None = None
     description: str | None = None

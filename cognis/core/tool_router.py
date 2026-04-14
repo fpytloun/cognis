@@ -20,7 +20,7 @@ from cognis.core.truncation import middle_truncate
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.artifact import ArtifactKind
-from cognis.models.credential import CredentialResolution
+from cognis.models.credential import CredentialAccessError, CredentialResolution
 from cognis.models.session import SessionModel
 from cognis.models.tool import ExecutorHandle, Permission, ToolCall, ToolResult, stable_tool_id
 from cognis.store.queries import create_artifact_record, get_artifact_record, get_setting_value
@@ -53,6 +53,11 @@ IMAGE_GENERATION_TOTAL = Counter(
 )
 
 logger = get_logger(__name__)
+
+_AUTH_STATE_KIND_HINT = (
+    "Use browser_fill value_ref for raw credential fields; use auth_state_ref only "
+    "for browser_storage_state credentials."
+)
 
 
 class ToolRoute(StrEnum):
@@ -247,8 +252,6 @@ class ToolRouter:
             },
         )
         TOOL_ROUTE_DECISIONS.labels(route=str(route)).inc()
-        if route is ToolRoute.LOCAL:
-            tool_call = await self._prepare_local_tool_call(tool_call, session, agent)
         if route is ToolRoute.UNKNOWN:
             TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome="unknown").inc()
             return self._sanitize_result(
@@ -428,6 +431,18 @@ class ToolRouter:
                 call_id=cid,
             )
 
+        try:
+            if route is ToolRoute.LOCAL:
+                tool_call = await self._prepare_local_tool_call(tool_call, session, agent)
+        except CredentialAccessError as exc:
+            TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome="failure").inc()
+            return self._sanitize_result(
+                tool_call.name,
+                self._credential_error_result(exc),
+                _tool_max_size(registry, tool_call.name),
+                call_id=cid,
+            )
+
         decision = await self.evaluate_tool_call(tool_call, agent, session, registry)
         eval_meta: dict[str, Any] = {
             "decision": decision.decision,
@@ -473,12 +488,15 @@ class ToolRouter:
         scoped_tool_call = tool_call.model_copy(update={"execution_scope_id": session.session_id})
 
         if registered_tool.handler is not None:
-            result = await self._execute_local_handler(
-                scoped_tool_call,
-                registered_tool=registered_tool,
-                executor=executor,
-            )
-            result = await self._persist_browser_auth_state_if_needed(result, session, agent)
+            try:
+                result = await self._execute_local_handler(
+                    scoped_tool_call,
+                    registered_tool=registered_tool,
+                    executor=executor,
+                )
+                result = await self._persist_browser_auth_state_if_needed(result, session, agent)
+            except CredentialAccessError as exc:
+                result = self._credential_error_result(exc)
             result = await self._materialize_inline_attachments(result, session, tool_call.name)
             if result.metadata is None:
                 result = result.model_copy(update={"metadata": {"evaluation": eval_meta}})
@@ -504,6 +522,8 @@ class ToolRouter:
             )
             result = await self._persist_browser_auth_state_if_needed(result, session, agent)
             result = await self._materialize_inline_attachments(result, session, tool_call.name)
+        except CredentialAccessError as exc:
+            result = self._credential_error_result(exc)
         except TimeoutError:
             await executor.cancel_call(tool_call.call_id)
             result = ToolResult(output="Tool execution timed out.", is_error=True)
@@ -623,13 +643,20 @@ class ToolRouter:
                 credential_id, session.user_email
             )
             if record is None or record.kind != "browser_storage_state":
-                raise PermissionError(
-                    "auth_state_ref must reference a browser_storage_state credential"
+                raise CredentialAccessError(
+                    "credential_wrong_kind",
+                    "auth_state_ref must reference a browser_storage_state credential",
+                    credential_id=credential_id,
+                    hint=_AUTH_STATE_KIND_HINT,
                 )
             target_url = str(resolved.get("url", ""))
             origin = str((record.metadata or {}).get("origin") or "")
             if not origin:
-                raise PermissionError("auth_state_ref is missing a bound origin")
+                raise CredentialAccessError(
+                    "credential_origin_missing",
+                    "auth_state_ref is missing a bound origin",
+                    credential_id=credential_id,
+                )
             origin_parts = urlparse(origin)
             target_parts = urlparse(target_url)
             if (
@@ -639,7 +666,11 @@ class ToolRouter:
                 or (origin_parts.port or _default_port(origin_parts.scheme))
                 != (target_parts.port or _default_port(target_parts.scheme))
             ):
-                raise PermissionError("auth_state_ref origin does not match target URL")
+                raise CredentialAccessError(
+                    "credential_origin_mismatch",
+                    "auth_state_ref origin does not match target URL",
+                    credential_id=credential_id,
+                )
             if isinstance(cred.value, dict):
                 if isinstance(cred.value.get("storage_state"), dict):
                     resolved["auth_state"] = cred.value["storage_state"]
@@ -690,7 +721,11 @@ class ToolRouter:
         if agent.permissions is not None and credential_id not in set(
             agent.permissions.allowed_credentials
         ):
-            raise PermissionError(f"Credential not allowed for agent: {credential_id}")
+            raise CredentialAccessError(
+                "credential_not_allowed",
+                f"Credential not allowed for agent: {credential_id}",
+                credential_id=credential_id,
+            )
         created = await self.credentials_provider.upsert_credential(
             credential_id=credential_id,
             user_email=session.user_email,
@@ -710,6 +745,17 @@ class ToolRouter:
                 "output": f"Saved browser auth state as credential '{created.credential_id}'.",
             }
         )
+
+    def _credential_error_result(self, exc: CredentialAccessError) -> ToolResult:
+        metadata: dict[str, Any] = {"code": exc.code, "recoverable": True}
+        if exc.credential_id:
+            metadata["credential_id"] = exc.credential_id
+        if exc.field:
+            metadata["field"] = exc.field
+        if exc.hint:
+            metadata["hint"] = exc.hint
+        output = exc.message if not exc.hint else f"{exc.message} Hint: {exc.hint}"
+        return ToolResult(output=output, is_error=True, metadata=metadata)
 
     async def _load_text_artifact(self, artifact_id: str, user_email: str) -> str:
         if self._session_factory is None or self.artifact_store is None:

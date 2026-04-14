@@ -117,15 +117,33 @@ function createMessageItem(
 
 let _noticeCounter = 0;
 
-function createNotice(title: string, description: string, tone: NoticeTimelineItem['tone'] = 'info'): NoticeTimelineItem {
+function createNotice(
+  title: string,
+  description: string,
+  tone: NoticeTimelineItem['tone'] = 'info',
+  id?: string
+): NoticeTimelineItem {
   return {
-    id: `notice:${++_noticeCounter}:${title}`,
+    id: id ?? `notice:${++_noticeCounter}:${title}`,
     kind: 'notice',
     title,
     description,
     tone,
     timestamp: new Date().toISOString()
   };
+}
+
+function removeTaskPauseNotices(items: TimelineItem[], taskId: string): TimelineItem[] {
+  return items.filter((item) => {
+    if (item.kind !== 'notice') return true;
+    return !item.description.includes(`Task ${taskId} paused at `);
+  });
+}
+
+function removeWorkflowPromptNotices(items: TimelineItem[]): TimelineItem[] {
+  return items.filter(
+    (item) => item.kind !== 'notice' || !item.id.startsWith('notice:workflow_')
+  );
 }
 
 export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
@@ -468,7 +486,7 @@ export function appendOptimisticUserMessage(items: TimelineItem[], content: stri
 }
 
 export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocketEvent): TimelineItem[] {
-  const next = [...items];
+  let next = [...items];
 
   if (event.type === 'user_message') {
     const itemId = `user-msg:${Date.now()}:${next.length}`;
@@ -711,6 +729,7 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
     event.type === 'workflow_failed' ||
     event.type === 'workflow_cancelled'
   ) {
+    next = removeTaskPauseNotices(next, event.task_id);
     const taskId = event.task_id;
     const itemId = `delegation:${taskId}`;
     let index = next.findIndex((item) => item.id === itemId && item.kind === 'delegation');
@@ -822,8 +841,15 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
     return next;
   }
 
+  if (event.type === 'reconnected') {
+    return removeWorkflowPromptNotices(next);
+  }
+
   if (event.type === 'workflow_gate' || event.type === 'workflow_step_question') {
     const isDirectQuestion = event.type === 'workflow_step_question' && !event.task_id;
+    const noticeId = event.notification_id
+      ? `notice:${event.type}:${event.notification_id}`
+      : undefined;
     const title = event.type === 'workflow_gate'
       ? 'Task waiting for approval'
       : isDirectQuestion
@@ -838,9 +864,17 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
       createNotice(
         title,
         description,
-        'info'
+        'info',
+        noticeId
       )
     );
+    return next;
+  }
+
+  if (event.type === 'workflow_gate_resolved' || event.type === 'workflow_step_question_resolved') {
+    if (!event.notification_id) return next;
+    const sourceType = event.type === 'workflow_gate_resolved' ? 'workflow_gate' : 'workflow_step_question';
+    return next.filter((item) => item.id !== `notice:${sourceType}:${event.notification_id}`);
   }
 
   return next;

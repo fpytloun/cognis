@@ -52,6 +52,26 @@
 
   type SettingsTab = 'providers' | 'routing' | 'secrets' | 'web' | 'tools' | 'executors' | 'users' | 'system' | 'account';
 
+  type CredentialKind = 'token' | 'text' | 'username_password' | 'totp_seed' | 'recovery_codes' | 'browser_storage_state';
+
+  const CREDENTIAL_PAYLOAD_TEMPLATES: Record<CredentialKind, string> = {
+    token: '{\n  "token": ""\n}',
+    text: '{\n  "value": ""\n}',
+    username_password: '{\n  "username": "",\n  "password": ""\n}',
+    totp_seed: '{\n  "issuer": "",\n  "account_name": "",\n  "secret": ""\n}',
+    recovery_codes: '{\n  "codes": []\n}',
+    browser_storage_state: '{\n  "storage_state": {\n    "cookies": [],\n    "origins": []\n  }\n}'
+  };
+
+  const CREDENTIAL_METADATA_HINTS: Record<CredentialKind, string> = {
+    token: 'Optional metadata can capture safe context such as provider, origin, or tags.',
+    text: 'Use metadata for safe labels like provider, origin, or intended purpose.',
+    username_password: 'Store safe metadata like origin, login_url, or provider. Username and password belong in payload.',
+    totp_seed: 'Metadata can describe the site or login flow. Keep the actual seed in payload.secret.',
+    recovery_codes: 'Metadata can describe issuer or origin. Put recovery codes in payload.codes.',
+    browser_storage_state: 'Set metadata.origin to the bound site origin when entering this manually, for example https://www.rohlik.cz.'
+  };
+
   const ALL_TABS: SettingsTab[] = ['providers', 'routing', 'secrets', 'web', 'tools', 'executors', 'users', 'system', 'account'];
   const TAB_LABELS: Record<SettingsTab, string> = {
     providers: 'providers',
@@ -148,7 +168,7 @@
     credential_id: '',
     kind: 'token',
     label: '',
-    payload_json: '{\n  "token": ""\n}',
+    payload_json: CREDENTIAL_PAYLOAD_TEMPLATES.token,
     metadata_json: '{}',
     scope: 'user',
     agent_id: '',
@@ -161,6 +181,24 @@
     new_password: '',
     confirm_password: ''
   });
+
+  function credentialPayloadTemplate(kind: string): string {
+    return CREDENTIAL_PAYLOAD_TEMPLATES[(kind as CredentialKind)] ?? '{}';
+  }
+
+  function credentialMetadataHint(kind: string): string {
+    return CREDENTIAL_METADATA_HINTS[(kind as CredentialKind)] ?? 'Metadata is optional and should contain only safe, non-secret context.';
+  }
+
+  function updateCredentialKind(nextKind: string): void {
+    const previousTemplate = credentialPayloadTemplate(credentialForm.kind);
+    const trimmedPayload = credentialForm.payload_json.trim();
+    const shouldReplacePayload = !trimmedPayload || trimmedPayload === previousTemplate.trim();
+    credentialForm.kind = nextKind;
+    if (shouldReplacePayload) {
+      credentialForm.payload_json = credentialPayloadTemplate(nextKind);
+    }
+  }
 
   function snapshotState(): string {
     return JSON.stringify({
@@ -752,6 +790,30 @@
     try {
       const payload = JSON.parse(credentialForm.payload_json || '{}');
       const metadata = JSON.parse(credentialForm.metadata_json || '{}');
+      if (credentialForm.kind === 'browser_storage_state') {
+        const origin = typeof metadata.origin === 'string' ? metadata.origin.trim() : '';
+        const storageState = typeof payload.storage_state === 'object' && payload.storage_state !== null
+          ? payload.storage_state
+          : null;
+        if (!storageState) {
+          error = 'Browser auth state credentials require payload.storage_state with cookies/origins data.';
+          return;
+        }
+        if (!origin) {
+          error = 'Browser auth state credentials require metadata.origin, for example https://www.rohlik.cz.';
+          return;
+        }
+        try {
+          const parsed = new URL(origin);
+          if (!parsed.protocol || !parsed.host) {
+            error = 'metadata.origin must be a full origin URL such as https://www.rohlik.cz.';
+            return;
+          }
+        } catch {
+          error = 'metadata.origin must be a valid origin URL such as https://www.rohlik.cz.';
+          return;
+        }
+      }
       await api.credentials.upsert({
         credential_id: credentialForm.credential_id,
         kind: credentialForm.kind,
@@ -767,7 +829,7 @@
         ...credentialForm,
         credential_id: '',
         label: '',
-        payload_json: '{\n  "token": ""\n}',
+        payload_json: credentialPayloadTemplate(credentialForm.kind),
         metadata_json: '{}',
         agent_id: '',
         description: '',
@@ -1610,7 +1672,7 @@
             </label>
             <label class="space-y-2 text-sm font-medium text-slate-200">
               <span>Kind</span>
-              <select bind:value={credentialForm.kind} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+              <select bind:value={credentialForm.kind} onchange={(event) => updateCredentialKind((event.currentTarget as HTMLSelectElement).value)} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
                 <option value="token">Token</option>
                 <option value="text">Text</option>
                 <option value="username_password">Username/password</option>
@@ -1626,10 +1688,12 @@
             <label class="space-y-2 text-sm font-medium text-slate-200">
               <span>Payload (JSON)</span>
               <textarea bind:value={credentialForm.payload_json} class="min-h-[140px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 font-mono text-sm text-slate-100"></textarea>
+              <span class="block text-xs text-slate-400">Expected payload template for <code>{credentialForm.kind}</code>. For login forms use <code>username</code>/<code>password</code>; for saved browser reuse use <code>browser_storage_state</code>.</span>
             </label>
             <label class="space-y-2 text-sm font-medium text-slate-200">
               <span>Metadata (JSON)</span>
               <textarea bind:value={credentialForm.metadata_json} class="min-h-[120px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 font-mono text-sm text-slate-100"></textarea>
+              <span class="block text-xs text-slate-400">{credentialMetadataHint(credentialForm.kind)}</span>
             </label>
             <label class="space-y-2 text-sm font-medium text-slate-200">
               <span>Scope</span>

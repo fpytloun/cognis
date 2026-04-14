@@ -676,10 +676,6 @@ class WebSocketConnectionManager:
                     )
                     replayed += 1
 
-        pending_pauses = await _load_pending_task_prompts(self.app, conversation_id)
-        for payload in pending_pauses:
-            await connection.send_json(payload)
-
         if (
             session.session_id in set(getattr(self.app.state, "recovered_session_ids", []))
             and session.session_id not in connection.recovery_notified
@@ -702,6 +698,11 @@ class WebSocketConnectionManager:
                 "last_seq": result.last_seq,
             }
         )
+
+        pending_pauses = await _load_pending_task_prompts(self.app, conversation_id)
+        for payload in pending_pauses:
+            await connection.send_json(payload)
+
         WS_RECONNECTIONS_TOTAL.inc()
         WS_MISSED_EVENTS_REPLAYED.inc(replayed)
 
@@ -1573,6 +1574,20 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
                 "type": "escalation_resolved",
                 "conversation_id": conversation_id,
                 "call_id": event.data.get("notification_id"),
+                "decision": event.data.get("decision"),
+            }
+        if ntype == "gate":
+            return {
+                "type": "workflow_gate_resolved",
+                "conversation_id": conversation_id,
+                "notification_id": event.data.get("notification_id"),
+                "decision": event.data.get("decision"),
+            }
+        if ntype == "step_question":
+            return {
+                "type": "workflow_step_question_resolved",
+                "conversation_id": conversation_id,
+                "notification_id": event.data.get("notification_id"),
                 "decision": event.data.get("decision"),
             }
     if event.type == EventType.USER_MESSAGE:

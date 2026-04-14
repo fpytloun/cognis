@@ -7,7 +7,7 @@ import pytest
 
 from cognis.core.tool_router import ToolRouter
 from cognis.models.agent import AgentDefinition, AgentPermissions
-from cognis.models.credential import CredentialRecord, CredentialResolution
+from cognis.models.credential import CredentialAccessError, CredentialRecord, CredentialResolution
 from cognis.models.tool import ExecutorHandle
 from cognis.tools.executor.browser import handlers as browser_handlers
 from cognis.tools.executor.browser.handlers import (
@@ -25,6 +25,7 @@ from cognis.tools.executor.browser.handlers import (
     handle_browser_snapshot,
     handle_browser_submit_form,
     handle_browser_type,
+    handle_browser_wait_for,
 )
 from cognis.tools.registry import ToolExecutionContext
 
@@ -256,6 +257,12 @@ class _FakePage:
 
     async def title(self) -> str:
         return "Settings"
+
+    async def wait_for_selector(self, selector: str, timeout: int) -> None:
+        self.last_wait_for_selector = (selector, timeout)
+
+    async def wait_for_timeout(self, timeout: int) -> None:
+        self.last_wait_for_timeout = timeout
 
 
 class _FakeManager:
@@ -712,7 +719,7 @@ async def test_tool_router_rejects_cross_origin_auth_state_ref() -> None:
         guardrails=SimpleNamespace(),
         credentials_provider=_FakeCredentialsProvider("https://github.com"),
     )
-    with pytest.raises(PermissionError):
+    with pytest.raises(CredentialAccessError, match="origin does not match"):
         await router._resolve_credential_refs(  # noqa: SLF001
             {"url": "https://evil.example", "auth_state_ref": "$credential:github_state"},
             SimpleNamespace(user_email="user@example.com"),
@@ -763,3 +770,57 @@ async def test_tool_router_ignores_blank_value_ref() -> None:
     )
     assert "value" not in resolved
     assert "value_ref" not in resolved
+
+
+class _WrongKindCredentialsProvider(_FakeCredentialsProvider):
+    async def get_credential(self, credential_id: str, user_email: str) -> CredentialRecord:
+        del user_email
+        return CredentialRecord(
+            credential_id=credential_id,
+            user_email="user@example.com",
+            kind="username_password",
+            label="Saved state",
+            metadata={"origin": self.origin},
+        )
+
+
+@pytest.mark.asyncio
+async def test_tool_router_auth_state_wrong_kind_includes_hint() -> None:
+    router = ToolRouter(
+        guardrails=SimpleNamespace(),
+        credentials_provider=_WrongKindCredentialsProvider("https://github.com"),
+    )
+
+    with pytest.raises(CredentialAccessError, match="browser_storage_state") as excinfo:
+        await router._resolve_credential_refs(  # noqa: SLF001
+            {"url": "https://github.com/settings", "auth_state_ref": "$credential:github_state"},
+            SimpleNamespace(user_email="user@example.com"),
+            AgentDefinition(
+                agent_id="agent-1",
+                owner_email="user@example.com",
+                name="Agent",
+                permissions=AgentPermissions(allowed_credentials=["github_state"]),
+            ),
+        )
+
+    assert excinfo.value.code == "credential_wrong_kind"
+    assert excinfo.value.hint is not None
+    assert "browser_fill value_ref" in excinfo.value.hint
+
+
+@pytest.mark.asyncio
+async def test_browser_wait_for_rejects_mixed_selector_syntax(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _FakeManager()
+    monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
+
+    with pytest.raises(ValueError, match="only supports CSS selectors"):
+        await handle_browser_wait_for(
+            {
+                "session_id": "sess-1",
+                "selector": "input[name='email'], text=Košík",
+                "timeout_ms": 1000,
+            },
+            _context(),
+        )

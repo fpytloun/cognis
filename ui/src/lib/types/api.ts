@@ -900,6 +900,7 @@ export interface CredentialMetadata {
   kind: string;
   label: string;
   metadata: Record<string, unknown>;
+  field_names: string[];
   scope: string;
   agent_id: string | null;
   description: string | null;
@@ -1077,6 +1078,7 @@ export interface WebSocketWorkflowStepCompletedEvent {
 export interface WebSocketWorkflowGateEvent {
   type: 'workflow_gate';
   conversation_id?: string;
+  notification_id?: string;
   task_id: string;
   step_name?: string;
   message?: string;
@@ -1093,6 +1095,20 @@ export interface WebSocketWorkflowQuestionEvent {
   question?: string;
   options?: Array<Record<string, unknown>>;
   context?: Record<string, unknown>;
+}
+
+export interface WebSocketWorkflowGateResolvedEvent {
+  type: 'workflow_gate_resolved';
+  conversation_id?: string;
+  notification_id?: string;
+  decision?: string;
+}
+
+export interface WebSocketWorkflowQuestionResolvedEvent {
+  type: 'workflow_step_question_resolved';
+  conversation_id?: string;
+  notification_id?: string;
+  decision?: string;
 }
 
 export interface WebSocketWorkflowCompletedEvent {
@@ -1272,6 +1288,8 @@ export type CognisWebSocketEvent =
   | WebSocketWorkflowStepCompletedEvent
   | WebSocketWorkflowGateEvent
   | WebSocketWorkflowQuestionEvent
+  | WebSocketWorkflowGateResolvedEvent
+  | WebSocketWorkflowQuestionResolvedEvent
   | WebSocketWorkflowCompletedEvent
   | WebSocketWorkflowFailedEvent
   | WebSocketWorkflowCancelledEvent

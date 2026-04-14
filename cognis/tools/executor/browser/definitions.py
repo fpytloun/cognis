@@ -33,7 +33,7 @@ def browser_tool_definitions() -> list[ToolDefinition]:
                     },
                     "auth_state_ref": {
                         "type": "string",
-                        "description": "Optional $credential:<id> or $credential:<id>.<field> ref for saved browser auth state. Omit entirely if you do not have one.",
+                        "description": "Optional saved browser auth state ref. Must reference a browser_storage_state credential such as $credential:rohlik-browser. Use browser_fill value_ref for raw username/password fields instead.",
                     },
                 },
                 "required": ["url", "session_id"],
@@ -195,7 +195,7 @@ def browser_tool_definitions() -> list[ToolDefinition]:
             name="browser_fill",
             description=(
                 "Fill an input by exact ref or by selector using literal value or value_ref. "
-                "Selector mode fails if multiple viable candidates match."
+                "Selector mode fails if multiple viable candidates match. Example value_ref refs: $credential:rohlik.username or $credential:rohlik.password."
             ),
             parameters={
                 "type": "object",
@@ -287,7 +287,7 @@ def browser_tool_definitions() -> list[ToolDefinition]:
         ),
         ToolDefinition(
             name="browser_wait_for",
-            description="Wait for a selector or a timeout in the current page.",
+            description="Wait for a CSS selector or a timeout in the current page. For text-based detection, use browser_get_text instead.",
             parameters={
                 "type": "object",
                 "properties": {

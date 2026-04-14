@@ -174,6 +174,15 @@ _CANDIDATE_DISCOVERY_SCRIPT = r"""
 }
 """
 
+_PLAYWRIGHT_LOCATOR_PREFIXES = (
+    "text=",
+    "role=",
+    "xpath=",
+    "id=",
+    "data-testid=",
+    "data-test-id=",
+)
+
 
 def _browser_config(runtime_metadata: dict[str, Any]) -> dict[str, Any]:
     browser_cfg = runtime_metadata.get("browser")
@@ -232,6 +241,19 @@ def _get_manager(context: ToolExecutionContext) -> BrowserManager:
     )
     context.runtime_metadata[BROWSER_MANAGER_KEY] = manager
     return manager
+
+
+def _validate_css_selector(tool_name: str, selector: str) -> None:
+    normalized = selector.strip().lower()
+    if normalized.startswith(_PLAYWRIGHT_LOCATOR_PREFIXES):
+        raise ValueError(
+            f"{tool_name} only supports CSS selectors; use browser_get_text for text-based detection."
+        )
+    for prefix in _PLAYWRIGHT_LOCATOR_PREFIXES:
+        if f",{prefix}" in normalized or f", {prefix}" in normalized:
+            raise ValueError(
+                f"{tool_name} only supports CSS selectors; use browser_get_text for text-based detection."
+            )
 
 
 async def _discover_candidates(
@@ -716,6 +738,7 @@ async def handle_browser_wait_for(
     selector = arguments.get("selector")
     timeout_ms = int(arguments.get("timeout_ms", 10000) or 10000)
     if isinstance(selector, str) and selector:
+        _validate_css_selector("browser_wait_for", selector)
         await session.page.wait_for_selector(selector, timeout=timeout_ms)
     else:
         await session.page.wait_for_timeout(timeout_ms)

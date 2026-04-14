@@ -2361,6 +2361,7 @@ class AgentLoop:
                                 "label": row.label,
                                 "description": row.description,
                                 "metadata": metadata,
+                                "field_names": list(row.field_names or []),
                                 "status": row.status,
                                 "expires_at": row.expires_at.isoformat()
                                 if row.expires_at

@@ -9,6 +9,7 @@ import pytest
 
 from cognis.core.tool_router import ToolRoute, ToolRouter
 from cognis.models.agent import AgentDefinition, AgentPermissions
+from cognis.models.credential import CredentialAccessError
 from cognis.models.session import SessionModel
 from cognis.models.tool import (
     Permission,
@@ -111,6 +112,16 @@ class _ArtifactStore:
 
     async def async_load(self, namespace: str, object_id: str, filename: str) -> tuple[bytes, str]:
         return b"image-bytes", "image/png"
+
+
+class _CredentialFailingProvider:
+    async def resolve_ref(self, ref: str, *, agent: AgentDefinition, user_email: str) -> object:
+        del ref, agent, user_email
+        raise CredentialAccessError(
+            "credential_not_allowed",
+            "Credential not allowed for agent: rohlik",
+            credential_id="rohlik",
+        )
 
 
 def _registry_with_result_limit(max_result_size: int = 20) -> ToolRegistry:
@@ -392,6 +403,34 @@ async def test_tool_router_executes_registered_builtin_handler_locally() -> None
 
     assert executor.calls == 0
     assert '"executor_type": "websocket"' in result.output
+
+
+@pytest.mark.asyncio
+async def test_tool_router_returns_recoverable_result_for_credential_resolution_errors() -> None:
+    router = ToolRouter(
+        guardrails=_Guardrails(),
+        non_bypassable_patterns=[],
+        credentials_provider=_CredentialFailingProvider(),
+    )
+
+    result = await router.execute(
+        ToolCall(
+            call_id="cred-1",
+            name=sanitize_mcp_tool_name("filesystem", "read_file"),
+            arguments={"value_ref": "$credential:rohlik.username"},
+        ),
+        _session(),
+        _agent(),
+        _registry(),
+        _Executor(),
+    )
+
+    assert result.is_error is True
+    assert result.metadata is not None
+    assert result.metadata["code"] == "credential_not_allowed"
+    assert result.metadata["recoverable"] is True
+    assert result.metadata["credential_id"] == "rohlik"
+    assert "Credential not allowed for agent" in result.output
 
 
 @pytest.mark.asyncio

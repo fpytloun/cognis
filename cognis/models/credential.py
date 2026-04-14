@@ -30,6 +30,7 @@ class CredentialRecord(BaseModel):
     label: str
     description: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    field_names: list[str] = Field(default_factory=list)
     version: int = 1
     status: CredentialStatus = "active"
     created_at: datetime | None = None
@@ -45,3 +46,23 @@ class CredentialResolution(BaseModel):
     credential_id: str
     field: str | None = None
     value: Any
+
+
+class CredentialAccessError(Exception):
+    """Recoverable credential access failure that should surface as a tool error."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        credential_id: str | None = None,
+        field: str | None = None,
+        hint: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.credential_id = credential_id
+        self.field = field
+        self.hint = hint

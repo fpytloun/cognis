@@ -143,6 +143,56 @@ describe('chat timeline helpers', () => {
     });
   });
 
+  it('removes a workflow gate notice when the notification is resolved', () => {
+    const withNotice = applyWebSocketEvent([], {
+      type: 'workflow_gate',
+      notification_id: 'notif_gate_1',
+      task_id: 'task_1',
+      step_name: 'review'
+    });
+
+    const resolved = applyWebSocketEvent(withNotice, {
+      type: 'workflow_gate_resolved',
+      notification_id: 'notif_gate_1',
+      decision: 'continue'
+    });
+
+    expect(resolved).toHaveLength(0);
+  });
+
+  it('removes stale task pause notices when the workflow completes', () => {
+    const withNotice = applyWebSocketEvent([], {
+      type: 'workflow_gate',
+      task_id: 'task_1',
+      step_name: 'architect_review_exhausted'
+    });
+
+    const completed = applyWebSocketEvent(withNotice, {
+      type: 'workflow_completed',
+      task_id: 'task_1',
+      result: 'done'
+    });
+
+    expect(completed[0]).toMatchObject({ kind: 'delegation', taskId: 'task_1', status: 'completed' });
+    expect(completed.some((item) => item.kind === 'notice')).toBe(false);
+  });
+
+  it('drops workflow prompt notices on reconnect so only replayed pending prompts remain', () => {
+    const withNotice = applyWebSocketEvent([], {
+      type: 'workflow_step_question',
+      notification_id: 'notif_q_1',
+      question: 'Still needed?'
+    });
+
+    const reconnected = applyWebSocketEvent(withNotice, {
+      type: 'reconnected',
+      conversation_id: 'conv_1',
+      missed_events_count: 0
+    });
+
+    expect(reconnected.some((item) => item.kind === 'notice')).toBe(false);
+  });
+
   it('creates a placeholder tool block when persisted history contains a tool_result first', () => {
     const items = normalizeHistory([
       {

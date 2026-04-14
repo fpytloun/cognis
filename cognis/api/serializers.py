@@ -278,6 +278,7 @@ def credential_to_response(row: Any) -> CredentialResponse:
         kind=row.kind,
         label=row.label,
         metadata=metadata or {},
+        field_names=list(getattr(row, "field_names", []) or []),
         scope=row.scope,
         agent_id=row.agent_id,
         description=row.description,
