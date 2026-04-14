@@ -22,6 +22,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    false,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -521,7 +522,7 @@ class SkillRow(Base):
     prompt_templates: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     tags: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
     auto_load: Mapped[bool] = mapped_column(nullable=False, default=False, server_default="0")
-    is_system: Mapped[bool] = mapped_column(nullable=False, default=False, server_default="0")
+    is_system: Mapped[bool] = mapped_column(nullable=False, default=False, server_default=false())
     source: Mapped[str] = mapped_column(String, nullable=False, default="db")
     current_version_id: Mapped[str | None] = mapped_column(String, nullable=True)
     owner_email: Mapped[str | None] = mapped_column(

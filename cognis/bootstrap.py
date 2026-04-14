@@ -429,7 +429,7 @@ def _ensure_skill_system_column(sync_conn: object) -> None:
     execute = sync_conn.execute  # type: ignore[attr-defined]
 
     if "is_system" not in columns:
-        execute(text("ALTER TABLE skills ADD COLUMN is_system BOOLEAN NOT NULL DEFAULT 0"))
+        execute(text("ALTER TABLE skills ADD COLUMN is_system BOOLEAN NOT NULL DEFAULT FALSE"))
 
 
 def _ensure_schedule_extended_columns(sync_conn: object) -> None:
