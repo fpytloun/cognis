@@ -122,7 +122,7 @@
   let userEditForm = $state({ name: '', role: 'user' as UserRole });
   let accountNameForm = $state('');
   let accountNameDirty = $state(false);
-  let executorPollTimer = $state<ReturnType<typeof setInterval> | null>(null);
+  let executorPollTimer: ReturnType<typeof setInterval> | null = null;
 
   let routingForm = $state({
     default: '',
