@@ -480,6 +480,55 @@ class _StepCompleteValidationLLM:
         return
 
 
+class _FinalAssistantContentLLM:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def count_tokens(self, text: str, model: str | None = None) -> int:
+        del model
+        return len(text)
+
+    async def get_model_info(self, model: str | None) -> SimpleNamespace:
+        del model
+        return SimpleNamespace(
+            max_tools=None,
+            supports_parallel_tool_calls=False,
+            supports_tool_choice=False,
+            supports_cache_control=False,
+            supports_defer_loading=False,
+            provider="test",
+        )
+
+    async def stream_generate(self, messages: list[dict[str, object]], **_: object):
+        del messages
+        self.calls += 1
+        if self.calls == 1:
+            yield {
+                "choices": [{"delta": {"content": "Meta commentary that should not be evaluated."}}]
+            }
+            return
+        yield {"choices": [{"delta": {"content": "Final clean briefing text."}}]}
+        yield {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_done",
+                                "function": {
+                                    "name": "step_complete",
+                                    "arguments": '{"summary":"done","claims":["Delivered final text"]}',
+                                },
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+        return
+
+
 class _NoopRememberQueue:
     async def enqueue(self, _: object) -> None:
         return None
@@ -911,3 +960,42 @@ async def test_resolve_task_pause_tool_retries_gate_with_note() -> None:
     resolution = await pause_waiter.wait("gate-1", timeout=0.01)
     assert resolution.decision == "revise(plan)"
     assert resolution.data == {"note": "Incorporate the review and continue."}
+
+
+@pytest.mark.asyncio
+async def test_step_complete_uses_only_final_assistant_message_for_content() -> None:
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=_FinalAssistantContentLLM(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(
+            name="briefing", type="run", prompt="Produce the final briefing."
+        ),
+        session=SimpleNamespace(
+            session_id="sess-1",
+            intaris_session_id="sess-1",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-1", title=None, title_source="unset"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=WORKFLOW_POLICY,
+        user_message="Create the daily briefing.",
+        user_attachments=[],
+        system_initiated=False,
+    )
+
+    output = await agent_loop.run_step(ctx)
+
+    assert output is not None
+    assert output.content == "Final clean briefing text."

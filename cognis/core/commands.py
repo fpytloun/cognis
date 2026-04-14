@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from cognis.core.agent_loop import PauseResolution
+from cognis.core.notifications import NotificationType
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.session import ConversationModel, SessionModel
@@ -710,19 +711,14 @@ class CommandDispatcher:
     ) -> CommandResult | None:
         """Resolve a pending workflow gate for the current conversation."""
 
-        pending_gates = self._pause_waiter.list_pending(
-            pause_type="gate",
-            conversation_id=conversation.conversation_id,
-        )
-        if not pending_gates:
+        pending = await self._find_latest_gate_pause(conversation, user_email)
+        if pending is None:
             if allow_missing:
                 return None
             return CommandResult(
                 type="system_message",
                 text="No pending workflow gate to resolve.",
             )
-        # Resolve the most recently registered pending gate for this conversation.
-        pending = pending_gates[-1]
 
         decision = action
         if action == "retry":
@@ -781,6 +777,37 @@ class CommandDispatcher:
             type="system_message",
             text=f"Cancelled the paused workflow{note_suffix}",
         )
+
+    async def _find_latest_gate_pause(
+        self,
+        conversation: ConversationModel,
+        user_email: str,
+    ) -> Any | None:
+        """Return the latest persisted pending gate pause for this conversation."""
+
+        if self._notification_service is not None and hasattr(
+            self._notification_service, "list_pending"
+        ):
+            notifications = await self._notification_service.list_pending(
+                user_email,
+                conversation_id=conversation.conversation_id,
+            )
+            for notification in notifications:
+                if notification.notification_type != NotificationType.GATE:
+                    continue
+                pending = self._pause_waiter.get(notification.notification_id)
+                if pending is None or pending.resolved:
+                    return None
+                return pending
+            return None
+
+        pending_gates = self._pause_waiter.list_pending(
+            pause_type="gate",
+            conversation_id=conversation.conversation_id,
+        )
+        if not pending_gates:
+            return None
+        return pending_gates[-1]
 
     async def _handle_stop(self, conversation: ConversationModel) -> CommandResult:
         """Handle /stop or /cancel by aborting active work immediately."""

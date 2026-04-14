@@ -22,6 +22,7 @@ class _NotificationService:
         self.calls: list[tuple[str, str, dict[str, object]]] = []
         self.orphaned: list[tuple[str, str]] = []
         self.resolve_result = True
+        self.pending_notifications: list[object] = []
 
     async def resolve(
         self,
@@ -37,6 +38,12 @@ class _NotificationService:
     async def mark_orphaned(self, notification_id: str, *, reason: str) -> bool:
         self.orphaned.append((notification_id, reason))
         return True
+
+    async def list_pending(
+        self, user_email: str, *, conversation_id: str | None = None
+    ) -> list[object]:
+        del user_email, conversation_id
+        return list(self.pending_notifications)
 
 
 class _TurnScheduler:
@@ -197,7 +204,12 @@ async def test_help_lists_stop_and_alias_commands() -> None:
         compaction_strategy=None,
         providers=None,
         pause_waiter=PauseWaiter(),
-        notification_service=_NotificationService(),
+        notification_service=SimpleNamespace(
+            **_NotificationService().__dict__,
+            list_pending=AsyncMock(
+                return_value=[SimpleNamespace(notification_id="gate-1", notification_type="gate")]
+            ),
+        ),
     )
 
     result = await dispatcher.dispatch(
@@ -305,6 +317,9 @@ async def test_retry_resolves_pending_gate_with_note() -> None:
         )
     )
     notifications = _NotificationService()
+    notifications.pending_notifications = [
+        SimpleNamespace(notification_id="gate-1", notification_type="gate")
+    ]
     dispatcher = CommandDispatcher(
         session_factory=None,
         session_manager=None,
@@ -343,6 +358,9 @@ async def test_continue_resolves_pending_gate_with_note() -> None:
         )
     )
     notifications = _NotificationService()
+    notifications.pending_notifications = [
+        SimpleNamespace(notification_id="gate-1", notification_type="gate")
+    ]
     dispatcher = CommandDispatcher(
         session_factory=None,
         session_manager=None,
@@ -380,6 +398,9 @@ async def test_cancel_prefers_pending_gate_over_stop() -> None:
         )
     )
     notifications = _NotificationService()
+    notifications.pending_notifications = [
+        SimpleNamespace(notification_id="gate-1", notification_type="gate")
+    ]
     scheduler = _TurnScheduler(cancelled=False)
     dispatcher = CommandDispatcher(
         session_factory=None,
@@ -419,6 +440,10 @@ async def test_retry_reports_when_pending_gate_has_no_retry_action() -> None:
             options=[{"label": "Continue", "action": "continue"}],
         )
     )
+    notifications = _NotificationService()
+    notifications.pending_notifications = [
+        SimpleNamespace(notification_id="gate-1", notification_type="gate")
+    ]
     dispatcher = CommandDispatcher(
         session_factory=None,
         session_manager=None,
@@ -426,7 +451,7 @@ async def test_retry_reports_when_pending_gate_has_no_retry_action() -> None:
         compaction_strategy=None,
         providers=None,
         pause_waiter=pause_waiter,
-        notification_service=_NotificationService(),
+        notification_service=notifications,
     )
 
     result = await dispatcher.dispatch(
@@ -455,6 +480,10 @@ async def test_continue_reports_when_gate_does_not_offer_continue() -> None:
             options=[{"label": "Retry step", "action": "revise(plan)"}],
         )
     )
+    notifications = _NotificationService()
+    notifications.pending_notifications = [
+        SimpleNamespace(notification_id="gate-1", notification_type="gate")
+    ]
     dispatcher = CommandDispatcher(
         session_factory=None,
         session_manager=None,
@@ -462,7 +491,7 @@ async def test_continue_reports_when_gate_does_not_offer_continue() -> None:
         compaction_strategy=None,
         providers=None,
         pause_waiter=pause_waiter,
-        notification_service=_NotificationService(),
+        notification_service=notifications,
     )
 
     result = await dispatcher.dispatch(
@@ -501,6 +530,11 @@ async def test_gate_commands_target_latest_pending_gate_in_conversation() -> Non
             options=[{"label": "Retry step", "action": "revise(plan)"}],
         )
     )
+    notifications = _NotificationService()
+    notifications.pending_notifications = [
+        SimpleNamespace(notification_id="gate-2", notification_type="gate"),
+        SimpleNamespace(notification_id="gate-1", notification_type="gate"),
+    ]
     dispatcher = CommandDispatcher(
         session_factory=None,
         session_manager=None,
@@ -508,7 +542,7 @@ async def test_gate_commands_target_latest_pending_gate_in_conversation() -> Non
         compaction_strategy=None,
         providers=None,
         pause_waiter=pause_waiter,
-        notification_service=_NotificationService(),
+        notification_service=notifications,
     )
 
     result = await dispatcher.dispatch(
@@ -521,8 +555,89 @@ async def test_gate_commands_target_latest_pending_gate_in_conversation() -> Non
 
     assert result is not None
     assert result.type == "system_message"
-    notifications = dispatcher._notification_service
     assert notifications.calls == [("gate-2", "revise(plan)", {"note": ""})]
+
+
+@pytest.mark.asyncio
+async def test_gate_commands_ignore_stale_pause_waiter_entries_when_notifications_absent() -> None:
+    pause_waiter = PauseWaiter()
+    pause_waiter.register(
+        PendingPause(
+            pause_id="gate-stale",
+            pause_type="gate",
+            conversation_id="conv-1",
+            task_id="task-1",
+            step_name="review",
+            options=[{"label": "Retry step", "action": "revise(plan)"}],
+        )
+    )
+    notifications = _NotificationService()
+    notifications.pending_notifications = []
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=None,
+        session_cache=None,
+        compaction_strategy=None,
+        providers=None,
+        pause_waiter=pause_waiter,
+        notification_service=notifications,
+    )
+
+    result = await dispatcher.dispatch(
+        "/retry",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert result is not None
+    assert result.type == "system_message"
+    assert result.text == "No pending workflow gate to resolve."
+
+
+@pytest.mark.asyncio
+async def test_gate_commands_do_not_fall_back_to_older_waiter_when_latest_notification_has_no_waiter() -> (
+    None
+):
+    pause_waiter = PauseWaiter()
+    pause_waiter.register(
+        PendingPause(
+            pause_id="gate-1",
+            pause_type="gate",
+            conversation_id="conv-1",
+            task_id="task-1",
+            step_name="review-1",
+            options=[{"label": "Retry step", "action": "revise(plan)"}],
+        )
+    )
+    notifications = _NotificationService()
+    notifications.pending_notifications = [
+        SimpleNamespace(notification_id="gate-2", notification_type="gate"),
+        SimpleNamespace(notification_id="gate-1", notification_type="gate"),
+    ]
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=None,
+        session_cache=None,
+        compaction_strategy=None,
+        providers=None,
+        pause_waiter=pause_waiter,
+        notification_service=notifications,
+    )
+
+    result = await dispatcher.dispatch(
+        "/retry",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert result is not None
+    assert result.type == "system_message"
+    assert result.text == "No pending workflow gate to resolve."
+    assert notifications.calls == []
 
 
 @pytest.mark.asyncio

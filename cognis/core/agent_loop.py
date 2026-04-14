@@ -1306,6 +1306,7 @@ class AgentLoop:
         messages: list[dict[str, Any]] = []
         assistant_content_parts: list[str] = []  # User-visible assistant output only
         assistant_memory_parts: list[str] = []  # Include attachment notes for memory/compaction
+        last_assistant_content = ""
 
         # Build tool definitions for LLM (controller-injected tools)
         controller_tool_schemas = self._build_controller_tool_schemas(ctx)
@@ -1655,6 +1656,7 @@ class AgentLoop:
                 if content:
                     messages.append({"role": "assistant", "content": content})
                     assistant_content_parts.append(content)
+                    last_assistant_content = content
                 memory_text = merge_content_and_attachment_note(
                     content,
                     _event_safe_attachments(collected_attachments),
@@ -1706,7 +1708,7 @@ class AgentLoop:
                     # Todos done (or max re-prompts reached) — complete
                     step_output = StepOutput(
                         summary=content[:500] if content else "",
-                        content="\n\n".join(assistant_content_parts),
+                        content=content,
                         outputs={},
                         claims=[],
                         attachments=list(collected_attachments),
@@ -1850,7 +1852,7 @@ class AgentLoop:
                     try:
                         step_output = StepOutput(
                             summary=tc.arguments.get("summary", ""),
-                            content="\n\n".join(assistant_content_parts),
+                            content=last_assistant_content,
                             outputs=tc.arguments.get("outputs", {}),
                             claims=tc.arguments.get("claims", []),
                             outcome=tc.arguments.get("outcome"),
