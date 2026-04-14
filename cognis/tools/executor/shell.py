@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
+import sys
 from typing import Any
 
 from cognis.models.tool import ToolResult
@@ -12,6 +14,44 @@ from cognis.tools.registry import ToolExecutionContext
 
 _DEFAULT_TIMEOUT_MS = 120_000
 _MAX_OUTPUT_SIZE = 50_000
+_SHELL_OVERRIDE_ENV = "COGNIS_EXECUTOR_SHELL"
+
+
+def _shell_name(path: str) -> str:
+    return os.path.basename(path).lower()
+
+
+def _resolve_shell_path() -> str:
+    override = os.environ.get(_SHELL_OVERRIDE_ENV)
+    if override:
+        return override
+
+    if sys.platform == "win32":
+        return os.environ.get("COMSPEC") or "cmd.exe"
+
+    env_shell = os.environ.get("SHELL")
+    env_shell_name = _shell_name(env_shell) if env_shell else ""
+    preferred_bash = shutil.which("bash")
+
+    # Service environments often export /bin/sh even when bash is present.
+    # Treat plain sh as weak evidence so the bash tool behaves closer to its name.
+    if env_shell:
+        if env_shell_name != "sh":
+            return env_shell
+        if preferred_bash is None:
+            return env_shell
+
+    if sys.platform == "darwin":
+        return "/bin/zsh"
+    if preferred_bash is not None:
+        return preferred_bash
+    return "/bin/sh"
+
+
+def _shell_command_args(shell_path: str, command: str) -> list[str]:
+    if sys.platform == "win32":
+        return [shell_path, "/c", command]
+    return [shell_path, "-c", command]
 
 
 async def handle_bash(arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
@@ -28,13 +68,19 @@ async def handle_bash(arguments: dict[str, Any], context: ToolExecutionContext) 
 
     try:
         resolved_cwd = str(resolve_path(workdir, default_to_home=True))
+        if not os.path.isdir(resolved_cwd):
+            return ToolResult(
+                output=f"Working directory not found: {workdir}",
+                is_error=True,
+            )
+        shell_path = _resolve_shell_path()
         merged_env = (
             {**os.environ, **{str(key): str(value) for key, value in env.items()}}
             if isinstance(env, dict)
             else None
         )
-        process = await asyncio.create_subprocess_shell(
-            command,
+        process = await asyncio.create_subprocess_exec(
+            *_shell_command_args(shell_path, command),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=resolved_cwd,
@@ -53,7 +99,7 @@ async def handle_bash(arguments: dict[str, Any], context: ToolExecutionContext) 
         )
     except FileNotFoundError:
         return ToolResult(
-            output=f"Working directory not found: {workdir}",
+            output=f"Shell executable not found: {shell_path}",
             is_error=True,
         )
     except OSError as exc:

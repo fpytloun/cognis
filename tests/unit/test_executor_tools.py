@@ -449,6 +449,60 @@ class TestGrepTool:
 class TestBashTool:
     """Test the bash shell tool."""
 
+    def test_resolve_shell_prefers_bash_over_sh_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from cognis.tools.executor.shell import _resolve_shell_path
+
+        monkeypatch.setattr("sys.platform", "linux")
+        monkeypatch.setenv("SHELL", "/bin/sh")
+        monkeypatch.delenv("COGNIS_EXECUTOR_SHELL", raising=False)
+        monkeypatch.setattr(
+            "shutil.which", lambda name: "/usr/bin/bash" if name == "bash" else None
+        )
+
+        assert _resolve_shell_path() == "/usr/bin/bash"
+
+    def test_resolve_shell_honors_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from cognis.tools.executor.shell import _resolve_shell_path
+
+        monkeypatch.setenv("COGNIS_EXECUTOR_SHELL", "/custom/shell")
+        assert _resolve_shell_path() == "/custom/shell"
+
+    def test_resolve_shell_keeps_user_zsh(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from cognis.tools.executor.shell import _resolve_shell_path
+
+        monkeypatch.setattr("sys.platform", "linux")
+        monkeypatch.setenv("SHELL", "/bin/zsh")
+        monkeypatch.delenv("COGNIS_EXECUTOR_SHELL", raising=False)
+        monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/bash")
+
+        assert _resolve_shell_path() == "/bin/zsh"
+
+    def test_resolve_shell_keeps_non_sh_user_shell(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from cognis.tools.executor.shell import _resolve_shell_path
+
+        monkeypatch.setattr("sys.platform", "linux")
+        monkeypatch.setenv("SHELL", "/usr/bin/fish")
+        monkeypatch.delenv("COGNIS_EXECUTOR_SHELL", raising=False)
+        monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/bash")
+
+        assert _resolve_shell_path() == "/usr/bin/fish"
+
+    def test_resolve_shell_uses_darwin_zsh_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from cognis.tools.executor.shell import _resolve_shell_path
+
+        monkeypatch.setattr("sys.platform", "darwin")
+        monkeypatch.delenv("SHELL", raising=False)
+        monkeypatch.delenv("COGNIS_EXECUTOR_SHELL", raising=False)
+        monkeypatch.setattr("shutil.which", lambda _: None)
+
+        assert _resolve_shell_path() == "/bin/zsh"
+
+    def test_shell_command_args_use_windows_flag(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from cognis.tools.executor.shell import _shell_command_args
+
+        monkeypatch.setattr("sys.platform", "win32")
+        assert _shell_command_args("cmd.exe", "echo hello") == ["cmd.exe", "/c", "echo hello"]
+
     @pytest.mark.asyncio()
     async def test_bash_echo(self) -> None:
         result = await handle_bash({"command": "echo hello"}, _DUMMY_CONTEXT)
@@ -471,6 +525,26 @@ class TestBashTool:
     async def test_bash_empty_command(self) -> None:
         result = await handle_bash({"command": ""}, _DUMMY_CONTEXT)
         assert result.is_error
+
+    @pytest.mark.asyncio()
+    async def test_bash_invalid_override_reports_missing_shell(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("COGNIS_EXECUTOR_SHELL", "/missing/shell")
+
+        result = await handle_bash({"command": "echo hello"}, _DUMMY_CONTEXT)
+
+        assert result.is_error
+        assert "Shell executable not found" in result.output
+
+    @pytest.mark.asyncio()
+    async def test_bash_invalid_workdir_reports_missing_directory(self) -> None:
+        result = await handle_bash(
+            {"command": "echo hello", "workdir": "/missing/workdir"}, _DUMMY_CONTEXT
+        )
+
+        assert result.is_error
+        assert "Working directory not found" in result.output
 
     @pytest.mark.asyncio()
     async def test_bash_defaults_to_home_when_workdir_omitted(
