@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import uuid
-
 from fastapi import APIRouter, Query, Request
 
 from cognis.api.common import (
@@ -14,11 +12,11 @@ from cognis.api.common import (
 )
 from cognis.api.models import CursorPage, WorkflowRequest, WorkflowResponse, WorkflowUpdateRequest
 from cognis.api.serializers import workflow_to_response
-from cognis.store.queries import (
-    create_workflow,
-    delete_workflow,
-    get_workflow,
-    update_workflow,
+from cognis.core.workflow_management import (
+    create_user_workflow,
+    delete_user_workflow,
+    duplicate_visible_workflow,
+    update_user_workflow,
 )
 
 router = APIRouter(prefix="/api/v1/workflows", tags=["workflows"])
@@ -70,34 +68,11 @@ async def workflow_list(
 async def workflow_create(request: Request, payload: WorkflowRequest) -> WorkflowResponse:
     forbid_mutation_for_viewer(request)
     user = require_current_user(request)
-    workflow_id = payload.workflow_id or f"wf_{uuid.uuid4().hex[:12]}"
-    definition = {
-        "workflow_id": workflow_id,
-        "name": payload.name,
-        "description": payload.description,
-        "version": payload.version,
-        "criteria": payload.criteria,
-        "tags": payload.tags,
-        "interaction": payload.interaction,
-        "defaults": payload.defaults,
-        "steps": payload.steps,
-        "is_system": False,
-        "owner_email": user.email,
-    }
-    _validate_workflow_payload(definition)
-    async with request.app.state.session_factory() as session:
-        row = await create_workflow(
-            session,
-            workflow_id=workflow_id,
-            name=payload.name,
-            description=payload.description,
-            definition=definition,
-            version=payload.version,
-            is_system=False,
-            owner_email=user.email,
-        )
-        await session.commit()
-        await session.refresh(row)
+    row = await create_user_workflow(
+        session_factory=request.app.state.session_factory,
+        owner_email=user.email,
+        payload=payload.model_dump(mode="json"),
+    )
     return workflow_to_response(row)
 
 
@@ -124,32 +99,20 @@ async def workflow_update_route(
 ) -> WorkflowResponse:
     forbid_mutation_for_viewer(request)
     user = require_current_user(request)
-    async with request.app.state.session_factory() as session:
-        row = await get_workflow(session, workflow_id)
-        if row is None:
-            raise api_exception(404, "not_found", "Workflow not found")
-        if row.is_system:
-            raise api_exception(403, "forbidden", "System workflows are read-only")
-        if row.owner_email != user.email:
-            raise api_exception(403, "forbidden", "Workflow access denied")
-        definition = dict(row.definition or {})
-        updates = payload.model_dump(exclude_none=True)
-        definition.update(updates)
-        _validate_workflow_payload(definition)
-        ok = await update_workflow(
-            session,
-            workflow_id,
-            updates={
-                **({"name": payload.name} if payload.name is not None else {}),
-                **({"description": payload.description} if payload.description is not None else {}),
-                **({"version": payload.version} if payload.version is not None else {}),
-                "definition": definition,
-            },
+    try:
+        row = await update_user_workflow(
+            session_factory=request.app.state.session_factory,
+            workflow_id=workflow_id,
+            owner_email=user.email,
+            payload=payload.model_dump(exclude_none=True, mode="json"),
         )
-        if not ok:
-            raise api_exception(400, "validation_error", "Workflow update failed")
-        await session.commit()
-        await session.refresh(row)
+    except ValueError as exc:
+        message = str(exc)
+        if message == "Workflow not found":
+            raise api_exception(404, "not_found", message) from exc
+        if message in {"System workflows are read-only", "Workflow access denied"}:
+            raise api_exception(403, "forbidden", message) from exc
+        raise api_exception(409, "conflict", message) from exc
     return workflow_to_response(row)
 
 
@@ -157,16 +120,19 @@ async def workflow_update_route(
 async def workflow_delete_route(request: Request, workflow_id: str) -> dict[str, bool]:
     forbid_mutation_for_viewer(request)
     user = require_current_user(request)
-    async with request.app.state.session_factory() as session:
-        row = await get_workflow(session, workflow_id)
-        if row is None:
-            raise api_exception(404, "not_found", "Workflow not found")
-        if row.is_system:
-            raise api_exception(403, "forbidden", "System workflows are read-only")
-        if row.owner_email != user.email:
-            raise api_exception(403, "forbidden", "Workflow access denied")
-        ok = await delete_workflow(session, workflow_id)
-        await session.commit()
+    try:
+        ok = await delete_user_workflow(
+            session_factory=request.app.state.session_factory,
+            workflow_id=workflow_id,
+            owner_email=user.email,
+        )
+    except ValueError as exc:
+        message = str(exc)
+        if message == "Workflow not found":
+            raise api_exception(404, "not_found", message) from exc
+        if message in {"System workflows are read-only", "Workflow access denied"}:
+            raise api_exception(403, "forbidden", message) from exc
+        raise api_exception(409, "conflict", message) from exc
     return {"ok": ok}
 
 
@@ -184,25 +150,11 @@ async def workflow_duplicate(request: Request, workflow_id: str) -> WorkflowResp
     ):
         raise api_exception(403, "forbidden", "Workflow access denied")
 
-    new_workflow_id = f"wf_{uuid.uuid4().hex[:12]}"
-    definition = workflow.model_dump(mode="json")
-    definition["workflow_id"] = new_workflow_id
-    definition["name"] = f"{workflow.name} Copy"
-    definition["is_system"] = False
-    definition["owner_email"] = user.email
-    _validate_workflow_payload(definition)
-
-    async with request.app.state.session_factory() as session:
-        new_row = await create_workflow(
-            session,
-            workflow_id=new_workflow_id,
-            name=f"{workflow.name} Copy",
-            description=workflow.description or "",
-            definition=definition,
-            version=workflow.version,
-            is_system=False,
-            owner_email=user.email,
-        )
-        await session.commit()
-        await session.refresh(new_row)
+    new_row = await duplicate_visible_workflow(
+        session_factory=request.app.state.session_factory,
+        workflow_registry=request.app.state.workflow_registry,
+        workflow_id=workflow_id,
+        owner_email=user.email,
+        allow_admin=user.role == "admin",
+    )
     return workflow_to_response(new_row)

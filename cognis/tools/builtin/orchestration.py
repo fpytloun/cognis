@@ -40,12 +40,21 @@ TASK_TOOL_NAMES = {
     "get_task",
     "get_task_output",
     "get_task_step_output",
+    "respond_task_input",
     "update_task",
     "cancel_task",
     "retry_task",
     "resolve_task_pause",
 }
-ORCHESTRATION_TOOL_NAMES = SUBSESSION_TOOL_NAMES | TASK_TOOL_NAMES
+WORKFLOW_TOOL_NAMES = {
+    "list_workflows",
+    "get_workflow",
+    "create_workflow",
+    "update_workflow",
+    "delete_workflow",
+    "duplicate_workflow",
+}
+ORCHESTRATION_TOOL_NAMES = SUBSESSION_TOOL_NAMES | TASK_TOOL_NAMES | WORKFLOW_TOOL_NAMES
 
 # ---------------------------------------------------------------------------
 # Sub-session tool definitions
@@ -275,6 +284,31 @@ GET_TASK_TOOL = ToolDefinition(
     read_only=True,
 )
 
+RESPOND_TASK_INPUT_TOOL = ToolDefinition(
+    name="respond_task_input",
+    description=(
+        "Answer a paused task step question or step input request. Use get_task first to inspect "
+        "the pending question and available context, then provide the response so the task can resume."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": "ID of the paused task.",
+            },
+            "response": {
+                "type": "string",
+                "description": "Answer to the pending step question.",
+            },
+        },
+        "required": ["task_id", "response"],
+    },
+    source=ToolSource(type="builtin"),
+    category="orchestration",
+    read_only=False,
+)
+
 UPDATE_TASK_TOOL = ToolDefinition(
     name="update_task",
     description=(
@@ -416,8 +450,11 @@ RESOLVE_TASK_PAUSE_TOOL = ToolDefinition(
             },
             "action": {
                 "type": "string",
-                "enum": ["retry", "continue", "cancel"],
-                "description": "How to resolve the paused workflow gate.",
+                "description": (
+                    "How to resolve the paused workflow gate. Use one of the currently offered "
+                    "pause actions, or use 'retry' as a convenience alias for the gate's "
+                    "revise(...) action when available."
+                ),
             },
             "note": {
                 "type": "string",
@@ -452,10 +489,123 @@ _ALL_TASK_TOOLS = [
     GET_TASK_TOOL,
     GET_TASK_OUTPUT_TOOL,
     GET_TASK_STEP_OUTPUT_TOOL,
+    RESPOND_TASK_INPUT_TOOL,
     UPDATE_TASK_TOOL,
     CANCEL_TASK_TOOL,
     RETRY_TASK_TOOL,
     RESOLVE_TASK_PAUSE_TOOL,
+]
+
+LIST_WORKFLOWS_TOOL = ToolDefinition(
+    name="list_workflows",
+    description=(
+        "List workflows visible to the current user. Returns summary metadata for both system "
+        "and user-owned workflows."
+    ),
+    parameters={"type": "object", "properties": {}},
+    source=ToolSource(type="builtin"),
+    category="orchestration",
+    read_only=True,
+)
+
+GET_WORKFLOW_TOOL = ToolDefinition(
+    name="get_workflow",
+    description="Get the full definition and metadata for one workflow.",
+    parameters={
+        "type": "object",
+        "properties": {"workflow_id": {"type": "string", "description": "Workflow ID to inspect."}},
+        "required": ["workflow_id"],
+    },
+    source=ToolSource(type="builtin"),
+    category="orchestration",
+    read_only=True,
+)
+
+CREATE_WORKFLOW_TOOL = ToolDefinition(
+    name="create_workflow",
+    description="Create a new user-owned workflow definition.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "workflow_id": {"type": "string", "description": "Optional workflow ID override."},
+            "name": {"type": "string", "description": "Workflow name."},
+            "description": {"type": "string", "description": "Workflow description."},
+            "version": {"type": "integer", "description": "Workflow version number."},
+            "criteria": {"type": "string", "description": "Workflow selection criteria."},
+            "tags": {"type": "array", "items": {"type": "string"}},
+            "interaction": {"type": "object", "description": "Workflow interaction config."},
+            "defaults": {"type": "object", "description": "Default workflow completion config."},
+            "steps": {
+                "type": "array",
+                "items": {"type": "object"},
+                "description": "Workflow step definitions.",
+            },
+        },
+        "required": ["name", "steps"],
+    },
+    source=ToolSource(type="builtin"),
+    category="orchestration",
+    read_only=False,
+)
+
+UPDATE_WORKFLOW_TOOL = ToolDefinition(
+    name="update_workflow",
+    description="Update a user-owned workflow definition. Active workflow references are protected.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "workflow_id": {"type": "string", "description": "Workflow ID to update."},
+            "name": {"type": "string"},
+            "description": {"type": "string"},
+            "version": {"type": "integer"},
+            "criteria": {"type": "string"},
+            "tags": {"type": "array", "items": {"type": "string"}},
+            "interaction": {"type": "object"},
+            "defaults": {"type": "object"},
+            "steps": {"type": "array", "items": {"type": "object"}},
+        },
+        "required": ["workflow_id"],
+    },
+    source=ToolSource(type="builtin"),
+    category="orchestration",
+    read_only=False,
+)
+
+DELETE_WORKFLOW_TOOL = ToolDefinition(
+    name="delete_workflow",
+    description="Delete a user-owned workflow. Active workflow references are protected.",
+    parameters={
+        "type": "object",
+        "properties": {"workflow_id": {"type": "string", "description": "Workflow ID to delete."}},
+        "required": ["workflow_id"],
+    },
+    source=ToolSource(type="builtin"),
+    category="orchestration",
+    read_only=False,
+)
+
+DUPLICATE_WORKFLOW_TOOL = ToolDefinition(
+    name="duplicate_workflow",
+    description="Duplicate a visible workflow into a new user-owned workflow.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "workflow_id": {"type": "string", "description": "Workflow ID to duplicate."}
+        },
+        "required": ["workflow_id"],
+    },
+    source=ToolSource(type="builtin"),
+    category="orchestration",
+    read_only=False,
+)
+
+_ALL_WORKFLOW_TOOLS = [
+    LIST_WORKFLOWS_TOOL,
+    GET_WORKFLOW_TOOL,
+    CREATE_WORKFLOW_TOOL,
+    UPDATE_WORKFLOW_TOOL,
+    DELETE_WORKFLOW_TOOL,
+    DUPLICATE_WORKFLOW_TOOL,
 ]
 
 # Sync-only delegate for task steps (no wait parameter exposed — always sync)
@@ -510,7 +660,7 @@ def orchestration_tools(mode: OrchestrationMode = OrchestrationMode.FULL) -> lis
     if mode == OrchestrationMode.DELEGATE_SYNC_ONLY:
         return [_DELEGATE_SYNC_TOOL]
     # FULL mode
-    return _ALL_SUBSESSION_TOOLS + _ALL_TASK_TOOLS
+    return _ALL_SUBSESSION_TOOLS + _ALL_TASK_TOOLS + _ALL_WORKFLOW_TOOLS
 
 
 def is_orchestration_tool(tool_name: str) -> bool:
@@ -526,6 +676,11 @@ def is_subsession_tool(tool_name: str) -> bool:
 def is_task_tool(tool_name: str) -> bool:
     """Return True for task management tools."""
     return tool_name in TASK_TOOL_NAMES
+
+
+def is_workflow_tool(tool_name: str) -> bool:
+    """Return True for workflow management tools."""
+    return tool_name in WORKFLOW_TOOL_NAMES
 
 
 # ---------------------------------------------------------------------------

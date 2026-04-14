@@ -85,6 +85,10 @@ Agents can manage skills through built-in tools:
 
 All mutation tools are non-bypassable and evaluated by Intaris guardrails. After a successful mutation, the updated skill is immediately available for the rest of the turn.
 
+### Built-in Cognis management skills
+
+Cognis also ships global management skills for Cognis-native operations such as task and workflow management. These skills are intended for the main chat agent and are discoverable through the normal skill tools (`skill_list`, `skill_load`). They guide the agent to inspect state first, use the correct management tools, and avoid mutating protected resources such as system workflows.
+
 ### Importing skills
 
 Skills can be imported from:

@@ -41,6 +41,8 @@ Open `Workflows` and either:
 
 You can then define metadata, edit steps, preview the pipeline diagram, and save the workflow.
 
+The main chat agent can also manage workflows directly when you want to stay in conversation instead of using the editor. In that case, the agent should inspect the existing workflow first, keep changes minimal, and avoid mutating workflows that are already referenced by active tasks.
+
 ## YAML import and export
 
 The workflow editor supports YAML import and export so you can:

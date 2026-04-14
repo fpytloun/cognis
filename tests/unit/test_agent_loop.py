@@ -26,6 +26,7 @@ from cognis.models.agent import AgentDefinition, AgentPermissions
 from cognis.models.session import EventAppendResult, ReasoningReportResult
 from cognis.models.tool import Permission, ToolCall, ToolDefinition, ToolSource
 from cognis.models.workflow import StepDefinition, StepOutput, WorkflowState
+from cognis.tools.builtin.orchestration import OrchestrationMode
 from cognis.tools.builtin.tool_search import SEARCH_TOOLS_TOOL
 
 # ---------------------------------------------------------------------------
@@ -960,6 +961,302 @@ async def test_resolve_task_pause_tool_retries_gate_with_note() -> None:
     resolution = await pause_waiter.wait("gate-1", timeout=0.01)
     assert resolution.decision == "revise(plan)"
     assert resolution.data == {"note": "Incorporate the review and continue."}
+
+
+@pytest.mark.asyncio
+async def test_resolve_task_pause_tool_does_not_bypass_non_retryable_gate() -> None:
+    pause_waiter = PauseWaiter()
+    pause_waiter.register(
+        PendingPause(
+            pause_id="gate-1",
+            pause_type="gate",
+            task_id="task-1",
+            step_name="review",
+            options=[{"label": "Continue", "action": "continue"}],
+        )
+    )
+
+    class _TaskSessionManager(_NoopSessionManager):
+        def session_factory(self) -> object:
+            class _Dummy:
+                async def __aenter__(self) -> SimpleNamespace:
+                    return SimpleNamespace()
+
+                async def __aexit__(self, exc_type: object, exc: object, tb: object) -> bool:
+                    return False
+
+            return _Dummy()
+
+    class _TaskQueue:
+        async def retry_failed_task(self, task_id: str) -> None:
+            raise AssertionError(f"retry_failed_task should not be called for {task_id}")
+
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=SimpleNamespace(), guardrails=_NoopGuardrails()),
+        session_manager=_TaskSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=pause_waiter,
+    )
+    agent_loop._task_queue = _TaskQueue()
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+    )
+
+    async def _get_task(*args: object, **kwargs: object) -> SimpleNamespace:
+        del args, kwargs
+        return SimpleNamespace(task_id="task-1", agent_id="agent-1", status="paused")
+
+    from unittest.mock import patch
+
+    with patch("cognis.store.queries.get_task", _get_task):
+        result = await agent_loop._handle_orchestration_tool(
+            ToolCall(
+                call_id="call-1",
+                name="resolve_task_pause",
+                arguments={"task_id": "task-1", "action": "retry"},
+            ),
+            ctx=ctx,
+            events_to_record=[],
+        )
+
+    assert result.is_error is True
+    assert "does not offer a retry action" in json.loads(result.output)["error"]
+
+
+@pytest.mark.asyncio
+async def test_respond_task_input_tool_returns_error_without_response() -> None:
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=SimpleNamespace(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-1", intaris_session_id="sess-1", user_email="user@example.com"
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+    )
+
+    result = await agent_loop._handle_task_tool(
+        ToolCall(call_id="call-1", name="respond_task_input", arguments={"task_id": "task-1"}),
+        ctx=ctx,
+        events_to_record=[],
+    )
+
+    assert result.is_error is True
+    assert json.loads(result.output)["error"] == "response is required."
+
+
+@pytest.mark.asyncio
+async def test_get_task_tool_includes_pending_pause_and_workflow_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pause_waiter = PauseWaiter()
+    pause_waiter.register(
+        PendingPause(
+            pause_id="gate-1",
+            pause_type="gate",
+            task_id="task-1",
+            step_name="review",
+            options=[{"label": "Retry step", "action": "revise(plan)"}],
+        )
+    )
+
+    class _TaskSessionManager(_NoopSessionManager):
+        def session_factory(self) -> object:
+            class _Dummy:
+                async def __aenter__(self) -> SimpleNamespace:
+                    return SimpleNamespace()
+
+                async def __aexit__(self, exc_type: object, exc: object, tb: object) -> bool:
+                    return False
+
+            return _Dummy()
+
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=SimpleNamespace(), guardrails=_NoopGuardrails()),
+        session_manager=_TaskSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=pause_waiter,
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-1", intaris_session_id="sess-1", user_email="user@example.com"
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+    )
+
+    async def _get_task(*args: object, **kwargs: object) -> SimpleNamespace:
+        del args, kwargs
+        return SimpleNamespace(
+            task_id="task-1",
+            title="Task",
+            description="Desc",
+            expected_output=None,
+            status="paused",
+            priority=0,
+            created_by="user@example.com",
+            agent_id="agent-1",
+            source_type="agent",
+            source_ref="conv-1",
+            delivery_mode="same_conversation",
+            delivery_target=None,
+            workflow_id="wf-1",
+            workflow_state=WorkflowState(current_step_index=0).model_dump(mode="json"),
+            queue_name="default",
+            scheduled_for=None,
+            created_at=None,
+            started_at=None,
+            completed_at=None,
+            result_summary=None,
+            result_data={"foo": "bar"},
+        )
+
+    async def _list_step_runs(*args: object, **kwargs: object) -> list[SimpleNamespace]:
+        del args, kwargs
+        return [
+            SimpleNamespace(
+                step_name="plan", status="approved", attempt=1, output={"summary": "ok"}
+            )
+        ]
+
+    class _Registry:
+        async def get(self, workflow_id: str) -> SimpleNamespace:
+            del workflow_id
+            return SimpleNamespace(steps=[SimpleNamespace(name="plan")])
+
+    monkeypatch.setattr("cognis.store.queries.get_task", _get_task)
+    monkeypatch.setattr("cognis.store.queries.list_step_runs_for_task", _list_step_runs)
+    monkeypatch.setattr(
+        "cognis.core.workflow_registry.WorkflowRegistry", lambda session_factory: _Registry()
+    )
+
+    result = await agent_loop._handle_task_tool(
+        ToolCall(call_id="call-1", name="get_task", arguments={"task_id": "task-1"}),
+        ctx=ctx,
+        events_to_record=[],
+    )
+
+    payload = json.loads(result.output)
+    assert payload["pending_pause"]["pause_type"] == "gate"
+    assert payload["workflow_run"]["current_step_name"] == "plan"
+    assert payload["result_data"] == {"foo": "bar"}
+
+
+@pytest.mark.asyncio
+async def test_workflow_tools_are_main_chat_only_in_delegate_sync_mode() -> None:
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=SimpleNamespace(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="plan", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-1", intaris_session_id="sess-1", user_email="user@example.com"
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=WORKFLOW_POLICY,
+        orchestration_mode=OrchestrationMode.DELEGATE_SYNC_ONLY,
+    )
+
+    result = await agent_loop._handle_orchestration_tool(
+        ToolCall(call_id="call-1", name="list_workflows", arguments={}),
+        ctx=ctx,
+        events_to_record=[],
+    )
+
+    assert result.is_error is True
+    assert "Only 'delegate' (sync) is available" in json.loads(result.output)["message"]
+
+
+@pytest.mark.asyncio
+async def test_create_workflow_tool_returns_created_workflow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=SimpleNamespace(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-1", intaris_session_id="sess-1", user_email="user@example.com"
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+    )
+
+    async def _create(*args: object, **kwargs: object) -> SimpleNamespace:
+        del args, kwargs
+        return SimpleNamespace(
+            workflow_id="wf-1",
+            name="Workflow",
+            description="desc",
+            version=1,
+            definition={"criteria": "", "tags": [], "interaction": {}, "defaults": {}, "steps": []},
+            is_system=False,
+            owner_email="user@example.com",
+        )
+
+    monkeypatch.setattr("cognis.core.workflow_management.create_user_workflow", _create)
+
+    result = await agent_loop._handle_workflow_tool(
+        ToolCall(
+            call_id="call-1", name="create_workflow", arguments={"name": "Workflow", "steps": []}
+        ),
+        ctx=ctx,
+    )
+
+    payload = json.loads(result.output)
+    assert payload["status"] == "created"
+    assert payload["workflow"]["workflow_id"] == "wf-1"
 
 
 @pytest.mark.asyncio

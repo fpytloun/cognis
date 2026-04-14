@@ -11,6 +11,13 @@ Use `Tasks` when work should be:
 - paused for human approval
 - routed back into a conversation when complete
 
+The main chat agent can also inspect and manage tasks directly. That includes:
+
+- creating or updating tasks from chat
+- inspecting paused task state and step outputs
+- resolving workflow gates
+- answering paused step questions
+
 ## Task board
 
 The task board gives you a kanban-style view of work by status. From there you can:
@@ -37,6 +44,8 @@ This view is the best place to understand why a task is waiting, revising, or fa
 ## Gates and step questions
 
 Some workflows pause for human input. When that happens, Cognis records the pause and lets you respond from the task flow instead of losing the context in chat.
+
+You can also steer a paused task from chat through the main agent. When you do that, Cognis keeps the same task/workflow state and carries any operator instruction into the resumed step.
 
 ## Delivery model
 

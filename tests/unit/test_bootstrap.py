@@ -9,7 +9,7 @@ from cognis.bootstrap import DEFAULT_SETTINGS, bootstrap_runtime, run_schema_boo
 from cognis.config import load_config
 from cognis.security import create_password_hasher
 from cognis.store.database import create_engine
-from cognis.store.queries import get_setting, list_settings, upsert_setting
+from cognis.store.queries import get_setting, get_skill, list_settings, upsert_setting
 
 
 @pytest.mark.asyncio
@@ -27,7 +27,13 @@ async def test_bootstrap_creates_keys_db_and_settings(monkeypatch: object, tmp_p
 
     async with session_factory() as session:
         settings = await list_settings(session)
+        task_skill = await get_skill(session, "cognis-task-manager")
+        workflow_skill = await get_skill(session, "cognis-workflow-manager")
     assert len(settings) == len(DEFAULT_SETTINGS)
+    assert task_skill is not None
+    assert workflow_skill is not None
+    assert task_skill.auto_load is False
+    assert workflow_skill.auto_load is False
 
     await engine.dispose()
 

@@ -136,6 +136,7 @@ def test_gate_response_conflict_when_already_resolved(monkeypatch: object, tmp_p
                 task_id=task_id,
                 step_name="review",
                 question="Approve?",
+                options=[{"label": "Continue", "action": "continue"}],
             )
         )
 
@@ -189,6 +190,57 @@ def test_task_mutation_rejects_non_owner(monkeypatch: object, tmp_path: Path) ->
             headers=_auth_headers(app, email="attacker@example.com"),
         )
         assert response.status_code == 403
+
+
+def test_gate_response_returns_conflict_for_unsupported_action(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> str:
+            async with app.state.session_factory() as session:  # type: ignore[attr-defined]
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                agent = await create_agent(
+                    session,
+                    owner_email="user@example.com",
+                    agent_id="agent-unsupported-gate",
+                    name="Unsupported Gate Agent",
+                )
+                task = await create_task(
+                    session,
+                    created_by="user@example.com",
+                    agent_id=agent.agent_id,
+                    title="Paused task",
+                    status="paused",
+                )
+                await session.commit()
+                return task.task_id
+
+        task_id = asyncio.run(_seed())
+        app.state.pause_waiter.register(
+            PendingPause(
+                pause_id="gate_conflict",
+                pause_type="gate",
+                task_id=task_id,
+                step_name="review",
+                options=[{"label": "Continue", "action": "continue"}],
+            )
+        )
+
+        response = client.post(
+            f"/api/v1/tasks/{task_id}/gate-response",
+            headers=_auth_headers(app, email="user@example.com"),
+            json={"step_name": "review", "action": "cancel"},
+        )
+
+        assert response.status_code == 409
 
 
 def test_task_create_allows_non_chat_source_refs(monkeypatch: object, tmp_path: Path) -> None:

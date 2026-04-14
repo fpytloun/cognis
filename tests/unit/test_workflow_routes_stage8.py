@@ -6,7 +6,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from cognis.api.app import create_app
-from cognis.store.queries import create_user
+from cognis.store.queries import create_user, create_workflow
 
 
 def _create_test_client(monkeypatch: object, tmp_path: Path) -> TestClient:
@@ -81,3 +81,48 @@ def test_workflow_duplicate_supports_system_workflow(monkeypatch: object, tmp_pa
         assert body["is_system"] is False
         assert body["owner_email"] == "user@example.com"
         assert len(body["steps"]) == 3
+
+
+def test_workflow_duplicate_allows_admin_for_user_owned_workflow(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        asyncio.run(_seed_user(client.app, email="owner@example.com"))
+        asyncio.run(_seed_user(client.app, email="admin@example.com"))
+
+        async def _seed_workflow() -> None:
+            async with client.app.state.session_factory() as session:  # type: ignore[attr-defined]
+                await create_workflow(
+                    session,
+                    workflow_id="wf_owner_private",
+                    name="Owner Workflow",
+                    description="desc",
+                    definition={
+                        "workflow_id": "wf_owner_private",
+                        "name": "Owner Workflow",
+                        "description": "desc",
+                        "version": 1,
+                        "criteria": "",
+                        "tags": [],
+                        "interaction": {},
+                        "defaults": {},
+                        "steps": [{"name": "plan", "type": "run"}],
+                        "is_system": False,
+                        "owner_email": "owner@example.com",
+                    },
+                    is_system=False,
+                    owner_email="owner@example.com",
+                )
+                await session.commit()
+
+        asyncio.run(_seed_workflow())
+
+        response = client.post(
+            "/api/v1/workflows/wf_owner_private/duplicate",
+            headers=_auth_headers(client.app, email="admin@example.com", role="admin"),
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["name"] == "Owner Workflow Copy"
+        assert body["owner_email"] == "admin@example.com"

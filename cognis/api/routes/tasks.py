@@ -33,13 +33,16 @@ from cognis.api.models import (
 )
 from cognis.api.serializers import (
     dependency_to_response,
-    pending_pause_to_response,
     step_run_to_response,
     task_detail_to_response,
     task_to_response,
-    workflow_run_to_response,
 )
-from cognis.core.agent_loop import PauseResolution, PendingPause
+from cognis.core.management import (
+    resolve_task_pause_action,
+    respond_task_input,
+    task_pending_pause_response,
+    task_workflow_run_response,
+)
 from cognis.models.task import TaskDelivery, TaskModel
 from cognis.models.workflow import WorkflowState
 from cognis.store.models import Task
@@ -52,7 +55,6 @@ from cognis.store.queries import (
     get_task_dependencies,
     list_step_runs_for_task,
     remove_task_dependency,
-    update_task_workflow_state,
 )
 
 _TERMINAL_STATUSES: frozenset[str] = frozenset({"completed", "failed", "cancelled"})
@@ -261,57 +263,33 @@ async def gate_response(
     forbid_mutation_for_viewer(request)
     task = await _require_task(request, task_id)
     note = (payload.feedback or "").strip()
-
-    # Try the unified notification service first
-    svc = getattr(request.app.state, "notification_service", None)
-    if svc is not None:
-        from cognis.core.notifications import NotificationService
-
-        svc_typed: NotificationService = svc
-        notif = await svc_typed.find_by_task(task_id, notification_type="gate", status="pending")
-        if notif is not None:
-            ok = await svc_typed.resolve(
-                notif.notification_id,
-                payload.action,
-                {"note": note},
+    try:
+        result = await resolve_task_pause_action(
+            task=task,
+            requested_action=payload.action,
+            note=note,
+            pause_waiter=request.app.state.pause_waiter,
+            notification_service=getattr(request.app.state, "notification_service", None),
+            task_queue=request.app.state.task_queue,
+            session_factory=request.app.state.session_factory,
+            user_email=task.created_by,
+        )
+    except ValueError as exc:
+        message = str(exc)
+        if message == "No pending gate for task":
+            resolved_pause = request.app.state.pause_waiter.find_pending(
+                task_id=task_id,
+                step_name=payload.step_name,
+                pause_type="gate",
+                include_resolved=True,
             )
-            if ok:
-                if _should_store_operator_instruction(payload.action, note):
-                    await _update_operator_instruction(request, task_id, task.workflow_state, note)
-                return TaskActionResponse(ok=True, task_id=task_id, status=str(task.status))
-            raise api_exception(409, "conflict", "Gate has already been resolved")
-        # Check if there's a recently resolved gate (409 vs 404)
-        resolved_notif = await svc_typed.find_by_task(
-            task_id, notification_type="gate", status="resolved"
-        )
-        if resolved_notif is not None:
-            raise api_exception(409, "conflict", "Gate has already been resolved")
-
-    # Legacy fallback: direct PauseWaiter
-    pause = request.app.state.pause_waiter.find_pending(
-        task_id=task_id,
-        step_name=payload.step_name,
-        pause_type="gate",
-    )
-    if pause is None:
-        resolved_pause = request.app.state.pause_waiter.find_pending(
-            task_id=task_id,
-            step_name=payload.step_name,
-            pause_type="gate",
-            include_resolved=True,
-        )
-        if resolved_pause is not None:
-            raise api_exception(409, "conflict", "Pause has already been resolved")
-        raise api_exception(404, "not_found", "No pending gate for task")
-    ok = request.app.state.pause_waiter.resolve(
-        pause.pause_id,
-        PauseResolution(decision=payload.action, data={"note": note}),
-    )
-    if not ok:
-        raise api_exception(409, "conflict", "Pause has already been resolved")
-    if _should_store_operator_instruction(payload.action, note):
-        await _update_operator_instruction(request, task_id, task.workflow_state, note)
-    return TaskActionResponse(ok=True, task_id=task_id, status=str(task.status))
+            if resolved_pause is not None:
+                raise api_exception(409, "conflict", "Pause has already been resolved") from exc
+            raise api_exception(404, "not_found", message) from exc
+        raise api_exception(409, "conflict", message) from exc
+    except RuntimeError as exc:
+        raise api_exception(409, "conflict", str(exc)) from exc
+    return TaskActionResponse(ok=True, task_id=task_id, status=result["task_status"])
 
 
 @router.post("/api/v1/tasks/{task_id}/step-response", response_model=TaskActionResponse)
@@ -323,51 +301,21 @@ async def step_response(
     forbid_mutation_for_viewer(request)
     task = await _require_task(request, task_id)
 
-    # Try the unified notification service first
-    svc = getattr(request.app.state, "notification_service", None)
-    if svc is not None:
-        from cognis.core.notifications import NotificationService
-
-        svc_typed: NotificationService = svc
-        notif = await svc_typed.find_by_task(
-            task_id, notification_type="step_question", status="pending"
+    try:
+        result = await respond_task_input(
+            task=task,
+            response=payload.response,
+            pause_waiter=request.app.state.pause_waiter,
+            notification_service=getattr(request.app.state, "notification_service", None),
+            task_queue=request.app.state.task_queue,
+            session_factory=request.app.state.session_factory,
+            user_email=task.created_by,
         )
-        if notif is not None:
-            ok = await svc_typed.resolve(
-                notif.notification_id,
-                "continue",
-                {"response": payload.response},
-            )
-            if ok:
-                if not request.app.state.task_queue.has_active_run(task_id):
-                    await _store_recovered_step_input_response(request, task_id, payload.response)
-                    resumed_task = await request.app.state.task_queue.resume_task(task_id)
-                    return TaskActionResponse(
-                        ok=True, task_id=task_id, status=str(resumed_task.status)
-                    )
-                return TaskActionResponse(ok=True, task_id=task_id, status=str(task.status))
-            raise api_exception(409, "conflict", "Step question has already been resolved")
-
-    # Legacy fallback: direct PauseWaiter
-    pause = request.app.state.pause_waiter.find_pending(
-        task_id=task_id,
-        step_name=payload.step_name,
-        pause_type="step_input",
-    )
-    if pause is None:
-        raise api_exception(404, "not_found", "No pending step question for task")
-    ok = request.app.state.pause_waiter.resolve(
-        pause.pause_id,
-        PauseResolution(decision="continue", data={"response": payload.response}),
-    )
-    if not ok:
-        raise api_exception(409, "conflict", "Pause has already been resolved")
-    if not request.app.state.task_queue.has_active_run(task_id):
-        await _store_recovered_step_input_response(request, task_id, payload.response)
-        request.app.state.pause_waiter.clear(pause.pause_id)
-        resumed_task = await request.app.state.task_queue.resume_task(task_id)
-        return TaskActionResponse(ok=True, task_id=task_id, status=str(resumed_task.status))
-    return TaskActionResponse(ok=True, task_id=task_id, status=str(task.status))
+    except ValueError as exc:
+        raise api_exception(404, "not_found", str(exc)) from exc
+    except RuntimeError as exc:
+        raise api_exception(409, "conflict", str(exc)) from exc
+    return TaskActionResponse(ok=True, task_id=task_id, status=result["status"])
 
 
 @router.post("/api/v1/tasks/batch-submit", response_model=BatchSubmitResponse)
@@ -489,84 +437,20 @@ async def _validate_conversation_access(request: Request, conversation_id: str |
     require_owner_or_admin(request, row.user_email)
 
 
-async def _update_operator_instruction(
-    request: Request,
-    task_id: str,
-    workflow_state: WorkflowState | None,
-    instruction: str,
-) -> None:
-    if workflow_state is None:
-        return
-    workflow_state.last_operator_instruction = instruction
-    async with request.app.state.session_factory() as session:
-        await update_task_workflow_state(session, task_id, workflow_state.model_dump(mode="json"))
-        await session.commit()
-
-
-def _should_store_operator_instruction(action: str, note: str) -> bool:
-    """Return whether a resolved gate action should persist a one-shot instruction."""
-
-    if not note:
-        return False
-    return action == "continue" or action.startswith("revise(")
-
-
 async def _build_workflow_run_response(
     request: Request,
     task: TaskModel,
     pending_pause: Any,
 ) -> WorkflowRunResponse | None:
-    if task.workflow_state is None:
-        return None
-    current_step_name: str | None = None
-    if task.workflow_id:
-        workflow = await request.app.state.workflow_registry.get(task.workflow_id)
-        if workflow is not None and task.workflow_state.current_step_index < len(workflow.steps):
-            current_step_name = workflow.steps[task.workflow_state.current_step_index].name
-    return workflow_run_to_response(
-        task, current_step_name=current_step_name, pending_pause=pending_pause
+    return await task_workflow_run_response(
+        task,
+        workflow_registry=request.app.state.workflow_registry,
+        pending_pause=pending_pause,
     )
 
 
 def _task_pending_pause(request: Request, task: TaskModel) -> Any:
-    live_pause = request.app.state.pause_waiter.find_pending(task_id=task.task_id)
-    if live_pause is not None:
-        return pending_pause_to_response(live_pause)
-    if task.workflow_state is None or task.workflow_state.pending_pause_type is None:
-        return None
-
-    payload = task.workflow_state.pending_pause_payload or {}
-    recovered_pause = PendingPause(
-        pause_id=str(payload.get("pause_id", "recovered")),
-        pause_type=task.workflow_state.pending_pause_type or "unknown",
-        task_id=task.task_id,
-        step_name=payload.get("step_name"),
-        step_run_id=payload.get("step_run_id"),
-        session_id=payload.get("session_id"),
-        question=payload.get("question") or payload.get("message") or payload.get("label"),
-        options=payload.get("options"),
-        context=payload.get("context"),
-    )
-    return pending_pause_to_response(recovered_pause)
-
-
-async def _store_recovered_step_input_response(
-    request: Request,
-    task_id: str,
-    response: str,
-) -> None:
-    async with request.app.state.session_factory() as session:
-        row = await get_task(session, task_id)
-        if row is None or not row.workflow_state:
-            return
-        state = WorkflowState.model_validate(row.workflow_state)
-        if state.pending_pause_type != "step_input":
-            return
-        payload = dict(state.pending_pause_payload or {})
-        payload["response"] = response
-        state.pending_pause_payload = payload
-        await update_task_workflow_state(session, task_id, state.model_dump(mode="json"))
-        await session.commit()
+    return task_pending_pause_response(request.app.state.pause_waiter, task)
 
 
 def _row_to_task(row: Any) -> TaskModel:

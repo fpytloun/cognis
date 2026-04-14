@@ -18,7 +18,14 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from cognis.config import CognisConfig
 from cognis.logging import get_logger
 from cognis.store.database import create_engine, create_session_factory
-from cognis.store.queries import count_users, create_user, get_setting, upsert_setting
+from cognis.store.queries import (
+    count_users,
+    create_skill,
+    create_user,
+    get_setting,
+    get_skill,
+    upsert_setting,
+)
 
 logger = get_logger(__name__)
 
@@ -47,6 +54,36 @@ DEFAULT_SETTINGS: Final[dict[str, tuple[str, object]]] = {
     "executors.allow_in_process": ("executors", True),
     "executors.allow_subprocess": ("executors", True),
 }
+
+_BUILTIN_MANAGEMENT_SKILLS: Final[list[dict[str, object]]] = [
+    {
+        "skill_id": "cognis-task-manager",
+        "name": "Cognis Task Manager",
+        "description": "Guidance for inspecting and managing Cognis tasks safely from main chat.",
+        "instructions": (
+            "Use Cognis task-management tools from main chat to inspect tasks before mutating them. "
+            "Prefer get_task first, then decide whether to resolve a pause, answer a step question, "
+            "retry, update, or cancel. Use only pause actions that are currently offered. Preserve "
+            "human operator notes exactly. These management actions are intended for main chat; "
+            "workflow steps and delegated sub-sessions may not have the required tools."
+        ),
+        "tags": ["cognis", "management", "tasks"],
+    },
+    {
+        "skill_id": "cognis-workflow-manager",
+        "name": "Cognis Workflow Manager",
+        "description": "Guidance for inspecting and managing Cognis workflow definitions safely from main chat.",
+        "instructions": (
+            "Use Cognis workflow-management tools from main chat to list, inspect, create, update, "
+            "duplicate, and delete workflows. Inspect the current workflow first, preserve valid step "
+            "references and route targets, and keep changes minimal. Do not attempt to modify system "
+            "workflows. If a workflow is referenced by active tasks, treat it as protected and adjust "
+            "plans accordingly. These management actions are intended for main chat; workflow steps and "
+            "delegated sub-sessions may not have the required tools."
+        ),
+        "tags": ["cognis", "management", "workflows"],
+    },
+]
 
 
 class SetupTokenManager:
@@ -541,6 +578,26 @@ async def seed_default_settings(session: AsyncSession) -> None:
             await upsert_setting(session, key=key, value=value, category=category)
 
 
+async def seed_builtin_management_skills(session: AsyncSession) -> None:
+    """Seed first-party Cognis management skills if they do not exist."""
+
+    for skill in _BUILTIN_MANAGEMENT_SKILLS:
+        existing = await get_skill(session, str(skill["skill_id"]))
+        if existing is not None:
+            continue
+        await create_skill(
+            session,
+            skill_id=str(skill["skill_id"]),
+            name=str(skill["name"]),
+            description=str(skill["description"]),
+            instructions=str(skill["instructions"]),
+            tags=list(skill["tags"]),
+            auto_load=False,
+            source="db",
+            owner_email=None,
+        )
+
+
 async def maybe_seed_initial_admin(
     session: AsyncSession,
     config: CognisConfig,
@@ -580,6 +637,7 @@ async def bootstrap_runtime(
     async with session_factory() as session:
         await seed_default_settings(session)
         await seed_system_agents(session)
+        await seed_builtin_management_skills(session)
         config = await maybe_seed_initial_admin(session, config, password_hasher)
         await session.commit()
 

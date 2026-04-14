@@ -55,6 +55,7 @@ from cognis.tools.builtin.orchestration import (
     is_orchestration_tool,
     is_subsession_tool,
     is_task_tool,
+    is_workflow_tool,
 )
 from cognis.tools.builtin.tool_search import SEARCH_TOOLS_TOOL, search_inventory
 
@@ -165,6 +166,48 @@ def _step_complete_example_payload() -> dict[str, Any]:
             "status": "success",
         },
     }
+
+
+def _task_row_to_model(task_row: Any) -> Any:
+    """Convert a task row into a ``TaskModel`` payload."""
+
+    from cognis.models.task import TaskModel
+
+    return TaskModel.model_validate(
+        {
+            "task_id": task_row.task_id,
+            "title": getattr(task_row, "title", "Untitled task"),
+            "description": getattr(task_row, "description", "") or "",
+            "expected_output": getattr(task_row, "expected_output", None),
+            "status": task_row.status,
+            "priority": getattr(task_row, "priority", 0),
+            "created_by": getattr(task_row, "created_by", "unknown@example.com"),
+            "agent_id": task_row.agent_id,
+            "source_type": getattr(task_row, "source_type", "agent"),
+            "source_ref": getattr(task_row, "source_ref", None),
+            "delivery": {
+                "mode": getattr(task_row, "delivery_mode", "same_conversation"),
+                "target": getattr(task_row, "delivery_target", None),
+            },
+            "workflow_id": getattr(task_row, "workflow_id", None),
+            "workflow_state": getattr(task_row, "workflow_state", None),
+            "queue_name": getattr(task_row, "queue_name", "default"),
+            "scheduled_for": getattr(task_row, "scheduled_for", None),
+            "created_at": getattr(task_row, "created_at", None),
+            "started_at": getattr(task_row, "started_at", None),
+            "completed_at": getattr(task_row, "completed_at", None),
+            "result_summary": getattr(task_row, "result_summary", None),
+            "result_data": getattr(task_row, "result_data", None),
+        }
+    )
+
+
+def _workflow_registry_for_agent_loop(agent_loop: Any) -> Any:
+    """Build a workflow registry from the session factory on demand."""
+
+    from cognis.core.workflow_registry import WorkflowRegistry
+
+    return WorkflowRegistry(agent_loop.session_manager.session_factory)
 
 
 def _build_step_complete_validation_error(arguments: dict[str, Any], exc: ValidationError) -> str:
@@ -2866,6 +2909,8 @@ class AgentLoop:
             return await self._handle_subsession_management(tc, ctx=ctx)
         elif is_task_tool(tc.name):
             return await self._handle_task_tool(tc, ctx=ctx, events_to_record=events_to_record)
+        elif is_workflow_tool(tc.name):
+            return await self._handle_workflow_tool(tc, ctx=ctx)
         else:
             return ToolResult(
                 output=json.dumps({"status": "error", "message": f"Unknown tool: {tc.name}"}),
@@ -3132,7 +3177,13 @@ class AgentLoop:
         ctx: StepContext,
         events_to_record: list[SessionEvent],
     ) -> ToolResult:
-        """Handle create_task, list_tasks, get_task, update_task, cancel_task."""
+        """Handle task management tools in main-chat contexts."""
+        from cognis.core.management import (
+            resolve_task_pause_action,
+            respond_task_input,
+            task_pending_pause_response,
+            task_workflow_run_response,
+        )
         from cognis.store.queries import (
             get_task,
             list_step_runs_for_task,
@@ -3154,6 +3205,7 @@ class AgentLoop:
                     is_error=True,
                 )
             try:
+                from cognis.core.workflow_management import get_workflow_for_user
                 from cognis.models.task import TaskDelivery
 
                 # Resolve agent_id: LLMs sometimes pass "self" literally
@@ -3162,6 +3214,24 @@ class AgentLoop:
                 raw_agent_id = tc.arguments.get("agent_id")
                 if not raw_agent_id or raw_agent_id == "self":
                     raw_agent_id = ctx.agent.agent_id
+
+                workflow_id = tc.arguments.get("workflow_id")
+                if workflow_id:
+                    workflow = await get_workflow_for_user(
+                        workflow_registry=_workflow_registry_for_agent_loop(self),
+                        workflow_id=str(workflow_id),
+                        owner_email=ctx.session.user_email,
+                    )
+                    if workflow is None:
+                        return ToolResult(
+                            output=json.dumps(
+                                {
+                                    "status": "error",
+                                    "message": "Workflow not found or not accessible.",
+                                }
+                            ),
+                            is_error=True,
+                        )
 
                 task = await task_queue.submit(
                     created_by=ctx.session.user_email,
@@ -3173,7 +3243,7 @@ class AgentLoop:
                     source_type="agent",
                     source_ref=ctx.conversation.conversation_id,
                     delivery=TaskDelivery(mode="same_conversation"),
-                    workflow_id=tc.arguments.get("workflow_id"),
+                    workflow_id=workflow_id,
                 )
 
                 # Record delegation event so the card appears in session
@@ -3267,6 +3337,7 @@ class AgentLoop:
                         is_error=True,
                     )
                 step_rows = await list_step_runs_for_task(db, task_id)
+            task_model = _task_row_to_model(task_row)
             step_run_summaries = [
                 {
                     "step_name": sr.step_name,
@@ -3276,6 +3347,12 @@ class AgentLoop:
                 }
                 for sr in step_rows
             ]
+            pending_pause = task_pending_pause_response(self.pause_waiter, task_model)
+            workflow_run = await task_workflow_run_response(
+                task_model,
+                workflow_registry=_workflow_registry_for_agent_loop(self),
+                pending_pause=pending_pause,
+            )
             return ToolResult(
                 output=json.dumps(
                     {
@@ -3292,6 +3369,17 @@ class AgentLoop:
                         if task_row.completed_at
                         else None,
                         "result_summary": task_row.result_summary,
+                        "result_data": task_row.result_data,
+                        "pending_pause": (
+                            pending_pause.model_dump(mode="json")
+                            if pending_pause is not None
+                            else None
+                        ),
+                        "workflow_run": (
+                            workflow_run.model_dump(mode="json")
+                            if workflow_run is not None
+                            else None
+                        ),
                         "step_runs": step_run_summaries,
                     },
                     default=str,
@@ -3378,6 +3466,39 @@ class AgentLoop:
                 ),
             )
 
+        elif tc.name == "respond_task_input":
+            task_id = tc.arguments.get("task_id", "")
+            response = str(tc.arguments.get("response", "")).strip()
+            if not response:
+                return ToolResult(
+                    output=json.dumps({"error": "response is required."}),
+                    is_error=True,
+                )
+            async with self.session_manager.session_factory() as db:
+                task_row = await get_task(db, task_id)
+                if task_row is None:
+                    return ToolResult(
+                        output=json.dumps({"error": "Task not found."}), is_error=True
+                    )
+                if task_row.agent_id != ctx.agent.agent_id:
+                    return ToolResult(
+                        output=json.dumps({"error": "Task belongs to a different agent."}),
+                        is_error=True,
+                    )
+            try:
+                result = await respond_task_input(
+                    task=_task_row_to_model(task_row),
+                    response=response,
+                    pause_waiter=self.pause_waiter,
+                    notification_service=getattr(self, "notification_service", None),
+                    task_queue=self._task_queue,
+                    session_factory=self.session_manager.session_factory,
+                    user_email=getattr(ctx.session, "user_email", ctx.agent.owner_email),
+                )
+            except (ValueError, RuntimeError) as exc:
+                return ToolResult(output=json.dumps({"error": str(exc)}), is_error=True)
+            return ToolResult(output=json.dumps({"task_id": task_id, **result}))
+
         elif tc.name in {"retry_task", "resolve_task_pause"}:
             task_id = tc.arguments.get("task_id", "")
             task_queue = self._task_queue
@@ -3388,13 +3509,6 @@ class AgentLoop:
             requested_action = (
                 "retry" if tc.name == "retry_task" else str(tc.arguments.get("action", "retry"))
             )
-            if requested_action not in {"retry", "continue", "cancel"}:
-                return ToolResult(
-                    output=json.dumps(
-                        {"error": ("Unsupported action. Use one of: retry, continue, cancel.")}
-                    ),
-                    is_error=True,
-                )
             note = _extract_operator_note(tc.arguments)
             async with self.session_manager.session_factory() as db:
                 task_row = await get_task(db, task_id)
@@ -3417,142 +3531,88 @@ class AgentLoop:
                         is_error=True,
                     )
             try:
-                # Check for pending pauses and handle by type
-                pauses = self.pause_waiter.list_pending(task_id=task_id)
-                if pauses:
-                    pause = pauses[0]
-
-                    if pause.pause_type == "gate":
-                        if requested_action == "retry":
-                            gate_action = _find_gate_revise_action(pause)
-                            if gate_action:
-                                self.pause_waiter.resolve(
-                                    pause.pause_id,
-                                    PauseResolution(
-                                        decision=gate_action,
-                                        data={"note": note},
-                                    ),
-                                )
-                                return ToolResult(
-                                    output=json.dumps(
-                                        {
-                                            "status": "retrying",
-                                            "task_id": task_id,
-                                            "message": f"Retrying: resolved gate with '{gate_action}'.",
-                                            "note_applied": bool(note),
-                                        }
-                                    ),
-                                )
-                            return ToolResult(
-                                output=json.dumps(
-                                    {
-                                        "error": (
-                                            "This paused gate does not offer a retry action. "
-                                            "Use continue or cancel instead."
-                                        )
-                                    }
-                                ),
-                                is_error=True,
-                            )
-
-                        gate_decision = "continue" if requested_action == "continue" else "cancel"
-                        self.pause_waiter.resolve(
-                            pause.pause_id,
-                            PauseResolution(decision=gate_decision, data={"note": note}),
-                        )
-                        return ToolResult(
-                            output=json.dumps(
-                                {
-                                    "status": (
-                                        "continuing" if gate_decision == "continue" else "cancelled"
-                                    ),
-                                    "task_id": task_id,
-                                    "message": (
-                                        "Gate resolved with 'continue'."
-                                        if gate_decision == "continue"
-                                        else "Gate resolved with 'cancel'."
-                                    ),
-                                    "note_applied": bool(note),
-                                }
-                            ),
-                        )
-
-                    elif pause.pause_type in ("step_question", "step_input"):
-                        # Step questions need a response, not a retry
-                        question = pause.question or "No question text available"
-                        return ToolResult(
-                            output=json.dumps(
-                                {
-                                    "error": (
-                                        f"Task is waiting for input on step "
-                                        f"'{pause.step_name or 'unknown'}'. "
-                                        f"Question: {question}. "
-                                        "The user needs to answer this question "
-                                        "before the task can continue."
-                                    ),
-                                }
-                            ),
-                            is_error=True,
-                        )
-
-                    elif pause.pause_type == "escalation":
-                        # Escalations need approve/deny, not retry
-                        tool_name = (
-                            (pause.context or {}).get("tool_name", "a tool call")
-                            if pause.context
-                            else "a tool call"
-                        )
-                        return ToolResult(
-                            output=json.dumps(
-                                {
-                                    "error": (
-                                        f"Task is waiting for escalation approval "
-                                        f"on {tool_name}. Use /approve or /deny "
-                                        "to resolve the escalation first."
-                                    ),
-                                }
-                            ),
-                            is_error=True,
-                        )
-
-                    else:
-                        # Unknown pause type — try generic resolve
-                        step_name = pause.step_name or ""
-                        self.pause_waiter.resolve(
-                            pause.pause_id,
-                            PauseResolution(
-                                decision=f"revise({step_name})" if step_name else "continue",
-                                data={},
-                            ),
-                        )
-                        return ToolResult(
-                            output=json.dumps(
-                                {
-                                    "status": "retrying",
-                                    "task_id": task_id,
-                                    "message": f"Resolved pending pause on '{step_name or 'unknown'}'.",
-                                }
-                            ),
-                        )
-
-                # No active pause — retry from failed state directly
-                await task_queue.retry_failed_task(task_id)
-                return ToolResult(
-                    output=json.dumps(
-                        {
-                            "status": "retrying",
-                            "task_id": task_id,
-                            "message": "Task reset and relaunched for retry.",
-                        }
-                    ),
+                result = await resolve_task_pause_action(
+                    task=_task_row_to_model(task_row),
+                    requested_action=requested_action,
+                    note=note,
+                    pause_waiter=self.pause_waiter,
+                    notification_service=getattr(self, "notification_service", None),
+                    task_queue=self._task_queue,
+                    session_factory=self.session_manager.session_factory,
+                    user_email=getattr(ctx.session, "user_email", ctx.agent.owner_email),
                 )
-            except Exception as exc:
+                return ToolResult(output=json.dumps({"task_id": task_id, **result}))
+            except ValueError as exc:
+                pauses = self.pause_waiter.list_pending(task_id=task_id)
+                if pauses and pauses[0].pause_type in ("step_question", "step_input"):
+                    question = pauses[0].question or "No question text available"
+                    return ToolResult(
+                        output=json.dumps(
+                            {
+                                "error": (
+                                    f"Task is waiting for input on step '{pauses[0].step_name or 'unknown'}'. "
+                                    f"Question: {question}. Use respond_task_input to continue."
+                                )
+                            }
+                        ),
+                        is_error=True,
+                    )
+                if pauses and pauses[0].pause_type == "escalation":
+                    tool_name = (
+                        (pauses[0].context or {}).get("tool_name", "a tool call")
+                        if pauses[0].context
+                        else "a tool call"
+                    )
+                    return ToolResult(
+                        output=json.dumps(
+                            {
+                                "error": (
+                                    f"Task is waiting for escalation approval on {tool_name}. "
+                                    "Use /approve or /deny to resolve the escalation first."
+                                )
+                            }
+                        ),
+                        is_error=True,
+                    )
+                if (
+                    not pauses
+                    and task_row.status in ("failed", "paused")
+                    and requested_action == "retry"
+                ):
+                    await task_queue.retry_failed_task(task_id)
+                    return ToolResult(
+                        output=json.dumps(
+                            {
+                                "status": "retrying",
+                                "task_id": task_id,
+                                "message": "Task reset and relaunched for retry.",
+                            }
+                        ),
+                    )
+                return ToolResult(output=json.dumps({"error": str(exc)}), is_error=True)
+            except RuntimeError as exc:
                 return ToolResult(
                     output=json.dumps({"error": f"Failed to retry task: {exc}"}), is_error=True
                 )
 
         elif tc.name == "update_task":
             task_id = tc.arguments.get("task_id", "")
+            from cognis.core.workflow_management import get_workflow_for_user
+
+            workflow_id = tc.arguments.get("workflow_id")
+            if workflow_id:
+                workflow = await get_workflow_for_user(
+                    workflow_registry=_workflow_registry_for_agent_loop(self),
+                    workflow_id=str(workflow_id),
+                    owner_email=ctx.session.user_email,
+                )
+                if workflow is None:
+                    return ToolResult(
+                        output=json.dumps(
+                            {"status": "error", "message": "Workflow not found or not accessible."}
+                        ),
+                        is_error=True,
+                    )
             async with self.session_manager.session_factory() as db:
                 task_row = await get_task(db, task_id)
                 if task_row is None:
@@ -3655,6 +3715,130 @@ class AgentLoop:
 
         return ToolResult(
             output=json.dumps({"status": "error", "message": f"Unknown tool: {tc.name}"}),
+            is_error=True,
+        )
+
+    async def _handle_workflow_tool(
+        self,
+        tc: ToolCall,
+        *,
+        ctx: StepContext,
+    ) -> ToolResult:
+        """Handle workflow CRUD tools in main-chat contexts."""
+
+        from cognis.api.serializers import workflow_to_response
+        from cognis.core.management import workflow_row_to_summary
+        from cognis.core.workflow_management import (
+            create_user_workflow,
+            delete_user_workflow,
+            duplicate_visible_workflow,
+            get_workflow_for_user,
+            list_workflows_for_user,
+            update_user_workflow,
+        )
+
+        workflow_registry = _workflow_registry_for_agent_loop(self)
+        owner_email = ctx.session.user_email
+
+        if tc.name == "list_workflows":
+            workflows = await list_workflows_for_user(
+                workflow_registry=workflow_registry,
+                owner_email=owner_email,
+            )
+            items = [workflow_row_to_summary(workflow) for workflow in workflows]
+            return ToolResult(output=json.dumps({"workflows": items, "count": len(items)}))
+
+        if tc.name == "get_workflow":
+            workflow_id = str(tc.arguments.get("workflow_id", "")).strip()
+            workflow = await get_workflow_for_user(
+                workflow_registry=workflow_registry,
+                workflow_id=workflow_id,
+                owner_email=owner_email,
+            )
+            if workflow is None:
+                return ToolResult(
+                    output=json.dumps({"error": "Workflow not found."}), is_error=True
+                )
+            return ToolResult(
+                output=json.dumps(workflow_to_response(workflow).model_dump(mode="json"))
+            )
+
+        if tc.name == "create_workflow":
+            try:
+                row = await create_user_workflow(
+                    session_factory=self.session_manager.session_factory,
+                    owner_email=owner_email,
+                    payload=tc.arguments,
+                )
+            except ValueError as exc:
+                return ToolResult(output=json.dumps({"error": str(exc)}), is_error=True)
+            return ToolResult(
+                output=json.dumps(
+                    {
+                        "status": "created",
+                        "workflow": workflow_to_response(row).model_dump(mode="json"),
+                    }
+                )
+            )
+
+        if tc.name == "update_workflow":
+            workflow_id = str(tc.arguments.get("workflow_id", "")).strip()
+            try:
+                row = await update_user_workflow(
+                    session_factory=self.session_manager.session_factory,
+                    workflow_id=workflow_id,
+                    owner_email=owner_email,
+                    payload={
+                        key: value for key, value in tc.arguments.items() if key != "workflow_id"
+                    },
+                )
+            except ValueError as exc:
+                return ToolResult(output=json.dumps({"error": str(exc)}), is_error=True)
+            return ToolResult(
+                output=json.dumps(
+                    {
+                        "status": "updated",
+                        "workflow": workflow_to_response(row).model_dump(mode="json"),
+                    }
+                )
+            )
+
+        if tc.name == "delete_workflow":
+            workflow_id = str(tc.arguments.get("workflow_id", "")).strip()
+            try:
+                ok = await delete_user_workflow(
+                    session_factory=self.session_manager.session_factory,
+                    workflow_id=workflow_id,
+                    owner_email=owner_email,
+                )
+            except ValueError as exc:
+                return ToolResult(output=json.dumps({"error": str(exc)}), is_error=True)
+            return ToolResult(
+                output=json.dumps({"status": "deleted", "workflow_id": workflow_id, "ok": ok})
+            )
+
+        if tc.name == "duplicate_workflow":
+            workflow_id = str(tc.arguments.get("workflow_id", "")).strip()
+            try:
+                row = await duplicate_visible_workflow(
+                    session_factory=self.session_manager.session_factory,
+                    workflow_registry=workflow_registry,
+                    workflow_id=workflow_id,
+                    owner_email=owner_email,
+                )
+            except ValueError as exc:
+                return ToolResult(output=json.dumps({"error": str(exc)}), is_error=True)
+            return ToolResult(
+                output=json.dumps(
+                    {
+                        "status": "duplicated",
+                        "workflow": workflow_to_response(row).model_dump(mode="json"),
+                    }
+                )
+            )
+
+        return ToolResult(
+            output=json.dumps({"error": f"Unknown workflow tool: {tc.name}"}),
             is_error=True,
         )
 
