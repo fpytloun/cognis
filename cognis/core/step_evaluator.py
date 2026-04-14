@@ -259,14 +259,9 @@ class StepEvaluator:
             else "(implicit success)"
         )
 
-        # Include the agent's actual response content so the evaluator can
-        # verify claims against evidence.  Use the tail of the content since
-        # the final deliverable is typically at the end.
-        raw_content = step_output.content or ""
-        if len(raw_content) > 4000:
-            formatted_content = f"...(truncated)...\n{raw_content[-4000:]}"
-        else:
-            formatted_content = raw_content or "(no content produced)"
+        # Include the full response content so the evaluator can verify claims
+        # against evidence anywhere in the deliverable.
+        formatted_content = step_output.content or "(no content produced)"
 
         return template.format(
             objective=step_definition.prompt or step_definition.description,

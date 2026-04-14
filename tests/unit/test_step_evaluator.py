@@ -54,6 +54,23 @@ class _SequenceLLM:
         return self._responses.pop(0)
 
 
+class _CaptureLLM:
+    def __init__(self) -> None:
+        self.messages: list[dict[str, object]] | None = None
+
+    async def generate(
+        self,
+        messages: list[dict[str, object]],
+        task_type: str = "default",
+        **kwargs: object,
+    ) -> dict[str, object]:
+        del task_type, kwargs
+        self.messages = messages
+        return {
+            "choices": [{"message": {"content": '{"decision": "approved", "reasoning": "ok"}'}}]
+        }
+
+
 def _step_def(prompt: str = "Implement the feature") -> StepDefinition:
     return StepDefinition(
         name="implement",
@@ -388,3 +405,33 @@ async def test_evaluator_invalid_decision_defaults_to_approved() -> None:
     )
 
     assert result.decision == "approved"
+
+
+@pytest.mark.asyncio
+async def test_evaluator_prompt_includes_full_long_content() -> None:
+    capture = _CaptureLLM()
+    evaluator = StepEvaluator(llm=capture, evaluator_timeout_seconds=5.0)
+    long_review = (
+        "### Summary\nReview overview.\n\n"
+        "### Strengths\n- Reuses existing workflow state.\n\n"
+        + ("Filler paragraph for a long review.\n" * 300)
+        + "### Verdict\n**REQUEST REWORK**\n"
+    )
+
+    result = await evaluator.evaluate(
+        step_definition=_step_def("Review the implementation plan"),
+        step_output=StepOutput(
+            summary="Review complete",
+            content=long_review,
+            outputs={"verdict": "REQUEST REWORK"},
+            claims=["Included Strengths and Verdict"],
+        ),
+        step_inputs={},
+    )
+
+    assert result.decision == "approved"
+    assert capture.messages is not None
+    prompt = str(capture.messages[1]["content"])
+    assert "### Strengths" in prompt
+    assert "### Verdict" in prompt
+    assert "truncated" not in prompt
