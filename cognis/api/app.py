@@ -43,6 +43,7 @@ from cognis.api.websocket import handle_websocket
 from cognis.bootstrap import bootstrap_runtime
 from cognis.config import load_config
 from cognis.core.agent_loop import AgentLoop, PauseWaiter, SessionLock
+from cognis.core.agent_registry import AgentRegistry
 from cognis.core.compaction import CompactionStrategy
 from cognis.core.context import ContextAssembler
 from cognis.core.decision import DecisionEngine
@@ -279,6 +280,7 @@ def create_app() -> FastAPI:
             image_generation_provider=providers.image_generation,
             artifact_store=artifact_store,
         )
+        agent_registry = AgentRegistry(session_factory)
         workflow_registry = WorkflowRegistry(session_factory)
         step_evaluator = await StepEvaluator.from_session_factory(
             session_factory=session_factory,
@@ -425,6 +427,7 @@ def create_app() -> FastAPI:
         app.state.pause_waiter = pause_waiter
         app.state.session_lock = session_lock
         app.state.tool_router = tool_router
+        app.state.agent_registry = agent_registry
         app.state.workflow_registry = workflow_registry
         app.state.step_evaluator = step_evaluator
         app.state.agent_loop = agent_loop

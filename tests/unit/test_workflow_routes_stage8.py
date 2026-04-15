@@ -49,6 +49,22 @@ def test_workflow_list_includes_system_workflows(monkeypatch: object, tmp_path: 
         assert "system:research" in workflow_ids
 
 
+def test_agent_list_includes_system_agents(monkeypatch: object, tmp_path: Path) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        asyncio.run(_seed_user(client.app))
+
+        response = client.get(
+            "/api/v1/agents",
+            headers=_auth_headers(client.app, email="user@example.com"),
+        )
+
+        assert response.status_code == 200
+        agent_ids = {item["agent_id"] for item in response.json()["items"]}
+        assert "system:explore" in agent_ids
+        assert "system:research" in agent_ids
+        assert "system:implement" in agent_ids
+
+
 def test_workflow_detail_supports_system_workflow(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
         asyncio.run(_seed_user(client.app))

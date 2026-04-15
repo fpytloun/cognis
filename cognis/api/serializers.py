@@ -97,19 +97,25 @@ def agent_to_response(row: Any) -> AgentResponse:
     if isinstance(checked_at, str):
         with contextlib.suppress(ValueError):
             checked_at = datetime.fromisoformat(checked_at)
+    llm_config = getattr(row, "llm_config", None)
+    if hasattr(llm_config, "model_dump"):
+        llm_config = llm_config.model_dump(mode="json", exclude_none=True)
+    permissions = getattr(row, "permissions", None)
+    if hasattr(permissions, "model_dump"):
+        permissions = permissions.model_dump(mode="json", exclude_none=True)
     return AgentResponse(
         agent_id=row.agent_id,
         owner_email=row.owner_email,
         name=row.name,
-        display_name=row.display_name,
+        display_name=getattr(row, "display_name", row.name),
         description=row.description,
         system_prompt=row.system_prompt,
         personality=row.personality,
         skills=row.skills,
         tools=row.tools,
-        permissions=row.permissions,
-        llm_config=row.llm_config,
-        execution=row.execution,
+        permissions=permissions,
+        llm_config=llm_config,
+        execution=getattr(row, "execution", None),
         personality_synced=bool(sync_metadata.get("personality_synced", True)),
         personality_sync_error=(
             str(sync_metadata.get("personality_sync_error"))
@@ -132,8 +138,8 @@ def agent_to_response(row: Any) -> AgentResponse:
         disableable=bool(getattr(row, "allow_user_disable", False)),
         sync_metadata=sync_metadata if sync_metadata else None,
         status=row.status,
-        created_at=row.created_at,
-        updated_at=row.updated_at,
+        created_at=getattr(row, "created_at", None),
+        updated_at=getattr(row, "updated_at", None),
     )
 
 

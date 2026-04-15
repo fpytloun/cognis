@@ -60,6 +60,17 @@ def test_settings_update_rejects_unknown_key(monkeypatch: object, tmp_path: Path
         assert response.status_code == 400
 
 
+def test_app_startup_registers_required_state_services(monkeypatch: object, tmp_path: Path) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        state = client.app.state
+
+        assert hasattr(state, "agent_registry")
+        assert hasattr(state, "workflow_registry")
+        assert hasattr(state, "turn_scheduler")
+        assert hasattr(state, "command_dispatcher")
+        assert hasattr(state, "task_queue")
+
+
 def test_workflow_create_rejects_empty_steps(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
         app = client.app
