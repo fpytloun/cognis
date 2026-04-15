@@ -110,16 +110,9 @@ def test_prepare_tool_exposure_dedupes_visible_names() -> None:
 
 
 def test_prepare_tool_exposure_uses_openai_responses_full_inventory() -> None:
-    mcp_tool = ToolDefinition(
-        name=sanitize_mcp_tool_name("github", "search/issues"),
-        description="search",
-        parameters={"type": "object", "properties": {}},
-        source=ToolSource(type="intaris_mcp", server_name="github", raw_tool_name="search/issues"),
-        category="mcp",
-    )
     inventory = [
         _tool("read", source_type="executor", category="filesystem"),
-        mcp_tool,
+        _tool("bash", source_type="executor", category="shell"),
     ]
 
     result = prepare_tool_exposure(
@@ -138,7 +131,7 @@ def test_prepare_tool_exposure_uses_openai_responses_full_inventory() -> None:
     tool_names = [tool["function"]["name"] for tool in result.tools]
     assert result.debug_metadata["strategy"] == "openai_responses_full_inventory"
     assert "search_tools" not in tool_names
-    assert sanitize_mcp_tool_name("github", "search/issues") in tool_names
+    assert {"read", "bash"} <= set(tool_names)
     assert result.request_kwargs["parallel_tool_calls"] is True
 
 
@@ -197,9 +190,47 @@ def test_prepare_tool_exposure_marks_skill_tools_deferred_for_responses() -> Non
     )
 
     skill_schema = next(
-        tool for tool in result.tools if tool["function"]["name"] == "skill_release"
+        child
+        for tool in result.tools
+        if tool["type"] == "namespace"
+        for child in tool["tools"]
+        if child["name"] == "skill_release"
     )
-    assert skill_schema["function"]["defer_loading"] is True
+    assert skill_schema["defer_loading"] is True
+
+
+def test_prepare_tool_exposure_uses_openai_tool_search_with_deferred_namespaces() -> None:
+    mcp_tool = ToolDefinition(
+        name=sanitize_mcp_tool_name("github", "search/issues"),
+        description="search",
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(type="intaris_mcp", server_name="github", raw_tool_name="search/issues"),
+        category="mcp",
+    )
+
+    result = prepare_tool_exposure(
+        inventory_tools=[_tool("read", source_type="executor", category="filesystem"), mcp_tool],
+        controller_tool_schemas=[],
+        model="gpt-5.4",
+        model_info=ModelInfo(
+            model_id="gpt-5.4",
+            supports_tool_search=True,
+            supports_responses_api=True,
+            max_tools=128,
+        ),
+        discovered_tool_ids=set(),
+    )
+
+    namespace = next(tool for tool in result.tools if tool["type"] == "namespace")
+    deferred_schema = next(
+        child
+        for child in namespace["tools"]
+        if child["name"] == sanitize_mcp_tool_name("github", "search/issues")
+    )
+    assert result.debug_metadata["strategy"] == "openai_responses_tool_search"
+    assert namespace["name"] == "mcp_github"
+    assert deferred_schema["defer_loading"] is True
+    assert {tool["type"] for tool in result.tools} >= {"tool_search", "namespace"}
 
 
 def test_prepare_tool_exposure_sanitizes_skill_visible_names() -> None:
@@ -225,9 +256,40 @@ def test_prepare_tool_exposure_sanitizes_skill_visible_names() -> None:
     )
 
     skill_schema = next(
-        tool for tool in result.tools if tool["function"]["name"] == "run_release_now"
+        child
+        for tool in result.tools
+        if tool["type"] == "namespace"
+        for child in tool["tools"]
+        if child["name"] == "run_release_now"
     )
-    assert skill_schema["function"]["defer_loading"] is True
+    assert skill_schema["defer_loading"] is True
+
+
+def test_prepare_tool_exposure_openai_tool_search_updates_alias_map_for_namespace_children() -> (
+    None
+):
+    skill_tool = ToolDefinition(
+        name="skill_git-release__run_release",
+        description="release",
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(type="skill", skill_id="git-release", raw_tool_name="run/release now"),
+        category="skill",
+    )
+
+    result = prepare_tool_exposure(
+        inventory_tools=[skill_tool],
+        controller_tool_schemas=[],
+        model="gpt-5.4",
+        model_info=ModelInfo(
+            model_id="gpt-5.4",
+            supports_tool_search=True,
+            supports_responses_api=True,
+            max_tools=128,
+        ),
+        discovered_tool_ids=set(),
+    )
+
+    assert result.alias_map["run_release_now"] == "skill_git-release__run_release"
 
 
 def test_prepare_tool_exposure_prioritizes_discovered_skill_tools_when_slots_are_tight() -> None:
@@ -275,7 +337,18 @@ def test_prepare_tool_exposure_strips_controller_search_tool_for_responses() -> 
     }
 
     result = prepare_tool_exposure(
-        inventory_tools=[_tool("read", source_type="executor", category="filesystem")],
+        inventory_tools=[
+            _tool("read", source_type="executor", category="filesystem"),
+            ToolDefinition(
+                name=sanitize_mcp_tool_name("github", "search/issues"),
+                description="search",
+                parameters={"type": "object", "properties": {}},
+                source=ToolSource(
+                    type="intaris_mcp", server_name="github", raw_tool_name="search/issues"
+                ),
+                category="mcp",
+            ),
+        ],
         controller_tool_schemas=[controller_search_schema],
         model="gpt-5.4",
         model_info=ModelInfo(
@@ -287,7 +360,71 @@ def test_prepare_tool_exposure_strips_controller_search_tool_for_responses() -> 
         discovered_tool_ids=set(),
     )
 
-    assert all(tool["function"]["name"] != "search_tools" for tool in result.tools)
+    assert all(tool.get("function", {}).get("name") != "search_tools" for tool in result.tools)
+    assert any(tool["type"] == "tool_search" for tool in result.tools)
+
+
+def test_prepare_tool_exposure_strips_controller_search_tool_for_responses_full_inventory() -> None:
+    controller_search_schema = {
+        "type": "function",
+        "function": {
+            "name": SEARCH_TOOLS_TOOL.name,
+            "description": SEARCH_TOOLS_TOOL.description,
+            "parameters": SEARCH_TOOLS_TOOL.parameters,
+        },
+    }
+
+    result = prepare_tool_exposure(
+        inventory_tools=[
+            _tool("read", source_type="executor", category="filesystem"),
+            _tool("bash", source_type="executor", category="shell"),
+        ],
+        controller_tool_schemas=[controller_search_schema],
+        model="gpt-5.4",
+        model_info=ModelInfo(
+            model_id="gpt-5.4",
+            supports_tool_search=True,
+            supports_responses_api=True,
+            max_tools=128,
+        ),
+        discovered_tool_ids=set(),
+    )
+
+    assert result.debug_metadata["strategy"] == "openai_responses_full_inventory"
+    assert all(tool.get("function", {}).get("name") != "search_tools" for tool in result.tools)
+
+
+def test_prepare_tool_exposure_dedupes_openai_namespace_names() -> None:
+    tool_a = ToolDefinition(
+        name=sanitize_mcp_tool_name("srv/a", "search/issues"),
+        description="search",
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(type="intaris_mcp", server_name="srv/a", raw_tool_name="search/issues"),
+        category="mcp",
+    )
+    tool_b = ToolDefinition(
+        name=sanitize_mcp_tool_name("srv_a", "search/issues"),
+        description="search",
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(type="local_mcp", server_name="srv_a", raw_tool_name="search/issues"),
+        category="mcp",
+    )
+
+    result = prepare_tool_exposure(
+        inventory_tools=[tool_a, tool_b],
+        controller_tool_schemas=[],
+        model="gpt-5.4",
+        model_info=ModelInfo(
+            model_id="gpt-5.4",
+            supports_tool_search=True,
+            supports_responses_api=True,
+            max_tools=128,
+        ),
+        discovered_tool_ids=set(),
+    )
+
+    namespace_names = [tool["name"] for tool in result.tools if tool["type"] == "namespace"]
+    assert len(namespace_names) == len(set(namespace_names))
 
 
 def test_prepare_tool_exposure_respects_responses_rollout_off(monkeypatch) -> None:

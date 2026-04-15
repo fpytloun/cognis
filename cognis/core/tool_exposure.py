@@ -39,17 +39,20 @@ def prepare_tool_exposure(
 ) -> ToolExposureResult:
     """Prepare provider-specific model-facing tool schemas."""
 
-    filtered_controller_tool_schemas = list(controller_tool_schemas)
-    if use_openai_responses := should_use_openai_responses(
+    use_openai_responses = should_use_openai_responses(
         model=model,
         model_info=model_info,
         rollout_mode=os.getenv("COGNIS_OPENAI_RESPONSES_MODE", "auto").strip().lower(),
-    ):
-        filtered_controller_tool_schemas = [
+    )
+    filtered_controller_tool_schemas = (
+        [
             schema
             for schema in controller_tool_schemas
             if schema.get("function", {}).get("name") != SEARCH_TOOLS_TOOL.name
         ]
+        if use_openai_responses
+        else list(controller_tool_schemas)
+    )
 
     alias_map = {
         schema.get("function", {}).get("name", ""): schema.get("function", {}).get("name", "")
@@ -71,6 +74,17 @@ def prepare_tool_exposure(
     use_anthropic_defer = bool(
         model_info.supports_defer_loading or _ANTHROPIC_MODEL_PATTERNS.search(model)
     )
+    use_openai_native_tool_search = bool(
+        use_openai_responses and model_info.supports_tool_search and deferred_tools
+    )
+    if use_openai_native_tool_search:
+        alias_map = {
+            schema.get("function", {}).get("name", ""): schema.get("function", {}).get("name", "")
+            for schema in filtered_controller_tool_schemas
+            if isinstance(schema.get("function", {}).get("name"), str)
+        }
+        controller_count = len(filtered_controller_tool_schemas)
+        available_slots = None if max_tools is None else max(0, max_tools - controller_count)
     if use_anthropic_defer:
         strategy = "anthropic_defer_loading"
         visible_tools = core_without_search + deferred_tools
@@ -82,14 +96,19 @@ def prepare_tool_exposure(
         if tool_schemas:
             tool_schemas[-1]["function"]["cache_control"] = {"type": "ephemeral"}
         request_kwargs = {"extra_headers": {"anthropic-beta": "tool-search-tool-2025-10-19"}}
+    elif use_openai_native_tool_search:
+        strategy = "openai_responses_tool_search"
+        visible_tools = core_without_search + deferred_tools
+        tool_schemas = [
+            *_build_inventory_schemas(core_without_search, alias_map),
+            *_build_openai_deferred_namespaces(deferred_tools, alias_map),
+            {"type": "tool_search"},
+        ]
+        request_kwargs = {"tool_choice": "auto", "parallel_tool_calls": True}
     elif use_openai_responses:
         strategy = "openai_responses_full_inventory"
         visible_tools = core_without_search + deferred_tools
-        tool_schemas = _build_inventory_schemas(
-            visible_tools,
-            alias_map,
-            deferred_tool_ids={stable_tool_id(tool) for tool in deferred_tools},
-        )
+        tool_schemas = _build_inventory_schemas(visible_tools, alias_map)
         request_kwargs = {"tool_choice": "auto", "parallel_tool_calls": True}
     else:
         strategy = "generic_search_tools"
@@ -149,6 +168,62 @@ def _build_inventory_schemas(
             function_schema["defer_loading"] = True
         schemas.append({"type": "function", "function": function_schema})
     return schemas
+
+
+def _build_openai_deferred_namespaces(
+    tools: list[ToolDefinition], alias_map: dict[str, str]
+) -> list[dict[str, Any]]:
+    grouped: dict[str, list[ToolDefinition]] = {}
+    for tool in tools:
+        grouped.setdefault(_openai_namespace_key(tool), []).append(tool)
+
+    namespaces: list[dict[str, Any]] = []
+    used_namespace_names: set[str] = set(alias_map)
+    for namespace_key in sorted(grouped):
+        group_tools = grouped[namespace_key]
+        namespace_name = _dedupe_visible_name(
+            _sanitize_visible_name(namespace_key), namespace_key, used_namespace_names
+        )
+        namespace_tools: list[dict[str, Any]] = []
+        used_names: set[str] = set(alias_map)
+        for tool in group_tools:
+            visible_name = _dedupe_visible_name(
+                _tool_visible_name(tool), stable_tool_id(tool), used_names
+            )
+            alias_map[visible_name] = tool.name
+            namespace_tools.append(
+                {
+                    "type": "function",
+                    "name": visible_name,
+                    "description": tool.description,
+                    "parameters": tool.parameters,
+                    "defer_loading": True,
+                }
+            )
+        namespaces.append(
+            {
+                "type": "namespace",
+                "name": namespace_name,
+                "description": _openai_namespace_description(group_tools[0]),
+                "tools": namespace_tools,
+            }
+        )
+    return namespaces
+
+
+def _openai_namespace_key(tool: ToolDefinition) -> str:
+    if tool.source.type == "skill":
+        return f"skill_{tool.source.skill_id or 'skill'}"
+    server_name = tool.source.server_name or tool.source.server_id or "server"
+    return f"mcp_{server_name}"
+
+
+def _openai_namespace_description(tool: ToolDefinition) -> str:
+    if tool.source.type == "skill":
+        skill_id = tool.source.skill_id or "skill"
+        return f"Deferred tools loaded from skill '{skill_id}'."
+    server_name = tool.source.server_name or tool.source.server_id or "server"
+    return f"Deferred tools loaded from MCP server '{server_name}'."
 
 
 def _select_generic_visible_tools(

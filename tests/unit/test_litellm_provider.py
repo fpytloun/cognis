@@ -7,6 +7,7 @@ import pytest
 from cognis.models.config import DEFAULT_MODEL_INFO
 from cognis.providers.llm.litellm import LiteLLMProvider, _normalize_proxy_model_info
 from cognis.providers.llm.reasoning import apply_reasoning_config, reasoning_efforts_for_model
+from cognis.providers.llm.responses_bridge import responses_request_kwargs
 from cognis.store.database import create_engine, create_session_factory
 from cognis.store.models import Base, LLMProvider, ModelRouting
 
@@ -257,6 +258,34 @@ def test_reasoning_efforts_for_reasoning_model_return_normalized_levels() -> Non
     assert reasoning_efforts_for_model(
         "gpt-5.4", provider_preset="openai", supports_reasoning=True
     ) == ["default", "none", "minimal", "low", "medium", "high", "max"]
+
+
+def test_responses_request_kwargs_preserves_namespace_and_tool_search_tools() -> None:
+    result = responses_request_kwargs(
+        {
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "mcp_github",
+                    "description": "Deferred tools loaded from MCP server 'github'.",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "mcp_github__search_issues",
+                            "description": "search",
+                            "parameters": {"type": "object", "properties": {}},
+                            "defer_loading": True,
+                        }
+                    ],
+                },
+                {"type": "tool_search"},
+            ]
+        }
+    )
+
+    assert result["tools"][0]["type"] == "namespace"
+    assert result["tools"][0]["tools"][0]["defer_loading"] is True
+    assert result["tools"][1] == {"type": "tool_search"}
 
 
 @pytest.mark.asyncio
