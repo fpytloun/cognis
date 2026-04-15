@@ -441,6 +441,61 @@ class LSPManager:
             )
         return results
 
+    async def has_clients(self, file_path: str) -> bool:
+        """Return whether any active or spawnable client exists for a file."""
+
+        return bool(await self._clients_for_file(file_path, wait=False))
+
+    async def definition(self, file_path: str, line: int, character: int) -> list[dict[str, Any]]:
+        """Return LSP definitions for a file position."""
+
+        clients = await self._clients_for_file(file_path, wait=True)
+        return await self._fanout_query(clients, "definition", file_path, line, character)
+
+    async def references(self, file_path: str, line: int, character: int) -> list[dict[str, Any]]:
+        """Return LSP references for a file position."""
+
+        clients = await self._clients_for_file(file_path, wait=True)
+        return await self._fanout_query(clients, "references", file_path, line, character)
+
+    async def hover(self, file_path: str, line: int, character: int) -> list[dict[str, Any]]:
+        """Return hover information for a file position."""
+
+        clients = await self._clients_for_file(file_path, wait=True)
+        results = await asyncio.gather(
+            *(client.hover(file_path, line, character) for client in clients),
+            return_exceptions=True,
+        )
+        return [result for result in results if isinstance(result, dict)]
+
+    async def document_symbol(self, file_path: str) -> list[dict[str, Any]]:
+        """Return document symbols for a file."""
+
+        clients = await self._clients_for_file(file_path, wait=True)
+        results = await asyncio.gather(
+            *(client.document_symbol(file_path) for client in clients),
+            return_exceptions=True,
+        )
+        return [item for result in results if isinstance(result, list) for item in result]
+
+    async def workspace_symbol(self, file_path: str, query: str) -> list[dict[str, Any]]:
+        """Return workspace symbols from relevant clients."""
+
+        clients = await self._clients_for_file(file_path, wait=True)
+        results = await asyncio.gather(
+            *(client.workspace_symbol(query) for client in clients),
+            return_exceptions=True,
+        )
+        return [item for result in results if isinstance(result, list) for item in result]
+
+    async def implementation(
+        self, file_path: str, line: int, character: int
+    ) -> list[dict[str, Any]]:
+        """Return implementations for a file position."""
+
+        clients = await self._clients_for_file(file_path, wait=True)
+        return await self._fanout_query(clients, "implementation", file_path, line, character)
+
     async def cleanup(self) -> None:
         """Shutdown all LSP clients and cancel background tasks."""
         if self._cleanup_done:
@@ -483,6 +538,55 @@ class LSPManager:
                 }
             },
         )
+
+    async def _clients_for_file(self, file_path: str, *, wait: bool) -> list[LSPClient]:
+        abs_path = os.path.abspath(file_path)
+        ext = os.path.splitext(abs_path)[1].lower()
+        if not ext:
+            return []
+        servers = get_servers_for_extension(ext)
+        if not servers:
+            return []
+        clients: list[LSPClient] = []
+        for server_def in servers:
+            root_path = _find_project_root(abs_path, server_def.root_markers)
+            client_key = f"{server_def.server_id}:{root_path}"
+            client = self._clients.get(client_key)
+            if client is None or not client.is_alive:
+                if not wait:
+                    continue
+                client = await self._spawn_or_reuse_client(server_def, root_path, client_key)
+            if client is not None:
+                self._last_access[client_key] = monotonic()
+                clients.append(client)
+        return clients
+
+    async def _spawn_or_reuse_client(
+        self, server_def: LSPServerDefinition, root_path: str, client_key: str
+    ) -> LSPClient | None:
+        if client_key in self._spawning:
+            spawn_task = self._spawning[client_key]
+        else:
+            spawn_task = asyncio.create_task(self._spawn_client(server_def, root_path, client_key))
+            self._spawning[client_key] = spawn_task
+        try:
+            return await asyncio.wait_for(spawn_task, timeout=15.0)
+        except (TimeoutError, Exception):
+            return None
+
+    async def _fanout_query(
+        self,
+        clients: list[LSPClient],
+        method_name: str,
+        file_path: str,
+        line: int,
+        character: int,
+    ) -> list[dict[str, Any]]:
+        results = await asyncio.gather(
+            *(getattr(client, method_name)(file_path, line, character) for client in clients),
+            return_exceptions=True,
+        )
+        return [item for result in results if isinstance(result, list) for item in result]
 
     # ------------------------------------------------------------------
     # Internal

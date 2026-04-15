@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import re
+import shutil
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -213,6 +215,71 @@ _DEFAULT_IGNORE = {
     ".nuxt",
 }
 
+_PRETTIER_EXTENSIONS = {
+    ".js",
+    ".jsx",
+    ".ts",
+    ".tsx",
+    ".mjs",
+    ".cjs",
+    ".json",
+    ".md",
+    ".css",
+    ".scss",
+    ".html",
+    ".yaml",
+    ".yml",
+}
+
+
+async def _maybe_format_file(path: Path) -> bool:
+    command = _formatter_command(path)
+    if command is None:
+        return False
+    before = path.read_bytes()
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(path.parent),
+        )
+        await asyncio.wait_for(process.communicate(), timeout=20)
+        after = path.read_bytes()
+        return before != after
+    except Exception:
+        logger.debug(
+            "formatter: file format failed",
+            extra={"extra_data": {"file_path": str(path)}},
+        )
+        return False
+
+
+def _formatter_command(path: Path) -> list[str] | None:
+    suffix = path.suffix.lower()
+    if suffix == ".py":
+        ruff = shutil.which("ruff")
+        if ruff:
+            return [ruff, "format", str(path)]
+        return None
+    if suffix not in _PRETTIER_EXTENSIONS:
+        return None
+    prettier = _find_prettier_binary(path.parent)
+    if prettier is None:
+        return None
+    return [prettier, "--write", str(path)]
+
+
+def _find_prettier_binary(start_dir: Path) -> str | None:
+    for directory in [start_dir, *start_dir.parents]:
+        local = directory / "node_modules" / ".bin" / "prettier"
+        if local.is_file() and os.access(local, os.X_OK):
+            return str(local)
+        if (directory / "package.json").is_file():
+            break
+    global_prettier = shutil.which("prettier")
+    return global_prettier
+
 
 async def handle_read(arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
     """Read a file or directory, returning line-numbered content."""
@@ -288,7 +355,11 @@ async def handle_write(arguments: dict[str, Any], context: ToolExecutionContext)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content, encoding="utf-8")
-            await _record_write(context, path)
+            formatter_changed = await _maybe_format_file(path)
+            if formatter_changed:
+                _remove_tracked_path(context, path)
+            else:
+                await _record_write(context, path)
         except (OSError, PermissionError) as exc:
             return ToolResult(output=f"Cannot write file: {exc}", is_error=True)
 
@@ -341,7 +412,11 @@ async def handle_edit(arguments: dict[str, Any], context: ToolExecutionContext) 
         )
         try:
             path.write_text(new_content, encoding="utf-8")
-            await _record_write(context, path)
+            formatter_changed = await _maybe_format_file(path)
+            if formatter_changed:
+                _remove_tracked_path(context, path)
+            else:
+                await _record_write(context, path)
         except (OSError, PermissionError) as exc:
             return ToolResult(output=f"Cannot write file: {exc}", is_error=True)
 
@@ -435,7 +510,11 @@ async def handle_multiedit(arguments: dict[str, Any], context: ToolExecutionCont
 
         try:
             path.write_text(content, encoding="utf-8")
-            await _record_write(context, path)
+            formatter_changed = await _maybe_format_file(path)
+            if formatter_changed:
+                _remove_tracked_path(context, path)
+            else:
+                await _record_write(context, path)
         except (OSError, PermissionError) as exc:
             return ToolResult(output=f"Cannot write file: {exc}", is_error=True)
 
@@ -894,7 +973,11 @@ async def _apply_staged_patch_operations(
         if operation.kind == "add":
             assert operation.destination_path is not None and operation.content is not None
             operation.destination_path.write_text(operation.content, encoding="utf-8")
-            await _record_write(context, operation.destination_path)
+            formatter_changed = await _maybe_format_file(operation.destination_path)
+            if formatter_changed:
+                _remove_tracked_path(context, operation.destination_path)
+            else:
+                await _record_write(context, operation.destination_path)
             summary_lines.append(f"Added {operation.destination_path}")
             diagnostic_paths.append(operation.destination_path)
             continue
@@ -909,7 +992,11 @@ async def _apply_staged_patch_operations(
         if operation.kind == "update":
             assert operation.source_path is not None and operation.content is not None
             operation.source_path.write_text(operation.content, encoding="utf-8")
-            await _record_write(context, operation.source_path)
+            formatter_changed = await _maybe_format_file(operation.source_path)
+            if formatter_changed:
+                _remove_tracked_path(context, operation.source_path)
+            else:
+                await _record_write(context, operation.source_path)
             summary_lines.append(f"Updated {operation.source_path}")
             diagnostic_paths.append(operation.source_path)
             continue
@@ -926,7 +1013,11 @@ async def _apply_staged_patch_operations(
                 await _move_tracked_path(context, operation.source_path, operation.destination_path)
             else:
                 operation.destination_path.write_text(operation.content, encoding="utf-8")
-                await _record_write(context, operation.destination_path)
+                formatter_changed = await _maybe_format_file(operation.destination_path)
+                if formatter_changed:
+                    _remove_tracked_path(context, operation.destination_path)
+                else:
+                    await _record_write(context, operation.destination_path)
                 operation.source_path.unlink()
                 _remove_tracked_path(context, operation.source_path)
             summary_lines.append(f"Moved {operation.source_path} -> {operation.destination_path}")

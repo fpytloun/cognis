@@ -28,9 +28,18 @@ Use this skill when the agent is doing software engineering work and should foll
 - Keep new abstractions minimal unless reuse is clear.
 - Stay within scope and avoid unrelated cleanup.
 
+# Routing
+
+- Keep small, clear edits inline when you can finish them immediately.
+- When the code path is unclear, use `system:explore` first to trace the implementation before editing.
+- For larger implementation, refactor, or multi-step debugging work, prefer delegation or a task with the software-development workflow instead of forcing everything inline.
+- For findings-first review, prefer `system:code-review`.
+- Use existing Cognis workflows for heavier engineering process instead of inventing a custom long-form process inside one chat turn.
+
 # Tool Use
 
 - Prefer `read`, `grep`, and `glob` for code inspection.
+- Use `lsp` for semantic navigation such as definitions, references, hover, and symbols when available.
 - Prefer `edit`, `multiedit`, `patch`, and `write` for file-content changes.
 - Use `bash` for git, tests, builds, package managers, and atomic filesystem operations.
 - Avoid shell or interpreter one-liners that rewrite files when dedicated edit tools fit the task.
@@ -39,6 +48,7 @@ Use this skill when the agent is doing software engineering work and should foll
 
 - Run the narrowest checks that prove the change works.
 - If the task affects tests, lint, typing, or build behavior, run the relevant command when feasible.
+- If you delegate substantial coding work, explain that to the user and keep the main thread responsive when possible.
 - Report verification performed and any remaining risks.
 
 # Do Not Do

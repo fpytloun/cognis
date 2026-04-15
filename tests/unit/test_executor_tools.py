@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,7 @@ from cognis.tools.executor.filesystem import (
     handle_read,
     handle_write,
 )
+from cognis.tools.executor.lsp.tool import handle_lsp
 from cognis.tools.executor.search import handle_glob, handle_grep
 from cognis.tools.executor.shell import handle_bash
 from cognis.tools.registry import ToolExecutionContext
@@ -63,6 +65,7 @@ class TestDefinitions:
             "patch",
             "multiedit",
             "list_directory",
+            "lsp",
             "glob",
             "grep",
             "bash",
@@ -189,6 +192,40 @@ class TestWriteTool:
 
         assert not result.is_error
         assert target.read_text() == "hello"
+
+    @pytest.mark.asyncio()
+    async def test_write_formats_python_file_when_formatter_exists(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        target = tmp_path / "format_me.py"
+        context = _context()
+
+        async def fake_exec(*command: str, **_: object):
+            class _Proc:
+                async def communicate(self) -> tuple[bytes, bytes]:
+                    target.write_text("x = 1\n")
+                    return b"", b""
+
+            assert command == ("ruff", "format", str(target))
+            return _Proc()
+
+        monkeypatch.setattr(
+            filesystem_module, "_formatter_command", lambda _path: ["ruff", "format", str(target)]
+        )
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+        result = await handle_write({"file_path": str(target), "content": "x=1\n"}, context)
+
+        assert not result.is_error
+        assert target.read_text() == "x = 1\n"
+
+        follow_up = await handle_edit(
+            {"file_path": str(target), "old_string": "x = 1", "new_string": "x = 2"},
+            context,
+        )
+
+        assert follow_up.is_error
+        assert "Use the read tool first" in follow_up.output
 
 
 class TestEditTool:
@@ -378,6 +415,34 @@ class TestPatchTool:
 
         assert result.is_error
         assert "already exists" in result.output
+
+    @pytest.mark.asyncio()
+    async def test_patch_formats_updated_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        target = tmp_path / "format_patch.py"
+        target.write_text("x=1\n")
+        context = _context()
+        await handle_read({"file_path": str(target)}, context)
+
+        calls: list[Path] = []
+
+        async def fake_format(path: Path) -> None:
+            calls.append(path)
+
+        monkeypatch.setattr(filesystem_module, "_maybe_format_file", fake_format)
+
+        result = await handle_patch(
+            {
+                "patch_text": (
+                    f"*** Begin Patch\n*** Update File: {target}\n@@\n-x=1\n+x=2\n*** End Patch\n"
+                )
+            },
+            context,
+        )
+
+        assert not result.is_error
+        assert calls == [target]
 
     @pytest.mark.asyncio()
     async def test_patch_delete_success(self, tmp_path: Path) -> None:
@@ -772,6 +837,32 @@ class TestBashTool:
         assert "hello" in result.output
 
     @pytest.mark.asyncio()
+    async def test_bash_rejects_python_file_rewrite_one_liner(self) -> None:
+        result = await handle_bash(
+            {"command": "python -c \"from pathlib import Path; Path('x.py').write_text('x=1')\""},
+            _DUMMY_CONTEXT,
+        )
+
+        assert result.is_error
+        assert "Use edit, multiedit, patch, or write" in result.output
+
+    @pytest.mark.asyncio()
+    async def test_bash_allows_python_read_only_one_liner(self) -> None:
+        result = await handle_bash(
+            {"command": "python -c \"print(open('/dev/null').read())\""},
+            _DUMMY_CONTEXT,
+        )
+
+        assert not result.is_error
+
+    @pytest.mark.asyncio()
+    async def test_bash_rejects_shell_redirection_to_source_file(self) -> None:
+        result = await handle_bash({"command": "printf 'x' > test.py"}, _DUMMY_CONTEXT)
+
+        assert result.is_error
+        assert "shell redirection" in result.output
+
+    @pytest.mark.asyncio()
     async def test_bash_exit_code(self) -> None:
         result = await handle_bash({"command": "exit 1"}, _DUMMY_CONTEXT)
         assert result.is_error
@@ -864,6 +955,89 @@ class TestListDirectoryTool:
         assert not result.is_error
         assert "file.txt" in result.output
         assert "other.txt" not in result.output
+
+
+class TestLspTool:
+    @pytest.mark.asyncio()
+    async def test_lsp_definition_returns_results(self, tmp_path: Path) -> None:
+        target = tmp_path / "sample.py"
+        target.write_text("value = 1\n")
+
+        class _FakeLsp:
+            async def touch_file(self, *_: object, **__: object) -> None:
+                return None
+
+            async def has_clients(self, *_: object, **__: object) -> bool:
+                return True
+
+            async def definition(self, *_: object, **__: object) -> list[dict[str, object]]:
+                return [{"uri": "file:///tmp/sample.py", "range": {}}]
+
+        context = _context(runtime_metadata={"lsp_manager": _FakeLsp()})
+        result = await handle_lsp(
+            {
+                "operation": "goToDefinition",
+                "file_path": str(target),
+                "line": 1,
+                "character": 1,
+            },
+            context,
+        )
+
+        assert not result.is_error
+        assert '"uri": "file:///tmp/sample.py"' in result.output
+
+    @pytest.mark.asyncio()
+    async def test_lsp_requires_available_server(self, tmp_path: Path) -> None:
+        target = tmp_path / "sample.py"
+        target.write_text("value = 1\n")
+
+        class _FakeLsp:
+            async def touch_file(self, *_: object, **__: object) -> None:
+                return None
+
+            async def has_clients(self, *_: object, **__: object) -> bool:
+                return False
+
+        context = _context(runtime_metadata={"lsp_manager": _FakeLsp()})
+        result = await handle_lsp(
+            {
+                "operation": "goToDefinition",
+                "file_path": str(target),
+                "line": 1,
+                "character": 1,
+            },
+            context,
+        )
+
+        assert result.is_error
+        assert "No LSP server available" in result.output
+
+    @pytest.mark.asyncio()
+    async def test_lsp_requires_position_for_definition(self, tmp_path: Path) -> None:
+        target = tmp_path / "sample.py"
+        target.write_text("value = 1\n")
+
+        result = await handle_lsp(
+            {"operation": "goToDefinition", "file_path": str(target)},
+            _context(runtime_metadata={"lsp_manager": object()}),
+        )
+
+        assert result.is_error
+        assert "requires both line and character" in result.output
+
+    @pytest.mark.asyncio()
+    async def test_lsp_workspace_symbol_requires_query(self, tmp_path: Path) -> None:
+        target = tmp_path / "sample.py"
+        target.write_text("value = 1\n")
+
+        result = await handle_lsp(
+            {"operation": "workspaceSymbol", "file_path": str(target), "query": ""},
+            _context(runtime_metadata={"lsp_manager": object()}),
+        )
+
+        assert result.is_error
+        assert "requires a non-empty query" in result.output
 
 
 class TestResolvePath:

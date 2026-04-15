@@ -41,6 +41,7 @@ from cognis.tools.executor.filesystem import (
     handle_read,
     handle_write,
 )
+from cognis.tools.executor.lsp.tool import handle_lsp
 from cognis.tools.executor.search import handle_glob, handle_grep
 from cognis.tools.executor.shell import handle_bash
 from cognis.tools.executor.web import (
@@ -201,6 +202,52 @@ LIST_DIRECTORY_TOOL = ToolDefinition(
     },
     source=_EXECUTOR_SOURCE,
     category="filesystem",
+    read_only=True,
+    timeout_seconds=30,
+)
+
+LSP_TOOL = ToolDefinition(
+    name="lsp",
+    description=(
+        "Query language-server features like definition, references, hover, and symbols. "
+        "Position-based operations require line and character. workspaceSymbol requires a non-empty query."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "operation": {
+                "type": "string",
+                "enum": [
+                    "goToDefinition",
+                    "findReferences",
+                    "hover",
+                    "documentSymbol",
+                    "workspaceSymbol",
+                    "goToImplementation",
+                ],
+                "description": "The LSP operation to perform.",
+            },
+            "file_path": {
+                "type": "string",
+                "description": "Absolute path to the file. Use ~ for home directory.",
+            },
+            "line": {
+                "type": "integer",
+                "description": "1-based line number for position-based operations like definition, references, hover, and implementation.",
+            },
+            "character": {
+                "type": "integer",
+                "description": "1-based character offset for position-based operations like definition, references, hover, and implementation.",
+            },
+            "query": {
+                "type": "string",
+                "description": "Required non-empty workspace symbol query. Used only for workspaceSymbol.",
+            },
+        },
+        "required": ["operation", "file_path"],
+    },
+    source=_EXECUTOR_SOURCE,
+    category="lsp",
     read_only=True,
     timeout_seconds=30,
 )
@@ -501,6 +548,7 @@ ALL_EXECUTOR_TOOLS: list[ToolDefinition] = [
     PATCH_TOOL,
     MULTIEDIT_TOOL,
     LIST_DIRECTORY_TOOL,
+    LSP_TOOL,
     GLOB_TOOL,
     GREP_TOOL,
     BASH_TOOL,
@@ -519,6 +567,7 @@ _HANDLER_MAP: dict[
     "patch": handle_patch,
     "multiedit": handle_multiedit,
     "list_directory": handle_list_directory,
+    "lsp": handle_lsp,
     "glob": handle_glob,
     "grep": handle_grep,
     "bash": handle_bash,

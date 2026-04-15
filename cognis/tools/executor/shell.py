@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import shutil
 import sys
 from typing import Any
@@ -15,6 +16,42 @@ from cognis.tools.registry import ToolExecutionContext
 _DEFAULT_TIMEOUT_MS = 120_000
 _MAX_OUTPUT_SIZE = 50_000
 _SHELL_OVERRIDE_ENV = "COGNIS_EXECUTOR_SHELL"
+_BLOCKED_EDIT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(r'(^|\s)sed\s+-i(?:[\s\'"]|$)'),
+        "Use edit, multiedit, patch, or write instead of sed -i for file content changes.",
+    ),
+    (
+        re.compile(r'(^|\s)perl\s+-pi(?:[\s\'"]|$)'),
+        "Use edit, multiedit, patch, or write instead of perl -pi for file content changes.",
+    ),
+    (
+        re.compile(r'(^|\s)ruby\s+-pi(?:[\s\'"]|$)'),
+        "Use edit, multiedit, patch, or write instead of ruby -pi for file content changes.",
+    ),
+    (
+        re.compile(
+            r"(^|\s)python(?:3)?\s+-c\s+.*(write_text|write_bytes|open\s*\([^\)]*,\s*['\"](?:w|a|x|w\+|a\+|x\+)['\"]).*",
+            re.DOTALL,
+        ),
+        "Use edit, multiedit, patch, or write instead of Python one-liners that rewrite files.",
+    ),
+    (
+        re.compile(
+            r"(^|\s)python(?:3)?\s+.*<<[-~]?['\"]?(?:PY|EOF)['\"]?.*(write_text|write_bytes|open\s*\([^\)]*,\s*['\"](?:w|a|x|w\+|a\+|x\+)['\"]).*",
+            re.DOTALL,
+        ),
+        "Use edit, multiedit, patch, or write instead of embedded Python scripts that rewrite files.",
+    ),
+    (
+        re.compile(r"(?:>>|>)\s*[^\s]+\.(?:py|js|jsx|ts|tsx|json|md|ya?ml|html|css|scss|toml)\b"),
+        "Use edit, multiedit, patch, or write instead of shell redirection to rewrite source files.",
+    ),
+    (
+        re.compile(r"(^|\s)tee\s+[^\n]*\.(?:py|js|jsx|ts|tsx|json|md|ya?ml|html|css|scss|toml)\b"),
+        "Use edit, multiedit, patch, or write instead of tee to rewrite source files.",
+    ),
+)
 
 
 def _shell_name(path: str) -> str:
@@ -54,6 +91,14 @@ def _shell_command_args(shell_path: str, command: str) -> list[str]:
     return [shell_path, "-c", command]
 
 
+def _blocked_shell_edit_message(command: str) -> str | None:
+    normalized = command.strip()
+    for pattern, message in _BLOCKED_EDIT_PATTERNS:
+        if pattern.search(normalized):
+            return message
+    return None
+
+
 async def handle_bash(arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
     """Execute a shell command and return its output."""
     command = arguments.get("command", "")
@@ -63,6 +108,10 @@ async def handle_bash(arguments: dict[str, Any], context: ToolExecutionContext) 
 
     if not command.strip():
         return ToolResult(output="No command provided.", is_error=True)
+
+    blocked_message = _blocked_shell_edit_message(command)
+    if blocked_message is not None:
+        return ToolResult(output=blocked_message, is_error=True)
 
     timeout_seconds = max(1, timeout_ms // 1000)
 

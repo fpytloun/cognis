@@ -380,6 +380,66 @@ class LSPClient:
         return diags
 
     # ------------------------------------------------------------------
+    # Query operations
+    # ------------------------------------------------------------------
+
+    async def definition(self, file_path: str, line: int, character: int) -> list[dict[str, Any]]:
+        """Return definitions at the given position."""
+
+        result = await self._request(
+            "textDocument/definition",
+            _position_params(file_path, line, character),
+        )
+        return _normalize_lsp_result_list(result)
+
+    async def references(self, file_path: str, line: int, character: int) -> list[dict[str, Any]]:
+        """Return references at the given position."""
+
+        result = await self._request(
+            "textDocument/references",
+            {
+                **_position_params(file_path, line, character),
+                "context": {"includeDeclaration": True},
+            },
+        )
+        return _normalize_lsp_result_list(result)
+
+    async def hover(self, file_path: str, line: int, character: int) -> dict[str, Any] | None:
+        """Return hover information at the given position."""
+
+        result = await self._request(
+            "textDocument/hover",
+            _position_params(file_path, line, character),
+        )
+        return result if isinstance(result, dict) else None
+
+    async def document_symbol(self, file_path: str) -> list[dict[str, Any]]:
+        """Return document symbols for a file."""
+
+        result = await self._request(
+            "textDocument/documentSymbol",
+            {"textDocument": {"uri": file_uri(file_path)}},
+        )
+        return _normalize_lsp_result_list(result)
+
+    async def workspace_symbol(self, query: str) -> list[dict[str, Any]]:
+        """Return workspace symbols matching a query."""
+
+        result = await self._request("workspace/symbol", {"query": query})
+        return _normalize_lsp_result_list(result)
+
+    async def implementation(
+        self, file_path: str, line: int, character: int
+    ) -> list[dict[str, Any]]:
+        """Return implementations at the given position."""
+
+        result = await self._request(
+            "textDocument/implementation",
+            _position_params(file_path, line, character),
+        )
+        return _normalize_lsp_result_list(result)
+
+    # ------------------------------------------------------------------
     # JSON-RPC transport
     # ------------------------------------------------------------------
 
@@ -631,3 +691,18 @@ class LSPClient:
     def is_alive(self) -> bool:
         """Check if the server process is still running."""
         return self.process is not None and self.process.returncode is None and not self._closed
+
+
+def _position_params(file_path: str, line: int, character: int) -> dict[str, Any]:
+    return {
+        "textDocument": {"uri": file_uri(file_path)},
+        "position": {"line": line, "character": character},
+    }
+
+
+def _normalize_lsp_result_list(result: dict[str, Any] | list[Any] | None) -> list[dict[str, Any]]:
+    if isinstance(result, list):
+        return [item for item in result if isinstance(item, dict)]
+    if isinstance(result, dict):
+        return [result]
+    return []
