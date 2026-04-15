@@ -215,7 +215,8 @@ async def generate_avatar_prompt(request: Request, payload: AvatarPromptRequest)
         )
         choices = response.get("choices", [])
         if choices:
-            prompt = choices[0].get("message", {}).get("content", "").strip()
+            content = choices[0].get("message", {}).get("content")
+            prompt = content.strip() if isinstance(content, str) else ""
             if prompt:
                 return {"prompt": prompt}
     except Exception:

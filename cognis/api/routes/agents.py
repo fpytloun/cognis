@@ -693,7 +693,8 @@ async def generate_agent_field(request: Request, payload: GenerateFieldRequest) 
         )
         choices = response.get("choices", [])
         if choices:
-            value = choices[0].get("message", {}).get("content", "").strip()
+            content = choices[0].get("message", {}).get("content")
+            value = content.strip() if isinstance(content, str) else ""
             if value:
                 return {"value": value}
     except Exception:
