@@ -106,7 +106,7 @@ class SkillSummary(BaseModel):
     name: str
     description: str | None = None
     tags: list[str] = Field(default_factory=list)
-    auto_load: bool = False
+    auto_load: bool = False  # Internal flag: attached to all agents
     source: str = "db"
     owner_email: str | None = None
     current_version_id: str | None = None
@@ -136,7 +136,8 @@ class ResolvedSkill(BaseModel):
     prompt_templates: dict[str, str] = Field(default_factory=dict)
     secret_placeholders: list[str] = Field(default_factory=list)
     asset_manifest: list[SkillAssetRef] = Field(default_factory=list)
-    auto_load: bool = False
+    auto_load: bool = False  # Internal flag: attached to all agents
+    attached: bool = False
 
 
 class ResolvedSkillSet(BaseModel):

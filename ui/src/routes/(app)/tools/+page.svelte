@@ -191,7 +191,7 @@
         description: skill.description || '',
         instructions: ver?.instructions || skill.instructions,
         tags: (skill.tags || []).join(', '),
-        autoLoad: skill.auto_load
+        autoLoad: Boolean(skill.attach_to_all_agents ?? skill.auto_load)
       };
     } else {
       editingSkill = null;
@@ -216,7 +216,7 @@
           description: skillForm.description || undefined,
           instructions: skillForm.instructions,
           tags: tags.length ? tags : undefined,
-          auto_load: skillForm.autoLoad
+          attach_to_all_agents: skillForm.autoLoad
         });
         addToast('Skill updated', 'success');
       } else {
@@ -225,7 +225,7 @@
           description: skillForm.description || undefined,
           instructions: skillForm.instructions,
           tags: tags.length ? tags : undefined,
-          auto_load: skillForm.autoLoad
+          attach_to_all_agents: skillForm.autoLoad
         });
         addToast('Skill created', 'success');
       }
@@ -247,7 +247,7 @@
         url: importForm.url.trim(),
         name: importForm.name.trim() || undefined,
         tags: tags.length ? tags : undefined,
-        auto_load: importForm.autoLoad
+        attach_to_all_agents: importForm.autoLoad
       });
       addToast('Skill imported successfully', 'success');
       showImportForm = false;
@@ -545,7 +545,7 @@
     <!-- Skills tab - unchanged -->
     <div class="space-y-4">
       <div class="flex justify-between items-center">
-        <p class="text-sm text-zinc-400">Skills are versioned instruction + tool bundles that agents can load on demand.</p>
+        <p class="text-sm text-zinc-400">Skills are versioned instruction + tool bundles that agents can discover in the prompt and load on demand.</p>
         <div class="flex gap-2">
           <Button variant="ghost" size="sm" onclick={openImportForm}><Import class="w-4 h-4 mr-1" /> Import from URL</Button>
           <Button variant="primary" size="sm" onclick={() => openSkillForm()}><Plus class="w-4 h-4 mr-1" /> New Skill</Button>
@@ -561,7 +561,7 @@
             <label class="block text-sm text-zinc-400 space-y-1"><span>Name override (optional)</span><input type="text" bind:value={importForm.name} class="w-full px-3 py-2 bg-zinc-900 border border-zinc-700 rounded-lg text-sm text-zinc-200 focus:outline-none focus:border-blue-500" placeholder="Leave empty to use imported name" /></label>
             <label class="block text-sm text-zinc-400 space-y-1"><span>Tags (comma-separated)</span><input type="text" bind:value={importForm.tags} class="w-full px-3 py-2 bg-zinc-900 border border-zinc-700 rounded-lg text-sm text-zinc-200 focus:outline-none focus:border-blue-500" placeholder="e.g. imported, claude" /></label>
           </div>
-          <label class="flex items-center gap-2 text-sm text-zinc-400"><input type="checkbox" bind:checked={importForm.autoLoad} class="rounded border-zinc-600" /> Auto-load for all agents</label>
+          <label class="flex items-center gap-2 text-sm text-zinc-400"><input type="checkbox" bind:checked={importForm.autoLoad} class="rounded border-zinc-600" /> Attach to all agents</label>
           <div class="flex gap-2 justify-end">
             <Button variant="ghost" size="sm" onclick={() => showImportForm = false}>Cancel</Button>
             <Button variant="primary" size="sm" onclick={importSkill} disabled={!importForm.url.trim()}>Import</Button>
@@ -578,7 +578,7 @@
           </div>
           <label class="block text-sm text-zinc-400 space-y-1"><span>Description</span><input type="text" bind:value={skillForm.description} class="w-full px-3 py-2 bg-zinc-900 border border-zinc-700 rounded-lg text-sm text-zinc-200 focus:outline-none focus:border-blue-500" placeholder="Brief description of what this skill does" /></label>
           <label class="block text-sm text-zinc-400 space-y-1"><span>Instructions (Markdown)</span><textarea bind:value={skillForm.instructions} rows="10" class="w-full px-3 py-2 bg-zinc-900 border border-zinc-700 rounded-lg text-sm text-zinc-200 font-mono focus:outline-none focus:border-blue-500" placeholder="# Skill Instructions&#10;&#10;Detailed instructions for the agent..."></textarea></label>
-          <label class="flex items-center gap-2 text-sm text-zinc-400"><input type="checkbox" bind:checked={skillForm.autoLoad} class="rounded border-zinc-600" /> Auto-load for all agents</label>
+          <label class="flex items-center gap-2 text-sm text-zinc-400"><input type="checkbox" bind:checked={skillForm.autoLoad} class="rounded border-zinc-600" /> Attach to all agents</label>
           <div class="flex gap-2 justify-end">
             <Button variant="ghost" size="sm" onclick={() => showSkillForm = false}>Cancel</Button>
             <Button variant="primary" size="sm" onclick={saveSkill} disabled={!skillForm.name || !skillForm.instructions}>{editingSkill ? 'Update' : 'Create'}</Button>
@@ -603,7 +603,7 @@
                     <span class="font-medium text-zinc-100">{skill.name}</span>
                     <Badge>{skill.source}</Badge>
                     {#if skill.is_system}<Badge class="border-amber-500/30 bg-amber-500/10 text-amber-300">system</Badge>{/if}
-                    {#if skill.auto_load}<Badge class="border-blue-500/30 bg-blue-500/10 text-blue-300">auto-load</Badge>{/if}
+                    {#if skill.attach_to_all_agents ?? skill.auto_load}<Badge class="border-blue-500/30 bg-blue-500/10 text-blue-300">attached to all agents</Badge>{/if}
                   </div>
                   {#if skill.description}<p class="text-sm text-zinc-400 mt-1">{skill.description}</p>{/if}
                   {#if skill.tags && skill.tags.length > 0}<div class="flex gap-1 mt-2">{#each skill.tags as tag}<Badge>{tag}</Badge>{/each}</div>{/if}

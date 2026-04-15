@@ -53,6 +53,7 @@ from cognis.models.tool import (
     MCPServerConfig,
     ToolDefinition,
     stable_tool_id,
+    tool_display_name,
 )
 from cognis.store.queries import (
     create_mcp_server,
@@ -219,7 +220,7 @@ def _tool_permission(agent: AgentDefinition, tool: ToolDefinition) -> str:
     tool_id = _tool_identifier(tool)
     if agent.permissions.tool_permissions and tool_id in agent.permissions.tool_permissions:
         return str(agent.permissions.tool_permissions[tool_id])
-    return str(agent.permissions.resolve_permission(tool.name, tool_id=tool_id))
+    return str(agent.permissions.resolve_permission(tool_display_name(tool), tool_id=tool_id))
 
 
 async def _discover_temp_mcp_tools(

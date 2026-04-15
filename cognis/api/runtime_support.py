@@ -29,7 +29,7 @@ from cognis.models.tool import (
     ExecutorConfig,
     MCPServerConfig,
     ToolDefinition,
-    stable_tool_id,
+    tool_matches_identifier,
 )
 from cognis.providers.executor.in_process import InProcessExecutorConnection
 from cognis.tools.builtin.datetime_tools import build_datetime_tool_handlers, datetime_tools
@@ -44,10 +44,11 @@ from cognis.tools.executor.definitions import executor_tool_definitions, executo
 from cognis.tools.mcp import invalid_mcp_config_reason
 from cognis.tools.registry import RegisteredTool, ToolRegistry
 from cognis.tools.skills import (
+    attached_skill_tool_ids,
     build_available_skills_metadata,
+    discoverable_skill_tools_to_definitions,
     load_skill_tool_names,
     resolve_skills_for_agent,
-    skill_tools_to_definitions,
 )
 
 logger = get_logger(__name__)
@@ -147,10 +148,8 @@ def select_static_tools(agent: Any | None = None) -> list[ToolDefinition]:
     selected: list[ToolDefinition] = []
     for tool in definitions:
         # Agent-level disable takes precedence
-        if (
-            tool.category in disabled_categories
-            or tool.name in disabled_tools
-            or stable_tool_id(tool) in disabled_tools
+        if tool.category in disabled_categories or any(
+            tool_matches_identifier(tool, identifier) for identifier in disabled_tools
         ):
             continue
         if tool.category == "orchestration":
@@ -321,9 +320,10 @@ def build_step_runtime_factory(
 
         agent_tools.extend(web_tool_definitions(web_config["web_available_backends"]))
 
-        # Resolve DB-backed skills for this agent and inject:
+        # Resolve discoverable DB-backed skills for this agent and inject:
         # 1. Compact metadata into agent.skills for context assembly
         # 2. Executable skill tool definitions into agent_tools
+        # 3. Initially attached skill tool ids for deferred exposure defaults
         try:
             async with session_factory() as db_session:
                 resolved_skills = await resolve_skills_for_agent(
@@ -336,9 +336,12 @@ def build_step_runtime_factory(
                     if not isinstance(agent.skills, dict):
                         agent.skills = {}
                     agent.skills["_available_skills_metadata"] = metadata
+                    agent.skills["_attached_skill_tool_ids"] = sorted(
+                        attached_skill_tool_ids(resolved_skills)
+                    )
 
                 # Add executable skill tools to the agent tool set
-                skill_tool_defs = skill_tools_to_definitions(resolved_skills)
+                skill_tool_defs = discoverable_skill_tools_to_definitions(resolved_skills)
                 agent_tools.extend(skill_tool_defs)
         except Exception:
             logger.warning(
@@ -362,10 +365,8 @@ def build_step_runtime_factory(
             )
             filtered: list[ToolDefinition] = []
             for tool in agent_tools:
-                if (
-                    tool.category in disabled_categories
-                    or tool.name in disabled_tools
-                    or stable_tool_id(tool) in disabled_tools
+                if tool.category in disabled_categories or any(
+                    tool_matches_identifier(tool, identifier) for identifier in disabled_tools
                 ):
                     continue
                 if tool.source.type in ("builtin",):
@@ -766,10 +767,8 @@ async def _merge_remote_runtime_inventory(
     remote_defs: list[ToolDefinition] = []
     for tool_data in remote_tools_data:
         tool_def = ToolDefinition.model_validate(tool_data)
-        if (
-            tool_def.category in disabled_categories
-            or tool_def.name in disabled_tools
-            or stable_tool_id(tool_def) in disabled_tools
+        if tool_def.category in disabled_categories or any(
+            tool_matches_identifier(tool_def, identifier) for identifier in disabled_tools
         ):
             continue
         remote_defs.append(tool_def)
@@ -912,7 +911,7 @@ async def _resolve_intaris_mcp_tools_from_server_cache(
             )
             if "mcp" in disabled_categories:
                 continue
-            if tool.name in disabled_tools or stable_tool_id(tool) in disabled_tools:
+            if any(tool_matches_identifier(tool, identifier) for identifier in disabled_tools):
                 continue
             by_server[name].append(tool)
 
@@ -1047,7 +1046,7 @@ async def _resolve_intaris_mcp_tools(
         )
         if "mcp" in disabled_categories:
             continue
-        if tool.name in disabled_tools or stable_tool_id(tool) in disabled_tools:
+        if any(tool_matches_identifier(tool, identifier) for identifier in disabled_tools):
             continue
         by_server[server_name].append(tool)
 

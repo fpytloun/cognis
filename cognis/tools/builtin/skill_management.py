@@ -10,7 +10,9 @@ from __future__ import annotations
 from typing import Any
 
 from cognis.logging import get_logger
-from cognis.models.tool import ToolDefinition, ToolResult, ToolSource
+from cognis.models.skill import ResolvedSkill, ResolvedSkillSet, SkillToolSpec
+from cognis.models.tool import ToolDefinition, ToolResult, ToolSource, stable_tool_id
+from cognis.tools.skills import skill_tools_to_definitions
 
 logger = get_logger(__name__)
 
@@ -37,7 +39,10 @@ def skill_management_tools() -> list[ToolDefinition]:
 
 SKILL_LIST_TOOL = ToolDefinition(
     name="skill_list",
-    description="List all available skills. Returns skill names, descriptions, tags, and version info.",
+    description=(
+        "List all available skills. Usually prefer the available_skills metadata in the "
+        "system prompt and load a specific skill with skill_load instead of browsing here."
+    ),
     parameters={"type": "object", "properties": {}},
     source=_SKILL_SOURCE,
     category="skill",
@@ -51,7 +56,8 @@ SKILL_LOAD_TOOL = ToolDefinition(
         "Load a skill's full instructions, prompt templates, and tool summaries. "
         "Use this when you need to follow a skill's guidance. Always returns the "
         "latest published version. This is the primary way to access skill content "
-        "— the available_skills metadata in the system prompt only contains summaries."
+        "— the available_skills metadata in the system prompt only contains summaries. "
+        "Loading a skill also makes its deferred skill tools available for subsequent model calls."
     ),
     parameters={
         "type": "object",
@@ -115,9 +121,9 @@ SKILL_WRITE_TOOL = ToolDefinition(
                 "type": "object",
                 "description": "Prompt templates (optional)",
             },
-            "auto_load": {
+            "attach_to_all_agents": {
                 "type": "boolean",
-                "description": "Auto-load for all agents (default false)",
+                "description": "Attach this skill to all agents by default (default false)",
             },
         },
         "required": ["name", "instructions"],
@@ -166,9 +172,9 @@ SKILL_IMPORT_URL_TOOL = ToolDefinition(
                 "items": {"type": "string"},
                 "description": "Tags to apply (optional)",
             },
-            "auto_load": {
+            "attach_to_all_agents": {
                 "type": "boolean",
-                "description": "Auto-load for all agents (default false)",
+                "description": "Attach this skill to all agents by default (default false)",
             },
         },
         "required": ["url"],
@@ -270,6 +276,63 @@ async def _auto_bind_skill_to_agent(session_factory: Any, skill_id: str) -> None
         )
 
 
+def _resolve_attach_to_all_agents(arguments: dict[str, Any]) -> bool:
+    """Resolve the user-facing global attachment flag.
+
+    ``attach_to_all_agents`` is the preferred name. ``auto_load`` remains an
+    accepted legacy alias for backward compatibility.
+    """
+
+    if "attach_to_all_agents" in arguments:
+        return bool(arguments.get("attach_to_all_agents"))
+    return bool(arguments.get("auto_load", False))
+
+
+def _resolved_skill_tool_ids(
+    skill_id: str,
+    name: str,
+    description: str | None,
+    attach_to_all_agents: bool,
+    instructions: str,
+    tools: list[dict[str, Any]] | dict[str, Any] | None,
+) -> set[str]:
+    """Return stable tool ids for one resolved skill payload."""
+
+    parsed_tools: list[SkillToolSpec] = []
+    raw_tools: list[Any] = []
+    if isinstance(tools, dict):
+        raw_tools = list(tools.values())
+    elif isinstance(tools, list):
+        raw_tools = tools
+    for raw in raw_tools:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            parsed_tools.append(SkillToolSpec.model_validate(raw))
+        except Exception:
+            logger.warning("Skipping invalid skill tool while resolving loaded skill tool ids")
+
+    tool_defs = skill_tools_to_definitions(
+        ResolvedSkillSet(
+            skills=[
+                ResolvedSkill(
+                    skill_id=skill_id,
+                    name=name,
+                    description=description,
+                    version_id="",
+                    version_number=0,
+                    content_hash="",
+                    instructions=instructions,
+                    tools=parsed_tools,
+                    auto_load=attach_to_all_agents,
+                    attached=True,
+                )
+            ]
+        )
+    )
+    return {stable_tool_id(tool) for tool in tool_defs}
+
+
 # ---------------------------------------------------------------------------
 # Tool handlers
 # ---------------------------------------------------------------------------
@@ -323,6 +386,7 @@ async def _handle_skill_list(session_factory: Any, user_email: str) -> ToolResul
                 "name": row.name,
                 "description": row.description,
                 "tags": row.tags or [],
+                "attach_to_all_agents": row.auto_load,
                 "auto_load": row.auto_load,
                 "source": row.source,
                 "current_version_id": row.current_version_id,
@@ -372,7 +436,21 @@ async def _handle_skill_load(
         "prompt_templates": templates,
         "tags": row.tags or [],
     }
-    return ToolResult(output=json.dumps(result, indent=2, default=str))
+    return ToolResult(
+        output=json.dumps(result, indent=2, default=str),
+        metadata={
+            "discovered_tool_ids": sorted(
+                _resolved_skill_tool_ids(
+                    row.skill_id,
+                    row.name,
+                    row.description,
+                    row.auto_load,
+                    instructions,
+                    tools,
+                )
+            )
+        },
+    )
 
 
 async def _handle_skill_get(
@@ -414,6 +492,7 @@ async def _handle_skill_get(
         "name": row.name,
         "description": row.description,
         "tags": row.tags or [],
+        "attach_to_all_agents": row.auto_load,
         "auto_load": row.auto_load,
         "source": row.source,
         "current_version": version_data,
@@ -449,12 +528,13 @@ async def _handle_skill_write(
     tools = arguments.get("tools")
     templates = arguments.get("prompt_templates")
     tags = arguments.get("tags")
-    auto_load = bool(arguments.get("auto_load", False))
+    attach_to_all_agents = _resolve_attach_to_all_agents(arguments)
     description = arguments.get("description")
 
     content_hash = compute_content_hash(instructions, tools, templates)
 
     async with session_factory() as session:
+        created_new_skill = False
         if skill_id:
             # Update existing
             row = await get_skill_scoped(session, skill_id, owner_email=user_email)
@@ -470,11 +550,12 @@ async def _handle_skill_write(
                 tools=tools,
                 prompt_templates=templates,
                 tags=tags,
-                auto_load=auto_load,
+                auto_load=attach_to_all_agents,
             )
             next_num = await get_next_version_number(session, skill_id)
         else:
             # Create new
+            created_new_skill = True
             row = await create_skill(
                 session,
                 name=name,
@@ -483,7 +564,7 @@ async def _handle_skill_write(
                 tools=tools,
                 prompt_templates=templates,
                 tags=tags,
-                auto_load=auto_load,
+                auto_load=attach_to_all_agents,
                 owner_email=user_email,
             )
             skill_id = row.skill_id
@@ -501,8 +582,21 @@ async def _handle_skill_write(
         await set_current_version(session, skill_id, version_row.version_id)
         await session.commit()
 
-    # Auto-bind the skill to the current agent so it is immediately available
-    await _auto_bind_skill_to_agent(session_factory, skill_id)
+    metadata: dict[str, Any] = {}
+    if created_new_skill:
+        # Auto-bind newly created skills to the current agent so they are immediately available.
+        await _auto_bind_skill_to_agent(session_factory, skill_id)
+        metadata["attached_skill_id"] = skill_id
+        metadata["discovered_tool_ids"] = sorted(
+            _resolved_skill_tool_ids(
+                skill_id,
+                name,
+                description if isinstance(description, str) else None,
+                attach_to_all_agents,
+                instructions,
+                tools,
+            )
+        )
 
     result = {
         "skill_id": skill_id,
@@ -511,13 +605,13 @@ async def _handle_skill_write(
         "version_number": next_num,
         "content_hash": content_hash,
     }
-    return ToolResult(output=json.dumps(result, indent=2))
+    return ToolResult(output=json.dumps(result, indent=2), metadata=metadata or None)
 
 
 async def _handle_skill_delete(
     session_factory: Any, user_email: str, arguments: dict[str, Any]
 ) -> ToolResult:
-    from cognis.store.queries import delete_skill, get_skill_scoped
+    from cognis.store.queries import delete_skill, get_skill_scoped, get_skill_version
 
     skill_id = str(arguments.get("skill_id", "")).strip()
     if not skill_id:
@@ -527,6 +621,23 @@ async def _handle_skill_delete(
         row = await get_skill_scoped(session, skill_id, owner_email=user_email)
         if row is None:
             return ToolResult(output=f"Skill '{skill_id}' not found", is_error=True)
+        instructions = row.instructions
+        tools = row.tools
+        if row.current_version_id:
+            version_row = await get_skill_version(session, row.current_version_id)
+            if version_row is not None:
+                instructions = version_row.instructions
+                tools = version_row.tools
+        removed_tool_ids = sorted(
+            _resolved_skill_tool_ids(
+                row.skill_id,
+                row.name,
+                row.description,
+                row.auto_load,
+                instructions,
+                tools,
+            )
+        )
         try:
             deleted = await delete_skill(session, skill_id, owner_email=user_email)
         except ValueError as exc:
@@ -535,7 +646,10 @@ async def _handle_skill_delete(
             return ToolResult(output=f"Skill '{skill_id}' not found", is_error=True)
         await session.commit()
 
-    return ToolResult(output=f"Skill '{skill_id}' deleted successfully.")
+    return ToolResult(
+        output=f"Skill '{skill_id}' deleted successfully.",
+        metadata={"deleted_skill_id": skill_id, "removed_tool_ids": removed_tool_ids},
+    )
 
 
 async def _handle_skill_import_url(
@@ -561,7 +675,7 @@ async def _handle_skill_import_url(
     tools = skill_data.get("tools")
     templates = skill_data.get("prompt_templates")
     tags = arguments.get("tags") or skill_data.get("tags") or []
-    auto_load = bool(arguments.get("auto_load", False))
+    attach_to_all_agents = _resolve_attach_to_all_agents(arguments)
 
     content_hash = compute_content_hash(instructions, tools, templates)
 
@@ -574,7 +688,7 @@ async def _handle_skill_import_url(
             tools=tools,
             prompt_templates=templates,
             tags=tags,
-            auto_load=auto_load,
+            auto_load=attach_to_all_agents,
             source="imported",
             owner_email=user_email,
         )
@@ -607,7 +721,22 @@ async def _handle_skill_import_url(
         "source_url": provenance.source_url,
         "import_format": provenance.import_format,
     }
-    return ToolResult(output=json.dumps(result, indent=2))
+    return ToolResult(
+        output=json.dumps(result, indent=2),
+        metadata={
+            "attached_skill_id": row.skill_id,
+            "discovered_tool_ids": sorted(
+                _resolved_skill_tool_ids(
+                    row.skill_id,
+                    str(name),
+                    skill_data.get("description"),
+                    attach_to_all_agents,
+                    str(instructions),
+                    tools,
+                )
+            ),
+        },
+    )
 
 
 async def _handle_skill_export(

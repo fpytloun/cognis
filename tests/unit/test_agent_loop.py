@@ -1055,6 +1055,65 @@ def test_build_step_prompt_includes_operator_instruction() -> None:
     assert "Incorporate the review and continue." in prompt
 
 
+def test_filter_model_inventory_tools_hides_unattached_skill_tools_until_discovered() -> None:
+    agent = AgentDefinition(
+        agent_id="agent-1",
+        owner_email="user@example.com",
+        name="Agent",
+        skills={"_attached_skill_tool_ids": ["skill:attached-skill:run_attached"]},
+    )
+    attached_tool = ToolDefinition(
+        name="skill_attached-skill__run_attached",
+        description="Attached",
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(type="skill", skill_id="attached-skill", raw_tool_name="run_attached"),
+        category="skill",
+    )
+    unattached_tool = ToolDefinition(
+        name="skill_unattached-skill__run_unattached",
+        description="Unattached",
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(
+            type="skill", skill_id="unattached-skill", raw_tool_name="run_unattached"
+        ),
+        category="skill",
+    )
+
+    filtered = _filter_model_inventory_tools(agent, [attached_tool, unattached_tool], set())
+    discovered = _filter_model_inventory_tools(
+        agent,
+        [attached_tool, unattached_tool],
+        {"skill:unattached-skill:run_unattached"},
+    )
+
+    assert [tool.name for tool in filtered] == ["skill_attached-skill__run_attached"]
+    assert [tool.name for tool in discovered] == [
+        "skill_attached-skill__run_attached",
+        "skill_unattached-skill__run_unattached",
+    ]
+
+
+def test_filter_model_inventory_tools_respects_legacy_skill_permission_names() -> None:
+    agent = AgentDefinition(
+        agent_id="agent-1",
+        owner_email="user@example.com",
+        name="Agent",
+        skills={"_attached_skill_tool_ids": ["skill:attached-skill:run_attached"]},
+        permissions=AgentPermissions(denied_tools=["run_attached"]),
+    )
+    attached_tool = ToolDefinition(
+        name="skill_attached-skill__run_attached",
+        description="Attached",
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(type="skill", skill_id="attached-skill", raw_tool_name="run_attached"),
+        category="skill",
+    )
+
+    filtered = _filter_model_inventory_tools(agent, [attached_tool], set())
+
+    assert filtered == []
+
+
 def test_format_prior_step_outputs_full_includes_full_content() -> None:
     agent_loop = object.__new__(AgentLoop)
     workflow_state = WorkflowState(

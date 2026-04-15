@@ -45,6 +45,28 @@ def test_list_skills_marks_system_skills(monkeypatch: object, tmp_path: Path) ->
         skills = {item["skill_id"]: item for item in response.json()}
         assert skills["cognis-task-manager"]["is_system"] is True
         assert skills["cognis-workflow-manager"]["is_system"] is True
+        assert "attach_to_all_agents" in skills["cognis-task-manager"]
+
+
+def test_skill_create_accepts_attach_to_all_agents(monkeypatch: object, tmp_path: Path) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        asyncio.run(_seed_user(client.app))
+        headers = _auth_headers(client.app, email="user@example.com")
+
+        response = client.post(
+            "/api/v1/skills",
+            headers=headers,
+            json={
+                "name": "Custom",
+                "instructions": "hello",
+                "attach_to_all_agents": True,
+            },
+        )
+
+        assert response.status_code == 201
+        body = response.json()
+        assert body["attach_to_all_agents"] is True
+        assert body["auto_load"] is True
 
 
 def test_system_skill_delete_is_forbidden(monkeypatch: object, tmp_path: Path) -> None:

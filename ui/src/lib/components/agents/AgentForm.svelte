@@ -244,8 +244,12 @@
     }
   }
 
-  const autoLoadSkills = $derived(skills.filter((s: Skill) => s.auto_load && !form.selectedSkillIds.includes(s.skill_id)));
-  const selectableSkills = $derived(skills.filter((s: Skill) => !s.auto_load));
+  function attachedToAllAgents(skill: Skill): boolean {
+    return Boolean(skill.attach_to_all_agents ?? skill.auto_load);
+  }
+
+  const globallyAttachedSkills = $derived(skills.filter((s: Skill) => attachedToAllAgents(s) && !form.selectedSkillIds.includes(s.skill_id)));
+  const selectableSkills = $derived(skills.filter((s: Skill) => !attachedToAllAgents(s)));
 
   async function handleSubmit(event: SubmitEvent): Promise<void> {
     event.preventDefault();
@@ -525,7 +529,7 @@
                       <div class="grid gap-2 md:grid-cols-[1fr_auto_auto] items-center text-sm">
                         <label class="flex items-center gap-3 text-slate-200">
                           <input type="checkbox" checked={!toolDisabled(toolKey(tool))} onchange={() => toggleTool(toolKey(tool))} disabled={readonly || categoryDisabled(category)} class="h-4 w-4 rounded border-slate-600 bg-slate-950" />
-                          <span class="font-mono">{tool.name}</span>
+                          <span class="font-mono">{tool.source?.type === 'skill' && tool.source?.raw_tool_name ? tool.source.raw_tool_name : tool.name}</span>
                         </label>
                         <span class="text-xs text-slate-500">{tool.description}</span>
                         <select bind:value={form.toolPermissions[toolKey(tool)]} class="w-32 rounded-lg border border-slate-700 bg-slate-950/80 px-2 py-1 text-xs text-slate-100" disabled={readonly || toolDisabled(toolKey(tool)) || categoryDisabled(category)}>
@@ -588,7 +592,7 @@
         {#if skills.length > 0}
           <div class="mt-4 space-y-3">
             <p class="text-sm font-medium text-slate-200">Skills</p>
-            <p class="text-xs text-slate-400">Select skills for this agent. Auto-loaded skills are always active.</p>
+            <p class="text-xs text-slate-400">Select skills to attach to this agent. Skills attached to all agents are always available.</p>
             {#if selectableSkills.length > 0}
               <div class="grid gap-2 md:grid-cols-2">
                 {#each selectableSkills as skill}
@@ -608,11 +612,11 @@
                 {/each}
               </div>
             {/if}
-            {#if autoLoadSkills.length > 0}
+            {#if globallyAttachedSkills.length > 0}
               <div class="mt-2">
-                <p class="mb-1 text-xs text-slate-500">Auto-loaded (always active):</p>
+                <p class="mb-1 text-xs text-slate-500">Attached to all agents:</p>
                 <div class="flex flex-wrap gap-1">
-                  {#each autoLoadSkills as skill}
+                  {#each globallyAttachedSkills as skill}
                     <span class="rounded bg-slate-700 px-2 py-0.5 text-xs text-slate-300">{skill.name}</span>
                   {/each}
                 </div>

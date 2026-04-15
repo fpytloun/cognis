@@ -142,6 +142,128 @@ def test_prepare_tool_exposure_uses_openai_responses_full_inventory() -> None:
     assert result.request_kwargs["parallel_tool_calls"] is True
 
 
+def test_prepare_tool_exposure_treats_skill_tools_as_deferred() -> None:
+    skill_tool = ToolDefinition(
+        name="skill_release",
+        description="release",
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(type="skill", skill_id="git-release"),
+        category="skill",
+    )
+
+    result = prepare_tool_exposure(
+        inventory_tools=[_tool("read", source_type="executor", category="filesystem"), skill_tool],
+        controller_tool_schemas=[
+            {
+                "type": "function",
+                "function": {
+                    "name": SEARCH_TOOLS_TOOL.name,
+                    "description": SEARCH_TOOLS_TOOL.description,
+                    "parameters": SEARCH_TOOLS_TOOL.parameters,
+                },
+            }
+        ],
+        model="gpt-4o-mini",
+        model_info=ModelInfo(model_id="gpt-4o-mini", max_tools=3),
+        discovered_tool_ids=set(),
+    )
+
+    tool_names = [tool["function"]["name"] for tool in result.tools]
+    assert result.debug_metadata["deferred_tool_count"] == 1
+    assert "skill_release" not in tool_names
+    assert "search_tools" in tool_names
+
+
+def test_prepare_tool_exposure_marks_skill_tools_deferred_for_responses() -> None:
+    skill_tool = ToolDefinition(
+        name="skill_release",
+        description="release",
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(type="skill", skill_id="git-release"),
+        category="skill",
+    )
+
+    result = prepare_tool_exposure(
+        inventory_tools=[_tool("read", source_type="executor", category="filesystem"), skill_tool],
+        controller_tool_schemas=[],
+        model="gpt-5.4",
+        model_info=ModelInfo(
+            model_id="gpt-5.4",
+            supports_tool_search=True,
+            supports_responses_api=True,
+            max_tools=128,
+        ),
+        discovered_tool_ids=set(),
+    )
+
+    skill_schema = next(
+        tool for tool in result.tools if tool["function"]["name"] == "skill_release"
+    )
+    assert skill_schema["function"]["defer_loading"] is True
+
+
+def test_prepare_tool_exposure_sanitizes_skill_visible_names() -> None:
+    skill_tool = ToolDefinition(
+        name="skill_git-release__run_release",
+        description="release",
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(type="skill", skill_id="git-release", raw_tool_name="run/release now"),
+        category="skill",
+    )
+
+    result = prepare_tool_exposure(
+        inventory_tools=[skill_tool],
+        controller_tool_schemas=[],
+        model="gpt-5.4",
+        model_info=ModelInfo(
+            model_id="gpt-5.4",
+            supports_tool_search=True,
+            supports_responses_api=True,
+            max_tools=128,
+        ),
+        discovered_tool_ids=set(),
+    )
+
+    skill_schema = next(
+        tool for tool in result.tools if tool["function"]["name"] == "run_release_now"
+    )
+    assert skill_schema["function"]["defer_loading"] is True
+
+
+def test_prepare_tool_exposure_prioritizes_discovered_skill_tools_when_slots_are_tight() -> None:
+    skill_tool = ToolDefinition(
+        name="skill_git-release__run_release",
+        description="release",
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(type="skill", skill_id="git-release", raw_tool_name="run_release"),
+        category="skill",
+    )
+    inventory = [
+        _tool("read", source_type="executor", category="filesystem"),
+        _tool("bash", source_type="executor", category="shell"),
+        skill_tool,
+    ]
+    controller_search_schema = {
+        "type": "function",
+        "function": {
+            "name": SEARCH_TOOLS_TOOL.name,
+            "description": SEARCH_TOOLS_TOOL.description,
+            "parameters": SEARCH_TOOLS_TOOL.parameters,
+        },
+    }
+
+    result = prepare_tool_exposure(
+        inventory_tools=inventory,
+        controller_tool_schemas=[controller_search_schema],
+        model="gpt-4o-mini",
+        model_info=ModelInfo(model_id="gpt-4o-mini", max_tools=3),
+        discovered_tool_ids={stable_tool_id(skill_tool)},
+    )
+
+    tool_names = [tool["function"]["name"] for tool in result.tools]
+    assert "run_release" in tool_names
+
+
 def test_prepare_tool_exposure_strips_controller_search_tool_for_responses() -> None:
     controller_search_schema = {
         "type": "function",

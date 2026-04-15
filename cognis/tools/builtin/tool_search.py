@@ -58,9 +58,14 @@ def search_inventory(
             continue
         if category and tool.category != category:
             continue
-        haystack = f"{tool.name} {tool.description} {tool.category}".lower()
+        display_name = (
+            tool.source.raw_tool_name
+            if tool.source.type == "skill" and tool.source.raw_tool_name
+            else tool.name
+        )
+        haystack = f"{display_name} {tool.description} {tool.category}".lower()
         score = 0
-        if normalized_query in tool.name.lower():
+        if normalized_query in display_name.lower():
             score += 50
         if normalized_query in tool.description.lower():
             score += 25
@@ -74,7 +79,7 @@ def search_inventory(
                 score,
                 {
                     "tool_id": stable_tool_id(tool),
-                    "name": tool.name,
+                    "name": display_name,
                     "description": tool.description,
                     "category": tool.category,
                     "source": tool.source.model_dump(mode="json"),

@@ -19,6 +19,8 @@ from cognis.tools.skill_parser import (
     resolve_github_url,
 )
 from cognis.tools.skills import (
+    build_available_skills_metadata,
+    discoverable_skill_tools_to_definitions,
     extract_agent_skill_refs,
     load_skill_tool_names,
     skill_tools_to_definitions,
@@ -366,14 +368,16 @@ def test_skill_tools_to_definitions() -> None:
                 content_hash="h1",
                 instructions="Do A",
                 tools=[tool],
+                attached=True,
             ),
         ]
     )
     definitions = skill_tools_to_definitions(skill_set)
     assert len(definitions) == 1
-    assert definitions[0].name == "my_tool"
+    assert definitions[0].name == "skill_skill-a__my_tool"
     assert definitions[0].source.type == "skill"
     assert definitions[0].source.skill_id == "skill-a"
+    assert definitions[0].source.raw_tool_name == "my_tool"
     assert definitions[0].source.skill_version_id == "v1"
     assert definitions[0].source.skill_content_hash == "h1"
     assert definitions[0].read_only is True
@@ -384,21 +388,38 @@ def test_skill_tools_to_definitions() -> None:
     assert definitions[0].execution_metadata["recipe"]["entry"] == "run.sh"
 
 
+def test_skill_tools_to_definitions_excludes_unattached_by_default() -> None:
+    tool = SkillToolSpec(name="my_tool", description="test tool")
+    skill_set = ResolvedSkillSet(
+        skills=[
+            ResolvedSkill(
+                skill_id="skill-a",
+                name="A",
+                version_id="v1",
+                version_number=1,
+                content_hash="h1",
+                instructions="Do A",
+                tools=[tool],
+                attached=False,
+            )
+        ]
+    )
+
+    assert skill_tools_to_definitions(skill_set) == []
+    assert len(discoverable_skill_tools_to_definitions(skill_set)) == 1
+
+
 # ---------------------------------------------------------------------------
 # Available skills metadata (compact prompt block)
 # ---------------------------------------------------------------------------
 
 
 def test_build_available_skills_metadata_empty() -> None:
-    from cognis.tools.skills import build_available_skills_metadata
-
     skill_set = ResolvedSkillSet(skills=[])
     assert build_available_skills_metadata(skill_set) == ""
 
 
 def test_build_available_skills_metadata_basic() -> None:
-    from cognis.tools.skills import build_available_skills_metadata
-
     skill_set = ResolvedSkillSet(
         skills=[
             ResolvedSkill(
@@ -410,6 +431,7 @@ def test_build_available_skills_metadata_basic() -> None:
                 content_hash="h1",
                 instructions="Automate git release workflows with tagging and changelog generation.",
                 tools=[SkillToolSpec(name="tag_release", description="Tag a release")],
+                attached=True,
             ),
         ]
     )
@@ -420,6 +442,7 @@ def test_build_available_skills_metadata_basic() -> None:
     assert "<tools>tag_release</tools>" in metadata
     # Description should use the real description field
     assert "Automate git release workflows" in metadata
+    assert "<attached>true</attached>" in metadata
     # Should NOT contain version ids (for prompt caching stability)
     assert "v1" not in metadata
     assert "h1" not in metadata
@@ -427,8 +450,6 @@ def test_build_available_skills_metadata_basic() -> None:
 
 def test_build_available_skills_metadata_fallback_description() -> None:
     """When description is None, fall back to truncated instruction snippet."""
-    from cognis.tools.skills import build_available_skills_metadata
-
     skill_set = ResolvedSkillSet(
         skills=[
             ResolvedSkill(
@@ -446,9 +467,7 @@ def test_build_available_skills_metadata_fallback_description() -> None:
     assert "This skill does something specific" in metadata
 
 
-def test_build_available_skills_metadata_auto_load() -> None:
-    from cognis.tools.skills import build_available_skills_metadata
-
+def test_build_available_skills_metadata_attach_to_all_agents() -> None:
     skill_set = ResolvedSkillSet(
         skills=[
             ResolvedSkill(
@@ -459,11 +478,12 @@ def test_build_available_skills_metadata_auto_load() -> None:
                 content_hash="h1",
                 instructions="Always active skill.",
                 auto_load=True,
+                attached=True,
             ),
         ]
     )
     metadata = build_available_skills_metadata(skill_set)
-    assert "<auto_load>true</auto_load>" in metadata
+    assert "<attach_to_all_agents>true</attach_to_all_agents>" in metadata
 
 
 # ---------------------------------------------------------------------------
@@ -480,6 +500,27 @@ def test_skill_load_tool_exists() -> None:
     # skill_load should be read-only
     skill_load = next(t for t in tools if t.name == "skill_load")
     assert skill_load.read_only is True
+
+
+def test_resolved_skill_tool_ids_supports_legacy_dict_payloads() -> None:
+    from cognis.tools.builtin.skill_management import _resolved_skill_tool_ids
+
+    tool_ids = _resolved_skill_tool_ids(
+        "legacy-skill",
+        "Legacy Skill",
+        None,
+        False,
+        "Instructions",
+        {
+            "run": {
+                "name": "run",
+                "description": "Run tool",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        },
+    )
+
+    assert tool_ids == {"skill:legacy-skill:run"}
 
 
 def test_skill_management_tool_count() -> None:

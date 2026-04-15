@@ -852,7 +852,8 @@ class SkillResponse(BaseModel):
     tools: list[dict[str, Any]] | None = None
     prompt_templates: dict[str, Any] | None = None
     tags: list[str] | None = None
-    auto_load: bool = False
+    attach_to_all_agents: bool = False
+    auto_load: bool = False  # Deprecated alias
     is_system: bool = False
     source: str = "db"
     current_version_id: str | None = None
@@ -869,7 +870,8 @@ class SkillCreateRequest(BaseModel):
     tools: list[dict[str, Any]] | None = None
     prompt_templates: dict[str, Any] | None = None
     tags: list[str] | None = None
-    auto_load: bool = False
+    attach_to_all_agents: bool | None = None
+    auto_load: bool | None = None
     secret_placeholders: list[str] | None = None
 
 
@@ -880,6 +882,7 @@ class SkillUpdateRequest(BaseModel):
     tools: list[dict[str, Any]] | None = None
     prompt_templates: dict[str, Any] | None = None
     tags: list[str] | None = None
+    attach_to_all_agents: bool | None = None
     auto_load: bool | None = None
     secret_placeholders: list[str] | None = None
 
@@ -890,7 +893,8 @@ class SkillImportRequest(BaseModel):
     format: str | None = None
     name: str | None = None
     tags: list[str] | None = None
-    auto_load: bool = False
+    attach_to_all_agents: bool | None = None
+    auto_load: bool | None = None
 
 
 class SkillExportResponse(BaseModel):

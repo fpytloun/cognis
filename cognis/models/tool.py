@@ -59,8 +59,34 @@ def stable_tool_id(tool: ToolDefinition) -> str:
         return f"mcp:{server_id}:{raw_name}"
     if tool.source.type == "skill":
         skill_id = tool.source.skill_id or "unknown"
-        return f"skill:{skill_id}:{tool.name}"
+        raw_name = tool.source.raw_tool_name or tool.name
+        return f"skill:{skill_id}:{raw_name}"
     return f"builtin:{tool.name}"
+
+
+def tool_display_name(tool: ToolDefinition) -> str:
+    """Return the user-authored display name for a tool when available."""
+
+    if tool.source.type == "skill" and tool.source.raw_tool_name:
+        return tool.source.raw_tool_name
+    return tool.name
+
+
+def tool_matches_identifier(tool: ToolDefinition, identifier: str) -> bool:
+    """Return whether an identifier matches a tool's stable, internal, or legacy name."""
+
+    return bool(
+        identifier
+        and (
+            tool.name == identifier
+            or stable_tool_id(tool) == identifier
+            or (
+                tool.source.type == "skill"
+                and tool.source.raw_tool_name is not None
+                and tool.source.raw_tool_name == identifier
+            )
+        )
+    )
 
 
 _SAFE_TOOL_NAME_PATTERN = re.compile(r"[^a-zA-Z0-9_-]+")

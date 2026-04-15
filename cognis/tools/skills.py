@@ -1,6 +1,6 @@
 """Skill resolution and runtime integration.
 
-Resolves active skills for an agent from DB records, returning versioned
+Resolves discoverable skills for an agent from DB records, returning versioned
 instruction blocks, tool definitions, prompt templates, and asset refs.
 
 Backward-compatible: legacy inline ``agent.skills.items[*].tool_names``
@@ -9,6 +9,8 @@ entries are still supported as an additive fallback.
 
 from __future__ import annotations
 
+import hashlib
+import re
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,10 +24,13 @@ from cognis.models.skill import (
     SkillAssetRef,
     SkillToolSpec,
 )
-from cognis.models.tool import ToolDefinition, ToolSource
+from cognis.models.tool import ToolDefinition, ToolSource, stable_tool_id
 from cognis.store.models import SkillRow, SkillVersionRow
 
 logger = get_logger(__name__)
+
+_SAFE_SKILL_TOOL_SEGMENT = re.compile(r"[^a-zA-Z0-9_-]+")
+_MAX_SKILL_TOOL_NAME_LENGTH = 64
 
 
 # ---------------------------------------------------------------------------
@@ -113,17 +118,19 @@ async def resolve_skills_for_agent(
     *,
     owner_email: str | None = None,
 ) -> ResolvedSkillSet:
-    """Resolve active skills for an agent from DB.
+    """Resolve discoverable skills for an agent from DB.
 
     Returns a ``ResolvedSkillSet`` with versioned skill data suitable
     for both effective-tools preview and runtime context assembly.
 
     Resolution order:
-    1. Agent-specified skill refs (in order)
-    2. Auto-load skills visible to the owner (alphabetical by skill_id)
+    1. Agent-attached skill refs (in order)
+    2. Skills attached to all agents (alphabetical by name)
+    3. Other visible skills (alphabetical by name)
 
-    Deduplication: a skill appearing in both lists is included only once,
-    in the agent-specified position.
+    All visible skills remain discoverable via prompt metadata and ``skill_load``.
+    Attached skills are marked so they can be highlighted in the prompt and
+    exposed by default through the deferred tool-loading path.
     """
     import sqlalchemy as sa
     from sqlalchemy import select
@@ -141,7 +148,7 @@ async def resolve_skills_for_agent(
     result = await session.execute(stmt)
     all_skills = {row.skill_id: row for row in result.scalars().all()}
 
-    # Build ordered list: agent-specified first, then auto_load
+    # Build ordered list: attached first, then globally attached, then discoverable.
     seen: set[str] = set()
     ordered_skill_ids: list[str] = []
 
@@ -150,10 +157,23 @@ async def resolve_skills_for_agent(
             ordered_skill_ids.append(skill_id)
             seen.add(skill_id)
 
-    for skill_id, row in sorted(all_skills.items()):
-        if row.auto_load and skill_id not in seen:
+    globally_attached = sorted(
+        (row for row in all_skills.values() if row.auto_load),
+        key=lambda row: (row.name.lower(), row.skill_id),
+    )
+    for row in globally_attached:
+        skill_id = row.skill_id
+        if skill_id not in seen:
             ordered_skill_ids.append(skill_id)
             seen.add(skill_id)
+
+    discoverable = sorted(
+        (row for row in all_skills.values() if row.skill_id not in seen),
+        key=lambda row: (row.name.lower(), row.skill_id),
+    )
+    for row in discoverable:
+        ordered_skill_ids.append(row.skill_id)
+        seen.add(row.skill_id)
 
     # Resolve versions
     resolved: list[ResolvedSkill] = []
@@ -161,6 +181,7 @@ async def resolve_skills_for_agent(
 
     for skill_id in ordered_skill_ids:
         skill_row = all_skills[skill_id]
+        attached = skill_id in enabled_ids or bool(skill_row.auto_load)
         version_id = skill_row.current_version_id
 
         if version_id:
@@ -186,6 +207,7 @@ async def resolve_skills_for_agent(
                         secret_placeholders=version_row.secret_placeholders or [],
                         asset_manifest=asset_manifest,
                         auto_load=skill_row.auto_load,
+                        attached=attached,
                     )
                 )
                 version_snapshot[skill_id] = version_row.version_id
@@ -205,6 +227,7 @@ async def resolve_skills_for_agent(
                 tools=tools,
                 prompt_templates=skill_row.prompt_templates or {},
                 auto_load=skill_row.auto_load,
+                attached=attached,
             )
         )
 
@@ -285,8 +308,10 @@ def build_available_skills_metadata(resolved: ResolvedSkillSet) -> str:
         lines.append(f"    <description>{desc}</description>")
         if tool_names:
             lines.append(f"    <tools>{tool_names}</tools>")
+        if skill.attached:
+            lines.append("    <attached>true</attached>")
         if skill.auto_load:
-            lines.append("    <auto_load>true</auto_load>")
+            lines.append("    <attach_to_all_agents>true</attach_to_all_agents>")
         lines.append("  </skill>")
 
     return "<available_skills>\n" + "\n".join(lines) + "\n</available_skills>"
@@ -299,6 +324,8 @@ def build_available_skills_metadata(resolved: ResolvedSkillSet) -> str:
 
 def skill_tools_to_definitions(
     resolved: ResolvedSkillSet,
+    *,
+    include_unattached: bool = False,
 ) -> list[ToolDefinition]:
     """Convert resolved skill tool specs into ToolDefinition objects.
 
@@ -308,6 +335,8 @@ def skill_tools_to_definitions(
     """
     definitions: list[ToolDefinition] = []
     for skill in resolved.skills:
+        if not include_unattached and not skill.attached:
+            continue
         for tool_spec in skill.tools:
             # Build execution metadata for the executor handler
             exec_meta: dict[str, Any] = {}
@@ -321,7 +350,7 @@ def skill_tools_to_definitions(
                 exec_meta["secret_placeholders"] = skill.secret_placeholders
 
             definition = ToolDefinition(
-                name=tool_spec.name,
+                name=_qualified_skill_tool_name(skill.skill_id, tool_spec.name),
                 description=tool_spec.description,
                 parameters=tool_spec.parameters,
                 source=ToolSource(
@@ -329,6 +358,7 @@ def skill_tools_to_definitions(
                     skill_id=skill.skill_id,
                     skill_version_id=skill.version_id or None,
                     skill_content_hash=skill.content_hash or None,
+                    raw_tool_name=tool_spec.name,
                 ),
                 category="skill",
                 read_only=tool_spec.read_only,
@@ -339,3 +369,33 @@ def skill_tools_to_definitions(
             )
             definitions.append(definition)
     return definitions
+
+
+def discoverable_skill_tools_to_definitions(resolved: ResolvedSkillSet) -> list[ToolDefinition]:
+    """Convert all discoverable skill tools into executable definitions."""
+
+    return skill_tools_to_definitions(resolved, include_unattached=True)
+
+
+def _qualified_skill_tool_name(skill_id: str, tool_name: str) -> str:
+    """Return a deterministic registry-safe internal name for a skill tool."""
+
+    safe_skill = _SAFE_SKILL_TOOL_SEGMENT.sub("_", skill_id).strip("_") or "skill"
+    safe_tool = _SAFE_SKILL_TOOL_SEGMENT.sub("_", tool_name).strip("_") or "tool"
+    base_name = f"skill_{safe_skill}__{safe_tool}"
+    if len(base_name) <= _MAX_SKILL_TOOL_NAME_LENGTH:
+        return base_name
+    suffix = hashlib.sha1(f"{skill_id}:{tool_name}".encode()).hexdigest()[:8]
+    trimmed = base_name[: _MAX_SKILL_TOOL_NAME_LENGTH - len(suffix) - 1].rstrip("_")
+    return f"{trimmed}_{suffix}"
+
+
+def attached_skill_tool_ids(resolved: ResolvedSkillSet) -> set[str]:
+    """Return stable tool IDs for skills attached to this agent context."""
+
+    return {
+        stable_tool_id(tool)
+        for tool in skill_tools_to_definitions(
+            ResolvedSkillSet(skills=[skill for skill in resolved.skills if skill.attached])
+        )
+    }

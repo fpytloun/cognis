@@ -71,6 +71,7 @@ def _skill_to_response(row: Any, version_row: Any | None = None) -> SkillRespons
         tools=row.tools,
         prompt_templates=row.prompt_templates,
         tags=row.tags,
+        attach_to_all_agents=row.auto_load,
         auto_load=row.auto_load,
         is_system=getattr(row, "is_system", False),
         source=row.source,
@@ -80,6 +81,15 @@ def _skill_to_response(row: Any, version_row: Any | None = None) -> SkillRespons
         created_at=row.created_at,
         updated_at=row.updated_at,
     )
+
+
+def _resolve_attach_to_all_agents(
+    body: SkillCreateRequest | SkillUpdateRequest | SkillImportRequest,
+) -> bool:
+    if getattr(body, "attach_to_all_agents", None) is not None:
+        return bool(body.attach_to_all_agents)
+    legacy = getattr(body, "auto_load", None)
+    return bool(legacy) if legacy is not None else False
 
 
 @router.get("/api/v1/skills", response_model=list[SkillResponse])
@@ -122,7 +132,7 @@ async def create_skill_route(request: Request, body: SkillCreateRequest) -> Skil
             tools=body.tools,
             prompt_templates=body.prompt_templates,
             tags=body.tags,
-            auto_load=body.auto_load,
+            auto_load=_resolve_attach_to_all_agents(body),
             owner_email=user.email,
         )
         # Create initial version
@@ -151,6 +161,8 @@ async def update_skill_route(
     updates = body.model_dump(exclude_none=True)
     if not updates:
         raise api_exception(400, "validation_error", "No fields to update")
+    if "attach_to_all_agents" in updates:
+        updates["auto_load"] = updates.pop("attach_to_all_agents")
     async with request.app.state.session_factory() as session:
         row = await get_skill_scoped(session, skill_id, owner_email=user.email)
         if row is None:
@@ -341,7 +353,7 @@ async def import_skill_route(request: Request, body: SkillImportRequest) -> Skil
             tools=tools,
             prompt_templates=templates,
             tags=tags,
-            auto_load=body.auto_load,
+            auto_load=_resolve_attach_to_all_agents(body),
             source="imported",
             owner_email=user.email,
         )

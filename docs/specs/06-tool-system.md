@@ -991,7 +991,7 @@ class Skill(BaseModel):
     tools: list[ToolDefinition] = []
     prompt_templates: dict[str, str] = {}
     source: str                    # "db", "file"
-    auto_load: bool = False
+    attach_to_all_agents: bool = False
     owner_email: str | None = None
     tags: list[str] = []
 ```
@@ -1007,7 +1007,7 @@ CREATE TABLE skills (
     tools       JSON,              -- list of ToolDefinition dicts
     prompt_templates JSON,
     tags        JSON,
-    auto_load   INTEGER NOT NULL DEFAULT 0,
+    auto_load   INTEGER NOT NULL DEFAULT 0,  -- internal storage for attach_to_all_agents
     owner_email TEXT REFERENCES users(email),
     created_at  TIMESTAMP NOT NULL,
     updated_at  TIMESTAMP NOT NULL
@@ -1021,6 +1021,37 @@ Skills are managed via:
 2. **UI** — Tools & Skills page, Skills tab
 3. **Import/Export** — YAML format for GitOps workflows
 4. **LLM Tool** — `skill_write` built-in tool for agent self-management
+
+### Runtime Model
+
+Skills have three distinct runtime states:
+
+1. **Discoverable** — all visible skills for the user. These are announced in
+   compact prompt metadata and can be loaded explicitly with `skill_load`.
+2. **Attached** — skills selected on the agent plus skills attached to all
+   agents. These are highlighted in the prompt as preferred defaults.
+3. **Forced/Inherited** — workflow or delegation scoped attachments that can be
+   injected into a sub-session explicitly.
+
+Discoverability and attachment are intentionally separate. Agents should
+usually choose from prompt-announced skills and call `skill_load` directly
+rather than browsing with `skill_list`.
+
+### Deferred Skill Tools
+
+Skill-defined tools participate in the same deferred tool exposure model as MCP
+tools:
+
+- Attached skills start with their tool IDs marked as discovered.
+- Discoverable but unattached skills expose their tools only after `skill_load`.
+- Prompt metadata stays compact and cache-friendly because full skill content is
+  loaded on demand.
+- Provider-specific deferred loading (`defer_loading`, `search_tools`, future
+  `allowed_tools` restrictions) controls visibility without changing the stable
+  tool inventory.
+
+This lets Cognis keep all visible skills discoverable while still encouraging
+explicit skill loading and preserving prompt caching.
 
 ### Filesystem Skills (read-only)
 

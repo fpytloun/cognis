@@ -36,7 +36,7 @@ Today, the most visible skill workflow is:
 - create or edit database-backed skills
 - import skills from supported external formats such as `SKILL.md`
 - export skills for sharing or version control
-- organize skills with tags and auto-load behavior
+- organize skills with tags and global attachment behavior
 - attach skills to agents so their instructions are available at runtime
 
 Depending on the imported format and runtime configuration, a skill can also carry richer metadata such as templates, assets, or tool-related information. This guide focuses on the shipped workflow you can use directly from the current app.
@@ -49,27 +49,27 @@ In the UI you can:
 - import skills from a URL, including `SKILL.md`-style sources
 - export skills for sharing and version control
 - organize skills with tags
-- set auto-load to make a skill active for all agents
+- attach a skill to all agents by default
 
 ### How skills work at runtime
 
 Skills use a hybrid lazy-loading model for token efficiency:
 
-1. **Compact metadata in the system prompt** -- only skill names, descriptions, and tool summaries are included in the immutable prompt prefix. This keeps the cached prefix stable and small.
+1. **Compact metadata in the system prompt** -- visible skills are announced in the immutable prompt prefix with compact summaries. Attached skills are marked so the agent knows which ones are preferred defaults.
 2. **On-demand loading via `skill_load`** -- the agent uses the `skill_load` tool to read full instructions when a skill is relevant to the current task. Instructions are loaded into the mutable context, not the cached prefix.
-3. **Executable skill tools** -- when a skill includes supported tool definitions and the runtime exposes them, those tools can be called directly by the agent.
+3. **Deferred executable skill tools** -- skill-defined tools are discoverable but treated as deferred. Attached skills start available by default; other skills expose their tools after the agent loads the skill.
 
 This means:
 - adding or removing skills does not invalidate the entire prompt cache
 - the agent only pays token costs for skills it actually uses
 - skill edits are visible on the next turn without restarting the session
-- after `skill_write` or `skill_import_url`, the updated skill is available in the same turn
+- after `skill_load`, the loaded skill's tools become eligible for subsequent model calls in the turn
 
 ### Agent skill selection
 
-In the agent editor, you can select which skills an agent should use. Selected skills contribute their tools to the agent's effective tool set and their metadata to the prompt.
+In the agent editor, you can select which skills to attach to an agent. Attached skills are highlighted in prompt metadata and their tools are available immediately through the deferred tool-loading path.
 
-Skills are resolved in order: agent-specified skills first, then auto-load skills alphabetically. This ordering is deterministic to preserve prompt caching stability.
+All visible skills remain discoverable via prompt metadata and `skill_load`. Resolution order is deterministic: agent-attached skills first, then skills attached to all agents, then other discoverable skills.
 
 ### LLM skill management
 
@@ -83,7 +83,7 @@ Agents can manage skills through built-in tools:
 - `skill_import_url` -- import a skill from a URL
 - `skill_export` -- export a skill as SKILL.md or YAML
 
-All mutation tools are non-bypassable and evaluated by Intaris guardrails. After a successful mutation, the updated skill is immediately available for the rest of the turn.
+All mutation tools are non-bypassable and evaluated by Intaris guardrails. When an agent creates or imports a skill, Cognis automatically attaches it to that agent for future runs.
 
 ### Built-in Cognis management skills
 

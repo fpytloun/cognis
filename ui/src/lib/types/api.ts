@@ -597,7 +597,8 @@ export interface Skill {
   tools: Record<string, unknown>[] | null;
   prompt_templates: Record<string, unknown> | null;
   tags: string[] | null;
-  auto_load: boolean;
+  attach_to_all_agents: boolean;
+  auto_load?: boolean;
   is_system: boolean;
   source: string;
   current_version_id: string | null;
@@ -614,6 +615,7 @@ export interface SkillCreate {
   tools?: Record<string, unknown>[];
   prompt_templates?: Record<string, unknown>;
   tags?: string[];
+  attach_to_all_agents?: boolean;
   auto_load?: boolean;
   secret_placeholders?: string[];
 }
@@ -625,6 +627,7 @@ export interface SkillUpdate {
   tools?: Record<string, unknown>[];
   prompt_templates?: Record<string, unknown>;
   tags?: string[];
+  attach_to_all_agents?: boolean;
   auto_load?: boolean;
   secret_placeholders?: string[];
 }
@@ -635,6 +638,7 @@ export interface SkillImportRequest {
   format?: string;
   name?: string;
   tags?: string[];
+  attach_to_all_agents?: boolean;
   auto_load?: boolean;
 }
 

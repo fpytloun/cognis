@@ -49,6 +49,8 @@ from cognis.models.tool import (
     ToolResult,
     ToolSource,
     stable_tool_id,
+    tool_display_name,
+    tool_matches_identifier,
 )
 from cognis.models.workflow import StepDefinition, StepOutput, WorkflowState
 from cognis.providers.retry import is_retryable_http_error
@@ -346,16 +348,23 @@ def _tool_id_for_call(tool_name: str, registry: Any | None) -> str:
 
 
 def _filter_model_inventory_tools(
-    agent: AgentDefinition, tools: list[ToolDefinition]
+    agent: AgentDefinition, tools: list[ToolDefinition], discovered_tool_ids: set[str] | None = None
 ) -> list[ToolDefinition]:
     filtered: list[ToolDefinition] = []
     permissions = agent.permissions
+    visible_skill_tool_ids = _attached_skill_tool_ids(agent)
+    if discovered_tool_ids:
+        visible_skill_tool_ids.update(discovered_tool_ids)
     for tool in tools:
         if tool.name in CONTROLLER_TOOLS or is_orchestration_tool(tool.name):
             continue
+        if tool.source.type == "skill" and stable_tool_id(tool) not in visible_skill_tool_ids:
+            continue
         if (
             permissions is not None
-            and permissions.resolve_permission(tool.name, tool_id=stable_tool_id(tool))
+            and permissions.resolve_permission(
+                tool_display_name(tool), tool_id=stable_tool_id(tool)
+            )
             is Permission.DENY
         ):
             continue
@@ -363,15 +372,22 @@ def _filter_model_inventory_tools(
     return filtered
 
 
+def _attached_skill_tool_ids(agent: AgentDefinition) -> set[str]:
+    if not isinstance(agent.skills, dict):
+        return set()
+    raw_ids = agent.skills.get("_attached_skill_tool_ids")
+    if not isinstance(raw_ids, list):
+        return set()
+    return {str(tool_id) for tool_id in raw_ids if isinstance(tool_id, str) and tool_id.strip()}
+
+
 def _controller_builtin_enabled(agent: AgentDefinition, tool: ToolDefinition) -> bool:
     if not isinstance(agent.tools, dict):
         return True
     disabled_categories = set(agent.tools.get("disabled_categories") or [])
     disabled_tools = set(agent.tools.get("disabled_tools") or [])
-    if (
-        tool.category in disabled_categories
-        or tool.name in disabled_tools
-        or stable_tool_id(tool) in disabled_tools
+    if tool.category in disabled_categories or any(
+        tool_matches_identifier(tool, identifier) for identifier in disabled_tools
     ):
         return False
     builtin_allow = agent.tools.get("builtin_tools")
@@ -1548,7 +1564,7 @@ class AgentLoop:
         reprompted = False
         mid_stream_retries = 0
         _MAX_MID_STREAM_RETRIES = 2
-        discovered_tool_ids: set[str] = set()
+        discovered_tool_ids = self._get_initial_discovered_tool_ids(ctx)
         collected_attachments: list[dict[str, Any]] = []
         while True:
             self._raise_if_cancelled(ctx)
@@ -1583,7 +1599,7 @@ class AgentLoop:
             model_info = await self.providers.llm.get_model_info(model_for_llm or resolved_model)
             registry = self._get_tool_registry(ctx)
             inventory_tools = (
-                _filter_model_inventory_tools(ctx.agent, registry.list_tools())
+                _filter_model_inventory_tools(ctx.agent, registry.list_tools(), discovered_tool_ids)
                 if registry is not None
                 else []
             )
@@ -2615,6 +2631,9 @@ class AgentLoop:
                         )
                     if result.attachments:
                         collected_attachments.extend(normalize_attachment_refs(result.attachments))
+                    if result.metadata:
+                        self._merge_discovered_tool_ids(discovered_tool_ids, result.metadata)
+                        self._apply_skill_attachment_metadata(ctx, result.metadata)
                     messages.append(
                         {
                             "role": "tool",
@@ -4741,6 +4760,72 @@ class AgentLoop:
         if ctx.tool_registry is not None:
             return ctx.tool_registry
         return getattr(self.providers, "_tool_registry", None)
+
+    def _get_initial_discovered_tool_ids(self, ctx: StepContext) -> set[str]:
+        """Return tool ids that should be visible before any discovery calls."""
+
+        if not isinstance(ctx.agent.skills, dict):
+            return set()
+        raw_ids = ctx.agent.skills.get("_attached_skill_tool_ids")
+        if not isinstance(raw_ids, list):
+            return set()
+        return {str(tool_id) for tool_id in raw_ids if isinstance(tool_id, str) and tool_id.strip()}
+
+    def _merge_discovered_tool_ids(
+        self, discovered_tool_ids: set[str], metadata: dict[str, Any]
+    ) -> None:
+        """Merge newly discovered tool ids from tool metadata."""
+
+        raw_ids = metadata.get("discovered_tool_ids")
+        if not isinstance(raw_ids, list):
+            raw_ids = []
+        discovered_tool_ids.update(
+            str(tool_id) for tool_id in raw_ids if isinstance(tool_id, str) and tool_id.strip()
+        )
+        removed_ids = metadata.get("removed_tool_ids")
+        if isinstance(removed_ids, list):
+            discovered_tool_ids.difference_update(
+                str(tool_id)
+                for tool_id in removed_ids
+                if isinstance(tool_id, str) and tool_id.strip()
+            )
+
+    def _apply_skill_attachment_metadata(self, ctx: StepContext, metadata: dict[str, Any]) -> None:
+        """Keep in-memory agent skill refs aligned with skill management mutations."""
+
+        if not isinstance(ctx.agent.skills, dict):
+            ctx.agent.skills = {}
+
+        items = ctx.agent.skills.get("items")
+        if not isinstance(items, list):
+            items = []
+
+        attached_skill_id = metadata.get("attached_skill_id")
+        if (
+            isinstance(attached_skill_id, str)
+            and attached_skill_id.strip()
+            and not any(
+                isinstance(item, dict) and item.get("skill_id") == attached_skill_id
+                for item in items
+            )
+        ):
+            items.append({"skill_id": attached_skill_id, "enabled": True})
+
+        deleted_skill_id = metadata.get("deleted_skill_id")
+        if isinstance(deleted_skill_id, str) and deleted_skill_id.strip():
+            items = [
+                item
+                for item in items
+                if not (isinstance(item, dict) and item.get("skill_id") == deleted_skill_id)
+            ]
+            attached_tool_ids = _attached_skill_tool_ids(ctx.agent)
+            ctx.agent.skills["_attached_skill_tool_ids"] = [
+                tool_id
+                for tool_id in attached_tool_ids
+                if not tool_id.startswith(f"skill:{deleted_skill_id}:")
+            ]
+
+        ctx.agent.skills["items"] = items
 
     def _get_executor(self, ctx: StepContext) -> Any:
         """Get the executor connection for the current step."""

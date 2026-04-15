@@ -14,6 +14,8 @@ from cognis.providers.llm.responses_bridge import should_use_openai_responses
 from cognis.tools.builtin.tool_search import SEARCH_TOOLS_TOOL
 
 _ANTHROPIC_MODEL_PATTERNS = re.compile(r"(claude|anthropic)", re.IGNORECASE)
+_VISIBLE_TOOL_NAME_PATTERN = re.compile(r"[^a-zA-Z0-9_-]+")
+_MAX_VISIBLE_TOOL_NAME_LENGTH = 64
 
 
 @dataclass(slots=True)
@@ -83,7 +85,11 @@ def prepare_tool_exposure(
     elif use_openai_responses:
         strategy = "openai_responses_full_inventory"
         visible_tools = core_without_search + deferred_tools
-        tool_schemas = _build_inventory_schemas(visible_tools, alias_map)
+        tool_schemas = _build_inventory_schemas(
+            visible_tools,
+            alias_map,
+            deferred_tool_ids={stable_tool_id(tool) for tool in deferred_tools},
+        )
         request_kwargs = {"tool_choice": "auto", "parallel_tool_calls": True}
     else:
         strategy = "generic_search_tools"
@@ -130,7 +136,9 @@ def _build_inventory_schemas(
     used_names: set[str] = set(alias_map)
     schemas: list[dict[str, Any]] = []
     for tool in tools:
-        visible_name = _dedupe_visible_name(tool.name, stable_tool_id(tool), used_names)
+        visible_name = _dedupe_visible_name(
+            _tool_visible_name(tool), stable_tool_id(tool), used_names
+        )
         alias_map[visible_name] = tool.name
         function_schema: dict[str, Any] = {
             "name": visible_name,
@@ -163,12 +171,18 @@ def _select_generic_visible_tools(
     must_include_search = (
         deferred_present or len(core_tools) + len(discovered_tools) > available_slots
     )
+    for tool in discovered_tools:
+        if len(visible) >= available_slots:
+            overflowed = True
+            break
+        visible.append(tool)
+    remaining_slots = max(0, available_slots - len(visible))
     reserved_for_search = (
-        1 if must_include_search and search_tool is not None and available_slots > 0 else 0
+        1 if must_include_search and search_tool is not None and remaining_slots > 0 else 0
     )
-    core_budget = max(0, available_slots - reserved_for_search)
-    for tool in core_tools:
-        if len(visible) >= core_budget:
+    core_budget = max(0, remaining_slots - reserved_for_search)
+    for added_core, tool in enumerate(core_tools, start=1):
+        if added_core > core_budget:
             overflowed = True
             break
         visible.append(tool)
@@ -210,7 +224,24 @@ def _dedupe_visible_name(name: str, tool_id: str, used_names: set[str]) -> str:
 
 
 def _is_deferred_tool(tool: ToolDefinition) -> bool:
-    return tool.source.type in {"local_mcp", "intaris_mcp"}
+    return tool.source.type in {"skill", "local_mcp", "intaris_mcp"}
+
+
+def _tool_visible_name(tool: ToolDefinition) -> str:
+    if tool.source.type == "skill" and tool.source.raw_tool_name:
+        return _sanitize_visible_name(tool.source.raw_tool_name)
+    return tool.name
+
+
+def _sanitize_visible_name(name: str) -> str:
+    cleaned = _VISIBLE_TOOL_NAME_PATTERN.sub("_", name).strip("_")
+    if not cleaned:
+        return "tool"
+    if len(cleaned) <= _MAX_VISIBLE_TOOL_NAME_LENGTH:
+        return cleaned
+    suffix = hashlib.sha1(name.encode()).hexdigest()[:8]
+    trimmed = cleaned[: _MAX_VISIBLE_TOOL_NAME_LENGTH - len(suffix) - 1].rstrip("_")
+    return f"{trimmed}_{suffix}"
 
 
 def _tool_sort_key(tool: ToolDefinition) -> tuple[int, int, str]:
