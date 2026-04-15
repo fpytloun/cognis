@@ -72,8 +72,9 @@
     skipped: 'bg-amber-500/20 text-amber-400',
     completed: 'bg-emerald-500/20 text-emerald-400',
     running: 'bg-blue-500/20 text-blue-400',
+    paused: 'bg-violet-500/20 text-violet-400',
     queued: 'bg-slate-500/20 text-slate-400',
-    ready: 'bg-slate-500/20 text-slate-400',
+    ready: 'bg-cyan-500/20 text-cyan-400',
     cancelled: 'bg-slate-500/20 text-slate-400'
   };
 

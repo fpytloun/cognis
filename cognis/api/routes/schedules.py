@@ -23,6 +23,7 @@ from cognis.store.queries import (
     create_schedule,
     delete_schedule,
     get_agent,
+    get_latest_schedule_task_runs,
     get_schedule,
     list_schedules,
     update_schedule,
@@ -36,7 +37,27 @@ router = APIRouter(tags=["schedules"])
 # ---------------------------------------------------------------------------
 
 
-def _row_to_response(row: Any) -> ScheduleResponse:
+def _effective_last_run_status(
+    row: Any,
+    latest_task_run: tuple[str, datetime | None] | None,
+) -> str | None:
+    """Return the user-visible latest run status for a schedule."""
+    if latest_task_run is None:
+        return row.last_run_status
+
+    task_status, task_created_at = latest_task_run
+    if row.last_run_status in {"failed", "skipped"} and (
+        task_created_at is None
+        or (row.last_fired_at is not None and task_created_at < row.last_fired_at)
+    ):
+        return row.last_run_status
+    return task_status
+
+
+def _row_to_response(
+    row: Any,
+    latest_task_run: tuple[str, datetime | None] | None = None,
+) -> ScheduleResponse:
     """Convert a Schedule ORM row to an API response."""
     model = _ScheduleModel(
         schedule_id=row.schedule_id,
@@ -81,7 +102,7 @@ def _row_to_response(row: Any) -> ScheduleResponse:
         suppress_empty=row.suppress_empty,
         last_fired_at=row.last_fired_at,
         next_fire_at=row.next_fire_at,
-        last_run_status=row.last_run_status,
+        last_run_status=_effective_last_run_status(row, latest_task_run),
         consecutive_errors=row.consecutive_errors,
         disabled_reason=row.disabled_reason,
         created_by=row.created_by,
@@ -89,6 +110,22 @@ def _row_to_response(row: Any) -> ScheduleResponse:
         updated_at=row.updated_at,
         human_schedule=describe_schedule(model),
     )
+
+
+async def _load_latest_task_run(
+    request: Request,
+    schedule_id: str,
+    *,
+    created_by: str,
+) -> tuple[str, datetime | None] | None:
+    """Load the latest scheduler-created task state for a schedule."""
+    async with request.app.state.session_factory() as db:
+        latest_runs = await get_latest_schedule_task_runs(
+            db,
+            [schedule_id],
+            created_by=created_by,
+        )
+    return latest_runs.get(schedule_id)
 
 
 # ---------------------------------------------------------------------------
@@ -113,7 +150,12 @@ async def list_schedules_route(
             schedule_type=schedule_type,
             agent_id=agent_id,
         )
-    return [_row_to_response(r) for r in rows]
+        latest_runs = await get_latest_schedule_task_runs(
+            db,
+            [row.schedule_id for row in rows],
+            created_by=user.email,
+        )
+    return [_row_to_response(r, latest_runs.get(r.schedule_id)) for r in rows]
 
 
 @router.post("/api/v1/schedules", response_model=ScheduleResponse, status_code=201)
@@ -189,7 +231,10 @@ async def create_schedule_route(
     if scheduler is not None:
         await scheduler.notify_schedule_changed(row.schedule_id)
 
-    return _row_to_response(row)
+    return _row_to_response(
+        row,
+        await _load_latest_task_run(request, row.schedule_id, created_by=user.email),
+    )
 
 
 @router.get("/api/v1/schedules/{schedule_id}", response_model=ScheduleResponse)
@@ -201,9 +246,14 @@ async def get_schedule_route(
     user = require_current_user(request)
     async with request.app.state.session_factory() as db:
         row = await get_schedule(db, schedule_id)
+        latest_run = await get_latest_schedule_task_runs(
+            db,
+            [schedule_id],
+            created_by=user.email,
+        )
     if row is None or row.created_by != user.email:
         raise api_exception(404, "schedule_not_found", "Schedule not found")
-    return _row_to_response(row)
+    return _row_to_response(row, latest_run.get(schedule_id))
 
 
 @router.put("/api/v1/schedules/{schedule_id}", response_model=ScheduleResponse)
@@ -238,7 +288,10 @@ async def update_schedule_route(
 
         fields = body.model_dump(exclude_unset=True)
         if not fields:
-            return _row_to_response(existing)
+            return _row_to_response(
+                existing,
+                await _load_latest_task_run(request, schedule_id, created_by=user.email),
+            )
 
         row = await update_schedule(db, schedule_id, **fields)
         await db.commit()
@@ -248,7 +301,10 @@ async def update_schedule_route(
     if scheduler is not None:
         await scheduler.notify_schedule_changed(schedule_id)
 
-    return _row_to_response(row)
+    return _row_to_response(
+        row,
+        await _load_latest_task_run(request, schedule_id, created_by=user.email),
+    )
 
 
 @router.delete("/api/v1/schedules/{schedule_id}", status_code=204)
@@ -299,7 +355,13 @@ async def trigger_schedule_route(
         row = await get_schedule(db, schedule_id)
     if row is None:
         raise api_exception(404, "schedule_not_found", "Schedule was deleted after trigger")
-    return _row_to_response(row)
+    async with request.app.state.session_factory() as db:
+        latest_run = await get_latest_schedule_task_runs(
+            db,
+            [schedule_id],
+            created_by=user.email,
+        )
+    return _row_to_response(row, latest_run.get(schedule_id))
 
 
 @router.post("/api/v1/schedules/{schedule_id}/enable", response_model=ScheduleResponse)
@@ -328,7 +390,10 @@ async def enable_schedule_route(
     if scheduler is not None:
         await scheduler.notify_schedule_changed(schedule_id)
 
-    return _row_to_response(row)
+    return _row_to_response(
+        row,
+        await _load_latest_task_run(request, schedule_id, created_by=user.email),
+    )
 
 
 @router.post("/api/v1/schedules/{schedule_id}/disable", response_model=ScheduleResponse)
@@ -351,7 +416,10 @@ async def disable_schedule_route(
     if scheduler is not None:
         await scheduler.notify_schedule_changed(schedule_id)
 
-    return _row_to_response(row)
+    return _row_to_response(
+        row,
+        await _load_latest_task_run(request, schedule_id, created_by=user.email),
+    )
 
 
 @router.get(

@@ -3400,3 +3400,47 @@ async def expire_stale_pairing_requests(
         .values(status="expired")
     )
     return int(result.rowcount or 0)
+
+async def get_latest_schedule_task_runs(
+    session: AsyncSession,
+    schedule_ids: list[str],
+    *,
+    created_by: str,
+) -> dict[str, tuple[str, datetime | None]]:
+    """Return the newest scheduler-created task status per schedule."""
+    if not schedule_ids:
+        return {}
+
+    ranked_runs = (
+        select(
+            Task.source_ref.label("schedule_id"),
+            Task.status.label("status"),
+            Task.created_at.label("created_at"),
+            sa.func.row_number()
+            .over(
+                partition_by=Task.source_ref,
+                order_by=(Task.created_at.desc(), Task.task_id.desc()),
+            )
+            .label("row_number"),
+        )
+        .where(
+            Task.source_type == "scheduler",
+            Task.source_ref.in_(schedule_ids),
+            Task.created_by == created_by,
+        )
+        .subquery()
+    )
+
+    result = await session.execute(
+        select(
+            ranked_runs.c.schedule_id,
+            ranked_runs.c.status,
+            ranked_runs.c.created_at,
+        ).where(ranked_runs.c.row_number == 1)
+    )
+    return {
+        str(schedule_id): (str(status), created_at)
+        for schedule_id, status, created_at in result.all()
+        if schedule_id is not None and status is not None
+    }
+
