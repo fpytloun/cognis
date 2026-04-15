@@ -950,8 +950,8 @@ steps:
   - name: research
     type: run
     prompt: "Execute the research plan..."
-    input: {type: full, source: plan}
-    # Full context from planning — researcher sees reasoning and decisions
+    input: {type: last, source: plan}
+    # Research consumes the finalized plan output and gathers evidence
     completion: {evaluate: true, max_attempts: 2}
   - name: synthesize
     type: run
@@ -971,29 +971,28 @@ steps:
     completion: {evaluate: true, max_attempts: 2}
   - name: architect_review
     type: run
-    prompt: "Review this plan critically..."
+    prompt: "Review this plan as a proportional architecture and risk check..."
     input: {type: full, source: plan}
-    # Reviewer sees the FULL planning session
+    # Reviewer sees the full plan output, including detailed content
     completion: {evaluate: true}
-    on_reject: {target: plan, max_loop_iterations: 2, on_exhausted: gate}
+    on_reject: {target: plan, max_loop_iterations: 3, on_exhausted: gate}
   - name: implement
     type: run
     prompt: "Implement the plan with tests and documentation..."
     input: {type: summary, source: [plan, architect_review]}
     # Summary saves context window for actual coding work
     completion: {evaluate: true, max_attempts: 3}
-  - name: run_tests
+  - name: update_docs
     type: run
-    prompt: "Run the test suite and fix any failures..."
-    # input not specified → default: type=last, source=implement
-    completion: {evaluate: true, max_attempts: 2}
-    on_reject: {target: implement, max_loop_iterations: 2, on_exhausted: continue}
+    prompt: "Update directly affected docs only when needed..."
+    input: {type: summary, source: implement}
+    completion: {evaluate: false}
   - name: code_review
     type: run
-    prompt: "Review code quality, test coverage, documentation..."
-    input: {type: summary, source: [plan, implement, run_tests]}
+    prompt: "Review the change for real defects, regressions, and meaningful gaps..."
+    input: {type: summary, source: [plan, implement, update_docs]}
     completion: {evaluate: true}
-    on_reject: {target: implement, max_loop_iterations: 2, on_exhausted: continue}
+    on_reject: {target: implement, max_loop_iterations: 3, on_exhausted: gate}
   - name: commit
     type: run
     prompt: "Create a conventional commit..."

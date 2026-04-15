@@ -69,8 +69,11 @@ GENERAL_TASK_WORKFLOW = Workflow(
             name="execute",
             type="run",
             prompt=(
-                "Execute the requested task directly. Use tools as needed, keep "
-                "the work focused, and verify the result before completing the step."
+                "Execute the requested task directly. Inspect the relevant context "
+                "first, keep the work focused, and verify the result before "
+                "completing the step. For coding work, prefer the smallest correct "
+                "change, preserve existing patterns, and update directly affected "
+                "docs only when needed."
             ),
             reasoning_effort="low",
             input=StepInputConfig(type="null"),
@@ -171,12 +174,15 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
             agent_override="system:architect",
             reasoning_effort="medium",
             prompt=(
-                "Review this implementation plan as an ARB reviewer. If the review is "
-                "complete and the plan needs revision, report that via "
+                "Review this implementation plan as a proportional architecture and "
+                "risk check. Focus on missing security, reliability, testability, "
+                "data, dependency, and failure-mode considerations. Catch important "
+                "omissions and overengineering, but do not block on nitpicks. If the "
+                "review is complete and the plan needs revision, report that via "
                 "step_complete.outcome.status='rejected' with a concise reason. If the "
                 "review itself could not be completed, use outcome.status='failed'."
             ),
-            input=StepInputConfig(type="last", source="plan"),
+            input=StepInputConfig(type="full", source="plan"),
             completion=CompletionConfig(evaluate=True, max_attempts=3),
             outcome_routes=[
                 OutcomeRoute(
@@ -197,22 +203,22 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
                 "After implementation, run relevant tests and linters to "
                 "verify correctness."
             ),
-            input=StepInputConfig(type="last", source=["plan", "architect_review"]),
+            input=StepInputConfig(type="summary", source=["plan", "architect_review"]),
             completion=CompletionConfig(evaluate=True, max_attempts=3),
         ),
         StepDefinition(
             name="update_docs",
             type="run",
+            agent_override="system:implement",
             reasoning_effort="low",
             prompt=(
                 "Update only the documentation directly affected by the changes, "
-                "such as README sections, API docs, configuration examples, or "
-                "inline comments. If no documentation updates are needed, "
-                "explicitly note that."
+                "such as README sections, guides, specs, API docs, configuration "
+                "examples, migration notes, or inline comments. If no documentation "
+                "updates are needed, explicitly say so instead of forcing changes."
             ),
-            input=StepInputConfig(type="last", source="implement"),
+            input=StepInputConfig(type="summary", source="implement"),
             completion=CompletionConfig(evaluate=False),
-            # Primary agent — knows what changed
         ),
         StepDefinition(
             name="code_review",
@@ -226,7 +232,7 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
                 "review itself could not be completed, use outcome.status='failed'."
             ),
             input=StepInputConfig(
-                type="last",
+                type="summary",
                 source=["plan", "implement", "update_docs"],
             ),
             completion=CompletionConfig(evaluate=True, max_attempts=3),

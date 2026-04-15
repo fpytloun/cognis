@@ -33,6 +33,39 @@ def test_system_implement_agent_has_expected_tools_and_constraints() -> None:
     assert "Do not delegate further" in agent.system_prompt
 
 
+def test_system_research_agent_has_expanded_web_tools() -> None:
+    agent = SYSTEM_AGENTS["system:research"]
+    tools = agent.tools or {}
+
+    assert tools.get("builtin_tools") == [
+        "read",
+        "grep",
+        "glob",
+        "web_search",
+        "web_fetch",
+        "web_crawl",
+        "web_map",
+        "web_research",
+    ]
+    assert "Separate repo-local findings from external findings" in agent.system_prompt
+    assert "web_research" in agent.system_prompt
+
+
+def test_system_review_agents_use_pragmatic_prompts() -> None:
+    architect = SYSTEM_AGENTS["system:architect"]
+    review = SYSTEM_AGENTS["system:code-review"]
+
+    assert architect.description == "Implementation plan review for architecture and risk"
+    assert "security, reliability, testability" in architect.system_prompt
+    assert "enterprise-style artifacts" in architect.system_prompt
+    assert "OVERENGINEERING" in architect.system_prompt
+
+    assert review.description == "Findings-first code review for defects and regressions"
+    assert "Primary focus: real bugs, regressions, security issues" in review.system_prompt
+    assert "Do not nitpick style or architecture" in review.system_prompt
+    assert "### Must Fix" in review.system_prompt
+
+
 def test_system_agents_seed_reasoning_and_override_capabilities() -> None:
     implement = SYSTEM_AGENTS["system:implement"]
     explore = SYSTEM_AGENTS["system:explore"]

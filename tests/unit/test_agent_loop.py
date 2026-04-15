@@ -26,7 +26,7 @@ from cognis.core.runtime import ResolvedStepRuntime, build_local_executor_enviro
 from cognis.models.agent import AgentDefinition, AgentPermissions
 from cognis.models.session import EventAppendResult, ReasoningReportResult
 from cognis.models.tool import Permission, ToolCall, ToolDefinition, ToolSource
-from cognis.models.workflow import StepDefinition, StepOutput, WorkflowState
+from cognis.models.workflow import StepDefinition, StepInputConfig, StepOutput, WorkflowState
 from cognis.tools.builtin.orchestration import OrchestrationMode
 from cognis.tools.builtin.tool_search import SEARCH_TOOLS_TOOL
 
@@ -1053,6 +1053,132 @@ def test_build_step_prompt_includes_operator_instruction() -> None:
 
     assert "## Operator Instruction" in prompt
     assert "Incorporate the review and continue." in prompt
+
+
+def test_format_prior_step_outputs_full_includes_full_content() -> None:
+    agent_loop = object.__new__(AgentLoop)
+    workflow_state = WorkflowState(
+        step_outputs={
+            "plan": StepOutput(
+                summary="Plan ready",
+                claims=["Covered edge cases"],
+                content="Detailed plan body",
+                outputs={"files": ["a.py"]},
+            ).model_dump(mode="json")
+        }
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(
+            name="architect_review",
+            type="run",
+            input=StepInputConfig(type="full", source="plan"),
+        ),
+        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=WORKFLOW_POLICY,
+        workflow_state=workflow_state,
+        workflow_steps=[
+            StepDefinition(name="plan", type="run"),
+            StepDefinition(
+                name="architect_review",
+                type="run",
+                input=StepInputConfig(type="full", source="plan"),
+            ),
+        ],
+        step_index=1,
+    )
+
+    text = agent_loop._format_prior_step_outputs(ctx)
+
+    assert "Summary: Plan ready" in text
+    assert "Claims:" in text
+    assert "Content:\nDetailed plan body" in text
+    assert "Structured outputs:" in text
+
+
+def test_format_prior_step_outputs_summary_excludes_claims_and_content() -> None:
+    agent_loop = object.__new__(AgentLoop)
+    workflow_state = WorkflowState(
+        step_outputs={
+            "implement": StepOutput(
+                summary="Implemented change",
+                claims=["Ran tests"],
+                content="Long implementation details",
+                outputs={"tests": ["pytest tests/unit"]},
+            ).model_dump(mode="json")
+        }
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(
+            name="update_docs",
+            type="run",
+            input=StepInputConfig(type="summary", source="implement"),
+        ),
+        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=WORKFLOW_POLICY,
+        workflow_state=workflow_state,
+        workflow_steps=[
+            StepDefinition(name="implement", type="run"),
+            StepDefinition(
+                name="update_docs",
+                type="run",
+                input=StepInputConfig(type="summary", source="implement"),
+            ),
+        ],
+        step_index=1,
+    )
+
+    text = agent_loop._format_prior_step_outputs(ctx)
+
+    assert "Summary: Implemented change" in text
+    assert "Structured outputs:" in text
+    assert "Claims:" not in text
+    assert "Long implementation details" not in text
+
+
+def test_format_prior_step_outputs_last_excludes_full_content() -> None:
+    agent_loop = object.__new__(AgentLoop)
+    workflow_state = WorkflowState(
+        step_outputs={
+            "plan": StepOutput(
+                summary="Plan ready",
+                claims=["Reviewed dependencies"],
+                content="Verbose plan details",
+                outputs={"files": ["a.py", "b.py"]},
+            ).model_dump(mode="json")
+        }
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(
+            name="implement",
+            type="run",
+            input=StepInputConfig(type="last", source="plan"),
+        ),
+        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=WORKFLOW_POLICY,
+        workflow_state=workflow_state,
+        workflow_steps=[
+            StepDefinition(name="plan", type="run"),
+            StepDefinition(
+                name="implement",
+                type="run",
+                input=StepInputConfig(type="last", source="plan"),
+            ),
+        ],
+        step_index=1,
+    )
+
+    text = agent_loop._format_prior_step_outputs(ctx)
+
+    assert "Summary: Plan ready" in text
+    assert "Claims:" in text
+    assert "Structured outputs:" in text
+    assert "Verbose plan details" not in text
 
 
 @pytest.mark.asyncio

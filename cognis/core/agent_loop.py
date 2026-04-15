@@ -4479,17 +4479,35 @@ class AgentLoop:
                 continue
             output = StepOutput.model_validate(raw)
             section_parts = [f'<step_output source="{source_name}">']
-            if output.summary:
-                section_parts.append(f"Summary: {output.summary}")
-            if output.claims:
-                claims_str = "\n".join(f"  - {c}" for c in output.claims)
-                section_parts.append(f"Claims:\n{claims_str}")
-            if output.content:
-                section_parts.append(f"Content:\n{output.content}")
-            if output.outputs:
-                section_parts.append(
-                    f"Structured outputs:\n{json.dumps(output.outputs, indent=2, default=str)}"
-                )
+            if effective_input.type == "full":
+                if output.summary:
+                    section_parts.append(f"Summary: {output.summary}")
+                if output.claims:
+                    claims_str = "\n".join(f"  - {c}" for c in output.claims)
+                    section_parts.append(f"Claims:\n{claims_str}")
+                if output.content:
+                    section_parts.append(f"Content:\n{output.content}")
+                if output.outputs:
+                    section_parts.append(
+                        f"Structured outputs:\n{json.dumps(output.outputs, indent=2, default=str)}"
+                    )
+            elif effective_input.type == "summary":
+                if output.summary:
+                    section_parts.append(f"Summary: {output.summary}")
+                if output.outputs:
+                    section_parts.append(
+                        f"Structured outputs:\n{json.dumps(output.outputs, indent=2, default=str)}"
+                    )
+            else:
+                if output.summary:
+                    section_parts.append(f"Summary: {output.summary}")
+                if output.claims:
+                    claims_str = "\n".join(f"  - {c}" for c in output.claims)
+                    section_parts.append(f"Claims:\n{claims_str}")
+                if output.outputs:
+                    section_parts.append(
+                        f"Structured outputs:\n{json.dumps(output.outputs, indent=2, default=str)}"
+                    )
             section_parts.append("</step_output>")
             sections.append("\n".join(section_parts))
 

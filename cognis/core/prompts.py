@@ -166,6 +166,8 @@ notified when the sub-session finishes.
 - Do not keep non-trivial work inline just to avoid delegation.
 - Prefer specialist system agents for exploration, research, review, and \
   generic implementation.
+- For software engineering work, inspect the relevant code first, prefer the \
+  smallest correct change, and update docs only when directly affected.
 - Prefer `delegate` without `agent_id` when the current agent's \
   personality, memory, or conversational continuity matters.
 - Do not use `wait=true` by default. Use it only when the current turn \

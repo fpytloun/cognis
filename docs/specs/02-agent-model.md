@@ -304,9 +304,9 @@ Return a structured summary of your findings:
 
 #### `system:research`
 
-Research agent for gathering information from web sources.
+Research agent for gathering information from web sources and local repo context.
 
-- **Tools**: read, grep, glob, web_search, web_fetch
+- **Tools**: read, grep, glob, web_search, web_fetch, web_crawl, web_map, web_research
 - **LLM config**: inherits from caller
 
 ```
@@ -333,7 +333,7 @@ Return structured research findings:
 
 #### `system:code-review`
 
-Code review agent with structured scoring.
+Findings-first code review agent for real defects and regressions.
 
 - **Tools**: read, grep, glob, bash (read-only git commands only)
 - **LLM config**: inherits from caller
@@ -414,7 +414,7 @@ The SCORE line MUST always be present.
 
 #### `system:architect`
 
-Architecture Review Board (ARB) reviewer.
+Implementation plan reviewer focused on architecture and risk.
 
 - **Tools**: read, grep, glob, bash (read-only git commands only)
 - **LLM config**: inherits from caller (recommend capable model)
@@ -792,7 +792,11 @@ Workflow(
             name="architect_review",
             type="run",
             agent_override="system:architect",
-            prompt="Review this implementation plan as an ARB reviewer.",
+            prompt=(
+                "Review this implementation plan as a proportional architecture "
+                "and risk check. Catch important omissions and overengineering, "
+                "but do not block on nitpicks."
+            ),
             input=StepInputConfig(type="full", source="plan"),
             completion=CompletionConfig(evaluate=True, max_attempts=3),
             on_reject=OnRejectConfig(
@@ -817,20 +821,22 @@ Workflow(
         StepDefinition(
             name="update_docs",
             type="run",
+            agent_override="system:implement",
             prompt=(
-                "Review and update documentation affected by the changes: "
-                "README, API docs, CHANGELOG, inline comments, architecture "
-                "documents, configuration examples. If no documentation "
-                "updates are needed, explicitly note this."
+                "Review and update only the documentation directly affected by "
+                "the changes: README, guides, specs, API docs, configuration "
+                "examples, migration notes, or inline comments. If no "
+                "documentation updates are needed, explicitly say so."
             ),
+            input=StepInputConfig(type="summary", source="implement"),
             completion=CompletionConfig(evaluate=False),
-            # Primary agent — knows what changed
+            # Implementation specialist — closes docs if needed, or reports none needed
         ),
         StepDefinition(
             name="code_review",
             type="run",
             agent_override="system:code-review",
-            prompt="Review all changes made during implementation.",
+            prompt="Review all changes made during implementation for real defects, regressions, and meaningful gaps.",
             input=StepInputConfig(
                 type="summary",
                 source=["plan", "implement", "update_docs"],

@@ -42,14 +42,25 @@ def test_general_task_workflow_has_single_step_with_evaluation() -> None:
     assert w.steps[0].reasoning_effort == "low"
     assert w.steps[0].completion is not None
     assert w.steps[0].completion.evaluate is True
+    assert "smallest correct change" in w.steps[0].prompt
 
 
 def test_software_development_workflow_uses_implement_specialist() -> None:
     implement_step = next(
         step for step in SOFTWARE_DEVELOPMENT_WORKFLOW.steps if step.name == "implement"
     )
+    update_docs_step = next(
+        step for step in SOFTWARE_DEVELOPMENT_WORKFLOW.steps if step.name == "update_docs"
+    )
+
     assert implement_step.agent_override == "system:implement"
     assert implement_step.reasoning_effort == "medium"
+    assert implement_step.input is not None
+    assert implement_step.input.type == "summary"
+    assert update_docs_step.agent_override == "system:implement"
+    assert update_docs_step.input is not None
+    assert update_docs_step.input.type == "summary"
+    assert "no documentation updates are needed" in update_docs_step.prompt
 
 
 def test_software_development_review_steps_use_outcome_routes() -> None:
@@ -71,6 +82,9 @@ def test_software_development_review_steps_use_outcome_routes() -> None:
             on_exhausted="gate",
         )
     ]
+    assert architect_step.input is not None
+    assert architect_step.input.type == "full"
+    assert "do not block on nitpicks" in architect_step.prompt
     assert code_review_step.outcome_routes == [
         OutcomeRoute(
             status="rejected",
@@ -79,6 +93,8 @@ def test_software_development_review_steps_use_outcome_routes() -> None:
             on_exhausted="gate",
         )
     ]
+    assert code_review_step.input is not None
+    assert code_review_step.input.type == "summary"
     assert commit_step.outcome_routes == [OutcomeRoute(status="failed", action="gate")]
 
 

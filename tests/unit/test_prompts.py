@@ -20,6 +20,14 @@ def test_chat_prompt_discourages_ceremonial_todos() -> None:
     assert "delegate or create a task instead of using chat todos" in instructions
 
 
+def test_chat_prompt_sets_pragmatic_coding_expectations() -> None:
+    instructions = build_system_instructions(PromptContext.CHAT)
+    assert instructions is not None
+    assert "For software engineering work" in instructions
+    assert "smallest correct change" in instructions
+    assert "update docs only when directly affected" in instructions
+
+
 def test_chat_prompt_describes_delegate_wait_behavior() -> None:
     instructions = build_system_instructions(PromptContext.CHAT)
     assert instructions is not None

@@ -22,18 +22,22 @@ Use this skill when the agent is doing software engineering work and should foll
 
 # Working Style
 
-- Inspect first. Read only the files and code paths needed to understand the change.
+- Inspect first. Read only the files, code paths, and repo guidance needed to act correctly.
 - For non-trivial edits, form a short plan before writing code.
 - Prefer the smallest correct change over broad rewrites.
+- Preserve existing patterns unless there is a concrete reason to improve them.
 - Keep new abstractions minimal unless reuse is clear.
 - Stay within scope and avoid unrelated cleanup.
+- When there is a simpler implementation that still satisfies the requirement, choose it.
 
 # Routing
 
 - Keep small, clear edits inline when you can finish them immediately.
 - When the code path is unclear, use `system:explore` first to trace the implementation before editing.
 - For larger implementation, refactor, or multi-step debugging work, prefer delegation or a task with the software-development workflow instead of forcing everything inline.
+- For focused coding work that does not need the current agent identity, prefer `system:implement`.
 - For findings-first review, prefer `system:code-review`.
+- For a second set of eyes on an implementation plan, prefer `system:architect`, but do not turn small coding tasks into architecture theater.
 - Use existing Cognis workflows for heavier engineering process instead of inventing a custom long-form process inside one chat turn.
 
 # Tool Use
@@ -48,6 +52,8 @@ Use this skill when the agent is doing software engineering work and should foll
 
 - Run the narrowest checks that prove the change works.
 - If the task affects tests, lint, typing, or build behavior, run the relevant command when feasible.
+- Update directly affected docs when behavior, usage, or contributor workflow actually changed.
+- If no documentation changes are needed, say so plainly.
 - If you delegate substantial coding work, explain that to the user and keep the main thread responsive when possible.
 - Report verification performed and any remaining risks.
 
@@ -55,6 +61,7 @@ Use this skill when the agent is doing software engineering work and should foll
 
 - Do not stop at a plan when the next concrete action is clear.
 - Do not perform large opportunistic refactors without a concrete need.
+- Do not overengineer, add speculative abstractions, or widen scope just because you see a cleaner architecture.
 - Do not claim verification you did not run.
 """,
     },
