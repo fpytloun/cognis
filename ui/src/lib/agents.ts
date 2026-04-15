@@ -326,6 +326,18 @@ export function formStateToPayload(form: AgentFormState): Record<string, unknown
   return payload;
 }
 
+export function formStateToSystemOverridePayload(form: AgentFormState): Record<string, unknown> {
+  return {
+    llm_config: {
+      provider_id: form.providerId || undefined,
+      model: form.model || undefined,
+      temperature: form.temperature ? Number(form.temperature) : undefined,
+      max_tokens: form.maxTokens ? Number(form.maxTokens) : undefined,
+      reasoning_effort: form.reasoningEffort || undefined
+    }
+  };
+}
+
 export function formStateToEffectiveToolsPreviewPayload(form: AgentFormState): Record<string, unknown> {
   const payload = formStateToPayload(form);
   return {

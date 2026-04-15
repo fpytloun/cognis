@@ -180,7 +180,9 @@ async def task_update(request: Request, task_id: str, payload: TaskUpdateRequest
     if payload.agent_id is not None:
         await _validate_agent_access(request, payload.agent_id)
     if payload.workflow_id is not None:
-        await _validate_workflow_access(request, payload.workflow_id)
+        await _validate_workflow_access(
+            request, payload.workflow_id, owner_email=existing_row.created_by
+        )
     effective_delivery_mode = payload.delivery_mode or existing_row.delivery_mode
     effective_delivery_target = payload.delivery_target or existing_row.delivery_target
     if effective_delivery_mode == "specific_conversation" and effective_delivery_target is None:
@@ -417,10 +419,15 @@ async def _validate_agent_access(request: Request, agent_id: str | None) -> None
     require_owner_or_admin(request, row.owner_email)
 
 
-async def _validate_workflow_access(request: Request, workflow_id: str | None) -> None:
+async def _validate_workflow_access(
+    request: Request, workflow_id: str | None, *, owner_email: str | None = None
+) -> None:
     if workflow_id is None:
         return
-    workflow = await request.app.state.workflow_registry.get(workflow_id)
+    user = require_current_user(request)
+    workflow = await request.app.state.workflow_registry.get(
+        workflow_id, owner_email=owner_email or user.email
+    )
     if workflow is None:
         raise api_exception(404, "not_found", "Workflow not found")
     if workflow.owner_email is not None:

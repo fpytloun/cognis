@@ -191,6 +191,10 @@ export interface Agent {
   agent_type: string;
   is_system: boolean;
   hidden: boolean;
+  editable_fields: string[];
+  has_overrides: boolean;
+  disabled: boolean;
+  disableable: boolean;
   status: string;
   created_at: string | null;
   updated_at: string | null;
@@ -738,6 +742,7 @@ export interface WorkflowStep {
   description?: string;
   prompt?: string;
   agent_override?: string | null;
+   reasoning_effort?: string | null;
   input?: {
     type: string;
     source?: string | string[] | null;
@@ -761,6 +766,11 @@ export interface Workflow {
   steps: WorkflowStep[];
   is_system: boolean;
   owner_email: string | null;
+  editable_fields: string[];
+  has_overrides: boolean;
+  disabled: boolean;
+  disableable: boolean;
+  override_warnings: string[];
 }
 
 export interface Schedule {

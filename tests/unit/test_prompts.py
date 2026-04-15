@@ -46,6 +46,13 @@ def test_chat_prompt_has_execution_bias() -> None:
     assert "Doing the work now includes the correct execution shape" in instructions
 
 
+def test_chat_prompt_prefers_dedicated_edit_tools_for_coding() -> None:
+    instructions = build_system_instructions(PromptContext.CHAT)
+    assert instructions is not None
+    assert "Prefer dedicated edit tools over shell or interpreter one-liners" in instructions
+    assert "Avoid using `bash` to run Python, Perl, Ruby" in instructions
+
+
 def test_task_step_prompt_requires_todos_for_non_trivial_work() -> None:
     instructions = build_system_instructions(PromptContext.TASK_STEP)
     assert instructions is not None

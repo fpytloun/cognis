@@ -7,6 +7,16 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+NORMALIZED_REASONING_LEVELS: tuple[str, ...] = (
+    "default",
+    "none",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "max",
+)
+
 
 class UserRole(StrEnum):
     """User roles for authorization."""

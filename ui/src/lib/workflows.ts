@@ -10,6 +10,7 @@ export interface WorkflowStepFormState {
   type: 'run' | 'gate';
   prompt: string;
   agentOverride: string;
+  reasoningEffort: string;
   inputMode: 'auto' | 'null' | 'last' | 'full' | 'summary';
   inputText: string;
   allowQuestions: boolean;
@@ -55,6 +56,7 @@ export function createEmptyStep(): WorkflowStepFormState {
     type: 'run',
     prompt: '',
     agentOverride: '',
+    reasoningEffort: '',
     inputMode: 'null',
     inputText: '',
     allowQuestions: false,
@@ -234,6 +236,7 @@ export function workflowToFormState(workflow: Workflow): WorkflowFormState {
         type: (step.type as 'run' | 'gate') ?? 'run',
         prompt: step.prompt ?? '',
         agentOverride: step.agent_override ?? '',
+        reasoningEffort: typeof step.reasoning_effort === 'string' ? step.reasoning_effort : '',
         inputMode: workflowInputMode(step.input),
         inputText: workflowInputSourceNames(step.input).join(', '),
         allowQuestions: step.allow_questions ?? false,
@@ -306,6 +309,7 @@ export function formStateToWorkflowPayload(form: WorkflowFormState): Record<stri
         type: step.type,
         prompt: step.prompt,
         agent_override: step.agentOverride || null,
+        reasoning_effort: step.reasoningEffort || undefined,
         ...(inputPayload ? { input: inputPayload } : {}),
         allow_questions: step.allowQuestions,
         completion:
@@ -333,6 +337,18 @@ export function formStateToWorkflowPayload(form: WorkflowFormState): Record<stri
         outcome_routes: outcomeRoutes.length > 0 ? outcomeRoutes : undefined
       };
     })
+  };
+}
+
+export function formStateToSystemWorkflowOverridePayload(form: WorkflowFormState): Record<string, unknown> {
+  return {
+    steps: form.steps.map((step) => ({
+      name: step.name,
+      reasoning_effort: step.reasoningEffort || undefined,
+      completion: {
+        max_attempts: Number(step.maxAttempts)
+      }
+    }))
   };
 }
 

@@ -28,7 +28,10 @@
     loading = true;
     error = '';
     try {
-      [agents, workflows] = await Promise.all([api.agents.listAll(), api.workflows.listAll()]);
+      [agents, workflows] = await Promise.all([
+        api.agents.listAll({ include_disabled: true }),
+        api.workflows.listAll({ include_disabled: true })
+      ]);
     } catch (caughtError) {
       error = asApiError(caughtError).message;
     } finally {
@@ -70,6 +73,17 @@
     } catch (caughtError) {
       error = asApiError(caughtError).message;
       addToast(error, 'error', 4_000, 'Unable to sync personality');
+    }
+  }
+
+  async function duplicateAgent(agent: Agent): Promise<void> {
+    try {
+      const duplicated = await api.agents.duplicate(agent.agent_id);
+      addToast('Agent duplicated.', 'success');
+      await goto(`/agents/${duplicated.agent_id}`);
+    } catch (caughtError) {
+      error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to duplicate agent');
     }
   }
 
@@ -177,7 +191,7 @@
         </div>
       </div>
       <span class="shrink-0 rounded-full border border-slate-700 bg-slate-800 px-3 py-1 text-xs font-medium uppercase tracking-[0.2em] text-slate-200">
-        {agent.status}
+        {agent.disabled ? 'disabled' : agent.status}
       </span>
     </div>
 
@@ -220,7 +234,8 @@
           <Button size="sm" variant="secondary" onclick={() => syncPersonality(agent)}>Sync personality</Button>
         {/if}
       {:else}
-        <Button size="sm" variant="secondary" onclick={() => goto(`/agents/${agent.agent_id}`)}>View</Button>
+        <Button size="sm" variant="secondary" onclick={() => goto(`/agents/${agent.agent_id}`)}>{agent.has_overrides || agent.disabled ? 'Configure' : 'View'}</Button>
+        <Button size="sm" variant="secondary" onclick={() => duplicateAgent(agent)}>Duplicate</Button>
       {/if}
     </div>
   </Card>

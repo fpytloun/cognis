@@ -186,6 +186,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_schedule_extended_columns)
         await conn.run_sync(_ensure_conversation_title_source_column)
         await conn.run_sync(_ensure_mcp_server_headers_column)
+        await conn.run_sync(_ensure_system_override_tables)
 
 
 def _ensure_session_lifecycle_columns(sync_conn: object) -> None:
@@ -496,6 +497,15 @@ def _ensure_mcp_server_headers_column(sync_conn: object) -> None:
         execute(text("ALTER TABLE mcp_servers ADD COLUMN headers JSON"))
 
 
+def _ensure_system_override_tables(sync_conn: object) -> None:
+    """Create per-user system override tables when missing."""
+
+    from cognis.store.models import SystemAgentOverride, SystemWorkflowOverride
+
+    SystemAgentOverride.__table__.create(sync_conn, checkfirst=True)
+    SystemWorkflowOverride.__table__.create(sync_conn, checkfirst=True)
+
+
 _SYSTEM_USER_EMAIL = "system@cognis.local"
 
 
@@ -531,22 +541,32 @@ async def seed_system_agents(session: AsyncSession) -> None:
 
     for agent_def in SYSTEM_AGENTS.values():
         existing = await session.execute(select(Agent).where(Agent.agent_id == agent_def.agent_id))
-        if existing.scalar_one_or_none() is not None:
-            continue
-        session.add(
-            Agent(
-                agent_id=agent_def.agent_id,
-                owner_email=_SYSTEM_USER_EMAIL,
-                name=agent_def.name,
-                description=agent_def.description,
-                system_prompt=agent_def.system_prompt,
-                tools=agent_def.tools if isinstance(agent_def.tools, dict) else None,
-                agent_type=agent_def.agent_type,
-                is_system=True,
-                hidden=agent_def.hidden,
-                status="active",
+        row = existing.scalar_one_or_none()
+        if row is None:
+            session.add(
+                Agent(
+                    agent_id=agent_def.agent_id,
+                    owner_email=_SYSTEM_USER_EMAIL,
+                    name=agent_def.name,
+                    description=agent_def.description,
+                    system_prompt=agent_def.system_prompt,
+                    tools=agent_def.tools if isinstance(agent_def.tools, dict) else None,
+                    agent_type=agent_def.agent_type,
+                    is_system=True,
+                    hidden=agent_def.hidden,
+                    status="active",
+                )
             )
-        )
+            continue
+        row.owner_email = _SYSTEM_USER_EMAIL
+        row.name = agent_def.name
+        row.description = agent_def.description
+        row.system_prompt = agent_def.system_prompt
+        row.tools = agent_def.tools if isinstance(agent_def.tools, dict) else None
+        row.agent_type = agent_def.agent_type
+        row.is_system = True
+        row.hidden = agent_def.hidden
+        row.status = "active"
     await session.flush()
 
 

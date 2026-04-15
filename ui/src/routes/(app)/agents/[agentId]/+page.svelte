@@ -50,6 +50,10 @@
     agent_type: 'primary',
     is_system: false,
     hidden: false,
+    editable_fields: [],
+    has_overrides: false,
+    disabled: false,
+    disableable: false,
     status: 'draft',
     created_at: null,
     updated_at: null
@@ -130,6 +134,46 @@
     }
   }
 
+  async function resetOverrides(): Promise<void> {
+    if (!agent?.is_system) return;
+    try {
+      await api.agents.resetOverrides(agentIdFromRoute());
+      await loadAgent();
+      addToast('System agent overrides reset.', 'success');
+    } catch (caughtError) {
+      error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to reset overrides');
+    }
+  }
+
+  async function toggleSystemDisabled(): Promise<void> {
+    if (!agent?.is_system) return;
+    try {
+      if (agent.disabled) {
+        await api.agents.enableSystem(agent.agent_id);
+      } else {
+        await api.agents.disableSystem(agent.agent_id);
+      }
+      await loadAgent();
+      addToast(agent.disabled ? 'System agent enabled.' : 'System agent disabled.', 'success');
+    } catch (caughtError) {
+      error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to update system agent state');
+    }
+  }
+
+  async function duplicateSystemAgent(): Promise<void> {
+    if (!agent) return;
+    try {
+      const duplicated = await api.agents.duplicate(agent.agent_id);
+      addToast('Agent duplicated.', 'success');
+      await goto(`/agents/${duplicated.agent_id}`);
+    } catch (caughtError) {
+      error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to duplicate agent');
+    }
+  }
+
   async function retrySyncPersonality(): Promise<void> {
     const confirmed = await confirmAction({
       title: 'Sync personality to Mnemory?',
@@ -201,6 +245,23 @@
         </div>
       </div>
     {/if}
+    {#if agent?.is_system}
+      <div class="rounded-2xl border border-sky-500/30 bg-sky-500/10 px-4 py-4 text-sm text-sky-100">
+        <div class="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <p class="font-medium">System agent</p>
+            <p class="mt-1 text-sky-100/80">This shipped agent stays immutable. You can only tune selected runtime fields here, or duplicate it for full customization.</p>
+          </div>
+          <div class="flex flex-wrap gap-2">
+            <Button size="sm" variant="secondary" onclick={duplicateSystemAgent}>Duplicate</Button>
+            <Button size="sm" variant="secondary" onclick={resetOverrides} disabled={!agent.has_overrides}>Reset overrides</Button>
+            {#if agent.disableable}
+              <Button size="sm" variant="secondary" onclick={toggleSystemDisabled}>{agent.disabled ? 'Enable' : 'Disable'}</Button>
+            {/if}
+          </div>
+        </div>
+      </div>
+    {/if}
     <AgentForm
       mode="edit"
       {form}
@@ -217,6 +278,8 @@
       {saving}
       {error}
       readonly={agent?.is_system ?? false}
+      isSystemAsset={agent?.is_system ?? false}
+      editableFields={agent?.editable_fields ?? []}
       onSave={saveAgent}
       onBindingsChange={async (bindings) => {
         try {

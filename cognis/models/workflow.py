@@ -141,6 +141,7 @@ class StepDefinition(BaseModel):
     description: str = ""
     prompt: str = ""
     agent_override: str | None = None  # Secondary agent ID for this step
+    reasoning_effort: str | None = None
     input: StepInputConfig | None = None
     completion: CompletionConfig | None = None
     allow_questions: bool = False
@@ -189,6 +190,12 @@ class Workflow(BaseModel):
     steps: list[StepDefinition]
     is_system: bool = False
     owner_email: str | None = None
+    allow_user_override: bool = Field(default=False, exclude=True)
+    allow_user_disable: bool = Field(default=False, exclude=True)
+    editable_fields: list[str] = Field(default_factory=list, exclude=True)
+    has_overrides: bool = Field(default=False, exclude=True)
+    disabled: bool = Field(default=False, exclude=True)
+    override_warnings: list[str] = Field(default_factory=list, exclude=True)
 
 
 class StepOutput(BaseModel):

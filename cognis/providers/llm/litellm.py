@@ -27,6 +27,7 @@ from cognis.models.config import (
     SpeechToTextResult,
     TokenUsage,
 )
+from cognis.providers.llm.reasoning import apply_reasoning_config, reasoning_efforts_for_model
 from cognis.providers.llm.responses_bridge import (
     messages_to_responses_input,
     normalize_openai_model_name,
@@ -548,6 +549,11 @@ class LiteLLMProvider:
 
         merged.update(configured)
         merged["model_id"] = model_id
+        merged["reasoning_efforts"] = reasoning_efforts_for_model(
+            model_id,
+            provider_preset=preset,
+            supports_reasoning=bool(merged.get("supports_reasoning")),
+        )
         return ModelInfo.model_validate(merged)
 
     def _infer_model_capabilities(
@@ -615,6 +621,14 @@ class LiteLLMProvider:
         model_info = await self.get_model_info(resolved_model)
         request_kwargs = _merge_request_kwargs(
             await self._resolve_provider_kwargs(provider), kwargs
+        )
+        request_kwargs = apply_reasoning_config(
+            request_kwargs,
+            model_id=resolved_model,
+            provider_preset=(
+                str(dict(provider.config).get("preset", "")).lower() if provider else ""
+            ),
+            model_info=model_info,
         )
         prepared_messages = _apply_message_cache_hints(
             messages, resolved_model, cache_breakpoint_index
@@ -704,6 +718,14 @@ class LiteLLMProvider:
         model_info = await self.get_model_info(resolved_model)
         request_kwargs = _merge_request_kwargs(
             await self._resolve_provider_kwargs(provider), kwargs
+        )
+        request_kwargs = apply_reasoning_config(
+            request_kwargs,
+            model_id=resolved_model,
+            provider_preset=(
+                str(dict(provider.config).get("preset", "")).lower() if provider else ""
+            ),
+            model_info=model_info,
         )
         prepared_messages = _apply_message_cache_hints(
             messages, resolved_model, cache_breakpoint_index

@@ -707,7 +707,9 @@ async def handle_delegate_tool_call(
         # Validate secondary agent binding if delegating to a different agent
         target_agent_id = args.get("agent_id") or getattr(agent, "agent_id", "")
         if target_agent_id and target_agent_id != getattr(agent, "agent_id", "") and agent_registry:
-            target_agent = await agent_registry.get(target_agent_id)
+            target_agent = await agent_registry.get(
+                target_agent_id, owner_email=getattr(session, "user_email", None)
+            )
             if target_agent is None:
                 return (
                     ToolResult(

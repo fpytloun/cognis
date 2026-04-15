@@ -36,7 +36,8 @@ const agent: Agent = {
   agent_id: 'agent-1', owner_email: 'user@example.com', name: 'Agent', display_name: 'Agent', description: null,
   system_prompt: null, personality: null, skills: null, tools: null, permissions: null, llm_config: null,
   execution: null, personality_synced: false, personality_sync_error: null, personality_sync_checked_at: null,
-  avatar_url: null, avatar_image_id: null, agent_type: 'primary', is_system: false, hidden: false, status: 'active',
+  avatar_url: null, avatar_image_id: null, agent_type: 'primary', is_system: false, hidden: false,
+  editable_fields: [], has_overrides: false, disabled: false, disableable: false, status: 'active',
   created_at: null, updated_at: null,
 };
 

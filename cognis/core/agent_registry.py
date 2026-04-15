@@ -12,8 +12,8 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cognis.logging import get_logger
-from cognis.models.agent import AgentDefinition
-from cognis.store.queries import get_agent, list_agents
+from cognis.models.agent import AgentDefinition, AgentLLMConfig
+from cognis.store.queries import get_agent, get_system_agent_override, list_agents
 
 logger = get_logger(__name__)
 
@@ -79,11 +79,15 @@ You are a focused implementation agent for software engineering tasks.
 - Make the smallest correct change that solves the task.
 - Prefer direct execution over extended discussion.
 - Read enough context to act correctly, but avoid unnecessary exploration.
+- For non-trivial changes, form a short plan before editing.
 - Use the most direct tool for the operation.
-- Use file and patch tools for content changes.
+- Prefer `read`, `grep`, and `glob` for inspection.
+- Prefer `edit`, `multiedit`, `patch`, and `write` for content changes.
 - Use shell commands for terminal-native operations and atomic filesystem
   operations such as `mv`, `cp`, `rm`, `mkdir`, `git`, and build/test
   commands.
+- Avoid shell or interpreter one-liners that rewrite files when dedicated
+  edit tools can make the same change directly.
 - Do not emulate filesystem moves or copies by reading and rewriting file
   contents when a direct operation exists.
 - When verification is feasible, run targeted checks relevant to the
@@ -444,6 +448,9 @@ def _system_agent(
     *,
     tools: dict[str, Any] | None = None,
     hidden: bool = False,
+    reasoning_effort: str | None = None,
+    allow_user_override: bool = False,
+    allow_user_disable: bool = False,
 ) -> AgentDefinition:
     """Create a system agent definition."""
     return AgentDefinition(
@@ -453,9 +460,23 @@ def _system_agent(
         description=description,
         system_prompt=system_prompt,
         tools=tools,
+        llm_config=AgentLLMConfig(reasoning_effort=reasoning_effort),
         agent_type="secondary",
         is_system=True,
         hidden=hidden,
+        allow_user_override=allow_user_override,
+        allow_user_disable=allow_user_disable,
+        editable_fields=(
+            [
+                "llm_config.provider_id",
+                "llm_config.model",
+                "llm_config.temperature",
+                "llm_config.max_tokens",
+                "llm_config.reasoning_effort",
+            ]
+            if allow_user_override
+            else []
+        ),
         status="active",
     )
 
@@ -470,6 +491,9 @@ SYSTEM_AGENTS: dict[str, AgentDefinition] = {
             "Fast read-only codebase exploration",
             _EXPLORE_PROMPT,
             tools={"builtin_tools": ["read", "grep", "glob", "list", "bash"]},
+            reasoning_effort="low",
+            allow_user_override=True,
+            allow_user_disable=True,
         ),
         _system_agent(
             "system:research",
@@ -477,6 +501,9 @@ SYSTEM_AGENTS: dict[str, AgentDefinition] = {
             "Web research and information gathering",
             _RESEARCH_PROMPT,
             tools={"builtin_tools": ["read", "grep", "glob", "web_search", "web_fetch"]},
+            reasoning_effort="medium",
+            allow_user_override=True,
+            allow_user_disable=True,
         ),
         _system_agent(
             "system:code-review",
@@ -484,6 +511,9 @@ SYSTEM_AGENTS: dict[str, AgentDefinition] = {
             "Code review with structured scoring",
             _CODE_REVIEW_PROMPT,
             tools={"builtin_tools": ["read", "grep", "glob", "bash"]},
+            reasoning_effort="medium",
+            allow_user_override=True,
+            allow_user_disable=True,
         ),
         _system_agent(
             "system:architect",
@@ -491,6 +521,9 @@ SYSTEM_AGENTS: dict[str, AgentDefinition] = {
             "Architecture Review Board (ARB) reviewer",
             _ARCHITECT_PROMPT,
             tools={"builtin_tools": ["read", "grep", "glob", "bash"]},
+            reasoning_effort="medium",
+            allow_user_override=True,
+            allow_user_disable=True,
         ),
         _system_agent(
             "system:implement",
@@ -510,6 +543,9 @@ SYSTEM_AGENTS: dict[str, AgentDefinition] = {
                     "bash",
                 ]
             },
+            reasoning_effort="medium",
+            allow_user_override=True,
+            allow_user_disable=True,
         ),
         _system_agent(
             "system:committer",
@@ -517,6 +553,9 @@ SYSTEM_AGENTS: dict[str, AgentDefinition] = {
             "Git commit message generation and commit creation",
             _COMMITTER_PROMPT,
             tools={"builtin_tools": ["read", "bash"]},
+            reasoning_effort="low",
+            allow_user_override=True,
+            allow_user_disable=True,
         ),
         # --- Hidden system agents (internal) ---
         _system_agent(
@@ -570,10 +609,18 @@ class AgentRegistry:
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
 
-    async def get(self, agent_id: str) -> AgentDefinition | None:
+    async def get(
+        self,
+        agent_id: str,
+        *,
+        owner_email: str | None = None,
+        include_disabled: bool = False,
+    ) -> AgentDefinition | None:
         """Resolve agent — checks system agents first, then DB."""
         if agent_id in SYSTEM_AGENTS:
-            return SYSTEM_AGENTS[agent_id]
+            return await self._resolve_system_agent(
+                SYSTEM_AGENTS[agent_id], owner_email=owner_email, include_disabled=include_disabled
+            )
 
         async with self._session_factory() as db_session:
             row = await get_agent(db_session, agent_id)
@@ -585,6 +632,13 @@ class AgentRegistry:
         """Get a system agent by ID (for internal use). No DB query."""
         return SYSTEM_AGENTS.get(agent_id)
 
+    async def get_effective(
+        self, agent_id: str, *, owner_email: str | None
+    ) -> AgentDefinition | None:
+        """Resolve an agent with user-scoped system overrides applied."""
+
+        return await self.get(agent_id, owner_email=owner_email)
+
     async def list_all(
         self,
         *,
@@ -592,17 +646,25 @@ class AgentRegistry:
         agent_type: str | None = None,
         include_hidden: bool = False,
         include_system: bool = True,
+        include_disabled: bool = False,
     ) -> list[AgentDefinition]:
         """List all available agents (system + user)."""
         result: list[AgentDefinition] = []
 
         if include_system:
             for agent in SYSTEM_AGENTS.values():
-                if not include_hidden and agent.hidden:
+                effective = await self._resolve_system_agent(
+                    agent,
+                    owner_email=owner_email,
+                    include_disabled=include_disabled,
+                )
+                if effective is None:
                     continue
-                if agent_type is not None and agent.agent_type != agent_type:
+                if not include_hidden and effective.hidden:
                     continue
-                result.append(agent)
+                if agent_type is not None and effective.agent_type != agent_type:
+                    continue
+                result.append(effective)
 
         async with self._session_factory() as db_session:
             rows = await list_agents(db_session, owner_email=owner_email)
@@ -615,6 +677,42 @@ class AgentRegistry:
             result.append(defn)
 
         return result
+
+    async def _resolve_system_agent(
+        self,
+        base: AgentDefinition,
+        *,
+        owner_email: str | None,
+        include_disabled: bool,
+    ) -> AgentDefinition | None:
+        effective = base.model_copy(deep=True)
+        if not owner_email or not base.allow_user_override:
+            return effective
+        async with self._session_factory() as db_session:
+            row = await get_system_agent_override(
+                db_session, owner_email=owner_email, agent_id=base.agent_id
+            )
+        if row is None:
+            return effective
+        effective.has_overrides = True
+        effective.disabled = bool(row.disabled)
+        if row.disabled:
+            effective.status = "disabled"
+            if not include_disabled:
+                return None
+        llm_override = row.llm_config_override if isinstance(row.llm_config_override, dict) else {}
+        if llm_override:
+            current_llm = (
+                effective.llm_config.model_dump(exclude_none=True) if effective.llm_config else {}
+            )
+            effective.llm_config = AgentLLMConfig.model_validate({**current_llm, **llm_override})
+        execution_override = (
+            row.execution_override if isinstance(row.execution_override, dict) else {}
+        )
+        if execution_override:
+            current_execution = dict(effective.execution or {})
+            effective.execution = {**current_execution, **execution_override}
+        return effective
 
     async def list_secondary_bindings(self, primary_agent_id: str) -> list[str]:
         """List secondary agent IDs bound to a primary agent."""

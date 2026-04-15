@@ -39,6 +39,7 @@ def test_general_task_workflow_has_single_step_with_evaluation() -> None:
     w = GENERAL_TASK_WORKFLOW
     assert len(w.steps) == 1
     assert w.steps[0].name == "execute"
+    assert w.steps[0].reasoning_effort == "low"
     assert w.steps[0].completion is not None
     assert w.steps[0].completion.evaluate is True
 
@@ -48,6 +49,7 @@ def test_software_development_workflow_uses_implement_specialist() -> None:
         step for step in SOFTWARE_DEVELOPMENT_WORKFLOW.steps if step.name == "implement"
     )
     assert implement_step.agent_override == "system:implement"
+    assert implement_step.reasoning_effort == "medium"
 
 
 def test_software_development_review_steps_use_outcome_routes() -> None:

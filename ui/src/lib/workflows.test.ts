@@ -70,7 +70,12 @@ describe('workflowToFormState', () => {
         }
       ],
       is_system: false,
-      owner_email: null
+      owner_email: null,
+      editable_fields: [],
+      has_overrides: false,
+      disabled: false,
+      disableable: false,
+      override_warnings: []
     });
 
     expect(form.steps[1].evaluatorRejectTarget).toBe('plan');
@@ -103,7 +108,12 @@ describe('workflowToFormState', () => {
         }
       ],
       is_system: false,
-      owner_email: null
+      owner_email: null,
+      editable_fields: [],
+      has_overrides: false,
+      disabled: false,
+      disableable: false,
+      override_warnings: []
     });
 
     expect(form.steps[1].outcomeRejectedAction).toBe('gate');
@@ -135,7 +145,12 @@ describe('workflowToFormState', () => {
         }
       ],
       is_system: false,
-      owner_email: null
+      owner_email: null,
+      editable_fields: [],
+      has_overrides: false,
+      disabled: false,
+      disableable: false,
+      override_warnings: []
     });
 
     expect(form.steps[1].outcomeSuccessAction).toBe('revise');

@@ -15,7 +15,7 @@ from cognis.store.queries import create_workflow, delete_workflow, get_workflow,
 async def list_workflows_for_user(*, workflow_registry: Any, owner_email: str) -> list[Any]:
     """List workflows visible to the user."""
 
-    return await workflow_registry.list_all(owner_email=owner_email)
+    return await workflow_registry.list_all(owner_email=owner_email, include_disabled=True)
 
 
 async def get_workflow_for_user(
@@ -23,7 +23,9 @@ async def get_workflow_for_user(
 ) -> Any | None:
     """Return a visible workflow for the user."""
 
-    workflow = await workflow_registry.get(workflow_id)
+    workflow = await workflow_registry.get(
+        workflow_id, owner_email=owner_email, include_disabled=True
+    )
     if workflow is None:
         return None
     if workflow.is_system or workflow.owner_email in {owner_email, None}:
@@ -164,7 +166,9 @@ async def duplicate_visible_workflow(
         owner_email=owner_email,
     )
     if workflow is None and allow_admin:
-        workflow = await workflow_registry.get(workflow_id)
+        workflow = await workflow_registry.get(
+            workflow_id, owner_email=owner_email, include_disabled=True
+        )
     if workflow is None:
         raise ValueError("Workflow not found")
 

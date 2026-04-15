@@ -21,6 +21,7 @@ from cognis.core.notifications import NotificationType
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.session import ConversationModel, SessionModel
+from cognis.providers.llm.reasoning import normalize_reasoning_effort
 
 logger = get_logger(__name__)
 
@@ -529,8 +530,19 @@ class CommandDispatcher:
             lines.append("Usage: /thinking <level>  (use 'off' to reset to default)")
             return CommandResult(type="system_message", text="\n".join(lines))
 
+        normalized_arg = normalize_reasoning_effort(arg)
+        if normalized_arg is None:
+            return CommandResult(
+                type="system_message",
+                text=(
+                    f"Unsupported level: {arg}\nAvailable: {', '.join(available)}"
+                    if available
+                    else "Unsupported reasoning level."
+                ),
+            )
+
         # Reset
-        if arg in ("off", "default", "reset", "none"):
+        if normalized_arg == "default":
             self._session_cache.set_reasoning_effort_override(session_id, None)
             return CommandResult(
                 type="system_message",
@@ -538,16 +550,16 @@ class CommandDispatcher:
             )
 
         # Validate
-        if available and arg not in available:
+        if available and normalized_arg not in available:
             return CommandResult(
                 type="system_message",
-                text=f"Unsupported level: {arg}\nAvailable: {', '.join(available)}",
+                text=f"Unsupported level: {normalized_arg}\nAvailable: {', '.join(available)}",
             )
 
-        self._session_cache.set_reasoning_effort_override(session_id, arg)
+        self._session_cache.set_reasoning_effort_override(session_id, normalized_arg)
         return CommandResult(
             type="system_message",
-            text=f"Reasoning effort set to: {arg}\nTakes effect on next message.",
+            text=f"Reasoning effort set to: {normalized_arg}\nTakes effect on next message.",
         )
 
     async def _handle_lsp(self, *, user_email: str | None = None) -> CommandResult:
@@ -879,7 +891,7 @@ Available commands:
   /help              Show this help message
   /lsp               Show LSP diagnostics status
   /model [name]      List available models or switch model
-  /thinking [level]  Show or set reasoning effort (low/medium/high)
+  /thinking [level]  Show or set reasoning effort
   /context           Show context window usage
   /info              Show session details and statistics
   /compact           Compact conversation history
@@ -905,12 +917,6 @@ _DEFAULT_REASONING_EFFORTS: dict[str, list[str]] = {
 def _infer_reasoning_efforts(model: str) -> list[str]:
     """Best-effort reasoning effort levels for a model."""
     m = model.lower()
-    if "opus" in m:
-        return ["low", "medium", "high", "max"]
-    if any(p in m for p in ("claude", "anthropic")):
-        return ["low", "medium", "high"]
-    if any(p in m for p in ("o1", "o3", "o4")):
-        return ["low", "medium", "high"]
-    if "gpt-5" in m:
-        return ["none", "low", "medium", "high"]
-    return ["low", "medium", "high"]
+    if any(p in m for p in ("claude", "anthropic", "opus", "gpt-5", "o1", "o3", "o4", "gemini")):
+        return ["default", "none", "minimal", "low", "medium", "high", "max"]
+    return []

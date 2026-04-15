@@ -317,6 +317,10 @@ class AgentResponse(BaseModel):
     agent_type: str = "primary"
     is_system: bool = False
     hidden: bool = False
+    editable_fields: list[str] = Field(default_factory=list)
+    has_overrides: bool = False
+    disabled: bool = False
+    disableable: bool = False
     sync_metadata: dict[str, Any] | None = None
     status: str
     created_at: datetime | None = None
@@ -695,6 +699,11 @@ class WorkflowResponse(BaseModel):
     steps: list[dict[str, Any]] = Field(default_factory=list)
     is_system: bool = False
     owner_email: str | None = None
+    editable_fields: list[str] = Field(default_factory=list)
+    has_overrides: bool = False
+    disabled: bool = False
+    disableable: bool = False
+    override_warnings: list[str] = Field(default_factory=list)
 
 
 class SecretUpsertRequest(BaseModel):

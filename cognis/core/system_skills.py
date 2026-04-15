@@ -5,6 +5,49 @@ from __future__ import annotations
 from typing import Final
 
 SYSTEM_SKILL_DEFAULTS: Final[dict[str, dict[str, object]]] = {
+    "cognis-coding": {
+        "skill_id": "cognis-coding",
+        "content": """---
+name: Cognis Coding
+description: Coding discipline for careful implementation work inside Cognis conversations and tasks.
+tags:
+  - cognis
+  - coding
+  - implementation
+---
+
+# Purpose
+
+Use this skill when the agent is doing software engineering work and should follow a careful, execution-first coding workflow.
+
+# Working Style
+
+- Inspect first. Read only the files and code paths needed to understand the change.
+- For non-trivial edits, form a short plan before writing code.
+- Prefer the smallest correct change over broad rewrites.
+- Keep new abstractions minimal unless reuse is clear.
+- Stay within scope and avoid unrelated cleanup.
+
+# Tool Use
+
+- Prefer `read`, `grep`, and `glob` for code inspection.
+- Prefer `edit`, `multiedit`, `patch`, and `write` for file-content changes.
+- Use `bash` for git, tests, builds, package managers, and atomic filesystem operations.
+- Avoid shell or interpreter one-liners that rewrite files when dedicated edit tools fit the task.
+
+# Verification
+
+- Run the narrowest checks that prove the change works.
+- If the task affects tests, lint, typing, or build behavior, run the relevant command when feasible.
+- Report verification performed and any remaining risks.
+
+# Do Not Do
+
+- Do not stop at a plan when the next concrete action is clear.
+- Do not perform large opportunistic refactors without a concrete need.
+- Do not claim verification you did not run.
+""",
+    },
     "cognis-task-manager": {
         "skill_id": "cognis-task-manager",
         "content": """---

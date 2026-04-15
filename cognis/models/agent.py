@@ -35,6 +35,11 @@ class AgentDefinition(BaseModel):
     agent_type: str = "primary"  # "primary" | "secondary"
     is_system: bool = False
     hidden: bool = False
+    allow_user_override: bool = Field(default=False, exclude=True)
+    allow_user_disable: bool = Field(default=False, exclude=True)
+    editable_fields: list[str] = Field(default_factory=list, exclude=True)
+    has_overrides: bool = Field(default=False, exclude=True)
+    disabled: bool = Field(default=False, exclude=True)
     # Metadata
     status: str = "active"
     created_at: datetime | None = None

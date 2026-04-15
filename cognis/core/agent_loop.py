@@ -1565,14 +1565,16 @@ class AgentLoop:
             )
 
             # Resolve model and reasoning effort for this turn.
-            # Chain: session override → agent config → system default.
+            # Chain: session override → workflow step default → agent config → provider default.
             model_for_llm = self.session_cache.get_model_override(ctx.session.session_id) or (
                 ctx.agent.llm_config.model if ctx.agent.llm_config else None
             )
 
-            reasoning_effort = self.session_cache.get_reasoning_effort_override(
-                ctx.session.session_id
-            ) or (ctx.agent.llm_config.reasoning_effort if ctx.agent.llm_config else None)
+            reasoning_effort = (
+                self.session_cache.get_reasoning_effort_override(ctx.session.session_id)
+                or getattr(ctx.step_definition, "reasoning_effort", None)
+                or (ctx.agent.llm_config.reasoning_effort if ctx.agent.llm_config else None)
+            )
 
             llm_kwargs: dict[str, Any] = {}
             if reasoning_effort:

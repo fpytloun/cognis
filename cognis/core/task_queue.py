@@ -641,7 +641,7 @@ class TaskQueue:
         from cognis.core.decision import select_workflow
 
         try:
-            available = await self._workflow_registry.list_all()
+            available = await self._workflow_registry.list_all(owner_email=task.created_by)
             if not available:
                 return "system:general-task"
 
@@ -706,7 +706,9 @@ class TaskQueue:
                     workflow_id = task.workflow_id
                 else:
                     workflow_id = await self._select_workflow_for_task(task)
-                workflow = await self._workflow_registry.get(workflow_id)
+                workflow = await self._workflow_registry.get(
+                    workflow_id, owner_email=task.created_by
+                )
                 if workflow is None:
                     logger.warning(
                         "Unknown workflow for task",

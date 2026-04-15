@@ -1311,11 +1311,13 @@ class TurnScheduler:
             ]
         if not available_workflows:
             default_workflow_id = execution.get("default_workflow_id")
-            return (
-                default_workflow_id
-                if isinstance(default_workflow_id, str)
-                else "system:general-task"
-            )
+            if isinstance(default_workflow_id, str):
+                resolved_default = await self._workflow_registry.get(
+                    default_workflow_id, owner_email=agent.owner_email
+                )
+                if resolved_default is not None:
+                    return default_workflow_id
+            return "system:general-task"
         from cognis.core.decision import select_workflow
 
         selection = await select_workflow(

@@ -1976,7 +1976,9 @@ class WorkflowEngine:
         registry = AgentRegistry(self._session_factory)
 
         if step_def.agent_override:
-            override_agent = await registry.get(step_def.agent_override)
+            override_agent = await registry.get(
+                step_def.agent_override, owner_email=task.created_by
+            )
             if override_agent is None:
                 logger.warning(
                     "agent_override agent not found, falling back to task agent",
@@ -1992,7 +1994,7 @@ class WorkflowEngine:
                 return override_agent
 
         # Default: use the task's primary agent
-        return await registry.get(task.agent_id)
+        return await registry.get(task.agent_id, owner_email=task.created_by)
 
     async def _create_step_session(
         self,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Query, Request
@@ -14,6 +15,7 @@ from cognis.api.common import (
     paginate_items,
     require_current_user,
     require_owner_or_admin,
+    slugify,
 )
 from cognis.api.error_sanitizer import sanitize_client_error_detail
 from cognis.api.models import (
@@ -30,18 +32,28 @@ from cognis.models.agent import AgentDefinition
 from cognis.store.queries import (
     add_secondary_binding,
     create_agent,
+    delete_system_agent_override,
     get_agent,
-    list_agents,
+    get_system_agent_override,
     list_secondary_bindings,
     remove_secondary_binding,
     set_agent_status,
     set_secondary_bindings,
     update_agent,
+    upsert_system_agent_override,
 )
 
 logger = get_logger(__name__)
 
 router = APIRouter(prefix="/api/v1/agents", tags=["agents"])
+
+_SYSTEM_AGENT_LLM_FIELDS = {
+    "provider_id",
+    "model",
+    "temperature",
+    "max_tokens",
+    "reasoning_effort",
+}
 
 
 def _sync_metadata(synced: bool, error_detail: str | None = None) -> dict[str, object]:
@@ -71,29 +83,17 @@ async def agent_list(
     agent_type: str | None = Query(default=None),
     include_hidden: bool = Query(default=False),
     include_system: bool = Query(default=True),
+    include_disabled: bool = Query(default=False),
 ) -> CursorPage[AgentResponse]:
     user = require_current_user(request)
-
-    # Start with system agents (if requested)
-    items: list[AgentResponse] = []
-    if include_system:
-        for agent in SYSTEM_AGENTS.values():
-            if not include_hidden and agent.hidden:
-                continue
-            if agent_type is not None and agent.agent_type != agent_type:
-                continue
-            items.append(_system_agent_to_response(agent))
-
-    # Add DB agents
-    async with request.app.state.session_factory() as session:
-        rows = await list_agents(session, owner_email=user.email)
-    for row in rows:
-        resp = agent_to_response(row)
-        if not include_hidden and getattr(row, "hidden", False):
-            continue
-        if agent_type is not None and getattr(row, "agent_type", "primary") != agent_type:
-            continue
-        items.append(resp)
+    agents = await request.app.state.agent_registry.list_all(
+        owner_email=user.email,
+        agent_type=agent_type,
+        include_hidden=include_hidden,
+        include_system=include_system,
+        include_disabled=include_disabled,
+    )
+    items = [agent_to_response(agent) for agent in agents]
 
     page_items, next_cursor, has_more = paginate_items(
         items,
@@ -104,33 +104,6 @@ async def agent_list(
     return CursorPage(items=page_items, cursor=next_cursor, has_more=has_more)
 
 
-def _system_agent_to_response(agent: AgentDefinition) -> AgentResponse:
-    """Convert a system agent definition to an API response."""
-    return AgentResponse(
-        agent_id=agent.agent_id,
-        owner_email=agent.owner_email,
-        name=agent.name,
-        display_name=agent.name,
-        description=agent.description,
-        system_prompt=agent.system_prompt,
-        personality=agent.personality,
-        skills=agent.skills,
-        tools=agent.tools,
-        permissions=None,
-        llm_config=None,
-        execution=agent.execution,
-        avatar_url=agent.avatar_url,
-        avatar_image_id=getattr(agent, "avatar_image_id", None),
-        agent_type=agent.agent_type,
-        is_system=agent.is_system,
-        hidden=agent.hidden,
-        status=agent.status,
-        sync_metadata=None,
-        created_at=None,
-        updated_at=None,
-    )
-
-
 @router.post("", response_model=AgentResponse)
 async def create_agent_route(request: Request, payload: AgentCreateRequest) -> AgentResponse:
     forbid_mutation_for_viewer(request)
@@ -139,8 +112,6 @@ async def create_agent_route(request: Request, payload: AgentCreateRequest) -> A
     # Auto-generate agent_id from name if not provided
     agent_id = payload.agent_id
     if not agent_id:
-        from cognis.api.common import slugify
-
         agent_id = slugify(payload.name)
 
     # Validate agent_id — system: prefix is reserved
@@ -199,9 +170,14 @@ async def create_agent_route(request: Request, payload: AgentCreateRequest) -> A
 
 @router.get("/{agent_id}", response_model=AgentResponse)
 async def agent_detail(request: Request, agent_id: str) -> AgentResponse:
-    # Check system agents first
+    user = require_current_user(request)
     if agent_id in SYSTEM_AGENTS:
-        return _system_agent_to_response(SYSTEM_AGENTS[agent_id])
+        agent = await request.app.state.agent_registry.get(
+            agent_id, owner_email=user.email, include_disabled=True
+        )
+        if agent is None:
+            raise api_exception(404, "not_found", "Agent not found")
+        return agent_to_response(agent)
 
     async with request.app.state.session_factory() as session:
         row = await get_agent(session, agent_id)
@@ -219,7 +195,7 @@ async def update_agent_route(
 ) -> AgentResponse:
     forbid_mutation_for_viewer(request)
     if agent_id in SYSTEM_AGENTS:
-        raise api_exception(403, "forbidden", "System agents are read-only")
+        return await _update_system_agent_route(request, agent_id, payload)
     async with request.app.state.session_factory() as session:
         row = await get_agent(session, agent_id)
         if row is None:
@@ -292,6 +268,55 @@ async def update_agent_route(
     return agent_to_response(row)
 
 
+async def _update_system_agent_route(
+    request: Request,
+    agent_id: str,
+    payload: AgentUpdateRequest,
+) -> AgentResponse:
+    user = require_current_user(request)
+    base = request.app.state.agent_registry.get_system_agent(agent_id)
+    if base is None:
+        raise api_exception(404, "not_found", "Agent not found")
+    if not base.allow_user_override:
+        raise api_exception(403, "forbidden", "This system agent cannot be overridden")
+
+    updates = payload.model_dump(exclude_unset=True)
+    allowed_top_level = {"llm_config"}
+    forbidden = sorted(key for key in updates if key not in allowed_top_level)
+    if forbidden:
+        raise api_exception(
+            403,
+            "forbidden",
+            f"System agent overrides only allow runtime tuning fields: {', '.join(forbidden)}",
+        )
+
+    raw_llm = updates.get("llm_config")
+    llm_override = raw_llm if isinstance(raw_llm, dict) else {}
+    invalid_llm = sorted(key for key in llm_override if key not in _SYSTEM_AGENT_LLM_FIELDS)
+    if invalid_llm:
+        raise api_exception(
+            403,
+            "forbidden",
+            f"Unsupported system agent override fields: {', '.join(invalid_llm)}",
+        )
+
+    async with request.app.state.session_factory() as session:
+        await upsert_system_agent_override(
+            session,
+            owner_email=user.email,
+            agent_id=agent_id,
+            llm_config_override=llm_override or None,
+            execution_override=None,
+        )
+        await session.commit()
+
+    agent = await request.app.state.agent_registry.get(
+        agent_id, owner_email=user.email, include_disabled=True
+    )
+    assert agent is not None
+    return agent_to_response(agent)
+
+
 @router.delete("/{agent_id}", response_model=dict)
 async def archive_agent(request: Request, agent_id: str) -> dict[str, bool]:
     forbid_mutation_for_viewer(request)
@@ -305,6 +330,145 @@ async def archive_agent(request: Request, agent_id: str) -> dict[str, bool]:
         ok = await set_agent_status(session, agent_id, "archived")
         await session.commit()
     return {"ok": ok}
+
+
+@router.post("/{agent_id}/duplicate", response_model=AgentResponse)
+async def duplicate_agent_route(request: Request, agent_id: str) -> AgentResponse:
+    forbid_mutation_for_viewer(request)
+    user = require_current_user(request)
+
+    if agent_id in SYSTEM_AGENTS:
+        base = request.app.state.agent_registry.get_system_agent(agent_id)
+        if base is None or base.hidden:
+            raise api_exception(403, "forbidden", "This system agent cannot be duplicated")
+        definition = await request.app.state.agent_registry.get(
+            agent_id, owner_email=user.email, include_disabled=True
+        )
+        assert definition is not None
+        new_agent_id = f"{slugify(definition.name)}-{uuid.uuid4().hex[:6]}"
+        async with request.app.state.session_factory() as session:
+            row = await create_agent(
+                session,
+                agent_id=new_agent_id,
+                owner_email=user.email,
+                name=f"{definition.name} Copy",
+                display_name=f"{definition.name} Copy",
+                description=definition.description,
+                system_prompt=definition.system_prompt,
+                personality=definition.personality,
+                skills=definition.skills,
+                tools=definition.tools,
+                permissions=definition.permissions.model_dump(mode="json")
+                if definition.permissions
+                else None,
+                llm_config=definition.llm_config.model_dump(mode="json", exclude_none=True)
+                if definition.llm_config
+                else None,
+                execution=definition.execution,
+                avatar_image_id=definition.avatar_image_id,
+                agent_type=definition.agent_type,
+                status="draft",
+            )
+            await session.commit()
+            await session.refresh(row)
+        return agent_to_response(row)
+
+    async with request.app.state.session_factory() as session:
+        row = await get_agent(session, agent_id)
+        if row is None:
+            raise api_exception(404, "not_found", "Agent not found")
+        require_owner_or_admin(request, row.owner_email)
+        new_agent_id = f"{slugify(row.display_name or row.name)}-{uuid.uuid4().hex[:6]}"
+        new_row = await create_agent(
+            session,
+            agent_id=new_agent_id,
+            owner_email=user.email,
+            name=f"{row.display_name or row.name} Copy",
+            display_name=f"{row.display_name or row.name} Copy",
+            description=row.description,
+            system_prompt=row.system_prompt,
+            personality=row.personality,
+            skills=row.skills,
+            tools=row.tools,
+            permissions=row.permissions,
+            llm_config=row.llm_config,
+            execution=row.execution,
+            avatar_image_id=row.avatar_image_id,
+            agent_type=row.agent_type,
+            status="draft",
+        )
+        await session.commit()
+        await session.refresh(new_row)
+    return agent_to_response(new_row)
+
+
+@router.post("/{agent_id}/reset-overrides", response_model=dict)
+async def reset_system_agent_overrides(request: Request, agent_id: str) -> dict[str, bool]:
+    forbid_mutation_for_viewer(request)
+    user = require_current_user(request)
+    base = request.app.state.agent_registry.get_system_agent(agent_id)
+    if base is None:
+        raise api_exception(404, "not_found", "Agent not found")
+    async with request.app.state.session_factory() as session:
+        ok = await delete_system_agent_override(session, owner_email=user.email, agent_id=agent_id)
+        await session.commit()
+    return {"ok": ok}
+
+
+@router.post("/{agent_id}/disable", response_model=AgentResponse)
+async def disable_system_agent(request: Request, agent_id: str) -> AgentResponse:
+    forbid_mutation_for_viewer(request)
+    user = require_current_user(request)
+    base = request.app.state.agent_registry.get_system_agent(agent_id)
+    if base is None:
+        raise api_exception(404, "not_found", "Agent not found")
+    if not base.allow_user_disable:
+        raise api_exception(403, "forbidden", "This system agent cannot be disabled")
+    async with request.app.state.session_factory() as session:
+        existing = await get_system_agent_override(
+            session, owner_email=user.email, agent_id=agent_id
+        )
+        await upsert_system_agent_override(
+            session,
+            owner_email=user.email,
+            agent_id=agent_id,
+            disabled=True,
+            llm_config_override=(existing.llm_config_override if existing else None),
+            execution_override=(existing.execution_override if existing else None),
+        )
+        await session.commit()
+    agent = await request.app.state.agent_registry.get(
+        agent_id, owner_email=user.email, include_disabled=True
+    )
+    assert agent is not None
+    return agent_to_response(agent)
+
+
+@router.post("/{agent_id}/enable", response_model=AgentResponse)
+async def enable_system_agent(request: Request, agent_id: str) -> AgentResponse:
+    forbid_mutation_for_viewer(request)
+    user = require_current_user(request)
+    base = request.app.state.agent_registry.get_system_agent(agent_id)
+    if base is None:
+        raise api_exception(404, "not_found", "Agent not found")
+    async with request.app.state.session_factory() as session:
+        existing = await get_system_agent_override(
+            session, owner_email=user.email, agent_id=agent_id
+        )
+        await upsert_system_agent_override(
+            session,
+            owner_email=user.email,
+            agent_id=agent_id,
+            disabled=False,
+            llm_config_override=(existing.llm_config_override if existing else None),
+            execution_override=(existing.execution_override if existing else None),
+        )
+        await session.commit()
+    agent = await request.app.state.agent_registry.get(
+        agent_id, owner_email=user.email, include_disabled=True
+    )
+    assert agent is not None
+    return agent_to_response(agent)
 
 
 @router.post("/{agent_id}/activate", response_model=AgentResponse)

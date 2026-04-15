@@ -16,6 +16,7 @@
     createEmptyStep,
     createEmptyWorkflowForm,
     exportWorkflowYaml,
+    formStateToSystemWorkflowOverridePayload,
     formStateToWorkflowPayload,
     importWorkflowYaml,
     validateWorkflowForm,
@@ -34,6 +35,14 @@
   let form: WorkflowFormState = createEmptyWorkflowForm();
   let dragIndex = -1;
   let initialSnapshot = JSON.stringify(form);
+
+  function canEditSystemWorkflowField(field: 'stepReasoning' | 'stepMaxAttempts'): boolean {
+    if (!selectedWorkflow?.is_system) return true;
+    const editable = new Set(selectedWorkflow.editable_fields ?? []);
+    if (field === 'stepReasoning') return editable.has('steps.*.reasoning_effort');
+    if (field === 'stepMaxAttempts') return editable.has('steps.*.completion.max_attempts');
+    return false;
+  }
 
   function isDirty(): boolean {
     return JSON.stringify(form) !== initialSnapshot;
@@ -62,7 +71,7 @@
     error = '';
     try {
       [workflows, secondaryAgents] = await Promise.all([
-        api.workflows.listAll(),
+        api.workflows.listAll({ include_disabled: true }),
         api.agents.listAll({ agent_type: 'secondary' }),
       ]);
       const nextSelected = selectedId ? workflows.find((workflow) => workflow.workflow_id === selectedId) : selectedWorkflow ? workflows.find((workflow) => workflow.workflow_id === selectedWorkflow?.workflow_id) : workflows[0];
@@ -122,6 +131,34 @@
     }
   }
 
+  async function resetWorkflowOverrides(): Promise<void> {
+    if (!selectedWorkflow?.is_system) return;
+    try {
+      await api.workflows.resetOverrides(selectedWorkflow.workflow_id);
+      await loadWorkflows(selectedWorkflow.workflow_id);
+      addToast('Workflow overrides reset.', 'success');
+    } catch (caughtError) {
+      error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to reset workflow overrides');
+    }
+  }
+
+  async function toggleWorkflowDisabled(): Promise<void> {
+    if (!selectedWorkflow?.is_system) return;
+    try {
+      if (selectedWorkflow.disabled) {
+        await api.workflows.enable(selectedWorkflow.workflow_id);
+      } else {
+        await api.workflows.disable(selectedWorkflow.workflow_id);
+      }
+      await loadWorkflows(selectedWorkflow.workflow_id);
+      addToast(selectedWorkflow.disabled ? 'Workflow enabled.' : 'Workflow disabled.', 'success');
+    } catch (caughtError) {
+      error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to update workflow state');
+    }
+  }
+
   async function saveWorkflow(): Promise<void> {
     const issues = validateWorkflowForm(form);
     if (issues.length > 0) {
@@ -131,7 +168,13 @@
     saving = true;
     try {
       const payload = formStateToWorkflowPayload(form);
-      if (selectedWorkflow && !selectedWorkflow.is_system) {
+      if (selectedWorkflow?.is_system) {
+        const updated = await api.workflows.update(
+          selectedWorkflow.workflow_id,
+          formStateToSystemWorkflowOverridePayload(form)
+        );
+        await loadWorkflows(updated.workflow_id);
+      } else if (selectedWorkflow) {
         const updated = await api.workflows.update(selectedWorkflow.workflow_id, payload);
         await loadWorkflows(updated.workflow_id);
       } else {
@@ -245,7 +288,7 @@
         <Button variant="secondary" onclick={duplicateSelectedWorkflow} disabled={!selectedWorkflow}>Duplicate</Button>
         <Button variant="secondary" onclick={downloadCurrentWorkflow}>Export YAML</Button>
         <Button variant="danger" onclick={deleteSelectedWorkflow} disabled={!selectedWorkflow || selectedWorkflow.is_system}>Delete</Button>
-        <Button onclick={saveWorkflow} disabled={saving || !!selectedWorkflow?.is_system}>{saving ? 'Saving…' : selectedWorkflow?.is_system ? 'Duplicate to edit' : 'Save workflow'}</Button>
+        <Button onclick={saveWorkflow} disabled={saving || (!!selectedWorkflow?.is_system && (selectedWorkflow.editable_fields?.length ?? 0) === 0)}>{saving ? 'Saving…' : selectedWorkflow?.is_system ? 'Save overrides' : 'Save workflow'}</Button>
       </div>
     </div>
 
@@ -261,7 +304,7 @@
               <button class={`w-full rounded-2xl border px-4 py-3 text-left transition ${workflow.workflow_id === selectedWorkflow?.workflow_id ? 'border-sky-400/40 bg-sky-500/10 text-white' : 'border-slate-800 bg-slate-950/70 text-slate-200 hover:border-slate-700'}`} onclick={() => selectWorkflow(workflow)}>
                 <div class="flex flex-wrap items-center justify-between gap-3">
                   <span class="min-w-0 flex-1 truncate font-medium">{workflow.name}</span>
-                  <span class="shrink-0 rounded-full border border-slate-700 px-2.5 py-1 text-[11px] uppercase tracking-[0.2em] text-slate-400">{workflow.is_system ? 'system' : 'user'}</span>
+                  <span class="shrink-0 rounded-full border border-slate-700 px-2.5 py-1 text-[11px] uppercase tracking-[0.2em] text-slate-400">{workflow.disabled ? 'disabled' : workflow.is_system ? 'system' : 'user'}</span>
                 </div>
                 <p class="mt-2 break-all text-xs leading-5 text-slate-400">{workflow.workflow_id}</p>
               </button>
@@ -282,10 +325,19 @@
             <div class="flex flex-wrap items-center justify-between gap-3">
               <div>
                 <p class="font-medium">System workflow</p>
-                <p class="mt-1 text-sky-100/80">This bundled workflow is read-only. Duplicate it to create an editable copy.</p>
+                <p class="mt-1 text-sky-100/80">This bundled workflow is immutable. You can tune selected step runtime fields here or duplicate it for full customization.</p>
               </div>
-              <Button variant="secondary" onclick={duplicateSelectedWorkflow}>Duplicate to edit</Button>
+              <div class="flex flex-wrap gap-2">
+                <Button variant="secondary" onclick={duplicateSelectedWorkflow}>Duplicate to edit</Button>
+                <Button variant="secondary" onclick={resetWorkflowOverrides} disabled={!selectedWorkflow.has_overrides}>Reset overrides</Button>
+                {#if selectedWorkflow.disableable}
+                  <Button variant="secondary" onclick={toggleWorkflowDisabled}>{selectedWorkflow.disabled ? 'Enable' : 'Disable'}</Button>
+                {/if}
+              </div>
             </div>
+            {#if selectedWorkflow.override_warnings.length > 0}
+              <p class="mt-3 text-xs text-sky-50/90">{selectedWorkflow.override_warnings.join(' ')}</p>
+            {/if}
           </Card>
         {/if}
 
@@ -440,6 +492,18 @@
                       {/each}
                     </select>
                   </label>
+                  <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
+                    <span>Reasoning effort</span>
+                    <select bind:value={step.reasoningEffort} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!canEditSystemWorkflowField('stepReasoning')}>
+                      <option value="">Default</option>
+                      <option value="none">None</option>
+                      <option value="minimal">Minimal</option>
+                      <option value="low">Low</option>
+                      <option value="medium">Medium</option>
+                      <option value="high">High</option>
+                      <option value="max">Max</option>
+                    </select>
+                  </label>
                 {/if}
 
                 <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
@@ -485,7 +549,7 @@
                           <span class="cursor-help text-slate-500">(?)</span>
                         </Tooltip>
                       </span>
-                      <Input bind:value={step.maxAttempts} disabled={!!selectedWorkflow?.is_system} type="number" />
+                      <Input bind:value={step.maxAttempts} disabled={!canEditSystemWorkflowField('stepMaxAttempts')} type="number" />
                     </label>
                     <label class="space-y-2 text-sm font-medium text-slate-200">
                       <span class="inline-flex items-center gap-2">

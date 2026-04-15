@@ -17,7 +17,12 @@ from cognis.models.workflow import (
     WorkflowDefaults,
     resolve_effective_input,
 )
-from cognis.store.queries import create_workflow, get_workflow, list_workflows
+from cognis.store.queries import (
+    create_workflow,
+    get_system_workflow_override,
+    get_workflow,
+    list_workflows,
+)
 
 logger = get_logger(__name__)
 
@@ -34,11 +39,13 @@ DIRECT_WORKFLOW = Workflow(
     tags=["chat", "inline"],
     interaction=InteractionMode(mode="step_requests"),
     defaults=WorkflowDefaults(evaluate=False),
+    allow_user_disable=False,
     steps=[
         StepDefinition(
             name="execute",
             type="run",
             prompt="{user_message}",
+            reasoning_effort="default",
             input=StepInputConfig(type="null"),
             completion=CompletionConfig(evaluate=False),
         ),
@@ -54,6 +61,9 @@ GENERAL_TASK_WORKFLOW = Workflow(
     tags=["task", "general", "evaluated"],
     interaction=InteractionMode(mode="step_requests"),
     defaults=WorkflowDefaults(evaluate=True),
+    allow_user_override=True,
+    allow_user_disable=True,
+    editable_fields=["steps.*.reasoning_effort", "steps.*.completion.max_attempts"],
     steps=[
         StepDefinition(
             name="execute",
@@ -62,6 +72,7 @@ GENERAL_TASK_WORKFLOW = Workflow(
                 "Execute the requested task directly. Use tools as needed, keep "
                 "the work focused, and verify the result before completing the step."
             ),
+            reasoning_effort="low",
             input=StepInputConfig(type="null"),
             completion=CompletionConfig(evaluate=True, max_attempts=3),
         ),
@@ -76,10 +87,14 @@ RESEARCH_WORKFLOW = Workflow(
     criteria="Research tasks, information gathering, analysis requests.",
     tags=["research", "analysis"],
     interaction=InteractionMode(mode="explicit_gates"),
+    allow_user_override=True,
+    allow_user_disable=True,
+    editable_fields=["steps.*.reasoning_effort", "steps.*.completion.max_attempts"],
     steps=[
         StepDefinition(
             name="plan",
             type="run",
+            reasoning_effort="medium",
             prompt=(
                 "Create a research plan for this task. Identify:\n"
                 "- Key questions to answer\n"
@@ -93,6 +108,7 @@ RESEARCH_WORKFLOW = Workflow(
             name="research",
             type="run",
             agent_override="system:research",
+            reasoning_effort="low",
             prompt=(
                 "Execute the research plan. Gather information from available "
                 "sources. Cross-reference findings for accuracy. Note any gaps "
@@ -104,6 +120,7 @@ RESEARCH_WORKFLOW = Workflow(
         StepDefinition(
             name="synthesize",
             type="run",
+            reasoning_effort="medium",
             prompt=(
                 "Synthesize the research findings into a coherent report with:\n"
                 "- Key findings and insights\n"
@@ -125,10 +142,14 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
     criteria="Implementation tasks, feature development, bug fixes requiring structured quality pipeline.",
     tags=["code", "development"],
     interaction=InteractionMode(mode="explicit_gates"),
+    allow_user_override=True,
+    allow_user_disable=True,
+    editable_fields=["steps.*.reasoning_effort", "steps.*.completion.max_attempts"],
     steps=[
         StepDefinition(
             name="plan",
             type="run",
+            reasoning_effort="medium",
             prompt=(
                 "Explore the codebase only as needed to understand the relevant "
                 "areas. Use focused exploration first, and parallelize only when "
@@ -148,6 +169,7 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
             name="architect_review",
             type="run",
             agent_override="system:architect",
+            reasoning_effort="medium",
             prompt=(
                 "Review this implementation plan as an ARB reviewer. If the review is "
                 "complete and the plan needs revision, report that via "
@@ -169,6 +191,7 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
             name="implement",
             type="run",
             agent_override="system:implement",
+            reasoning_effort="medium",
             prompt=(
                 "Implement the approved plan. Follow the plan step by step. "
                 "After implementation, run relevant tests and linters to "
@@ -180,6 +203,7 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
         StepDefinition(
             name="update_docs",
             type="run",
+            reasoning_effort="low",
             prompt=(
                 "Update only the documentation directly affected by the changes, "
                 "such as README sections, API docs, configuration examples, or "
@@ -194,6 +218,7 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
             name="code_review",
             type="run",
             agent_override="system:code-review",
+            reasoning_effort="medium",
             prompt=(
                 "Review all changes made during implementation. If the review is complete "
                 "but fixes are required before approval, report that via "
@@ -218,6 +243,7 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
             name="commit",
             type="run",
             agent_override="system:committer",
+            reasoning_effort="low",
             prompt=(
                 "Create a conventional commit for all changes. If the commit cannot be "
                 "created due to an operational problem such as missing git identity or a "
@@ -230,6 +256,7 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
         StepDefinition(
             name="remember",
             type="run",
+            reasoning_effort="low",
             prompt=(
                 "Store key findings, decisions, and implementation details "
                 "as memories for future reference. Attach a detailed summary "
@@ -253,10 +280,14 @@ CREATIVE_WORKFLOW = Workflow(
     criteria="Creative writing, content generation, copywriting.",
     tags=["creative", "writing"],
     interaction=InteractionMode(mode="explicit_gates"),
+    allow_user_override=True,
+    allow_user_disable=True,
+    editable_fields=["steps.*.reasoning_effort", "steps.*.completion.max_attempts"],
     steps=[
         StepDefinition(
             name="generate",
             type="run",
+            reasoning_effort="low",
             prompt="Create the requested content. Focus on quality, originality, and meeting the stated requirements.",
             input=StepInputConfig(type="null"),
             completion=CompletionConfig(evaluate=True, max_attempts=5, on_exhausted="continue"),
@@ -288,10 +319,20 @@ class WorkflowRegistry:
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
 
-    async def get(self, workflow_id: str) -> Workflow | None:
+    async def get(
+        self,
+        workflow_id: str,
+        *,
+        owner_email: str | None = None,
+        include_disabled: bool = False,
+    ) -> Workflow | None:
         """Resolve a workflow by ID — checks system workflows first, then DB."""
         if workflow_id in SYSTEM_WORKFLOWS:
-            return SYSTEM_WORKFLOWS[workflow_id]
+            return await self._resolve_system_workflow(
+                SYSTEM_WORKFLOWS[workflow_id],
+                owner_email=owner_email,
+                include_disabled=include_disabled,
+            )
 
         async with self._session_factory() as db_session:
             row = await get_workflow(db_session, workflow_id)
@@ -299,9 +340,17 @@ class WorkflowRegistry:
             return None
         return _row_to_workflow(row)
 
-    async def list_all(self, *, owner_email: str | None = None) -> list[Workflow]:
+    async def list_all(
+        self, *, owner_email: str | None = None, include_disabled: bool = False
+    ) -> list[Workflow]:
         """List all available workflows (system + user)."""
-        result = list(SYSTEM_WORKFLOWS.values())
+        result: list[Workflow] = []
+        for workflow in SYSTEM_WORKFLOWS.values():
+            effective = await self._resolve_system_workflow(
+                workflow, owner_email=owner_email, include_disabled=include_disabled
+            )
+            if effective is not None:
+                result.append(effective)
         async with self._session_factory() as db_session:
             rows = await list_workflows(db_session, owner_email=owner_email, include_system=False)
         result.extend(_row_to_workflow(r) for r in rows)
@@ -331,6 +380,59 @@ class WorkflowRegistry:
     def get_direct_workflow(self) -> Workflow:
         """Return the system Direct workflow (single-step, no evaluation)."""
         return DIRECT_WORKFLOW
+
+    def get_system_workflow(self, workflow_id: str) -> Workflow | None:
+        """Return the raw shipped system workflow."""
+
+        return SYSTEM_WORKFLOWS.get(workflow_id)
+
+    async def get_effective(self, workflow_id: str, *, owner_email: str | None) -> Workflow | None:
+        """Resolve a workflow with user-scoped system overrides applied."""
+
+        return await self.get(workflow_id, owner_email=owner_email)
+
+    async def _resolve_system_workflow(
+        self,
+        base: Workflow,
+        *,
+        owner_email: str | None,
+        include_disabled: bool,
+    ) -> Workflow | None:
+        effective = base.model_copy(deep=True)
+        if not owner_email or not base.allow_user_override:
+            return effective
+        async with self._session_factory() as db_session:
+            row = await get_system_workflow_override(
+                db_session, owner_email=owner_email, workflow_id=base.workflow_id
+            )
+        if row is None:
+            return effective
+        effective.has_overrides = True
+        effective.disabled = bool(row.disabled)
+        if row.disabled and not include_disabled:
+            return None
+        raw_step_overrides = row.step_overrides if isinstance(row.step_overrides, dict) else {}
+        steps_by_name = {step.name: step for step in effective.steps}
+        warnings: list[str] = []
+        for step_name, raw_override in raw_step_overrides.items():
+            if not isinstance(raw_override, dict):
+                continue
+            step = steps_by_name.get(step_name)
+            if step is None:
+                warnings.append(f"Override for missing step '{step_name}' is ignored.")
+                continue
+            reasoning_effort = raw_override.get("reasoning_effort")
+            if isinstance(reasoning_effort, str):
+                step.reasoning_effort = reasoning_effort
+            completion_override = raw_override.get("completion")
+            if isinstance(completion_override, dict):
+                if step.completion is None:
+                    step.completion = CompletionConfig()
+                max_attempts = completion_override.get("max_attempts")
+                if isinstance(max_attempts, int):
+                    step.completion.max_attempts = max_attempts
+        effective.override_warnings = warnings
+        return effective
 
 
 # ---------------------------------------------------------------------------

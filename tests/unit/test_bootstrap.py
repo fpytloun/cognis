@@ -28,11 +28,15 @@ async def test_bootstrap_creates_keys_db_and_settings(monkeypatch: object, tmp_p
 
     async with session_factory() as session:
         settings = await list_settings(session)
+        coding_skill = await get_skill(session, "cognis-coding")
         task_skill = await get_skill(session, "cognis-task-manager")
         workflow_skill = await get_skill(session, "cognis-workflow-manager")
     assert len(settings) == len(DEFAULT_SETTINGS)
+    assert coding_skill is not None
     assert task_skill is not None
     assert workflow_skill is not None
+    assert coding_skill.auto_load is False
+    assert coding_skill.is_system is True
     assert task_skill.auto_load is False
     assert workflow_skill.auto_load is False
     assert task_skill.is_system is True
@@ -41,6 +45,7 @@ async def test_bootstrap_creates_keys_db_and_settings(monkeypatch: object, tmp_p
     assert workflow_skill.instructions.startswith("# Purpose")
     assert task_skill.current_version_id is not None
     assert workflow_skill.current_version_id is not None
+    assert coding_skill.current_version_id is not None
 
     await engine.dispose()
 
@@ -223,5 +228,24 @@ async def test_run_schema_bootstrap_upgrades_legacy_sessions_table(tmp_path: Pat
         )
 
     assert {"idle_since", "updated_at"}.issubset(session_columns)
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_run_schema_bootstrap_creates_system_override_tables(tmp_path: Path) -> None:
+    engine = create_engine(f"sqlite+aiosqlite:///{tmp_path / 'overrides.db'}")
+
+    await run_schema_bootstrap(engine)
+
+    async with engine.begin() as conn:
+
+        def _table_names(sync_conn: object) -> list[str]:
+            return inspect(sync_conn).get_table_names()
+
+        table_names = await conn.run_sync(_table_names)
+
+    assert "system_agent_overrides" in table_names
+    assert "system_workflow_overrides" in table_names
 
     await engine.dispose()

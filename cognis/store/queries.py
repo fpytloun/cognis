@@ -33,6 +33,8 @@ from cognis.store.models import (
     SkillRow,
     SkillVersionRow,
     StepRun,
+    SystemAgentOverride,
+    SystemWorkflowOverride,
     Task,
     TaskDependency,
     User,
@@ -550,6 +552,74 @@ async def set_agent_status(session: AsyncSession, agent_id: str, status: str) ->
     row.updated_at = datetime.now(UTC)
     await session.flush()
     return True
+
+
+async def get_system_agent_override(
+    session: AsyncSession, *, owner_email: str, agent_id: str
+) -> SystemAgentOverride | None:
+    """Return the per-user override for a shipped system agent."""
+
+    result = await session.execute(
+        select(SystemAgentOverride).where(
+            SystemAgentOverride.owner_email == owner_email,
+            SystemAgentOverride.agent_id == agent_id,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def list_system_agent_overrides(
+    session: AsyncSession, *, owner_email: str
+) -> list[SystemAgentOverride]:
+    """List all system-agent overrides for a user."""
+
+    result = await session.execute(
+        select(SystemAgentOverride).where(SystemAgentOverride.owner_email == owner_email)
+    )
+    return list(result.scalars().all())
+
+
+async def upsert_system_agent_override(
+    session: AsyncSession,
+    *,
+    owner_email: str,
+    agent_id: str,
+    disabled: bool | None = None,
+    llm_config_override: dict[str, Any] | None = None,
+    execution_override: dict[str, Any] | None = None,
+) -> SystemAgentOverride:
+    """Create or update a per-user system-agent override row."""
+
+    row = await get_system_agent_override(session, owner_email=owner_email, agent_id=agent_id)
+    if row is None:
+        row = SystemAgentOverride(
+            override_id=f"sao_{uuid.uuid4().hex[:12]}",
+            owner_email=owner_email,
+            agent_id=agent_id,
+        )
+        session.add(row)
+    if disabled is not None:
+        row.disabled = disabled
+    row.llm_config_override = llm_config_override
+    row.execution_override = execution_override
+    row.updated_at = _utcnow()
+    await session.flush()
+    return row
+
+
+async def delete_system_agent_override(
+    session: AsyncSession, *, owner_email: str, agent_id: str
+) -> bool:
+    """Delete a per-user system-agent override row."""
+
+    result = await session.execute(
+        delete(SystemAgentOverride).where(
+            SystemAgentOverride.owner_email == owner_email,
+            SystemAgentOverride.agent_id == agent_id,
+        )
+    )
+    await session.flush()
+    return int(getattr(result, "rowcount", 0) or 0) > 0
 
 
 async def list_secondary_bindings(session: AsyncSession, primary_agent_id: str) -> list[str]:
@@ -1776,6 +1846,74 @@ async def delete_workflow(session: AsyncSession, workflow_id: str) -> bool:
     """Delete a workflow row."""
     result = await session.execute(
         delete(WorkflowRow).where(WorkflowRow.workflow_id == workflow_id)
+    )
+    await session.flush()
+    return int(getattr(result, "rowcount", 0) or 0) > 0
+
+
+async def get_system_workflow_override(
+    session: AsyncSession, *, owner_email: str, workflow_id: str
+) -> SystemWorkflowOverride | None:
+    """Return the per-user override for a shipped system workflow."""
+
+    result = await session.execute(
+        select(SystemWorkflowOverride).where(
+            SystemWorkflowOverride.owner_email == owner_email,
+            SystemWorkflowOverride.workflow_id == workflow_id,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def list_system_workflow_overrides(
+    session: AsyncSession, *, owner_email: str
+) -> list[SystemWorkflowOverride]:
+    """List all system-workflow overrides for a user."""
+
+    result = await session.execute(
+        select(SystemWorkflowOverride).where(SystemWorkflowOverride.owner_email == owner_email)
+    )
+    return list(result.scalars().all())
+
+
+async def upsert_system_workflow_override(
+    session: AsyncSession,
+    *,
+    owner_email: str,
+    workflow_id: str,
+    disabled: bool | None = None,
+    step_overrides: dict[str, Any] | None = None,
+) -> SystemWorkflowOverride:
+    """Create or update a per-user system-workflow override row."""
+
+    row = await get_system_workflow_override(
+        session, owner_email=owner_email, workflow_id=workflow_id
+    )
+    if row is None:
+        row = SystemWorkflowOverride(
+            override_id=f"swo_{uuid.uuid4().hex[:12]}",
+            owner_email=owner_email,
+            workflow_id=workflow_id,
+        )
+        session.add(row)
+    if disabled is not None:
+        row.disabled = disabled
+    row.step_overrides = step_overrides
+    row.updated_at = _utcnow()
+    await session.flush()
+    return row
+
+
+async def delete_system_workflow_override(
+    session: AsyncSession, *, owner_email: str, workflow_id: str
+) -> bool:
+    """Delete a per-user system-workflow override row."""
+
+    result = await session.execute(
+        delete(SystemWorkflowOverride).where(
+            SystemWorkflowOverride.owner_email == owner_email,
+            SystemWorkflowOverride.workflow_id == workflow_id,
+        )
     )
     await session.flush()
     return int(getattr(result, "rowcount", 0) or 0) > 0

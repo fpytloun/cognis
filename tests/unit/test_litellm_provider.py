@@ -6,6 +6,7 @@ import pytest
 
 from cognis.models.config import DEFAULT_MODEL_INFO
 from cognis.providers.llm.litellm import LiteLLMProvider, _normalize_proxy_model_info
+from cognis.providers.llm.reasoning import apply_reasoning_config, reasoning_efforts_for_model
 from cognis.store.database import create_engine, create_session_factory
 from cognis.store.models import Base, LLMProvider, ModelRouting
 
@@ -228,6 +229,34 @@ async def test_litellm_provider_infers_anthropic_capabilities(tmp_path: object) 
     assert model_info.supports_defer_loading is True
     assert model_info.supports_prompt_caching is True
     await engine.dispose()
+
+
+def test_reasoning_translation_maps_openai_max_to_xhigh() -> None:
+    kwargs = apply_reasoning_config(
+        {"reasoning_effort": "max"},
+        model_id="gpt-5.4",
+        provider_preset="openai",
+        model_info=DEFAULT_MODEL_INFO.model_copy(update={"supports_reasoning": True}),
+    )
+
+    assert kwargs["reasoning_effort"] == "xhigh"
+
+
+def test_reasoning_translation_uses_adaptive_default_for_claude_46() -> None:
+    kwargs = apply_reasoning_config(
+        {"reasoning_effort": "default"},
+        model_id="claude-opus-4.6",
+        provider_preset="anthropic",
+        model_info=DEFAULT_MODEL_INFO.model_copy(update={"supports_reasoning": True}),
+    )
+
+    assert kwargs["thinking"] == {"type": "adaptive"}
+
+
+def test_reasoning_efforts_for_reasoning_model_return_normalized_levels() -> None:
+    assert reasoning_efforts_for_model(
+        "gpt-5.4", provider_preset="openai", supports_reasoning=True
+    ) == ["default", "none", "minimal", "low", "medium", "high", "max"]
 
 
 @pytest.mark.asyncio

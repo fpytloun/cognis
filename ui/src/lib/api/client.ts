@@ -388,7 +388,7 @@ export const api = {
   agents: {
     list(
       cursor: string | null = null,
-      params?: { agent_type?: string; include_hidden?: boolean; include_system?: boolean }
+      params?: { agent_type?: string; include_hidden?: boolean; include_system?: boolean; include_disabled?: boolean }
     ): Promise<CursorPage<Agent>> {
       return request<CursorPage<Agent>>(
         `/api/v1/agents${encodeQuery({ cursor, limit: 100, ...params })}`
@@ -396,7 +396,7 @@ export const api = {
     },
 
     async listAll(
-      params?: { agent_type?: string; include_hidden?: boolean; include_system?: boolean }
+      params?: { agent_type?: string; include_hidden?: boolean; include_system?: boolean; include_disabled?: boolean }
     ): Promise<Agent[]> {
       return collectCursorPages((cursor) => this.list(cursor, params));
     },
@@ -417,6 +417,22 @@ export const api = {
         method: 'PUT',
         body: JSON.stringify(payload)
       });
+    },
+
+    duplicate(agentId: string): Promise<Agent> {
+      return request<Agent>(`/api/v1/agents/${agentId}/duplicate`, { method: 'POST' });
+    },
+
+    resetOverrides(agentId: string): Promise<{ ok: boolean }> {
+      return request<{ ok: boolean }>(`/api/v1/agents/${agentId}/reset-overrides`, { method: 'POST' });
+    },
+
+    disableSystem(agentId: string): Promise<Agent> {
+      return request<Agent>(`/api/v1/agents/${agentId}/disable`, { method: 'POST' });
+    },
+
+    enableSystem(agentId: string): Promise<Agent> {
+      return request<Agent>(`/api/v1/agents/${agentId}/enable`, { method: 'POST' });
     },
 
     archive(agentId: string): Promise<{ ok: boolean }> {
@@ -810,12 +826,12 @@ export const api = {
   },
 
   workflows: {
-    list(cursor: string | null = null): Promise<CursorPage<Workflow>> {
-      return request<CursorPage<Workflow>>(`/api/v1/workflows${encodeQuery({ cursor, limit: 100 })}`);
+    list(cursor: string | null = null, params?: { include_disabled?: boolean }): Promise<CursorPage<Workflow>> {
+      return request<CursorPage<Workflow>>(`/api/v1/workflows${encodeQuery({ cursor, limit: 100, ...params })}`);
     },
 
-    async listAll(): Promise<Workflow[]> {
-      return collectCursorPages((cursor) => this.list(cursor));
+    async listAll(params?: { include_disabled?: boolean }): Promise<Workflow[]> {
+      return collectCursorPages((cursor) => this.list(cursor, params));
     },
 
     detail(workflowId: string): Promise<Workflow> {
@@ -842,6 +858,18 @@ export const api = {
 
     duplicate(workflowId: string): Promise<Workflow> {
       return request<Workflow>(`/api/v1/workflows/${workflowId}/duplicate`, { method: 'POST' });
+    },
+
+    resetOverrides(workflowId: string): Promise<{ ok: boolean }> {
+      return request<{ ok: boolean }>(`/api/v1/workflows/${workflowId}/reset-overrides`, { method: 'POST' });
+    },
+
+    disable(workflowId: string): Promise<Workflow> {
+      return request<Workflow>(`/api/v1/workflows/${workflowId}/disable`, { method: 'POST' });
+    },
+
+    enable(workflowId: string): Promise<Workflow> {
+      return request<Workflow>(`/api/v1/workflows/${workflowId}/enable`, { method: 'POST' });
     }
   },
 

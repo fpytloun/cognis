@@ -11,6 +11,7 @@
     buildSystemPromptPreview,
     defaultSystemPrompt,
     formStateToPayload,
+    formStateToSystemOverridePayload,
     slugify,
     type AgentFormState
   } from '$lib/agents';
@@ -34,6 +35,8 @@
     saving = false,
     error = '',
     readonly = false,
+    isSystemAsset = false,
+    editableFields = [],
     onSave,
     onBindingsChange,
   } = $props<{
@@ -52,6 +55,8 @@
     saving?: boolean;
     error?: string;
     readonly?: boolean;
+    isSystemAsset?: boolean;
+    editableFields?: string[];
     onSave: (payload: Record<string, unknown>) => void | Promise<void>;
     onBindingsChange?: ((bindings: string[]) => void | Promise<void>) | null;
   }>();
@@ -61,6 +66,12 @@
   let showAvatarLightbox = $state(false);
   let uploadingAvatar = $state(false);
   let fileInput: HTMLInputElement | undefined = $state();
+  const editableFieldSet = $derived(new Set(editableFields));
+
+  function canEditField(field: string): boolean {
+    if (!isSystemAsset) return !readonly;
+    return editableFieldSet.has(field);
+  }
 
   function handleAvatarAccept(imageId: string, avatarUrl: string) {
     form.avatarImageId = imageId;
@@ -241,7 +252,7 @@
     if (!canSubmit) {
       return;
     }
-    await onSave(formStateToPayload(form));
+    await onSave(isSystemAsset ? formStateToSystemOverridePayload(form) : formStateToPayload(form));
   }
 
   function resetSystemPrompt(): void {
@@ -321,7 +332,7 @@
                 <AgentAvatar name={form.name || 'A'} avatarUrl={null} class="h-14 w-14" />
               {/if}
               <div class="flex flex-col gap-1.5">
-                {#if !readonly}
+                {#if !readonly && !isSystemAsset}
                   <div class="flex gap-2">
                     <input
                       bind:this={fileInput}
@@ -387,7 +398,7 @@
             <div class="space-y-2 text-sm font-medium text-slate-200">
               <div class="flex items-center justify-between">
                 <span>Tone</span>
-                {#if !readonly}
+                {#if !readonly && !isSystemAsset}
                   <button type="button" class="text-sky-400 hover:text-sky-300 disabled:opacity-50" disabled={generatingField === 'tone'} onclick={() => generateField('tone', () => form.tone, (v) => { form.tone = v; })} title="Generate with AI">
                     {#if generatingField === 'tone'}<Loader2 class="h-3 w-3 animate-spin" />{:else}<Sparkles class="h-3 w-3" />{/if}
                   </button>
@@ -399,7 +410,7 @@
             <div class="space-y-2 text-sm font-medium text-slate-200">
               <div class="flex items-center justify-between">
                 <span>Temperament</span>
-                {#if !readonly}
+                {#if !readonly && !isSystemAsset}
                   <button type="button" class="text-sky-400 hover:text-sky-300 disabled:opacity-50" disabled={generatingField === 'temperament'} onclick={() => generateField('temperament', () => form.temperament, (v) => { form.temperament = v; })} title="Generate with AI">
                     {#if generatingField === 'temperament'}<Loader2 class="h-3 w-3 animate-spin" />{:else}<Sparkles class="h-3 w-3" />{/if}
                   </button>
@@ -411,7 +422,7 @@
             <div class="space-y-2 text-sm font-medium text-slate-200">
               <div class="flex items-center justify-between">
                 <span>Purpose</span>
-                {#if !readonly}
+                {#if !readonly && !isSystemAsset}
                   <button type="button" class="text-sky-400 hover:text-sky-300 disabled:opacity-50" disabled={generatingField === 'purpose'} onclick={() => generateField('purpose', () => form.purpose, (v) => { form.purpose = v; })} title="Generate with AI">
                     {#if generatingField === 'purpose'}<Loader2 class="h-3 w-3 animate-spin" />{:else}<Sparkles class="h-3 w-3" />{/if}
                   </button>
@@ -423,7 +434,7 @@
           <div class="mt-4 space-y-2 text-sm font-medium text-slate-200">
             <div class="flex items-center justify-between">
               <span>Behavioral rules (one per line)</span>
-              {#if !readonly}
+              {#if !readonly && !isSystemAsset}
                 <button type="button" class="flex items-center gap-1 text-xs text-sky-400 hover:text-sky-300 disabled:opacity-50" disabled={generatingField === 'behavioral_rules'} onclick={() => generateField('behavioral_rules', () => form.behavioralRules, (v) => { form.behavioralRules = v; })} title="Generate with AI">
                   {#if generatingField === 'behavioral_rules'}<Loader2 class="h-3 w-3 animate-spin" />{:else}<Sparkles class="h-3 w-3" />{/if}
                 </button>
@@ -438,7 +449,11 @@
       <Card class="p-5">
         <div class="mb-3 flex items-center justify-between gap-3">
           <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">System prompt</p>
-          <Button size="sm" variant="secondary" type="button" onclick={resetSystemPrompt}>Reset to default</Button>
+          {#if !isSystemAsset}
+            <Button size="sm" variant="secondary" type="button" onclick={resetSystemPrompt}>Reset to default</Button>
+          {:else}
+            <span class="text-xs text-slate-500">Managed by the shipped system agent definition.</span>
+          {/if}
         </div>
         <textarea bind:value={form.systemPrompt} class="min-h-[180px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500" placeholder="You are {'{'}name{'}'}.&#10;&#10;Be helpful, direct, and concise." disabled={readonly}></textarea>
         <p class="mt-2 text-xs text-slate-400">The agent's base instructions. Memory context and tool descriptions are injected separately at runtime.</p>
@@ -650,7 +665,7 @@
         <div class="grid gap-4 md:grid-cols-2">
           <label class="space-y-2 text-sm font-medium text-slate-200">
             <span>Provider</span>
-            <select bind:value={form.providerId} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+            <select bind:value={form.providerId} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!canEditField('llm_config.provider_id')}>
               <option value="">Use default provider</option>
               {#each providers as provider}
                 <option value={provider.provider_id}>{provider.display_name}{provider.is_default ? ' ⭐' : ''}</option>
@@ -661,32 +676,35 @@
           <label class="space-y-2 text-sm font-medium text-slate-200">
             <span>Model</span>
             {#if selectedProviderModels().length > 0}
-              <select bind:value={form.model} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+               <select bind:value={form.model} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!canEditField('llm_config.model')}>
                 <option value="">Use provider default</option>
                 {#each selectedProviderModels() as modelId}
                   <option value={modelId}>{modelId}</option>
                 {/each}
               </select>
             {:else}
-              <Input bind:value={form.model} placeholder="Use provider default" />
+               <Input bind:value={form.model} placeholder="Use provider default" disabled={!canEditField('llm_config.model')} />
             {/if}
             <span class="block text-xs text-slate-400">Leave empty to use the provider's default model.</span>
           </label>
           <label class="space-y-2 text-sm font-medium text-slate-200">
             <span>Temperature</span>
-            <Input bind:value={form.temperature} type="number" placeholder="default" />
+            <Input bind:value={form.temperature} type="number" placeholder="default" disabled={!canEditField('llm_config.temperature')} />
           </label>
           <label class="space-y-2 text-sm font-medium text-slate-200">
             <span>Max tokens</span>
-            <Input bind:value={form.maxTokens} type="number" placeholder="default" />
+            <Input bind:value={form.maxTokens} type="number" placeholder="default" disabled={!canEditField('llm_config.max_tokens')} />
           </label>
           <label class="space-y-2 text-sm font-medium text-slate-200">
             <span>Reasoning effort</span>
-            <select bind:value={form.reasoningEffort} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+            <select bind:value={form.reasoningEffort} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!canEditField('llm_config.reasoning_effort')}>
               <option value="">Default</option>
+              <option value="none">None</option>
+              <option value="minimal">Minimal</option>
               <option value="low">Low</option>
               <option value="medium">Medium</option>
               <option value="high">High</option>
+              <option value="max">Max</option>
             </select>
           </label>
         </div>
@@ -779,9 +797,9 @@
         </p>
       {/if}
 
-      {#if !readonly}
+      {#if !readonly || isSystemAsset}
         <div class="flex justify-end gap-3">
-          <Button type="submit" disabled={saving || !canSubmit}>{saving ? 'Saving…' : mode === 'create' ? 'Create agent' : 'Save changes'}</Button>
+          <Button type="submit" disabled={saving || !canSubmit}>{saving ? 'Saving…' : mode === 'create' ? 'Create agent' : isSystemAsset ? 'Save overrides' : 'Save changes'}</Button>
         </div>
       {/if}
     </div>

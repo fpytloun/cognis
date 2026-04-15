@@ -126,6 +126,10 @@ def agent_to_response(row: Any) -> AgentResponse:
         agent_type=getattr(row, "agent_type", "primary"),
         is_system=getattr(row, "is_system", False),
         hidden=getattr(row, "hidden", False),
+        editable_fields=list(getattr(row, "editable_fields", []) or []),
+        has_overrides=bool(getattr(row, "has_overrides", False)),
+        disabled=bool(getattr(row, "disabled", False)),
+        disableable=bool(getattr(row, "allow_user_disable", False)),
         sync_metadata=sync_metadata if sync_metadata else None,
         status=row.status,
         created_at=row.created_at,
@@ -231,7 +235,15 @@ def step_run_to_response(row: Any) -> StepRunResponse:
 def workflow_to_response(row: Any) -> WorkflowResponse:
     definition = row.definition if hasattr(row, "definition") else row.model_dump(mode="json")
     if isinstance(row, Workflow):
-        return WorkflowResponse(**row.model_dump(mode="json"))
+        payload = row.model_dump(mode="json")
+        payload.update(
+            editable_fields=list(getattr(row, "editable_fields", []) or []),
+            has_overrides=bool(getattr(row, "has_overrides", False)),
+            disabled=bool(getattr(row, "disabled", False)),
+            disableable=bool(getattr(row, "allow_user_disable", False)),
+            override_warnings=list(getattr(row, "override_warnings", []) or []),
+        )
+        return WorkflowResponse(**payload)
     return WorkflowResponse(
         workflow_id=row.workflow_id,
         name=row.name,
@@ -244,6 +256,11 @@ def workflow_to_response(row: Any) -> WorkflowResponse:
         steps=list(definition.get("steps", [])),
         is_system=row.is_system,
         owner_email=row.owner_email,
+        editable_fields=list(getattr(row, "editable_fields", []) or []),
+        has_overrides=bool(getattr(row, "has_overrides", False)),
+        disabled=bool(getattr(row, "disabled", False)),
+        disableable=bool(getattr(row, "allow_user_disable", False)),
+        override_warnings=list(getattr(row, "override_warnings", []) or []),
     )
 
 

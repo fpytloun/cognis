@@ -130,6 +130,31 @@ class AgentSecondaryBinding(Base):
     )
 
 
+class SystemAgentOverride(Base):
+    """Per-user runtime tuning overlay for shipped system agents."""
+
+    __tablename__ = "system_agent_overrides"
+    __table_args__ = (
+        UniqueConstraint("owner_email", "agent_id", name="uq_system_agent_overrides_owner_agent"),
+        Index("ix_system_agent_overrides_owner", "owner_email"),
+    )
+
+    override_id: Mapped[str] = mapped_column(String, primary_key=True)
+    owner_email: Mapped[str] = mapped_column(String, ForeignKey("users.email"), nullable=False)
+    agent_id: Mapped[str] = mapped_column(String, nullable=False)
+    disabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="0"
+    )
+    llm_config_override: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    execution_override: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+
 class Conversation(Base):
     """Conversation metadata. Session content is in Intaris."""
 
@@ -365,6 +390,32 @@ class WorkflowRow(Base):
     owner_email: Mapped[str | None] = mapped_column(
         String, ForeignKey("users.email"), nullable=True
     )
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+
+class SystemWorkflowOverride(Base):
+    """Per-user runtime tuning overlay for shipped system workflows."""
+
+    __tablename__ = "system_workflow_overrides"
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_email", "workflow_id", name="uq_system_workflow_overrides_owner_workflow"
+        ),
+        Index("ix_system_workflow_overrides_owner", "owner_email"),
+    )
+
+    override_id: Mapped[str] = mapped_column(String, primary_key=True)
+    owner_email: Mapped[str] = mapped_column(String, ForeignKey("users.email"), nullable=False)
+    workflow_id: Mapped[str] = mapped_column(String, nullable=False)
+    disabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="0"
+    )
+    step_overrides: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, default=_utcnow
     )

@@ -58,6 +58,11 @@ _TOOL_GUIDANCE = """\
 - Use `bash` for terminal-native operations and atomic filesystem \
   operations such as `mv`, `cp`, `rm`, `mkdir`, `chmod`, `git`, build, \
   test, and package-manager commands.
+- Prefer dedicated edit tools over shell or interpreter one-liners for file \
+  content changes.
+- Avoid using `bash` to run Python, Perl, Ruby, or shell one-liners that \
+  rewrite files when `edit`, `multiedit`, `patch`, or `write` can make the \
+  change directly.
 - Do not emulate filesystem operations by reading and rewriting file \
   contents when a direct `bash` operation is more appropriate.
 - Prefer the fewest correct tool calls.

@@ -18,6 +18,11 @@ from cognis.core.workflow_management import (
     duplicate_visible_workflow,
     update_user_workflow,
 )
+from cognis.store.queries import (
+    delete_system_workflow_override,
+    get_system_workflow_override,
+    upsert_system_workflow_override,
+)
 
 router = APIRouter(prefix="/api/v1/workflows", tags=["workflows"])
 
@@ -51,9 +56,12 @@ async def workflow_list(
     request: Request,
     cursor: str | None = None,
     limit: int = Query(default=20, ge=1, le=100),
+    include_disabled: bool = Query(default=False),
 ) -> CursorPage[WorkflowResponse]:
     user = require_current_user(request)
-    workflows = await request.app.state.workflow_registry.list_all(owner_email=user.email)
+    workflows = await request.app.state.workflow_registry.list_all(
+        owner_email=user.email, include_disabled=include_disabled
+    )
     items = [workflow_to_response(workflow) for workflow in workflows]
     page_items, next_cursor, has_more = paginate_items(
         items,
@@ -68,6 +76,7 @@ async def workflow_list(
 async def workflow_create(request: Request, payload: WorkflowRequest) -> WorkflowResponse:
     forbid_mutation_for_viewer(request)
     user = require_current_user(request)
+    _validate_workflow_payload(payload.model_dump(mode="json"))
     row = await create_user_workflow(
         session_factory=request.app.state.session_factory,
         owner_email=user.email,
@@ -79,7 +88,9 @@ async def workflow_create(request: Request, payload: WorkflowRequest) -> Workflo
 @router.get("/{workflow_id}", response_model=WorkflowResponse)
 async def workflow_detail(request: Request, workflow_id: str) -> WorkflowResponse:
     user = require_current_user(request)
-    workflow = await request.app.state.workflow_registry.get(workflow_id)
+    workflow = await request.app.state.workflow_registry.get(
+        workflow_id, owner_email=user.email, include_disabled=True
+    )
     if workflow is None:
         raise api_exception(404, "not_found", "Workflow not found")
     if (
@@ -99,6 +110,9 @@ async def workflow_update_route(
 ) -> WorkflowResponse:
     forbid_mutation_for_viewer(request)
     user = require_current_user(request)
+    base = request.app.state.workflow_registry.get_system_workflow(workflow_id)
+    if base is not None:
+        return await _update_system_workflow_route(request, workflow_id, payload)
     try:
         row = await update_user_workflow(
             session_factory=request.app.state.session_factory,
@@ -114,6 +128,66 @@ async def workflow_update_route(
             raise api_exception(403, "forbidden", message) from exc
         raise api_exception(409, "conflict", message) from exc
     return workflow_to_response(row)
+
+
+async def _update_system_workflow_route(
+    request: Request,
+    workflow_id: str,
+    payload: WorkflowUpdateRequest,
+) -> WorkflowResponse:
+    user = require_current_user(request)
+    base = request.app.state.workflow_registry.get_system_workflow(workflow_id)
+    if base is None:
+        raise api_exception(404, "not_found", "Workflow not found")
+    if not base.allow_user_override:
+        raise api_exception(403, "forbidden", "This system workflow cannot be overridden")
+
+    updates = payload.model_dump(exclude_unset=True)
+    forbidden = sorted(key for key in updates if key != "steps")
+    if forbidden:
+        raise api_exception(
+            403,
+            "forbidden",
+            f"System workflow overrides only allow step runtime tuning: {', '.join(forbidden)}",
+        )
+
+    step_overrides: dict[str, dict[str, object]] = {}
+    for step_payload in updates.get("steps") or []:
+        if not isinstance(step_payload, dict):
+            continue
+        step_name = step_payload.get("name")
+        if not isinstance(step_name, str) or not step_name:
+            continue
+        override: dict[str, object] = {}
+        reasoning_effort = step_payload.get("reasoning_effort")
+        if isinstance(reasoning_effort, str) and reasoning_effort:
+            override["reasoning_effort"] = reasoning_effort
+        completion = step_payload.get("completion")
+        if isinstance(completion, dict):
+            max_attempts = completion.get("max_attempts")
+            if isinstance(max_attempts, int):
+                override["completion"] = {"max_attempts": max_attempts}
+        if override:
+            step_overrides[step_name] = override
+
+    async with request.app.state.session_factory() as session:
+        existing = await get_system_workflow_override(
+            session, owner_email=user.email, workflow_id=workflow_id
+        )
+        await upsert_system_workflow_override(
+            session,
+            owner_email=user.email,
+            workflow_id=workflow_id,
+            disabled=(existing.disabled if existing else False),
+            step_overrides=step_overrides or None,
+        )
+        await session.commit()
+
+    workflow = await request.app.state.workflow_registry.get(
+        workflow_id, owner_email=user.email, include_disabled=True
+    )
+    assert workflow is not None
+    return workflow_to_response(workflow)
 
 
 @router.delete("/{workflow_id}", response_model=dict)
@@ -140,7 +214,9 @@ async def workflow_delete_route(request: Request, workflow_id: str) -> dict[str,
 async def workflow_duplicate(request: Request, workflow_id: str) -> WorkflowResponse:
     forbid_mutation_for_viewer(request)
     user = require_current_user(request)
-    workflow = await request.app.state.workflow_registry.get(workflow_id)
+    workflow = await request.app.state.workflow_registry.get(
+        workflow_id, owner_email=user.email, include_disabled=True
+    )
     if workflow is None:
         raise api_exception(404, "not_found", "Workflow not found")
     if (
@@ -158,3 +234,72 @@ async def workflow_duplicate(request: Request, workflow_id: str) -> WorkflowResp
         allow_admin=user.role == "admin",
     )
     return workflow_to_response(new_row)
+
+
+@router.post("/{workflow_id}/reset-overrides", response_model=dict)
+async def workflow_reset_overrides(request: Request, workflow_id: str) -> dict[str, bool]:
+    forbid_mutation_for_viewer(request)
+    user = require_current_user(request)
+    base = request.app.state.workflow_registry.get_system_workflow(workflow_id)
+    if base is None:
+        raise api_exception(404, "not_found", "Workflow not found")
+    async with request.app.state.session_factory() as session:
+        ok = await delete_system_workflow_override(
+            session, owner_email=user.email, workflow_id=workflow_id
+        )
+        await session.commit()
+    return {"ok": ok}
+
+
+@router.post("/{workflow_id}/disable", response_model=WorkflowResponse)
+async def workflow_disable(request: Request, workflow_id: str) -> WorkflowResponse:
+    forbid_mutation_for_viewer(request)
+    user = require_current_user(request)
+    base = request.app.state.workflow_registry.get_system_workflow(workflow_id)
+    if base is None:
+        raise api_exception(404, "not_found", "Workflow not found")
+    if not base.allow_user_disable:
+        raise api_exception(403, "forbidden", "This system workflow cannot be disabled")
+    async with request.app.state.session_factory() as session:
+        existing = await get_system_workflow_override(
+            session, owner_email=user.email, workflow_id=workflow_id
+        )
+        await upsert_system_workflow_override(
+            session,
+            owner_email=user.email,
+            workflow_id=workflow_id,
+            disabled=True,
+            step_overrides=(existing.step_overrides if existing else None),
+        )
+        await session.commit()
+    workflow = await request.app.state.workflow_registry.get(
+        workflow_id, owner_email=user.email, include_disabled=True
+    )
+    assert workflow is not None
+    return workflow_to_response(workflow)
+
+
+@router.post("/{workflow_id}/enable", response_model=WorkflowResponse)
+async def workflow_enable(request: Request, workflow_id: str) -> WorkflowResponse:
+    forbid_mutation_for_viewer(request)
+    user = require_current_user(request)
+    base = request.app.state.workflow_registry.get_system_workflow(workflow_id)
+    if base is None:
+        raise api_exception(404, "not_found", "Workflow not found")
+    async with request.app.state.session_factory() as session:
+        existing = await get_system_workflow_override(
+            session, owner_email=user.email, workflow_id=workflow_id
+        )
+        await upsert_system_workflow_override(
+            session,
+            owner_email=user.email,
+            workflow_id=workflow_id,
+            disabled=False,
+            step_overrides=(existing.step_overrides if existing else None),
+        )
+        await session.commit()
+    workflow = await request.app.state.workflow_registry.get(
+        workflow_id, owner_email=user.email, include_disabled=True
+    )
+    assert workflow is not None
+    return workflow_to_response(workflow)
