@@ -281,7 +281,7 @@ async def _update_system_agent_route(
         raise api_exception(403, "forbidden", "This system agent cannot be overridden")
 
     updates = payload.model_dump(exclude_unset=True)
-    allowed_top_level = {"llm_config"}
+    allowed_top_level = {"llm_config", "skills"}
     forbidden = sorted(key for key in updates if key not in allowed_top_level)
     if forbidden:
         raise api_exception(
@@ -300,12 +300,30 @@ async def _update_system_agent_route(
             f"Unsupported system agent override fields: {', '.join(invalid_llm)}",
         )
 
+    raw_skills = updates.get("skills")
+    if raw_skills is not None and not isinstance(raw_skills, dict):
+        raise api_exception(403, "forbidden", "System agent skill overrides must be an object")
+
     async with request.app.state.session_factory() as session:
+        existing = await get_system_agent_override(
+            session, owner_email=user.email, agent_id=agent_id
+        )
+        llm_override_to_store = (
+            (llm_override or None)
+            if "llm_config" in updates
+            else (existing.llm_config_override if existing else None)
+        )
+        skills_override_to_store = (
+            (raw_skills if isinstance(raw_skills, dict) else None)
+            if "skills" in updates
+            else (existing.skills_override if existing else None)
+        )
         await upsert_system_agent_override(
             session,
             owner_email=user.email,
             agent_id=agent_id,
-            llm_config_override=llm_override or None,
+            llm_config_override=llm_override_to_store,
+            skills_override=skills_override_to_store,
             execution_override=None,
         )
         await session.commit()
@@ -434,6 +452,7 @@ async def disable_system_agent(request: Request, agent_id: str) -> AgentResponse
             agent_id=agent_id,
             disabled=True,
             llm_config_override=(existing.llm_config_override if existing else None),
+            skills_override=(existing.skills_override if existing else None),
             execution_override=(existing.execution_override if existing else None),
         )
         await session.commit()
@@ -461,6 +480,7 @@ async def enable_system_agent(request: Request, agent_id: str) -> AgentResponse:
             agent_id=agent_id,
             disabled=False,
             llm_config_override=(existing.llm_config_override if existing else None),
+            skills_override=(existing.skills_override if existing else None),
             execution_override=(existing.execution_override if existing else None),
         )
         await session.commit()

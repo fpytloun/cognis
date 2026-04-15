@@ -69,6 +69,11 @@ This means:
 
 In the agent editor, you can select which skills to attach to an agent. Attached skills are highlighted in prompt metadata and their tools are available immediately through the deferred tool-loading path.
 
+Some shipped system agents also come with default attached skills. For example,
+`system:implement` and `system:code-review` attach the built-in Cognis coding
+skill by default. When a system agent allows overrides, its attached skill list
+can be replaced per user through the normal agent editor.
+
 All visible skills remain discoverable via prompt metadata and `skill_load`. Resolution order is deterministic: agent-attached skills first, then skills attached to all agents, then other discoverable skills.
 
 ### LLM skill management

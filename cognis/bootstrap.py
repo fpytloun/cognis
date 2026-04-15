@@ -187,6 +187,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_conversation_title_source_column)
         await conn.run_sync(_ensure_mcp_server_headers_column)
         await conn.run_sync(_ensure_system_override_tables)
+        await conn.run_sync(_ensure_system_agent_override_skill_columns)
 
 
 def _ensure_session_lifecycle_columns(sync_conn: object) -> None:
@@ -504,6 +505,20 @@ def _ensure_system_override_tables(sync_conn: object) -> None:
 
     SystemAgentOverride.__table__.create(sync_conn, checkfirst=True)
     SystemWorkflowOverride.__table__.create(sync_conn, checkfirst=True)
+
+
+def _ensure_system_agent_override_skill_columns(sync_conn: object) -> None:
+    """Add missing skill override columns to system agent overrides."""
+
+    inspector = cast(Any, inspect(sync_conn))
+    try:
+        columns = {column["name"] for column in inspector.get_columns("system_agent_overrides")}
+    except Exception:
+        return
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+
+    if "skills_override" not in columns:
+        execute(text("ALTER TABLE system_agent_overrides ADD COLUMN skills_override JSON"))
 
 
 _SYSTEM_USER_EMAIL = "system@cognis.local"

@@ -328,6 +328,9 @@ export function formStateToPayload(form: AgentFormState): Record<string, unknown
 
 export function formStateToSystemOverridePayload(form: AgentFormState): Record<string, unknown> {
   return {
+    skills: {
+      items: form.selectedSkillIds.map((id) => ({ skill_id: id, enabled: true }))
+    },
     llm_config: {
       provider_id: form.providerId || undefined,
       model: form.model || undefined,

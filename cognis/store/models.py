@@ -146,6 +146,7 @@ class SystemAgentOverride(Base):
         Boolean, nullable=False, default=False, server_default="0"
     )
     llm_config_override: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    skills_override: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     execution_override: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, default=_utcnow

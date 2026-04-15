@@ -586,6 +586,7 @@ async def upsert_system_agent_override(
     agent_id: str,
     disabled: bool | None = None,
     llm_config_override: dict[str, Any] | None = None,
+    skills_override: dict[str, Any] | None = None,
     execution_override: dict[str, Any] | None = None,
 ) -> SystemAgentOverride:
     """Create or update a per-user system-agent override row."""
@@ -601,6 +602,7 @@ async def upsert_system_agent_override(
     if disabled is not None:
         row.disabled = disabled
     row.llm_config_override = llm_config_override
+    row.skills_override = skills_override
     row.execution_override = execution_override
     row.updated_at = _utcnow()
     await session.flush()

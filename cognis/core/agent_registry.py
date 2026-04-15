@@ -346,6 +346,7 @@ def _system_agent(
     reasoning_effort: str | None = None,
     allow_user_override: bool = False,
     allow_user_disable: bool = False,
+    skills: dict[str, Any] | None = None,
 ) -> AgentDefinition:
     """Create a system agent definition."""
     return AgentDefinition(
@@ -354,6 +355,7 @@ def _system_agent(
         name=name,
         description=description,
         system_prompt=system_prompt,
+        skills=skills,
         tools=tools,
         llm_config=AgentLLMConfig(reasoning_effort=reasoning_effort),
         agent_type="secondary",
@@ -368,6 +370,7 @@ def _system_agent(
                 "llm_config.temperature",
                 "llm_config.max_tokens",
                 "llm_config.reasoning_effort",
+                "skills",
             ]
             if allow_user_override
             else []
@@ -416,6 +419,7 @@ SYSTEM_AGENTS: dict[str, AgentDefinition] = {
             "Code Review",
             "Findings-first code review for defects and regressions",
             _CODE_REVIEW_PROMPT,
+            skills={"items": [{"skill_id": "cognis-coding", "enabled": True}]},
             tools={"builtin_tools": ["read", "grep", "glob", "bash"]},
             reasoning_effort="medium",
             allow_user_override=True,
@@ -436,6 +440,7 @@ SYSTEM_AGENTS: dict[str, AgentDefinition] = {
             "Implement",
             "Focused implementation and targeted verification",
             _IMPLEMENT_PROMPT,
+            skills={"items": [{"skill_id": "cognis-coding", "enabled": True}]},
             tools={
                 "builtin_tools": [
                     "read",
@@ -618,6 +623,8 @@ class AgentRegistry:
         if execution_override:
             current_execution = dict(effective.execution or {})
             effective.execution = {**current_execution, **execution_override}
+        if isinstance(row.skills_override, dict):
+            effective.skills = row.skills_override
         return effective
 
     async def list_secondary_bindings(self, primary_agent_id: str) -> list[str]:

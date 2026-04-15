@@ -17,6 +17,7 @@ def test_system_implement_agent_has_expected_tools_and_constraints() -> None:
     agent = SYSTEM_AGENTS["system:implement"]
     tools = agent.tools or {}
     builtin_tools = tools.get("builtin_tools")
+    skills = agent.skills or {}
 
     assert builtin_tools == [
         "read",
@@ -29,6 +30,7 @@ def test_system_implement_agent_has_expected_tools_and_constraints() -> None:
         "list",
         "bash",
     ]
+    assert skills == {"items": [{"skill_id": "cognis-coding", "enabled": True}]}
     assert "Make the smallest correct change" in agent.system_prompt
     assert "Do not delegate further" in agent.system_prompt
 
@@ -61,6 +63,7 @@ def test_system_review_agents_use_pragmatic_prompts() -> None:
     assert "OVERENGINEERING" in architect.system_prompt
 
     assert review.description == "Findings-first code review for defects and regressions"
+    assert review.skills == {"items": [{"skill_id": "cognis-coding", "enabled": True}]}
     assert "Primary focus: real bugs, regressions, security issues" in review.system_prompt
     assert "Do not nitpick style or architecture" in review.system_prompt
     assert "### Must Fix" in review.system_prompt
@@ -75,6 +78,7 @@ def test_system_agents_seed_reasoning_and_override_capabilities() -> None:
     assert implement.allow_user_override is True
     assert implement.allow_user_disable is True
     assert "llm_config.reasoning_effort" in implement.editable_fields
+    assert "skills" in implement.editable_fields
 
     assert explore.llm_config is not None
     assert explore.llm_config.reasoning_effort == "low"

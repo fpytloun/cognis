@@ -602,7 +602,7 @@
                       class="h-4 w-4 rounded border-slate-600 bg-slate-950"
                       type="checkbox"
                       onchange={() => toggleSkill(skill.skill_id)}
-                      disabled={readonly}
+                      disabled={!canEditField('skills')}
                     />
                     <span>{skill.name}</span>
                     {#if skill.current_version?.tools && skill.current_version.tools.length > 0}
