@@ -21,6 +21,7 @@ export interface MessageTimelineItem {
   messageId?: string;
   streaming?: boolean;
   attachments?: AttachmentRef[];
+  optimistic?: boolean;
 }
 
 export interface ToolCallEvaluation {
@@ -99,7 +100,8 @@ function createMessageItem(
   seq: number | null,
   messageId?: string,
   streaming = false,
-  attachments: AttachmentRef[] = []
+  attachments: AttachmentRef[] = [],
+  optimistic = false
 ): MessageTimelineItem {
   return {
     id,
@@ -111,8 +113,42 @@ function createMessageItem(
     timestamp,
     messageId,
     streaming,
-    attachments
+    attachments,
+    optimistic
   };
+}
+
+function attachmentIds(attachments: AttachmentRef[] = []): string[] {
+  return attachments.map((attachment) => attachment.artifact_id);
+}
+
+function sameAttachmentIds(left: AttachmentRef[] = [], right: AttachmentRef[] = []): boolean {
+  const leftIds = attachmentIds(left).sort();
+  const rightIds = attachmentIds(right).sort();
+  return (
+    leftIds.length === rightIds.length && leftIds.every((artifactId, index) => artifactId === rightIds[index])
+  );
+}
+
+function isRecentOptimisticUserMessage(item: MessageTimelineItem): boolean {
+  if (!item.optimistic || item.role !== 'user' || item.seq !== null || !item.timestamp) return false;
+  const ts = Date.parse(item.timestamp);
+  if (Number.isNaN(ts)) return false;
+  return Date.now() - ts <= 15_000;
+}
+
+function findOptimisticUserMessageIndex(
+  items: TimelineItem[],
+  content: string,
+  attachments: AttachmentRef[]
+): number {
+  const index = items.length - 1;
+  const item = items[index];
+  if (item?.kind !== 'message') return -1;
+  if (!isRecentOptimisticUserMessage(item)) return -1;
+  if (item.content !== content) return -1;
+  if (!sameAttachmentIds(item.attachments, attachments)) return -1;
+  return index;
 }
 
 let _noticeCounter = 0;
@@ -481,7 +517,17 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
 export function appendOptimisticUserMessage(items: TimelineItem[], content: string, attachments: AttachmentRef[] = []): TimelineItem[] {
   return [
     ...items,
-    createMessageItem(`local-user:${Date.now()}`, 'user', content, new Date().toISOString(), null, undefined, false, attachments)
+    createMessageItem(
+      `local-user:${Date.now()}`,
+      'user',
+      content,
+      new Date().toISOString(),
+      null,
+      undefined,
+      false,
+      attachments,
+      true
+    )
   ];
 }
 
@@ -489,8 +535,18 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
   let next = [...items];
 
   if (event.type === 'user_message') {
-    const itemId = `user-msg:${Date.now()}:${next.length}`;
     const attachments = Array.isArray(event.attachments) ? event.attachments : [];
+    const optimisticIndex = findOptimisticUserMessageIndex(next, event.content, attachments);
+    if (optimisticIndex >= 0 && next[optimisticIndex]?.kind === 'message') {
+      const existing = next[optimisticIndex] as MessageTimelineItem;
+      next[optimisticIndex] = {
+        ...existing,
+        attachments,
+        optimistic: false
+      };
+      return next;
+    }
+    const itemId = `user-msg:${Date.now()}:${next.length}`;
     next.push(
       createMessageItem(itemId, 'user', event.content, new Date().toISOString(), null, undefined, false, attachments)
     );

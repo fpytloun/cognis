@@ -3,6 +3,13 @@ import { describe, expect, it } from 'vitest';
 import { renderDocsMarkdown, renderMarkdown } from '$lib/markdown';
 
 describe('renderMarkdown', () => {
+  it('renders inline code without markdown delimiters in the HTML output', () => {
+    const html = renderMarkdown('Use `git status` before committing.');
+
+    expect(html).toContain('<code>git status</code>');
+    expect(html).not.toContain('`git status`');
+  });
+
   it('strips dangerous html and event handlers', () => {
     const html = renderMarkdown(
       '<script>alert(1)</script><a href="javascript:alert(1)">bad</a><img src="x" onerror="alert(1)" />'

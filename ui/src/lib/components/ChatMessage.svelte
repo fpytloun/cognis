@@ -41,8 +41,8 @@
 
   function proseClass(): string {
     return item.role === 'user'
-      ? 'prose-user prose-headings:text-slate-950 prose-p:text-slate-950 prose-strong:text-slate-950 prose-code:text-slate-800 prose-a:text-slate-900 prose-a:underline'
-      : 'prose-invert prose-code:text-sky-200';
+      ? 'prose-user prose-headings:text-slate-950 prose-p:text-slate-950 prose-strong:text-slate-950 prose-code:text-slate-800 prose-code:before:content-none prose-code:after:content-none prose-a:text-slate-900 prose-a:underline'
+      : 'prose-invert prose-code:text-sky-200 prose-code:before:content-none prose-code:after:content-none';
   }
 
   function isImage(mimeType: string | undefined): boolean {

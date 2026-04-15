@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { applyWebSocketEvent, normalizeHistory } from '$lib/chat';
+import { appendOptimisticUserMessage, applyWebSocketEvent, normalizeHistory } from '$lib/chat';
 
 describe('chat timeline helpers', () => {
   it('normalizes history messages and updates streaming assistant content', () => {
@@ -252,6 +252,125 @@ describe('chat timeline helpers', () => {
       role: 'user',
       content: 'Hello from Signal'
     });
+  });
+
+  it('reconciles echoed user_message events with optimistic local sends', () => {
+    const optimistic = appendOptimisticUserMessage([], 'Hello from web');
+
+    const reconciled = applyWebSocketEvent(optimistic, {
+      type: 'user_message',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      content: 'Hello from web'
+    });
+
+    expect(reconciled).toHaveLength(1);
+    expect(reconciled[0]).toMatchObject({
+      kind: 'message',
+      role: 'user',
+      content: 'Hello from web',
+      optimistic: false
+    });
+  });
+
+  it('reconciles optimistic user messages with matching attachments', () => {
+    const attachments = [
+      {
+        artifact_id: 'art_1',
+        kind: 'pdf' as const,
+        mime_type: 'application/pdf',
+        filename: 'notes.pdf',
+        size_bytes: 123,
+        url: 'https://cognis.example.com/notes.pdf'
+      }
+    ];
+    const optimistic = appendOptimisticUserMessage([], 'Attached', attachments);
+
+    const reconciled = applyWebSocketEvent(optimistic, {
+      type: 'user_message',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      content: 'Attached',
+      attachments
+    });
+
+    expect(reconciled).toHaveLength(1);
+    expect(reconciled[0]).toMatchObject({
+      kind: 'message',
+      role: 'user',
+      attachments: [{ artifact_id: 'art_1', filename: 'notes.pdf' }],
+      optimistic: false
+    });
+  });
+
+  it('reconciles echoed attachments even when the server returns them in a different order', () => {
+    const optimistic = appendOptimisticUserMessage([], 'Attached', [
+      {
+        artifact_id: 'art_1',
+        kind: 'pdf' as const,
+        mime_type: 'application/pdf',
+        filename: 'notes.pdf',
+        size_bytes: 123,
+        url: 'https://cognis.example.com/notes.pdf'
+      },
+      {
+        artifact_id: 'art_2',
+        kind: 'image' as const,
+        mime_type: 'image/png',
+        filename: 'diagram.png',
+        size_bytes: 456,
+        url: 'https://cognis.example.com/diagram.png'
+      }
+    ]);
+
+    const reconciled = applyWebSocketEvent(optimistic, {
+      type: 'user_message',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      content: 'Attached',
+      attachments: [
+        {
+          artifact_id: 'art_2',
+          kind: 'image',
+          mime_type: 'image/png',
+          filename: 'diagram.png',
+          size_bytes: 456,
+          url: 'https://cognis.example.com/diagram.png'
+        },
+        {
+          artifact_id: 'art_1',
+          kind: 'pdf',
+          mime_type: 'application/pdf',
+          filename: 'notes.pdf',
+          size_bytes: 123,
+          url: 'https://cognis.example.com/notes.pdf'
+        }
+      ]
+    });
+
+    expect(reconciled).toHaveLength(1);
+    expect(reconciled[0]).toMatchObject({ kind: 'message', role: 'user', optimistic: false });
+  });
+
+  it('does not reconcile echoed user messages once newer timeline items exist', () => {
+    const optimistic = appendOptimisticUserMessage([], 'Hello from web');
+    const withNotice = applyWebSocketEvent(optimistic, {
+      type: 'history_notice',
+      title: 'History incomplete',
+      description: 'Gap',
+      tone: 'warning'
+    });
+
+    const echoed = applyWebSocketEvent(withNotice, {
+      type: 'user_message',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      content: 'Hello from web'
+    });
+
+    expect(echoed).toHaveLength(3);
+    expect(echoed[0]).toMatchObject({ kind: 'message', role: 'user', optimistic: true });
+    expect(echoed[2]).toMatchObject({ kind: 'message', role: 'user', optimistic: false });
   });
 
   it('deduplicates replayed system and history notice events using seq', () => {
