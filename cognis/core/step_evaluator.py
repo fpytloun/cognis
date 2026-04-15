@@ -64,9 +64,10 @@ Evaluation checklist:
 2. For each claim, is there evidence in the response content?
 3. Are there obvious errors, missing pieces, or incomplete work?
 4. If the objective mentions tests/validation, are they present and passing?
-5. A proper step completion may still report an outcome of "rejected" or "failed".
-   Judge whether the step was completed correctly, not whether the business
-   result was positive.
+5. A proper step completion may report an outcome of "success", "rejected",
+   or "failed". Success is valid when the review approves the plan or work
+   with no required changes. Judge whether the step was completed correctly,
+   not whether the business result was positive.
 
 Decide:
 - "approved" — the step objective is satisfactorily met based on actual \

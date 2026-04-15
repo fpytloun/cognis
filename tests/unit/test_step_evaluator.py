@@ -435,3 +435,27 @@ async def test_evaluator_prompt_includes_full_long_content() -> None:
     assert "### Strengths" in prompt
     assert "### Verdict" in prompt
     assert "truncated" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_evaluator_prompt_explicitly_allows_success_for_review_steps() -> None:
+    capture = _CaptureLLM()
+    evaluator = StepEvaluator(llm=capture, evaluator_timeout_seconds=5.0)
+
+    result = await evaluator.evaluate(
+        step_definition=_step_def("Review the implementation plan and approve it if it is sound."),
+        step_output=StepOutput(
+            summary="Review complete",
+            content="The revised plan is sound and ready for implementation.",
+            claims=["Reviewed the plan and found no blocking issues"],
+        ),
+        step_inputs={},
+    )
+
+    assert result.decision == "approved"
+    assert capture.messages is not None
+    prompt = str(capture.messages[1]["content"])
+    assert 'outcome of "success"' in prompt
+    assert '"rejected"' in prompt
+    assert '"failed"' in prompt
+    assert "Success is valid when the review approves the plan or work" in prompt

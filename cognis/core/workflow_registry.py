@@ -178,9 +178,12 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
                 "risk check. Focus on missing security, reliability, testability, "
                 "data, dependency, and failure-mode considerations. Catch important "
                 "omissions and overengineering, but do not block on nitpicks. If the "
+                "plan is sound and ready, complete the step normally with success. If the "
                 "review is complete and the plan needs revision, report that via "
                 "step_complete.outcome.status='rejected' with a concise reason. If the "
-                "review itself could not be completed, use outcome.status='failed'."
+                "review itself could not be completed, use outcome.status='failed'. Put "
+                "the outcome only in step_complete, not as a trailing JSON object in the "
+                "written review."
             ),
             input=StepInputConfig(type="full", source="plan"),
             completion=CompletionConfig(evaluate=True, max_attempts=3),
@@ -227,9 +230,12 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
             reasoning_effort="medium",
             prompt=(
                 "Review all changes made during implementation. If the review is complete "
-                "but fixes are required before approval, report that via "
+                "and the changes are acceptable, complete the step normally with success. "
+                "If the review is complete but fixes are required before approval, report that via "
                 "step_complete.outcome.status='rejected' with a concise reason. If the "
-                "review itself could not be completed, use outcome.status='failed'."
+                "review itself could not be completed, use outcome.status='failed'. Put "
+                "the outcome only in step_complete, not as a trailing JSON object in the "
+                "written review."
             ),
             input=StepInputConfig(
                 type="summary",

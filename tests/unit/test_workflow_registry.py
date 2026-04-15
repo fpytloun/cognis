@@ -85,6 +85,10 @@ def test_software_development_review_steps_use_outcome_routes() -> None:
     assert architect_step.input is not None
     assert architect_step.input.type == "full"
     assert "do not block on nitpicks" in architect_step.prompt
+    assert (
+        "plan is sound and ready, complete the step normally with success" in architect_step.prompt
+    )
+    assert "Put the outcome only in step_complete" in architect_step.prompt
     assert code_review_step.outcome_routes == [
         OutcomeRoute(
             status="rejected",
@@ -95,6 +99,10 @@ def test_software_development_review_steps_use_outcome_routes() -> None:
     ]
     assert code_review_step.input is not None
     assert code_review_step.input.type == "summary"
+    assert (
+        "changes are acceptable, complete the step normally with success" in code_review_step.prompt
+    )
+    assert "Put the outcome only in step_complete" in code_review_step.prompt
     assert commit_step.outcome_routes == [OutcomeRoute(status="failed", action="gate")]
 
 
