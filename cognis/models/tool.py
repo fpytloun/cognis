@@ -128,6 +128,7 @@ class ToolCall(BaseModel):
     name: str
     arguments: dict[str, Any] = Field(default_factory=dict)
     execution_scope_id: str | None = None
+    runtime_metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class MCPServerConfig(BaseModel):

@@ -187,6 +187,8 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_conversation_title_source_column)
         await conn.run_sync(_ensure_mcp_server_headers_column)
         await conn.run_sync(_ensure_system_override_tables)
+        await conn.run_sync(_ensure_task_execution_paths)
+        await conn.run_sync(_ensure_step_run_execution_paths)
         await conn.run_sync(_ensure_system_agent_override_skill_columns)
 
 
@@ -505,6 +507,34 @@ def _ensure_system_override_tables(sync_conn: object) -> None:
 
     SystemAgentOverride.__table__.create(sync_conn, checkfirst=True)
     SystemWorkflowOverride.__table__.create(sync_conn, checkfirst=True)
+
+
+def _ensure_task_execution_paths(sync_conn: object) -> None:
+    """Add working-directory columns to tasks when missing."""
+
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(sync_conn)
+    columns = {column["name"] for column in inspector.get_columns("tasks")}
+    execute = sync_conn.execute
+    if "workspace_root" not in columns:
+        execute(text("ALTER TABLE tasks ADD COLUMN workspace_root TEXT"))
+    if "working_directory" not in columns:
+        execute(text("ALTER TABLE tasks ADD COLUMN working_directory TEXT"))
+
+
+def _ensure_step_run_execution_paths(sync_conn: object) -> None:
+    """Add working-directory columns to step_runs when missing."""
+
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(sync_conn)
+    columns = {column["name"] for column in inspector.get_columns("step_runs")}
+    execute = sync_conn.execute
+    if "workspace_root" not in columns:
+        execute(text("ALTER TABLE step_runs ADD COLUMN workspace_root TEXT"))
+    if "working_directory" not in columns:
+        execute(text("ALTER TABLE step_runs ADD COLUMN working_directory TEXT"))
 
 
 def _ensure_system_agent_override_skill_columns(sync_conn: object) -> None:

@@ -49,6 +49,11 @@ from cognis.models.workflow import (
     resolve_effective_input,
     resolve_source_names,
 )
+from cognis.runtime_context import (
+    current_effective_working_directory,
+    current_workspace_root,
+    scoped_runtime_context,
+)
 from cognis.store.queries import (
     create_step_run,
     get_latest_active_conversation_for_agent,
@@ -177,18 +182,26 @@ class WorkflowEngine:
             tool_registry=runtime.tool_registry,
             executor_connection=runtime.executor_connection,
             executor_environment=runtime.executor_environment,
+            workspace_root=current_workspace_root.get(),
+            working_directory=current_effective_working_directory.get(),
             cancel_event=cancel_event,
             bootstrap_wait_for_intention=bootstrap_wait_for_intention,
             orchestration_mode=OrchestrationMode.FULL,
         )
 
         try:
-            return await self._agent_loop.run_step(
-                ctx,
-                on_token=on_progress,
-                on_tool_call=on_tool_call,
-                on_tool_result=on_tool_result,
-            )
+            with scoped_runtime_context(
+                user_email=session.user_email,
+                agent_id=agent.agent_id,
+                workspace_root=ctx.workspace_root,
+                effective_working_directory=ctx.working_directory,
+            ):
+                return await self._agent_loop.run_step(
+                    ctx,
+                    on_token=on_progress,
+                    on_tool_call=on_tool_call,
+                    on_tool_result=on_tool_result,
+                )
         finally:
             await runtime.cleanup()
 
@@ -299,7 +312,7 @@ class WorkflowEngine:
                         continue
 
                 # Run step
-                step_result = await self._execute_run_step(
+                step_execution = await self._execute_run_step(
                     task,
                     step_def,
                     state,
@@ -307,6 +320,10 @@ class WorkflowEngine:
                     on_progress=on_progress,
                     cancel_event=cancel_event,
                 )
+                if isinstance(step_execution, tuple):
+                    step_result, step_run_id = step_execution
+                else:
+                    step_result, step_run_id = step_execution, ""
 
                 if step_result is None:
                     # Step execution failed (e.g. mid-stream LLM error after
@@ -340,7 +357,11 @@ class WorkflowEngine:
                 completion = self._resolve_completion(step_def, workflow)
                 if completion and completion.evaluate:
                     evaluation = await self._evaluate_step(
-                        step_def, step_result, state, task, workflow
+                        step_def,
+                        step_result,
+                        state,
+                        task,
+                        workflow,
                     )
 
                     # Persist evaluation and update step_run status based
@@ -351,17 +372,13 @@ class WorkflowEngine:
                         "failed": "failed",
                     }.get(evaluation.decision, "rejected")
                     async with self._session_factory() as db_session:
-                        step_run = await get_latest_step_run_for_task_step(
-                            db_session, task.task_id, step_def.name
+                        await update_step_run(
+                            db_session,
+                            step_run_id,
+                            evaluation=evaluation.model_dump(mode="json"),
+                            status=eval_status,
                         )
-                        if step_run:
-                            await update_step_run(
-                                db_session,
-                                step_run.step_run_id,
-                                evaluation=evaluation.model_dump(mode="json"),
-                                status=eval_status,
-                            )
-                            await db_session.commit()
+                        await db_session.commit()
 
                     logger.info(
                         "Step evaluation result",
@@ -570,7 +587,7 @@ class WorkflowEngine:
         *,
         on_progress: ProgressCallback | None = None,
         cancel_event: asyncio.Event | None = None,
-    ) -> StepOutput | None:
+    ) -> tuple[StepOutput | None, str]:
         """Execute a single run step via the agent loop."""
 
         # Resolve agent
@@ -580,7 +597,7 @@ class WorkflowEngine:
                 "Could not resolve agent for step",
                 extra={"extra_data": {"task_id": task.task_id, "step": step_def.name}},
             )
-            return None
+            return None, ""
 
         # Determine if this is a retry (re-attempt of a previously-run step)
         attempt = state.loop_iterations.get(f"attempts:{step_def.name}", 1)
@@ -628,6 +645,8 @@ class WorkflowEngine:
                 attempt=attempt,
                 step_run_id=step_run_id,
                 conversation_id=conversation.conversation_id,
+                workspace_root=task.workspace_root,
+                working_directory=task.working_directory,
             )
             await update_step_run(
                 db_session,
@@ -692,6 +711,8 @@ class WorkflowEngine:
             task_title=task.title,
             task_description=task.description,
             task_expected_output=task.expected_output,
+            workspace_root=task.workspace_root,
+            working_directory=task.working_directory,
             step_run_id=step_run_id,
             policy=step_policy,
             is_retry=is_retry,
@@ -763,7 +784,7 @@ class WorkflowEngine:
 
         # Return None for failed steps so the workflow engine treats them
         # as failures (retry logic, on_exhausted handling, etc.)
-        return None if step_failed else output
+        return (None if step_failed else output), step_run_id
 
     async def _evaluate_step(
         self,
@@ -788,6 +809,8 @@ class WorkflowEngine:
             step_output=step_output,
             step_inputs=step_inputs,
             task_context=self._build_step_task_context(task, state),
+            execution_evidence=step_output.execution_evidence
+            or {"tools": [], "files_read": [], "files_written": [], "commands": []},
         )
 
     async def _handle_gate_step(

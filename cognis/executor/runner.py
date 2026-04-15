@@ -675,7 +675,14 @@ class ExecutorRunner:
                         executor_id=self.config.executor_id,
                         executor_type="remote",
                     ),
-                    runtime_metadata=self._runtime_metadata,
+                    runtime_metadata={
+                        **self._runtime_metadata,
+                        **(
+                            params.get("runtime_metadata")
+                            if isinstance(params.get("runtime_metadata"), dict)
+                            else {}
+                        ),
+                    },
                     execution_scope_id=str(
                         params.get("execution_scope_id")
                         or f"{self.config.executor_id}:{self._runtime_metadata.get('user_email', 'runtime')}"

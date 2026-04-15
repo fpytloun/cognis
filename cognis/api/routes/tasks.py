@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Query, Request
@@ -120,6 +122,7 @@ async def task_create(request: Request, payload: TaskCreateRequest) -> TaskRespo
         await _validate_conversation_access(request, payload.source_ref)
     if payload.delivery_target is not None:
         await _validate_conversation_access(request, payload.delivery_target)
+    _validate_execution_paths(payload.workspace_root, payload.working_directory)
     queue = request.app.state.task_queue
     delivery = TaskDelivery(mode=payload.delivery_mode, target=payload.delivery_target)
     if payload.status == "draft":
@@ -132,6 +135,8 @@ async def task_create(request: Request, payload: TaskCreateRequest) -> TaskRespo
             priority=payload.priority,
             delivery=delivery,
             workflow_id=payload.workflow_id,
+            workspace_root=payload.workspace_root,
+            working_directory=payload.working_directory,
             source_type=payload.source_type,
             source_ref=payload.source_ref,
         )
@@ -147,6 +152,8 @@ async def task_create(request: Request, payload: TaskCreateRequest) -> TaskRespo
             source_ref=payload.source_ref,
             delivery=delivery,
             workflow_id=payload.workflow_id,
+            workspace_root=payload.workspace_root,
+            working_directory=payload.working_directory,
             status=payload.status,
         )
     return task_to_response(task)
@@ -185,6 +192,17 @@ async def task_update(request: Request, task_id: str, payload: TaskUpdateRequest
         )
     effective_delivery_mode = payload.delivery_mode or existing_row.delivery_mode
     effective_delivery_target = payload.delivery_target or existing_row.delivery_target
+    effective_workspace_root = payload.workspace_root or getattr(
+        existing_row, "workspace_root", None
+    )
+    effective_working_directory = payload.working_directory or getattr(
+        existing_row, "working_directory", None
+    )
+    if payload.working_directory is not None and effective_workspace_root is None:
+        effective_workspace_root = payload.working_directory
+    if payload.workspace_root is not None and effective_working_directory is None:
+        effective_working_directory = payload.workspace_root
+    _validate_execution_paths(effective_workspace_root, effective_working_directory)
     if effective_delivery_mode == "specific_conversation" and effective_delivery_target is None:
         raise api_exception(
             400,
@@ -208,6 +226,18 @@ async def task_update(request: Request, task_id: str, payload: TaskUpdateRequest
             row.delivery_mode = updates.pop("delivery_mode")
         if "delivery_target" in updates:
             row.delivery_target = updates.pop("delivery_target")
+        if (
+            payload.working_directory is not None
+            and payload.workspace_root is None
+            and row.workspace_root is None
+        ):
+            row.workspace_root = payload.working_directory
+        if (
+            payload.workspace_root is not None
+            and payload.working_directory is None
+            and row.working_directory is None
+        ):
+            row.working_directory = payload.workspace_root
         for field_name, value in updates.items():
             setattr(row, field_name, value)
         row.updated_at = datetime.now(UTC)
@@ -474,6 +504,8 @@ def _row_to_task(row: Any) -> TaskModel:
         source_ref=row.source_ref,
         delivery=TaskDelivery(mode=row.delivery_mode, target=row.delivery_target),
         workflow_id=row.workflow_id,
+        workspace_root=getattr(row, "workspace_root", None),
+        working_directory=getattr(row, "working_directory", None),
         workflow_state=WorkflowState.model_validate(row.workflow_state)
         if row.workflow_state
         else None,
@@ -485,3 +517,19 @@ def _row_to_task(row: Any) -> TaskModel:
         result_summary=row.result_summary,
         result_data=row.result_data,
     )
+
+
+def _validate_execution_paths(workspace_root: str | None, working_directory: str | None) -> None:
+    if not workspace_root or not working_directory:
+        return
+
+    root = Path(os.path.realpath(os.path.expanduser(workspace_root)))
+    cwd = Path(os.path.realpath(os.path.expanduser(working_directory)))
+    try:
+        cwd.relative_to(root)
+    except ValueError as exc:
+        raise api_exception(
+            400,
+            "validation_error",
+            "working_directory must be equal to or inside workspace_root",
+        ) from exc

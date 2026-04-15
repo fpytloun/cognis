@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import uuid
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import sqlalchemy as sa
@@ -1245,12 +1247,19 @@ async def create_task(
     delivery_mode: str = "same_conversation",
     delivery_target: str | None = None,
     workflow_id: str | None = None,
+    workspace_root: str | None = None,
+    working_directory: str | None = None,
     workflow_state: dict[str, object] | None = None,
     queue_name: str = "default",
     scheduled_for: datetime | None = None,
     task_id: str | None = None,
 ) -> Task:
     """Create a new task."""
+    if working_directory and not workspace_root:
+        workspace_root = working_directory
+    if workspace_root and not working_directory:
+        working_directory = workspace_root
+    _validate_task_execution_paths(workspace_root, working_directory)
     row = Task(
         task_id=task_id or f"task_{uuid.uuid4().hex}",
         title=title,
@@ -1265,6 +1274,8 @@ async def create_task(
         delivery_mode=delivery_mode,
         delivery_target=delivery_target,
         workflow_id=workflow_id,
+        workspace_root=workspace_root,
+        working_directory=working_directory,
         workflow_state=workflow_state,
         queue_name=queue_name,
         scheduled_for=scheduled_for,
@@ -1272,6 +1283,19 @@ async def create_task(
     session.add(row)
     await session.flush()
     return row
+
+
+def _validate_task_execution_paths(
+    workspace_root: str | None, working_directory: str | None
+) -> None:
+    if not workspace_root or not working_directory:
+        return
+    root = Path(os.path.realpath(os.path.expanduser(workspace_root)))
+    cwd = Path(os.path.realpath(os.path.expanduser(working_directory)))
+    try:
+        cwd.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("working_directory must be equal to or inside workspace_root") from exc
 
 
 async def get_task(session: AsyncSession, task_id: str) -> Task | None:
@@ -1614,6 +1638,8 @@ async def create_step_run(
     attempt: int = 1,
     step_run_id: str | None = None,
     conversation_id: str | None = None,
+    workspace_root: str | None = None,
+    working_directory: str | None = None,
 ) -> StepRun:
     """Create a new step run record."""
     row = StepRun(
@@ -1623,6 +1649,8 @@ async def create_step_run(
         step_type=step_type,
         agent_id=agent_id,
         attempt=attempt,
+        workspace_root=workspace_root,
+        working_directory=working_directory,
         conversation_id=conversation_id,
     )
     session.add(row)
@@ -1650,6 +1678,8 @@ async def update_step_run(
     conversation_id: str | None = None,
     session_id: str | None = None,
     intaris_session_id: str | None = None,
+    workspace_root: str | None = None,
+    working_directory: str | None = None,
     output: dict[str, object] | None = None,
     evaluation: dict[str, object] | None = None,
     todos: list[dict[str, object]] | None = None,
@@ -1671,6 +1701,10 @@ async def update_step_run(
         values["session_id"] = session_id
     if intaris_session_id is not None:
         values["intaris_session_id"] = intaris_session_id
+    if workspace_root is not None:
+        values["workspace_root"] = workspace_root
+    if working_directory is not None:
+        values["working_directory"] = working_directory
     if output is not None:
         values["output"] = output
     if evaluation is not None:
@@ -2139,6 +2173,50 @@ async def count_active_tasks_for_schedule(session: AsyncSession, schedule_id: st
         )
     )
     return int(result.scalar_one())
+
+
+async def get_latest_schedule_task_runs(
+    session: AsyncSession,
+    schedule_ids: list[str],
+    *,
+    created_by: str,
+) -> dict[str, tuple[str, datetime | None]]:
+    """Return the newest scheduler-created task status per schedule."""
+    if not schedule_ids:
+        return {}
+
+    ranked_runs = (
+        select(
+            Task.source_ref.label("schedule_id"),
+            Task.status.label("status"),
+            Task.created_at.label("created_at"),
+            sa.func.row_number()
+            .over(
+                partition_by=Task.source_ref,
+                order_by=(Task.created_at.desc(), Task.task_id.desc()),
+            )
+            .label("row_number"),
+        )
+        .where(
+            Task.source_type == "scheduler",
+            Task.source_ref.in_(schedule_ids),
+            Task.created_by == created_by,
+        )
+        .subquery()
+    )
+
+    result = await session.execute(
+        select(
+            ranked_runs.c.schedule_id,
+            ranked_runs.c.status,
+            ranked_runs.c.created_at,
+        ).where(ranked_runs.c.row_number == 1)
+    )
+    return {
+        str(schedule_id): (str(status), created_at)
+        for schedule_id, status, created_at in result.all()
+        if schedule_id is not None and status is not None
+    }
 
 
 # --- Skills ---
@@ -3400,47 +3478,3 @@ async def expire_stale_pairing_requests(
         .values(status="expired")
     )
     return int(result.rowcount or 0)
-
-async def get_latest_schedule_task_runs(
-    session: AsyncSession,
-    schedule_ids: list[str],
-    *,
-    created_by: str,
-) -> dict[str, tuple[str, datetime | None]]:
-    """Return the newest scheduler-created task status per schedule."""
-    if not schedule_ids:
-        return {}
-
-    ranked_runs = (
-        select(
-            Task.source_ref.label("schedule_id"),
-            Task.status.label("status"),
-            Task.created_at.label("created_at"),
-            sa.func.row_number()
-            .over(
-                partition_by=Task.source_ref,
-                order_by=(Task.created_at.desc(), Task.task_id.desc()),
-            )
-            .label("row_number"),
-        )
-        .where(
-            Task.source_type == "scheduler",
-            Task.source_ref.in_(schedule_ids),
-            Task.created_by == created_by,
-        )
-        .subquery()
-    )
-
-    result = await session.execute(
-        select(
-            ranked_runs.c.schedule_id,
-            ranked_runs.c.status,
-            ranked_runs.c.created_at,
-        ).where(ranked_runs.c.row_number == 1)
-    )
-    return {
-        str(schedule_id): (str(status), created_at)
-        for schedule_id, status, created_at in result.all()
-        if schedule_id is not None and status is not None
-    }
-

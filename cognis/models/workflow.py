@@ -206,6 +206,7 @@ class StepOutput(BaseModel):
     outputs: dict[str, Any] = {}
     claims: list[str] = []
     outcome: StepOutcome | None = None
+    execution_evidence: dict[str, Any] | None = None
     error: str | None = None  # Set when the step failed with an exception
     completed_at: datetime | None = None
     session_id: str | None = None

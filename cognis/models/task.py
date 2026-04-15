@@ -61,6 +61,8 @@ class TaskModel(BaseModel):
     source_ref: str | None = None
     delivery: TaskDelivery = TaskDelivery()
     workflow_id: str | None = None
+    workspace_root: str | None = None
+    working_directory: str | None = None
     workflow_state: WorkflowState | None = None
     queue_name: str = "default"
     scheduled_for: datetime | None = None
@@ -81,6 +83,8 @@ class StepRunModel(BaseModel):
     status: StepRunStatus = StepRunStatus.PENDING
     attempt: int = 1
     agent_id: str
+    workspace_root: str | None = None
+    working_directory: str | None = None
     session_id: str | None = None
     intaris_session_id: str | None = None
     output: StepOutput | None = None

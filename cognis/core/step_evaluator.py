@@ -47,14 +47,17 @@ Step objective:
 Step inputs (from previous steps):
 {inputs}
 
-Agent's completion claim:
+step_complete metadata:
   Summary: {summary}
   Claims: {claims}
   Outputs: {outputs}
   Outcome: {outcome}
 
-Agent's last response:
+Assistant written deliverable:
 {content}
+
+Execution evidence:
+{execution_evidence}
 
 Task context:
 {task_context}
@@ -68,6 +71,11 @@ Evaluation checklist:
    or "failed". Success is valid when the review approves the plan or work
    with no required changes. Judge whether the step was completed correctly,
    not whether the business result was positive.
+6. Do not require step_complete metadata fields to appear inside the assistant's
+   written deliverable. They are supplied separately above.
+7. Only require artifacts explicitly requested by the step objective. Process
+   guidance is not automatically a required output artifact.
+8. Use execution evidence to validate claims when it is relevant and available.
 
 Decide:
 - "approved" — the step objective is satisfactorily met based on actual \
@@ -118,6 +126,7 @@ class StepEvaluator:
         step_output: StepOutput,
         step_inputs: dict[str, StepOutput],
         task_context: str = "",
+        execution_evidence: dict[str, Any] | None = None,
     ) -> StepEvaluation:
         """Run semantic evaluation on a step's output.
 
@@ -125,7 +134,13 @@ class StepEvaluator:
         On timeout or transport error, defaults to 'approved' (fail-open).
         Empty or truncated evaluator output is treated as an evaluator failure.
         """
-        prompt = self._build_prompt(step_definition, step_output, step_inputs, task_context)
+        prompt = self._build_prompt(
+            step_definition,
+            step_output,
+            step_inputs,
+            task_context,
+            execution_evidence or {},
+        )
 
         with EVALUATION_DURATION.time():
             try:
@@ -240,6 +255,7 @@ class StepEvaluator:
         step_output: StepOutput,
         step_inputs: dict[str, StepOutput],
         task_context: str,
+        execution_evidence: dict[str, Any],
     ) -> str:
         """Build the evaluator prompt."""
         template = (
@@ -259,6 +275,7 @@ class StepEvaluator:
             if step_output.outcome is not None
             else "(implicit success)"
         )
+        formatted_execution_evidence = json.dumps(execution_evidence, default=str)[:4000] or "{}"
 
         # Include the full response content so the evaluator can verify claims
         # against evidence anywhere in the deliverable.
@@ -272,6 +289,7 @@ class StepEvaluator:
             outputs=formatted_outputs,
             outcome=formatted_outcome,
             content=formatted_content,
+            execution_evidence=formatted_execution_evidence,
             task_context=task_context or "(none)",
         )
 

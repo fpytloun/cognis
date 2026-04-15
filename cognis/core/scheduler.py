@@ -225,6 +225,8 @@ class Scheduler:
             expected_output = template.pop("expected_output", None)
             priority = template.pop("priority", 0)
             workflow_id = template.pop("workflow_id", None) or sched.workflow_id
+            workspace_root = template.pop("workspace_root", None)
+            working_directory = template.pop("working_directory", None)
 
             # Delivery config from template
             delivery_raw = template.pop("delivery", None)
@@ -243,6 +245,8 @@ class Scheduler:
                 source_ref=schedule_id,
                 delivery=delivery,
                 workflow_id=workflow_id,
+                workspace_root=workspace_root,
+                working_directory=working_directory,
             )
 
             logger.info(

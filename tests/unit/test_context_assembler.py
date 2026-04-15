@@ -227,6 +227,51 @@ async def test_context_assembler_runs_fetches_in_parallel_and_attaches_memory_se
 
 
 @pytest.mark.asyncio
+async def test_context_assembler_loads_root_project_instructions(tmp_path: Path) -> None:
+    (tmp_path / "AGENTS.md").write_text("# Project instructions\nUse pytest.\n")
+    (tmp_path / "README.md").write_text("# Readme\nHelpful overview.\n")
+
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=_SessionCache(),
+        session_manager=_SessionManager(),
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+
+    result = await assembler.assemble(
+        session=_session(),
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="implement this",
+        tool_definitions=[],
+        workspace_root=str(tmp_path),
+        effective_working_directory=str(tmp_path),
+        executor_environment=ExecutorEnvironmentSnapshot(
+            available=True,
+            executor_id="exec-1",
+            executor_type="in_process",
+            cwd=str(tmp_path),
+            home=str(tmp_path),
+        ),
+    )
+
+    system_messages = [
+        str(message.get("content", ""))
+        for message in result.messages
+        if message.get("role") == "system"
+    ]
+    assert any(
+        "Instructions from:" in content and "AGENTS.md" in content for content in system_messages
+    )
+    assert not any(
+        "Instructions from:" in content and "README.md" in content for content in system_messages
+    )
+
+
+@pytest.mark.asyncio
 async def test_context_assembler_uses_search_mode_for_follow_up_turns() -> None:
     memory = _Memory()
     assembler = ContextAssembler(
@@ -366,7 +411,7 @@ def test_build_environment_info_uses_executor_snapshot() -> None:
     assert "exec-1" in info
     assert "/remote/home" in info
     assert "/remote/work" in info
-    assert "defaults to its home directory" in info
+    assert "tools default to the effective working directory" in info
 
 
 def test_build_environment_info_marks_unavailable_remote_environment() -> None:

@@ -196,6 +196,8 @@ class TaskQueue:
         source_ref: str | None = None,
         delivery: TaskDelivery | None = None,
         workflow_id: str | None = None,
+        workspace_root: str | None = None,
+        working_directory: str | None = None,
         scheduled_for: datetime | None = None,
         status: str = "queued",
     ) -> TaskModel:
@@ -223,6 +225,8 @@ class TaskQueue:
                 delivery_mode=delivery.mode,
                 delivery_target=delivery.target,
                 workflow_id=workflow_id,
+                workspace_root=workspace_root,
+                working_directory=working_directory,
                 scheduled_for=scheduled_for,
             )
             await db_session.commit()
@@ -257,6 +261,8 @@ class TaskQueue:
         priority: int = 0,
         delivery: TaskDelivery | None = None,
         workflow_id: str | None = None,
+        workspace_root: str | None = None,
+        working_directory: str | None = None,
         source_type: str = "api",
         source_ref: str | None = None,
     ) -> TaskModel:
@@ -270,6 +276,8 @@ class TaskQueue:
             priority=priority,
             delivery=delivery,
             workflow_id=workflow_id,
+            workspace_root=workspace_root,
+            working_directory=working_directory,
             source_type=source_type,
             source_ref=source_ref,
             status="draft",
@@ -699,6 +707,8 @@ class TaskQueue:
         with scoped_runtime_context(
             user_email=task.created_by,
             agent_id=task.agent_id,
+            workspace_root=task.workspace_root,
+            effective_working_directory=task.working_directory or task.workspace_root,
         ):
             try:
                 # Resolve workflow — auto-select via LLM classifier if not set
@@ -866,6 +876,8 @@ def _row_to_task_model(row: Any) -> TaskModel:
             target=row.delivery_target,
         ),
         workflow_id=row.workflow_id,
+        workspace_root=getattr(row, "workspace_root", None),
+        working_directory=getattr(row, "working_directory", None),
         workflow_state=(
             WorkflowState.model_validate(row.workflow_state) if row.workflow_state else None
         ),

@@ -22,7 +22,10 @@ async def handle_glob(arguments: dict[str, Any], context: ToolExecutionContext) 
     if not pattern:
         return ToolResult(output="No pattern provided.", is_error=True)
 
-    base = resolve_path(search_path, default_to_home=True)
+    try:
+        base = resolve_path(search_path, context=context, default_to_home=True)
+    except ValueError as exc:
+        return ToolResult(output=str(exc), is_error=True)
     if not base.is_dir():
         return ToolResult(output=f"Not a directory: {search_path}", is_error=True)
 
@@ -68,7 +71,10 @@ async def handle_grep(arguments: dict[str, Any], context: ToolExecutionContext) 
     except re.error as exc:
         return ToolResult(output=f"Invalid regex: {exc}", is_error=True)
 
-    base = resolve_path(search_path, default_to_home=True)
+    try:
+        base = resolve_path(search_path, context=context, default_to_home=True)
+    except ValueError as exc:
+        return ToolResult(output=str(exc), is_error=True)
     if not base.is_dir():
         return ToolResult(output=f"Not a directory: {search_path}", is_error=True)
 

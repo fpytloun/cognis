@@ -563,8 +563,21 @@ class ToolRouter:
             return ToolResult(output="Unknown tool handler.", is_error=True)
         start = perf_counter()
         executor_handle = self._executor_handle_for_local_tool(executor)
+        from cognis.runtime_context import (
+            current_effective_working_directory,
+            current_workspace_root,
+        )
+
+        runtime_metadata: dict[str, Any] = {}
+        workspace_root = current_workspace_root.get()
+        working_directory = current_effective_working_directory.get()
+        if workspace_root:
+            runtime_metadata["workspace_root"] = workspace_root
+        if working_directory:
+            runtime_metadata["working_directory"] = working_directory
         context = ToolExecutionContext(
             executor_handle=executor_handle,
+            runtime_metadata=runtime_metadata,
             execution_scope_id=tool_call.execution_scope_id,
         )
         normalized_arguments = strip_empty_optional_values(

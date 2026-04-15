@@ -447,6 +447,8 @@ class TaskCreateRequest(BaseModel):
     source_type: str = "api"
     source_ref: str | None = None
     status: str = "draft"
+    workspace_root: str | None = None
+    working_directory: str | None = None
 
 
 class TaskUpdateRequest(BaseModel):
@@ -458,6 +460,8 @@ class TaskUpdateRequest(BaseModel):
     workflow_id: str | None = None
     delivery_mode: str | None = None
     delivery_target: str | None = None
+    workspace_root: str | None = None
+    working_directory: str | None = None
 
 
 class TaskActionResponse(BaseModel):
@@ -506,6 +510,8 @@ class TaskResponse(BaseModel):
     source_ref: str | None = None
     delivery: TaskDelivery = Field(default_factory=TaskDelivery)
     workflow_id: str | None = None
+    workspace_root: str | None = None
+    working_directory: str | None = None
     workflow_state: WorkflowState | None = None
     queue_name: str = "default"
     scheduled_for: datetime | None = None
@@ -552,6 +558,8 @@ class StepRunResponse(BaseModel):
     status: str
     attempt: int = 1
     agent_id: str
+    workspace_root: str | None = None
+    working_directory: str | None = None
     conversation_id: str | None = None
     session_id: str | None = None
     intaris_session_id: str | None = None

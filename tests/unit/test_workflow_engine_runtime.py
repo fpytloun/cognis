@@ -585,3 +585,56 @@ async def test_handle_exhausted_gate_continue_does_not_mark_step_skipped(
     assert state.current_step_index == len(workflow.steps)
     assert state.skipped_steps == ["architect_review"]
     assert persisted == [(["architect_review"], len(workflow.steps))]
+
+
+@pytest.mark.asyncio
+async def test_execute_workflow_updates_current_step_run_id_after_retry_reset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _build_engine()
+    task = TaskModel(
+        task_id="task-1",
+        title="Task",
+        created_by="user@example.com",
+        agent_id="agent-1",
+        workflow_id="wf:test",
+        workflow_state=WorkflowState(current_step_index=0),
+    )
+    workflow = Workflow(
+        workflow_id="wf:test",
+        name="Test",
+        steps=[StepDefinition(name="implement", type="run", completion={"evaluate": True})],
+    )
+    updated_ids: list[str] = []
+
+    async def _execute_run_step(*args: object, **kwargs: object):
+        del args, kwargs
+        return StepOutput(summary="done", content="done", execution_evidence={}), "sr-current"
+
+    async def _evaluate_step(*args: object, **kwargs: object) -> SimpleNamespace:
+        del args, kwargs
+        return SimpleNamespace(
+            decision="approved", model_dump=lambda mode=None: {"decision": "approved"}
+        )
+
+    async def _update_step_run(_session: object, step_run_id: str, **kwargs: object) -> bool:
+        if kwargs.get("evaluation") is not None:
+            updated_ids.append(step_run_id)
+        return True
+
+    async def _noop(*args: object, **kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(engine, "_execute_run_step", _execute_run_step)
+    monkeypatch.setattr(engine, "_evaluate_step", _evaluate_step)
+    monkeypatch.setattr(engine, "_persist_workflow_state", _noop)
+    monkeypatch.setattr(engine, "_persist_task_final", _noop)
+    monkeypatch.setattr(engine, "_cleanup_step_sessions", _noop)
+    monkeypatch.setattr(engine, "_deliver_task_result", _noop)
+    monkeypatch.setattr("cognis.core.workflow_engine.update_step_run", _update_step_run)
+    monkeypatch.setattr(engine._session_manager, "mark_completed", _noop, raising=False)
+
+    result = await engine.execute_workflow(task, workflow)
+
+    assert result.status == "completed"
+    assert updated_ids == ["sr-current"]

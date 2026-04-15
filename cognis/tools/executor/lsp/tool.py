@@ -48,7 +48,10 @@ async def handle_lsp(arguments: dict[str, Any], context: ToolExecutionContext) -
     if lsp is None or not hasattr(lsp, "touch_file") or not hasattr(lsp, "has_clients"):
         return ToolResult(output="LSP is not available in this executor.", is_error=True)
 
-    resolved_path = str(resolve_path(file_path))
+    try:
+        resolved_path = str(resolve_path(file_path, context=context))
+    except ValueError as exc:
+        return ToolResult(output=str(exc), is_error=True)
     if not os.path.exists(resolved_path):
         return ToolResult(output=f"Path does not exist: {file_path}", is_error=True)
     if not os.path.isfile(resolved_path):

@@ -7,6 +7,7 @@ import datetime
 import html
 import json
 import re
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -40,6 +41,8 @@ EVENT_TYPES_FOR_CONTEXT = [
     "lifecycle",
     "evaluation",
 ]
+
+_MAX_PROJECT_INSTRUCTION_BYTES = 32000
 
 
 def _is_newer_timestamp(candidate: str | None, current: str | None) -> bool:
@@ -120,6 +123,9 @@ def _native_attachment_blocks(
 
 def _build_environment_info(
     executor_environment: ExecutorEnvironmentSnapshot | None = None,
+    *,
+    workspace_root: str | None = None,
+    effective_working_directory: str | None = None,
 ) -> str:
     """Build environment information for the LLM context.
 
@@ -148,10 +154,16 @@ def _build_environment_info(
         + f"- System user: {env.user or 'unknown'}\n"
         + f"- Home directory: {env.home or 'unknown'}\n"
         + f"- Working directory: {env.cwd or 'unknown'}\n"
-        f"- Date: {datetime.date.today().isoformat()}\n"
-        "When the user references ~ or $HOME, use the home directory above. "
-        "If a filesystem path or shell workdir is omitted, the executor defaults to its "
-        "home directory; the working directory above is informational only."
+        + (f"- Workspace root: {workspace_root}\n" if workspace_root else "")
+        + (
+            f"- Effective working directory: {effective_working_directory}\n"
+            if effective_working_directory
+            else ""
+        )
+        + f"- Date: {datetime.date.today().isoformat()}\n"
+        + "When the user references ~ or $HOME, use the home directory above. "
+        + "If a filesystem path or shell workdir is omitted, tools default to the effective "
+        + "working directory above when available."
     )
 
 
@@ -175,6 +187,51 @@ def _compose_identity_prompt(agent: AgentDefinition) -> str | None:
     """Compose the immutable identity prompt for an agent."""
     identity_parts = [part for part in [agent.compose_personality(), agent.system_prompt] if part]
     return "\n\n".join(identity_parts) if identity_parts else None
+
+
+def _load_project_instructions(
+    *,
+    workspace_root: str | None,
+    effective_working_directory: str | None,
+    executor_environment: ExecutorEnvironmentSnapshot | None,
+) -> list[str]:
+    executor_type = executor_environment.executor_type if executor_environment else None
+    if executor_type not in {None, "in_process", "subprocess", "controller"}:
+        return []
+    root = workspace_root or effective_working_directory
+    if not root:
+        return []
+    root_path = Path(root).resolve()
+    if not root_path.is_dir():
+        return []
+    directories: list[Path] = []
+    if effective_working_directory:
+        current = Path(effective_working_directory).resolve()
+        while True:
+            directories.append(current)
+            if current == root_path or current.parent == current:
+                break
+            current = current.parent
+    else:
+        directories.append(root_path)
+
+    seen_dirs: set[Path] = set()
+    for directory in directories:
+        if directory in seen_dirs or not directory.is_dir():
+            continue
+        seen_dirs.add(directory)
+        for filename in ("AGENTS.md", "CLAUDE.md", "README.md"):
+            candidate = directory / filename
+            if not candidate.is_file():
+                continue
+            try:
+                content = candidate.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if not content.strip():
+                continue
+            return [f"Instructions from: {candidate}\n{content[:_MAX_PROJECT_INSTRUCTION_BYTES]}"]
+    return []
 
 
 class ContextAssembler:
@@ -255,6 +312,8 @@ class ContextAssembler:
         skip_memory: bool = False,
         prompt_context: PromptContext = PromptContext.CHAT,
         executor_environment: ExecutorEnvironmentSnapshot | None = None,
+        workspace_root: str | None = None,
+        effective_working_directory: str | None = None,
     ) -> ContextAssemblyResult:
         """Build the LLM message list for a single turn.
 
@@ -296,6 +355,8 @@ class ContextAssembler:
                 skip_user_message=skip_user_message,
                 prompt_context=prompt_context,
                 executor_environment=executor_environment,
+                workspace_root=workspace_root,
+                effective_working_directory=effective_working_directory,
             )
 
         cached_intention = self.session_cache.get_intention(session.session_id)
@@ -566,9 +627,21 @@ class ContextAssembler:
         messages.append(
             {
                 "role": "system",
-                "content": _build_environment_info(executor_environment),
+                "content": _build_environment_info(
+                    executor_environment,
+                    workspace_root=workspace_root,
+                    effective_working_directory=effective_working_directory,
+                ),
             }
         )
+
+        project_instructions = _load_project_instructions(
+            workspace_root=workspace_root,
+            effective_working_directory=effective_working_directory,
+            executor_environment=executor_environment,
+        )
+        for item in project_instructions:
+            messages.append({"role": "system", "content": item})
 
         # History messages (append-only)
         history_messages = self._events_to_messages(
@@ -729,6 +802,8 @@ class ContextAssembler:
         skip_user_message: bool = False,
         prompt_context: PromptContext = PromptContext.TASK_STEP,
         executor_environment: ExecutorEnvironmentSnapshot | None = None,
+        workspace_root: str | None = None,
+        effective_working_directory: str | None = None,
     ) -> ContextAssemblyResult:
         """Assemble context without Mnemory calls — for secondary agents.
 
@@ -805,9 +880,21 @@ class ContextAssembler:
         messages.append(
             {
                 "role": "system",
-                "content": _build_environment_info(executor_environment),
+                "content": _build_environment_info(
+                    executor_environment,
+                    workspace_root=workspace_root,
+                    effective_working_directory=effective_working_directory,
+                ),
             }
         )
+
+        project_instructions = _load_project_instructions(
+            workspace_root=workspace_root,
+            effective_working_directory=effective_working_directory,
+            executor_environment=executor_environment,
+        )
+        for item in project_instructions:
+            messages.append({"role": "system", "content": item})
 
         history_messages = self._events_to_messages(
             self.session_cache.get_events_since_compaction(

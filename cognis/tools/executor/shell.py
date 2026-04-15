@@ -116,7 +116,7 @@ async def handle_bash(arguments: dict[str, Any], context: ToolExecutionContext) 
     timeout_seconds = max(1, timeout_ms // 1000)
 
     try:
-        resolved_cwd = str(resolve_path(workdir, default_to_home=True))
+        resolved_cwd = str(resolve_path(workdir, context=context, default_to_home=True))
         if not os.path.isdir(resolved_cwd):
             return ToolResult(
                 output=f"Working directory not found: {workdir}",
@@ -173,4 +173,17 @@ async def handle_bash(arguments: dict[str, Any], context: ToolExecutionContext) 
             output[:_MAX_OUTPUT_SIZE] + f"\n[truncated: {len(output)} chars -> {_MAX_OUTPUT_SIZE}]"
         )
 
-    return ToolResult(output=output, is_error=exit_code != 0)
+    return ToolResult(
+        output=output,
+        is_error=exit_code != 0,
+        metadata={
+            "commands": [
+                {
+                    "program": command.split(maxsplit=1)[0] if command.strip() else "",
+                    "cwd": resolved_cwd,
+                    "ok": exit_code == 0,
+                    "exit_code": exit_code,
+                }
+            ]
+        },
+    )

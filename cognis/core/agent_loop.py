@@ -54,7 +54,11 @@ from cognis.models.tool import (
 )
 from cognis.models.workflow import StepDefinition, StepOutput, WorkflowState
 from cognis.providers.retry import is_retryable_http_error
-from cognis.runtime_context import scoped_runtime_context  # noqa: F401 — used in delegation
+from cognis.runtime_context import (  # noqa: F401 — used in delegation
+    current_effective_working_directory,
+    current_workspace_root,
+    scoped_runtime_context,
+)
 from cognis.store.queries import get_setting_value
 from cognis.tools.builtin.orchestration import (
     OrchestrationMode,
@@ -209,6 +213,8 @@ def _task_row_to_model(task_row: Any) -> Any:
                 "target": getattr(task_row, "delivery_target", None),
             },
             "workflow_id": getattr(task_row, "workflow_id", None),
+            "workspace_root": getattr(task_row, "workspace_root", None),
+            "working_directory": getattr(task_row, "working_directory", None),
             "workflow_state": getattr(task_row, "workflow_state", None),
             "queue_name": getattr(task_row, "queue_name", "default"),
             "scheduled_for": getattr(task_row, "scheduled_for", None),
@@ -819,6 +825,8 @@ class StepContext:
     task_title: str = ""
     task_description: str = ""
     task_expected_output: str | None = None
+    workspace_root: str | None = None
+    working_directory: str | None = None
     step_run_id: str | None = None
     policy: ExecutionPolicy = field(default_factory=lambda: CHAT_POLICY)
     is_retry: bool = False  # True for re-attempt within the same step
@@ -838,6 +846,14 @@ class StepContext:
     follow_up: FollowUpMetadata | None = None
     bootstrap_wait_for_intention: bool = False
     orchestration_mode: OrchestrationMode = OrchestrationMode.FULL
+    execution_evidence: dict[str, Any] = field(
+        default_factory=lambda: {
+            "tools": [],
+            "files_read": [],
+            "files_written": [],
+            "commands": [],
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1107,6 +1123,8 @@ class AgentLoop:
             tool_registry=child_runtime.tool_registry,
             executor_connection=child_runtime.executor_connection,
             executor_environment=child_runtime.executor_environment,
+            workspace_root=current_workspace_root.get(),
+            working_directory=current_effective_working_directory.get(),
             orchestration_mode=OrchestrationMode.NONE,  # Sub-sessions cannot delegate
         )
 
@@ -1116,6 +1134,8 @@ class AgentLoop:
         with scoped_runtime_context(
             user_email=child_session.user_email,
             agent_id=resolved_agent.agent_id,
+            workspace_root=current_workspace_root.get(),
+            effective_working_directory=current_effective_working_directory.get(),
         ):
             try:
                 output = await self.run_step(
@@ -1541,6 +1561,8 @@ class AgentLoop:
             skip_memory=ctx.policy.skip_memory,
             prompt_context=_prompt_ctx,
             executor_environment=ctx.executor_environment,
+            workspace_root=ctx.workspace_root,
+            effective_working_directory=ctx.working_directory,
         )
         messages = context_result.messages
 
@@ -1946,6 +1968,7 @@ class AgentLoop:
                             outputs=tc.arguments.get("outputs", {}),
                             claims=tc.arguments.get("claims", []),
                             outcome=tc.arguments.get("outcome"),
+                            execution_evidence=dict(ctx.execution_evidence),
                             attachments=list(collected_attachments),
                             session_id=ctx.session.session_id,
                             intaris_session_id=ctx.session.intaris_session_id
@@ -2566,12 +2589,15 @@ class AgentLoop:
                     )
 
                     result = await self.tool_router.execute(
-                        tc,
+                        tc.model_copy(
+                            update={"runtime_metadata": self._tool_runtime_metadata(ctx)}
+                        ),
                         ctx.session,
                         ctx.agent,
                         self._get_tool_registry(ctx),
                         self._get_executor(ctx),
                     )
+                    self._record_execution_evidence(ctx, tool_name=tc.name, result=result)
 
                     # -------------------------------------------------------
                     # Escalation blocking: pause and wait for user approval
@@ -2847,12 +2873,13 @@ class AgentLoop:
             )
             # Re-execute: Intaris auto-approves via escalation retry (10 min)
             result = await self.tool_router.execute(
-                tc,
+                tc.model_copy(update={"runtime_metadata": self._tool_runtime_metadata(ctx)}),
                 ctx.session,
                 ctx.agent,
                 self._get_tool_registry(ctx),
                 self._get_executor(ctx),
             )
+            self._record_execution_evidence(ctx, tool_name=tc.name, result=result)
             # If Intaris still escalates on retry (shouldn't happen), treat
             # as denied to avoid infinite loops.
             retry_eval = result.metadata.get("evaluation") if result.metadata else None
@@ -3295,6 +3322,8 @@ class AgentLoop:
                     source_ref=ctx.conversation.conversation_id,
                     delivery=TaskDelivery(mode="same_conversation"),
                     workflow_id=workflow_id,
+                    workspace_root=ctx.workspace_root,
+                    working_directory=ctx.working_directory,
                 )
 
                 # Record delegation event so the card appears in session
@@ -4403,6 +4432,45 @@ class AgentLoop:
         if response is None:
             return None
         return str(response)
+
+    def _tool_runtime_metadata(self, ctx: StepContext) -> dict[str, Any]:
+        metadata: dict[str, Any] = {}
+        if ctx.workspace_root:
+            metadata["workspace_root"] = ctx.workspace_root
+        if ctx.working_directory:
+            metadata["working_directory"] = ctx.working_directory
+        return metadata
+
+    def _record_execution_evidence(
+        self,
+        ctx: StepContext,
+        *,
+        tool_name: str,
+        result: ToolResult | None = None,
+    ) -> None:
+        evidence = ctx.execution_evidence
+        tools = evidence.setdefault("tools", [])
+        tools.append({"name": tool_name, "ok": False if result is None else not result.is_error})
+        if result is None or result.metadata is None:
+            return
+        for key in ("files_read", "files_written"):
+            bucket = evidence.setdefault(key, [])
+            for item in (
+                result.metadata.get(key, []) if isinstance(result.metadata.get(key), list) else []
+            ):
+                if {"path": item} not in bucket:
+                    bucket.append({"path": item})
+        commands = evidence.setdefault("commands", [])
+        for item in (
+            result.metadata.get("commands", [])
+            if isinstance(result.metadata.get("commands"), list)
+            else []
+        ):
+            if isinstance(item, dict):
+                commands.append(item)
+
+        for key in ("tools", "files_read", "files_written", "commands"):
+            evidence[key] = evidence[key][:20]
 
     def _build_step_prompt(self, ctx: StepContext) -> str:
         """Build the step objective prompt.

@@ -32,6 +32,7 @@ from cognis.models.tool import (
     tool_matches_identifier,
 )
 from cognis.providers.executor.in_process import InProcessExecutorConnection
+from cognis.runtime_context import current_effective_working_directory, current_workspace_root
 from cognis.tools.builtin.datetime_tools import build_datetime_tool_handlers, datetime_tools
 from cognis.tools.builtin.image import image_tools
 from cognis.tools.builtin.memory import memory_tools
@@ -305,6 +306,12 @@ def build_step_runtime_factory(
         # Build runtime metadata: user context + executor DB config (LSP settings, etc.)
         db_config = executor_config.get("config", {}) if executor_config else {}
         runtime_metadata = {"user_email": user_email, **db_config}
+        workspace_root = current_workspace_root.get()
+        working_directory = current_effective_working_directory.get()
+        if workspace_root:
+            runtime_metadata["workspace_root"] = workspace_root
+        if working_directory:
+            runtime_metadata["working_directory"] = working_directory
 
         # Inject web backend config (backend name + API keys)
         web_config = await _resolve_web_config(providers, user_email)

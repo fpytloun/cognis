@@ -132,6 +132,32 @@ class TestReadTool:
         result = await handle_read({"file_path": "/nonexistent/path"}, _DUMMY_CONTEXT)
         assert result.is_error
 
+    @pytest.mark.asyncio()
+    async def test_read_relative_path_uses_working_directory(self, tmp_path: Path) -> None:
+        target = tmp_path / "nested.txt"
+        target.write_text("hello\n")
+        context = _context(
+            runtime_metadata={"workspace_root": str(tmp_path), "working_directory": str(tmp_path)}
+        )
+
+        result = await handle_read({"file_path": "nested.txt"}, context)
+
+        assert not result.is_error
+        assert "1: hello" in result.output
+
+    @pytest.mark.asyncio()
+    async def test_read_rejects_paths_outside_workspace_root(self, tmp_path: Path) -> None:
+        outside = tmp_path.parent / "outside.txt"
+        outside.write_text("secret\n")
+        context = _context(
+            runtime_metadata={"workspace_root": str(tmp_path), "working_directory": str(tmp_path)}
+        )
+
+        result = await handle_read({"file_path": str(outside)}, context)
+
+        assert result.is_error
+        assert "escapes workspace root" in result.output
+
 
 class TestWriteTool:
     """Test the write filesystem tool."""
@@ -861,6 +887,17 @@ class TestBashTool:
 
         assert result.is_error
         assert "shell redirection" in result.output
+
+    @pytest.mark.asyncio()
+    async def test_bash_defaults_to_runtime_working_directory(self, tmp_path: Path) -> None:
+        context = _context(
+            runtime_metadata={"workspace_root": str(tmp_path), "working_directory": str(tmp_path)}
+        )
+
+        result = await handle_bash({"command": "pwd"}, context)
+
+        assert not result.is_error
+        assert str(tmp_path) in result.output
 
     @pytest.mark.asyncio()
     async def test_bash_exit_code(self) -> None:

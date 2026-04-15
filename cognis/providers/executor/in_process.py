@@ -125,7 +125,7 @@ class InProcessExecutorConnection:
             start = perf_counter()
             context = ToolExecutionContext(
                 executor_handle=self.handle,
-                runtime_metadata=self.runtime_metadata,
+                runtime_metadata={**self.runtime_metadata, **tool_call.runtime_metadata},
                 execution_scope_id=tool_call.execution_scope_id or self.handle.executor_id,
             )
             result = await handler(tool_call.arguments, context)

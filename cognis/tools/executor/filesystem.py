@@ -27,9 +27,9 @@ _MAX_READ_LINES = 2000
 _MAX_LINE_LENGTH = 2000
 
 
-def _resolve_path(raw: str) -> Path:
+def _resolve_path(raw: str, context: ToolExecutionContext) -> Path:
     """Resolve a user-provided path, expanding ``~`` and environment variables."""
-    return resolve_path(raw)
+    return resolve_path(raw, context=context)
 
 
 # Canonical key for LSPManager in ToolExecutionContext.runtime_metadata
@@ -287,7 +287,10 @@ async def handle_read(arguments: dict[str, Any], context: ToolExecutionContext) 
     offset = max(1, int(arguments.get("offset", 1)))
     limit = int(arguments.get("limit", _MAX_READ_LINES))
 
-    path = _resolve_path(file_path)
+    try:
+        path = _resolve_path(file_path, context)
+    except ValueError as exc:
+        return ToolResult(output=str(exc), is_error=True)
     if not path.exists():
         return ToolResult(output=f"Path does not exist: {file_path}", is_error=True)
 
@@ -319,7 +322,7 @@ async def handle_read(arguments: dict[str, Any], context: ToolExecutionContext) 
         await _record_read(context, path)
         _warm_lsp(context, str(path))
 
-    return ToolResult(output=result)
+    return ToolResult(output=result, metadata={"files_read": [str(path)]})
 
 
 def _read_directory(path: Path) -> ToolResult:
@@ -343,7 +346,10 @@ async def handle_write(arguments: dict[str, Any], context: ToolExecutionContext)
     file_path = arguments.get("file_path", "")
     content = arguments.get("content", "")
 
-    path = _resolve_path(file_path)
+    try:
+        path = _resolve_path(file_path, context)
+    except ValueError as exc:
+        return ToolResult(output=str(exc), is_error=True)
 
     async def _write() -> ToolResult:
         exists = path.exists()
@@ -367,7 +373,7 @@ async def handle_write(arguments: dict[str, Any], context: ToolExecutionContext)
         diagnostics_text = await _collect_lsp_diagnostics(context, file_path)
         if diagnostics_text:
             output += f"\n\n{diagnostics_text}"
-        return ToolResult(output=output)
+        return ToolResult(output=output, metadata={"files_written": [str(path)]})
 
     return await _with_file_lock(context, path, _write)
 
@@ -382,7 +388,10 @@ async def handle_edit(arguments: dict[str, Any], context: ToolExecutionContext) 
     if old_string == new_string:
         return ToolResult(output="old_string and new_string are identical.", is_error=True)
 
-    path = _resolve_path(file_path)
+    try:
+        path = _resolve_path(file_path, context)
+    except ValueError as exc:
+        return ToolResult(output=str(exc), is_error=True)
     if not path.is_file():
         return ToolResult(output=f"File not found: {file_path}", is_error=True)
 
@@ -425,7 +434,7 @@ async def handle_edit(arguments: dict[str, Any], context: ToolExecutionContext) 
         diagnostics_text = await _collect_lsp_diagnostics(context, file_path)
         if diagnostics_text:
             output += f"\n\n{diagnostics_text}"
-        return ToolResult(output=output)
+        return ToolResult(output=output, metadata={"files_written": [str(path)]})
 
     return await _with_file_lock(context, path, _edit)
 
@@ -437,9 +446,16 @@ async def handle_patch(arguments: dict[str, Any], context: ToolExecutionContext)
         return ToolResult(output="Empty patch text.", is_error=True)
 
     try:
-        operations = _parse_patch_operations(patch_text)
+        operations = _parse_patch_operations(patch_text, context)
         await _stage_patch_operations(operations, context)
-    except (PatchFormatError, PatchConflictError, RuntimeError, OSError, PermissionError) as exc:
+    except (
+        PatchFormatError,
+        PatchConflictError,
+        RuntimeError,
+        OSError,
+        PermissionError,
+        ValueError,
+    ) as exc:
         return ToolResult(output=str(exc), is_error=True)
 
     touched_paths = _operation_lock_paths(operations)
@@ -447,7 +463,14 @@ async def handle_patch(arguments: dict[str, Any], context: ToolExecutionContext)
         async with _with_file_locks(context, touched_paths):
             staged = await _stage_patch_operations(operations, context)
             summary_lines, diagnostic_paths = await _apply_staged_patch_operations(staged, context)
-    except (PatchFormatError, PatchConflictError, RuntimeError, OSError, PermissionError) as exc:
+    except (
+        PatchFormatError,
+        PatchConflictError,
+        RuntimeError,
+        OSError,
+        PermissionError,
+        ValueError,
+    ) as exc:
         return ToolResult(output=str(exc), is_error=True)
 
     if not summary_lines:
@@ -459,7 +482,10 @@ async def handle_patch(arguments: dict[str, Any], context: ToolExecutionContext)
         if diagnostics_text:
             summary_lines.append(diagnostics_text)
 
-    return ToolResult(output="\n".join(summary_lines))
+    return ToolResult(
+        output="\n".join(summary_lines),
+        metadata={"files_written": [str(path) for path in diagnostic_paths]},
+    )
 
 
 async def handle_multiedit(arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
@@ -470,7 +496,10 @@ async def handle_multiedit(arguments: dict[str, Any], context: ToolExecutionCont
     if not isinstance(edits, list) or not edits:
         return ToolResult(output="No edits provided.", is_error=True)
 
-    path = _resolve_path(file_path)
+    try:
+        path = _resolve_path(file_path, context)
+    except ValueError as exc:
+        return ToolResult(output=str(exc), is_error=True)
     if not path.is_file():
         return ToolResult(output=f"File not found: {file_path}", is_error=True)
 
@@ -522,7 +551,7 @@ async def handle_multiedit(arguments: dict[str, Any], context: ToolExecutionCont
         diagnostics_text = await _collect_lsp_diagnostics(context, file_path)
         if diagnostics_text:
             output += f"\n\n{diagnostics_text}"
-        return ToolResult(output=output)
+        return ToolResult(output=output, metadata={"files_written": [str(path)]})
 
     return await _with_file_lock(context, path, _multiedit)
 
@@ -534,7 +563,10 @@ async def handle_list_directory(
     dir_path = arguments.get("path")
     ignore_patterns = arguments.get("ignore") or []
 
-    path = resolve_path(dir_path, default_to_home=True)
+    try:
+        path = resolve_path(dir_path, context=context, default_to_home=True)
+    except ValueError as exc:
+        return ToolResult(output=str(exc), is_error=True)
     if not path.is_dir():
         return ToolResult(output=f"Not a directory: {dir_path}", is_error=True)
 
@@ -604,14 +636,16 @@ def _read_text_file(path: Path) -> str:
         raise PatchConflictError(f"Patch only supports UTF-8 text files: {path}") from exc
 
 
-def _parse_patch_operations(patch_text: str) -> list[_PatchOperation]:
+def _parse_patch_operations(
+    patch_text: str, context: ToolExecutionContext
+) -> list[_PatchOperation]:
     stripped = patch_text.lstrip()
     if stripped.startswith("*** Begin Patch"):
-        return _parse_apply_patch(patch_text)
-    return _parse_unified_diff(patch_text)
+        return _parse_apply_patch(patch_text, context)
+    return _parse_unified_diff(patch_text, context)
 
 
-def _parse_apply_patch(patch_text: str) -> list[_PatchOperation]:
+def _parse_apply_patch(patch_text: str, context: ToolExecutionContext) -> list[_PatchOperation]:
     lines = patch_text.splitlines(keepends=True)
     if not lines or _line_stripped(lines[0]) != "*** Begin Patch":
         raise PatchFormatError("apply_patch must start with `*** Begin Patch`.")
@@ -633,8 +667,8 @@ def _parse_apply_patch(patch_text: str) -> list[_PatchOperation]:
                 raise PatchFormatError("`*** Update File:` requires a path.")
             operation = _PatchOperation(
                 kind="update",
-                source_path=_canonicalize_path(_resolve_path(raw_path)),
-                destination_path=_canonicalize_path(_resolve_path(raw_path)),
+                source_path=_canonicalize_path(_resolve_path(raw_path, context)),
+                destination_path=_canonicalize_path(_resolve_path(raw_path, context)),
             )
             index += 1
             if index < len(lines):
@@ -644,7 +678,9 @@ def _parse_apply_patch(patch_text: str) -> list[_PatchOperation]:
                     if not move_path:
                         raise PatchFormatError("`*** Move to:` requires a path.")
                     operation.kind = "move"
-                    operation.destination_path = _canonicalize_path(_resolve_path(move_path))
+                    operation.destination_path = _canonicalize_path(
+                        _resolve_path(move_path, context)
+                    )
                     index += 1
 
             while index < len(lines):
@@ -671,7 +707,7 @@ def _parse_apply_patch(patch_text: str) -> list[_PatchOperation]:
                 raise PatchFormatError("`*** Add File:` requires a path.")
             operation = _PatchOperation(
                 kind="add",
-                destination_path=_canonicalize_path(_resolve_path(raw_path)),
+                destination_path=_canonicalize_path(_resolve_path(raw_path, context)),
             )
             index += 1
             content_parts: list[str] = []
@@ -697,7 +733,7 @@ def _parse_apply_patch(patch_text: str) -> list[_PatchOperation]:
                 raise PatchFormatError("`*** Delete File:` requires a path.")
             operation = _PatchOperation(
                 kind="delete",
-                source_path=_canonicalize_path(_resolve_path(raw_path)),
+                source_path=_canonicalize_path(_resolve_path(raw_path, context)),
             )
             index += 1
             while index < len(lines):
@@ -740,7 +776,7 @@ def _parse_apply_patch_hunk(lines: list[str], start_index: int) -> tuple[_PatchH
     return _PatchHunk(old_text="".join(old_parts), new_text="".join(new_parts)), index
 
 
-def _parse_unified_diff(patch_text: str) -> list[_PatchOperation]:
+def _parse_unified_diff(patch_text: str, context: ToolExecutionContext) -> list[_PatchOperation]:
     operations: list[_PatchOperation] = []
     current_path: Path | None = None
     expected_old_path: Path | None = None
@@ -763,7 +799,7 @@ def _parse_unified_diff(patch_text: str) -> list[_PatchOperation]:
                 )
             if old_path.startswith("a/"):
                 old_path = old_path[2:]
-            expected_old_path = _canonicalize_path(_resolve_path(old_path))
+            expected_old_path = _canonicalize_path(_resolve_path(old_path, context))
             continue
         if line.startswith("+++ "):
             if current_path is not None:
@@ -787,7 +823,7 @@ def _parse_unified_diff(patch_text: str) -> list[_PatchOperation]:
                 )
             if path.startswith("b/"):
                 path = path[2:]
-            current_path = _canonicalize_path(_resolve_path(path))
+            current_path = _canonicalize_path(_resolve_path(path, context))
             if expected_old_path is not None and expected_old_path != current_path:
                 raise PatchFormatError(
                     "Unified diff rename/add/delete operations are not supported."

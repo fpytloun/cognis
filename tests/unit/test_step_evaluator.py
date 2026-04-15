@@ -459,3 +459,40 @@ async def test_evaluator_prompt_explicitly_allows_success_for_review_steps() -> 
     assert '"rejected"' in prompt
     assert '"failed"' in prompt
     assert "Success is valid when the review approves the plan or work" in prompt
+
+
+@pytest.mark.asyncio
+async def test_evaluator_prompt_separates_prose_metadata_and_execution_evidence() -> None:
+    capture = _CaptureLLM()
+    evaluator = StepEvaluator(llm=capture, evaluator_timeout_seconds=5.0)
+
+    result = await evaluator.evaluate(
+        step_definition=_step_def("Implement the feature with tests."),
+        step_output=StepOutput(
+            summary="Implemented /todo",
+            content="Implemented the slash command and added tests.",
+            claims=["Added /todo command", "Added unit tests"],
+        ),
+        step_inputs={},
+        execution_evidence={
+            "tools": [{"name": "edit", "ok": True}],
+            "files_written": [{"path": "cognis/core/commands.py"}],
+            "commands": [
+                {
+                    "program": "pytest",
+                    "summary": "uv run pytest tests/unit/test_commands.py -q",
+                    "cwd": "/repo",
+                    "ok": True,
+                    "exit_code": 0,
+                }
+            ],
+        },
+    )
+
+    assert result.decision == "approved"
+    assert capture.messages is not None
+    prompt = str(capture.messages[1]["content"])
+    assert "Assistant written deliverable:" in prompt
+    assert "step_complete metadata:" in prompt
+    assert "Execution evidence:" in prompt
+    assert "require step_complete metadata" in prompt

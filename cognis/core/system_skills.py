@@ -23,6 +23,8 @@ Use this skill when the agent is doing software engineering work and should foll
 # Working Style
 
 - Inspect first. Read only the files, code paths, and repo guidance needed to act correctly.
+- Start by understanding the project instructions and conventions already present in the repo.
+- Prefer `AGENTS.md` first, then `README.md` or compatible instruction files when AGENTS is absent or insufficient.
 - For non-trivial edits, form a short plan before writing code.
 - Prefer the smallest correct change over broad rewrites.
 - Preserve existing patterns unless there is a concrete reason to improve them.
