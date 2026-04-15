@@ -1094,7 +1094,9 @@ async def test_resolve_task_pause_tool_retries_gate_with_note() -> None:
     agent_loop._task_queue = SimpleNamespace()
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        session=SimpleNamespace(
+            session_id="sess-1", intaris_session_id="sess-1", user_email="user@example.com"
+        ),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         policy=CHAT_POLICY,
@@ -1102,7 +1104,9 @@ async def test_resolve_task_pause_tool_retries_gate_with_note() -> None:
 
     async def _get_task(*args: object, **kwargs: object) -> SimpleNamespace:
         del args, kwargs
-        return SimpleNamespace(task_id="task-1", agent_id="agent-1", status="paused")
+        return SimpleNamespace(
+            task_id="task-1", created_by="user@example.com", agent_id="agent-1", status="paused"
+        )
 
     from unittest.mock import patch
 
@@ -1172,7 +1176,9 @@ async def test_resolve_task_pause_tool_does_not_bypass_non_retryable_gate() -> N
     agent_loop._task_queue = _TaskQueue()
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        session=SimpleNamespace(
+            session_id="sess-1", intaris_session_id="sess-1", user_email="user@example.com"
+        ),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         policy=CHAT_POLICY,
@@ -1180,7 +1186,9 @@ async def test_resolve_task_pause_tool_does_not_bypass_non_retryable_gate() -> N
 
     async def _get_task(*args: object, **kwargs: object) -> SimpleNamespace:
         del args, kwargs
-        return SimpleNamespace(task_id="task-1", agent_id="agent-1", status="paused")
+        return SimpleNamespace(
+            task_id="task-1", created_by="user@example.com", agent_id="agent-1", status="paused"
+        )
 
     from unittest.mock import patch
 
@@ -1285,12 +1293,12 @@ async def test_get_task_tool_includes_pending_pause_and_workflow_run(
         del args, kwargs
         return SimpleNamespace(
             task_id="task-1",
+            created_by="user@example.com",
             title="Task",
             description="Desc",
             expected_output=None,
             status="paused",
             priority=0,
-            created_by="user@example.com",
             agent_id="agent-1",
             source_type="agent",
             source_ref="conv-1",
@@ -1336,6 +1344,317 @@ async def test_get_task_tool_includes_pending_pause_and_workflow_run(
     assert payload["pending_pause"]["pause_type"] == "gate"
     assert payload["workflow_run"]["current_step_name"] == "plan"
     assert payload["result_data"] == {"foo": "bar"}
+
+
+@pytest.mark.asyncio
+async def test_get_task_tool_allows_bound_secondary_agent_access(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _ImplicitSystemRegistry:
+        def __init__(self, session_factory: object) -> None:
+            del session_factory
+
+        async def get(self, agent_id: str) -> AgentDefinition:
+            return AgentDefinition(
+                agent_id=agent_id,
+                owner_email="user@example.com",
+                name=agent_id,
+                agent_type="secondary" if agent_id.startswith("system:") else "primary",
+            )
+
+        async def is_secondary_bound(self, primary_agent_id: str, secondary_agent_id: str) -> bool:
+            del primary_agent_id
+            return secondary_agent_id.startswith("system:")
+
+    class _TaskSessionManager(_NoopSessionManager):
+        def __init__(self) -> None:
+            self.session_factory = super().session_factory
+
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=SimpleNamespace(), guardrails=_NoopGuardrails()),
+        session_manager=_TaskSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="review", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-1", intaris_session_id="sess-1", user_email="user@example.com"
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(
+            agent_id="system:architect", owner_email="user@example.com", name="Architect"
+        ),
+        policy=CHAT_POLICY,
+    )
+
+    async def _get_task(*args: object, **kwargs: object) -> SimpleNamespace:
+        del args, kwargs
+        return SimpleNamespace(
+            task_id="task-1",
+            created_by="user@example.com",
+            title="Task",
+            description="Desc",
+            expected_output=None,
+            status="paused",
+            priority=0,
+            agent_id="agent-1",
+            source_type="agent",
+            source_ref="conv-1",
+            delivery_mode="same_conversation",
+            delivery_target=None,
+            workflow_id=None,
+            workflow_state=None,
+            queue_name="default",
+            scheduled_for=None,
+            created_at=None,
+            started_at=None,
+            completed_at=None,
+            result_summary=None,
+            result_data=None,
+        )
+
+    monkeypatch.setattr("cognis.store.queries.get_task", _get_task)
+    monkeypatch.setattr("cognis.core.agent_registry.AgentRegistry", _ImplicitSystemRegistry)
+
+    async def _list_step_runs(*args: object, **kwargs: object) -> list[SimpleNamespace]:
+        del args, kwargs
+        return []
+
+    monkeypatch.setattr("cognis.store.queries.list_step_runs_for_task", _list_step_runs)
+
+    result = await agent_loop._handle_task_tool(
+        ToolCall(call_id="call-1", name="get_task", arguments={"task_id": "task-1"}),
+        ctx=ctx,
+        events_to_record=[],
+    )
+
+    assert result.is_error is False
+    assert json.loads(result.output)["task_id"] == "task-1"
+
+
+@pytest.mark.asyncio
+async def test_get_task_tool_allows_primary_agent_to_access_bound_secondary_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _BoundAgentRegistry:
+        def __init__(self, session_factory: object) -> None:
+            del session_factory
+
+        async def get(self, agent_id: str) -> AgentDefinition:
+            return AgentDefinition(
+                agent_id=agent_id,
+                owner_email="user@example.com",
+                name=agent_id,
+                agent_type="secondary" if agent_id.startswith("system:") else "primary",
+            )
+
+        async def is_secondary_bound(self, primary_agent_id: str, secondary_agent_id: str) -> bool:
+            return primary_agent_id == "agent-1" and secondary_agent_id == "system:architect"
+
+    class _TaskSessionManager(_NoopSessionManager):
+        def __init__(self) -> None:
+            self.session_factory = super().session_factory
+
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=SimpleNamespace(), guardrails=_NoopGuardrails()),
+        session_manager=_TaskSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-1", intaris_session_id="sess-1", user_email="user@example.com"
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+    )
+
+    async def _get_task(*args: object, **kwargs: object) -> SimpleNamespace:
+        del args, kwargs
+        return SimpleNamespace(
+            task_id="task-1",
+            title="Task",
+            description="Desc",
+            expected_output=None,
+            status="paused",
+            priority=0,
+            created_by="user@example.com",
+            agent_id="system:architect",
+            source_type="agent",
+            source_ref="conv-1",
+            delivery_mode="same_conversation",
+            delivery_target=None,
+            workflow_id=None,
+            workflow_state=None,
+            queue_name="default",
+            scheduled_for=None,
+            created_at=None,
+            started_at=None,
+            completed_at=None,
+            result_summary=None,
+            result_data=None,
+        )
+
+    monkeypatch.setattr("cognis.store.queries.get_task", _get_task)
+    monkeypatch.setattr("cognis.core.agent_registry.AgentRegistry", _BoundAgentRegistry)
+
+    async def _list_step_runs(*args: object, **kwargs: object) -> list[SimpleNamespace]:
+        del args, kwargs
+        return []
+
+    monkeypatch.setattr("cognis.store.queries.list_step_runs_for_task", _list_step_runs)
+
+    result = await agent_loop._handle_task_tool(
+        ToolCall(call_id="call-1", name="get_task", arguments={"task_id": "task-1"}),
+        ctx=ctx,
+        events_to_record=[],
+    )
+
+    assert result.is_error is False
+    assert json.loads(result.output)["task_id"] == "task-1"
+
+
+@pytest.mark.asyncio
+async def test_get_task_tool_still_rejects_unrelated_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _UnboundAgentRegistry:
+        def __init__(self, session_factory: object) -> None:
+            del session_factory
+
+        async def get(self, agent_id: str) -> AgentDefinition:
+            return AgentDefinition(
+                agent_id=agent_id,
+                owner_email="user@example.com",
+                name=agent_id,
+                agent_type="secondary" if agent_id.startswith("system:") else "primary",
+            )
+
+        async def is_secondary_bound(self, primary_agent_id: str, secondary_agent_id: str) -> bool:
+            del primary_agent_id, secondary_agent_id
+            return False
+
+    class _TaskSessionManager(_NoopSessionManager):
+        def __init__(self) -> None:
+            self.session_factory = super().session_factory
+
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=SimpleNamespace(), guardrails=_NoopGuardrails()),
+        session_manager=_TaskSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-1", intaris_session_id="sess-1", user_email="user@example.com"
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-2", owner_email="user@example.com", name="Other"),
+        policy=CHAT_POLICY,
+    )
+
+    async def _get_task(*args: object, **kwargs: object) -> SimpleNamespace:
+        del args, kwargs
+        return SimpleNamespace(task_id="task-1", created_by="user@example.com", agent_id="agent-1")
+
+    monkeypatch.setattr("cognis.store.queries.get_task", _get_task)
+    monkeypatch.setattr("cognis.core.agent_registry.AgentRegistry", _UnboundAgentRegistry)
+
+    result = await agent_loop._handle_task_tool(
+        ToolCall(call_id="call-1", name="get_task", arguments={"task_id": "task-1"}),
+        ctx=ctx,
+        events_to_record=[],
+    )
+
+    assert result.is_error is True
+    assert json.loads(result.output)["message"] == "Task belongs to a different agent."
+
+
+@pytest.mark.asyncio
+async def test_get_task_tool_rejects_cross_user_task_even_for_system_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _ImplicitSystemRegistry:
+        def __init__(self, session_factory: object) -> None:
+            del session_factory
+
+        async def get(self, agent_id: str) -> AgentDefinition:
+            return AgentDefinition(
+                agent_id=agent_id,
+                owner_email="user@example.com",
+                name=agent_id,
+                agent_type="secondary" if agent_id.startswith("system:") else "primary",
+            )
+
+        async def is_secondary_bound(self, primary_agent_id: str, secondary_agent_id: str) -> bool:
+            del primary_agent_id
+            return secondary_agent_id.startswith("system:")
+
+    class _TaskSessionManager(_NoopSessionManager):
+        def __init__(self) -> None:
+            self.session_factory = super().session_factory
+
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=SimpleNamespace(), guardrails=_NoopGuardrails()),
+        session_manager=_TaskSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="review", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-1", intaris_session_id="sess-1", user_email="user@example.com"
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(
+            agent_id="system:architect", owner_email="user@example.com", name="Architect"
+        ),
+        policy=CHAT_POLICY,
+    )
+
+    async def _get_task(*args: object, **kwargs: object) -> SimpleNamespace:
+        del args, kwargs
+        return SimpleNamespace(task_id="task-1", created_by="other@example.com", agent_id="agent-1")
+
+    monkeypatch.setattr("cognis.store.queries.get_task", _get_task)
+    monkeypatch.setattr("cognis.core.agent_registry.AgentRegistry", _ImplicitSystemRegistry)
+
+    result = await agent_loop._handle_task_tool(
+        ToolCall(call_id="call-1", name="get_task", arguments={"task_id": "task-1"}),
+        ctx=ctx,
+        events_to_record=[],
+    )
+
+    assert result.is_error is True
+    assert json.loads(result.output)["message"] == "Task belongs to a different agent."
 
 
 @pytest.mark.asyncio

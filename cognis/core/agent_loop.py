@@ -3359,7 +3359,7 @@ class AgentLoop:
                         output=json.dumps({"status": "error", "message": "Task not found."}),
                         is_error=True,
                     )
-                if task_row.agent_id != ctx.agent.agent_id:
+                if not await self._can_access_task(task_row, ctx):
                     return ToolResult(
                         output=json.dumps(
                             {"status": "error", "message": "Task belongs to a different agent."}
@@ -3424,7 +3424,7 @@ class AgentLoop:
                     return ToolResult(
                         output=json.dumps({"error": "Task not found."}), is_error=True
                     )
-                if task_row.agent_id != ctx.agent.agent_id:
+                if not await self._can_access_task(task_row, ctx):
                     return ToolResult(
                         output=json.dumps({"error": "Task belongs to a different agent."}),
                         is_error=True,
@@ -3466,7 +3466,7 @@ class AgentLoop:
                     return ToolResult(
                         output=json.dumps({"error": "Task not found."}), is_error=True
                     )
-                if task_row.agent_id != ctx.agent.agent_id:
+                if not await self._can_access_task(task_row, ctx):
                     return ToolResult(
                         output=json.dumps({"error": "Task belongs to a different agent."}),
                         is_error=True,
@@ -3510,7 +3510,7 @@ class AgentLoop:
                     return ToolResult(
                         output=json.dumps({"error": "Task not found."}), is_error=True
                     )
-                if task_row.agent_id != ctx.agent.agent_id:
+                if not await self._can_access_task(task_row, ctx):
                     return ToolResult(
                         output=json.dumps({"error": "Task belongs to a different agent."}),
                         is_error=True,
@@ -3546,7 +3546,7 @@ class AgentLoop:
                     return ToolResult(
                         output=json.dumps({"error": "Task not found."}), is_error=True
                     )
-                if task_row.agent_id != ctx.agent.agent_id:
+                if not await self._can_access_task(task_row, ctx):
                     return ToolResult(
                         output=json.dumps({"error": "Task belongs to a different agent."}),
                         is_error=True,
@@ -3650,7 +3650,7 @@ class AgentLoop:
                         output=json.dumps({"status": "error", "message": "Task not found."}),
                         is_error=True,
                     )
-                if task_row.agent_id != ctx.agent.agent_id:
+                if not await self._can_access_task(task_row, ctx):
                     return ToolResult(
                         output=json.dumps(
                             {
@@ -3705,7 +3705,7 @@ class AgentLoop:
                     output=json.dumps({"status": "error", "message": "Task not found."}),
                     is_error=True,
                 )
-            if task_row.agent_id != ctx.agent.agent_id:
+            if not await self._can_access_task(task_row, ctx):
                 return ToolResult(
                     output=json.dumps(
                         {
@@ -3747,6 +3747,37 @@ class AgentLoop:
             output=json.dumps({"status": "error", "message": f"Unknown tool: {tc.name}"}),
             is_error=True,
         )
+
+    async def _can_access_task(self, task_row: Any, ctx: StepContext) -> bool:
+        task_owner = getattr(task_row, "created_by", None)
+        current_user = getattr(ctx.session, "user_email", ctx.agent.owner_email)
+        if not task_owner or task_owner != current_user:
+            return False
+
+        task_agent_id = getattr(task_row, "agent_id", None)
+        current_agent_id = ctx.agent.agent_id
+        if not task_agent_id:
+            return False
+        if task_agent_id == current_agent_id:
+            return True
+
+        session_factory = getattr(self.session_manager, "session_factory", None)
+        if session_factory is None:
+            return False
+
+        from cognis.core.agent_registry import AgentRegistry
+
+        registry = AgentRegistry(session_factory)
+        task_agent = await registry.get(task_agent_id)
+        current_agent = await registry.get(current_agent_id)
+        task_agent_type = task_agent.agent_type if task_agent is not None else "primary"
+        current_agent_type = current_agent.agent_type if current_agent is not None else "primary"
+
+        if task_agent_type == "primary" and current_agent_type == "secondary":
+            return await registry.is_secondary_bound(task_agent_id, current_agent_id)
+        if task_agent_type == "secondary" and current_agent_type == "primary":
+            return await registry.is_secondary_bound(current_agent_id, task_agent_id)
+        return False
 
     async def _handle_workflow_tool(
         self,
