@@ -574,6 +574,8 @@ Full architecture and design specifications are in `docs/specs/`:
 | `13-nfr-operations.md` | NFRs, SLOs, metrics, degraded modes, retention |
 | `14-workflow-engine.md` | Workflow templates, step types, completion protocol, evaluation, gates |
 | `15-browser-credentials.md` | Browser automation, credential records, auth request flows, and cloud-native executor behavior |
+| `21-workflow-deliverables.md` | Typed deliverables, `write_deliverable` tool, step_complete gate, once-only channel delivery |
+| `22-step-profiles.md` | Step profiles (`unrestricted`/`research`/`coding`), tool classification, per-step overrides |
 
 **Read the relevant spec before making changes in that area.**
 

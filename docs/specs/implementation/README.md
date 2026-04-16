@@ -97,6 +97,7 @@ bring the codebase in line with the updated specs.
 | 17 | [Browser Takeover and Session Recording](stage-17-browser-takeover-recording.md) | PLANNED | Optional noVNC browser takeover, Intaris-owned recording/evidence flow, browser/desktop audit model |
 | 18 | [First-Class Agent Runtimes](stage-18-agent-runtimes.md) | PLANNED | Runtime abstraction, `runtime_runs`, executor runtime RPC, Claude runtime host, projection model, direct chat/delegation/workflow parity |
 | 19 | [Auto Routing for Agents and Workflows](stage-19-auto-routing.md) | PLANNED | `auto` / `self` routing semantics, shared routing helper, execution-envelope enforcement, classifier fallback, telemetry |
+| 20 | [Workflow Deliverables and Step Profiles](stage-20-workflow-deliverables.md) | PLANNED | Typed deliverables + `write_deliverable`, once-only channel delivery, step profiles (`research`/`coding`), tool classification, system workflow wiring |
 
 ## Scope Boundary
 

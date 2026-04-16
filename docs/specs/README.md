@@ -23,3 +23,5 @@
 | `18-runtime-contract.md` | Normative runtime lifecycle, event, projection, and tool contract |
 | `19-runtime-implementation-plan.md` | Phased implementation plan for first-class runtimes |
 | `20-auto-routing-implementation-plan.md` | Deterministic agent/workflow auto-routing, execution envelopes, classifier fallback, and rollout plan |
+| `21-workflow-deliverables.md` | Typed, versioned deliverables, `write_deliverable` tool, step_complete gate, and once-only channel delivery |
+| `22-step-profiles.md` | Step profiles (`unrestricted`, `research`, `coding`), tool classification taxonomy, per-step overrides |
