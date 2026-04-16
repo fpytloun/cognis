@@ -83,6 +83,9 @@ Evaluation checklist:
 10. Silent completion can be valid when the step completed successfully and the
    runtime policy explicitly allows no user-facing notification. Evaluate task
    completion separately from whether the result should be shown to the user.
+11. Direct completion can also be valid for ready-to-read outputs. Do not
+   penalize the step for bypassing the normal follow-up flow when direct
+   delivery was explicitly selected.
 
 Decide:
 - "approved" — the step objective is satisfactorily met based on actual \

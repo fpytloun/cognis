@@ -193,6 +193,9 @@ def _step_complete_example_payload() -> dict[str, Any]:
         "outcome": {
             "status": "success",
         },
+        "notification": {
+            "mode": "direct",
+        },
     }
 
 
@@ -278,13 +281,19 @@ def _validate_step_completion_notification(ctx: StepContext, step_output: StepOu
     notification = step_output.notification
     if notification is None:
         return
-    if notification.mode != "silent":
+    if notification.mode not in {"silent", "direct"}:
         raise ValueError(f"Unsupported notification mode: {notification.mode}")
-    if not ctx.completion_delivery.allow_silent_completion:
-        raise ValueError("notification.mode='silent' is not allowed for this step")
     outcome_status = step_output.outcome.status if step_output.outcome is not None else "success"
+    if notification.mode == "silent" and not ctx.completion_delivery.allow_silent_completion:
+        raise ValueError("notification.mode='silent' is not allowed for this step")
     if outcome_status != "success":
+        if notification.mode == "direct":
+            raise ValueError("notification.mode='direct' is only valid for successful completion")
         raise ValueError("notification.mode='silent' is only valid for successful completion")
+    if notification.mode == "direct" and not step_output.content.strip():
+        raise ValueError(
+            "notification.mode='direct' requires a non-empty final assistant message to deliver"
+        )
 
 
 def _find_gate_revise_action(pause: PendingPause) -> str | None:
@@ -4608,8 +4617,11 @@ class AgentLoop:
             "outcome when the completed step should explicitly report rejection "
             "or failure. Use notification.mode='silent' only when the work "
             "completed successfully, silent completion is allowed, and there is "
-            "nothing user-actionable to notify. Otherwise omit notification and "
-            "the configured delivery family will be used automatically."
+            "nothing user-actionable to notify. Use notification.mode='direct' "
+            "for ready-to-read outputs like daily briefs, evening summaries, or "
+            "report digests when the result should be sent directly to the "
+            "resolved target channel. Otherwise omit notification and the "
+            "configured delivery family will be used automatically."
         )
 
         return "".join(parts)
@@ -4746,22 +4758,24 @@ class AgentLoop:
                                 "notification": {
                                     "type": "object",
                                     "description": (
-                                        "Optional completion delivery choice. In v1 only "
-                                        "notification.mode='silent' is supported. Use it only "
-                                        "when silent completion is allowed and nothing user-"
-                                        "actionable happened."
+                                        "Optional completion delivery choice. Use "
+                                        "notification.mode='silent' only when silent "
+                                        "completion is allowed and nothing user-actionable "
+                                        "happened. Use notification.mode='direct' for "
+                                        "ready-to-read outputs like daily briefs or summaries "
+                                        "that should go straight to the resolved target channel."
                                     ),
                                     "properties": {
                                         "mode": {
                                             "type": "string",
-                                            "enum": ["silent"],
+                                            "enum": ["silent", "direct"],
                                         },
                                         "reason": {
                                             "type": "string",
-                                            "description": "Required for silent completion.",
+                                            "description": "Required for silent completion. Optional for direct.",
                                         },
                                     },
-                                    "required": ["mode", "reason"],
+                                    "required": ["mode"],
                                 },
                             },
                             "required": ["summary"],

@@ -115,7 +115,7 @@ class StepOutcome(BaseModel):
 class StepCompletionNotification(BaseModel):
     """Optional completion delivery choice requested by the step."""
 
-    mode: Literal["silent"]
+    mode: Literal["silent", "direct"]
     reason: str | None = None
 
     @model_validator(mode="after")

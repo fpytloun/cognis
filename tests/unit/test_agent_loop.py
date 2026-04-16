@@ -1098,6 +1098,109 @@ def test_step_complete_rejects_silent_notification_when_not_allowed() -> None:
         _validate_step_completion_notification(ctx, step_output)
 
 
+def test_step_complete_allows_direct_notification_for_success() -> None:
+    ctx = StepContext(
+        step_definition=StepDefinition(name="brief", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-1",
+            intaris_session_id="sess-1",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(
+            conversation_id="conv-1",
+            title=None,
+            title_source="unset",
+        ),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=WORKFLOW_POLICY,
+        user_message="prepare brief",
+        user_attachments=[],
+        system_initiated=False,
+        completion_delivery=CompletionDeliveryPolicy(
+            completion_mode_family="default",
+            allow_silent_completion=False,
+        ),
+    )
+    step_output = StepOutput(
+        summary="Prepared daily brief.",
+        content="Here is the daily brief.",
+        notification={"mode": "direct"},
+    )
+
+    _validate_step_completion_notification(ctx, step_output)
+
+
+def test_step_complete_rejects_direct_notification_for_failed_outcome() -> None:
+    ctx = StepContext(
+        step_definition=StepDefinition(name="brief", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-1",
+            intaris_session_id="sess-1",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(
+            conversation_id="conv-1",
+            title=None,
+            title_source="unset",
+        ),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=WORKFLOW_POLICY,
+        user_message="prepare brief",
+        user_attachments=[],
+        system_initiated=False,
+        completion_delivery=CompletionDeliveryPolicy(
+            completion_mode_family="default",
+            allow_silent_completion=False,
+        ),
+    )
+    step_output = StepOutput(
+        summary="Failed to prepare daily brief.",
+        outcome={"status": "failed", "reason": "upstream API unavailable"},
+        notification={"mode": "direct"},
+    )
+
+    with pytest.raises(ValueError, match="only valid for successful completion"):
+        _validate_step_completion_notification(ctx, step_output)
+
+
+def test_step_complete_rejects_direct_notification_without_written_deliverable() -> None:
+    ctx = StepContext(
+        step_definition=StepDefinition(name="brief", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-1",
+            intaris_session_id="sess-1",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(
+            conversation_id="conv-1",
+            title=None,
+            title_source="unset",
+        ),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=WORKFLOW_POLICY,
+        user_message="prepare brief",
+        user_attachments=[],
+        system_initiated=False,
+        completion_delivery=CompletionDeliveryPolicy(
+            completion_mode_family="default",
+            allow_silent_completion=False,
+        ),
+    )
+    step_output = StepOutput(
+        summary="Prepared daily brief.",
+        notification={"mode": "direct"},
+    )
+
+    with pytest.raises(ValueError, match="requires a non-empty final assistant message"):
+        _validate_step_completion_notification(ctx, step_output)
+
+
 def test_build_step_prompt_includes_revision_context() -> None:
     agent_loop = AgentLoop(
         providers=SimpleNamespace(llm=SimpleNamespace(), guardrails=_NoopGuardrails()),

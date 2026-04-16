@@ -8,7 +8,7 @@ import pytest
 from cognis.core.events import EventBus, EventType
 from cognis.core.workflow_engine import WorkflowEngine
 from cognis.models.task import TaskDelivery, TaskModel, TaskStatus
-from cognis.models.workflow import CompletionDeliveryPolicy
+from cognis.models.workflow import CompletionDeliveryPolicy, WorkflowState
 from cognis.store.database import create_engine, create_session_factory
 from cognis.store.models import Base
 from cognis.store.queries import (
@@ -251,6 +251,130 @@ async def test_deliver_task_result_direct_sends_channel_message_without_follow_u
     assert channel_delivery.calls == [(conversation.conversation_id, "Final direct reply", [])]
     assert EventType.FOLLOW_UP_TURN_REQUESTED not in seen
     assert EventType.TASK_COMPLETED in seen
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_explicit_direct_delivery_overrides_legacy_silent_target_mode(
+    tmp_path: object,
+) -> None:
+    engine, session_factory = await _runtime(tmp_path)
+    guardrails = _Guardrails()
+    channel_delivery = _ChannelDelivery()
+    event_bus = EventBus()
+    workflow_engine = WorkflowEngine(
+        session_factory=session_factory,
+        providers=SimpleNamespace(guardrails=guardrails),
+        agent_loop=SimpleNamespace(),
+        step_evaluator=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        event_bus=event_bus,
+        pause_waiter=SimpleNamespace(),
+        channel_delivery=channel_delivery,
+    )
+
+    async with session_factory() as session:
+        await create_user(
+            session, email="user@example.com", name="User", password_hash="hash", role="user"
+        )
+        await create_agent(
+            session, agent_id="agent-1", owner_email="user@example.com", name="Agent"
+        )
+        conversation = await create_conversation(
+            session,
+            user_email="user@example.com",
+            agent_id="agent-1",
+            context_type="signal",
+            context_ref="signal:acct-1:chat-1",
+            context_data={
+                "channel_type": "signal",
+                "account_id": "acct-1",
+                "chat_id": "chat-1",
+            },
+            title="Signal",
+        )
+        root_session = await create_session(
+            session,
+            conversation_id=conversation.conversation_id,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        )
+        await set_session_intaris_session_id(
+            session, root_session.session_id, "intaris-direct-legacy"
+        )
+        await update_conversation_active_session(
+            session, conversation.conversation_id, root_session.session_id
+        )
+        await session.commit()
+
+    await workflow_engine._deliver_task_result(
+        TaskModel(
+            task_id="task-direct-legacy",
+            title="Daily brief",
+            description="",
+            status=TaskStatus.COMPLETED,
+            priority=0,
+            created_by="user@example.com",
+            agent_id="agent-1",
+            source_type="chat",
+            source_ref=conversation.conversation_id,
+            delivery=TaskDelivery(mode="silent"),
+            completion_delivery=CompletionDeliveryPolicy(completion_mode_family="default"),
+            workflow_id=None,
+            result_summary="Done",
+            result_data={"final_content": "Direct brief"},
+            applied_completion_mode="direct",
+        )
+    )
+
+    assert channel_delivery.calls == [(conversation.conversation_id, "Direct brief", [])]
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_explicit_direct_notification_overrides_default_policy(tmp_path: object) -> None:
+    engine, session_factory = await _runtime(tmp_path)
+    workflow_engine = WorkflowEngine(
+        session_factory=session_factory,
+        providers=SimpleNamespace(guardrails=_Guardrails()),
+        agent_loop=SimpleNamespace(),
+        step_evaluator=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        event_bus=EventBus(),
+        pause_waiter=SimpleNamespace(),
+    )
+
+    task = TaskModel(
+        task_id="task-explicit-direct",
+        title="Daily brief",
+        description="",
+        status=TaskStatus.COMPLETED,
+        priority=0,
+        created_by="user@example.com",
+        agent_id="agent-1",
+        source_type="scheduler",
+        source_ref="schedule-1",
+        delivery=TaskDelivery(mode="latest_active_for_agent"),
+        completion_delivery=CompletionDeliveryPolicy(completion_mode_family="default"),
+        result_data={"final_content": "Ready-to-read brief"},
+    )
+    state = WorkflowState(
+        current_step="publish",
+        step_outputs={
+            "publish": {
+                "summary": "Prepared the daily brief.",
+                "content": "Ready-to-read brief",
+                "notification": {"mode": "direct"},
+            }
+        },
+    )
+
+    applied_mode, applied_reason = workflow_engine._resolve_applied_completion(task, state)
+
+    assert applied_mode == "direct"
+    assert applied_reason is None
     await engine.dispose()
 
 

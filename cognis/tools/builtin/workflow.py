@@ -56,21 +56,26 @@ STEP_COMPLETE_TOOL = ToolDefinition(
             "notification": {
                 "type": "object",
                 "description": (
-                    "Optional completion delivery choice. In v1 only 'silent' is supported, "
-                    "and only when silent completion is explicitly allowed for the step."
+                    "Optional completion delivery choice. Use 'silent' only when silent completion "
+                    "is explicitly allowed and nothing user-actionable happened. Use 'direct' for "
+                    "ready-to-read outputs like daily briefs or summaries when the result should be "
+                    "sent directly to the resolved target channel."
                 ),
                 "properties": {
                     "mode": {
                         "type": "string",
-                        "enum": ["silent"],
-                        "description": "Request silent completion with no outward notification.",
+                        "enum": ["silent", "direct"],
+                        "description": (
+                            "Request silent completion with no outward notification, or direct "
+                            "delivery to the resolved target channel."
+                        ),
                     },
                     "reason": {
                         "type": "string",
-                        "description": "Required for silent completion.",
+                        "description": "Required for silent completion. Optional for direct.",
                     },
                 },
-                "required": ["mode", "reason"],
+                "required": ["mode"],
             },
         },
         "required": ["summary"],

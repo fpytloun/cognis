@@ -394,6 +394,9 @@
                     {#if !schedule.enabled}
                       <Badge class="bg-slate-700/50 text-slate-400">Disabled</Badge>
                     {/if}
+                    {#if schedule.completion_mode_family === 'direct'}
+                      <Badge class="bg-cyan-500/20 text-cyan-300">Direct delivery</Badge>
+                    {/if}
                     {#if schedule.allow_silent_completion}
                       <Badge class="bg-indigo-500/20 text-indigo-400">Silent allowed</Badge>
                     {/if}

@@ -1513,6 +1513,32 @@ class WorkflowEngine:
             )
             return
 
+        if applied_mode == "direct":
+            target_conversation_id: str | None = None
+            delivery_mode = task.delivery.mode
+            if delivery_mode == "same_conversation":
+                target_conversation_id = task.source_ref
+            elif delivery_mode == "specific_conversation":
+                target_conversation_id = task.delivery.target
+            elif delivery_mode in ("latest_active_for_agent", "preferred_channel"):
+                async with self._session_factory() as db_session:
+                    latest = await get_latest_active_conversation_for_agent(
+                        db_session, task.created_by, task.agent_id
+                    )
+                target_conversation_id = (
+                    latest.conversation_id if latest is not None else task.source_ref
+                )
+            elif delivery_mode == "silent":
+                target_conversation_id = task.source_ref
+            if target_conversation_id is None:
+                logger.warning(
+                    "task_delivery: explicit direct completion has no resolved target, skipping",
+                    extra={"extra_data": {"task_id": task.task_id, "delivery_mode": delivery_mode}},
+                )
+                return
+            await self._deliver_task_result_direct(task, target_conversation_id)
+            return
+
         delivery_mode = task.delivery.mode
         target_conversation_id: str | None = None
 
@@ -1559,10 +1585,6 @@ class WorkflowEngine:
                 }
             },
         )
-
-        if applied_mode == "direct":
-            await self._deliver_task_result_direct(task, target_conversation_id)
-            return
 
         await self._deliver_task_result_default(task, target_conversation_id)
 
@@ -2342,6 +2364,13 @@ class WorkflowEngine:
             and last_output.notification.mode == "silent"
         ):
             return "silent", last_output.notification.reason
+        if (
+            task.status == TaskStatus.COMPLETED
+            and last_output is not None
+            and last_output.notification is not None
+            and last_output.notification.mode == "direct"
+        ):
+            return "direct", last_output.notification.reason
 
         policy = task.completion_delivery or CompletionDeliveryPolicy()
         if policy.completion_mode_family == "direct":

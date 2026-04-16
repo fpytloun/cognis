@@ -216,7 +216,10 @@ current throughout the step.
   `"failed"` if that accurately reflects the result of the completed work.
 - Respect the step's completion delivery policy. Use \
   `notification.mode="silent"` only when silent completion is explicitly \
-  allowed and there is nothing user-actionable to notify.
+  allowed and there is nothing user-actionable to notify. Use \
+  `notification.mode="direct"` for ready-to-read outputs like daily briefs, \
+  summaries, or digests when they should go straight to the resolved target \
+  channel.
 - If you need clarification, use `step_request_input` (when available) \
 rather than guessing.
 - Do not call `step_complete` until every remaining todo is `done` or \
@@ -240,8 +243,10 @@ when available rather than guessing or stopping early.
   a summary and include an `outcome` if the delegated work properly concluded \
   with rejection or failure. Respect the completion delivery policy and use \
   `notification.mode="silent"` only when it is explicitly allowed and nothing \
-  user-actionable happened. Do not finish until remaining todos are `done` or \
-  `cancelled`.
+  user-actionable happened. Use `notification.mode="direct"` for ready-to-read \
+  outputs like daily briefs, summaries, or digests when they should go straight \
+  to the resolved target channel. Do not finish until remaining todos are \
+  `done` or `cancelled`.
 - Delegate further only if the task genuinely requires it — prefer doing \
 the work directly."""
 

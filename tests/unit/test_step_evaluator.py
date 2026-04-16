@@ -499,3 +499,4 @@ async def test_evaluator_prompt_separates_prose_metadata_and_execution_evidence(
     assert "require step_complete metadata" in prompt
     assert "Expected output as strong guidance for output shape" in prompt
     assert "Silent completion can be valid" in prompt
+    assert "Direct completion can also be valid" in prompt
