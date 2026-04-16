@@ -1,10 +1,11 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
   import { page } from '$app/stores';
-  import { ArrowDown, ArrowLeft, CheckCircle2, ChevronDown, ChevronUp, Clock3, GitBranch, LoaderCircle, PanelRightOpen, PlayCircle, Sparkles, Target } from 'lucide-svelte';
+  import { ArrowDown, ArrowLeft, ArrowRight, CheckCircle2, ChevronDown, ChevronUp, Clock3, GitBranch, LoaderCircle, PanelRightOpen, PlayCircle, Settings2, Sparkles, Target } from 'lucide-svelte';
   import { onMount } from 'svelte';
 
   import { api, asApiError } from '$lib/api/client';
+  import AgentAvatar from '$lib/components/AgentAvatar.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import SessionLogsDrawer from '$lib/components/tasks/SessionLogsDrawer.svelte';
   import Button from '$lib/components/ui/Button.svelte';
@@ -34,6 +35,7 @@
   let expandedStepHistory = $state<Set<string>>(new Set());
   let selectedStepName = $state('');
   let mobileStepDetailOpen = $state(false);
+  let configModalOpen = $state(false);
   let pollTimer: number | null = null;
   let tickNow = $state(Date.now());
   let durationTimer: ReturnType<typeof setInterval> | null = null;
@@ -97,9 +99,35 @@
     return workflows.find((w) => w.workflow_id === workflowId)?.name ?? workflowId;
   }
 
+  function agentFor(agentId: string | null): Agent | null {
+    if (!agentId) return null;
+    return agents.find((a) => a.agent_id === agentId) ?? null;
+  }
+
   function agentName(agentId: string | null): string {
-    if (!agentId) return 'Unknown';
-    return agents.find((a) => a.agent_id === agentId)?.name ?? agentId;
+    const agent = agentFor(agentId);
+    return agent?.display_name ?? agent?.name ?? agentId ?? 'Unknown';
+  }
+
+  function deliveryModeLabel(mode: string): string {
+    const labels: Record<string, string> = {
+      same_conversation: 'Same conversation',
+      specific_conversation: 'Specific conversation',
+      latest_active_for_agent: 'Latest active',
+      preferred_channel: 'Preferred channel',
+      silent: 'Silent'
+    };
+    return labels[mode] ?? mode;
+  }
+
+  function completionModeFamilyLabel(mode: 'default' | 'direct'): string {
+    return mode === 'direct' ? 'Direct delivery' : 'Default delivery';
+  }
+
+  function priorityTone(priority: number): string {
+    if (priority >= 80) return 'border-rose-500/40 bg-rose-500/10 text-rose-200';
+    if (priority >= 50) return 'border-amber-500/40 bg-amber-500/10 text-amber-200';
+    return 'border-slate-700 bg-slate-900/80 text-slate-300';
   }
 
   function completionModeLabel(taskDetail: TaskDetail): string {
@@ -136,6 +164,10 @@
 
   function closeMobileStepDetail(): void {
     mobileStepDetailOpen = false;
+  }
+
+  function closeConfigModal(): void {
+    configModalOpen = false;
   }
 
   function stepOutputSummary(stepRun: StepRun): string {
@@ -214,6 +246,12 @@
       sessionId,
       stepName: `${stepRun.step_name} (attempt ${stepRun.attempt})`
     };
+  }
+
+  function openSessionLogsForStep(stepName: string): void {
+    const group = stepGroups.find((candidate) => candidate.stepName === stepName);
+    if (!group?.latest) return;
+    openSessionLogs(group.latest);
   }
 
   interface StepGroup {
@@ -437,6 +475,35 @@
     return conversations.find((c) => c.conversation_id === task!.source_ref) ?? null;
   });
 
+  let taskAgent = $derived(agentFor(task?.agent_id ?? null));
+
+  let activePause = $derived.by(() => {
+    if (!task?.pending_pause || task.status !== 'paused') return null;
+    const pause = task.pending_pause;
+    const currentStepName = task.workflow_run?.current_step_name;
+    if (pause.step_name && currentStepName && pause.step_name !== currentStepName) {
+      return {
+        ...pause,
+        question: pause.question ?? 'Task is paused and waiting for input.'
+      };
+    }
+    return pause;
+  });
+
+  let dependencyTasks = $derived.by(() => {
+    if (!task) return [] as Array<{ taskId: string; title: string; status: string }>;
+    return task.dependencies.map((dependency) => {
+      const linkedTask = allTasks.find((candidate) => candidate.task_id === dependency.depends_on);
+      return {
+        taskId: dependency.depends_on,
+        title: linkedTask?.title ?? dependency.depends_on,
+        status: linkedTask?.status ?? 'unknown'
+      };
+    });
+  });
+
+  let stepHasLogs = $derived.by(() => Object.fromEntries(stepGroups.map((group) => [group.stepName, Boolean(group.latest?.output?.session_id || group.latest?.session_id)])));
+
   // ---------------------------------------------------------------------------
   // Data loading
   // ---------------------------------------------------------------------------
@@ -475,7 +542,10 @@
   async function refreshTaskOnly(): Promise<void> {
     if (document.hidden) return;
     try {
-      task = await api.tasks.detail(taskIdFromRoute());
+      [task, allTasks] = await Promise.all([
+        api.tasks.detail(taskIdFromRoute()),
+        api.tasks.listAll()
+      ]);
       selectedStepName = defaultStepSelection(task, selectedStepName);
     } catch (caughtError) {
       error = asApiError(caughtError).message;
@@ -496,10 +566,11 @@
   // Task actions
   // ---------------------------------------------------------------------------
 
-  async function saveTask(): Promise<void> {
-    if (!task) return;
+  async function saveTask(): Promise<boolean> {
+    if (!task) return false;
     saving = true;
     try {
+      error = '';
       const updatedTask = await api.tasks.update(task.task_id, {
         title: editForm.title,
         description: editForm.description,
@@ -514,9 +585,11 @@
       });
       task = await api.tasks.detail(updatedTask.task_id);
       addToast('Task updated.', 'success');
+      return true;
     } catch (caughtError) {
       error = asApiError(caughtError).message;
       addToast(error, 'error', 4_000, 'Unable to update task');
+      return false;
     } finally {
       saving = false;
     }
@@ -636,15 +709,36 @@
   <LoadingState label="Loading task" description="Fetching workflow state, step runs, and dependency information." />
 {:else if task}
   <section class="space-y-5">
-    <div class="flex flex-wrap items-center justify-between gap-3">
-      <div>
-        <div class="mb-3">
-          <Button size="sm" variant="secondary" onclick={() => goto('/tasks')}>Back to task board</Button>
+    <div class="flex flex-wrap items-start justify-between gap-4">
+      <div class="min-w-0 space-y-3">
+        <Button size="sm" variant="secondary" onclick={() => goto('/tasks')}>Back to task board</Button>
+        <div class="flex min-w-0 items-start gap-3">
+          <AgentAvatar
+            name={taskAgent?.display_name ?? taskAgent?.name ?? task.agent_id}
+            avatarUrl={taskAgent?.avatar_url ?? null}
+            class="h-11 w-11 rounded-2xl"
+          />
+          <div class="min-w-0">
+            <p class="text-sm uppercase tracking-[0.25em] text-slate-400">Task detail</p>
+            <h1 class="mt-1 truncate text-2xl font-semibold text-white">{task.title}</h1>
+            <div class="mt-2 flex flex-wrap items-center gap-2 text-sm text-slate-400">
+              <span>Owner agent</span>
+              <span class="font-medium text-slate-200">{agentName(task.agent_id)}</span>
+              <span class="rounded-full border px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.2em] {priorityTone(task.priority)}">P{task.priority}</span>
+              <span class="rounded-full border border-slate-700 bg-slate-900/80 px-2.5 py-1 text-[11px] text-slate-300">{deliveryModeLabel(task.delivery.mode)}</span>
+              <span class="rounded-full border border-slate-700 bg-slate-900/80 px-2.5 py-1 text-[11px] text-slate-300">{completionModeFamilyLabel(task.completion_mode_family)}</span>
+              {#if task.allow_silent_completion}
+                <span class="rounded-full border border-slate-700 bg-slate-900/80 px-2.5 py-1 text-[11px] text-slate-300">Silent allowed</span>
+              {/if}
+            </div>
+          </div>
         </div>
-        <p class="text-sm uppercase tracking-[0.25em] text-slate-400">Task detail</p>
-        <h1 class="mt-1 text-2xl font-semibold text-white">{task.title}</h1>
       </div>
       <div class="flex items-center gap-3">
+        <Button size="sm" variant="secondary" onclick={() => (configModalOpen = true)}>
+          <Settings2 class="mr-1.5 h-3.5 w-3.5" />
+          Configure
+        </Button>
         {#if isCancellable}
           <Button size="sm" variant="danger" onclick={cancelTask}>Cancel task</Button>
         {/if}
@@ -682,12 +776,36 @@
                   </div>
                 </div>
                 {#if selectedStepGroup}
+                  <div class="flex items-center gap-2">
+                  {#if stepHasLogs[selectedStepGroup.stepName]}
+                    <Button size="sm" variant="ghost" onclick={() => openSessionLogsForStep(selectedStepGroup.stepName)}>Open logs</Button>
+                  {/if}
                   <Button class="xl:hidden" size="sm" variant="secondary" onclick={() => openStepDetail(selectedStepGroup.stepName)}>
                     <PanelRightOpen class="mr-1.5 h-3.5 w-3.5" />
                     Step detail
                   </Button>
+                  </div>
                 {/if}
               </div>
+              {#if dependencyTasks.length > 0}
+                <div class="mt-4 rounded-2xl border border-slate-800 bg-slate-950/50 p-3">
+                  <p class="text-[11px] font-medium uppercase tracking-[0.25em] text-slate-500">Direct dependencies</p>
+                  <div class="mt-3 flex flex-wrap items-center gap-2">
+                    {#each dependencyTasks as dependency}
+                      <button
+                        class="inline-flex items-center gap-2 rounded-full border border-slate-700 bg-slate-950/80 px-3 py-1.5 text-xs text-slate-200 transition hover:border-slate-600 hover:text-white"
+                        onclick={() => goto(`/tasks/${dependency.taskId}`)}
+                        type="button"
+                      >
+                        <span class="truncate max-w-[12rem]">{dependency.title}</span>
+                        <span class="rounded-full border px-1.5 py-0.5 text-[10px] uppercase tracking-wide {statusColors[dependency.status] ?? 'border-slate-700 text-slate-400'}">{dependency.status}</span>
+                      </button>
+                      <ArrowRight class="h-3.5 w-3.5 text-slate-600" />
+                    {/each}
+                    <span class="inline-flex items-center rounded-full border border-sky-500/30 bg-sky-500/10 px-3 py-1.5 text-xs font-medium text-sky-100">{task.title}</span>
+                  </div>
+                </div>
+              {/if}
               <div class="mt-4 flex gap-2 overflow-x-auto pb-1">
                 {#each stepGroups as group}
                   {@const liveStatus = group.latest ? displayStepStatus(group.latest) : (task.pending_pause?.step_name === group.stepName ? 'paused' : 'pending')}
@@ -696,9 +814,7 @@
                     onclick={() => openStepDetail(group.stepName)}
                     type="button"
                   >
-                    {#if group.stepName === diagramActiveStep && (task.status === 'running' || task.status === 'evaluating')}
-                      <LoaderCircle class="h-3.5 w-3.5 animate-spin text-sky-300" />
-                    {:else if ['approved', 'completed'].includes(liveStatus)}
+                    {#if ['approved', 'completed'].includes(liveStatus)}
                       <CheckCircle2 class="h-3.5 w-3.5 text-emerald-300" />
                     {:else if group.stepType === 'gate'}
                       <GitBranch class="h-3.5 w-3.5 text-amber-300" />
@@ -723,127 +839,36 @@
               stepDurations={diagramStepDurations}
               stepAttemptCounts={stepAttemptCounts}
               stepStateLabels={stepStateLabels}
+              stepHasLogs={stepHasLogs}
               skippedSteps={diagramSkippedSteps}
               onStepSelect={(stepName) => openStepDetail(stepName)}
+              onStepLogsOpen={openSessionLogsForStep}
             />
             </div>
           </Card>
         {/if}
 
-        <!-- Edit form -->
-        <Card class="p-5">
-          <p class="mb-3 text-xs uppercase tracking-[0.25em] text-slate-400">Task configuration</p>
-          <div class="grid gap-4 md:grid-cols-2">
-            <label class="space-y-2 text-sm font-medium text-slate-200">
-              <span>Title</span>
-              <Input bind:value={editForm.title} disabled={!isEditable} />
-            </label>
-            <label class="space-y-2 text-sm font-medium text-slate-200">
-              <span>Priority</span>
-              <Input bind:value={editForm.priority} type="number" disabled={!isEditable} />
-            </label>
-            <label class="space-y-2 text-sm font-medium text-slate-200">
-              <span>Agent</span>
-              <select bind:value={editForm.agent_id} disabled={!isEditable} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100 disabled:opacity-50">
-                {#each agents.filter((a) => a.agent_type === 'primary') as agent}
-                  <option value={agent.agent_id}>{agent.display_name ?? agent.name}</option>
-                {/each}
-              </select>
-            </label>
-            <label class="space-y-2 text-sm font-medium text-slate-200">
-              <span>Workflow</span>
-              <select bind:value={editForm.workflow_id} disabled={!isEditable} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100 disabled:opacity-50">
-                <option value="">Auto</option>
-                {#each workflows as workflow}
-                  <option value={workflow.workflow_id}>{workflow.name}</option>
-                {/each}
-              </select>
-            </label>
-          </div>
-
-          <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
-            <span>Description</span>
-            <textarea bind:value={editForm.description} disabled={!isEditable} class="min-h-[110px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500 disabled:opacity-50"></textarea>
-          </label>
-
-          <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
-            <span>Expected output</span>
-            <textarea bind:value={editForm.expected_output} disabled={!isEditable} class="min-h-[60px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500 disabled:opacity-50" placeholder="Describe the expected format or content of the result (optional)"></textarea>
-          </label>
-
-          <div class="mt-4 grid gap-4 md:grid-cols-2">
-            <label class="space-y-2 text-sm font-medium text-slate-200">
-              <span class="inline-flex items-center gap-2">
-                Delivery mode
-                <Tooltip text="How the task resolves its target conversation or channel route for completion delivery.">
-                  <span class="cursor-help text-slate-500">(?)</span>
-                </Tooltip>
-              </span>
-              <select bind:value={editForm.delivery_mode} disabled={!isEditable} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100 disabled:opacity-50">
-                <option value="same_conversation">Same conversation</option>
-                <option value="specific_conversation">Specific conversation</option>
-                <option value="latest_active_for_agent">Latest active</option>
-                <option value="preferred_channel">Preferred channel</option>
-              </select>
-            </label>
-            {#if editForm.delivery_mode === 'specific_conversation'}
-              <label class="space-y-2 text-sm font-medium text-slate-200">
-                <span>Delivery target</span>
-                <select bind:value={editForm.delivery_target} disabled={!isEditable} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100 disabled:opacity-50">
-                  <option value="">Select conversation</option>
-                  {#each conversations as conversation}
-                    <option value={conversation.conversation_id}>{conversation.title ?? conversation.conversation_id}</option>
-                  {/each}
-                </select>
-              </label>
-            {/if}
-          </div>
-
-          <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
-            <span class="inline-flex items-center gap-2">
-              Completion notification behavior
-              <Tooltip text="Default delivery sends task results through the normal conversation flow. Direct channel delivery sends the final result directly to the resolved target channel. Allow silent completion lets the agent finish without notifying when nothing user-actionable happened.">
-                <span class="cursor-help text-slate-500">(?)</span>
-              </Tooltip>
-            </span>
-            <div class="grid gap-3 md:grid-cols-[minmax(0,1fr)_auto]">
-              <select bind:value={editForm.completion_mode_family} disabled={!isEditable} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100 disabled:opacity-50">
-                <option value="default">Default delivery</option>
-                <option value="direct">Direct channel delivery</option>
-              </select>
-              <label class="inline-flex items-center gap-2 rounded-xl border border-slate-800 bg-slate-950/60 px-3 py-2 text-sm text-slate-200 disabled:opacity-50">
-                <input bind:checked={editForm.allow_silent_completion} disabled={!isEditable} class="h-4 w-4 rounded border-slate-600 bg-slate-950" type="checkbox" />
-                <span>Allow silent completion</span>
-              </label>
-            </div>
-          </label>
-
-          <div class="mt-5 flex justify-end">
-            <Button disabled={saving || !isEditable} onclick={saveTask}>{saving ? 'Saving...' : 'Save task'}</Button>
-          </div>
-        </Card>
-
         <!-- Pending pause -->
-        {#if task.pending_pause}
+        {#if activePause}
           <Card class="overflow-hidden p-0">
             <div class="space-y-4">
               <div class="border-b border-slate-800/80 bg-gradient-to-r from-sky-500/10 via-slate-900 to-slate-900 px-5 py-4">
                 <div class="flex flex-wrap items-center gap-2 text-xs uppercase tracking-[0.25em] text-slate-400">
-                  <span>{task.pending_pause.pause_type === 'gate' ? 'Workflow gate' : 'Step question'}</span>
-                  {#if task.pending_pause.step_name}
-                    <span class="rounded-full border border-slate-700 bg-slate-950/70 px-2 py-0.5 text-[10px] tracking-[0.2em] text-slate-300">{task.pending_pause.step_name}</span>
+                  <span>{activePause.pause_type === 'gate' ? 'Workflow gate' : 'Step question'}</span>
+                  {#if activePause.step_name}
+                    <span class="rounded-full border border-slate-700 bg-slate-950/70 px-2 py-0.5 text-[10px] tracking-[0.2em] text-slate-300">{activePause.step_name}</span>
                   {/if}
                 </div>
-                <h2 class="mt-3 text-lg font-semibold text-white">{task.pending_pause.question}</h2>
+                <h2 class="mt-3 text-lg font-semibold text-white">{activePause.question}</h2>
                 <p class="mt-2 text-sm text-slate-400">
-                  {task.pending_pause.pause_type === 'gate'
+                  {activePause.pause_type === 'gate'
                     ? 'Review the latest attempt, give guidance if needed, then continue or stop the workflow.'
                     : 'Answer here to resume the active step without leaving the task view.'}
                 </p>
               </div>
 
               <div class="px-5 pb-5">
-              {#if task.pending_pause.pause_type === 'gate'}
+              {#if activePause.pause_type === 'gate'}
                 <div class="space-y-3">
                   <div class="rounded-2xl border border-sky-500/20 bg-sky-500/5 p-4">
                     <div class="flex items-center gap-2 text-sm font-medium text-sky-100">
@@ -854,10 +879,10 @@
                     <textarea bind:value={gateFeedback} class="mt-3 min-h-[120px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500" placeholder="Example: approve the direction, but tighten the final summary and validate edge cases before finishing."></textarea>
                   </div>
                   <div class="grid gap-2 sm:grid-cols-2">
-                    {#each task.pending_pause.options ?? [] as option}
+                    {#each activePause.options ?? [] as option}
                       <Button class="justify-center" size="sm" onclick={() => respondToGate(String(option.action ?? 'continue'))}>{String(option.label ?? option.action ?? 'continue')}</Button>
                     {/each}
-                    {#if (task.pending_pause.options ?? []).length === 0}
+                    {#if (activePause.options ?? []).length === 0}
                       <Button class="justify-center" size="sm" onclick={() => respondToGate('continue')}>Continue workflow</Button>
                     {/if}
                     <Button class="justify-center" size="sm" variant="secondary" onclick={() => respondToGate('cancel')}>Stop task</Button>
@@ -865,9 +890,9 @@
                 </div>
               {:else}
                 <div class="space-y-3">
-                  {#if (task.pending_pause.options ?? []).length > 0}
+                  {#if (activePause.options ?? []).length > 0}
                     <div class="flex flex-wrap gap-2">
-                      {#each task.pending_pause.options ?? [] as option}
+                      {#each activePause.options ?? [] as option}
                         <button class="rounded-full border border-slate-700 bg-slate-900/70 px-3 py-1.5 text-xs text-slate-200 transition hover:border-sky-400/40 hover:bg-sky-500/10 hover:text-white" onclick={() => { stepResponse = String(option.action ?? option.label ?? ''); }} type="button">{String(option.label ?? option.action ?? 'Use option')}</button>
                       {/each}
                     </div>
@@ -875,7 +900,7 @@
                   <textarea bind:value={stepResponse} class="min-h-[120px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500" placeholder="Provide the answer that resumes the current step"></textarea>
                   <div class="flex flex-wrap gap-2">
                     <Button size="sm" onclick={() => respondToStepQuestion(stepResponse)}>Send response</Button>
-                    {#each task.pending_pause.options ?? [] as option}
+                    {#each activePause.options ?? [] as option}
                       <Button size="sm" variant="secondary" onclick={() => respondToStepQuestion(String(option.action ?? option.label ?? ''))}>{String(option.label ?? option.action ?? 'Use option')}</Button>
                     {/each}
                   </div>
@@ -907,6 +932,7 @@
             <div class="space-y-2">
               {#each stepGroups as group}
                 {@const latestStatus = group.latest ? displayStepStatus(group.latest) : (task.pending_pause?.step_name === group.stepName ? 'paused' : 'pending')}
+                {@const groupAgent = agentFor(group.latest?.agent_id ?? null)}
                 <button
                   class={`w-full rounded-2xl border px-4 py-3 text-left transition ${selectedStepGroup?.stepName === group.stepName ? 'border-sky-400/50 bg-sky-500/10' : 'border-slate-800 bg-slate-950/50 hover:border-slate-700 hover:bg-slate-950/80'}`}
                   onclick={() => openStepDetail(group.stepName, { mobileDrawer: false })}
@@ -915,10 +941,10 @@
                   <div class="flex items-center justify-between gap-3">
                     <div class="min-w-0">
                       <div class="flex items-center gap-2">
-                        <p class="truncate font-medium text-white">{group.stepName}</p>
-                        {#if group.stepName === diagramActiveStep && (task.status === 'running' || task.status === 'evaluating')}
-                          <LoaderCircle class="h-3.5 w-3.5 animate-spin text-sky-300" />
+                        {#if groupAgent}
+                          <AgentAvatar name={groupAgent.display_name ?? groupAgent.name} avatarUrl={groupAgent.avatar_url} class="h-6 w-6 rounded-xl" />
                         {/if}
+                        <p class="truncate font-medium text-white">{group.stepName}</p>
                       </div>
                       <p class="mt-1 text-xs text-slate-500">{group.stepType === 'gate' ? 'Gate' : 'Execution'} {#if group.attempts.length > 1}<span class="ml-1 text-slate-400">x{group.attempts.length}</span>{/if}</p>
                     </div>
@@ -946,13 +972,18 @@
                       <div>
                         <div class="flex flex-wrap items-center gap-2">
                           <h3 class="text-lg font-semibold text-white">{latestAttempt.step_name}</h3>
-                          <span class="rounded-full border border-sky-500/30 bg-sky-500/10 px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wider text-sky-200">Latest attempt</span>
+                          {#if selectedStepGroup.attempts.length > 1}
+                            <span class="rounded-full border border-sky-500/30 bg-sky-500/10 px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wider text-sky-200">Latest attempt</span>
+                          {/if}
                           <span class="text-xs text-slate-500">#{latestAttempt.attempt}</span>
                         </div>
                         <div class="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-500">
                           <span>{latestAttempt.step_type === 'gate' ? 'Gate' : 'Run'}</span>
                           {#if latestAttempt.agent_id}
-                            <span class="text-slate-300">{agentName(latestAttempt.agent_id)}</span>
+                            <span class="inline-flex items-center gap-2 text-slate-300">
+                              <AgentAvatar name={agentName(latestAttempt.agent_id)} avatarUrl={agentFor(latestAttempt.agent_id)?.avatar_url ?? null} class="h-5 w-5 rounded-lg" />
+                              {agentName(latestAttempt.agent_id)}
+                            </span>
                           {/if}
                           {#if latestAttempt.started_at}
                             <Tooltip text={formatAbsoluteTime(latestAttempt.started_at)}>
@@ -1127,7 +1158,7 @@
                 {#if sourceConversation}
                   <div class="flex justify-between gap-3"><dt class="text-slate-500">Conversation</dt><dd><a href="/chat?conversation={sourceConversation.conversation_id}" class="text-sky-400 hover:text-sky-300 hover:underline">{sourceConversation.title ?? 'Untitled'}</a></dd></div>
                 {/if}
-                <div class="flex justify-between gap-3"><dt class="text-slate-500">Agent</dt><dd>{agentName(task.agent_id)}</dd></div>
+                <div class="flex justify-between gap-3"><dt class="text-slate-500">Agent</dt><dd class="inline-flex items-center gap-2"><AgentAvatar name={agentName(task.agent_id)} avatarUrl={taskAgent?.avatar_url ?? null} class="h-5 w-5 rounded-lg" />{agentName(task.agent_id)}</dd></div>
                 <div class="flex justify-between gap-3"><dt class="text-slate-500">Workflow</dt><dd>{workflowName(task.workflow_id)}</dd></div>
               </dl>
             </div>
@@ -1144,38 +1175,13 @@
 
         <details class="group rounded-3xl border border-slate-800 bg-slate-950/40 p-4">
           <summary class="flex cursor-pointer list-none items-center justify-between gap-3 text-sm font-medium text-white">
-            Result and dependencies
+            Result
             <ChevronDown class="h-4 w-4 text-slate-500 transition group-open:rotate-180" />
           </summary>
           <div class="mt-4 space-y-4 text-sm text-slate-300">
             <div class="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
               <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Result</p>
               <p class="mt-3 leading-6 text-slate-300">{task.result_summary ?? 'This task has not produced a final result yet.'}</p>
-            </div>
-            <div class="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
-              <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Dependencies</p>
-              <div class="mt-3 space-y-3">
-                {#each task.dependencies as dependency}
-                  <div class="flex items-center justify-between gap-3 rounded-2xl border border-slate-800 bg-slate-950/60 px-4 py-3">
-                    <span>{allTasks.find((c) => c.task_id === dependency.depends_on)?.title ?? dependency.depends_on}</span>
-                    <Button size="sm" variant="danger" onclick={() => removeDependency(dependency.depends_on)}>Remove</Button>
-                  </div>
-                {/each}
-                {#if task.dependencies.length === 0}
-                  <p class="text-slate-400">No dependencies configured.</p>
-                {/if}
-                {#if isEditable}
-                  <div class="space-y-3 border-t border-slate-800 pt-4">
-                    <select bind:value={dependencyTaskId} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
-                      <option value="">Add dependency...</option>
-                      {#each allTasks.filter((c) => c.task_id !== taskIdFromRoute()) as candidate}
-                        <option value={candidate.task_id}>{candidate.title}</option>
-                      {/each}
-                    </select>
-                    <Button class="w-full justify-center" disabled={!dependencyTaskId} onclick={addDependency}>Add dependency</Button>
-                  </div>
-                {/if}
-              </div>
             </div>
           </div>
         </details>
@@ -1214,7 +1220,7 @@
             {/if}
             <div class="flex justify-between gap-3">
               <dt class="text-slate-500">Agent</dt>
-              <dd class="text-slate-300">{agentName(task.agent_id)}</dd>
+              <dd class="inline-flex items-center gap-2 text-slate-300"><AgentAvatar name={agentName(task.agent_id)} avatarUrl={taskAgent?.avatar_url ?? null} class="h-5 w-5 rounded-lg" />{agentName(task.agent_id)}</dd>
             </div>
             <div class="flex justify-between gap-3">
               <dt class="text-slate-500">Workflow</dt>
@@ -1329,36 +1335,6 @@
           {/if}
           <p class="mt-3 text-sm leading-6 text-slate-300">{task.result_summary ?? 'This task has not produced a final result yet.'}</p>
         </Card>
-
-        <!-- Dependencies -->
-        <Card class="p-5">
-          <div class="space-y-4">
-            <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Dependencies</p>
-            <div class="space-y-3">
-              {#each task.dependencies as dependency}
-                <div class="flex items-center justify-between gap-3 rounded-2xl border border-slate-800 bg-slate-950/60 px-4 py-3">
-                  <span class="text-sm text-slate-200">{allTasks.find((c) => c.task_id === dependency.depends_on)?.title ?? dependency.depends_on}</span>
-                  <Button size="sm" variant="danger" onclick={() => removeDependency(dependency.depends_on)}>Remove</Button>
-                </div>
-              {/each}
-              {#if task.dependencies.length === 0}
-                <p class="text-sm text-slate-400">No dependencies configured.</p>
-              {/if}
-            </div>
-
-            {#if isEditable}
-              <div class="space-y-3 border-t border-slate-800 pt-4">
-                <select bind:value={dependencyTaskId} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
-                  <option value="">Add dependency...</option>
-                  {#each allTasks.filter((c) => c.task_id !== taskIdFromRoute()) as candidate}
-                    <option value={candidate.task_id}>{candidate.title}</option>
-                  {/each}
-                </select>
-                <Button class="w-full justify-center" disabled={!dependencyTaskId} onclick={addDependency}>Add dependency</Button>
-              </div>
-            {/if}
-          </div>
-        </Card>
       </div>
     </div>
   </section>
@@ -1398,6 +1374,135 @@
         {:else}
           <div class="mt-4 rounded-3xl border border-dashed border-slate-700 px-4 py-8 text-center text-sm text-slate-400">This step has not produced an attempt yet.</div>
         {/if}
+      </div>
+    </div>
+  {/if}
+
+  {#if configModalOpen}
+    <div class="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/85 p-4" role="presentation">
+      <button class="absolute inset-0" onclick={closeConfigModal} type="button" aria-label="Close configuration"></button>
+      <div class="relative z-10 max-h-[90vh] w-full max-w-4xl overflow-y-auto rounded-[2rem] border border-slate-700 bg-slate-900 p-6 shadow-2xl">
+        <div class="flex items-start justify-between gap-4 border-b border-slate-800 pb-4">
+          <div>
+            <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Task configuration</p>
+            <h2 class="mt-1 text-xl font-semibold text-white">{task.title}</h2>
+            <p class="mt-2 text-sm text-slate-400">Configuration is secondary to live execution, so edits live here while the main page stays focused on workflow progress.</p>
+          </div>
+          <Button size="sm" variant="secondary" onclick={closeConfigModal}>Close</Button>
+        </div>
+
+        <div class="mt-5 grid gap-4 md:grid-cols-2">
+          <label class="space-y-2 text-sm font-medium text-slate-200">
+            <span>Title</span>
+            <Input bind:value={editForm.title} disabled={!isEditable} />
+          </label>
+          <label class="space-y-2 text-sm font-medium text-slate-200">
+            <span>Priority</span>
+            <Input bind:value={editForm.priority} type="number" disabled={!isEditable} />
+          </label>
+          <label class="space-y-2 text-sm font-medium text-slate-200">
+            <span>Agent</span>
+            <select bind:value={editForm.agent_id} disabled={!isEditable} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100 disabled:opacity-50">
+              {#each agents.filter((a) => a.agent_type === 'primary') as agent}
+                <option value={agent.agent_id}>{agent.display_name ?? agent.name}</option>
+              {/each}
+            </select>
+          </label>
+          <label class="space-y-2 text-sm font-medium text-slate-200">
+            <span>Workflow</span>
+            <select bind:value={editForm.workflow_id} disabled={!isEditable} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100 disabled:opacity-50">
+              <option value="">Auto</option>
+              {#each workflows as workflow}
+                <option value={workflow.workflow_id}>{workflow.name}</option>
+              {/each}
+            </select>
+          </label>
+        </div>
+
+        <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
+          <span>Description</span>
+          <textarea bind:value={editForm.description} disabled={!isEditable} class="min-h-[110px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500 disabled:opacity-50"></textarea>
+        </label>
+
+        <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
+          <span>Expected output</span>
+          <textarea bind:value={editForm.expected_output} disabled={!isEditable} class="min-h-[60px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500 disabled:opacity-50"></textarea>
+        </label>
+
+        <div class="mt-4 grid gap-4 md:grid-cols-2">
+          <label class="space-y-2 text-sm font-medium text-slate-200">
+            <span>Delivery mode</span>
+            <select bind:value={editForm.delivery_mode} disabled={!isEditable} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100 disabled:opacity-50">
+              <option value="same_conversation">Same conversation</option>
+              <option value="specific_conversation">Specific conversation</option>
+              <option value="latest_active_for_agent">Latest active</option>
+              <option value="preferred_channel">Preferred channel</option>
+            </select>
+          </label>
+          {#if editForm.delivery_mode === 'specific_conversation'}
+            <label class="space-y-2 text-sm font-medium text-slate-200">
+              <span>Delivery target</span>
+              <select bind:value={editForm.delivery_target} disabled={!isEditable} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100 disabled:opacity-50">
+                <option value="">Select conversation</option>
+                {#each conversations as conversation}
+                  <option value={conversation.conversation_id}>{conversation.title ?? conversation.conversation_id}</option>
+                {/each}
+              </select>
+            </label>
+          {/if}
+        </div>
+
+        <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
+          <span>Completion notification behavior</span>
+          <div class="grid gap-3 md:grid-cols-[minmax(0,1fr)_auto]">
+            <select bind:value={editForm.completion_mode_family} disabled={!isEditable} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100 disabled:opacity-50">
+              <option value="default">Default delivery</option>
+              <option value="direct">Direct channel delivery</option>
+            </select>
+            <label class="inline-flex items-center gap-2 rounded-xl border border-slate-800 bg-slate-950/60 px-3 py-2 text-sm text-slate-200 disabled:opacity-50">
+              <input bind:checked={editForm.allow_silent_completion} disabled={!isEditable} class="h-4 w-4 rounded border-slate-600 bg-slate-950" type="checkbox" />
+              <span>Allow silent completion</span>
+            </label>
+          </div>
+        </label>
+
+        <div class="mt-6 rounded-3xl border border-slate-800 bg-slate-950/40 p-4">
+          <div class="flex items-center justify-between gap-3">
+            <div>
+              <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Dependencies</p>
+              <p class="mt-1 text-sm text-slate-400">Only direct dependencies are shown in the live workflow. Manage them here.</p>
+            </div>
+          </div>
+          <div class="mt-4 space-y-3">
+            {#each task.dependencies as dependency}
+              <div class="flex items-center justify-between gap-3 rounded-2xl border border-slate-800 bg-slate-950/60 px-4 py-3">
+                <button class="min-w-0 truncate text-left text-sm text-slate-200 hover:text-white" onclick={() => goto(`/tasks/${dependency.depends_on}`)} type="button">{allTasks.find((candidate) => candidate.task_id === dependency.depends_on)?.title ?? dependency.depends_on}</button>
+                {#if isEditable}
+                  <Button size="sm" variant="danger" onclick={() => removeDependency(dependency.depends_on)}>Remove</Button>
+                {/if}
+              </div>
+            {/each}
+            {#if task.dependencies.length === 0}
+              <p class="text-sm text-slate-400">No dependencies configured.</p>
+            {/if}
+            {#if isEditable}
+              <div class="grid gap-3 border-t border-slate-800 pt-4 md:grid-cols-[minmax(0,1fr)_auto]">
+                <select bind:value={dependencyTaskId} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+                  <option value="">Add dependency...</option>
+                  {#each allTasks.filter((candidate) => candidate.task_id !== taskIdFromRoute()) as candidate}
+                    <option value={candidate.task_id}>{candidate.title}</option>
+                  {/each}
+                </select>
+                <Button class="justify-center" disabled={!dependencyTaskId} onclick={addDependency}>Add dependency</Button>
+              </div>
+            {/if}
+          </div>
+        </div>
+
+        <div class="mt-6 flex justify-end gap-3 border-t border-slate-800 pt-4">
+          <Button variant="secondary" onclick={closeConfigModal}>Close</Button>
+          <Button disabled={saving || !isEditable} onclick={async () => { if (await saveTask()) closeConfigModal(); }}>{saving ? 'Saving...' : 'Save task'}</Button>
+        </div>
       </div>
     </div>
   {/if}

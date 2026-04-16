@@ -11,8 +11,10 @@
     stepDurations = {} as Record<string, string>,
     stepAttemptCounts = {} as Record<string, number>,
     stepStateLabels = {} as Record<string, string>,
+    stepHasLogs = {} as Record<string, boolean>,
     skippedSteps = [] as string[],
     onStepSelect = (_stepName: string) => {},
+    onStepLogsOpen = (_stepName: string) => {},
   } = $props<{
     steps: WorkflowStepFormState[];
     interactionMode: string;
@@ -22,8 +24,10 @@
     stepDurations?: Record<string, string>;
     stepAttemptCounts?: Record<string, number>;
     stepStateLabels?: Record<string, string>;
+    stepHasLogs?: Record<string, boolean>;
     skippedSteps?: string[];
     onStepSelect?: (stepName: string) => void;
+    onStepLogsOpen?: (stepName: string) => void;
   }>();
 
   let isTaskMode = $derived(activeStepName !== '' || selectedStepName !== '' || Object.keys(stepStatuses).length > 0);
@@ -169,6 +173,16 @@
     event.preventDefault();
     handleNodeSelect(stepName);
   }
+
+  function handleStepLogsOpen(stepName: string): void {
+    if (!stepHasLogs[stepName]) return;
+    onStepLogsOpen(stepName);
+  }
+
+  function handleStepLogsClick(event: MouseEvent, stepName: string): void {
+    event.stopPropagation();
+    handleStepLogsOpen(stepName);
+  }
 </script>
 
 {#if steps.length === 0}
@@ -197,11 +211,11 @@
               50% { opacity: 0.5; }
             }
             @keyframes node-spin {
-              from { transform: rotate(0deg); }
-              to { transform: rotate(360deg); }
+              from { stroke-dashoffset: 28; }
+              to { stroke-dashoffset: 0; }
             }
             .node-active { animation: pulse-stroke 2s ease-in-out infinite; }
-            .node-spinner { animation: node-spin 1s linear infinite; transform-origin: center; }
+            .node-spinner { animation: node-spin 1s linear infinite; }
           </style>
         {/if}
       </defs>
@@ -257,9 +271,11 @@
         {@const duration = stepDurations[step.name] ?? ''}
         {@const statusLabel = stepStatusLabel(step.name)}
         {@const attempt = attemptLabel(step.name)}
+        {@const hasLogs = stepHasLogs[step.name] ?? false}
 
         {#if isGate}
           <!-- Gate: diamond shape -->
+          <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions a11y_no_noninteractive_tabindex -->
           <g
             opacity={nodeOpacity(step.name)}
             onclick={() => handleNodeSelect(step.name)}
@@ -293,18 +309,32 @@
               gate
             </text>
             {#if isActive}
-              <g class="node-spinner">
+              <g>
                 <circle cx={x + NODE_W - 18} cy={y + 18} r="7" fill="none" stroke="#f59e0b33" stroke-width="2" />
-                <path d="M {x + NODE_W - 18} {y + 11} a 7 7 0 0 1 7 7" fill="none" stroke="#fbbf24" stroke-width="2" stroke-linecap="round" />
+                <circle cx={x + NODE_W - 18} cy={y + 18} r="7" fill="none" stroke="#fbbf24" stroke-width="2" stroke-linecap="round" stroke-dasharray="9 19" class="node-spinner" />
               </g>
             {/if}
             {#if attempt}
               <rect x={x + NODE_W - 28} y={y + NODE_H - 18} width="22" height="12" rx="6" fill="#f59e0b1a" stroke="#f59e0b66" stroke-width="0.75" />
               <text x={x + NODE_W - 17} y={y + NODE_H - 9} text-anchor="middle" class="fill-amber-300 text-[8px] font-semibold">{attempt}</text>
             {/if}
+            {#if isTaskMode && hasLogs}
+              <foreignObject x={x + 8} y={y + 8} width="20" height="20">
+                <button
+                  class="flex h-5 w-5 items-center justify-center rounded-md border border-slate-600/80 bg-slate-950/85 text-[10px] text-slate-200 hover:border-sky-400/60 hover:text-white"
+                  onclick={(event) => handleStepLogsClick(event, step.name)}
+                  type="button"
+                  aria-label={`Open logs for ${step.name}`}
+                  title="Open logs"
+                >
+                  L
+                </button>
+              </foreignObject>
+            {/if}
           </g>
         {:else}
           <!-- Run: rounded rectangle -->
+          <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions a11y_no_noninteractive_tabindex -->
           <g
             opacity={nodeOpacity(step.name)}
             onclick={() => handleNodeSelect(step.name)}
@@ -344,14 +374,27 @@
               </text>
             {/if}
             {#if isActive}
-              <g class="node-spinner">
+              <g>
                 <circle cx={x + NODE_W - 16} cy={y + 16} r="7" fill="none" stroke="#0ea5e933" stroke-width="2" />
-                <path d="M {x + NODE_W - 16} {y + 9} a 7 7 0 0 1 7 7" fill="none" stroke="#38bdf8" stroke-width="2" stroke-linecap="round" />
+                <circle cx={x + NODE_W - 16} cy={y + 16} r="7" fill="none" stroke="#38bdf8" stroke-width="2" stroke-linecap="round" stroke-dasharray="9 19" class="node-spinner" />
               </g>
             {/if}
             {#if attempt}
               <rect x={x + NODE_W - 28} y={y + NODE_H - 18} width="22" height="12" rx="6" fill="#0ea5e91a" stroke="#38bdf866" stroke-width="0.75" />
               <text x={x + NODE_W - 17} y={y + NODE_H - 9} text-anchor="middle" class="fill-sky-300 text-[8px] font-semibold">{attempt}</text>
+            {/if}
+            {#if isTaskMode && hasLogs}
+              <foreignObject x={x + 8} y={y + 8} width="20" height="20">
+                <button
+                  class="flex h-5 w-5 items-center justify-center rounded-md border border-slate-600/80 bg-slate-950/85 text-[10px] text-slate-200 hover:border-sky-400/60 hover:text-white"
+                  onclick={(event) => handleStepLogsClick(event, step.name)}
+                  type="button"
+                  aria-label={`Open logs for ${step.name}`}
+                  title="Open logs"
+                >
+                  L
+                </button>
+              </foreignObject>
             {/if}
           </g>
         {/if}

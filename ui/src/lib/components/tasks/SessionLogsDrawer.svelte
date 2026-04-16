@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
+  import { ArrowDown } from 'lucide-svelte';
 
   import { api, asApiError } from '$lib/api/client';
   import {
@@ -37,6 +38,29 @@
   let pollDelayMs = $state(SESSION_LOG_POLL_INTERVAL_MS);
 
   let initialLoadDone = $state(false);
+  let timelineEl = $state<HTMLDivElement | null>(null);
+  let userScrolledUp = $state(false);
+  let programmaticScroll = false;
+
+  function scrollToBottom(force = false): void {
+    if (!timelineEl || (!force && userScrolledUp)) return;
+    programmaticScroll = true;
+    requestAnimationFrame(() => {
+      if (timelineEl) timelineEl.scrollTop = timelineEl.scrollHeight;
+      programmaticScroll = false;
+    });
+  }
+
+  function handleTimelineScroll(): void {
+    if (!timelineEl || programmaticScroll) return;
+    const distanceFromBottom = timelineEl.scrollHeight - timelineEl.scrollTop - timelineEl.clientHeight;
+    userScrolledUp = distanceFromBottom > 80;
+  }
+
+  function jumpToBottom(): void {
+    userScrolledUp = false;
+    scrollToBottom(true);
+  }
 
   async function loadEvents(refresh = false): Promise<void> {
     // Only show loading spinner on the first load — background refreshes
@@ -69,11 +93,17 @@
         events = history;
         lastSeq = finalLastSeq;
         timeline = normalizeHistory(history);
+        await tick();
+        userScrolledUp = false;
+        scrollToBottom(true);
       } else {
         const result = await api.conversations.sessionEvents(conversationId, sessionId, lastSeq, SESSION_LOG_PAGE_SIZE);
         if ((result.items ?? []).length > 0) {
+          const shouldFollow = !userScrolledUp;
           events = [...events, ...(result.items ?? [])];
           timeline = normalizeHistory(events);
+          await tick();
+          if (shouldFollow) scrollToBottom(true);
         }
         lastSeq = result.last_seq;
       }
@@ -118,7 +148,7 @@
 
 <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
 <div class="fixed inset-0 z-50 flex justify-end bg-black/40" onclick={handleBackdropClick} role="presentation">
-  <aside class="flex h-full w-full max-w-2xl flex-col border-l border-slate-700 bg-slate-900 shadow-2xl animate-slide-in-right">
+  <aside class="flex h-full min-h-0 w-full max-w-2xl flex-col border-l border-slate-700 bg-slate-900 shadow-2xl animate-slide-in-right">
     <div class="flex items-center justify-between border-b border-slate-800 px-4 py-3">
       <div>
         <p class="text-xs uppercase tracking-widest text-slate-500">Session logs</p>
@@ -130,7 +160,7 @@
       </div>
     </div>
 
-    <div class="flex-1 space-y-4 overflow-y-auto px-4 py-4">
+    <div class="relative min-h-0 flex-1 space-y-4 overflow-y-auto px-4 py-4" bind:this={timelineEl} onscroll={handleTimelineScroll}>
       {#if loading}
         <LoadingState />
       {:else if error}
@@ -165,6 +195,12 @@
             </div>
           {/if}
         {/each}
+      {/if}
+
+      {#if userScrolledUp}
+        <button class="sticky bottom-2 left-1/2 z-10 -translate-x-1/2 rounded-full border border-slate-700 bg-slate-900/90 p-2 shadow-lg transition hover:bg-slate-800" onclick={jumpToBottom} type="button" title="Scroll to latest">
+          <ArrowDown class="h-4 w-4 text-slate-300" />
+        </button>
       {/if}
     </div>
   </aside>
