@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { FileText } from 'lucide-svelte';
+  import { FileSearch, Logs } from 'lucide-svelte';
   import type { WorkflowStepFormState } from '$lib/workflows';
 
   let {
@@ -13,9 +13,11 @@
     stepAttemptCounts = {} as Record<string, number>,
     stepStateLabels = {} as Record<string, string>,
     stepHasLogs = {} as Record<string, boolean>,
+    stepHasOutput = {} as Record<string, boolean>,
     skippedSteps = [] as string[],
     onStepSelect = (_stepName: string) => {},
     onStepLogsOpen = (_stepName: string) => {},
+    onStepOutputOpen = (_stepName: string) => {},
   } = $props<{
     steps: WorkflowStepFormState[];
     interactionMode: string;
@@ -26,9 +28,11 @@
     stepAttemptCounts?: Record<string, number>;
     stepStateLabels?: Record<string, string>;
     stepHasLogs?: Record<string, boolean>;
+    stepHasOutput?: Record<string, boolean>;
     skippedSteps?: string[];
     onStepSelect?: (stepName: string) => void;
     onStepLogsOpen?: (stepName: string) => void;
+    onStepOutputOpen?: (stepName: string) => void;
   }>();
 
   let isTaskMode = $derived(activeStepName !== '' || selectedStepName !== '' || Object.keys(stepStatuses).length > 0);
@@ -184,6 +188,16 @@
     event.stopPropagation();
     handleStepLogsOpen(stepName);
   }
+
+  function handleStepOutputOpen(stepName: string): void {
+    if (!stepHasOutput[stepName]) return;
+    onStepOutputOpen(stepName);
+  }
+
+  function handleStepOutputClick(event: MouseEvent, stepName: string): void {
+    event.stopPropagation();
+    handleStepOutputOpen(stepName);
+  }
 </script>
 
 {#if steps.length === 0}
@@ -273,6 +287,7 @@
         {@const statusLabel = stepStatusLabel(step.name)}
         {@const attempt = attemptLabel(step.name)}
         {@const hasLogs = stepHasLogs[step.name] ?? false}
+        {@const hasOutput = stepHasOutput[step.name] ?? false}
 
         {#if isGate}
           <!-- Gate: diamond shape -->
@@ -319,8 +334,21 @@
               <rect x={x + NODE_W - 28} y={y + NODE_H - 18} width="22" height="12" rx="6" fill="#f59e0b1a" stroke="#f59e0b66" stroke-width="0.75" />
               <text x={x + NODE_W - 17} y={y + NODE_H - 9} text-anchor="middle" class="fill-amber-300 text-[8px] font-semibold">{attempt}</text>
             {/if}
-            {#if isTaskMode && hasLogs}
-              <foreignObject x={x + 8} y={y + 8} width="20" height="20">
+            {#if isTaskMode && (hasLogs || hasOutput)}
+              <foreignObject x={x + 8} y={y + 8} width="44" height="20">
+                <div class="flex gap-1">
+                {#if hasOutput}
+                <button
+                  class="flex h-5 w-5 items-center justify-center rounded-md border border-slate-600/80 bg-slate-950/90 text-slate-200 transition hover:border-violet-400/60 hover:text-white"
+                  onclick={(event) => handleStepOutputClick(event, step.name)}
+                  type="button"
+                  aria-label={`Open full output for ${step.name}`}
+                  title="Open full output"
+                >
+                  <FileSearch class="h-3 w-3" />
+                </button>
+                {/if}
+                {#if hasLogs}
                 <button
                   class="flex h-5 w-5 items-center justify-center rounded-md border border-slate-600/80 bg-slate-950/90 text-slate-200 transition hover:border-sky-400/60 hover:text-white"
                   onclick={(event) => handleStepLogsClick(event, step.name)}
@@ -328,8 +356,10 @@
                   aria-label={`Open logs for ${step.name}`}
                   title="Open logs"
                 >
-                  <FileText class="h-3 w-3" />
+                  <Logs class="h-3 w-3" />
                 </button>
+                {/if}
+                </div>
               </foreignObject>
             {/if}
           </g>
@@ -384,8 +414,21 @@
               <rect x={x + NODE_W - 28} y={y + NODE_H - 18} width="22" height="12" rx="6" fill="#0ea5e91a" stroke="#38bdf866" stroke-width="0.75" />
               <text x={x + NODE_W - 17} y={y + NODE_H - 9} text-anchor="middle" class="fill-sky-300 text-[8px] font-semibold">{attempt}</text>
             {/if}
-            {#if isTaskMode && hasLogs}
-              <foreignObject x={x + 8} y={y + 8} width="20" height="20">
+            {#if isTaskMode && (hasLogs || hasOutput)}
+              <foreignObject x={x + 8} y={y + 8} width="44" height="20">
+                <div class="flex gap-1">
+                {#if hasOutput}
+                <button
+                  class="flex h-5 w-5 items-center justify-center rounded-md border border-slate-600/80 bg-slate-950/90 text-slate-200 transition hover:border-violet-400/60 hover:text-white"
+                  onclick={(event) => handleStepOutputClick(event, step.name)}
+                  type="button"
+                  aria-label={`Open full output for ${step.name}`}
+                  title="Open full output"
+                >
+                  <FileSearch class="h-3 w-3" />
+                </button>
+                {/if}
+                {#if hasLogs}
                 <button
                   class="flex h-5 w-5 items-center justify-center rounded-md border border-slate-600/80 bg-slate-950/90 text-slate-200 transition hover:border-sky-400/60 hover:text-white"
                   onclick={(event) => handleStepLogsClick(event, step.name)}
@@ -393,8 +436,10 @@
                   aria-label={`Open logs for ${step.name}`}
                   title="Open logs"
                 >
-                  <FileText class="h-3 w-3" />
+                  <Logs class="h-3 w-3" />
                 </button>
+                {/if}
+                </div>
               </foreignObject>
             {/if}
           </g>

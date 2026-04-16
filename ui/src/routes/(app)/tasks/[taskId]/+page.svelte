@@ -256,6 +256,12 @@
     openSessionLogs(group.latest);
   }
 
+  function openOutputModalForStep(stepName: string): void {
+    const group = stepGroups.find((candidate) => candidate.stepName === stepName);
+    if (!group?.latest) return;
+    openOutputModal(group.latest);
+  }
+
   interface StepGroup {
     stepName: string;
     stepType: string;
@@ -505,6 +511,14 @@
   });
 
   let stepHasLogs = $derived.by(() => Object.fromEntries(stepGroups.map((group) => [group.stepName, Boolean(group.latest?.output?.session_id || group.latest?.session_id)])));
+  let stepHasOutput = $derived.by(() => {
+    const entries: Array<[string, boolean]> = [];
+    for (const group of stepGroups) {
+      const latest = group.latest;
+      entries.push([group.stepName, Boolean(latest && (stepOutputSummary(latest) || stepOutputContent(latest)))]);
+    }
+    return Object.fromEntries(entries);
+  });
 
   // ---------------------------------------------------------------------------
   // Data loading
@@ -779,6 +793,9 @@
                 </div>
                 {#if selectedStepGroup}
                   <div class="flex items-center gap-2">
+                  {#if stepHasOutput[selectedStepGroup.stepName]}
+                    <Button size="sm" variant="secondary" onclick={() => openOutputModalForStep(selectedStepGroup.stepName)}>Open output</Button>
+                  {/if}
                   {#if stepHasLogs[selectedStepGroup.stepName]}
                     <Button size="sm" variant="ghost" onclick={() => openSessionLogsForStep(selectedStepGroup.stepName)}>Open logs</Button>
                   {/if}
@@ -842,9 +859,11 @@
               stepAttemptCounts={stepAttemptCounts}
               stepStateLabels={stepStateLabels}
               stepHasLogs={stepHasLogs}
+              stepHasOutput={stepHasOutput}
               skippedSteps={diagramSkippedSteps}
               onStepSelect={(stepName) => openStepDetail(stepName)}
               onStepLogsOpen={openSessionLogsForStep}
+              onStepOutputOpen={openOutputModalForStep}
             />
             </div>
           </Card>
