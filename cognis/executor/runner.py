@@ -243,6 +243,8 @@ class ExecutorRunner:
                 asyncio.create_task(self._handle_lsp_status(ws, msg_id, params))
             elif method == "executor.cancel":
                 logger.info("Received executor.cancel, shutting down")
+                if msg_id is not None:
+                    await self._send_rpc_result(ws, msg_id, {"status": "shutting_down"})
                 self._running = False
                 break
             else:

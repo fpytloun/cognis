@@ -637,6 +637,10 @@ class WebSocketExecutorProvider:
         """Send ``executor.cancel`` and close the connection."""
         conn = self._connections.get(handle.executor_id)
         if conn is not None and conn.connected:
+            _logger.info(
+                "executor_ws: sending executor.cancel",
+                extra={"extra_data": {"executor_id": handle.executor_id}},
+            )
             with contextlib.suppress(Exception):
                 await conn.rpc_call("executor.cancel", {"reason": "cancelled"}, timeout=5.0)
             await conn.close()
@@ -648,11 +652,15 @@ class WebSocketExecutorProvider:
         return [h for h in self._handles.values() if h.status == "ready"]
 
     async def cleanup(self) -> None:
-        """Disconnect all executors."""
-        for executor_id in list(self._connections):
-            handle = self._handles.get(executor_id)
-            if handle is not None:
-                await self.cancel(handle)
+        """Drop controller-side websocket connections without stopping remote runtimes."""
+        for executor_id, conn in list(self._connections.items()):
+            _logger.info(
+                "executor_ws: closing controller-side connection during cleanup",
+                extra={"extra_data": {"executor_id": executor_id}},
+            )
+            with contextlib.suppress(Exception):
+                await conn.close()
+            self.unregister_connection(executor_id, conn)
 
     async def health(self) -> ProviderHealth:
         """Report health of the WebSocket executor provider."""

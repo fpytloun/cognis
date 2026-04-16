@@ -34,6 +34,16 @@ class FakeWebSocket:
         self._receive_queue.put_nowait(data)
 
 
+class CloseTrackingConnection:
+    def __init__(self) -> None:
+        self.connected = True
+        self.closed = False
+
+    async def close(self) -> None:
+        self.connected = False
+        self.closed = True
+
+
 @pytest.mark.asyncio
 async def test_rpc_call_sends_jsonrpc_request() -> None:
     """rpc_call sends a JSON-RPC 2.0 request and awaits correlated response."""
@@ -319,3 +329,22 @@ async def test_provider_list_active() -> None:
     active = await provider.list_active()
     assert len(active) == 1
     assert active[0].executor_id == "exec-2"
+
+
+@pytest.mark.asyncio
+async def test_provider_cleanup_does_not_send_executor_cancel() -> None:
+    provider = WebSocketExecutorProvider()
+    conn = CloseTrackingConnection()
+    provider._connections["exec-1"] = conn  # type: ignore[assignment]
+    provider._handles["exec-1"] = ExecutorHandle(
+        executor_id="exec-1",
+        executor_type="websocket",
+        capabilities=ExecutorCapabilities(),
+        status="ready",
+    )
+
+    await provider.cleanup()
+
+    assert conn.closed is True
+    assert provider._connections == {}
+    assert provider._handles["exec-1"].status == "disconnected"

@@ -25,6 +25,20 @@ class DummyWebSocket:
         self.sent.append(json.loads(raw))
 
 
+class DummyMessageWebSocket(DummyWebSocket):
+    def __init__(self, messages: list[dict]) -> None:
+        super().__init__()
+        self._messages = [json.dumps(message) for message in messages]
+
+    def __aiter__(self) -> DummyMessageWebSocket:
+        return self
+
+    async def __anext__(self) -> str:
+        if not self._messages:
+            raise StopAsyncIteration
+        return self._messages.pop(0)
+
+
 def test_normalize_result_from_string() -> None:
     result = _normalize_result("hello world", 42)
     assert isinstance(result, ToolResult)
@@ -155,6 +169,30 @@ async def test_heartbeat_includes_configuration_state() -> None:
     runner._running = False
     await task
     assert ws.sent[0]["params"]["configured"] is False
+
+
+@pytest.mark.asyncio
+async def test_executor_cancel_acknowledges_before_shutdown() -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    ws = DummyMessageWebSocket(
+        [
+            {
+                "jsonrpc": "2.0",
+                "method": "executor.cancel",
+                "id": "cancel-1",
+                "params": {"reason": "cancelled"},
+            }
+        ]
+    )
+
+    await runner._handle_configure(ws, "cfg-1", {"enabled_tools": [], "config": {}})
+    ws.sent.clear()
+
+    await runner._message_loop(ws)
+
+    assert runner._running is False
+    assert ws.sent[-1]["id"] == "cancel-1"
+    assert ws.sent[-1]["result"]["status"] == "shutting_down"
 
 
 @pytest.mark.asyncio
