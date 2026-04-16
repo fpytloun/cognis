@@ -654,7 +654,19 @@ class ContextAssembler:
                 }
             )
 
-        if not skip_user_message:
+        # Detect whether the current user_message was already recorded into
+        # the Intaris history (turn_scheduler / agent_loop record it early so
+        # the intention barrier can start updating in parallel). If so, it is
+        # already present as the trailing user-role message in history and
+        # must not be re-appended, or the LLM sees the prompt twice.
+        already_in_history = _current_user_message_already_in_history(
+            history_messages,
+            user_message=user_message,
+            user_message_role=user_message_role,
+            user_attachments=user_attachments,
+        )
+
+        if not skip_user_message and not already_in_history:
             if routing_reminder:
                 messages.append(
                     {
@@ -692,6 +704,24 @@ class ContextAssembler:
                     content = f"{user_message}\n\n{note}" if user_message.strip() else note
                 if content or user_message_role != "system":
                     messages.append({"role": user_message_role, "content": content})
+        elif already_in_history:
+            # Prompt already recorded in history; still surface any
+            # turn-local signals that were meant to accompany it. The
+            # prompt-replay side does not carry these because they are
+            # ephemeral (not persisted to history).
+            if routing_reminder:
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": routing_reminder,
+                        "_routing_reminder": True,
+                    }
+                )
+            if attachment_notice:
+                # Controller diagnostic about unsupported attachments for
+                # this model — must survive dedupe or the model is not
+                # told why files are missing from the request.
+                messages.append({"role": "system", "content": attachment_notice})
 
         messages = self._prune_messages(
             messages=messages,
@@ -875,7 +905,14 @@ class ContextAssembler:
                 }
             )
 
-        if not skip_user_message:
+        already_in_history = _current_user_message_already_in_history(
+            history_messages,
+            user_message=user_message,
+            user_message_role=user_message_role,
+            user_attachments=user_attachments,
+        )
+
+        if not skip_user_message and not already_in_history:
             if routing_reminder:
                 messages.append(
                     {
@@ -913,6 +950,17 @@ class ContextAssembler:
                     content = f"{user_message}\n\n{note}" if user_message.strip() else note
                 if content or user_message_role != "system":
                     messages.append({"role": user_message_role, "content": content})
+        elif already_in_history:
+            if routing_reminder:
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": routing_reminder,
+                        "_routing_reminder": True,
+                    }
+                )
+            if attachment_notice:
+                messages.append({"role": "system", "content": attachment_notice})
 
         messages = self._prune_messages(
             messages=messages,
@@ -1327,6 +1375,119 @@ def events_to_messages(events: list[Any]) -> list[dict[str, Any]]:
         _flush_tool_calls()
     _append_orphan_placeholders()
     return messages
+
+
+def _current_user_message_already_in_history(
+    history_messages: list[dict[str, Any]],
+    *,
+    user_message: str,
+    user_message_role: str,
+    user_attachments: list[dict[str, Any]] | None,
+) -> bool:
+    """Return True when ``user_message`` is already the trailing user entry.
+
+    The controller records the current turn's user message into the Intaris
+    event store before assembling context so the intention barrier can start
+    updating in parallel. That record is then replayed as part of
+    ``history_messages``. Without deduping, ``assemble()`` would append the
+    same message a second time and the LLM would see the current prompt
+    twice — a harness protocol defect that destabilizes model behavior
+    (observed on gpt-5.4 with low reasoning emitting pathological no-op tool
+    calls and duplicated final outputs).
+
+    We only consider it a duplicate when:
+
+    * ``user_message_role == "user"`` (system-initiated turns do not record
+      a ``user_message`` event),
+    * the last message in history is a ``role: "user"`` string-content
+      message,
+    * and the textual content matches (attachment note variants included).
+
+    Returns ``False`` for any uncertainty so the original, safe behavior —
+    appending the current message explicitly — is preserved. Missing
+    user_message still yields ``False`` so we do not prevent a legitimate
+    empty user_message when user_message_role is "user".
+    """
+
+    if user_message_role != "user":
+        return False
+    if not history_messages:
+        return False
+
+    # Walk backwards, skipping tool/assistant continuations to find the
+    # last genuine user-role message.
+    last_user_content: str | None = None
+    for message in reversed(history_messages):
+        if message.get("role") != "user":
+            # If we hit any non-user role (assistant with tool_calls,
+            # tool results, system), the most recent user turn already
+            # has an assistant response or aux content after it, which
+            # means this turn's prompt has not been replayed as the tail.
+            return False
+        content = message.get("content")
+        if isinstance(content, str):
+            last_user_content = content
+            break
+        if isinstance(content, list):
+            # Attachment-form message: concatenate text blocks.
+            text_parts = [
+                part.get("text", "")
+                for part in content
+                if isinstance(part, dict) and part.get("type") == "text"
+            ]
+            last_user_content = "".join(text_parts)
+            break
+        return False
+
+    if last_user_content is None:
+        return False
+
+    normalized_history = last_user_content.strip()
+    if not normalized_history:
+        return False
+
+    # Exact match (no attachment note appended during the original
+    # recording).
+    if normalized_history == user_message.strip():
+        return True
+
+    # Match when an attachment note was appended during recording
+    # (_user_message_for_recording may add one).
+    if user_message and normalized_history.startswith(user_message.strip()):
+        suffix = normalized_history[len(user_message.strip()) :].lstrip()
+        # Accept the append-only attachment-note pattern; do not risk a
+        # false positive on unrelated suffixes.
+        if not suffix:
+            return True
+        if _looks_like_attachment_note_suffix(suffix):
+            return True
+
+    return False
+
+
+def _looks_like_attachment_note_suffix(text: str) -> bool:
+    """Heuristic: trailing text looks like an attachment note artifact.
+
+    We only use this to decide whether a recorded user message is the same
+    as the current one with an attachment note appended during history
+    replay. The canonical format produced by ``attachment_note`` is
+    ``"Attachments: <name> (<kind>), ..."`` (see
+    ``cognis/core/attachment_utils.py``). A few legacy/synthetic variants
+    are also accepted to keep the dedupe robust if the recording format
+    changes slightly.
+    """
+
+    if not text:
+        return False
+    stripped = text.lstrip()
+    return stripped.startswith(
+        (
+            "Attachments:",
+            "Attached files",
+            "<attachments",
+            "Attachment:",
+        )
+    )
 
 
 def _find_cache_breakpoint(messages: list[dict[str, Any]]) -> int | None:

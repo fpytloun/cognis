@@ -80,16 +80,20 @@ _TOOL_GUIDANCE = """\
   enable `exact_match` when appropriate.
 - If a tool result says `middle truncated` or `Tool result cleared`, the \
   visible content is incomplete.
-- For structured saved outputs such as numbered search results, use \
-  `list_tool_output_anchors(call_id=...)` first to discover anchors and \
-  `read_tool_output_anchor(call_id=..., anchor=...)` to load one section \
-  without reloading the full output.
-- When a truncated tool result includes a `call_id`, use \
-  `search_tool_output(call_id=..., pattern="error|timeout|keyword")` first when you need a \
-  specific error, URL, symbol, heading, date, or keyword.
-- Use `read_tool_output(call_id=..., offset=..., limit=...)` when you need \
-  to inspect the saved output sequentially or after search has located the \
-  relevant region.
+- For structured saved outputs such as numbered search results, use the \
+  list_tool_output_anchors tool first to discover anchors, then \
+  read_tool_output_anchor to load one section without reloading the full \
+  output. Always pass a real call_id from a prior tool_call event. Never \
+  invent call_ids or pass placeholder values such as "dummy", "example", \
+  "...", or the empty string.
+- When a truncated tool result includes a call_id, use the \
+  search_tool_output tool first when you need a specific error, URL, \
+  symbol, heading, date, or keyword. Pass the exact call_id from the \
+  truncation notice; if no real call_id is available, do not call the \
+  tool at all.
+- Use the read_tool_output tool when you need to inspect a saved output \
+  sequentially or after search has located the relevant region. Again, \
+  pass a real call_id from a prior tool_call; never use placeholders.
 - Do not assume omitted portions of a truncated tool result are irrelevant; \
   recover them when the missing content could affect the answer or next step."""
 

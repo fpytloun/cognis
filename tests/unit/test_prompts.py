@@ -66,10 +66,16 @@ def test_chat_prompt_explains_truncated_output_recovery() -> None:
     assert instructions is not None
     assert "middle truncated" in instructions
     assert "Tool result cleared" in instructions
-    assert "list_tool_output_anchors(call_id=...)" in instructions
-    assert "read_tool_output_anchor(call_id=..., anchor=...)" in instructions
-    assert 'search_tool_output(call_id=..., pattern="error|timeout|keyword")' in instructions
-    assert "read_tool_output(call_id=..., offset=..., limit=...)" in instructions
+    # The tools are referenced by name; placeholder-style example syntax
+    # like ``list_tool_output_anchors(call_id=...)`` has been removed to
+    # prevent the model from copying placeholder literals into real tool
+    # calls (e.g. call_id="dummy" observed on gpt-5.4 low reasoning).
+    assert "list_tool_output_anchors" in instructions
+    assert "read_tool_output_anchor" in instructions
+    assert "search_tool_output" in instructions
+    assert "read_tool_output" in instructions
+    # Explicit guardrail against placeholder bleed.
+    assert 'placeholder values such as "dummy"' in instructions
 
 
 def test_chat_prompt_guides_tavily_query_shape() -> None:

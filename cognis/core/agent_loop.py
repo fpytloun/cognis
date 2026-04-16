@@ -32,6 +32,14 @@ from cognis.core.compaction import ROTATION_TOTAL
 from cognis.core.decision import build_routing_reminder
 from cognis.core.events import Event, EventBus, EventType
 from cognis.core.followups import FollowUpMetadata, FollowUpMode, FollowUpPolicy
+from cognis.core.harness_guards import (
+    LoopGuardState,
+    argument_sanity_rejection_payload,
+    check_argument_sanity,
+    check_loop_guard,
+    loop_guard_rejection_payload,
+    record_tool_call,
+)
 from cognis.core.prompts import PromptContext
 from cognis.core.pruning import prune_tool_outputs
 from cognis.core.runtime import ExecutorEnvironmentSnapshot, ResolvedStepRuntime
@@ -114,6 +122,16 @@ DELEGATIONS_TOTAL = Counter(
     "Sub-session delegations spawned",
     labelnames=("status",),
 )
+HARNESS_GUARD_TRIPS = Counter(
+    "cognis_harness_guard_trips_total",
+    "Tool calls rejected by harness guards before executor dispatch",
+    labelnames=("guard", "tool_name"),
+)
+STEP_COMPLETE_REJECTIONS = Counter(
+    "cognis_step_complete_rejections_total",
+    "step_complete calls rejected by the controller",
+    labelnames=("reason",),
+)
 AUTO_COMPACTION_DURATION = Histogram(
     "cognis_auto_compaction_duration_seconds",
     "Duration of automatic post-turn compaction (compact + rotate + cache)",
@@ -138,6 +156,12 @@ CONTROLLER_TOOLS = {
     STEP_TODO_LIST,
     SEARCH_TOOLS_TOOL.name,
 }
+
+# Tools whose arguments are validated by their dedicated controller
+# handlers below. The argument-sanity gate skips these to avoid
+# double-validating (and to avoid rejecting controller-owned schema
+# choices such as empty-arg ``step_todo_list``).
+_CONTROLLER_INTERCEPTED_TOOLS: frozenset[str] = frozenset(CONTROLLER_TOOLS)
 
 # Callback types
 TokenCallback = Callable[[str], Coroutine[Any, Any, None]]
@@ -174,6 +198,31 @@ def _normalize_todos(todos: list[dict[str, Any]]) -> list[dict[str, Any]]:
         item["status"] = _normalize_todo_status(item.get("status"))
         normalized.append(item)
     return normalized
+
+
+_TODO_ECHO_CONTENT_MAX = 280
+
+
+def _echo_todos_bounded(todos: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return todos with per-item content truncated to a bounded length.
+
+    Used for the ``step_todo_write`` tool-result echo. ``ctx.todos`` keeps
+    the untruncated values; only what we hand back to the model is capped
+    so very long todo content does not inflate context/token usage on
+    every write. Truncation is rare in practice (typical todos are short
+    action labels) and adds an ellipsis marker so the model can see the
+    item was shortened.
+    """
+
+    bounded: list[dict[str, Any]] = []
+    for todo in todos:
+        content = todo.get("content")
+        if isinstance(content, str) and len(content) > _TODO_ECHO_CONTENT_MAX:
+            trimmed = content[: _TODO_ECHO_CONTENT_MAX - 1].rstrip() + "…"
+            bounded.append({**todo, "content": trimmed, "content_truncated": True})
+        else:
+            bounded.append(todo)
+    return bounded
 
 
 def _truncate_tool_data(text: str) -> str:
@@ -892,6 +941,8 @@ class StepContext:
             "commands": [],
         }
     )
+    # Harness guards (step-scoped; reset per step execution).
+    loop_guard_state: LoopGuardState = field(default_factory=LoopGuardState)
 
 
 # ---------------------------------------------------------------------------
@@ -1836,21 +1887,24 @@ class AgentLoop:
                             {
                                 "role": "system",
                                 "content": (
-                                    "Internal controller reminder — this is not a new user message. "
-                                    "Do not write a filler acknowledgment just for this reminder.\n\n"
-                                    f"You have {len(incomplete_todos)} incomplete todos:\n"
+                                    "Internal controller reminder — this is not a new user "
+                                    "message. Do not write a filler acknowledgment just for "
+                                    "this reminder.\n\n"
+                                    f"You have {len(incomplete_todos)} non-terminal todos:\n"
                                     f"{todo_list}\n\n"
-                                    "These todos should represent only current-turn "
-                                    "execution work that you still own. First decide "
-                                    "whether work actually remains, or whether only your "
-                                    "todo state is stale. If work remains, continue it, "
-                                    "ask for input if needed, and only produce assistant "
-                                    "text if you have new user-visible information, a "
-                                    "required question, or a correction. If only todo "
-                                    "cleanup remains, update or cancel the todos via "
-                                    "step_todo_write and produce no assistant text. Do "
-                                    "not repeat, restate, or paraphrase content that has "
-                                    "already been sent to the user."
+                                    "Every todo must be in a terminal state before the "
+                                    "turn ends — either 'completed' (work is done) or "
+                                    "'cancelled' (work is no longer relevant). First "
+                                    "decide whether work actually remains, or whether "
+                                    "only your todo state is stale. If work remains, "
+                                    "continue it, ask for input if needed, and only "
+                                    "produce assistant text if you have new user-visible "
+                                    "information, a required question, or a correction. "
+                                    "If only todo cleanup remains, update each todo via "
+                                    "step_todo_write to 'completed' or 'cancelled' and "
+                                    "produce no assistant text. Do not repeat, restate, "
+                                    "or paraphrase content that has already been sent "
+                                    "to the user."
                                 ),
                             }
                         )
@@ -1932,6 +1986,77 @@ class AgentLoop:
                 if on_tool_call:
                     await on_tool_call(tc.name, tc.call_id, tc.arguments)
 
+                # ---- Harness guards (pre-dispatch) ----------------------
+                #
+                # Loop guard: reject a 2nd consecutive identical call with a
+                # teach-back so the model makes progress or finalizes. Must
+                # run before argument sanity so a repeatedly invalid call
+                # also trips loop detection (record_tool_call is idempotent
+                # from the model's perspective — it only tracks the
+                # (name, args) key, not success/failure).
+                loop_message = check_loop_guard(ctx.loop_guard_state, tc.name, tc.arguments)
+                if loop_message is not None:
+                    HARNESS_GUARD_TRIPS.labels(guard="loop", tool_name=tool_id).inc()
+                    _append_tool_call_event(events_to_record, tc, tool_id)
+                    loop_payload = loop_guard_rejection_payload(tc.name, tc.arguments, loop_message)
+                    messages.append(
+                        {"role": "tool", "tool_call_id": tc.call_id, "content": loop_payload}
+                    )
+                    _append_tool_result_event(
+                        events_to_record, tc, loop_payload, True, tool_id=tool_id
+                    )
+                    await self._flush_events_incremental(
+                        ctx,
+                        events_to_record,
+                        reason=f"tool_result:loop_guard:{tc.name}",
+                        on_token=on_token,
+                    )
+                    if on_tool_result:
+                        await on_tool_result(tc.call_id, tc.name, loop_payload, True, None, None)
+                    # Record the call so a *third* identical call also
+                    # fails (streak keeps incrementing). This matters when
+                    # the model ignores the teach-back.
+                    record_tool_call(ctx.loop_guard_state, tc.name, tc.arguments)
+                    continue
+
+                # Argument sanity gate — applies only to real executor-
+                # routed tools, not controller-intercepted ones whose args
+                # are validated in their dedicated handlers below.
+                if tc.name not in _CONTROLLER_INTERCEPTED_TOOLS:
+                    violation = check_argument_sanity(tc.name, tc.arguments)
+                    if violation is not None:
+                        HARNESS_GUARD_TRIPS.labels(guard="argument_sanity", tool_name=tool_id).inc()
+                        _append_tool_call_event(events_to_record, tc, tool_id)
+                        sanity_payload = argument_sanity_rejection_payload(
+                            tc.name, tc.arguments, violation
+                        )
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc.call_id,
+                                "content": sanity_payload,
+                            }
+                        )
+                        _append_tool_result_event(
+                            events_to_record, tc, sanity_payload, True, tool_id=tool_id
+                        )
+                        await self._flush_events_incremental(
+                            ctx,
+                            events_to_record,
+                            reason=f"tool_result:arg_sanity:{tc.name}",
+                            on_token=on_token,
+                        )
+                        if on_tool_result:
+                            await on_tool_result(
+                                tc.call_id, tc.name, sanity_payload, True, None, None
+                            )
+                        record_tool_call(ctx.loop_guard_state, tc.name, tc.arguments)
+                        continue
+
+                # Record the (name, args) tuple so future calls can detect
+                # identical-in-a-row repeats.
+                record_tool_call(ctx.loop_guard_state, tc.name, tc.arguments)
+
                 # Controller tool interception
                 if tc.name == STEP_COMPLETE:
                     _append_tool_call_event(events_to_record, tc, tool_id)
@@ -1968,19 +2093,56 @@ class AgentLoop:
                             await on_tool_result(tc.call_id, tc.name, err_content, True, None, None)
                         continue
 
-                    # Enforce todo completion for workflow steps
+                    # Enforce todo completion for workflow steps. Every
+                    # todo must be in a terminal state — either ``completed``
+                    # or ``cancelled``. Cancellation is a first-class closure
+                    # action so the agent has a clean out when a todo turns
+                    # out to be impossible or irrelevant.
                     incomplete_todos = self._get_incomplete_todos(ctx)
                     if incomplete_todos and ctx.policy.require_step_complete:
-                        todo_list = ", ".join(t.get("content", "?") for t in incomplete_todos[:5])
+                        STEP_COMPLETE_REJECTIONS.labels(reason="todos_pending").inc()
+                        pending_names = [
+                            str(t.get("content", "?"))
+                            for t in incomplete_todos
+                            if t.get("status") == "pending"
+                        ]
+                        in_progress_names = [
+                            str(t.get("content", "?"))
+                            for t in incomplete_todos
+                            if t.get("status") == "in_progress"
+                        ]
+
+                        def _fmt(items: list[str], limit: int = 5) -> str:
+                            if not items:
+                                return ""
+                            head = items[:limit]
+                            rendered = ", ".join(repr(name) for name in head)
+                            if len(items) > limit:
+                                rendered += f", … (+{len(items) - limit} more)"
+                            return rendered
+
+                        detail_parts: list[str] = []
+                        if pending_names:
+                            detail_parts.append(f"pending: {_fmt(pending_names)}")
+                        if in_progress_names:
+                            detail_parts.append(f"in_progress: {_fmt(in_progress_names)}")
+                        detail = "; ".join(detail_parts) or "non-terminal todos exist"
+
                         err_content = json.dumps(
                             {
                                 "status": "rejected",
-                                "reason": "incomplete_todos",
+                                "reason": "todos_pending",
                                 "message": (
-                                    f"Cannot complete: {len(incomplete_todos)} todos still "
-                                    f"pending ({todo_list}). Complete or cancel them first "
-                                    "via step_todo_write."
+                                    f"Cannot complete: {len(incomplete_todos)} todo(s) are "
+                                    f"still non-terminal ({detail}). Mark each remaining "
+                                    "todo as either completed or cancelled via "
+                                    "step_todo_write, then call step_complete again. Do "
+                                    "not repeat, restate, or paraphrase your prior written "
+                                    "deliverable — it is already in session history."
                                 ),
+                                "pending": pending_names,
+                                "in_progress": in_progress_names,
+                                "required_action": "update_todos_then_retry_step_complete",
                             }
                         )
                         messages.append(
@@ -1989,6 +2151,30 @@ class AgentLoop:
                         _append_tool_result_event(
                             events_to_record, tc, err_content, True, tool_id=tool_id
                         )
+
+                        # Strong follow-up system reminder — the tool-result
+                        # alone has proven insufficient to stop models from
+                        # repeating an already-delivered brief. A distinct
+                        # system message keeps the instructions prominent
+                        # and lets the controller emit a single, consistent
+                        # prescription.
+                        messages.append(
+                            {
+                                "role": "system",
+                                "content": (
+                                    "Internal controller reminder — this is not a new "
+                                    "user message. Do not write a filler acknowledgment. "
+                                    "step_complete was rejected: todos remain "
+                                    "non-terminal. Your next action MUST be "
+                                    "step_todo_write that marks every remaining todo as "
+                                    "either 'completed' or 'cancelled'. Then call "
+                                    "step_complete again. Do NOT repeat, restate, or "
+                                    "paraphrase your prior written deliverable — it is "
+                                    "already recorded and the evaluator will read it."
+                                ),
+                            }
+                        )
+
                         await self._flush_events_incremental(
                             ctx,
                             events_to_record,
@@ -2016,6 +2202,9 @@ class AgentLoop:
                         )
                         _validate_step_completion_notification(ctx, step_output)
                     except ValidationError as exc:
+                        STEP_COMPLETE_REJECTIONS.labels(
+                            reason="invalid_step_complete_arguments"
+                        ).inc()
                         err_content = _build_step_complete_validation_error(tc.arguments, exc)
                         messages.append(
                             {"role": "tool", "tool_call_id": tc.call_id, "content": err_content}
@@ -2033,6 +2222,9 @@ class AgentLoop:
                             await on_tool_result(tc.call_id, tc.name, err_content, True, None, None)
                         continue
                     except ValueError as exc:
+                        STEP_COMPLETE_REJECTIONS.labels(
+                            reason="invalid_step_complete_notification"
+                        ).inc()
                         err_content = json.dumps(
                             {
                                 "status": "rejected",
@@ -2095,8 +2287,53 @@ class AgentLoop:
 
                 elif tc.name == STEP_TODO_WRITE:
                     _append_tool_call_event(events_to_record, tc, tool_id)
-                    ctx.todos = tc.arguments.get("todos", [])
-                    result_content = json.dumps({"status": "updated", "count": len(ctx.todos)})
+                    requested_todos = tc.arguments.get("todos", []) or []
+                    previous_normalized = _normalize_todos(ctx.todos or [])
+                    new_normalized = _normalize_todos(requested_todos)
+                    unchanged = previous_normalized == new_normalized
+                    ctx.todos = requested_todos
+                    non_terminal = [
+                        item
+                        for item in new_normalized
+                        if item.get("status") not in ("completed", "cancelled")
+                    ]
+                    non_terminal_count = len(non_terminal)
+                    if unchanged:
+                        guidance = (
+                            "Todos unchanged since the last write. Make progress "
+                            "on the in_progress item, mark items completed or "
+                            "cancelled as appropriate, or call step_complete if "
+                            "all work is done."
+                        )
+                    elif non_terminal_count > 0:
+                        guidance = (
+                            f"{non_terminal_count} todo(s) are still pending or "
+                            "in_progress. Before calling step_complete, mark each "
+                            "remaining todo as either completed or cancelled."
+                        )
+                    else:
+                        guidance = (
+                            "All todos are terminal (completed or cancelled). "
+                            "You may call step_complete when the deliverable is ready."
+                        )
+                    # Canonical echo gives the model a verifiable view of
+                    # what it actually wrote (the previous write-only
+                    # ``{status, count}`` shape provoked repeated identical
+                    # rewrites in the daily-brief trace). To keep echo size
+                    # bounded for very long todo lists, we cap per-item
+                    # ``content`` in the echo; ``ctx.todos`` still holds
+                    # the untruncated values for the agent loop.
+                    echo_todos = _echo_todos_bounded(new_normalized)
+                    result_content = json.dumps(
+                        {
+                            "status": "updated",
+                            "count": len(new_normalized),
+                            "todos": echo_todos,
+                            "unchanged": unchanged,
+                            "non_terminal_count": non_terminal_count,
+                            "guidance": guidance,
+                        }
+                    )
                     messages.append(
                         {"role": "tool", "tool_call_id": tc.call_id, "content": result_content}
                     )
@@ -2115,7 +2352,19 @@ class AgentLoop:
 
                 elif tc.name == STEP_TODO_LIST:
                     _append_tool_call_event(events_to_record, tc, tool_id)
-                    result_content = json.dumps({"todos": ctx.todos})
+                    list_normalized = _normalize_todos(ctx.todos or [])
+                    list_non_terminal = sum(
+                        1
+                        for item in list_normalized
+                        if item.get("status") not in ("completed", "cancelled")
+                    )
+                    result_content = json.dumps(
+                        {
+                            "todos": list_normalized,
+                            "count": len(list_normalized),
+                            "non_terminal_count": list_non_terminal,
+                        }
+                    )
                     messages.append(
                         {"role": "tool", "tool_call_id": tc.call_id, "content": result_content}
                     )
@@ -2291,7 +2540,7 @@ class AgentLoop:
                     )
                     pause_id = f"auth_{uuid.uuid4().hex[:12]}"
                     timeout_seconds = int(tc.arguments.get("timeout_seconds", 600) or 600)
-                    payload = {
+                    auth_payload: dict[str, Any] = {
                         "credential_id": tc.arguments.get("credential_id"),
                         "kind": tc.arguments.get("kind"),
                         "scope": tc.arguments.get("scope", "user"),
@@ -2329,7 +2578,7 @@ class AgentLoop:
                         step_run_id=ctx.step_run_id,
                         session_id=ctx.session.session_id,
                         notification_id=pause_id,
-                        payload=payload,
+                        payload=auth_payload,
                     )
                     await self._set_interactive_pause_state(
                         ctx,
@@ -2339,7 +2588,7 @@ class AgentLoop:
                             "step_name": ctx.step_definition.name,
                             "step_run_id": ctx.step_run_id,
                             "session_id": ctx.session.session_id,
-                            **payload,
+                            **auth_payload,
                         },
                     )
                     try:
@@ -2784,7 +3033,12 @@ class AgentLoop:
                 )
                 break
 
-            # Check tool call limit
+            # Check tool call limit. The reminder must be coordinated with
+            # the step_complete gate: if calling step_complete would be
+            # rejected (non-terminal todos, require_step_complete policy),
+            # pushing the model toward "call step_complete now" causes a
+            # rejection-and-repeat loop that ate the daily-brief trace.
+            # Instead, tell the model exactly which closure action applies.
             if tool_call_count >= max_tool_calls:
                 logger.warning(
                     "Tool call limit reached",
@@ -2795,15 +3049,48 @@ class AgentLoop:
                         }
                     },
                 )
+                incomplete_todos = self._get_incomplete_todos(ctx)
+                if incomplete_todos and ctx.policy.require_step_complete:
+                    pending_names = [
+                        str(t.get("content", "?"))
+                        for t in incomplete_todos
+                        if t.get("status") == "pending"
+                    ]
+                    in_progress_names = [
+                        str(t.get("content", "?"))
+                        for t in incomplete_todos
+                        if t.get("status") == "in_progress"
+                    ]
+                    budget_guidance = (
+                        f"Tool call budget ({max_tool_calls}) reached, but "
+                        f"{len(incomplete_todos)} todo(s) are still non-terminal "
+                        f"(pending: {len(pending_names)}, in_progress: "
+                        f"{len(in_progress_names)}). Your next action MUST be "
+                        "step_todo_write that marks every remaining todo as "
+                        "either 'completed' or 'cancelled'. Then call "
+                        "step_complete. Do not attempt new executor tool calls."
+                    )
+                elif ctx.policy.require_step_complete:
+                    budget_guidance = (
+                        f"Tool call budget ({max_tool_calls}) reached. All "
+                        "todos are terminal. If the step is finished, call "
+                        "step_complete now with your summary. Otherwise "
+                        "continue only if you can finish without more tool "
+                        "calls."
+                    )
+                else:
+                    budget_guidance = (
+                        f"Tool call budget ({max_tool_calls}) reached. "
+                        "Wrap up with a direct reply; do not start new tool "
+                        "calls unless absolutely required to answer."
+                    )
                 messages.append(
                     {
                         "role": "system",
                         "content": (
-                            "Internal controller reminder — this is not a new user message. "
-                            "Do not write a filler acknowledgment just for this reminder. "
-                            f"Tool call limit ({max_tool_calls}) reached. "
-                            "If the step is finished, call step_complete now. Otherwise continue "
-                            "only if you can finish without more tool calls."
+                            "Internal controller reminder — this is not a new user "
+                            "message. Do not write a filler acknowledgment just for "
+                            "this reminder.\n\n" + budget_guidance
                         ),
                     }
                 )

@@ -31,14 +31,19 @@ READ_TOOL_OUTPUT = ToolDefinition(
         "need the omitted sections in order. Supports pagination via offset "
         "(1-indexed line number) and limit. Returns line-numbered content "
         "similar to the file read tool. For structured outputs with anchors, "
-        "prefer list_tool_output_anchors and read_tool_output_anchor first."
+        "prefer list_tool_output_anchors and read_tool_output_anchor first. "
+        "Only call this when you have a real call_id from a prior tool_call "
+        "event; never invent or use placeholder values."
     ),
     parameters={
         "type": "object",
         "properties": {
             "call_id": {
                 "type": "string",
-                "description": "The call_id of the tool result to read.",
+                "description": (
+                    "Exact call_id string from a prior tool_call event. "
+                    "Must not be empty or a placeholder such as 'dummy'."
+                ),
             },
             "offset": {
                 "type": "integer",
@@ -67,14 +72,19 @@ SEARCH_TOOL_OUTPUT = ToolDefinition(
         "regex pattern. Returns matching lines with surrounding context. "
         "Use this before read_tool_output when you need to locate a specific "
         "error, URL, symbol, heading, date, or keyword inside a large or "
-        "cleared tool output."
+        "cleared tool output. Only call this when you have a real call_id "
+        "from a prior tool_call event; never invent or use placeholder "
+        "values."
     ),
     parameters={
         "type": "object",
         "properties": {
             "call_id": {
                 "type": "string",
-                "description": "The call_id of the tool result to search.",
+                "description": (
+                    "Exact call_id string from a prior tool_call event. "
+                    "Must not be empty or a placeholder such as 'dummy'."
+                ),
             },
             "pattern": {
                 "type": "string",
@@ -100,14 +110,19 @@ LIST_TOOL_OUTPUT_ANCHORS = ToolDefinition(
     description=(
         "List named anchors for a previous tool output when it contains structured "
         "sections such as search results. Use this before read_tool_output_anchor "
-        "when you need to inspect a specific saved section without regex search."
+        "when you need to inspect a specific saved section without regex search. "
+        "Only call this when you have a real call_id from a prior tool_call "
+        "event; never invent or use placeholder values."
     ),
     parameters={
         "type": "object",
         "properties": {
             "call_id": {
                 "type": "string",
-                "description": "The call_id of the tool result to inspect.",
+                "description": (
+                    "Exact call_id string from a prior tool_call event. "
+                    "Must not be empty or a placeholder such as 'dummy'."
+                ),
             }
         },
         "required": ["call_id"],
@@ -124,14 +139,19 @@ READ_TOOL_OUTPUT_ANCHOR = ToolDefinition(
     description=(
         "Read a named anchored section from a previous tool output. Use this for "
         "structured outputs such as saved search results when you want one section "
-        "without reloading the entire output."
+        "without reloading the entire output. Only call this when you have a "
+        "real call_id from a prior tool_call event; never invent or use "
+        "placeholder values."
     ),
     parameters={
         "type": "object",
         "properties": {
             "call_id": {
                 "type": "string",
-                "description": "The call_id of the tool result to inspect.",
+                "description": (
+                    "Exact call_id string from a prior tool_call event. "
+                    "Must not be empty or a placeholder such as 'dummy'."
+                ),
             },
             "anchor": {
                 "type": "string",

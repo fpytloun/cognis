@@ -721,9 +721,13 @@ async def test_direct_todo_reprompt_is_system_message() -> None:
     )
     calls = await _run_reminder_capture(ctx)
     assert calls[1][-1]["role"] == "system"
-    assert "incomplete todos" in str(calls[1][-1]["content"])
-    assert "produce no assistant text" in str(calls[1][-1]["content"])
-    assert "Do not repeat, restate, or paraphrase" in str(calls[1][-1]["content"])
+    # New prescriptive wording: "non-terminal todos" + terminal-state
+    # instruction + do-not-repeat guidance.
+    content = str(calls[1][-1]["content"])
+    assert "non-terminal todos" in content
+    assert "'completed'" in content and "'cancelled'" in content
+    assert "produce no assistant text" in content
+    assert "Do not repeat, restate, or paraphrase" in content
 
 
 @pytest.mark.asyncio
