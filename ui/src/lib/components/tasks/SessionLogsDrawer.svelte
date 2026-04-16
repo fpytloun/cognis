@@ -117,7 +117,7 @@
 <svelte:window onkeydown={handleKeydown} />
 
 <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-<div class="fixed inset-0 z-50 flex justify-end bg-black/40" onclick={handleBackdropClick}>
+<div class="fixed inset-0 z-50 flex justify-end bg-black/40" onclick={handleBackdropClick} role="presentation">
   <aside class="flex h-full w-full max-w-2xl flex-col border-l border-slate-700 bg-slate-900 shadow-2xl animate-slide-in-right">
     <div class="flex items-center justify-between border-b border-slate-800 px-4 py-3">
       <div>

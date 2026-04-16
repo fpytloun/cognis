@@ -1,6 +1,7 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
   import { page } from '$app/stores';
+  import { ArrowDown, ArrowLeft, CheckCircle2, ChevronDown, ChevronUp, Clock3, GitBranch, LoaderCircle, PanelRightOpen, PlayCircle, Sparkles, Target } from 'lucide-svelte';
   import { onMount } from 'svelte';
 
   import { api, asApiError } from '$lib/api/client';
@@ -30,6 +31,9 @@
   let gateFeedback = $state('');
   let stepResponse = $state('');
   let expandedSteps = $state<Set<string>>(new Set());
+  let expandedStepHistory = $state<Set<string>>(new Set());
+  let selectedStepName = $state('');
+  let mobileStepDetailOpen = $state(false);
   let pollTimer: number | null = null;
   let tickNow = $state(Date.now());
   let durationTimer: ReturnType<typeof setInterval> | null = null;
@@ -101,6 +105,28 @@
     if (next.has(stepRunId)) next.delete(stepRunId);
     else next.add(stepRunId);
     expandedSteps = next;
+  }
+
+  function toggleStepHistory(stepName: string): void {
+    const next = new Set(expandedStepHistory);
+    if (next.has(stepName)) next.delete(stepName);
+    else next.add(stepName);
+    expandedStepHistory = next;
+  }
+
+  function isMobileViewport(): boolean {
+    return typeof window !== 'undefined' && window.matchMedia('(max-width: 1279px)').matches;
+  }
+
+  function openStepDetail(stepName: string, options: { mobileDrawer?: boolean } = {}): void {
+    selectedStepName = stepName;
+    if (options.mobileDrawer !== false && isMobileViewport()) {
+      mobileStepDetailOpen = true;
+    }
+  }
+
+  function closeMobileStepDetail(): void {
+    mobileStepDetailOpen = false;
   }
 
   function stepOutputSummary(stepRun: StepRun): string {
@@ -181,6 +207,30 @@
     };
   }
 
+  interface StepGroup {
+    stepName: string;
+    stepType: string;
+    attempts: StepRun[];
+    latest: StepRun | null;
+    workflowIndex: number;
+  }
+
+  function stepRunSortValue(stepRun: StepRun): number {
+    return Date.parse(stepRun.updated_at ?? stepRun.completed_at ?? stepRun.started_at ?? '') || 0;
+  }
+
+  function defaultStepSelection(detail: TaskDetail | null, preferred = ''): string {
+    if (!detail) return '';
+    const available = new Set(detail.step_runs.map((run) => run.step_name));
+    const workflow = workflows.find((candidate) => candidate.workflow_id === detail.workflow_id) ?? null;
+    const workflowNames = workflow ? workflowToFormState(workflow).steps.map((step) => step.name) : [];
+    if (preferred && (available.has(preferred) || workflowNames.includes(preferred))) return preferred;
+    const activeName = detail.pending_pause?.step_name ?? detail.workflow_run?.current_step_name ?? '';
+    if (activeName) return activeName;
+    const latestRun = [...detail.step_runs].sort((a, b) => stepRunSortValue(b) - stepRunSortValue(a))[0];
+    return latestRun?.step_name ?? workflowNames[0] ?? '';
+  }
+
   // ---------------------------------------------------------------------------
   // Diagram helpers
   // ---------------------------------------------------------------------------
@@ -233,6 +283,89 @@
   });
 
   let diagramSkippedSteps = $derived(task?.workflow_state?.skipped_steps ?? []);
+
+  let stepGroups = $derived.by(() => {
+    if (!task) return [] as StepGroup[];
+    const groups = new Map<string, StepGroup>();
+    const workflowStepNames = diagramSteps.map((step) => step.name);
+    diagramSteps.forEach((step, index) => {
+      groups.set(step.name, {
+        stepName: step.name,
+        stepType: step.type,
+        attempts: [],
+        latest: null,
+        workflowIndex: index,
+      });
+    });
+    for (const run of task.step_runs) {
+      const existing = groups.get(run.step_name);
+      if (existing) {
+        existing.attempts.push(run);
+      } else {
+        groups.set(run.step_name, {
+          stepName: run.step_name,
+          stepType: run.step_type,
+          attempts: [run],
+          latest: null,
+          workflowIndex: workflowStepNames.length + groups.size,
+        });
+      }
+    }
+    return [...groups.values()]
+      .map((group) => {
+        const attempts = [...group.attempts].sort((a, b) => b.attempt - a.attempt || stepRunSortValue(b) - stepRunSortValue(a));
+        return {
+          ...group,
+          attempts,
+          latest: attempts[0] ?? null,
+        } satisfies StepGroup;
+      })
+      .sort((a, b) => a.workflowIndex - b.workflowIndex || (b.latest ? stepRunSortValue(b.latest) : 0) - (a.latest ? stepRunSortValue(a.latest) : 0));
+  });
+
+  let selectedStepGroup = $derived.by(() => {
+    const selected = stepGroups.find((group) => group.stepName === selectedStepName);
+    return selected ?? stepGroups[0] ?? null;
+  });
+
+  let stepAttemptCounts = $derived.by(() => Object.fromEntries(stepGroups.map((group) => [group.stepName, group.attempts.length])));
+
+  let stepStateLabels = $derived.by(() => {
+    const labels: Record<string, string> = {};
+    for (const group of stepGroups) {
+      if (task?.pending_pause?.step_name === group.stepName) {
+        labels[group.stepName] = task.pending_pause.pause_type === 'gate' ? 'awaiting gate' : 'awaiting reply';
+        continue;
+      }
+      const status = group.latest ? displayStepStatus(group.latest) : '';
+      if (!status) continue;
+      if (group.stepName === diagramActiveStep && ['running', 'evaluating'].includes(status)) {
+        labels[group.stepName] = status === 'evaluating' ? 'evaluating' : 'live';
+        continue;
+      }
+      labels[group.stepName] = status.replaceAll('_', ' ');
+    }
+    return labels;
+  });
+
+  let executionSummary = $derived.by(() => {
+    if (!task) return null;
+    const activeGroup = selectedStepGroup ?? stepGroups.find((group) => group.stepName === diagramActiveStep) ?? null;
+    return {
+      activeStepName: task.pending_pause?.step_name ?? diagramActiveStep ?? activeGroup?.stepName ?? '',
+      activeLabel: task.pending_pause
+        ? task.pending_pause.pause_type === 'gate'
+          ? 'Waiting for approval'
+          : 'Waiting for input'
+        : task.status === 'running'
+          ? diagramActiveStep
+            ? 'Agent is executing'
+            : 'Task is live'
+          : task.status === 'paused'
+            ? 'Task paused'
+            : task.status,
+    };
+  });
 
   // ---------------------------------------------------------------------------
   // Statistics
@@ -320,6 +453,7 @@
         delivery_mode: task.delivery.mode,
         delivery_target: task.delivery.target ?? ''
       };
+      selectedStepName = defaultStepSelection(task, selectedStepName);
     } catch (caughtError) {
       error = asApiError(caughtError).message;
     } finally {
@@ -331,6 +465,7 @@
     if (document.hidden) return;
     try {
       task = await api.tasks.detail(taskIdFromRoute());
+      selectedStepName = defaultStepSelection(task, selectedStepName);
     } catch (caughtError) {
       error = asApiError(caughtError).message;
     }
@@ -514,16 +649,71 @@
       <div class="space-y-5">
         <!-- Pipeline diagram -->
         {#if diagramSteps.length > 0}
-          <Card class="p-5">
-            <p class="mb-3 text-xs uppercase tracking-[0.25em] text-slate-400">Pipeline</p>
+          <Card class="overflow-hidden p-0">
+            <div class="border-b border-slate-800/80 px-4 py-4 sm:px-5">
+              <div class="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Live workflow</p>
+                  <div class="mt-2 flex flex-wrap items-center gap-2 text-sm text-slate-300">
+                    {#if task.status === 'running' || task.status === 'evaluating'}
+                      <span class="inline-flex h-5 w-5 items-center justify-center rounded-full border border-sky-500/30 bg-sky-500/10 text-sky-300">
+                        <LoaderCircle class="h-3.5 w-3.5 animate-spin" />
+                      </span>
+                    {/if}
+                    <span class="font-medium text-white">{executionSummary?.activeLabel ?? 'Workflow status'}</span>
+                    {#if executionSummary?.activeStepName}
+                      <span class="rounded-full border border-slate-700 bg-slate-900/80 px-2.5 py-1 text-xs text-slate-300">
+                        {executionSummary.activeStepName}
+                      </span>
+                    {/if}
+                  </div>
+                </div>
+                {#if selectedStepGroup}
+                  <Button class="xl:hidden" size="sm" variant="secondary" onclick={() => openStepDetail(selectedStepGroup.stepName)}>
+                    <PanelRightOpen class="mr-1.5 h-3.5 w-3.5" />
+                    Step detail
+                  </Button>
+                {/if}
+              </div>
+              <div class="mt-4 flex gap-2 overflow-x-auto pb-1">
+                {#each stepGroups as group}
+                  {@const liveStatus = group.latest ? displayStepStatus(group.latest) : (task.pending_pause?.step_name === group.stepName ? 'paused' : 'pending')}
+                  <button
+                    class={`inline-flex shrink-0 items-center gap-2 rounded-full border px-3 py-1.5 text-xs transition ${selectedStepGroup?.stepName === group.stepName ? 'border-sky-400/60 bg-sky-500/10 text-sky-100' : 'border-slate-700 bg-slate-900/70 text-slate-300 hover:border-slate-600 hover:text-white'}`}
+                    onclick={() => openStepDetail(group.stepName)}
+                    type="button"
+                  >
+                    {#if group.stepName === diagramActiveStep && (task.status === 'running' || task.status === 'evaluating')}
+                      <LoaderCircle class="h-3.5 w-3.5 animate-spin text-sky-300" />
+                    {:else if ['approved', 'completed'].includes(liveStatus)}
+                      <CheckCircle2 class="h-3.5 w-3.5 text-emerald-300" />
+                    {:else if group.stepType === 'gate'}
+                      <GitBranch class="h-3.5 w-3.5 text-amber-300" />
+                    {:else}
+                      <PlayCircle class="h-3.5 w-3.5 text-slate-400" />
+                    {/if}
+                    <span>{group.stepName}</span>
+                    {#if group.attempts.length > 1}
+                      <span class="rounded-full bg-slate-800 px-1.5 py-0.5 text-[10px] text-slate-300">x{group.attempts.length}</span>
+                    {/if}
+                  </button>
+                {/each}
+              </div>
+            </div>
+            <div class="px-3 py-4 sm:px-5">
             <WorkflowDiagram
               steps={diagramSteps}
               interactionMode={workflowDef?.interaction?.mode?.toString() ?? 'explicit_gates'}
               activeStepName={diagramActiveStep}
+              selectedStepName={selectedStepGroup?.stepName ?? ''}
               stepStatuses={diagramStepStatuses}
               stepDurations={diagramStepDurations}
+              stepAttemptCounts={stepAttemptCounts}
+              stepStateLabels={stepStateLabels}
               skippedSteps={diagramSkippedSteps}
+              onStepSelect={(stepName) => openStepDetail(stepName)}
             />
+            </div>
           </Card>
         {/if}
 
@@ -604,201 +794,287 @@
 
         <!-- Pending pause -->
         {#if task.pending_pause}
-          <Card class="p-5">
+          <Card class="overflow-hidden p-0">
             <div class="space-y-4">
-              <div>
-                <p class="text-xs uppercase tracking-[0.25em] text-slate-400">
-                  {task.pending_pause.pause_type === 'gate' ? 'Workflow gate' : 'Step question'}
+              <div class="border-b border-slate-800/80 bg-gradient-to-r from-sky-500/10 via-slate-900 to-slate-900 px-5 py-4">
+                <div class="flex flex-wrap items-center gap-2 text-xs uppercase tracking-[0.25em] text-slate-400">
+                  <span>{task.pending_pause.pause_type === 'gate' ? 'Workflow gate' : 'Step question'}</span>
+                  {#if task.pending_pause.step_name}
+                    <span class="rounded-full border border-slate-700 bg-slate-950/70 px-2 py-0.5 text-[10px] tracking-[0.2em] text-slate-300">{task.pending_pause.step_name}</span>
+                  {/if}
+                </div>
+                <h2 class="mt-3 text-lg font-semibold text-white">{task.pending_pause.question}</h2>
+                <p class="mt-2 text-sm text-slate-400">
+                  {task.pending_pause.pause_type === 'gate'
+                    ? 'Review the latest attempt, give guidance if needed, then continue or stop the workflow.'
+                    : 'Answer here to resume the active step without leaving the task view.'}
                 </p>
-                <h2 class="mt-1 text-lg font-semibold text-white">{task.pending_pause.question}</h2>
               </div>
 
+              <div class="px-5 pb-5">
               {#if task.pending_pause.pause_type === 'gate'}
-                <div class="space-y-2">
-                  <p class="text-sm text-slate-400">
-                    Optional instruction for the next step. This is applied when you retry or continue.
-                  </p>
-                  <textarea bind:value={gateFeedback} class="min-h-[110px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500" placeholder="Optional instruction, for example: incorporate the last review and continue with implementation"></textarea>
-                </div>
-                <div class="flex flex-wrap gap-2">
-                  {#each task.pending_pause.options ?? [] as option}
-                    <Button size="sm" onclick={() => respondToGate(String(option.action ?? 'continue'))}>{String(option.label ?? option.action ?? 'continue')}</Button>
-                  {/each}
-                  {#if (task.pending_pause.options ?? []).length === 0}
-                    <Button size="sm" onclick={() => respondToGate('continue')}>Continue</Button>
-                  {/if}
-                  <Button size="sm" variant="secondary" onclick={() => respondToGate('cancel')}>Cancel task</Button>
+                <div class="space-y-3">
+                  <div class="rounded-2xl border border-sky-500/20 bg-sky-500/5 p-4">
+                    <div class="flex items-center gap-2 text-sm font-medium text-sky-100">
+                      <Sparkles class="h-4 w-4 text-sky-300" />
+                      Optional instruction for the next attempt
+                    </div>
+                    <p class="mt-1 text-sm text-slate-400">This will be passed into the next execution when you continue or retry.</p>
+                    <textarea bind:value={gateFeedback} class="mt-3 min-h-[120px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500" placeholder="Example: approve the direction, but tighten the final summary and validate edge cases before finishing."></textarea>
+                  </div>
+                  <div class="grid gap-2 sm:grid-cols-2">
+                    {#each task.pending_pause.options ?? [] as option}
+                      <Button class="justify-center" size="sm" onclick={() => respondToGate(String(option.action ?? 'continue'))}>{String(option.label ?? option.action ?? 'continue')}</Button>
+                    {/each}
+                    {#if (task.pending_pause.options ?? []).length === 0}
+                      <Button class="justify-center" size="sm" onclick={() => respondToGate('continue')}>Continue workflow</Button>
+                    {/if}
+                    <Button class="justify-center" size="sm" variant="secondary" onclick={() => respondToGate('cancel')}>Stop task</Button>
+                  </div>
                 </div>
               {:else}
-                <textarea bind:value={stepResponse} class="min-h-[110px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500" placeholder="Provide the answer that resumes the current step"></textarea>
-                <div class="flex flex-wrap gap-2">
-                  {#each task.pending_pause.options ?? [] as option}
-                    <Button size="sm" onclick={() => respondToStepQuestion(String(option.action ?? option.label ?? ''))}>{String(option.label ?? option.action ?? 'Use option')}</Button>
-                  {/each}
-                  <Button size="sm" onclick={() => respondToStepQuestion(stepResponse)}>Send response</Button>
+                <div class="space-y-3">
+                  {#if (task.pending_pause.options ?? []).length > 0}
+                    <div class="flex flex-wrap gap-2">
+                      {#each task.pending_pause.options ?? [] as option}
+                        <button class="rounded-full border border-slate-700 bg-slate-900/70 px-3 py-1.5 text-xs text-slate-200 transition hover:border-sky-400/40 hover:bg-sky-500/10 hover:text-white" onclick={() => { stepResponse = String(option.action ?? option.label ?? ''); }} type="button">{String(option.label ?? option.action ?? 'Use option')}</button>
+                      {/each}
+                    </div>
+                  {/if}
+                  <textarea bind:value={stepResponse} class="min-h-[120px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500" placeholder="Provide the answer that resumes the current step"></textarea>
+                  <div class="flex flex-wrap gap-2">
+                    <Button size="sm" onclick={() => respondToStepQuestion(stepResponse)}>Send response</Button>
+                    {#each task.pending_pause.options ?? [] as option}
+                      <Button size="sm" variant="secondary" onclick={() => respondToStepQuestion(String(option.action ?? option.label ?? ''))}>{String(option.label ?? option.action ?? 'Use option')}</Button>
+                    {/each}
+                  </div>
                 </div>
               {/if}
+              </div>
             </div>
           </Card>
         {/if}
 
         <!-- Workflow progress / step runs -->
-        <Card class="p-5">
-          <div class="space-y-4">
-            <div class="flex items-center justify-between gap-3">
+        <Card class="overflow-hidden p-0">
+          <div class="border-b border-slate-800/80 px-5 py-4">
+            <div class="flex flex-wrap items-start justify-between gap-3">
               <div>
-                <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Step runs</p>
-                <h2 class="mt-1 text-lg font-semibold text-white">{workflowName(task.workflow_id)}</h2>
+                <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Step detail</p>
+                <h2 class="mt-1 text-lg font-semibold text-white">{selectedStepGroup?.stepName ?? workflowName(task.workflow_id)}</h2>
+                <p class="mt-1 text-sm text-slate-400">Click the diagram or progress chips to focus a step. Latest attempt stays on top, earlier attempts collapse into history.</p>
               </div>
-              {#if task.step_runs.length > 0}
-                <span class="text-xs text-slate-500">{task.step_runs.length} run{task.step_runs.length !== 1 ? 's' : ''}</span>
+              {#if selectedStepGroup}
+                <span class="rounded-full border border-slate-700 bg-slate-950/80 px-3 py-1 text-xs text-slate-300">
+                  {selectedStepGroup.attempts.length} attempt{selectedStepGroup.attempts.length === 1 ? '' : 's'}
+                </span>
               {/if}
             </div>
+          </div>
 
-            <div class="space-y-3">
-              {#each task.step_runs as stepRun (stepRun.step_run_id)}
-                {@const summary = stepOutputSummary(stepRun)}
-                {@const content = stepOutputContent(stepRun)}
-                {@const claims = stepOutputClaims(stepRun)}
-                {@const stepError = stepOutputError(stepRun)}
-                {@const outcomeStatus = stepOutcomeStatus(stepRun)}
-                {@const outcomeReason = stepOutcomeReason(stepRun)}
-                {@const visibleStatus = displayStepStatus(stepRun)}
-                {@const feedback = stepEvalFeedback(stepRun)}
-                {@const isExpanded = expandedSteps.has(stepRun.step_run_id)}
-
-                <article class="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
-                  <!-- Header -->
-                  <div class="flex flex-wrap items-center justify-between gap-3">
-                    <div>
+          <div class="grid gap-4 px-5 py-5 lg:grid-cols-[260px_minmax(0,1fr)]">
+            <div class="space-y-2">
+              {#each stepGroups as group}
+                {@const latestStatus = group.latest ? displayStepStatus(group.latest) : (task.pending_pause?.step_name === group.stepName ? 'paused' : 'pending')}
+                <button
+                  class={`w-full rounded-2xl border px-4 py-3 text-left transition ${selectedStepGroup?.stepName === group.stepName ? 'border-sky-400/50 bg-sky-500/10' : 'border-slate-800 bg-slate-950/50 hover:border-slate-700 hover:bg-slate-950/80'}`}
+                  onclick={() => openStepDetail(group.stepName, { mobileDrawer: false })}
+                  type="button"
+                >
+                  <div class="flex items-center justify-between gap-3">
+                    <div class="min-w-0">
                       <div class="flex items-center gap-2">
-                        <h3 class="font-semibold text-white">{stepRun.step_name}</h3>
-                        <span class="text-xs text-slate-600">#{stepRun.attempt}</span>
-                      </div>
-                      <div class="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-500">
-                        <span>{stepRun.step_type === 'gate' ? 'Gate' : 'Run'}</span>
-                        {#if stepRun.agent_id}
-                          <span class="text-slate-400">{agentName(stepRun.agent_id)}</span>
-                        {/if}
-                        {#if stepRun.started_at}
-                          <Tooltip text={formatAbsoluteTime(stepRun.started_at)}>
-                            <span class="cursor-help">started {formatRelativeTime(stepRun.started_at)}</span>
-                          </Tooltip>
-                        {/if}
-                        {#if stepRun.started_at}
-                          <span class="font-mono text-slate-300" title="{formatAbsoluteTime(stepRun.started_at)} — {stepRun.completed_at ? formatAbsoluteTime(stepRun.completed_at) : 'running'}">
-                            {formatDuration(stepRun.started_at, stepRun.completed_at, tickNow)}
-                          </span>
+                        <p class="truncate font-medium text-white">{group.stepName}</p>
+                        {#if group.stepName === diagramActiveStep && (task.status === 'running' || task.status === 'evaluating')}
+                          <LoaderCircle class="h-3.5 w-3.5 animate-spin text-sky-300" />
                         {/if}
                       </div>
+                      <p class="mt-1 text-xs text-slate-500">{group.stepType === 'gate' ? 'Gate' : 'Execution'} {#if group.attempts.length > 1}<span class="ml-1 text-slate-400">x{group.attempts.length}</span>{/if}</p>
                     </div>
-                    <div class="flex items-center gap-2">
-                      {#if stepRun.output?.session_id || stepRun.session_id}
-                        <Button size="sm" variant="ghost" onclick={() => openSessionLogs(stepRun)}>Logs</Button>
-                      {/if}
-                      <Tooltip text={displayStepStatusHint(stepRun)}>
-                        <span class="cursor-help rounded-full border px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wider {statusColors[visibleStatus] ?? 'border-slate-600 text-slate-400'}">
-                          {visibleStatus}
-                        </span>
-                      </Tooltip>
-                    </div>
+                    <span class="rounded-full border px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wider {statusColors[latestStatus] ?? 'border-slate-600 text-slate-400'}">{latestStatus}</span>
                   </div>
+                </button>
+              {/each}
+            </div>
 
-                  {#if outcomeStatus !== 'success'}
-                    <div class="mt-3 rounded-xl border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-sm text-amber-100">
-                      <p class="font-medium uppercase tracking-wide text-[11px] text-amber-300">Outcome</p>
-                      <p class="mt-1">
-                        This step finished properly but reported
-                        <span class="font-semibold uppercase"> {outcomeStatus}</span>
-                        {#if outcomeReason}
-                          : {outcomeReason}
+            <div class="space-y-4">
+              {#if selectedStepGroup}
+                {#if selectedStepGroup.latest}
+                  {@const latestAttempt = selectedStepGroup.latest}
+                  {@const summary = stepOutputSummary(latestAttempt)}
+                  {@const content = stepOutputContent(latestAttempt)}
+                  {@const claims = stepOutputClaims(latestAttempt)}
+                  {@const stepError = stepOutputError(latestAttempt)}
+                  {@const outcomeStatus = stepOutcomeStatus(latestAttempt)}
+                  {@const outcomeReason = stepOutcomeReason(latestAttempt)}
+                  {@const visibleStatus = displayStepStatus(latestAttempt)}
+                  {@const feedback = stepEvalFeedback(latestAttempt)}
+                  {@const isExpanded = expandedSteps.has(latestAttempt.step_run_id)}
+                  <article class="rounded-3xl border border-slate-800 bg-slate-950/60 p-4 sm:p-5">
+                    <div class="flex flex-wrap items-start justify-between gap-3">
+                      <div>
+                        <div class="flex flex-wrap items-center gap-2">
+                          <h3 class="text-lg font-semibold text-white">{latestAttempt.step_name}</h3>
+                          <span class="rounded-full border border-sky-500/30 bg-sky-500/10 px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wider text-sky-200">Latest attempt</span>
+                          <span class="text-xs text-slate-500">#{latestAttempt.attempt}</span>
+                        </div>
+                        <div class="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-500">
+                          <span>{latestAttempt.step_type === 'gate' ? 'Gate' : 'Run'}</span>
+                          {#if latestAttempt.agent_id}
+                            <span class="text-slate-300">{agentName(latestAttempt.agent_id)}</span>
+                          {/if}
+                          {#if latestAttempt.started_at}
+                            <Tooltip text={formatAbsoluteTime(latestAttempt.started_at)}>
+                              <span class="inline-flex cursor-help items-center gap-1"><Clock3 class="h-3.5 w-3.5" />started {formatRelativeTime(latestAttempt.started_at)}</span>
+                            </Tooltip>
+                          {/if}
+                          {#if latestAttempt.started_at}
+                            <span class="font-mono text-slate-300">{formatDuration(latestAttempt.started_at, latestAttempt.completed_at, tickNow)}</span>
+                          {/if}
+                        </div>
+                      </div>
+                      <div class="flex items-center gap-2">
+                        {#if latestAttempt.output?.session_id || latestAttempt.session_id}
+                          <Button size="sm" variant="ghost" onclick={() => openSessionLogs(latestAttempt)}>Logs</Button>
                         {/if}
-                      </p>
-                    </div>
-                  {/if}
-
-                  <!-- Error -->
-                  {#if stepError}
-                    <div class="mt-3 rounded-xl border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-sm text-rose-200">
-                      <p class="font-medium">Error</p>
-                      <pre class="mt-1 whitespace-pre-wrap text-xs text-rose-300">{stepError}</pre>
-                    </div>
-                  {/if}
-
-                  <!-- Summary -->
-                  {#if summary && !stepError}
-                    <div class="prose prose-sm prose-invert mt-3 max-w-none text-slate-300">
-                      {@html renderMarkdown(summary)}
-                    </div>
-                  {/if}
-
-                  <!-- Claims -->
-                  {#if claims.length > 0}
-                    <ul class="mt-3 space-y-1 text-sm text-slate-400">
-                      {#each claims as claim}
-                        <li class="flex items-start gap-2">
-                          <span class="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-slate-600"></span>
-                          <span>{claim}</span>
-                        </li>
-                      {/each}
-                    </ul>
-                  {/if}
-
-                  <!-- Content (collapsible) -->
-                  {#if content}
-                    {#if content.length > 300 && !isExpanded}
-                      <div class="prose prose-sm prose-invert mt-3 max-w-none text-slate-400">
-                        {@html renderMarkdown(content.slice(0, 300) + '...')}
+                        <Tooltip text={displayStepStatusHint(latestAttempt)}>
+                          <span class="cursor-help rounded-full border px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wider {statusColors[visibleStatus] ?? 'border-slate-600 text-slate-400'}">{visibleStatus}</span>
+                        </Tooltip>
                       </div>
-                      <button class="mt-2 text-xs text-blue-400 hover:text-blue-300" onclick={() => toggleStepExpand(stepRun.step_run_id)}>
-                        Show full output
-                      </button>
-                    {:else if content.length > 300}
-                      <div class="prose prose-sm prose-invert mt-3 max-w-none text-slate-400">
-                        {@html renderMarkdown(content)}
-                      </div>
-                      <button class="mt-2 text-xs text-blue-400 hover:text-blue-300" onclick={() => toggleStepExpand(stepRun.step_run_id)}>
-                        Collapse
-                      </button>
-                    {:else}
-                      <div class="prose prose-sm prose-invert mt-3 max-w-none text-slate-400">
-                        {@html renderMarkdown(content)}
+                    </div>
+
+                    {#if outcomeStatus !== 'success'}
+                      <div class="mt-4 rounded-2xl border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
+                        <p class="font-medium uppercase tracking-wide text-[11px] text-amber-300">Outcome marker</p>
+                        <p class="mt-1">This attempt completed but reported <span class="font-semibold uppercase">{outcomeStatus}</span>{#if outcomeReason}: {outcomeReason}{/if}</p>
                       </div>
                     {/if}
-                  {/if}
 
-                  <!-- Evaluation -->
-                  {#if stepRun.evaluation}
-                    {@const evalDecision = String(stepRun.evaluation.decision ?? '')}
-                    {@const evalReasoning = String(stepRun.evaluation.reasoning ?? '')}
-                    {@const evalColor = evalDecision === 'approved' || evalDecision === 'approve'
-                      ? 'text-emerald-400'
-                      : evalDecision === 'revise'
-                        ? 'text-blue-400'
-                        : evalDecision === 'failed' || evalDecision === 'reject'
-                          ? 'text-rose-400'
-                          : 'text-amber-400'}
-                    <div class="mt-3 rounded-xl border border-slate-800 bg-slate-950/80 px-3 py-2">
-                      <p class="text-xs font-medium uppercase tracking-widest text-slate-500">Evaluation</p>
-                      <p class="mt-1 text-sm text-slate-300">
-                        <Tooltip text={evalDecision === 'approved' ? 'Step objective was met' : evalDecision === 'revise' ? 'Agent needs to revise and retry' : evalDecision === 'failed' ? 'Step cannot succeed — will not retry' : evalDecision}>
-                          <span class="cursor-help font-medium {evalColor}">{evalDecision}</span>
-                        </Tooltip>
-                        {#if evalReasoning}
-                          — {evalReasoning}
-                        {/if}
-                      </p>
-                      {#if feedback}
-                        <p class="mt-2 rounded-lg border border-slate-700/50 bg-slate-900/50 px-2 py-1.5 text-xs text-slate-400">
-                          <span class="font-medium text-slate-500">Feedback:</span> {feedback}
+                    {#if stepError}
+                      <div class="mt-4 rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
+                        <p class="font-medium">Error</p>
+                        <pre class="mt-2 whitespace-pre-wrap text-xs text-rose-300">{stepError}</pre>
+                      </div>
+                    {/if}
+
+                    {#if summary && !stepError}
+                      <div class="prose prose-sm prose-invert mt-4 max-w-none text-slate-300">
+                        {@html renderMarkdown(summary)}
+                      </div>
+                    {/if}
+
+                    {#if claims.length > 0}
+                      <ul class="mt-4 space-y-1 text-sm text-slate-400">
+                        {#each claims as claim}
+                          <li class="flex items-start gap-2">
+                            <span class="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-slate-600"></span>
+                            <span>{claim}</span>
+                          </li>
+                        {/each}
+                      </ul>
+                    {/if}
+
+                    {#if content}
+                      {#if content.length > 300 && !isExpanded}
+                        <div class="prose prose-sm prose-invert mt-4 max-w-none text-slate-400">
+                          {@html renderMarkdown(content.slice(0, 300) + '...')}
+                        </div>
+                        <button class="mt-2 text-xs text-sky-400 hover:text-sky-300" onclick={() => toggleStepExpand(latestAttempt.step_run_id)} type="button">Show full output</button>
+                      {:else if content.length > 300}
+                        <div class="prose prose-sm prose-invert mt-4 max-w-none text-slate-400">
+                          {@html renderMarkdown(content)}
+                        </div>
+                        <button class="mt-2 text-xs text-sky-400 hover:text-sky-300" onclick={() => toggleStepExpand(latestAttempt.step_run_id)} type="button">Collapse</button>
+                      {:else}
+                        <div class="prose prose-sm prose-invert mt-4 max-w-none text-slate-400">
+                          {@html renderMarkdown(content)}
+                        </div>
+                      {/if}
+                    {/if}
+
+                    {#if latestAttempt.evaluation}
+                      {@const evalDecision = String(latestAttempt.evaluation.decision ?? '')}
+                      {@const evalReasoning = String(latestAttempt.evaluation.reasoning ?? '')}
+                      {@const evalColor = evalDecision === 'approved' || evalDecision === 'approve' ? 'text-emerald-400' : evalDecision === 'revise' ? 'text-sky-400' : evalDecision === 'failed' || evalDecision === 'reject' ? 'text-rose-400' : 'text-amber-400'}
+                      <div class="mt-4 rounded-2xl border border-slate-800 bg-slate-950/80 px-4 py-3">
+                        <p class="text-xs font-medium uppercase tracking-widest text-slate-500">Evaluation</p>
+                        <p class="mt-1 text-sm text-slate-300">
+                          <span class="font-medium {evalColor}">{evalDecision}</span>
+                          {#if evalReasoning} - {evalReasoning}{/if}
                         </p>
+                        {#if feedback}
+                          <p class="mt-2 rounded-lg border border-slate-700/50 bg-slate-900/50 px-2 py-1.5 text-xs text-slate-400"><span class="font-medium text-slate-500">Feedback:</span> {feedback}</p>
+                        {/if}
+                      </div>
+                    {/if}
+                  </article>
+
+                  {#if selectedStepGroup.attempts.length > 1}
+                    <div class="rounded-3xl border border-slate-800/80 bg-slate-950/30 p-4">
+                      <button class="flex w-full items-center justify-between gap-3 text-left" onclick={() => toggleStepHistory(selectedStepGroup.stepName)} type="button">
+                        <div>
+                          <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Attempt history</p>
+                          <p class="mt-1 text-sm text-slate-300">{selectedStepGroup.attempts.length - 1} earlier attempt{selectedStepGroup.attempts.length === 2 ? '' : 's'} hidden behind the latest execution.</p>
+                        </div>
+                        {#if expandedStepHistory.has(selectedStepGroup.stepName)}
+                          <ChevronUp class="h-4 w-4 text-slate-400" />
+                        {:else}
+                          <ChevronDown class="h-4 w-4 text-slate-400" />
+                        {/if}
+                      </button>
+
+                      {#if expandedStepHistory.has(selectedStepGroup.stepName)}
+                        <div class="mt-4 space-y-4 border-t border-dashed border-slate-800 pt-4">
+                          {#each selectedStepGroup.attempts.slice(1) as stepRun (stepRun.step_run_id)}
+                            {@const summary = stepOutputSummary(stepRun)}
+                            {@const content = stepOutputContent(stepRun)}
+                            {@const stepError = stepOutputError(stepRun)}
+                            {@const visibleStatus = displayStepStatus(stepRun)}
+                            {@const isExpanded = expandedSteps.has(stepRun.step_run_id)}
+                            <div class="relative pl-5">
+                              <div class="absolute left-1.5 top-0 bottom-0 w-px bg-slate-800"></div>
+                              <div class="absolute left-0 top-2 h-3 w-3 rounded-full border border-slate-600 bg-slate-950"></div>
+                              <div class="mb-2 flex items-center justify-between gap-3 border-b border-slate-800/80 pb-2">
+                                <div>
+                                  <p class="text-xs font-semibold uppercase tracking-[0.25em] text-slate-500">Earlier attempt #{stepRun.attempt}</p>
+                                  <p class="mt-1 text-xs text-slate-500">{stepRun.started_at ? formatAbsoluteTime(stepRun.started_at) : 'No start time recorded'}</p>
+                                </div>
+                                <span class="rounded-full border px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wider {statusColors[visibleStatus] ?? 'border-slate-600 text-slate-400'}">{visibleStatus}</span>
+                              </div>
+                              {#if stepError}
+                                <div class="rounded-xl border border-rose-500/20 bg-rose-500/10 px-3 py-2 text-xs text-rose-200">
+                                  <pre class="whitespace-pre-wrap">{stepError}</pre>
+                                </div>
+                              {:else}
+                                {#if summary}
+                                  <div class="prose prose-sm prose-invert max-w-none text-slate-400">{@html renderMarkdown(summary)}</div>
+                                {/if}
+                                {#if content}
+                                  {#if content.length > 220 && !isExpanded}
+                                    <div class="prose prose-sm prose-invert mt-3 max-w-none text-slate-500">{@html renderMarkdown(content.slice(0, 220) + '...')}</div>
+                                    <button class="mt-2 text-xs text-sky-400 hover:text-sky-300" onclick={() => toggleStepExpand(stepRun.step_run_id)} type="button">Show full output</button>
+                                  {:else if content.length > 220}
+                                    <div class="prose prose-sm prose-invert mt-3 max-w-none text-slate-500">{@html renderMarkdown(content)}</div>
+                                    <button class="mt-2 text-xs text-sky-400 hover:text-sky-300" onclick={() => toggleStepExpand(stepRun.step_run_id)} type="button">Collapse</button>
+                                  {:else}
+                                    <div class="prose prose-sm prose-invert mt-3 max-w-none text-slate-500">{@html renderMarkdown(content)}</div>
+                                  {/if}
+                                {/if}
+                              {/if}
+                            </div>
+                          {/each}
+                        </div>
                       {/if}
                     </div>
                   {/if}
-                </article>
-              {/each}
-
-              {#if task.step_runs.length === 0}
+                {:else}
+                  <div class="rounded-3xl border border-dashed border-slate-700 bg-slate-950/40 px-5 py-10 text-center">
+                    <Target class="mx-auto h-10 w-10 text-slate-600" />
+                    <p class="mt-4 text-sm text-slate-300">This step has not produced an attempt yet.</p>
+                    <p class="mt-1 text-xs text-slate-500">When the workflow reaches it, execution details and logs will appear here.</p>
+                  </div>
+                {/if}
+              {:else}
                 <p class="text-sm text-slate-400">No steps have been executed yet.</p>
               {/if}
             </div>
@@ -806,8 +1082,76 @@
         </Card>
       </div>
 
+      <div class="space-y-4 xl:hidden">
+        <details class="group rounded-3xl border border-slate-800 bg-slate-950/40 p-4" open>
+          <summary class="flex cursor-pointer list-none items-center justify-between gap-3 text-sm font-medium text-white">
+            Task meta
+            <ChevronDown class="h-4 w-4 text-slate-500 transition group-open:rotate-180" />
+          </summary>
+          <div class="mt-4 grid gap-4 text-sm text-slate-300 sm:grid-cols-2">
+            <div class="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
+              <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Origin</p>
+              <dl class="mt-3 space-y-2">
+                <div class="flex justify-between gap-3"><dt class="text-slate-500">Source</dt><dd>{sourceLabel}</dd></div>
+                {#if sourceConversation}
+                  <div class="flex justify-between gap-3"><dt class="text-slate-500">Conversation</dt><dd><a href="/chat?conversation={sourceConversation.conversation_id}" class="text-sky-400 hover:text-sky-300 hover:underline">{sourceConversation.title ?? 'Untitled'}</a></dd></div>
+                {/if}
+                <div class="flex justify-between gap-3"><dt class="text-slate-500">Agent</dt><dd>{agentName(task.agent_id)}</dd></div>
+                <div class="flex justify-between gap-3"><dt class="text-slate-500">Workflow</dt><dd>{workflowName(task.workflow_id)}</dd></div>
+              </dl>
+            </div>
+            <div class="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
+              <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Timing</p>
+              <dl class="mt-3 space-y-2">
+                {#if task.created_at}<div class="flex justify-between gap-3"><dt class="text-slate-500">Created</dt><dd>{formatRelativeTime(task.created_at)}</dd></div>{/if}
+                {#if task.started_at}<div class="flex justify-between gap-3"><dt class="text-slate-500">Started</dt><dd>{formatRelativeTime(task.started_at)}</dd></div>{/if}
+                {#if task.started_at}<div class="flex justify-between gap-3"><dt class="text-slate-500">Duration</dt><dd class="font-mono">{formatDuration(task.started_at, task.completed_at, tickNow)}</dd></div>{/if}
+              </dl>
+            </div>
+          </div>
+        </details>
+
+        <details class="group rounded-3xl border border-slate-800 bg-slate-950/40 p-4">
+          <summary class="flex cursor-pointer list-none items-center justify-between gap-3 text-sm font-medium text-white">
+            Result and dependencies
+            <ChevronDown class="h-4 w-4 text-slate-500 transition group-open:rotate-180" />
+          </summary>
+          <div class="mt-4 space-y-4 text-sm text-slate-300">
+            <div class="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
+              <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Result</p>
+              <p class="mt-3 leading-6 text-slate-300">{task.result_summary ?? 'This task has not produced a final result yet.'}</p>
+            </div>
+            <div class="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
+              <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Dependencies</p>
+              <div class="mt-3 space-y-3">
+                {#each task.dependencies as dependency}
+                  <div class="flex items-center justify-between gap-3 rounded-2xl border border-slate-800 bg-slate-950/60 px-4 py-3">
+                    <span>{allTasks.find((c) => c.task_id === dependency.depends_on)?.title ?? dependency.depends_on}</span>
+                    <Button size="sm" variant="danger" onclick={() => removeDependency(dependency.depends_on)}>Remove</Button>
+                  </div>
+                {/each}
+                {#if task.dependencies.length === 0}
+                  <p class="text-slate-400">No dependencies configured.</p>
+                {/if}
+                {#if isEditable}
+                  <div class="space-y-3 border-t border-slate-800 pt-4">
+                    <select bind:value={dependencyTaskId} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+                      <option value="">Add dependency...</option>
+                      {#each allTasks.filter((c) => c.task_id !== taskIdFromRoute()) as candidate}
+                        <option value={candidate.task_id}>{candidate.title}</option>
+                      {/each}
+                    </select>
+                    <Button class="w-full justify-center" disabled={!dependencyTaskId} onclick={addDependency}>Add dependency</Button>
+                  </div>
+                {/if}
+              </div>
+            </div>
+          </div>
+        </details>
+      </div>
+
       <!-- Sidebar -->
-      <div class="space-y-5">
+      <div class="hidden space-y-5 xl:block">
         <!-- Origin -->
         <Card class="p-5">
           <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Origin</p>
@@ -984,6 +1328,45 @@
       </div>
     </div>
   </section>
+
+  {#if mobileStepDetailOpen && selectedStepGroup}
+    <div class="fixed inset-0 z-40 xl:hidden" role="presentation">
+      <button class="absolute inset-0 bg-slate-950/80" onclick={closeMobileStepDetail} type="button" aria-label="Close step detail"></button>
+      <div class="absolute inset-x-0 bottom-0 max-h-[82vh] overflow-y-auto rounded-t-[2rem] border-t border-slate-700 bg-slate-950 p-5 shadow-2xl">
+        <div class="flex items-start justify-between gap-3">
+          <div>
+            <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Step detail</p>
+            <h2 class="mt-1 text-lg font-semibold text-white">{selectedStepGroup.stepName}</h2>
+            <p class="mt-1 text-sm text-slate-400">{selectedStepGroup.stepType === 'gate' ? 'Gate step' : 'Execution step'} with {selectedStepGroup.attempts.length} attempt{selectedStepGroup.attempts.length === 1 ? '' : 's'}.</p>
+          </div>
+          <Button size="sm" variant="secondary" onclick={closeMobileStepDetail}>Close</Button>
+        </div>
+
+        {#if selectedStepGroup.latest}
+          {@const latestAttempt = selectedStepGroup.latest}
+          {@const summary = stepOutputSummary(latestAttempt)}
+          {@const content = stepOutputContent(latestAttempt)}
+          {@const visibleStatus = displayStepStatus(latestAttempt)}
+          <div class="mt-4 rounded-3xl border border-slate-800 bg-slate-900/60 p-4">
+            <div class="flex items-center justify-between gap-3">
+              <span class="rounded-full border px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wider {statusColors[visibleStatus] ?? 'border-slate-600 text-slate-400'}">{visibleStatus}</span>
+              {#if latestAttempt.output?.session_id || latestAttempt.session_id}
+                <Button size="sm" variant="ghost" onclick={() => openSessionLogs(latestAttempt)}>Logs</Button>
+              {/if}
+            </div>
+            {#if summary}
+              <div class="prose prose-sm prose-invert mt-4 max-w-none text-slate-300">{@html renderMarkdown(summary)}</div>
+            {/if}
+            {#if content}
+              <div class="prose prose-sm prose-invert mt-4 max-w-none text-slate-400">{@html renderMarkdown(content.slice(0, 500) + (content.length > 500 ? '...' : ''))}</div>
+            {/if}
+          </div>
+        {:else}
+          <div class="mt-4 rounded-3xl border border-dashed border-slate-700 px-4 py-8 text-center text-sm text-slate-400">This step has not produced an attempt yet.</div>
+        {/if}
+      </div>
+    </div>
+  {/if}
 
   <!-- Session logs drawer -->
   {#if sessionDrawer}

@@ -6,19 +6,27 @@
     interactionMode = 'explicit_gates',
     // Task-aware mode (optional — omit for workflow editor)
     activeStepName = '',
+    selectedStepName = '',
     stepStatuses = {} as Record<string, string>,
     stepDurations = {} as Record<string, string>,
+    stepAttemptCounts = {} as Record<string, number>,
+    stepStateLabels = {} as Record<string, string>,
     skippedSteps = [] as string[],
+    onStepSelect = (_stepName: string) => {},
   } = $props<{
     steps: WorkflowStepFormState[];
     interactionMode: string;
     activeStepName?: string;
+    selectedStepName?: string;
     stepStatuses?: Record<string, string>;
     stepDurations?: Record<string, string>;
+    stepAttemptCounts?: Record<string, number>;
+    stepStateLabels?: Record<string, string>;
     skippedSteps?: string[];
+    onStepSelect?: (stepName: string) => void;
   }>();
 
-  let isTaskMode = $derived(activeStepName !== '' || Object.keys(stepStatuses).length > 0);
+  let isTaskMode = $derived(activeStepName !== '' || selectedStepName !== '' || Object.keys(stepStatuses).length > 0);
 
   // Layout constants
   const NODE_W = 160;
@@ -117,6 +125,10 @@
     return '1.5';
   }
 
+  function isSelected(stepName: string): boolean {
+    return selectedStepName !== '' && selectedStepName === stepName;
+  }
+
   function nodeFill(stepName: string, defaultFill: string): string {
     if (!isTaskMode) return defaultFill;
     if (skippedSteps.includes(stepName)) return '#0c0a0940';
@@ -136,6 +148,27 @@
   let nodesY = $derived(PAD_TOP + arcHeadroom);
   let svgW = $derived(Math.max(300, PAD_X * 2 + steps.length * NODE_W + (steps.length - 1) * GAP_X));
   let svgH = $derived(nodesY + NODE_H + BADGE_ROW_H + 16);
+
+  function stepStatusLabel(stepName: string): string {
+    return stepStateLabels[stepName] ?? '';
+  }
+
+  function attemptLabel(stepName: string): string {
+    const attempts = stepAttemptCounts[stepName] ?? 0;
+    if (attempts <= 1) return '';
+    return `x${attempts}`;
+  }
+
+  function handleNodeSelect(stepName: string): void {
+    if (!stepName) return;
+    onStepSelect(stepName);
+  }
+
+  function handleNodeKeydown(event: KeyboardEvent, stepName: string): void {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    event.preventDefault();
+    handleNodeSelect(stepName);
+  }
 </script>
 
 {#if steps.length === 0}
@@ -163,7 +196,12 @@
               0%, 100% { opacity: 1; }
               50% { opacity: 0.5; }
             }
+            @keyframes node-spin {
+              from { transform: rotate(0deg); }
+              to { transform: rotate(360deg); }
+            }
             .node-active { animation: pulse-stroke 2s ease-in-out infinite; }
+            .node-spinner { animation: node-spin 1s linear infinite; transform-origin: center; }
           </style>
         {/if}
       </defs>
@@ -215,16 +253,26 @@
         {@const hasEval = step.evaluate && step.type === 'run'}
         {@const hasQuestions = step.allowQuestions && interactionMode === 'step_requests'}
         {@const isActive = isTaskMode && step.name === activeStepName}
+        {@const selected = isTaskMode && isSelected(step.name)}
         {@const duration = stepDurations[step.name] ?? ''}
+        {@const statusLabel = stepStatusLabel(step.name)}
+        {@const attempt = attemptLabel(step.name)}
 
         {#if isGate}
           <!-- Gate: diamond shape -->
-          <g opacity={nodeOpacity(step.name)}>
+          <g
+            opacity={nodeOpacity(step.name)}
+            onclick={() => handleNodeSelect(step.name)}
+            onkeydown={(event) => handleNodeKeydown(event, step.name)}
+            class={isTaskMode ? 'cursor-pointer' : ''}
+            role={isTaskMode ? 'button' : undefined}
+            tabindex={isTaskMode ? 0 : undefined}
+          >
             <polygon
               points="{x + NODE_W / 2},{y} {x + NODE_W},{y + NODE_H / 2} {x + NODE_W / 2},{y + NODE_H} {x},{y + NODE_H / 2}"
-              fill={nodeFill(step.name, '#1c1917')}
-              stroke={nodeStroke(step.name, '#d97706')}
-              stroke-width={nodeStrokeWidth(step.name)}
+              fill={selected ? '#f59e0b14' : nodeFill(step.name, '#1c1917')}
+              stroke={selected ? '#fbbf24' : nodeStroke(step.name, '#d97706')}
+              stroke-width={selected ? '2.5' : nodeStrokeWidth(step.name)}
               class={isActive ? 'node-active' : ''}
             />
             <text
@@ -244,19 +292,36 @@
             >
               gate
             </text>
+            {#if isActive}
+              <g class="node-spinner">
+                <circle cx={x + NODE_W - 18} cy={y + 18} r="7" fill="none" stroke="#f59e0b33" stroke-width="2" />
+                <path d="M {x + NODE_W - 18} {y + 11} a 7 7 0 0 1 7 7" fill="none" stroke="#fbbf24" stroke-width="2" stroke-linecap="round" />
+              </g>
+            {/if}
+            {#if attempt}
+              <rect x={x + NODE_W - 28} y={y + NODE_H - 18} width="22" height="12" rx="6" fill="#f59e0b1a" stroke="#f59e0b66" stroke-width="0.75" />
+              <text x={x + NODE_W - 17} y={y + NODE_H - 9} text-anchor="middle" class="fill-amber-300 text-[8px] font-semibold">{attempt}</text>
+            {/if}
           </g>
         {:else}
           <!-- Run: rounded rectangle -->
-          <g opacity={nodeOpacity(step.name)}>
+          <g
+            opacity={nodeOpacity(step.name)}
+            onclick={() => handleNodeSelect(step.name)}
+            onkeydown={(event) => handleNodeKeydown(event, step.name)}
+            class={isTaskMode ? 'cursor-pointer' : ''}
+            role={isTaskMode ? 'button' : undefined}
+            tabindex={isTaskMode ? 0 : undefined}
+          >
             <rect
               {x}
               {y}
               width={NODE_W}
               height={NODE_H}
               rx="12"
-              fill={nodeFill(step.name, '#0c0a09')}
-              stroke={isActive ? '#0ea5e9' : nodeStroke(step.name, hasAgent ? '#0ea5e9' : '#334155')}
-              stroke-width={nodeStrokeWidth(step.name)}
+              fill={selected ? '#0ea5e914' : nodeFill(step.name, '#0c0a09')}
+              stroke={selected ? '#38bdf8' : isActive ? '#0ea5e9' : nodeStroke(step.name, hasAgent ? '#0ea5e9' : '#334155')}
+              stroke-width={selected ? '2.5' : nodeStrokeWidth(step.name)}
               class={isActive ? 'node-active' : ''}
             />
             <text
@@ -278,20 +343,43 @@
                 {step.agentOverride}
               </text>
             {/if}
+            {#if isActive}
+              <g class="node-spinner">
+                <circle cx={x + NODE_W - 16} cy={y + 16} r="7" fill="none" stroke="#0ea5e933" stroke-width="2" />
+                <path d="M {x + NODE_W - 16} {y + 9} a 7 7 0 0 1 7 7" fill="none" stroke="#38bdf8" stroke-width="2" stroke-linecap="round" />
+              </g>
+            {/if}
+            {#if attempt}
+              <rect x={x + NODE_W - 28} y={y + NODE_H - 18} width="22" height="12" rx="6" fill="#0ea5e91a" stroke="#38bdf866" stroke-width="0.75" />
+              <text x={x + NODE_W - 17} y={y + NODE_H - 9} text-anchor="middle" class="fill-sky-300 text-[8px] font-semibold">{attempt}</text>
+            {/if}
           </g>
         {/if}
 
         <!-- Below-node row: badges (editor mode) or duration (task mode) -->
-        {#if isTaskMode && duration}
-          <text
-            x={x + NODE_W / 2}
-            y={y + NODE_H + 16}
-            text-anchor="middle"
-            class="fill-slate-400 text-[10px]"
-            opacity={nodeOpacity(step.name)}
-          >
-            {duration}
-          </text>
+        {#if isTaskMode}
+          {#if statusLabel}
+            <text
+              x={x + NODE_W / 2}
+              y={y + NODE_H + 14}
+              text-anchor="middle"
+              class="fill-slate-300 text-[9px]"
+              opacity={nodeOpacity(step.name)}
+            >
+              {statusLabel}
+            </text>
+          {/if}
+          {#if duration}
+            <text
+              x={x + NODE_W / 2}
+              y={y + NODE_H + (statusLabel ? 25 : 16)}
+              text-anchor="middle"
+              class="fill-slate-400 text-[10px]"
+              opacity={nodeOpacity(step.name)}
+            >
+              {duration}
+            </text>
+          {/if}
         {:else if !isTaskMode}
           {#if hasEval || hasQuestions}
             {@const badges = [
