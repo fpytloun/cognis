@@ -952,8 +952,10 @@ preserve cache hits across turns within a session.
    between turns within a session.  Use ``allowed_tools`` (OpenAI) or
    ``defer_loading`` (Anthropic) to vary visibility without changing the array.
 
-2. **Place static content first.**  Order: tools → system prompt → memory
-   instructions → core memories → compaction summary → history → user message.
+2. **Place static content first.**  Order: tools → one consolidated immutable
+   system message (identity → runtime instructions → memory instructions →
+   core memories → skills metadata/guidance → continuation summary) →
+   environment → history → user message.
 
 3. **Use multiple cache breakpoints for Anthropic.**  Mark the last tool
    definition and the last immutable system message with ``cache_control``.

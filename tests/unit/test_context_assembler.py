@@ -626,7 +626,7 @@ async def test_context_assembler_consolidates_immutable_prefix_into_first_messag
     assert "Release Helper" in content
     assert "<skills_guidance>" in content
     assert "This is a continuation from a previous session." in content
-    assert "<prior_session_summary>" in content
+    assert "<continuation_summary>" in content
     assert "Mutable recalled memory" not in content
     assert result.cache_breakpoint_index == 0
 
@@ -675,7 +675,7 @@ async def test_context_assembler_skip_memory_path_uses_consolidated_immutable_pr
     assert "Release Helper" in content
     assert "<skills_guidance>" in content
     assert "This is a continuation from a previous session." in content
-    assert "<prior_session_summary>" in content
+    assert "<continuation_summary>" in content
     assert "<memory_instructions>" not in content
     assert "Recalled memories:" not in content
     assert result.cache_breakpoint_index == 0

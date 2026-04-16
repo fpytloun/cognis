@@ -1027,7 +1027,7 @@ class ContextAssembler:
 
         compaction_block = _format_compaction_summary(compaction_summary)
         if compaction_block:
-            tagged_summary = _tagged_section("prior_session_summary", compaction_block)
+            tagged_summary = _tagged_section("continuation_summary", compaction_block)
             if tagged_summary:
                 sections.append(tagged_summary)
 
