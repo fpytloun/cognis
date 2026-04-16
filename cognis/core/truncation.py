@@ -47,6 +47,10 @@ def middle_truncate(
 def _build_marker(total_chars: int, call_id: str | None) -> str:
     parts = [f"\n\n... [middle truncated: {total_chars:,} chars total"]
     if call_id:
-        parts.append(f", use read_tool_output(call_id='{call_id}') to view full output")
+        parts.append(
+            ", saved output is incomplete here; use "
+            f"search_tool_output(call_id='{call_id}', pattern='error|timeout|keyword') to find specific details "
+            f"or read_tool_output(call_id='{call_id}') to inspect sequentially"
+        )
     parts.append("] ...\n\n")
     return "".join(parts)

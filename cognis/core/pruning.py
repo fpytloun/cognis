@@ -111,7 +111,9 @@ def prune_tool_outputs(
         result[i] = {
             **msg,
             "content": (
-                f"[Tool result cleared — use read_tool_output(call_id='{call_id}') to view]"
+                "[Tool result cleared from context; content is incomplete here. "
+                f"Use search_tool_output(call_id='{call_id}', pattern='error|timeout|keyword') for targeted lookup "
+                f"or read_tool_output(call_id='{call_id}') to inspect the saved output.]"
             ),
         }
 

@@ -231,6 +231,12 @@ class TestDynamicWebDefinitions:
         assert "backend" in props
         assert "search_depth" in props
         assert "include_answer" in props
+        assert "include_domains" in props
+        assert "exclude_domains" in props
+        assert "include_raw_content" in props
+        assert "chunks_per_source" in props
+        assert "start_date" in props
+        assert "end_date" in props
         assert "topic" in props
         backend_enum = props["backend"]["enum"]
         assert "direct" in backend_enum
@@ -356,9 +362,12 @@ class TestWebSearchHandler:
             await handle_web_search(
                 {
                     "query": "test",
+                    "backend": "tavily",
                     "search_depth": "advanced",
                     "topic": "news",
-                    "include_answer": True,
+                    "include_answer": "advanced",
+                    "include_domains": ["example.com"],
+                    "chunks_per_source": 2,
                 },
                 _DUMMY_CONTEXT,
             )
@@ -366,7 +375,9 @@ class TestWebSearchHandler:
             options = call_kwargs.kwargs.get("options", {})
             assert options["search_depth"] == "advanced"
             assert options["topic"] == "news"
-            assert options["include_answer"] is True
+            assert options["include_answer"] == "advanced"
+            assert options["include_domains"] == ["example.com"]
+            assert options["chunks_per_source"] == 2
 
     @pytest.mark.asyncio()
     async def test_search_omits_empty_optional_strings(self) -> None:
@@ -427,6 +438,120 @@ class TestWebSearchHandler:
             assert options["include_answer"] is False
             assert "time_range" not in options
             assert "country" not in options
+
+    @pytest.mark.asyncio()
+    async def test_search_drops_country_for_non_general_tavily_topics(self) -> None:
+        from cognis.tools.executor.web.handlers import handle_web_search
+
+        with patch("cognis.tools.executor.web.handlers.resolve_search_backend") as mock_resolve:
+            mock_backend = AsyncMock()
+            mock_backend.search.return_value = ToolResult(output="results")
+            mock_resolve.return_value = mock_backend
+
+            await handle_web_search(
+                {
+                    "query": "Czech politics today",
+                    "backend": "tavily",
+                    "topic": "news",
+                    "country": "Czech Republic",
+                },
+                _DUMMY_CONTEXT,
+            )
+
+            call_kwargs = mock_backend.search.call_args
+            options = call_kwargs.kwargs.get("options", {})
+            assert options["topic"] == "news"
+            assert "country" not in options
+
+    @pytest.mark.asyncio()
+    async def test_search_normalizes_general_tavily_country_and_dates(self) -> None:
+        from cognis.tools.executor.web.handlers import handle_web_search
+
+        with patch("cognis.tools.executor.web.handlers.resolve_search_backend") as mock_resolve:
+            mock_backend = AsyncMock()
+            mock_backend.search.return_value = ToolResult(output="results")
+            mock_resolve.return_value = mock_backend
+
+            await handle_web_search(
+                {
+                    "query": "US AI news",
+                    "backend": "tavily",
+                    "topic": "general",
+                    "country": "United States",
+                    "start_date": "2026-04-01",
+                    "end_date": "2026-04-16",
+                },
+                _DUMMY_CONTEXT,
+            )
+
+            call_kwargs = mock_backend.search.call_args
+            options = call_kwargs.kwargs.get("options", {})
+            assert options["topic"] == "general"
+            assert options["country"] == "united states"
+            assert options["start_date"] == "2026-04-01"
+            assert options["end_date"] == "2026-04-16"
+
+    @pytest.mark.asyncio()
+    async def test_search_drops_chunks_when_tavily_depth_is_not_advanced(self) -> None:
+        from cognis.tools.executor.web.handlers import handle_web_search
+
+        with patch("cognis.tools.executor.web.handlers.resolve_search_backend") as mock_resolve:
+            mock_backend = AsyncMock()
+            mock_backend.search.return_value = ToolResult(output="results")
+            mock_resolve.return_value = mock_backend
+
+            await handle_web_search(
+                {
+                    "query": "test",
+                    "backend": "tavily",
+                    "search_depth": "basic",
+                    "chunks_per_source": 3,
+                },
+                _DUMMY_CONTEXT,
+            )
+
+            call_kwargs = mock_backend.search.call_args
+            options = call_kwargs.kwargs.get("options", {})
+            assert options["search_depth"] == "basic"
+            assert "chunks_per_source" not in options
+
+    @pytest.mark.asyncio()
+    async def test_search_rejects_invalid_tavily_date(self) -> None:
+        from cognis.tools.executor.web.handlers import handle_web_search
+
+        result = await handle_web_search(
+            {
+                "query": "test",
+                "backend": "tavily",
+                "start_date": "16-04-2026",
+            },
+            _DUMMY_CONTEXT,
+        )
+
+        assert result.is_error
+        assert "start_date" in result.output
+
+    @pytest.mark.asyncio()
+    async def test_search_rejects_impossible_tavily_date(self) -> None:
+        from cognis.tools.executor.web.handlers import handle_web_search
+
+        result = await handle_web_search(
+            {
+                "query": "test",
+                "backend": "tavily",
+                "start_date": "2026-13-40",
+            },
+            _DUMMY_CONTEXT,
+        )
+
+        assert result.is_error
+        assert "real calendar date" in result.output
+
+    def test_tool_output_descriptions_guide_recovery(self) -> None:
+        from cognis.tools.builtin.tool_output import READ_TOOL_OUTPUT, SEARCH_TOOL_OUTPUT
+
+        assert "truncated or cleared from context" in READ_TOOL_OUTPUT.description
+        assert "Use this before read_tool_output" in SEARCH_TOOL_OUTPUT.description
 
 
 class TestTavilyRequiredTools:

@@ -61,6 +61,15 @@ def test_chat_prompt_prefers_dedicated_edit_tools_for_coding() -> None:
     assert "Avoid using `bash` to run Python, Perl, Ruby" in instructions
 
 
+def test_chat_prompt_explains_truncated_output_recovery() -> None:
+    instructions = build_system_instructions(PromptContext.CHAT)
+    assert instructions is not None
+    assert "middle truncated" in instructions
+    assert "Tool result cleared" in instructions
+    assert 'search_tool_output(call_id=..., pattern="error|timeout|keyword")' in instructions
+    assert "read_tool_output(call_id=..., offset=..., limit=...)" in instructions
+
+
 def test_task_step_prompt_requires_todos_for_non_trivial_work() -> None:
     instructions = build_system_instructions(PromptContext.TASK_STEP)
     assert instructions is not None

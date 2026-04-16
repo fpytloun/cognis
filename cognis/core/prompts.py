@@ -70,7 +70,17 @@ _TOOL_GUIDANCE = """\
   blindly.
 - Make independent tool calls in parallel when possible for efficiency.
 - Large outputs are automatically truncated. Use offset/limit parameters \
-  or search tools to navigate large files."""
+  or search tools to navigate large files.
+- If a tool result says `middle truncated` or `Tool result cleared`, the \
+  visible content is incomplete.
+- When a truncated tool result includes a `call_id`, use \
+  `search_tool_output(call_id=..., pattern="error|timeout|keyword")` first when you need a \
+  specific error, URL, symbol, heading, date, or keyword.
+- Use `read_tool_output(call_id=..., offset=..., limit=...)` when you need \
+  to inspect the saved output sequentially or after search has located the \
+  relevant region.
+- Do not assume omitted portions of a truncated tool result are irrelevant; \
+  recover them when the missing content could affect the answer or next step."""
 
 _EXECUTION_BIAS = """\
 ## Execution bias

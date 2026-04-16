@@ -34,6 +34,7 @@ def test_call_id_included_in_marker() -> None:
     text = "x" * 2000
     result, was_truncated = middle_truncate(text, 500, call_id="call_abc123")
     assert was_truncated is True
+    assert "search_tool_output(call_id='call_abc123', pattern='error|timeout|keyword')" in result
     assert "read_tool_output(call_id='call_abc123')" in result
 
 

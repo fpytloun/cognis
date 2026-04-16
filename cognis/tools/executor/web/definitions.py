@@ -126,8 +126,66 @@ def _build_web_search(
             "description": "Tavily: topic category (default: general)",
         }
         properties["include_answer"] = {
-            "type": "boolean",
+            "oneOf": [
+                {"type": "boolean"},
+                {"type": "string", "enum": ["basic", "advanced"]},
+            ],
             "description": "Tavily: generate LLM answer from results",
+        }
+        properties["include_raw_content"] = {
+            "oneOf": [
+                {"type": "boolean"},
+                {"type": "string", "enum": ["markdown", "text"]},
+            ],
+            "description": "Tavily: include cleaned raw page content",
+        }
+        properties["include_images"] = {
+            "type": "boolean",
+            "description": "Tavily: include query-related and per-result images",
+        }
+        properties["include_image_descriptions"] = {
+            "type": "boolean",
+            "description": "Tavily: include image descriptions when images are returned",
+        }
+        properties["include_domains"] = {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Tavily: prefer these domains instead of using site: operators",
+        }
+        properties["exclude_domains"] = {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Tavily: exclude these domains from search results",
+        }
+        properties["chunks_per_source"] = {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 3,
+            "description": "Tavily: max relevant snippets per source (advanced depth only)",
+        }
+        properties["auto_parameters"] = {
+            "type": "boolean",
+            "description": "Tavily: automatically tune search parameters from the query",
+        }
+        properties["start_date"] = {
+            "type": "string",
+            "description": "Tavily: include results after this date (YYYY-MM-DD)",
+        }
+        properties["end_date"] = {
+            "type": "string",
+            "description": "Tavily: include results before this date (YYYY-MM-DD)",
+        }
+        properties["exact_match"] = {
+            "type": "boolean",
+            "description": "Tavily: enforce exact quoted phrase matches in the query",
+        }
+        properties["include_usage"] = {
+            "type": "boolean",
+            "description": "Tavily: include search credit usage in the response",
+        }
+        properties["include_favicon"] = {
+            "type": "boolean",
+            "description": "Tavily: include favicon URLs for results",
         }
 
     # Brave-specific params
@@ -312,7 +370,13 @@ def _search_description(backends: list[str], has_tavily: bool, has_brave: bool) 
         parts.append("'tavily' (AI-optimized, supports answer generation)")
     if has_brave:
         parts.append("'brave' (large index, freshness filters)")
-    return " ".join(parts) + "."
+    description = " ".join(parts) + "."
+    if has_tavily:
+        description += (
+            " Prefer include_domains/exclude_domains for Tavily instead of long site:"
+            " operators in the query. Use country only with topic='general'."
+        )
+    return description
 
 
 def _fetch_backend_hints(backends: list[str]) -> str:

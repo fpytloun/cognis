@@ -20,9 +20,10 @@ READ_TOOL_OUTPUT = ToolDefinition(
     name="read_tool_output",
     description=(
         "Read the full output of a previous tool call by its call_id. "
-        "Use when a tool result was truncated or cleared from context. "
-        "Supports pagination via offset (1-indexed line number) and limit. "
-        "Returns line-numbered content similar to the file read tool."
+        "Use when a tool result was truncated or cleared from context and you "
+        "need the omitted sections in order. Supports pagination via offset "
+        "(1-indexed line number) and limit. Returns line-numbered content "
+        "similar to the file read tool."
     ),
     parameters={
         "type": "object",
@@ -56,8 +57,9 @@ SEARCH_TOOL_OUTPUT = ToolDefinition(
     description=(
         "Search within the full output of a previous tool call using a "
         "regex pattern. Returns matching lines with surrounding context. "
-        "Use when you need to find specific content in a large or cleared "
-        "tool output."
+        "Use this before read_tool_output when you need to locate a specific "
+        "error, URL, symbol, heading, date, or keyword inside a large or "
+        "cleared tool output."
     ),
     parameters={
         "type": "object",

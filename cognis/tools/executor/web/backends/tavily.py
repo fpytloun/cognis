@@ -104,13 +104,18 @@ class TavilyBackend:
         _set_if(body, opts, "include_raw_content")
         _set_if(body, opts, "include_images")
         _set_if(body, opts, "include_image_descriptions")
+        _set_if(body, opts, "include_favicon")
         _set_if(body, opts, "include_domains")
         _set_if(body, opts, "exclude_domains")
         _set_if(body, opts, "country")
         _set_if(body, opts, "days")
         _set_if(body, opts, "time_range")  # day, week, month, year
+        _set_if(body, opts, "start_date")
+        _set_if(body, opts, "end_date")
         _set_if(body, opts, "auto_parameters")
         _set_if(body, opts, "chunks_per_source")
+        _set_if(body, opts, "exact_match")
+        _set_if(body, opts, "include_usage")
 
         result = await self._safe_call("/search", body)
         if isinstance(result, ToolResult):
