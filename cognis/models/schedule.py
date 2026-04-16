@@ -6,7 +6,9 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, Field, model_validator
+
+from cognis.models.workflow import CompletionDeliveryPolicy
 
 
 class ScheduleType(StrEnum):
@@ -42,7 +44,7 @@ class ScheduleModel(BaseModel):
     enabled: bool = True
     max_concurrent_runs: int = 1
     delete_after_run: bool = False
-    suppress_empty: bool = False
+    completion_delivery: CompletionDeliveryPolicy = Field(default_factory=CompletionDeliveryPolicy)
     last_fired_at: datetime | None = None
     next_fire_at: datetime | None = None
     last_run_status: ScheduleRunStatus | None = None

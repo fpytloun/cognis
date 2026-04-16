@@ -41,6 +41,7 @@ from cognis.models.session import SessionEvent
 from cognis.models.task import TaskModel, TaskStatus
 from cognis.models.workflow import (
     CompletionConfig,
+    CompletionDeliveryPolicy,
     StepDefinition,
     StepEvaluation,
     StepOutput,
@@ -115,6 +116,7 @@ class WorkflowEngine:
         shared_executor_connection: Any = None,
         session_cache: Any = None,
         notification_service: Any = None,
+        channel_delivery: Any = None,
     ) -> None:
         self._session_factory = session_factory
         self._providers = providers
@@ -129,6 +131,7 @@ class WorkflowEngine:
         self._session_cache = session_cache
         self._shared_executor_connection = shared_executor_connection
         self._notification_service = notification_service
+        self._channel_delivery = channel_delivery
         self._follow_up_policy = FollowUpPolicy(
             llm=getattr(providers, "llm", None),
         )
@@ -529,6 +532,9 @@ class WorkflowEngine:
                 task.completed_at = datetime.now(UTC)
 
             task.result_data = self._build_result_data(state)
+            task.applied_completion_mode, task.applied_completion_reason = (
+                self._resolve_applied_completion(task, state)
+            )
 
             await self._persist_task_final(task)
 
@@ -711,6 +717,7 @@ class WorkflowEngine:
             task_title=task.title,
             task_description=task.description,
             task_expected_output=task.expected_output,
+            completion_delivery=task.completion_delivery,
             workspace_root=task.workspace_root,
             working_directory=task.working_directory,
             step_run_id=step_run_id,
@@ -1498,6 +1505,14 @@ class WorkflowEngine:
 
     async def _deliver_task_result(self, task: TaskModel) -> None:
         """Resolve delivery target and inject synthetic event."""
+        applied_mode = task.applied_completion_mode or "default"
+        if applied_mode == "silent":
+            logger.info(
+                "task_delivery: explicit silent completion, skipping outward delivery",
+                extra={"extra_data": {"task_id": task.task_id}},
+            )
+            return
+
         delivery_mode = task.delivery.mode
         target_conversation_id: str | None = None
 
@@ -1515,7 +1530,7 @@ class WorkflowEngine:
             )
         elif delivery_mode == "silent":
             logger.info(
-                "task_delivery: silent mode, skipping",
+                "task_delivery: legacy silent delivery mode, skipping",
                 extra={"extra_data": {"task_id": task.task_id}},
             )
             return
@@ -1544,6 +1559,140 @@ class WorkflowEngine:
                 }
             },
         )
+
+        if applied_mode == "direct":
+            await self._deliver_task_result_direct(task, target_conversation_id)
+            return
+
+        await self._deliver_task_result_default(task, target_conversation_id)
+
+    async def _deliver_task_result_direct(
+        self, task: TaskModel, target_conversation_id: str
+    ) -> None:
+        """Deliver the final assistant message directly to the resolved channel."""
+
+        final_content = ""
+        attachments: list[dict[str, Any]] = []
+        if isinstance(task.result_data, dict):
+            raw_content = task.result_data.get("final_content")
+            if isinstance(raw_content, str):
+                final_content = raw_content.strip()
+            raw_attachments = task.result_data.get("attachments")
+            if isinstance(raw_attachments, list):
+                attachments = [item for item in raw_attachments if isinstance(item, dict)]
+
+        if not final_content:
+            logger.warning(
+                "task_delivery: direct delivery requested but final content missing; falling back",
+                extra={"extra_data": {"task_id": task.task_id}},
+            )
+            task.applied_completion_mode = "default"
+            task.applied_completion_reason = (
+                "Direct delivery requested but no final assistant message was available."
+            )
+            await self._update_applied_completion_fields(task)
+            await self._deliver_task_result_default(task, target_conversation_id)
+            return
+
+        if self._channel_delivery is None:
+            logger.warning(
+                "task_delivery: direct delivery unavailable; channel delivery service missing",
+                extra={"extra_data": {"task_id": task.task_id}},
+            )
+            task.applied_completion_mode = "default"
+            task.applied_completion_reason = (
+                "Direct delivery fell back because channel delivery is unavailable."
+            )
+            await self._update_applied_completion_fields(task)
+            await self._deliver_task_result_default(task, target_conversation_id)
+            return
+
+        async with self._session_factory() as db_session:
+            from cognis.store.queries import get_conversation_channel_route
+
+            route = await get_conversation_channel_route(db_session, target_conversation_id)
+        if route is None:
+            logger.warning(
+                "task_delivery: direct delivery requested but no channel route resolved; falling back",
+                extra={
+                    "extra_data": {
+                        "task_id": task.task_id,
+                        "conversation_id": target_conversation_id,
+                    }
+                },
+            )
+            task.applied_completion_mode = "default"
+            task.applied_completion_reason = (
+                "Direct delivery fell back because no direct-capable channel target was resolved."
+            )
+            await self._update_applied_completion_fields(task)
+            await self._deliver_task_result_default(task, target_conversation_id)
+            return
+
+        sent = await self._channel_delivery.send_to_conversation(
+            target_conversation_id,
+            final_content,
+            attachments=attachments,
+        )
+        if not sent:
+            logger.warning(
+                "task_delivery: direct delivery send failed; falling back",
+                extra={"extra_data": {"task_id": task.task_id}},
+            )
+            task.applied_completion_mode = "default"
+            task.applied_completion_reason = (
+                "Direct delivery fell back because channel send failed."
+            )
+            await self._update_applied_completion_fields(task)
+            await self._deliver_task_result_default(task, target_conversation_id)
+            return
+
+        logger.info(
+            "task_delivery: direct delivery sent",
+            extra={
+                "extra_data": {
+                    "task_id": task.task_id,
+                    "conversation_id": target_conversation_id,
+                }
+            },
+        )
+
+        event_type = EventType.TASK_FAILED
+        if task.status == TaskStatus.COMPLETED:
+            event_type = EventType.TASK_COMPLETED
+        elif task.status == TaskStatus.CANCELLED:
+            event_type = EventType.TASK_CANCELLED
+
+        await self._event_bus.publish(
+            Event(
+                type=event_type,
+                data={
+                    "task_id": task.task_id,
+                    "task_title": task.title,
+                    "title": task.title,
+                    "conversation_id": target_conversation_id,
+                    "result_summary": task.result_summary,
+                    "attachments": (task.result_data or {}).get("attachments", []),
+                    "direct_delivery": True,
+                },
+            )
+        )
+
+    async def _update_applied_completion_fields(self, task: TaskModel) -> None:
+        async with self._session_factory() as db_session:
+            from cognis.store.queries import get_task
+
+            row = await get_task(db_session, task.task_id)
+            if row is None:
+                return
+            row.applied_completion_mode = task.applied_completion_mode
+            row.applied_completion_reason = task.applied_completion_reason
+            await db_session.commit()
+
+    async def _deliver_task_result_default(
+        self, task: TaskModel, target_conversation_id: str
+    ) -> None:
+        """Deliver task results through the normal follow-up flow."""
 
         task_event = {
             TaskStatus.COMPLETED: "task_result",
@@ -1688,33 +1837,6 @@ class WorkflowEngine:
                 },
             )
         )
-        # Check suppress_empty: skip follow-up turn if the schedule has
-        # suppress_empty enabled and the result is empty/trivial.
-        # The lifecycle event is already recorded to Intaris for audit.
-        if (
-            task.source_type == "scheduler"
-            and task.source_ref
-            and task.status == TaskStatus.COMPLETED
-            and not (task.result_summary or "").strip()
-        ):
-            try:
-                async with self._session_factory() as db_session:
-                    from cognis.store.queries import get_schedule
-
-                    schedule_row = await get_schedule(db_session, task.source_ref)
-                    if schedule_row is not None and schedule_row.suppress_empty:
-                        logger.info(
-                            "task_delivery: suppressing empty follow-up for schedule",
-                            extra={
-                                "extra_data": {
-                                    "task_id": task.task_id,
-                                    "schedule_id": task.source_ref,
-                                }
-                            },
-                        )
-                        return
-            except Exception:
-                logger.debug("suppress_empty check failed, proceeding with delivery", exc_info=True)
 
         # Always request a follow-up turn so the agent can process the
         # result even if Intaris recording failed (degraded mode).
@@ -1805,6 +1927,8 @@ class WorkflowEngine:
                 completed_at=task.completed_at,
                 result_summary=task.result_summary,
                 result_data=task.result_data,
+                applied_completion_mode=task.applied_completion_mode,
+                applied_completion_reason=task.applied_completion_reason,
             )
             if task.workflow_state:
                 await update_task_workflow_state(
@@ -2167,6 +2291,11 @@ class WorkflowEngine:
         return ""
 
     def _build_result_data(self, state: WorkflowState) -> dict[str, Any] | None:
+        result: dict[str, Any] = {}
+        last_output = self._last_step_output(state)
+        if last_output is not None and last_output.content.strip():
+            result["final_content"] = last_output.content
+
         attachments: list[dict[str, Any]] = []
         for raw in state.step_outputs.values():
             if not isinstance(raw, dict):
@@ -2177,7 +2306,7 @@ class WorkflowEngine:
                 continue
             attachments.extend(step_output.attachments)
         if not attachments:
-            return None
+            return result or None
         deduped: list[dict[str, Any]] = []
         seen: set[tuple[str, str]] = set()
         for item in attachments:
@@ -2188,7 +2317,44 @@ class WorkflowEngine:
                 continue
             seen.add(key)
             deduped.append(item)
-        return {"attachments": deduped}
+        if deduped:
+            result["attachments"] = deduped
+        return result or None
+
+    def _last_step_output(self, state: WorkflowState) -> StepOutput | None:
+        for raw in reversed(list(state.step_outputs.values())):
+            if not isinstance(raw, dict):
+                continue
+            try:
+                return StepOutput.model_validate(raw)
+            except Exception:
+                continue
+        return None
+
+    def _resolve_applied_completion(
+        self, task: TaskModel, state: WorkflowState
+    ) -> tuple[str, str | None]:
+        last_output = self._last_step_output(state)
+        if (
+            task.status == TaskStatus.COMPLETED
+            and last_output is not None
+            and last_output.notification is not None
+            and last_output.notification.mode == "silent"
+        ):
+            return "silent", last_output.notification.reason
+
+        policy = task.completion_delivery or CompletionDeliveryPolicy()
+        if policy.completion_mode_family == "direct":
+            if isinstance(task.result_data, dict):
+                final_content = task.result_data.get("final_content")
+                if isinstance(final_content, str) and final_content.strip():
+                    return "direct", None
+            return (
+                "default",
+                "Direct delivery requested but no final assistant message was available.",
+            )
+
+        return "default", None
 
 
 def _build_exhaustion_gate(step_def: StepDefinition, last_error: str | None = None) -> Any:

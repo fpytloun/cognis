@@ -351,6 +351,12 @@ class Task(Base):
     source_ref: Mapped[str | None] = mapped_column(String, nullable=True)
     delivery_mode: Mapped[str] = mapped_column(String, nullable=False, default="same_conversation")
     delivery_target: Mapped[str | None] = mapped_column(String, nullable=True)
+    completion_mode_family: Mapped[str] = mapped_column(
+        String, nullable=False, default="default", server_default="default"
+    )
+    allow_silent_completion: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="0"
+    )
     workflow_id: Mapped[str | None] = mapped_column(String, nullable=True)
     workspace_root: Mapped[str | None] = mapped_column(Text, nullable=True)
     working_directory: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -364,6 +370,8 @@ class Task(Base):
     completed_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
     result_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     result_data: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    applied_completion_mode: Mapped[str | None] = mapped_column(String, nullable=True)
+    applied_completion_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
     )
@@ -477,7 +485,12 @@ class Schedule(Base):
     enabled: Mapped[bool] = mapped_column(nullable=False, default=True)
     max_concurrent_runs: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     delete_after_run: Mapped[bool] = mapped_column(nullable=False, default=False)
-    suppress_empty: Mapped[bool] = mapped_column(nullable=False, default=False)
+    completion_mode_family: Mapped[str] = mapped_column(
+        String, nullable=False, default="default", server_default="default"
+    )
+    allow_silent_completion: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="0"
+    )
     last_fired_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
     next_fire_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
     last_run_status: Mapped[str | None] = mapped_column(String, nullable=True)

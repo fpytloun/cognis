@@ -213,7 +213,10 @@ current throughout the step.
 - The evaluator checks your work against your written output and claims — \
  be thorough and specific. Vague summaries get rejected.
 - A step can still finish properly with `outcome.status="rejected"` or \
- `"failed"` if that accurately reflects the result of the completed work.
+  `"failed"` if that accurately reflects the result of the completed work.
+- Respect the step's completion delivery policy. Use \
+  `notification.mode="silent"` only when silent completion is explicitly \
+  allowed and there is nothing user-actionable to notify.
 - If you need clarification, use `step_request_input` (when available) \
 rather than guessing.
 - Do not call `step_complete` until every remaining todo is `done` or \
@@ -234,9 +237,11 @@ before substantial work, and keep them updated as you proceed.
 - If you need input from the caller to continue, use `step_request_input` \
 when available rather than guessing or stopping early.
 - Write a comprehensive result when done, then call `step_complete` with \
- a summary and include an `outcome` if the delegated work properly concluded \
- with rejection or failure. Do not finish until remaining todos are `done` or \
- `cancelled`.
+  a summary and include an `outcome` if the delegated work properly concluded \
+  with rejection or failure. Respect the completion delivery policy and use \
+  `notification.mode="silent"` only when it is explicitly allowed and nothing \
+  user-actionable happened. Do not finish until remaining todos are `done` or \
+  `cancelled`.
 - Delegate further only if the task genuinely requires it — prefer doing \
 the work directly."""
 

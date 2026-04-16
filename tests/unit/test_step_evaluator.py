@@ -494,6 +494,8 @@ async def test_evaluator_prompt_separates_prose_metadata_and_execution_evidence(
     prompt = str(capture.messages[1]["content"])
     assert "Assistant written deliverable:" in prompt
     assert "step_complete metadata:" in prompt
+    assert "Notification:" in prompt
     assert "Execution evidence:" in prompt
     assert "require step_complete metadata" in prompt
     assert "Expected output as strong guidance for output shape" in prompt
+    assert "Silent completion can be valid" in prompt

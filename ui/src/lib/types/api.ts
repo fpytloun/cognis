@@ -653,6 +653,11 @@ export interface TaskDelivery {
   target: string | null;
 }
 
+export interface CompletionDeliveryPolicy {
+  completion_mode_family: 'default' | 'direct';
+  allow_silent_completion: boolean;
+}
+
 export interface WorkflowState {
   current_step_index: number;
   step_outputs: Record<string, Record<string, unknown>>;
@@ -722,6 +727,8 @@ export interface Task {
   source_type: string;
   source_ref: string | null;
   delivery: TaskDelivery;
+  completion_mode_family: 'default' | 'direct';
+  allow_silent_completion: boolean;
   workflow_id: string | null;
   workflow_state: WorkflowState | null;
   queue_name: string;
@@ -731,6 +738,8 @@ export interface Task {
   completed_at: string | null;
   result_summary: string | null;
   result_data: Record<string, unknown> | null;
+  applied_completion_mode: 'default' | 'direct' | 'silent' | null;
+  applied_completion_reason: string | null;
 }
 
 export interface TaskDetail extends Task {
@@ -792,7 +801,8 @@ export interface Schedule {
   enabled: boolean;
   max_concurrent_runs: number;
   delete_after_run: boolean;
-  suppress_empty: boolean;
+  completion_mode_family: 'default' | 'direct';
+  allow_silent_completion: boolean;
   last_fired_at: string | null;
   next_fire_at: string | null;
   last_run_status: string | null;

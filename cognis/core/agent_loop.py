@@ -52,7 +52,12 @@ from cognis.models.tool import (
     tool_display_name,
     tool_matches_identifier,
 )
-from cognis.models.workflow import StepDefinition, StepOutput, WorkflowState
+from cognis.models.workflow import (
+    CompletionDeliveryPolicy,
+    StepDefinition,
+    StepOutput,
+    WorkflowState,
+)
 from cognis.providers.retry import is_retryable_http_error
 from cognis.runtime_context import (  # noqa: F401 — used in delegation
     current_effective_working_directory,
@@ -212,6 +217,12 @@ def _task_row_to_model(task_row: Any) -> Any:
                 "mode": getattr(task_row, "delivery_mode", "same_conversation"),
                 "target": getattr(task_row, "delivery_target", None),
             },
+            "completion_delivery": {
+                "completion_mode_family": getattr(task_row, "completion_mode_family", "default"),
+                "allow_silent_completion": bool(
+                    getattr(task_row, "allow_silent_completion", False)
+                ),
+            },
             "workflow_id": getattr(task_row, "workflow_id", None),
             "workspace_root": getattr(task_row, "workspace_root", None),
             "working_directory": getattr(task_row, "working_directory", None),
@@ -223,6 +234,8 @@ def _task_row_to_model(task_row: Any) -> Any:
             "completed_at": getattr(task_row, "completed_at", None),
             "result_summary": getattr(task_row, "result_summary", None),
             "result_data": getattr(task_row, "result_data", None),
+            "applied_completion_mode": getattr(task_row, "applied_completion_mode", None),
+            "applied_completion_reason": getattr(task_row, "applied_completion_reason", None),
         }
     )
 
@@ -257,6 +270,21 @@ def _build_step_complete_validation_error(arguments: dict[str, Any], exc: Valida
             "example": _step_complete_example_payload(),
         }
     )
+
+
+def _validate_step_completion_notification(ctx: StepContext, step_output: StepOutput) -> None:
+    """Validate the requested completion notification against the step policy."""
+
+    notification = step_output.notification
+    if notification is None:
+        return
+    if notification.mode != "silent":
+        raise ValueError(f"Unsupported notification mode: {notification.mode}")
+    if not ctx.completion_delivery.allow_silent_completion:
+        raise ValueError("notification.mode='silent' is not allowed for this step")
+    outcome_status = step_output.outcome.status if step_output.outcome is not None else "success"
+    if outcome_status != "success":
+        raise ValueError("notification.mode='silent' is only valid for successful completion")
 
 
 def _find_gate_revise_action(pause: PendingPause) -> str | None:
@@ -825,6 +853,7 @@ class StepContext:
     task_title: str = ""
     task_description: str = ""
     task_expected_output: str | None = None
+    completion_delivery: CompletionDeliveryPolicy = field(default_factory=CompletionDeliveryPolicy)
     workspace_root: str | None = None
     working_directory: str | None = None
     step_run_id: str | None = None
@@ -1968,6 +1997,7 @@ class AgentLoop:
                             outputs=tc.arguments.get("outputs", {}),
                             claims=tc.arguments.get("claims", []),
                             outcome=tc.arguments.get("outcome"),
+                            notification=tc.arguments.get("notification"),
                             execution_evidence=dict(ctx.execution_evidence),
                             attachments=list(collected_attachments),
                             session_id=ctx.session.session_id,
@@ -1975,8 +2005,34 @@ class AgentLoop:
                             or ctx.session.session_id,
                             completed_at=datetime.now(UTC),
                         )
+                        _validate_step_completion_notification(ctx, step_output)
                     except ValidationError as exc:
                         err_content = _build_step_complete_validation_error(tc.arguments, exc)
+                        messages.append(
+                            {"role": "tool", "tool_call_id": tc.call_id, "content": err_content}
+                        )
+                        _append_tool_result_event(
+                            events_to_record, tc, err_content, True, tool_id=tool_id
+                        )
+                        await self._flush_events_incremental(
+                            ctx,
+                            events_to_record,
+                            reason="tool_result:step_complete",
+                            on_token=on_token,
+                        )
+                        if on_tool_result:
+                            await on_tool_result(tc.call_id, tc.name, err_content, True, None, None)
+                        continue
+                    except ValueError as exc:
+                        err_content = json.dumps(
+                            {
+                                "status": "rejected",
+                                "reason": "invalid_step_complete_notification",
+                                "message": str(exc),
+                                "received": tc.arguments,
+                                "example": _step_complete_example_payload(),
+                            }
+                        )
                         messages.append(
                             {"role": "tool", "tool_call_id": tc.call_id, "content": err_content}
                         )
@@ -2002,6 +2058,11 @@ class AgentLoop:
                                 "summary": step_output.summary,
                                 "outcome_status": (
                                     step_output.outcome.status if step_output.outcome else "success"
+                                ),
+                                "notification_mode": (
+                                    step_output.notification.mode
+                                    if step_output.notification is not None
+                                    else ctx.completion_delivery.completion_mode_family
                                 ),
                             },
                         )
@@ -4491,6 +4552,14 @@ class AgentLoop:
                 parts.append(f"{ctx.task_description}\n\n")
             if ctx.task_expected_output:
                 parts.append(f"**Expected output:** {ctx.task_expected_output}\n\n")
+            parts.append(
+                "**Notification delivery family:** "
+                f"{ctx.completion_delivery.completion_mode_family}\n\n"
+            )
+            parts.append(
+                "**Silent completion allowed:** "
+                f"{str(ctx.completion_delivery.allow_silent_completion).lower()}\n\n"
+            )
 
         # Inject prior step outputs so the LLM has context from previous steps.
         # This resolves the step's input configuration and reads structured
@@ -4537,7 +4606,10 @@ class AgentLoop:
             "to omit the assistant deliverable entirely. Then call step_complete "
             "with a summary, structured outputs, verifiable claims, and an "
             "outcome when the completed step should explicitly report rejection "
-            "or failure."
+            "or failure. Use notification.mode='silent' only when the work "
+            "completed successfully, silent completion is allowed, and there is "
+            "nothing user-actionable to notify. Otherwise omit notification and "
+            "the configured delivery family will be used automatically."
         )
 
         return "".join(parts)
@@ -4670,6 +4742,26 @@ class AgentLoop:
                                         },
                                     },
                                     "required": ["status"],
+                                },
+                                "notification": {
+                                    "type": "object",
+                                    "description": (
+                                        "Optional completion delivery choice. In v1 only "
+                                        "notification.mode='silent' is supported. Use it only "
+                                        "when silent completion is allowed and nothing user-"
+                                        "actionable happened."
+                                    ),
+                                    "properties": {
+                                        "mode": {
+                                            "type": "string",
+                                            "enum": ["silent"],
+                                        },
+                                        "reason": {
+                                            "type": "string",
+                                            "description": "Required for silent completion.",
+                                        },
+                                    },
+                                    "required": ["mode", "reason"],
                                 },
                             },
                             "required": ["summary"],

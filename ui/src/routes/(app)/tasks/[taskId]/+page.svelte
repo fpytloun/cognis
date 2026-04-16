@@ -50,7 +50,9 @@
     agent_id: '',
     workflow_id: '',
     delivery_mode: 'same_conversation',
-    delivery_target: ''
+    delivery_target: '',
+    completion_mode_family: 'default' as 'default' | 'direct',
+    allow_silent_completion: false
   });
 
   const statusColors: Record<string, string> = {
@@ -98,6 +100,13 @@
   function agentName(agentId: string | null): string {
     if (!agentId) return 'Unknown';
     return agents.find((a) => a.agent_id === agentId)?.name ?? agentId;
+  }
+
+  function completionModeLabel(taskDetail: TaskDetail): string {
+    if (taskDetail.applied_completion_mode === 'silent') return 'Completed silently';
+    if (taskDetail.applied_completion_mode === 'direct') return 'Completed via direct delivery';
+    if (taskDetail.status === 'completed') return 'Completed';
+    return taskDetail.status;
   }
 
   function toggleStepExpand(stepRunId: string): void {
@@ -451,7 +460,9 @@
         agent_id: task.agent_id,
         workflow_id: task.workflow_id ?? '',
         delivery_mode: task.delivery.mode,
-        delivery_target: task.delivery.target ?? ''
+        delivery_target: task.delivery.target ?? '',
+        completion_mode_family: task.completion_mode_family,
+        allow_silent_completion: task.allow_silent_completion
       };
       selectedStepName = defaultStepSelection(task, selectedStepName);
     } catch (caughtError) {
@@ -497,7 +508,9 @@
         agent_id: editForm.agent_id,
         workflow_id: editForm.workflow_id || null,
         delivery_mode: editForm.delivery_mode,
-        delivery_target: editForm.delivery_mode === 'specific_conversation' ? editForm.delivery_target : null
+        delivery_target: editForm.delivery_mode === 'specific_conversation' ? editForm.delivery_target : null,
+        completion_mode_family: editForm.completion_mode_family,
+        allow_silent_completion: editForm.allow_silent_completion
       });
       task = await api.tasks.detail(updatedTask.task_id);
       addToast('Task updated.', 'success');
@@ -636,7 +649,7 @@
           <Button size="sm" variant="danger" onclick={cancelTask}>Cancel task</Button>
         {/if}
         <span class="rounded-full border px-3 py-1 text-xs font-semibold uppercase tracking-[0.2em] {statusColors[task.status] ?? 'border-slate-700 text-slate-200'}">
-          {task.status}
+          {completionModeLabel(task)}
         </span>
       </div>
     </div>
@@ -762,7 +775,7 @@
             <label class="space-y-2 text-sm font-medium text-slate-200">
               <span class="inline-flex items-center gap-2">
                 Delivery mode
-                <Tooltip text="How the task result is delivered back. 'Same conversation' posts to the originating chat. 'Silent' stores the result without notifying.">
+                <Tooltip text="How the task resolves its target conversation or channel route for completion delivery.">
                   <span class="cursor-help text-slate-500">(?)</span>
                 </Tooltip>
               </span>
@@ -771,7 +784,6 @@
                 <option value="specific_conversation">Specific conversation</option>
                 <option value="latest_active_for_agent">Latest active</option>
                 <option value="preferred_channel">Preferred channel</option>
-                <option value="silent">Silent</option>
               </select>
             </label>
             {#if editForm.delivery_mode === 'specific_conversation'}
@@ -786,6 +798,25 @@
               </label>
             {/if}
           </div>
+
+          <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
+            <span class="inline-flex items-center gap-2">
+              Completion notification behavior
+              <Tooltip text="Default delivery sends task results through the normal conversation flow. Direct channel delivery sends the final result directly to the resolved target channel. Allow silent completion lets the agent finish without notifying when nothing user-actionable happened.">
+                <span class="cursor-help text-slate-500">(?)</span>
+              </Tooltip>
+            </span>
+            <div class="grid gap-3 md:grid-cols-[minmax(0,1fr)_auto]">
+              <select bind:value={editForm.completion_mode_family} disabled={!isEditable} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100 disabled:opacity-50">
+                <option value="default">Default delivery</option>
+                <option value="direct">Direct channel delivery</option>
+              </select>
+              <label class="inline-flex items-center gap-2 rounded-xl border border-slate-800 bg-slate-950/60 px-3 py-2 text-sm text-slate-200 disabled:opacity-50">
+                <input bind:checked={editForm.allow_silent_completion} disabled={!isEditable} class="h-4 w-4 rounded border-slate-600 bg-slate-950" type="checkbox" />
+                <span>Allow silent completion</span>
+              </label>
+            </div>
+          </label>
 
           <div class="mt-5 flex justify-end">
             <Button disabled={saving || !isEditable} onclick={saveTask}>{saving ? 'Saving...' : 'Save task'}</Button>
@@ -1293,6 +1324,9 @@
         <!-- Result -->
         <Card class="p-5">
           <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Result</p>
+          {#if task.applied_completion_reason}
+            <p class="mt-3 text-xs leading-5 text-slate-500">{task.applied_completion_reason}</p>
+          {/if}
           <p class="mt-3 text-sm leading-6 text-slate-300">{task.result_summary ?? 'This task has not produced a final result yet.'}</p>
         </Card>
 

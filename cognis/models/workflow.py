@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from enum import StrEnum
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -14,12 +15,41 @@ class InteractionMode(BaseModel):
     mode: Literal["none", "explicit_gates", "step_requests"] = "explicit_gates"
 
 
+class CompletionModeFamily(StrEnum):
+    """Family used when publishing a completed task result."""
+
+    DEFAULT = "default"
+    DIRECT = "direct"
+
+
+class CompletionDeliveryPolicy(BaseModel):
+    """Resolved policy for workflow/task completion notifications."""
+
+    completion_mode_family: CompletionModeFamily = CompletionModeFamily.DEFAULT
+    allow_silent_completion: bool = False
+
+
+def resolve_completion_delivery_policy(
+    workflow_defaults: WorkflowDefaults | None,
+    *,
+    task_policy: CompletionDeliveryPolicy | None = None,
+) -> CompletionDeliveryPolicy:
+    """Resolve the effective completion delivery policy for a task or step."""
+
+    if task_policy is not None:
+        return task_policy
+    if workflow_defaults is not None:
+        return workflow_defaults.delivery
+    return CompletionDeliveryPolicy()
+
+
 class WorkflowDefaults(BaseModel):
     """Default values inherited by all steps unless overridden."""
 
     max_attempts: int = 3
     evaluate: bool = True
     on_exhausted: Literal["continue", "fail", "gate"] = "gate"
+    delivery: CompletionDeliveryPolicy = Field(default_factory=CompletionDeliveryPolicy)
 
 
 class GateOption(BaseModel):
@@ -79,6 +109,19 @@ class StepOutcome(BaseModel):
     def _validate_reason_requirement(self) -> StepOutcome:
         if self.status in {"rejected", "failed"} and not (self.reason or "").strip():
             raise ValueError("outcome.reason is required when outcome.status is rejected or failed")
+        return self
+
+
+class StepCompletionNotification(BaseModel):
+    """Optional completion delivery choice requested by the step."""
+
+    mode: Literal["silent"]
+    reason: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_reason_requirement(self) -> StepCompletionNotification:
+        if self.mode == "silent" and not (self.reason or "").strip():
+            raise ValueError("notification.reason is required when notification.mode is silent")
         return self
 
 
@@ -206,6 +249,7 @@ class StepOutput(BaseModel):
     outputs: dict[str, Any] = {}
     claims: list[str] = []
     outcome: StepOutcome | None = None
+    notification: StepCompletionNotification | None = None
     execution_evidence: dict[str, Any] | None = None
     error: str | None = None  # Set when the step failed with an exception
     completed_at: datetime | None = None

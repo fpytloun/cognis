@@ -21,6 +21,7 @@ from cognis.core.workflow_engine import WorkflowEngine
 from cognis.core.workflow_registry import WorkflowRegistry
 from cognis.logging import get_logger
 from cognis.models.task import TaskDelivery, TaskModel, TaskStatus
+from cognis.models.workflow import CompletionDeliveryPolicy
 from cognis.models.workflow import WorkflowState
 from cognis.runtime_context import scoped_runtime_context
 from cognis.store.queries import (
@@ -195,6 +196,7 @@ class TaskQueue:
         source_type: str = "api",
         source_ref: str | None = None,
         delivery: TaskDelivery | None = None,
+        completion_delivery: CompletionDeliveryPolicy | None = None,
         workflow_id: str | None = None,
         workspace_root: str | None = None,
         working_directory: str | None = None,
@@ -209,6 +211,10 @@ class TaskQueue:
             raise RuntimeError("Task queue is not accepting new tasks")
 
         delivery = delivery or TaskDelivery()
+        completion_delivery = completion_delivery or await self._resolve_completion_delivery_policy(
+            workflow_id=workflow_id,
+            owner_email=created_by,
+        )
 
         async with self._session_factory() as db_session:
             row = await create_task(
@@ -224,6 +230,8 @@ class TaskQueue:
                 source_ref=source_ref,
                 delivery_mode=delivery.mode,
                 delivery_target=delivery.target,
+                completion_mode_family=completion_delivery.completion_mode_family,
+                allow_silent_completion=completion_delivery.allow_silent_completion,
                 workflow_id=workflow_id,
                 workspace_root=workspace_root,
                 working_directory=working_directory,
@@ -250,6 +258,34 @@ class TaskQueue:
 
         return task
 
+    async def _resolve_completion_delivery_policy(
+        self,
+        *,
+        workflow_id: str | None,
+        owner_email: str,
+    ) -> CompletionDeliveryPolicy:
+        if workflow_id is None:
+            return CompletionDeliveryPolicy()
+
+        workflow = await self._workflow_registry.get(workflow_id, owner_email=owner_email)
+        if workflow is None:
+            return CompletionDeliveryPolicy()
+
+        defaults = getattr(workflow, "defaults", None)
+        delivery_defaults = (
+            defaults.get("delivery")
+            if isinstance(defaults, dict)
+            else getattr(defaults, "delivery", None)
+        )
+        if delivery_defaults is None:
+            return CompletionDeliveryPolicy()
+
+        return CompletionDeliveryPolicy.model_validate(
+            delivery_defaults.model_dump(mode="json")
+            if hasattr(delivery_defaults, "model_dump")
+            else delivery_defaults
+        )
+
     async def create_draft(
         self,
         *,
@@ -260,6 +296,7 @@ class TaskQueue:
         expected_output: str | None = None,
         priority: int = 0,
         delivery: TaskDelivery | None = None,
+        completion_delivery: CompletionDeliveryPolicy | None = None,
         workflow_id: str | None = None,
         workspace_root: str | None = None,
         working_directory: str | None = None,
@@ -275,6 +312,7 @@ class TaskQueue:
             expected_output=expected_output,
             priority=priority,
             delivery=delivery,
+            completion_delivery=completion_delivery,
             workflow_id=workflow_id,
             workspace_root=workspace_root,
             working_directory=working_directory,
@@ -875,6 +913,10 @@ def _row_to_task_model(row: Any) -> TaskModel:
             mode=row.delivery_mode,
             target=row.delivery_target,
         ),
+        completion_delivery=CompletionDeliveryPolicy(
+            completion_mode_family=getattr(row, "completion_mode_family", "default"),
+            allow_silent_completion=bool(getattr(row, "allow_silent_completion", False)),
+        ),
         workflow_id=row.workflow_id,
         workspace_root=getattr(row, "workspace_root", None),
         working_directory=getattr(row, "working_directory", None),
@@ -888,4 +930,6 @@ def _row_to_task_model(row: Any) -> TaskModel:
         completed_at=row.completed_at,
         result_summary=row.result_summary,
         result_data=row.result_data,
+        applied_completion_mode=getattr(row, "applied_completion_mode", None),
+        applied_completion_reason=getattr(row, "applied_completion_reason", None),
     )

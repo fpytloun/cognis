@@ -1246,6 +1246,8 @@ async def create_task(
     source_ref: str | None = None,
     delivery_mode: str = "same_conversation",
     delivery_target: str | None = None,
+    completion_mode_family: str = "default",
+    allow_silent_completion: bool = False,
     workflow_id: str | None = None,
     workspace_root: str | None = None,
     working_directory: str | None = None,
@@ -1273,6 +1275,8 @@ async def create_task(
         source_ref=source_ref,
         delivery_mode=delivery_mode,
         delivery_target=delivery_target,
+        completion_mode_family=completion_mode_family,
+        allow_silent_completion=allow_silent_completion,
         workflow_id=workflow_id,
         workspace_root=workspace_root,
         working_directory=working_directory,
@@ -1313,6 +1317,8 @@ async def update_task_status(
     completed_at: datetime | None = None,
     result_summary: str | None = None,
     result_data: dict[str, object] | None = None,
+    applied_completion_mode: str | None = None,
+    applied_completion_reason: str | None = None,
 ) -> bool:
     """Update task status and optional lifecycle fields.
 
@@ -1338,6 +1344,10 @@ async def update_task_status(
         values["result_summary"] = result_summary
     if result_data is not None:
         values["result_data"] = result_data
+    if applied_completion_mode is not None:
+        values["applied_completion_mode"] = applied_completion_mode
+    if applied_completion_reason is not None:
+        values["applied_completion_reason"] = applied_completion_reason
 
     stmt = (
         update(Task).where(Task.task_id == task_id, Task.status.in_(allowed_from)).values(**values)
@@ -2019,7 +2029,8 @@ async def create_schedule(
     enabled: bool = True,
     max_concurrent_runs: int = 1,
     delete_after_run: bool = False,
-    suppress_empty: bool = False,
+    completion_mode_family: str = "default",
+    allow_silent_completion: bool = False,
     next_fire_at: datetime | None = None,
     created_by: str,
 ) -> Schedule:
@@ -2039,7 +2050,8 @@ async def create_schedule(
         enabled=enabled,
         max_concurrent_runs=max_concurrent_runs,
         delete_after_run=delete_after_run,
-        suppress_empty=suppress_empty,
+        completion_mode_family=completion_mode_family,
+        allow_silent_completion=allow_silent_completion,
         next_fire_at=next_fire_at,
         created_by=created_by,
     )
@@ -2099,7 +2111,8 @@ async def update_schedule(
         "enabled",
         "max_concurrent_runs",
         "delete_after_run",
-        "suppress_empty",
+        "completion_mode_family",
+        "allow_silent_completion",
         "next_fire_at",
     }
     for key, value in fields.items():

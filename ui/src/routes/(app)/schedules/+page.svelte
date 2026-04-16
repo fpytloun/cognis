@@ -76,9 +76,10 @@
     task_description: '',
     priority: 0,
     expected_output: '',
-    suppress_empty: false,
     delivery_mode: 'latest_active_for_agent',
-    delivery_target: ''
+    delivery_target: '',
+    completion_mode_family: 'default' as 'default' | 'direct',
+    allow_silent_completion: false
   });
 
   const typeIcons: Record<string, typeof Clock> = {
@@ -161,7 +162,8 @@
         agent_id: form.agent_id,
         workflow_id: form.workflow_id || null,
         task_template: taskTemplate,
-        suppress_empty: form.suppress_empty
+        completion_mode_family: form.completion_mode_family,
+        allow_silent_completion: form.allow_silent_completion
       });
       addToast('Schedule created', 'success');
       showCreateModal = false;
@@ -189,9 +191,10 @@
       task_description: '',
       priority: 0,
       expected_output: '',
-      suppress_empty: false,
       delivery_mode: 'latest_active_for_agent',
-      delivery_target: ''
+      delivery_target: '',
+      completion_mode_family: 'default',
+      allow_silent_completion: false
     };
   }
 
@@ -201,7 +204,7 @@
     form.description = 'Periodic check-in: review pending items, check messages, and report anything that needs attention.';
     form.schedule_type = 'interval';
     form.interval_seconds = 1800;
-    form.suppress_empty = true;
+    form.allow_silent_completion = true;
     form.task_title = 'Heartbeat check';
     form.task_description = 'Review pending items, check for new messages or events, and report anything that needs attention. If nothing requires action, respond with a brief "nothing to report" summary.';
     showCreateModal = true;
@@ -391,8 +394,8 @@
                     {#if !schedule.enabled}
                       <Badge class="bg-slate-700/50 text-slate-400">Disabled</Badge>
                     {/if}
-                    {#if schedule.suppress_empty}
-                      <Badge class="bg-indigo-500/20 text-indigo-400">Heartbeat</Badge>
+                    {#if schedule.allow_silent_completion}
+                      <Badge class="bg-indigo-500/20 text-indigo-400">Silent allowed</Badge>
                     {/if}
                     {#if schedule.consecutive_errors > 0}
                       <Badge class="bg-red-500/20 text-red-400">
@@ -605,7 +608,6 @@
             <select id="sched-delivery" bind:value={form.delivery_mode} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
               <option value="latest_active_for_agent">Latest active conversation</option>
               <option value="specific_conversation">Specific conversation</option>
-              <option value="silent">Silent (no delivery)</option>
             </select>
           </div>
         </div>
@@ -632,12 +634,19 @@
           ></textarea>
         </div>
 
-        <!-- Options -->
-        <div class="flex items-center gap-3">
-          <label class="flex cursor-pointer items-center gap-2 text-sm text-slate-300">
-            <input type="checkbox" bind:checked={form.suppress_empty} class="rounded border-slate-600 bg-slate-800" />
-            Suppress empty results (heartbeat mode)
-          </label>
+        <div class="space-y-1">
+          <label for="sched-completion-family" class="text-xs font-medium uppercase tracking-widest text-slate-400">Completion notification behavior</label>
+          <div class="grid gap-3 md:grid-cols-[minmax(0,1fr)_auto]">
+            <select id="sched-completion-family" bind:value={form.completion_mode_family} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+              <option value="default">Default delivery</option>
+              <option value="direct">Direct channel delivery</option>
+            </select>
+            <label class="inline-flex items-center gap-2 rounded-xl border border-slate-700 bg-slate-950/60 px-3 py-2 text-sm text-slate-200">
+              <input type="checkbox" bind:checked={form.allow_silent_completion} class="rounded border-slate-600 bg-slate-800" />
+              <span>Allow silent completion</span>
+            </label>
+          </div>
+          <p class="text-xs text-slate-500">Default delivery uses the normal conversation flow. Direct channel delivery sends the final result straight to the resolved target channel.</p>
         </div>
       </div>
 

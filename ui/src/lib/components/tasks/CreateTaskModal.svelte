@@ -22,8 +22,11 @@
       agent_id: string;
       workflow_id: string | null;
       priority: number;
+      expected_output: string | null;
       delivery_mode: string;
       delivery_target: string | null;
+      completion_mode_family: 'default' | 'direct';
+      allow_silent_completion: boolean;
       status: string;
     }) => void;
   }>();
@@ -39,7 +42,9 @@
     expected_output: '',
     priority: 0,
     delivery_mode: 'same_conversation',
-    delivery_target: ''
+    delivery_target: '',
+    completion_mode_family: 'default' as 'default' | 'direct',
+    allow_silent_completion: false
   });
 
   function handleSubmit(): void {
@@ -53,6 +58,8 @@
       priority: Number(form.priority),
       delivery_mode: form.delivery_mode,
       delivery_target: form.delivery_mode === 'specific_conversation' ? form.delivery_target : null,
+      completion_mode_family: form.completion_mode_family,
+      allow_silent_completion: form.allow_silent_completion,
       status: 'draft'
     });
   }
@@ -139,7 +146,6 @@
             <option value="specific_conversation">Specific conversation</option>
             <option value="latest_active_for_agent">Latest active</option>
             <option value="preferred_channel">Preferred channel</option>
-            <option value="silent">Silent</option>
           </select>
         </div>
       </div>
@@ -155,6 +161,21 @@
           </select>
         </div>
       {/if}
+
+      <div class="space-y-1">
+        <label for="task-completion-family" class="text-xs font-medium uppercase tracking-widest text-slate-400">Completion notification behavior</label>
+        <div class="grid gap-3 md:grid-cols-[minmax(0,1fr)_auto]">
+          <select id="task-completion-family" bind:value={form.completion_mode_family} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+            <option value="default">Default delivery</option>
+            <option value="direct">Direct channel delivery</option>
+          </select>
+          <label class="inline-flex items-center gap-2 rounded-xl border border-slate-700 bg-slate-950/60 px-3 py-2 text-sm text-slate-200">
+            <input type="checkbox" bind:checked={form.allow_silent_completion} class="rounded border-slate-600 bg-slate-800" />
+            <span>Allow silent completion</span>
+          </label>
+        </div>
+        <p class="text-xs text-slate-500">Default delivery uses the normal conversation flow. Direct channel delivery sends the final result straight to the resolved target channel.</p>
+      </div>
     </div>
 
     <div class="mt-6 flex justify-end gap-3">

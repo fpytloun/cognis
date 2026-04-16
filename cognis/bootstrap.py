@@ -188,6 +188,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_mcp_server_headers_column)
         await conn.run_sync(_ensure_system_override_tables)
         await conn.run_sync(_ensure_task_execution_paths)
+        await conn.run_sync(_ensure_task_completion_delivery_columns)
         await conn.run_sync(_ensure_step_run_execution_paths)
         await conn.run_sync(_ensure_system_agent_override_skill_columns)
 
@@ -437,7 +438,7 @@ def _ensure_skill_system_column(sync_conn: object) -> None:
 
 
 def _ensure_schedule_extended_columns(sync_conn: object) -> None:
-    """Add schedule type, error tracking, and heartbeat columns."""
+    """Add schedule type, error tracking, and completion delivery columns."""
     inspector = cast(Any, inspect(sync_conn))
     try:
         columns = {column["name"] for column in inspector.get_columns("schedules")}
@@ -473,9 +474,24 @@ def _ensure_schedule_extended_columns(sync_conn: object) -> None:
         )
     if "disabled_reason" not in columns:
         execute(text("ALTER TABLE schedules ADD COLUMN disabled_reason TEXT"))
-    if "suppress_empty" not in columns:
+    if "completion_mode_family" not in columns:
         execute(
-            text("ALTER TABLE schedules ADD COLUMN suppress_empty BOOLEAN NOT NULL DEFAULT false")
+            text(
+                "ALTER TABLE schedules ADD COLUMN completion_mode_family VARCHAR NOT NULL DEFAULT 'default'"
+            )
+        )
+    if "allow_silent_completion" not in columns:
+        execute(
+            text(
+                "ALTER TABLE schedules ADD COLUMN allow_silent_completion BOOLEAN NOT NULL DEFAULT false"
+            )
+        )
+    if "suppress_empty" in columns:
+        execute(
+            text(
+                "UPDATE schedules SET allow_silent_completion = suppress_empty "
+                "WHERE allow_silent_completion = false"
+            )
         )
     # Make cron_expr nullable (PostgreSQL: drop NOT NULL constraint).
     # Idempotent — if already nullable, it's a no-op.
@@ -521,6 +537,34 @@ def _ensure_task_execution_paths(sync_conn: object) -> None:
         execute(text("ALTER TABLE tasks ADD COLUMN workspace_root TEXT"))
     if "working_directory" not in columns:
         execute(text("ALTER TABLE tasks ADD COLUMN working_directory TEXT"))
+
+
+def _ensure_task_completion_delivery_columns(sync_conn: object) -> None:
+    """Add task completion delivery policy and applied mode columns."""
+
+    inspector = cast(Any, inspect(sync_conn))
+    try:
+        columns = {column["name"] for column in inspector.get_columns("tasks")}
+    except Exception:
+        return
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+
+    if "completion_mode_family" not in columns:
+        execute(
+            text(
+                "ALTER TABLE tasks ADD COLUMN completion_mode_family VARCHAR NOT NULL DEFAULT 'default'"
+            )
+        )
+    if "allow_silent_completion" not in columns:
+        execute(
+            text(
+                "ALTER TABLE tasks ADD COLUMN allow_silent_completion BOOLEAN NOT NULL DEFAULT false"
+            )
+        )
+    if "applied_completion_mode" not in columns:
+        execute(text("ALTER TABLE tasks ADD COLUMN applied_completion_mode VARCHAR"))
+    if "applied_completion_reason" not in columns:
+        execute(text("ALTER TABLE tasks ADD COLUMN applied_completion_reason TEXT"))
 
 
 def _ensure_step_run_execution_paths(sync_conn: object) -> None:

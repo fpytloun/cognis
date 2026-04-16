@@ -53,6 +53,25 @@ STEP_COMPLETE_TOOL = ToolDefinition(
                 },
                 "required": ["status"],
             },
+            "notification": {
+                "type": "object",
+                "description": (
+                    "Optional completion delivery choice. In v1 only 'silent' is supported, "
+                    "and only when silent completion is explicitly allowed for the step."
+                ),
+                "properties": {
+                    "mode": {
+                        "type": "string",
+                        "enum": ["silent"],
+                        "description": "Request silent completion with no outward notification.",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Required for silent completion.",
+                    },
+                },
+                "required": ["mode", "reason"],
+            },
         },
         "required": ["summary"],
     },

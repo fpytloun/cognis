@@ -47,6 +47,8 @@ export interface WorkflowFormState {
   defaultEvaluate: boolean;
   defaultMaxAttempts: number;
   defaultOnExhausted: string;
+  defaultCompletionModeFamily: 'default' | 'direct';
+  defaultAllowSilentCompletion: boolean;
   steps: WorkflowStepFormState[];
 }
 
@@ -95,6 +97,8 @@ export function createEmptyWorkflowForm(): WorkflowFormState {
     defaultEvaluate: true,
     defaultMaxAttempts: 3,
     defaultOnExhausted: 'gate',
+    defaultCompletionModeFamily: 'default',
+    defaultAllowSilentCompletion: false,
     steps: [createEmptyStep()]
   };
 }
@@ -216,6 +220,7 @@ function pushOutcomeRoute(
 }
 
 export function workflowToFormState(workflow: Workflow): WorkflowFormState {
+  const deliveryDefaults = isRecord(workflow.defaults.delivery) ? workflow.defaults.delivery : null;
   return {
     workflowId: workflow.workflow_id,
     name: workflow.name,
@@ -227,6 +232,9 @@ export function workflowToFormState(workflow: Workflow): WorkflowFormState {
     defaultEvaluate: workflow.defaults.evaluate !== false,
     defaultMaxAttempts: typeof workflow.defaults.max_attempts === 'number' ? workflow.defaults.max_attempts : 3,
     defaultOnExhausted: typeof workflow.defaults.on_exhausted === 'string' ? workflow.defaults.on_exhausted : 'gate',
+    defaultCompletionModeFamily:
+      deliveryDefaults?.completion_mode_family === 'direct' ? 'direct' : 'default',
+    defaultAllowSilentCompletion: deliveryDefaults?.allow_silent_completion === true,
     steps: workflow.steps.map((step) => {
       const successRoute = outcomeRouteForStatus(step, 'success');
       const rejectedRoute = outcomeRouteForStatus(step, 'rejected');
@@ -277,7 +285,11 @@ export function formStateToWorkflowPayload(form: WorkflowFormState): Record<stri
     defaults: {
       evaluate: form.defaultEvaluate,
       max_attempts: Number(form.defaultMaxAttempts),
-      on_exhausted: form.defaultOnExhausted
+      on_exhausted: form.defaultOnExhausted,
+      delivery: {
+        completion_mode_family: form.defaultCompletionModeFamily,
+        allow_silent_completion: form.defaultAllowSilentCompletion
+      }
     },
     steps: form.steps.map((step) => {
       const inputPayload = formInputToPayload(step.inputMode, step.inputText);

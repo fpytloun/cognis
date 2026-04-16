@@ -436,6 +436,24 @@
               </Tooltip>
             </span>
           </label>
+          <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
+            <span class="inline-flex items-center gap-2">
+              Completion notification behavior
+              <Tooltip text="Default delivery sends results through the normal conversation flow. Direct channel delivery sends the final result straight to the resolved target channel. Allow silent completion lets the agent finish without notifying when nothing user-actionable happened.">
+                <span class="cursor-help text-slate-500">(?)</span>
+              </Tooltip>
+            </span>
+            <div class="grid gap-3 md:grid-cols-[minmax(0,1fr)_auto]">
+              <select bind:value={form.defaultCompletionModeFamily} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}>
+                <option value="default">Default delivery</option>
+                <option value="direct">Direct channel delivery</option>
+              </select>
+              <label class="inline-flex items-center gap-2 rounded-xl border border-slate-800 bg-slate-950/60 px-3 py-2 text-sm text-slate-200">
+                <input bind:checked={form.defaultAllowSilentCompletion} class="h-4 w-4 rounded border-slate-600 bg-slate-950" disabled={!!selectedWorkflow?.is_system} type="checkbox" />
+                <span>Allow silent completion</span>
+              </label>
+            </div>
+          </label>
         </Card>
 
         <!-- Step editor -->

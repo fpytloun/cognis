@@ -6,9 +6,14 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from cognis.models.workflow import StepEvaluation, StepOutput, WorkflowState
+from cognis.models.workflow import (
+    CompletionDeliveryPolicy,
+    StepEvaluation,
+    StepOutput,
+    WorkflowState,
+)
 
 
 class TaskStatus(StrEnum):
@@ -42,7 +47,7 @@ class TaskDelivery(BaseModel):
 
     mode: str = "same_conversation"
     # same_conversation | specific_conversation | latest_active_for_agent
-    # | preferred_channel | silent
+    # | preferred_channel
     target: str | None = None
 
 
@@ -59,7 +64,8 @@ class TaskModel(BaseModel):
     agent_id: str
     source_type: str = "api"  # "chat" | "api" | "scheduler" | "webhook"
     source_ref: str | None = None
-    delivery: TaskDelivery = TaskDelivery()
+    delivery: TaskDelivery = Field(default_factory=TaskDelivery)
+    completion_delivery: CompletionDeliveryPolicy = Field(default_factory=CompletionDeliveryPolicy)
     workflow_id: str | None = None
     workspace_root: str | None = None
     working_directory: str | None = None
@@ -71,6 +77,8 @@ class TaskModel(BaseModel):
     completed_at: datetime | None = None
     result_summary: str | None = None
     result_data: dict[str, Any] | None = None
+    applied_completion_mode: str | None = None
+    applied_completion_reason: str | None = None
 
 
 class StepRunModel(BaseModel):

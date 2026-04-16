@@ -184,6 +184,8 @@ def task_to_response(task: TaskModel) -> TaskResponse:
         source_type=task.source_type,
         source_ref=task.source_ref,
         delivery=task.delivery,
+        completion_mode_family=task.completion_delivery.completion_mode_family,
+        allow_silent_completion=task.completion_delivery.allow_silent_completion,
         workflow_id=task.workflow_id,
         workspace_root=task.workspace_root,
         working_directory=task.working_directory,
@@ -195,6 +197,8 @@ def task_to_response(task: TaskModel) -> TaskResponse:
         completed_at=task.completed_at,
         result_summary=task.result_summary,
         result_data=task.result_data,
+        applied_completion_mode=task.applied_completion_mode,
+        applied_completion_reason=task.applied_completion_reason,
     )
 
 

@@ -491,6 +491,7 @@ def create_app() -> FastAPI:
             channel_manager_ref=_get_channel_manager,
             turn_scheduler=turn_scheduler,
         )
+        workflow_engine._channel_delivery = channel_delivery  # noqa: SLF001
 
         app.state.channel_manager = channel_manager
         app.state.channel_delivery = channel_delivery

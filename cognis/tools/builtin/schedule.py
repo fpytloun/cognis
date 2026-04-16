@@ -108,14 +108,10 @@ MANAGE_SCHEDULES_TOOL = ToolDefinition(
             },
             "delivery_mode": {
                 "type": "string",
-                "enum": [
-                    "latest_active_for_agent",
-                    "silent",
-                ],
+                "enum": ["latest_active_for_agent"],
                 "description": (
                     "How task results are delivered. "
-                    "'latest_active_for_agent' delivers to the most recent active conversation (default). "
-                    "'silent' records the result without delivery."
+                    "'latest_active_for_agent' delivers to the most recent active conversation (default)."
                 ),
             },
             "expected_output": {
@@ -125,11 +121,20 @@ MANAGE_SCHEDULES_TOOL = ToolDefinition(
                     "in workflow-driven tasks."
                 ),
             },
-            "suppress_empty": {
+            "completion_mode_family": {
+                "type": "string",
+                "enum": ["default", "direct"],
+                "description": (
+                    "How successful task completion is delivered. 'default' uses the normal "
+                    "follow-up flow. 'direct' sends the final assistant message directly to the "
+                    "resolved target channel."
+                ),
+            },
+            "allow_silent_completion": {
                 "type": "boolean",
                 "description": (
-                    "If true, suppress delivery when the task result is empty. "
-                    "Useful for heartbeat schedules that only report when something needs attention."
+                    "If true, the agent may complete silently when the work succeeded and there is "
+                    "nothing user-actionable to report."
                 ),
             },
         },
@@ -316,7 +321,8 @@ async def _handle_create(
             workflow_id=arguments.get("workflow_id"),
             task_template=task_template,
             enabled=arguments.get("enabled", True),
-            suppress_empty=arguments.get("suppress_empty", False),
+            completion_mode_family=arguments.get("completion_mode_family", "default"),
+            allow_silent_completion=arguments.get("allow_silent_completion", False),
             next_fire_at=next_fire,
             created_by=user_email,
         )
@@ -363,7 +369,8 @@ async def _handle_update(
             "agent_id",
             "workflow_id",
             "enabled",
-            "suppress_empty",
+            "completion_mode_family",
+            "allow_silent_completion",
         ):
             if key in arguments and arguments[key] is not None:
                 fields[key] = arguments[key]
@@ -483,7 +490,8 @@ async def _handle_status(
         "disabled_reason": row.disabled_reason,
         "active_tasks": active_tasks,
         "max_concurrent_runs": row.max_concurrent_runs,
-        "suppress_empty": row.suppress_empty,
+        "completion_mode_family": getattr(row, "completion_mode_family", "default"),
+        "allow_silent_completion": bool(getattr(row, "allow_silent_completion", False)),
     }
     return ToolResult(output=json.dumps(info, indent=2))
 
@@ -510,7 +518,10 @@ def _row_to_model(row: Any) -> ScheduleModel:
         enabled=row.enabled,
         max_concurrent_runs=row.max_concurrent_runs,
         delete_after_run=row.delete_after_run,
-        suppress_empty=row.suppress_empty,
+        completion_delivery={
+            "completion_mode_family": getattr(row, "completion_mode_family", "default"),
+            "allow_silent_completion": bool(getattr(row, "allow_silent_completion", False)),
+        },
         last_fired_at=row.last_fired_at,
         next_fire_at=row.next_fire_at,
         last_run_status=row.last_run_status,

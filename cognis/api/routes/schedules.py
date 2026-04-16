@@ -19,6 +19,7 @@ from cognis.api.models import (
 )
 from cognis.models.schedule import ScheduleModel as _ScheduleModel
 from cognis.models.schedule import describe_schedule
+from cognis.models.workflow import CompletionDeliveryPolicy
 from cognis.store.queries import (
     create_schedule,
     delete_schedule,
@@ -74,7 +75,8 @@ def _row_to_response(
         enabled=row.enabled,
         max_concurrent_runs=row.max_concurrent_runs,
         delete_after_run=row.delete_after_run,
-        suppress_empty=row.suppress_empty,
+        completion_mode_family=getattr(row, "completion_mode_family", "default"),
+        allow_silent_completion=bool(getattr(row, "allow_silent_completion", False)),
         last_fired_at=row.last_fired_at,
         next_fire_at=row.next_fire_at,
         last_run_status=row.last_run_status,
@@ -99,7 +101,8 @@ def _row_to_response(
         enabled=row.enabled,
         max_concurrent_runs=row.max_concurrent_runs,
         delete_after_run=row.delete_after_run,
-        suppress_empty=row.suppress_empty,
+        completion_mode_family=getattr(row, "completion_mode_family", "default"),
+        allow_silent_completion=bool(getattr(row, "allow_silent_completion", False)),
         last_fired_at=row.last_fired_at,
         next_fire_at=row.next_fire_at,
         last_run_status=_effective_last_run_status(row, latest_task_run),
@@ -201,6 +204,10 @@ async def create_schedule_route(
     )()
     scheduler_instance = Scheduler.__new__(Scheduler)
     next_fire = scheduler_instance._compute_next_fire(temp_sched, now)
+    CompletionDeliveryPolicy(
+        completion_mode_family=body.completion_mode_family,
+        allow_silent_completion=body.allow_silent_completion,
+    )
 
     async with request.app.state.session_factory() as db:
         row = await create_schedule(
@@ -218,7 +225,8 @@ async def create_schedule_route(
             enabled=body.enabled,
             max_concurrent_runs=body.max_concurrent_runs,
             delete_after_run=body.delete_after_run,
-            suppress_empty=body.suppress_empty,
+            completion_mode_family=body.completion_mode_family,
+            allow_silent_completion=body.allow_silent_completion,
             next_fire_at=next_fire,
             created_by=user.email,
         )
@@ -287,6 +295,16 @@ async def update_schedule_route(
                 raise api_exception(400, "invalid_cron", f"Invalid cron expression: {exc}") from exc
 
         fields = body.model_dump(exclude_unset=True)
+        if "completion_mode_family" in fields or "allow_silent_completion" in fields:
+            CompletionDeliveryPolicy(
+                completion_mode_family=fields.get(
+                    "completion_mode_family", getattr(existing, "completion_mode_family", "default")
+                ),
+                allow_silent_completion=fields.get(
+                    "allow_silent_completion",
+                    bool(getattr(existing, "allow_silent_completion", False)),
+                ),
+            )
         if not fields:
             return _row_to_response(
                 existing,

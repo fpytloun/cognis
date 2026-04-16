@@ -367,6 +367,8 @@ class ChannelDeliveryService:
         delivery_id = event.data.get("channel_follow_up_delivery_id")
         if isinstance(delivery_id, str):
             return
+        if event.data.get("direct_delivery") is True:
+            return
 
         # Only deliver to channel conversations (not web)
         channel_info = await self._resolve_channel(conversation_id)

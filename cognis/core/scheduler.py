@@ -5,9 +5,9 @@ cron/interval/one-shot schedules, and creates Tasks via TaskQueue.submit()
 when they become due.  It is started alongside the TaskQueue during app
 startup and stopped before it during shutdown.
 
-Heartbeat schedules are regular interval schedules with ``suppress_empty``
-enabled.  When the resulting task completes with an empty or suppression-
-flagged result, delivery to the user is skipped.
+Schedules can set an explicit completion delivery family (default or direct)
+and optionally allow silent completion when the agent finishes with nothing
+user-actionable to report.
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ from croniter import croniter
 from cognis.core.events import Event, EventBus, EventType
 from cognis.logging import get_logger
 from cognis.models.task import TaskDelivery
+from cognis.models.workflow import CompletionDeliveryPolicy
 from cognis.store.queries import (
     count_active_tasks_for_schedule,
     delete_schedule,
@@ -233,6 +234,10 @@ class Scheduler:
             delivery: TaskDelivery | None = None
             if isinstance(delivery_raw, dict):
                 delivery = TaskDelivery(**delivery_raw)
+            completion_delivery = CompletionDeliveryPolicy(
+                completion_mode_family=getattr(sched, "completion_mode_family", "default"),
+                allow_silent_completion=bool(getattr(sched, "allow_silent_completion", False)),
+            )
 
             task = await self._task_queue.submit(
                 created_by=sched.created_by,
@@ -244,6 +249,7 @@ class Scheduler:
                 source_type="scheduler",
                 source_ref=schedule_id,
                 delivery=delivery,
+                completion_delivery=completion_delivery,
                 workflow_id=workflow_id,
                 workspace_root=workspace_root,
                 working_directory=working_directory,

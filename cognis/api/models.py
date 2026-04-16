@@ -444,6 +444,8 @@ class TaskCreateRequest(BaseModel):
     workflow_id: str | None = None
     delivery_mode: str = "same_conversation"
     delivery_target: str | None = None
+    completion_mode_family: str | None = None
+    allow_silent_completion: bool | None = None
     source_type: str = "api"
     source_ref: str | None = None
     status: str = "draft"
@@ -460,6 +462,8 @@ class TaskUpdateRequest(BaseModel):
     workflow_id: str | None = None
     delivery_mode: str | None = None
     delivery_target: str | None = None
+    completion_mode_family: str | None = None
+    allow_silent_completion: bool | None = None
     workspace_root: str | None = None
     working_directory: str | None = None
 
@@ -509,6 +513,8 @@ class TaskResponse(BaseModel):
     source_type: str
     source_ref: str | None = None
     delivery: TaskDelivery = Field(default_factory=TaskDelivery)
+    completion_mode_family: str = "default"
+    allow_silent_completion: bool = False
     workflow_id: str | None = None
     workspace_root: str | None = None
     working_directory: str | None = None
@@ -520,6 +526,8 @@ class TaskResponse(BaseModel):
     completed_at: datetime | None = None
     result_summary: str | None = None
     result_data: dict[str, Any] | None = None
+    applied_completion_mode: str | None = None
+    applied_completion_reason: str | None = None
 
 
 class WorkflowRunResponse(BaseModel):
@@ -597,7 +605,8 @@ class CreateScheduleRequest(BaseModel):
     enabled: bool = True
     max_concurrent_runs: int = 1
     delete_after_run: bool = False
-    suppress_empty: bool = False
+    completion_mode_family: str = "default"
+    allow_silent_completion: bool = False
 
     @model_validator(mode="after")
     def _validate_schedule_type(self) -> CreateScheduleRequest:
@@ -630,7 +639,8 @@ class UpdateScheduleRequest(BaseModel):
     enabled: bool | None = None
     max_concurrent_runs: int | None = None
     delete_after_run: bool | None = None
-    suppress_empty: bool | None = None
+    completion_mode_family: str | None = None
+    allow_silent_completion: bool | None = None
 
 
 class ScheduleResponse(BaseModel):
@@ -648,7 +658,8 @@ class ScheduleResponse(BaseModel):
     enabled: bool = True
     max_concurrent_runs: int = 1
     delete_after_run: bool = False
-    suppress_empty: bool = False
+    completion_mode_family: str = "default"
+    allow_silent_completion: bool = False
     last_fired_at: datetime | None = None
     next_fire_at: datetime | None = None
     last_run_status: str | None = None

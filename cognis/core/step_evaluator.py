@@ -52,6 +52,7 @@ step_complete metadata:
   Claims: {claims}
   Outputs: {outputs}
   Outcome: {outcome}
+  Notification: {notification}
 
 Assistant written deliverable:
 {content}
@@ -79,6 +80,9 @@ Evaluation checklist:
 9. Treat Expected output as strong guidance for output shape, tone, format, and
    level of detail, but do not fail the step solely because the assistant
    produced the minimum deliverable required by the runtime step contract.
+10. Silent completion can be valid when the step completed successfully and the
+   runtime policy explicitly allows no user-facing notification. Evaluate task
+   completion separately from whether the result should be shown to the user.
 
 Decide:
 - "approved" — the step objective is satisfactorily met based on actual \
@@ -278,6 +282,11 @@ class StepEvaluator:
             if step_output.outcome is not None
             else "(implicit success)"
         )
+        formatted_notification = (
+            step_output.notification.model_dump_json()
+            if step_output.notification is not None
+            else "(use configured delivery family)"
+        )
         formatted_execution_evidence = json.dumps(execution_evidence, default=str)[:4000] or "{}"
 
         # Include the full response content so the evaluator can verify claims
@@ -291,6 +300,7 @@ class StepEvaluator:
             claims=formatted_claims,
             outputs=formatted_outputs,
             outcome=formatted_outcome,
+            notification=formatted_notification,
             content=formatted_content,
             execution_evidence=formatted_execution_evidence,
             task_context=task_context or "(none)",

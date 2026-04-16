@@ -46,6 +46,7 @@ from cognis.core.management import (
     task_workflow_run_response,
 )
 from cognis.models.task import TaskDelivery, TaskModel
+from cognis.models.workflow import CompletionDeliveryPolicy
 from cognis.models.workflow import WorkflowState
 from cognis.store.models import Task
 from cognis.store.queries import (
@@ -62,6 +63,41 @@ from cognis.store.queries import (
 _TERMINAL_STATUSES: frozenset[str] = frozenset({"completed", "failed", "cancelled"})
 
 router = APIRouter(tags=["tasks"])
+
+
+async def _resolve_completion_delivery(
+    request: Request,
+    *,
+    workflow_id: str | None,
+    owner_email: str,
+    completion_mode_family: str | None,
+    allow_silent_completion: bool | None,
+) -> CompletionDeliveryPolicy:
+    if completion_mode_family is not None or allow_silent_completion is not None:
+        return CompletionDeliveryPolicy(
+            completion_mode_family=completion_mode_family or "default",
+            allow_silent_completion=bool(allow_silent_completion),
+        )
+
+    if workflow_id is not None:
+        workflow = await request.app.state.workflow_registry.get(
+            workflow_id, owner_email=owner_email
+        )
+        if workflow is not None:
+            defaults = getattr(workflow, "defaults", None)
+            delivery_defaults = (
+                defaults.get("delivery")
+                if isinstance(defaults, dict)
+                else getattr(defaults, "delivery", None)
+            )
+            if delivery_defaults is not None:
+                return CompletionDeliveryPolicy.model_validate(
+                    delivery_defaults.model_dump(mode="json")
+                    if hasattr(delivery_defaults, "model_dump")
+                    else delivery_defaults
+                )
+
+    return CompletionDeliveryPolicy()
 
 
 @router.get("/api/v1/tasks", response_model=CursorPage[TaskResponse])
@@ -125,6 +161,13 @@ async def task_create(request: Request, payload: TaskCreateRequest) -> TaskRespo
     _validate_execution_paths(payload.workspace_root, payload.working_directory)
     queue = request.app.state.task_queue
     delivery = TaskDelivery(mode=payload.delivery_mode, target=payload.delivery_target)
+    completion_delivery = await _resolve_completion_delivery(
+        request,
+        workflow_id=payload.workflow_id,
+        owner_email=user.email,
+        completion_mode_family=payload.completion_mode_family,
+        allow_silent_completion=payload.allow_silent_completion,
+    )
     if payload.status == "draft":
         task = await queue.create_draft(
             created_by=user.email,
@@ -134,6 +177,7 @@ async def task_create(request: Request, payload: TaskCreateRequest) -> TaskRespo
             expected_output=payload.expected_output,
             priority=payload.priority,
             delivery=delivery,
+            completion_delivery=completion_delivery,
             workflow_id=payload.workflow_id,
             workspace_root=payload.workspace_root,
             working_directory=payload.working_directory,
@@ -151,6 +195,7 @@ async def task_create(request: Request, payload: TaskCreateRequest) -> TaskRespo
             source_type=payload.source_type,
             source_ref=payload.source_ref,
             delivery=delivery,
+            completion_delivery=completion_delivery,
             workflow_id=payload.workflow_id,
             workspace_root=payload.workspace_root,
             working_directory=payload.working_directory,
@@ -192,6 +237,14 @@ async def task_update(request: Request, task_id: str, payload: TaskUpdateRequest
         )
     effective_delivery_mode = payload.delivery_mode or existing_row.delivery_mode
     effective_delivery_target = payload.delivery_target or existing_row.delivery_target
+    effective_completion_mode_family = payload.completion_mode_family or getattr(
+        existing_row, "completion_mode_family", "default"
+    )
+    effective_allow_silent_completion = (
+        payload.allow_silent_completion
+        if payload.allow_silent_completion is not None
+        else bool(getattr(existing_row, "allow_silent_completion", False))
+    )
     effective_workspace_root = payload.workspace_root or getattr(
         existing_row, "workspace_root", None
     )
@@ -211,6 +264,10 @@ async def task_update(request: Request, task_id: str, payload: TaskUpdateRequest
         )
     if payload.delivery_target is not None:
         await _validate_conversation_access(request, payload.delivery_target)
+    CompletionDeliveryPolicy(
+        completion_mode_family=effective_completion_mode_family,
+        allow_silent_completion=effective_allow_silent_completion,
+    )
     async with request.app.state.session_factory() as session:
         row = await get_task(session, task_id)
         if row is None:
@@ -226,6 +283,10 @@ async def task_update(request: Request, task_id: str, payload: TaskUpdateRequest
             row.delivery_mode = updates.pop("delivery_mode")
         if "delivery_target" in updates:
             row.delivery_target = updates.pop("delivery_target")
+        if "completion_mode_family" in updates:
+            row.completion_mode_family = updates.pop("completion_mode_family")
+        if "allow_silent_completion" in updates:
+            row.allow_silent_completion = updates.pop("allow_silent_completion")
         if (
             payload.working_directory is not None
             and payload.workspace_root is None
@@ -503,6 +564,10 @@ def _row_to_task(row: Any) -> TaskModel:
         source_type=row.source_type,
         source_ref=row.source_ref,
         delivery=TaskDelivery(mode=row.delivery_mode, target=row.delivery_target),
+        completion_delivery=CompletionDeliveryPolicy(
+            completion_mode_family=getattr(row, "completion_mode_family", "default"),
+            allow_silent_completion=bool(getattr(row, "allow_silent_completion", False)),
+        ),
         workflow_id=row.workflow_id,
         workspace_root=getattr(row, "workspace_root", None),
         working_directory=getattr(row, "working_directory", None),
@@ -516,6 +581,8 @@ def _row_to_task(row: Any) -> TaskModel:
         completed_at=row.completed_at,
         result_summary=row.result_summary,
         result_data=row.result_data,
+        applied_completion_mode=getattr(row, "applied_completion_mode", None),
+        applied_completion_reason=getattr(row, "applied_completion_reason", None),
     )
 
 
