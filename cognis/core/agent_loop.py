@@ -2698,6 +2698,11 @@ class AgentLoop:
                             type="tool_result",
                             data={
                                 "call_id": tc.call_id,
+                                "audit_call_id": (
+                                    eval_meta.get("call_id")
+                                    if isinstance(eval_meta, dict)
+                                    else None
+                                ),
                                 "name": tc.name,
                                 "tool_id": tool_id,
                                 "is_error": result.is_error,
