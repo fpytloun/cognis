@@ -459,6 +459,66 @@ async def test_litellm_provider_merges_extra_headers(tmp_path: object) -> None:
 
 
 @pytest.mark.asyncio
+async def test_litellm_provider_generate_applies_anthropic_cache_hint_to_first_message(
+    tmp_path: object,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="default",
+                display_name="Anthropic",
+                location="controller",
+                backend="litellm",
+                config={"default_model": "claude-sonnet-4-20250514"},
+                status="active",
+            )
+        )
+        await session.commit()
+
+    captured: dict[str, object] = {}
+
+    async def _fake_completion(**kwargs: object) -> object:
+        captured.update(kwargs)
+
+        class _Response:
+            def model_dump(self) -> dict[str, object]:
+                return {"choices": [{"message": {"content": "ok"}}]}
+
+        return _Response()
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.acompletion", _fake_completion)
+    try:
+        provider = LiteLLMProvider(session_factory)
+        await provider.generate(
+            messages=[
+                {"role": "system", "content": "immutable prefix"},
+                {"role": "system", "content": "mutable environment"},
+                {"role": "user", "content": "hi"},
+            ],
+            model="claude-sonnet-4-20250514",
+            cache_breakpoint_index=0,
+        )
+    finally:
+        monkeypatch.undo()
+
+    messages = captured["messages"]
+    assert isinstance(messages, list)
+    assert messages[0]["role"] == "system"
+    assert messages[0]["content"] == [
+        {
+            "type": "text",
+            "text": "immutable prefix",
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
+    assert messages[1] == {"role": "system", "content": "mutable environment"}
+    assert messages[2] == {"role": "user", "content": "hi"}
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_litellm_provider_generate_uses_responses_bridge_for_supported_model(
     tmp_path: object,
     monkeypatch: pytest.MonkeyPatch,
@@ -498,12 +558,20 @@ async def test_litellm_provider_generate_uses_responses_bridge_for_supported_mod
 
     provider = LiteLLMProvider(session_factory)
     result = await provider.generate(
-        messages=[{"role": "user", "content": "hi"}],
+        messages=[
+            {"role": "system", "content": "immutable prefix"},
+            {"role": "system", "content": "mutable environment"},
+            {"role": "user", "content": "hi"},
+        ],
         model="gpt-5.4",
         max_tokens=123,
     )
 
-    assert captured["input"] == [{"role": "user", "content": "hi"}]
+    assert captured["input"] == [
+        {"role": "system", "content": "immutable prefix"},
+        {"role": "system", "content": "mutable environment"},
+        {"role": "user", "content": "hi"},
+    ]
     assert captured["max_output_tokens"] == 123
     assert result["choices"][0]["message"]["content"] == "hello"
     await engine.dispose()

@@ -130,7 +130,7 @@ class _LLM:
 
     async def get_model_info(self, model_id: str) -> ModelInfo:
         del model_id
-        return ModelInfo(model_id="test-model", context_window=2000, max_output_tokens=256)
+        return ModelInfo(model_id="test-model", context_window=20000, max_output_tokens=256)
 
     def count_tokens(self, text: str, model: str) -> int:
         del model
@@ -171,6 +171,26 @@ def _agent_with_personality() -> AgentDefinition:
             "tone": "formal, precise",
             "temperament": "patient, methodical",
             "behavioral_rules": ["Always cite sources"],
+        },
+        llm_config=AgentLLMConfig(model="test-model", max_tokens=128),
+    )
+
+
+def _agent_with_skills() -> AgentDefinition:
+    return AgentDefinition(
+        agent_id="agent-1",
+        owner_email="user@example.com",
+        name="Agent",
+        system_prompt="You are helpful.",
+        skills={
+            "_available_skills_metadata": (
+                "<available_skills>\n"
+                "  <skill>\n"
+                "    <name>Release Helper</name>\n"
+                "    <tools>tag_release</tools>\n"
+                "  </skill>\n"
+                "</available_skills>"
+            )
         },
         llm_config=AgentLLMConfig(model="test-model", max_tokens=128),
     )
@@ -553,7 +573,103 @@ async def test_context_assembler_includes_composed_identity_prompt() -> None:
     assert "Tone: formal, precise" in content
     assert "Temperament: patient, methodical" in content
     assert "- Always cite sources" in content
-    assert content.endswith("Be helpful.")
+    assert "Be helpful." in content
+    assert "## Behavior" in content
+    assert result.cache_breakpoint_index == 0
+
+
+@pytest.mark.asyncio
+async def test_context_assembler_consolidates_immutable_prefix_into_first_message() -> None:
+    class _MemoryWithInstructions:
+        async def recall(self, **kwargs: object) -> dict[str, object]:
+            del kwargs
+            return {
+                "session_id": "mem-1",
+                "instructions": "Use remember tool to store durable facts.",
+                "core_memories": "Prefers Python and pytest.",
+                "search_results": [{"memory": "Mutable recalled memory", "score": 0.9}],
+            }
+
+    assembler = ContextAssembler(
+        memory=_MemoryWithInstructions(),
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=_SessionCache(),
+        session_manager=_SessionManager(),
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+
+    result = await assembler.assemble(
+        session=_session(),
+        conversation=_conversation(),
+        agent=_agent_with_skills(),
+        user_message="hello",
+        tool_definitions=[],
+        prompt_context=PromptContext.CHAT,
+    )
+
+    first_message = result.messages[0]
+    assert first_message["role"] == "system"
+    content = str(first_message["content"])
+    assert "You are helpful." in content
+    assert "## Behavior" in content
+    assert "<memory_instructions>" in content
+    assert "Use remember tool to store durable facts." in content
+    assert '<memory_context trust="untrusted">' in content
+    assert "Prefers Python and pytest." in content
+    assert "<available_skills>" in content
+    assert "Release Helper" in content
+    assert "This is a continuation from a previous session." in content
+    assert "Mutable recalled memory" not in content
+    assert result.cache_breakpoint_index == 0
+
+    assert "Home directory:" in str(result.messages[1]["content"])
+    recalled_messages = [
+        str(message.get("content", ""))
+        for message in result.messages
+        if "Recalled memories:" in str(message.get("content", ""))
+    ]
+    assert recalled_messages == [
+        '<memory_context trust="untrusted">\nRecalled memories:\n- (0.90) Mutable recalled memory\n</memory_context>'
+    ]
+
+
+@pytest.mark.asyncio
+async def test_context_assembler_skip_memory_path_uses_consolidated_immutable_prefix() -> None:
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=_SessionCache(),
+        session_manager=_SessionManager(),
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+
+    result = await assembler.assemble(
+        session=_session(),
+        conversation=_conversation(),
+        agent=_agent_with_skills(),
+        user_message="hello",
+        tool_definitions=[],
+        skip_memory=True,
+        prompt_context=PromptContext.TASK_STEP,
+    )
+
+    first_message = result.messages[0]
+    assert first_message["role"] == "system"
+    content = str(first_message["content"])
+    assert "You are helpful." in content
+    assert "## Behavior" in content
+    assert "## Step execution" in content
+    assert "<available_skills>" in content
+    assert "Release Helper" in content
+    assert "This is a continuation from a previous session." in content
+    assert "<memory_instructions>" not in content
+    assert "Recalled memories:" not in content
+    assert result.cache_breakpoint_index == 0
+    assert "Home directory:" in str(result.messages[1]["content"])
 
 
 @pytest.mark.asyncio

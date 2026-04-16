@@ -1,8 +1,9 @@
 """Composable system instructions injected at runtime.
 
 These instructions are NOT part of the user-editable agent system prompt.
-They are assembled by the controller based on execution context and injected
-as a separate system message after the agent's identity prompt.
+They are assembled by the controller based on execution context and folded
+into the immutable system-prefix message alongside the agent's identity and
+other stable runtime context.
 
 The agent's ``system_prompt`` field (stored in DB, editable in UI) contains
 only the agent's identity: name, description, personality, behavioral rules.

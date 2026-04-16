@@ -189,6 +189,18 @@ def _compose_identity_prompt(agent: AgentDefinition) -> str | None:
     return "\n\n".join(identity_parts) if identity_parts else None
 
 
+def _format_compaction_summary(compaction_summary: str | None) -> str | None:
+    """Format the stable continuation summary for the immutable prefix."""
+    if not compaction_summary:
+        return None
+    return (
+        "This is a continuation from a previous session. "
+        "Here is a summary of what was discussed:\n\n"
+        f"{compaction_summary}\n\n"
+        "The conversation continues below."
+    )
+
+
 def _load_project_instructions(
     *,
     workspace_root: str | None,
@@ -537,9 +549,17 @@ class ContextAssembler:
             else model_info.max_output_tokens
         )
         identity_prompt = _compose_identity_prompt(agent)
+        immutable_prefix = self._compose_immutable_prefix(
+            agent=agent,
+            prompt_context=prompt_context,
+            identity_prompt=identity_prompt,
+            immutable_instructions=immutable_instructions,
+            immutable_core_memories=immutable_core_memories,
+            compaction_summary=cache_entry.last_compaction_summary,
+        )
         system_prompt_tokens, tool_schema_tokens = self._count_static_tokens(
             resolved_model=resolved_model,
-            system_prompt=identity_prompt,
+            immutable_prefix=immutable_prefix,
             tool_definitions=tool_definitions or [],
         )
         static_tokens = system_prompt_tokens + tool_schema_tokens
@@ -549,77 +569,9 @@ class ContextAssembler:
         # ----- Build messages: immutable prefix first, then mutable suffix -----
         messages: list[dict[str, Any]] = []
 
-        # Immutable prefix block 1: agent identity (personality fields + system prompt).
-        # Personality fields (purpose, tone, temperament, behavioral_rules) form the
-        # static core identity that is always present.  The system_prompt provides
-        # additional user-written instructions.  Note: personality text may also
-        # appear in Mnemory core memories (block 4) after bootstrap — this is
-        # intentional.  The system prompt is the guaranteed baseline; Mnemory is the
-        # evolution layer that can refine or extend the agent's self-understanding.
-        if identity_prompt:
-            messages.append({"role": "system", "content": identity_prompt})
-
-        # Immutable prefix block 2: system instructions (context-dependent, not editable)
-        system_instructions = build_system_instructions(prompt_context, agent_id=agent.agent_id)
-        if system_instructions:
-            messages.append({"role": "system", "content": system_instructions})
-
-        # Immutable prefix block 3: memory instructions (behavioral guidance)
-        if immutable_instructions:
+        if immutable_prefix:
             messages.append(
-                {
-                    "role": "system",
-                    "content": f"<memory_instructions>\n{immutable_instructions}\n</memory_instructions>",
-                }
-            )
-
-        # Immutable prefix block 4: core memories (pinned facts, identity)
-        if immutable_core_memories:
-            messages.append(
-                {
-                    "role": "system",
-                    "content": (
-                        '<memory_context trust="untrusted">\n'
-                        + immutable_core_memories
-                        + "\n</memory_context>"
-                    ),
-                }
-            )
-
-        # Immutable prefix block 5: available skills metadata (stable, token-light)
-        # Only compact metadata is included here for prompt caching stability.
-        # Full instructions are loaded on demand via the skill_load tool.
-        # Version ids and content hashes are intentionally excluded to keep
-        # the immutable prefix stable across skill edits.
-        skill_metadata = self._get_available_skills_metadata(agent)
-        if skill_metadata:
-            messages.append(
-                {
-                    "role": "system",
-                    "content": (
-                        skill_metadata + "\n\nYou have skills that extend your capabilities. "
-                        "Review the list above and use skill_load to load any "
-                        "skills relevant to the current task. Skills marked as "
-                        "attached are preferred defaults for this agent. Follow "
-                        "loaded skill instructions carefully. You can also create "
-                        "new skills with skill_write to remember procedures for future use."
-                    ),
-                }
-            )
-
-        # Immutable prefix block 6: compaction summary (stable within session)
-        compaction_summary = cache_entry.last_compaction_summary
-        if compaction_summary:
-            messages.append(
-                {
-                    "role": "system",
-                    "content": (
-                        "This is a continuation from a previous session. "
-                        "Here is a summary of what was discussed:\n\n"
-                        f"{compaction_summary}\n\n"
-                        "The conversation continues below."
-                    ),
-                }
+                {"role": "system", "content": immutable_prefix, "_immutable_prefix": True}
             )
 
         # ----- Mutable suffix -----
@@ -738,18 +690,18 @@ class ContextAssembler:
             messages=messages,
             resolved_model=resolved_model,
             max_prompt_tokens=max_prompt_tokens,
-            system_prompt=identity_prompt,
             tool_schema_tokens=tool_schema_tokens,
         )
 
+        # Recompute cache breakpoint after pruning while internal markers are still present.
+        cache_breakpoint_index = _find_cache_breakpoint(messages)
+
         # Strip internal markers before sending to LLM
         for msg in messages:
+            msg.pop("_immutable_prefix", None)
             msg.pop("_prior_context", None)
             msg.pop("_follow_up_context", None)
             msg.pop("_routing_reminder", None)
-
-        # Recompute cache breakpoint after pruning (immutable messages may have shifted)
-        cache_breakpoint_index = _find_cache_breakpoint(messages)
 
         prompt_tokens = (
             self.llm.count_messages_tokens(messages, resolved_model) + tool_schema_tokens
@@ -841,40 +793,29 @@ class ContextAssembler:
             else model_info.max_output_tokens
         )
         identity_prompt = _compose_identity_prompt(agent)
+        immutable_prefix = self._compose_immutable_prefix(
+            agent=agent,
+            prompt_context=prompt_context,
+            identity_prompt=identity_prompt,
+            immutable_instructions=None,
+            immutable_core_memories=None,
+            compaction_summary=cache_entry.last_compaction_summary,
+        )
         system_prompt_tokens, tool_schema_tokens = self._count_static_tokens(
             resolved_model=resolved_model,
-            system_prompt=identity_prompt,
+            immutable_prefix=immutable_prefix,
             tool_definitions=tool_definitions or [],
         )
         static_tokens = system_prompt_tokens + tool_schema_tokens
         dynamic_tokens = max(0, max_context_tokens - static_tokens - reserve_output_tokens)
         max_prompt_tokens = max(0, max_context_tokens - reserve_output_tokens)
 
-        # Build messages: identity + system instructions + env + compaction + history
+        # Build messages: immutable prefix + env + history
         messages: list[dict[str, Any]] = []
 
-        if identity_prompt:
-            messages.append({"role": "system", "content": identity_prompt})
-
-        # System instructions (context-dependent, not editable)
-        system_instructions = build_system_instructions(prompt_context, agent_id=agent.agent_id)
-        if system_instructions:
-            messages.append({"role": "system", "content": system_instructions})
-
-        # No memory instructions, no core memories (skip_memory)
-
-        compaction_summary = cache_entry.last_compaction_summary
-        if compaction_summary:
+        if immutable_prefix:
             messages.append(
-                {
-                    "role": "system",
-                    "content": (
-                        "This is a continuation from a previous session. "
-                        "Here is a summary of what was discussed:\n\n"
-                        f"{compaction_summary}\n\n"
-                        "The conversation continues below."
-                    ),
-                }
+                {"role": "system", "content": immutable_prefix, "_immutable_prefix": True}
             )
 
         messages.append(
@@ -970,16 +911,16 @@ class ContextAssembler:
             messages=messages,
             resolved_model=resolved_model,
             max_prompt_tokens=max_prompt_tokens,
-            system_prompt=identity_prompt,
             tool_schema_tokens=tool_schema_tokens,
         )
 
+        cache_breakpoint_index = _find_cache_breakpoint(messages)
+
         for msg in messages:
+            msg.pop("_immutable_prefix", None)
             msg.pop("_prior_context", None)
             msg.pop("_follow_up_context", None)
             msg.pop("_routing_reminder", None)
-
-        cache_breakpoint_index = _find_cache_breakpoint(messages)
         prompt_tokens = (
             self.llm.count_messages_tokens(messages, resolved_model) + tool_schema_tokens
         )
@@ -1026,17 +967,66 @@ class ContextAssembler:
             return metadata
         return None
 
+    def _compose_immutable_prefix(
+        self,
+        *,
+        agent: AgentDefinition,
+        prompt_context: PromptContext,
+        identity_prompt: str | None,
+        immutable_instructions: str | None,
+        immutable_core_memories: str | None,
+        compaction_summary: str | None,
+    ) -> str | None:
+        """Compose the cacheable immutable system prefix as one message."""
+        sections: list[str] = []
+
+        if identity_prompt:
+            sections.append(identity_prompt)
+
+        system_instructions = build_system_instructions(prompt_context, agent_id=agent.agent_id)
+        if system_instructions:
+            sections.append(system_instructions)
+
+        if immutable_instructions:
+            sections.append(
+                f"<memory_instructions>\n{immutable_instructions}\n</memory_instructions>"
+            )
+
+        if immutable_core_memories:
+            sections.append(
+                '<memory_context trust="untrusted">\n'
+                + immutable_core_memories
+                + "\n</memory_context>"
+            )
+
+        skill_metadata = self._get_available_skills_metadata(agent)
+        if skill_metadata:
+            sections.append(
+                skill_metadata + "\n\nYou have skills that extend your capabilities. "
+                "Review the list above and use skill_load to load any "
+                "skills relevant to the current task. Skills marked as "
+                "attached are preferred defaults for this agent. Follow "
+                "loaded skill instructions carefully. You can also create "
+                "new skills with skill_write to remember procedures for future use."
+            )
+
+        compaction_block = _format_compaction_summary(compaction_summary)
+        if compaction_block:
+            sections.append(compaction_block)
+
+        return "\n\n".join(section for section in sections if section) or None
+
     def _count_static_tokens(
         self,
         *,
         resolved_model: str,
-        system_prompt: str | None,
+        immutable_prefix: str | None,
         tool_definitions: list[ToolDefinition],
     ) -> tuple[int, int]:
         system_prompt_tokens = 0
         tool_schema_tokens = 0
-        if system_prompt:
-            system_prompt_tokens += self.llm.count_tokens(system_prompt, resolved_model)
+        if immutable_prefix:
+            system_prompt_tokens += self.llm.count_tokens(immutable_prefix, resolved_model)
         if tool_definitions:
             schemas = json.dumps(
                 [tool.model_dump(mode="json") for tool in tool_definitions],
@@ -1054,7 +1044,6 @@ class ContextAssembler:
         messages: list[dict[str, Any]],
         resolved_model: str,
         max_prompt_tokens: int,
-        system_prompt: str | None,
         tool_schema_tokens: int,
     ) -> list[dict[str, Any]]:
         if max_prompt_tokens <= 0:
@@ -1085,7 +1074,7 @@ class ContextAssembler:
             # Tool call groups (assistant message with tool_calls + matching
             # tool role responses) must be dropped atomically to avoid
             # orphaned tool_calls that LLM providers reject.
-            indices_to_drop = _find_oldest_droppable_group(pruned_messages, system_prompt)
+            indices_to_drop = _find_oldest_droppable_group(pruned_messages)
             if not indices_to_drop:
                 break
             for idx in sorted(indices_to_drop, reverse=True):
@@ -1326,27 +1315,19 @@ def events_to_messages(events: list[Any]) -> list[dict[str, Any]]:
 def _find_cache_breakpoint(messages: list[dict[str, Any]]) -> int | None:
     """Find the index of the last immutable prefix message.
 
-    The cache breakpoint is the last system message that belongs to the
-    immutable prefix (system prompt, memory instructions, core memories,
-    or compaction summary). Everything after this index is mutable and
-    changes every turn.
-
-    The system prompt (first message) is always immutable. We detect
-    the other immutable messages by their content markers.
+    The cache breakpoint is the last system message in the consolidated
+    immutable prefix. Everything after this index is mutable and changes
+    every turn.
     """
 
     if not messages:
         return None
 
-    # The first message is always the system prompt (immutable)
-    system_prompt = messages[0].get("content") if messages[0].get("role") == "system" else None
-
     last_immutable = None
     for index, message in enumerate(messages):
-        if _is_immutable_prefix_message(message, system_prompt):
+        if _is_immutable_prefix_message(message):
             last_immutable = index
-        elif message.get("role") != "system":
-            # First non-system message means we've left the prefix
+        elif message.get("role") != "system" or last_immutable is not None:
             break
     return last_immutable
 
@@ -1371,7 +1352,6 @@ def _format_search_results(search_results: Any) -> str | None:
 
 def _find_oldest_droppable_group(
     messages: list[dict[str, Any]],
-    system_prompt: str | None,
 ) -> list[int]:
     """Find the indices of the oldest droppable message group.
 
@@ -1386,7 +1366,7 @@ def _find_oldest_droppable_group(
     for i, msg in enumerate(messages):
         if i == last_idx:
             continue  # Never drop the last message (current user turn)
-        if _is_immutable_prefix_message(msg, system_prompt):
+        if _is_protected_context_message(msg):
             continue
         if msg.get("_follow_up_context"):
             continue
@@ -1455,35 +1435,25 @@ def _find_oldest_droppable_group(
     return []
 
 
-def _is_immutable_prefix_message(message: dict[str, Any], system_prompt: str | None) -> bool:
-    """Check if a message belongs to the immutable prompt prefix.
+def _is_immutable_prefix_message(message: dict[str, Any]) -> bool:
+    """Check if a message belongs to the cacheable immutable prompt prefix.
+
+    The assembled immutable prefix is emitted as a single marked system
+    message so cache-breakpoint detection does not need content heuristics.
+    """
+    return message.get("role") == "system" and bool(message.get("_immutable_prefix"))
+
+
+def _is_protected_context_message(message: dict[str, Any]) -> bool:
+    """Check if a message is protected from pruning.
 
     Protected messages that should never be pruned:
-    - System prompt
-    - Memory instructions (server-generated behavioral guidance)
-    - Core memories (untrusted wrapper with pinned facts)
-    - Compaction summary (continuation context)
+    - Consolidated immutable prefix
     - Prior step context (workflow step output from a previous step)
     """
-    # Prior step context is critical for workflow step continuity
     if message.get("_prior_context"):
         return True
-    if message.get("role") != "system":
-        return False
-    content = message.get("content")
-    if not isinstance(content, str):
-        return False
-    # System prompt
-    if system_prompt is not None and content == system_prompt:
-        return True
-    # Memory instructions (server-generated behavioral guidance)
-    if content.startswith("<memory_instructions>"):
-        return True
-    # Compaction summary
-    if content.startswith("This is a continuation from a previous session."):
-        return True
-    # Core memories (untrusted wrapper without "Recalled memories" marker)
-    return '<memory_context trust="untrusted">' in content and "Recalled memories:" not in content
+    return _is_immutable_prefix_message(message)
 
 
 # ---------------------------------------------------------------------------
