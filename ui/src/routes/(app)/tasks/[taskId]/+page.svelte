@@ -1,13 +1,14 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
   import { page } from '$app/stores';
-  import { ArrowDown, ArrowLeft, ArrowRight, CheckCircle2, ChevronDown, ChevronUp, Clock3, GitBranch, LoaderCircle, PanelRightOpen, PlayCircle, Settings2, Sparkles, Target } from 'lucide-svelte';
+  import { ArrowLeft, ArrowRight, CheckCircle2, ChevronDown, ChevronUp, Clock3, GitBranch, LoaderCircle, PanelRightOpen, PlayCircle, Settings2, Sparkles, Target } from 'lucide-svelte';
   import { onMount } from 'svelte';
 
   import { api, asApiError } from '$lib/api/client';
   import AgentAvatar from '$lib/components/AgentAvatar.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import SessionLogsDrawer from '$lib/components/tasks/SessionLogsDrawer.svelte';
+  import StepOutputModal from '$lib/components/tasks/StepOutputModal.svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import Card from '$lib/components/ui/Card.svelte';
   import Input from '$lib/components/ui/Input.svelte';
@@ -31,11 +32,11 @@
   let dependencyTaskId = $state('');
   let gateFeedback = $state('');
   let stepResponse = $state('');
-  let expandedSteps = $state<Set<string>>(new Set());
   let expandedStepHistory = $state<Set<string>>(new Set());
   let selectedStepName = $state('');
   let mobileStepDetailOpen = $state(false);
   let configModalOpen = $state(false);
+  let outputModalStepRun = $state<StepRun | null>(null);
   let pollTimer: number | null = null;
   let tickNow = $state(Date.now());
   let durationTimer: ReturnType<typeof setInterval> | null = null;
@@ -137,13 +138,6 @@
     return taskDetail.status;
   }
 
-  function toggleStepExpand(stepRunId: string): void {
-    const next = new Set(expandedSteps);
-    if (next.has(stepRunId)) next.delete(stepRunId);
-    else next.add(stepRunId);
-    expandedSteps = next;
-  }
-
   function toggleStepHistory(stepName: string): void {
     const next = new Set(expandedStepHistory);
     if (next.has(stepName)) next.delete(stepName);
@@ -168,6 +162,14 @@
 
   function closeConfigModal(): void {
     configModalOpen = false;
+  }
+
+  function openOutputModal(stepRun: StepRun): void {
+    outputModalStepRun = stepRun;
+  }
+
+  function closeOutputModal(): void {
+    outputModalStepRun = null;
   }
 
   function stepOutputSummary(stepRun: StepRun): string {
@@ -757,7 +759,7 @@
         <!-- Pipeline diagram -->
         {#if diagramSteps.length > 0}
           <Card class="overflow-hidden p-0">
-            <div class="border-b border-slate-800/80 px-4 py-4 sm:px-5">
+            <div class="border-b border-slate-800/80 px-4 py-3 sm:px-5 sm:py-4">
               <div class="flex flex-wrap items-start justify-between gap-3">
                 <div>
                   <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Live workflow</p>
@@ -829,7 +831,7 @@
                 {/each}
               </div>
             </div>
-            <div class="px-3 py-4 sm:px-5">
+            <div class="px-3 py-3 sm:px-5 sm:py-4">
             <WorkflowDiagram
               steps={diagramSteps}
               interactionMode={workflowDef?.interaction?.mode?.toString() ?? 'explicit_gates'}
@@ -913,7 +915,7 @@
 
         <!-- Workflow progress / step runs -->
         <Card class="overflow-hidden p-0">
-          <div class="border-b border-slate-800/80 px-5 py-4">
+          <div class="border-b border-slate-800/80 px-4 py-3 sm:px-5 sm:py-4">
             <div class="flex flex-wrap items-start justify-between gap-3">
               <div>
                 <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Step detail</p>
@@ -928,7 +930,7 @@
             </div>
           </div>
 
-          <div class="grid gap-4 px-5 py-5 lg:grid-cols-[260px_minmax(0,1fr)]">
+          <div class="grid gap-4 px-4 py-4 sm:px-5 sm:py-5 lg:grid-cols-[260px_minmax(0,1fr)]">
             <div class="space-y-2">
               {#each stepGroups as group}
                 {@const latestStatus = group.latest ? displayStepStatus(group.latest) : (task.pending_pause?.step_name === group.stepName ? 'paused' : 'pending')}
@@ -959,14 +961,12 @@
                 {#if selectedStepGroup.latest}
                   {@const latestAttempt = selectedStepGroup.latest}
                   {@const summary = stepOutputSummary(latestAttempt)}
-                  {@const content = stepOutputContent(latestAttempt)}
                   {@const claims = stepOutputClaims(latestAttempt)}
                   {@const stepError = stepOutputError(latestAttempt)}
                   {@const outcomeStatus = stepOutcomeStatus(latestAttempt)}
                   {@const outcomeReason = stepOutcomeReason(latestAttempt)}
                   {@const visibleStatus = displayStepStatus(latestAttempt)}
                   {@const feedback = stepEvalFeedback(latestAttempt)}
-                  {@const isExpanded = expandedSteps.has(latestAttempt.step_run_id)}
                   <article class="rounded-3xl border border-slate-800 bg-slate-950/60 p-4 sm:p-5">
                     <div class="flex flex-wrap items-start justify-between gap-3">
                       <div>
@@ -1020,39 +1020,34 @@
                     {/if}
 
                     {#if summary && !stepError}
-                      <div class="prose prose-sm prose-invert mt-4 max-w-none text-slate-300">
-                        {@html renderMarkdown(summary)}
+                      <div>
+                        <p class="mt-4 text-xs uppercase tracking-[0.25em] text-slate-500">Summary</p>
+                        <div class="prose prose-sm prose-invert mt-3 max-w-none text-slate-300">
+                          {@html renderMarkdown(summary)}
+                        </div>
                       </div>
                     {/if}
 
-                    {#if claims.length > 0}
-                      <ul class="mt-4 space-y-1 text-sm text-slate-400">
-                        {#each claims as claim}
-                          <li class="flex items-start gap-2">
-                            <span class="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-slate-600"></span>
-                            <span>{claim}</span>
-                          </li>
-                        {/each}
-                      </ul>
-                    {/if}
-
-                    {#if content}
-                      {#if content.length > 300 && !isExpanded}
-                        <div class="prose prose-sm prose-invert mt-4 max-w-none text-slate-400">
-                          {@html renderMarkdown(content.slice(0, 300) + '...')}
-                        </div>
-                        <button class="mt-2 text-xs text-sky-400 hover:text-sky-300" onclick={() => toggleStepExpand(latestAttempt.step_run_id)} type="button">Show full output</button>
-                      {:else if content.length > 300}
-                        <div class="prose prose-sm prose-invert mt-4 max-w-none text-slate-400">
-                          {@html renderMarkdown(content)}
-                        </div>
-                        <button class="mt-2 text-xs text-sky-400 hover:text-sky-300" onclick={() => toggleStepExpand(latestAttempt.step_run_id)} type="button">Collapse</button>
-                      {:else}
-                        <div class="prose prose-sm prose-invert mt-4 max-w-none text-slate-400">
-                          {@html renderMarkdown(content)}
-                        </div>
+                    <div class="mt-4 rounded-2xl border border-slate-800 bg-slate-900/60 px-4 py-3">
+                      <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Completion metadata</p>
+                      {#if claims.length > 0}
+                        <ul class="mt-3 space-y-1 text-sm text-slate-400">
+                          {#each claims as claim}
+                            <li class="flex items-start gap-2">
+                              <span class="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-slate-600"></span>
+                              <span>{claim}</span>
+                            </li>
+                          {/each}
+                        </ul>
+                      {:else if outcomeStatus === 'success' && !stepError && !latestAttempt.evaluation}
+                        <p class="mt-3 text-sm text-slate-400">No extra completion metadata was recorded for this attempt.</p>
                       {/if}
-                    {/if}
+
+                      <div class="mt-4 flex flex-wrap items-center gap-2 border-t border-slate-800 pt-3">
+                        <Button size="sm" variant="secondary" onclick={() => openOutputModal(latestAttempt)}>Show full output</Button>
+                        <span class="text-xs text-slate-500">Includes completion metadata and the finalized assistant output.</span>
+                      </div>
+                    </div>
 
                     {#if latestAttempt.evaluation}
                       {@const evalDecision = String(latestAttempt.evaluation.decision ?? '')}
@@ -1089,10 +1084,8 @@
                         <div class="mt-4 space-y-4 border-t border-dashed border-slate-800 pt-4">
                           {#each selectedStepGroup.attempts.slice(1) as stepRun (stepRun.step_run_id)}
                             {@const summary = stepOutputSummary(stepRun)}
-                            {@const content = stepOutputContent(stepRun)}
                             {@const stepError = stepOutputError(stepRun)}
                             {@const visibleStatus = displayStepStatus(stepRun)}
-                            {@const isExpanded = expandedSteps.has(stepRun.step_run_id)}
                             <div class="relative pl-5">
                               <div class="absolute left-1.5 top-0 bottom-0 w-px bg-slate-800"></div>
                               <div class="absolute left-0 top-2 h-3 w-3 rounded-full border border-slate-600 bg-slate-950"></div>
@@ -1111,17 +1104,10 @@
                                 {#if summary}
                                   <div class="prose prose-sm prose-invert max-w-none text-slate-400">{@html renderMarkdown(summary)}</div>
                                 {/if}
-                                {#if content}
-                                  {#if content.length > 220 && !isExpanded}
-                                    <div class="prose prose-sm prose-invert mt-3 max-w-none text-slate-500">{@html renderMarkdown(content.slice(0, 220) + '...')}</div>
-                                    <button class="mt-2 text-xs text-sky-400 hover:text-sky-300" onclick={() => toggleStepExpand(stepRun.step_run_id)} type="button">Show full output</button>
-                                  {:else if content.length > 220}
-                                    <div class="prose prose-sm prose-invert mt-3 max-w-none text-slate-500">{@html renderMarkdown(content)}</div>
-                                    <button class="mt-2 text-xs text-sky-400 hover:text-sky-300" onclick={() => toggleStepExpand(stepRun.step_run_id)} type="button">Collapse</button>
-                                  {:else}
-                                    <div class="prose prose-sm prose-invert mt-3 max-w-none text-slate-500">{@html renderMarkdown(content)}</div>
-                                  {/if}
-                                {/if}
+                                <div class="mt-3 flex flex-wrap items-center gap-2">
+                                  <Button size="sm" variant="ghost" onclick={() => openOutputModal(stepRun)}>Show full output</Button>
+                                  <span class="text-xs text-slate-500">Opens the finalized result for this attempt.</span>
+                                </div>
                               {/if}
                             </div>
                           {/each}
@@ -1355,7 +1341,7 @@
         {#if selectedStepGroup.latest}
           {@const latestAttempt = selectedStepGroup.latest}
           {@const summary = stepOutputSummary(latestAttempt)}
-          {@const content = stepOutputContent(latestAttempt)}
+          {@const claims = stepOutputClaims(latestAttempt)}
           {@const visibleStatus = displayStepStatus(latestAttempt)}
           <div class="mt-4 rounded-3xl border border-slate-800 bg-slate-900/60 p-4">
             <div class="flex items-center justify-between gap-3">
@@ -1367,9 +1353,22 @@
             {#if summary}
               <div class="prose prose-sm prose-invert mt-4 max-w-none text-slate-300">{@html renderMarkdown(summary)}</div>
             {/if}
-            {#if content}
-              <div class="prose prose-sm prose-invert mt-4 max-w-none text-slate-400">{@html renderMarkdown(content.slice(0, 500) + (content.length > 500 ? '...' : ''))}</div>
-            {/if}
+            <div class="mt-4 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3">
+              <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Completion metadata</p>
+              {#if claims.length > 0}
+                <ul class="mt-3 space-y-1 text-sm text-slate-400">
+                  {#each claims as claim}
+                    <li class="flex items-start gap-2">
+                      <span class="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-slate-600"></span>
+                      <span>{claim}</span>
+                    </li>
+                  {/each}
+                </ul>
+              {:else}
+                <p class="mt-3 text-sm text-slate-400">Open the full output to inspect completion metadata and the finalized assistant output.</p>
+              {/if}
+              <Button class="mt-4" size="sm" variant="secondary" onclick={() => openOutputModal(latestAttempt)}>Show full output</Button>
+            </div>
           </div>
         {:else}
           <div class="mt-4 rounded-3xl border border-dashed border-slate-700 px-4 py-8 text-center text-sm text-slate-400">This step has not produced an attempt yet.</div>
@@ -1505,6 +1504,16 @@
         </div>
       </div>
     </div>
+  {/if}
+
+  {#if outputModalStepRun}
+    <StepOutputModal
+      stepRun={outputModalStepRun}
+      agentName={agentName(outputModalStepRun.agent_id)}
+      agentAvatarUrl={agentFor(outputModalStepRun.agent_id)?.avatar_url ?? null}
+      visibleStatus={displayStepStatus(outputModalStepRun)}
+      onclose={closeOutputModal}
+    />
   {/if}
 
   <!-- Session logs drawer -->

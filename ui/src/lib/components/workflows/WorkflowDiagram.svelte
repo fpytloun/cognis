@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { FileText } from 'lucide-svelte';
   import type { WorkflowStepFormState } from '$lib/workflows';
 
   let {
@@ -321,13 +322,13 @@
             {#if isTaskMode && hasLogs}
               <foreignObject x={x + 8} y={y + 8} width="20" height="20">
                 <button
-                  class="flex h-5 w-5 items-center justify-center rounded-md border border-slate-600/80 bg-slate-950/85 text-[10px] text-slate-200 hover:border-sky-400/60 hover:text-white"
+                  class="flex h-5 w-5 items-center justify-center rounded-md border border-slate-600/80 bg-slate-950/90 text-slate-200 transition hover:border-sky-400/60 hover:text-white"
                   onclick={(event) => handleStepLogsClick(event, step.name)}
                   type="button"
                   aria-label={`Open logs for ${step.name}`}
                   title="Open logs"
                 >
-                  L
+                  <FileText class="h-3 w-3" />
                 </button>
               </foreignObject>
             {/if}
@@ -386,13 +387,13 @@
             {#if isTaskMode && hasLogs}
               <foreignObject x={x + 8} y={y + 8} width="20" height="20">
                 <button
-                  class="flex h-5 w-5 items-center justify-center rounded-md border border-slate-600/80 bg-slate-950/85 text-[10px] text-slate-200 hover:border-sky-400/60 hover:text-white"
+                  class="flex h-5 w-5 items-center justify-center rounded-md border border-slate-600/80 bg-slate-950/90 text-slate-200 transition hover:border-sky-400/60 hover:text-white"
                   onclick={(event) => handleStepLogsClick(event, step.name)}
                   type="button"
                   aria-label={`Open logs for ${step.name}`}
                   title="Open logs"
                 >
-                  L
+                  <FileText class="h-3 w-3" />
                 </button>
               </foreignObject>
             {/if}
