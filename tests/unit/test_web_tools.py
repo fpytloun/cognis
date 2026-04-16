@@ -355,7 +355,7 @@ class TestWebSearchHandler:
         from cognis.tools.executor.web.handlers import handle_web_search
 
         with patch("cognis.tools.executor.web.handlers.resolve_search_backend") as mock_resolve:
-            mock_backend = AsyncMock()
+            mock_backend = AsyncMock(spec=TavilyBackend)
             mock_backend.search.return_value = ToolResult(output="results")
             mock_resolve.return_value = mock_backend
 
@@ -384,7 +384,7 @@ class TestWebSearchHandler:
         from cognis.tools.executor.web.handlers import handle_web_search
 
         with patch("cognis.tools.executor.web.handlers.resolve_search_backend") as mock_resolve:
-            mock_backend = AsyncMock()
+            mock_backend = AsyncMock(spec=TavilyBackend)
             mock_backend.search.return_value = ToolResult(output="results")
             mock_resolve.return_value = mock_backend
 
@@ -417,7 +417,7 @@ class TestWebSearchHandler:
         from cognis.tools.executor.web.handlers import handle_web_search
 
         with patch("cognis.tools.executor.web.handlers.resolve_search_backend") as mock_resolve:
-            mock_backend = AsyncMock()
+            mock_backend = AsyncMock(spec=TavilyBackend)
             mock_backend.search.return_value = ToolResult(output="results")
             mock_resolve.return_value = mock_backend
 
@@ -444,7 +444,7 @@ class TestWebSearchHandler:
         from cognis.tools.executor.web.handlers import handle_web_search
 
         with patch("cognis.tools.executor.web.handlers.resolve_search_backend") as mock_resolve:
-            mock_backend = AsyncMock()
+            mock_backend = AsyncMock(spec=TavilyBackend)
             mock_backend.search.return_value = ToolResult(output="results")
             mock_resolve.return_value = mock_backend
 
@@ -468,7 +468,7 @@ class TestWebSearchHandler:
         from cognis.tools.executor.web.handlers import handle_web_search
 
         with patch("cognis.tools.executor.web.handlers.resolve_search_backend") as mock_resolve:
-            mock_backend = AsyncMock()
+            mock_backend = AsyncMock(spec=TavilyBackend)
             mock_backend.search.return_value = ToolResult(output="results")
             mock_resolve.return_value = mock_backend
 
@@ -496,7 +496,7 @@ class TestWebSearchHandler:
         from cognis.tools.executor.web.handlers import handle_web_search
 
         with patch("cognis.tools.executor.web.handlers.resolve_search_backend") as mock_resolve:
-            mock_backend = AsyncMock()
+            mock_backend = AsyncMock(spec=TavilyBackend)
             mock_backend.search.return_value = ToolResult(output="results")
             mock_resolve.return_value = mock_backend
 
@@ -516,17 +516,224 @@ class TestWebSearchHandler:
             assert "chunks_per_source" not in options
 
     @pytest.mark.asyncio()
+    async def test_search_normalizes_tavily_site_filters_into_include_domains(self) -> None:
+        from cognis.tools.executor.web.handlers import handle_web_search
+
+        with patch("cognis.tools.executor.web.handlers.resolve_search_backend") as mock_resolve:
+            mock_backend = AsyncMock(spec=TavilyBackend)
+            mock_backend.search.return_value = ToolResult(output="results")
+            mock_resolve.return_value = mock_backend
+
+            await handle_web_search(
+                {
+                    "query": "site:example.com OR site:news.example.org policy economy",
+                    "backend": "tavily",
+                },
+                _DUMMY_CONTEXT,
+            )
+
+            call_args = mock_backend.search.call_args
+            assert call_args.args[0] == "policy economy"
+            options = call_args.kwargs.get("options", {})
+            assert options["include_domains"] == ["example.com", "news.example.org"]
+
+    @pytest.mark.asyncio()
+    async def test_search_merges_explicit_include_domains_with_normalized_sites(self) -> None:
+        from cognis.tools.executor.web.handlers import handle_web_search
+
+        with patch("cognis.tools.executor.web.handlers.resolve_search_backend") as mock_resolve:
+            mock_backend = AsyncMock(spec=TavilyBackend)
+            mock_backend.search.return_value = ToolResult(output="results")
+            mock_resolve.return_value = mock_backend
+
+            await handle_web_search(
+                {
+                    "query": "site:example.com security",
+                    "backend": "tavily",
+                    "include_domains": ["api.example.net", "example.com"],
+                },
+                _DUMMY_CONTEXT,
+            )
+
+            call_args = mock_backend.search.call_args
+            options = call_args.kwargs.get("options", {})
+            assert options["include_domains"] == ["api.example.net", "example.com"]
+
+    @pytest.mark.asyncio()
+    async def test_search_accepts_string_include_domains_for_tavily(self) -> None:
+        from cognis.tools.executor.web.handlers import handle_web_search
+
+        with patch("cognis.tools.executor.web.handlers.resolve_search_backend") as mock_resolve:
+            mock_backend = AsyncMock(spec=TavilyBackend)
+            mock_backend.search.return_value = ToolResult(output="results")
+            mock_resolve.return_value = mock_backend
+
+            await handle_web_search(
+                {
+                    "query": "compliance",
+                    "backend": "tavily",
+                    "include_domains": "example.com",
+                },
+                _DUMMY_CONTEXT,
+            )
+
+            call_args = mock_backend.search.call_args
+            options = call_args.kwargs.get("options", {})
+            assert options["include_domains"] == ["example.com"]
+
+    @pytest.mark.asyncio()
+    async def test_search_retries_empty_tavily_result_with_simpler_query(self) -> None:
+        from cognis.tools.executor.web.handlers import handle_web_search
+
+        with patch("cognis.tools.executor.web.handlers.resolve_search_backend") as mock_resolve:
+            mock_backend = AsyncMock(spec=TavilyBackend)
+            mock_backend.search.side_effect = [
+                ToolResult(output="No search results found."),
+                ToolResult(output="results", metadata={"source": "retry"}),
+            ]
+            mock_resolve.return_value = mock_backend
+
+            result = await handle_web_search(
+                {
+                    "query": "site:finance.example.com quote ABC=XYZ",
+                    "backend": "tavily",
+                    "topic": "finance",
+                },
+                _DUMMY_CONTEXT,
+            )
+
+            assert not result.is_error
+            assert result.output == "results"
+            assert mock_backend.search.await_count == 2
+            first_call = mock_backend.search.await_args_list[0]
+            second_call = mock_backend.search.await_args_list[1]
+            assert first_call.args[0] == "quote ABC=XYZ"
+            assert second_call.args[0] == "ABC=XYZ"
+            assert second_call.kwargs["options"]["exact_match"] is True
+            assert result.metadata["tavily_retry_attempted"] is True
+            assert result.metadata["tavily_retry_reason"] == "empty_results"
+
+    @pytest.mark.asyncio()
+    async def test_search_adds_tavily_metadata_without_retry(self) -> None:
+        from cognis.tools.executor.web.handlers import handle_web_search
+
+        with patch("cognis.tools.executor.web.handlers.resolve_search_backend") as mock_resolve:
+            mock_backend = AsyncMock(spec=TavilyBackend)
+            mock_backend.search.return_value = ToolResult(output="results")
+            mock_resolve.return_value = mock_backend
+
+            result = await handle_web_search(
+                {
+                    "query": "site:example.com compliance",
+                    "backend": "tavily",
+                },
+                _DUMMY_CONTEXT,
+            )
+
+            assert result.metadata["tavily_query_normalized"] is True
+            assert result.metadata["tavily_retry_attempted"] is False
+
+    @pytest.mark.asyncio()
+    async def test_search_does_not_normalize_when_resolved_backend_is_not_tavily(self) -> None:
+        from cognis.tools.executor.web.handlers import handle_web_search
+
+        with patch("cognis.tools.executor.web.handlers.resolve_search_backend") as mock_resolve:
+            mock_backend = AsyncMock()
+            mock_backend.search.return_value = ToolResult(output="results")
+            mock_resolve.return_value = mock_backend
+
+            result = await handle_web_search(
+                {
+                    "query": "site:example.com compliance",
+                    "backend": "tavily",
+                },
+                _DUMMY_CONTEXT,
+            )
+
+            call_args = mock_backend.search.call_args
+            assert call_args.args[0] == "site:example.com compliance"
+            assert result.metadata is None
+
+    @pytest.mark.asyncio()
+    async def test_search_does_not_rewrite_complex_boolean_tavily_query(self) -> None:
+        from cognis.tools.executor.web.handlers import handle_web_search
+
+        with patch("cognis.tools.executor.web.handlers.resolve_search_backend") as mock_resolve:
+            mock_backend = AsyncMock(spec=TavilyBackend)
+            mock_backend.search.return_value = ToolResult(output="results")
+            mock_resolve.return_value = mock_backend
+
+            result = await handle_web_search(
+                {
+                    "query": "site:example.com AND security OR resilience",
+                    "backend": "tavily",
+                },
+                _DUMMY_CONTEXT,
+            )
+
+            call_args = mock_backend.search.call_args
+            assert call_args.args[0] == "site:example.com AND security OR resilience"
+            assert result.metadata["tavily_query_normalized"] is False
+
+    @pytest.mark.asyncio()
+    async def test_search_does_not_rewrite_mixed_or_query(self) -> None:
+        from cognis.tools.executor.web.handlers import handle_web_search
+
+        with patch("cognis.tools.executor.web.handlers.resolve_search_backend") as mock_resolve:
+            mock_backend = AsyncMock(spec=TavilyBackend)
+            mock_backend.search.return_value = ToolResult(output="results")
+            mock_resolve.return_value = mock_backend
+
+            result = await handle_web_search(
+                {
+                    "query": "site:example.com OR apple",
+                    "backend": "tavily",
+                },
+                _DUMMY_CONTEXT,
+            )
+
+            call_args = mock_backend.search.call_args
+            assert call_args.args[0] == "site:example.com OR apple"
+            assert result.metadata["tavily_query_normalized"] is False
+
+    @pytest.mark.asyncio()
+    async def test_search_does_not_lift_path_qualified_site_filter(self) -> None:
+        from cognis.tools.executor.web.handlers import handle_web_search
+
+        with patch("cognis.tools.executor.web.handlers.resolve_search_backend") as mock_resolve:
+            mock_backend = AsyncMock(spec=TavilyBackend)
+            mock_backend.search.return_value = ToolResult(output="results")
+            mock_resolve.return_value = mock_backend
+
+            result = await handle_web_search(
+                {
+                    "query": "site:example.com/markets currency update",
+                    "backend": "tavily",
+                },
+                _DUMMY_CONTEXT,
+            )
+
+            call_args = mock_backend.search.call_args
+            assert call_args.args[0] == "site:example.com/markets currency update"
+            options = call_args.kwargs.get("options") or {}
+            assert "include_domains" not in options
+            assert result.metadata["tavily_query_normalized"] is False
+
+    @pytest.mark.asyncio()
     async def test_search_rejects_invalid_tavily_date(self) -> None:
         from cognis.tools.executor.web.handlers import handle_web_search
 
-        result = await handle_web_search(
-            {
-                "query": "test",
-                "backend": "tavily",
-                "start_date": "16-04-2026",
-            },
-            _DUMMY_CONTEXT,
-        )
+        with patch("cognis.tools.executor.web.handlers.resolve_search_backend") as mock_resolve:
+            mock_resolve.return_value = AsyncMock(spec=TavilyBackend)
+
+            result = await handle_web_search(
+                {
+                    "query": "test",
+                    "backend": "tavily",
+                    "start_date": "16-04-2026",
+                },
+                _DUMMY_CONTEXT,
+            )
 
         assert result.is_error
         assert "start_date" in result.output
@@ -535,14 +742,17 @@ class TestWebSearchHandler:
     async def test_search_rejects_impossible_tavily_date(self) -> None:
         from cognis.tools.executor.web.handlers import handle_web_search
 
-        result = await handle_web_search(
-            {
-                "query": "test",
-                "backend": "tavily",
-                "start_date": "2026-13-40",
-            },
-            _DUMMY_CONTEXT,
-        )
+        with patch("cognis.tools.executor.web.handlers.resolve_search_backend") as mock_resolve:
+            mock_resolve.return_value = AsyncMock(spec=TavilyBackend)
+
+            result = await handle_web_search(
+                {
+                    "query": "test",
+                    "backend": "tavily",
+                    "start_date": "2026-13-40",
+                },
+                _DUMMY_CONTEXT,
+            )
 
         assert result.is_error
         assert "real calendar date" in result.output

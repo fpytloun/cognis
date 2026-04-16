@@ -373,8 +373,10 @@ def _search_description(backends: list[str], has_tavily: bool, has_brave: bool) 
     description = " ".join(parts) + "."
     if has_tavily:
         description += (
-            " Prefer include_domains/exclude_domains for Tavily instead of long site:"
-            " operators in the query. Use country only with topic='general'."
+            " For Tavily, prefer include_domains/exclude_domains over site: operators in the query."
+            " Keep the query focused on the subject itself rather than search syntax."
+            " For exact identifiers, prefer shorter queries and use exact_match when appropriate."
+            " Use country only with topic='general'."
         )
     return description
 

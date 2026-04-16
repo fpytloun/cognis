@@ -72,6 +72,14 @@ def test_chat_prompt_explains_truncated_output_recovery() -> None:
     assert "read_tool_output(call_id=..., offset=..., limit=...)" in instructions
 
 
+def test_chat_prompt_guides_tavily_query_shape() -> None:
+    instructions = build_system_instructions(PromptContext.CHAT)
+    assert instructions is not None
+    assert "structured parameters over query" in instructions
+    assert "include_domains" in instructions
+    assert "exact_match" in instructions
+
+
 def test_task_step_prompt_requires_todos_for_non_trivial_work() -> None:
     instructions = build_system_instructions(PromptContext.TASK_STEP)
     assert instructions is not None

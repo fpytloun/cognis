@@ -71,6 +71,12 @@ _TOOL_GUIDANCE = """\
 - Make independent tool calls in parallel when possible for efficiency.
 - Large outputs are automatically truncated. Use offset/limit parameters \
   or search tools to navigate large files.
+- When using Tavily-backed web search, prefer structured parameters over query \
+  syntax hacks: use `include_domains` and `exclude_domains` instead of `site:` \
+  operators whenever possible.
+- Keep Tavily `query` values focused on the actual subject or identifier rather \
+  than transport syntax. For exact identifiers, prefer shorter queries and \
+  enable `exact_match` when appropriate.
 - If a tool result says `middle truncated` or `Tool result cleared`, the \
   visible content is incomplete.
 - For structured saved outputs such as numbered search results, use \

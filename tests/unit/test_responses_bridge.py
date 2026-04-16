@@ -52,6 +52,14 @@ def test_messages_to_responses_input_normalizes_multimodal_blocks() -> None:
     ]
 
 
+def test_messages_to_responses_input_preserves_system_role() -> None:
+    messages = [{"role": "system", "content": "Follow system instructions."}]
+
+    result = messages_to_responses_input(messages)
+
+    assert result == [{"role": "system", "content": "Follow system instructions."}]
+
+
 def test_responses_to_chat_response_preserves_reasoning_only_payload() -> None:
     payload = {
         "status": "completed",

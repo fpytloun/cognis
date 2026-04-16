@@ -70,7 +70,7 @@ def messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str
         if role in {"system", "user", "assistant"} and not message.get("tool_calls"):
             items.append(
                 {
-                    "role": "developer" if role == "system" else role,
+                    "role": role,
                     "content": _normalize_message_content(content),
                 }
             )
@@ -374,7 +374,7 @@ class _ResponsesStreamState:
     def final_message_fallback(self, response_payload: dict[str, Any]) -> list[dict[str, Any]]:
         envelope = _extract_response_envelope(response_payload)
         chunks: list[dict[str, Any]] = []
-        for field, fallback_text in (
+        for response_field, fallback_text in (
             ("content", envelope.content),
             ("reasoning_content", envelope.reasoning_content),
             ("reasoning", envelope.reasoning_summary),
@@ -382,7 +382,7 @@ class _ResponsesStreamState:
         ):
             if not fallback_text:
                 continue
-            chunk = self.final_text_delta(fallback_text, field=field)
+            chunk = self.final_text_delta(fallback_text, field=response_field)
             if chunk is not None:
                 self.completed_fallback_used = True
                 chunks.append(chunk)

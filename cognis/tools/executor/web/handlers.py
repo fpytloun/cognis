@@ -20,6 +20,11 @@ _TAVILY_TIME_RANGES = {"day", "week", "month", "year", "d", "w", "m", "y"}
 _TAVILY_ANSWER_MODES = {"basic", "advanced"}
 _TAVILY_RAW_CONTENT_MODES = {"markdown", "text"}
 _DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_SITE_FILTER_RE = re.compile(
+    r"(?P<prefix>^|\s)site:(?P<domain>[A-Za-z0-9.-]+\.[A-Za-z]{2,})(?=\s|$)"
+)
+_BOOLEAN_TOKEN_RE = re.compile(r"\b(?:AND|OR|NOT)\b", re.IGNORECASE)
+_EXACT_LOOKUP_FILLER = frozenset({"quote", "quotes", "price", "prices", "ticker", "symbol"})
 
 
 def _normalize_optional_web_value(value: Any) -> Any:
@@ -105,6 +110,20 @@ def _normalize_tavily_search_options(options: dict[str, Any]) -> dict[str, Any]:
             )
         normalized["include_raw_content"] = mode
 
+    for domains_key in ("include_domains", "exclude_domains"):
+        domains_value = normalized.get(domains_key)
+        if domains_value is None:
+            continue
+        if isinstance(domains_value, str):
+            stripped = domains_value.strip()
+            normalized[domains_key] = [stripped] if stripped else []
+            continue
+        if not isinstance(domains_value, list) or not all(
+            isinstance(item, str) and item.strip() for item in domains_value
+        ):
+            raise ValueError(f"Tavily option '{domains_key}' must be a string or list of strings.")
+        normalized[domains_key] = [item.strip() for item in domains_value]
+
     for date_key in ("start_date", "end_date"):
         value = normalized.get(date_key)
         if value is None:
@@ -145,6 +164,121 @@ def _normalize_tavily_search_options(options: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+def _normalize_tavily_query(
+    query: str,
+    options: dict[str, Any],
+) -> tuple[str, dict[str, Any], bool]:
+    """Normalize Tavily queries by lifting simple site filters into options."""
+    normalized_query = query.strip()
+    normalized_options = dict(options)
+    include_domains = list(normalized_options.get("include_domains") or [])
+    leading_domains, remaining_query = _extract_leading_site_filters(normalized_query)
+    if not leading_domains:
+        return normalized_query, normalized_options, False
+    normalized_query = remaining_query or query.strip()
+
+    changed = False
+    if leading_domains:
+        merged_domains: list[str] = []
+        for domain in [*include_domains, *leading_domains]:
+            lowered = str(domain).strip().lower()
+            if lowered and lowered not in merged_domains:
+                merged_domains.append(lowered)
+        normalized_options["include_domains"] = merged_domains
+        changed = True
+
+    if normalized_query != query.strip():
+        changed = True
+
+    return normalized_query or query.strip(), normalized_options, changed
+
+
+def _extract_leading_site_filters(query: str) -> tuple[list[str], str]:
+    """Extract a leading `site:domain OR site:domain` cluster conservatively."""
+    tokens = [token for token in re.split(r"\s+", query.strip()) if token]
+    if not tokens:
+        return [], query.strip()
+
+    extracted: list[str] = []
+    index = 0
+    expecting_site = False
+    while index < len(tokens):
+        site_match = _SITE_FILTER_RE.fullmatch(tokens[index])
+        if not site_match:
+            break
+        extracted.append(site_match.group("domain").lower().strip("."))
+        expecting_site = False
+        index += 1
+        if index >= len(tokens):
+            break
+        boolean = tokens[index]
+        if boolean.upper() != "OR":
+            break
+        expecting_site = True
+        index += 1
+
+    if not extracted:
+        return [], query.strip()
+    if expecting_site:
+        return [], query.strip()
+    if index > len(tokens):
+        return [], query.strip()
+    if index < len(tokens) and _BOOLEAN_TOKEN_RE.fullmatch(tokens[index]):
+        return [], query.strip()
+
+    remaining = " ".join(tokens[index:]).strip()
+    return extracted, remaining
+
+
+def _identifier_like_tokens(query: str) -> list[str]:
+    tokens = [token for token in re.split(r"\s+", query.strip()) if token]
+    result: list[str] = []
+    for token in tokens:
+        stripped = token.strip(",.;:()[]{}\"'")
+        if not stripped:
+            continue
+        if any(char in stripped for char in ("=", "/", ":", "_")):
+            result.append(stripped)
+            continue
+        if any(char.isdigit() for char in stripped):
+            result.append(stripped)
+            continue
+        if stripped.isupper() and len(stripped) >= 2:
+            result.append(stripped)
+    return result
+
+
+def _build_tavily_retry_query(query: str) -> str | None:
+    """Return a simpler retry query when the original Tavily query looks overloaded."""
+    base_tokens = [token for token in re.split(r"\s+", query.strip()) if token]
+    if not base_tokens:
+        return None
+
+    filtered_tokens = [
+        token
+        for token in base_tokens
+        if token.strip(",.;:()[]{}\"'").lower() not in _EXACT_LOOKUP_FILLER
+    ]
+    identifier_tokens = _identifier_like_tokens(" ".join(filtered_tokens))
+    if identifier_tokens:
+        candidate = " ".join(identifier_tokens[:3]).strip()
+        return candidate if candidate and candidate != query.strip() else None
+
+    candidate = " ".join(filtered_tokens[:8]).strip()
+    return candidate if candidate and candidate != query.strip() else None
+
+
+def _is_empty_search_result(result: ToolResult) -> bool:
+    return not result.is_error and result.output.strip() == "No search results found."
+
+
+def _merge_result_metadata(result: ToolResult, metadata: dict[str, Any]) -> ToolResult:
+    merged = dict(result.metadata or {})
+    merged.update(metadata)
+    result.metadata = merged
+    return result
+
+
 async def handle_web_fetch(arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
     """Fetch content from a URL and return it as text or markdown."""
     url = arguments.get("url", "")
@@ -177,7 +311,6 @@ async def handle_web_search(arguments: dict[str, Any], context: ToolExecutionCon
 
     num_results = int(arguments.get("num_results", 8))
     backend_name = arguments.get("backend")
-
     options = _collect_optional_options(
         arguments,
         (
@@ -218,18 +351,57 @@ async def handle_web_search(arguments: dict[str, Any], context: ToolExecutionCon
         ),
     )
 
-    if _selected_search_backend(arguments, context) == "tavily":
+    query_to_run = str(query).strip()
+    query_normalized = False
+    retry_attempted = False
+
+    backend = resolve_search_backend(context.runtime_metadata, backend_name)
+    is_tavily_backend = isinstance(backend, TavilyBackend)
+    if is_tavily_backend:
         try:
             options = _normalize_tavily_search_options(options)
         except ValueError as exc:
             return ToolResult(output=str(exc), is_error=True)
+        query_to_run, options, query_normalized = _normalize_tavily_query(query_to_run, options)
 
-    backend = resolve_search_backend(context.runtime_metadata, backend_name)
-    return await backend.search(
-        query,
+    result = await backend.search(
+        query_to_run,
         num_results=num_results,
         options=options if options else None,
     )
+
+    if is_tavily_backend and _is_empty_search_result(result):
+        retry_query = _build_tavily_retry_query(query_to_run)
+        retry_options = dict(options)
+        if retry_query and retry_query != query_to_run:
+            retry_attempted = True
+            if _identifier_like_tokens(retry_query) and "exact_match" not in retry_options:
+                retry_options["exact_match"] = True
+            retry_result = await backend.search(
+                retry_query,
+                num_results=num_results,
+                options=retry_options if retry_options else None,
+            )
+            if not _is_empty_search_result(retry_result):
+                return _merge_result_metadata(
+                    retry_result,
+                    {
+                        "tavily_query_normalized": query_normalized,
+                        "tavily_retry_attempted": True,
+                        "tavily_retry_reason": "empty_results",
+                    },
+                )
+
+    if is_tavily_backend:
+        return _merge_result_metadata(
+            result,
+            {
+                "tavily_query_normalized": query_normalized,
+                "tavily_retry_attempted": retry_attempted,
+                "tavily_retry_reason": "empty_results" if retry_attempted else None,
+            },
+        )
+    return result
 
 
 async def handle_web_crawl(arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
