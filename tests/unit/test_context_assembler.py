@@ -569,11 +569,13 @@ async def test_context_assembler_includes_composed_identity_prompt() -> None:
     first_message = result.messages[0]
     assert first_message["role"] == "system"
     content = str(first_message["content"])
+    assert "<identity>" in content
     assert "Purpose: research specialist" in content
     assert "Tone: formal, precise" in content
     assert "Temperament: patient, methodical" in content
     assert "- Always cite sources" in content
     assert "Be helpful." in content
+    assert "<instructions>" in content
     assert "## Behavior" in content
     assert result.cache_breakpoint_index == 0
 
@@ -612,7 +614,9 @@ async def test_context_assembler_consolidates_immutable_prefix_into_first_messag
     first_message = result.messages[0]
     assert first_message["role"] == "system"
     content = str(first_message["content"])
+    assert "<identity>" in content
     assert "You are helpful." in content
+    assert "<instructions>" in content
     assert "## Behavior" in content
     assert "<memory_instructions>" in content
     assert "Use remember tool to store durable facts." in content
@@ -620,7 +624,9 @@ async def test_context_assembler_consolidates_immutable_prefix_into_first_messag
     assert "Prefers Python and pytest." in content
     assert "<available_skills>" in content
     assert "Release Helper" in content
+    assert "<skills_guidance>" in content
     assert "This is a continuation from a previous session." in content
+    assert "<prior_session_summary>" in content
     assert "Mutable recalled memory" not in content
     assert result.cache_breakpoint_index == 0
 
@@ -660,12 +666,16 @@ async def test_context_assembler_skip_memory_path_uses_consolidated_immutable_pr
     first_message = result.messages[0]
     assert first_message["role"] == "system"
     content = str(first_message["content"])
+    assert "<identity>" in content
     assert "You are helpful." in content
+    assert "<instructions>" in content
     assert "## Behavior" in content
     assert "## Step execution" in content
     assert "<available_skills>" in content
     assert "Release Helper" in content
+    assert "<skills_guidance>" in content
     assert "This is a continuation from a previous session." in content
+    assert "<prior_session_summary>" in content
     assert "<memory_instructions>" not in content
     assert "Recalled memories:" not in content
     assert result.cache_breakpoint_index == 0

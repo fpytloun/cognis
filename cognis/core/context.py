@@ -201,6 +201,13 @@ def _format_compaction_summary(compaction_summary: str | None) -> str | None:
     )
 
 
+def _tagged_section(tag: str, content: str | None) -> str | None:
+    """Wrap stable prompt content in a simple XML-style section tag."""
+    if not content:
+        return None
+    return f"<{tag}>\n{content}\n</{tag}>"
+
+
 def _load_project_instructions(
     *,
     workspace_root: str | None,
@@ -981,11 +988,15 @@ class ContextAssembler:
         sections: list[str] = []
 
         if identity_prompt:
-            sections.append(identity_prompt)
+            tagged_identity = _tagged_section("identity", identity_prompt)
+            if tagged_identity:
+                sections.append(tagged_identity)
 
         system_instructions = build_system_instructions(prompt_context, agent_id=agent.agent_id)
         if system_instructions:
-            sections.append(system_instructions)
+            tagged_instructions = _tagged_section("instructions", system_instructions)
+            if tagged_instructions:
+                sections.append(tagged_instructions)
 
         if immutable_instructions:
             sections.append(
@@ -1001,18 +1012,24 @@ class ContextAssembler:
 
         skill_metadata = self._get_available_skills_metadata(agent)
         if skill_metadata:
-            sections.append(
-                skill_metadata + "\n\nYou have skills that extend your capabilities. "
+            sections.append(skill_metadata)
+            tagged_skills_guidance = _tagged_section(
+                "skills_guidance",
+                "You have skills that extend your capabilities. "
                 "Review the list above and use skill_load to load any "
                 "skills relevant to the current task. Skills marked as "
                 "attached are preferred defaults for this agent. Follow "
                 "loaded skill instructions carefully. You can also create "
-                "new skills with skill_write to remember procedures for future use."
+                "new skills with skill_write to remember procedures for future use.",
             )
+            if tagged_skills_guidance:
+                sections.append(tagged_skills_guidance)
 
         compaction_block = _format_compaction_summary(compaction_summary)
         if compaction_block:
-            sections.append(compaction_block)
+            tagged_summary = _tagged_section("prior_session_summary", compaction_block)
+            if tagged_summary:
+                sections.append(tagged_summary)
 
         return "\n\n".join(section for section in sections if section) or None
 
