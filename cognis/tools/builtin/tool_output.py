@@ -14,7 +14,14 @@ from cognis.models.tool import ToolDefinition, ToolResult, ToolSource
 
 _SOURCE = ToolSource(type="builtin")
 
-TOOL_OUTPUT_TOOL_NAMES = frozenset({"read_tool_output", "search_tool_output"})
+TOOL_OUTPUT_TOOL_NAMES = frozenset(
+    {
+        "read_tool_output",
+        "search_tool_output",
+        "list_tool_output_anchors",
+        "read_tool_output_anchor",
+    }
+)
 
 READ_TOOL_OUTPUT = ToolDefinition(
     name="read_tool_output",
@@ -23,7 +30,8 @@ READ_TOOL_OUTPUT = ToolDefinition(
         "Use when a tool result was truncated or cleared from context and you "
         "need the omitted sections in order. Supports pagination via offset "
         "(1-indexed line number) and limit. Returns line-numbered content "
-        "similar to the file read tool."
+        "similar to the file read tool. For structured outputs with anchors, "
+        "prefer list_tool_output_anchors and read_tool_output_anchor first."
     ),
     parameters={
         "type": "object",
@@ -87,10 +95,77 @@ SEARCH_TOOL_OUTPUT = ToolDefinition(
     max_result_size=50_000,
 )
 
+LIST_TOOL_OUTPUT_ANCHORS = ToolDefinition(
+    name="list_tool_output_anchors",
+    description=(
+        "List named anchors for a previous tool output when it contains structured "
+        "sections such as search results. Use this before read_tool_output_anchor "
+        "when you need to inspect a specific saved section without regex search."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "call_id": {
+                "type": "string",
+                "description": "The call_id of the tool result to inspect.",
+            }
+        },
+        "required": ["call_id"],
+    },
+    source=_SOURCE,
+    category="context",
+    read_only=True,
+    timeout_seconds=10,
+    max_result_size=20_000,
+)
+
+READ_TOOL_OUTPUT_ANCHOR = ToolDefinition(
+    name="read_tool_output_anchor",
+    description=(
+        "Read a named anchored section from a previous tool output. Use this for "
+        "structured outputs such as saved search results when you want one section "
+        "without reloading the entire output."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "call_id": {
+                "type": "string",
+                "description": "The call_id of the tool result to inspect.",
+            },
+            "anchor": {
+                "type": "string",
+                "description": "Exact anchor name to read, e.g. 'result:3'.",
+            },
+            "before_lines": {
+                "type": "integer",
+                "description": "Optional lines to include before the anchored section.",
+                "default": 0,
+            },
+            "after_lines": {
+                "type": "integer",
+                "description": "Optional lines to include after the anchored section.",
+                "default": 0,
+            },
+        },
+        "required": ["call_id", "anchor"],
+    },
+    source=_SOURCE,
+    category="context",
+    read_only=True,
+    timeout_seconds=10,
+    max_result_size=30_000,
+)
+
 
 def tool_output_tools() -> list[ToolDefinition]:
     """Return tool output exploration tool definitions."""
-    return [READ_TOOL_OUTPUT, SEARCH_TOOL_OUTPUT]
+    return [
+        READ_TOOL_OUTPUT,
+        SEARCH_TOOL_OUTPUT,
+        LIST_TOOL_OUTPUT_ANCHORS,
+        READ_TOOL_OUTPUT_ANCHOR,
+    ]
 
 
 def is_tool_output_tool(name: str) -> bool:
@@ -109,6 +184,10 @@ async def handle_tool_output_tool(
         return await _handle_read(arguments, store)
     if tool_name == "search_tool_output":
         return await _handle_search(arguments, store)
+    if tool_name == "list_tool_output_anchors":
+        return await _handle_list_anchors(arguments, store)
+    if tool_name == "read_tool_output_anchor":
+        return await _handle_read_anchor(arguments, store)
     return ToolResult(output=f"Unknown tool output tool: {tool_name}", is_error=True)
 
 
@@ -178,3 +257,65 @@ async def _handle_search(arguments: dict[str, Any], store: ToolOutputStore) -> T
     header += ":"
 
     return ToolResult(output=header + "\n\n" + "\n---\n".join(parts))
+
+
+async def _handle_list_anchors(arguments: dict[str, Any], store: ToolOutputStore) -> ToolResult:
+    call_id = arguments.get("call_id")
+    if not isinstance(call_id, str) or not call_id:
+        return ToolResult(output="call_id is required.", is_error=True)
+
+    anchors = await store.list_anchors(call_id)
+    if anchors is None:
+        return ToolResult(
+            output=f"No stored output found for call_id '{call_id}'.",
+            is_error=True,
+        )
+    if not anchors:
+        return ToolResult(output=f"No anchors found for call_id '{call_id}'.")
+
+    lines = [f"Found {len(anchors)} anchor(s) for '{call_id}':", ""]
+    for item in anchors:
+        label_suffix = f" - {item.label}" if item.label else ""
+        lines.append(
+            f"- {item.anchor} ({item.kind}, lines {item.start_line}-{item.end_line}){label_suffix}"
+        )
+    return ToolResult(output="\n".join(lines))
+
+
+async def _handle_read_anchor(arguments: dict[str, Any], store: ToolOutputStore) -> ToolResult:
+    call_id = arguments.get("call_id")
+    if not isinstance(call_id, str) or not call_id:
+        return ToolResult(output="call_id is required.", is_error=True)
+
+    anchor = arguments.get("anchor")
+    if not isinstance(anchor, str) or not anchor:
+        return ToolResult(output="anchor is required.", is_error=True)
+
+    before_lines = max(0, int(arguments.get("before_lines", 0)))
+    after_lines = max(0, int(arguments.get("after_lines", 0)))
+    result = await store.read_anchor(
+        call_id,
+        anchor,
+        before_lines=before_lines,
+        after_lines=after_lines,
+    )
+    if result is None:
+        anchors = await store.list_anchors(call_id)
+        if anchors is None:
+            return ToolResult(
+                output=f"No stored output found for call_id '{call_id}'.",
+                is_error=True,
+            )
+        available = ", ".join(item.anchor for item in anchors[:10])
+        message = f"No anchor named '{anchor}' found for call_id '{call_id}'."
+        if available:
+            message += f" Available anchors: {available}."
+        return ToolResult(output=message, is_error=True)
+
+    header = (
+        f"Anchor '{result.anchor.anchor}' ({result.anchor.kind}, "
+        f"lines {result.anchor.start_line}-{result.anchor.end_line})"
+    )
+    if result.anchor.label:
+        header += f" - {result.anchor.label}"
+    return ToolResult(output=header + "\n\n" + result.content)

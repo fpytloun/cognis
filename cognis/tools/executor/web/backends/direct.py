@@ -17,6 +17,7 @@ import httpx
 
 from cognis.models.tool import ToolResult
 from cognis.providers.circuit_breaker import CircuitBreaker, CircuitBreakerError
+from cognis.tools.executor.web.backends.formatting import build_search_tool_result
 from cognis.tools.executor.web.headers import (
     clamp_timeout,
     fetch_with_retry,
@@ -137,15 +138,12 @@ async def _ddg_search(
     if not results:
         return ToolResult(output="No search results found.")
 
-    lines: list[str] = []
-    for i, r in enumerate(results, 1):
-        title = r.get("title", "")
-        url = r.get("href", r.get("link", ""))
-        body = r.get("body", r.get("snippet", ""))
-        lines.append(f"[{i}] {title}")
-        lines.append(f"    URL: {url}")
-        if body:
-            lines.append(f"    {body}")
-        lines.append("")
-
-    return ToolResult(output="\n".join(lines))
+    formatted_results = [
+        {
+            "title": r.get("title", ""),
+            "url": r.get("href", r.get("link", "")),
+            "snippet": r.get("body", r.get("snippet", "")),
+        }
+        for r in results
+    ]
+    return build_search_tool_result(answer=None, results=formatted_results)

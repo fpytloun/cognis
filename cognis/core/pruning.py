@@ -112,6 +112,8 @@ def prune_tool_outputs(
             **msg,
             "content": (
                 "[Tool result cleared from context; content is incomplete here. "
+                f"Use list_tool_output_anchors(call_id='{call_id}') for structured sections, "
+                f"read_tool_output_anchor(call_id='{call_id}', anchor='result:1') for one anchored section, "
                 f"Use search_tool_output(call_id='{call_id}', pattern='error|timeout|keyword') for targeted lookup "
                 f"or read_tool_output(call_id='{call_id}') to inspect the saved output.]"
             ),

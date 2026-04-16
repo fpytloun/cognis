@@ -13,6 +13,7 @@ import httpx
 
 from cognis.models.tool import ToolResult
 from cognis.providers.circuit_breaker import CircuitBreaker, CircuitBreakerError
+from cognis.tools.executor.web.backends.formatting import build_search_tool_result
 
 logger = logging.getLogger(__name__)
 
@@ -264,31 +265,23 @@ def _set_if(body: dict[str, Any], opts: dict[str, Any], key: str) -> None:
 
 def _format_tavily_search(data: dict[str, Any]) -> ToolResult:
     """Format Tavily search response into readable output."""
-    lines: list[str] = []
-
     answer = data.get("answer")
-    if answer:
-        lines.append(f"Answer: {answer}")
-        lines.append("")
-
     results = data.get("results", [])
-    for i, r in enumerate(results, 1):
-        title = r.get("title", "")
-        url = r.get("url", "")
-        content = r.get("content", "")
-        score = r.get("score")
-        lines.append(f"[{i}] {title}")
-        lines.append(f"    URL: {url}")
-        if score is not None:
-            lines.append(f"    Relevance: {score:.2f}")
-        if content:
-            lines.append(f"    {content}")
-        lines.append("")
-
     if not results and not answer:
         return ToolResult(output="No search results found.")
-
-    return ToolResult(output="\n".join(lines))
+    formatted_results = [
+        {
+            "title": r.get("title", ""),
+            "url": r.get("url", ""),
+            "snippet": r.get("content", ""),
+            "score": r.get("score"),
+        }
+        for r in results
+    ]
+    return build_search_tool_result(
+        answer=str(answer) if isinstance(answer, str) else None,
+        results=formatted_results,
+    )
 
 
 def _format_tavily_crawl(data: dict[str, Any]) -> ToolResult:

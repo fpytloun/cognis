@@ -2680,8 +2680,18 @@ class AgentLoop:
                     # exploration via read_tool_output / search_tool_output.
                     # The raw output (before XML wrapping) is what we store.
                     raw_output = result.metadata.get("_raw_output") if result.metadata else None
-                    if raw_output and self.tool_output_store is not None:
-                        await self.tool_output_store.save(tc.call_id, raw_output)
+                    stored_output = (
+                        result.metadata.get("stored_output") if result.metadata else None
+                    )
+                    if (stored_output or raw_output) and self.tool_output_store is not None:
+                        anchors = result.metadata.get("output_anchors") if result.metadata else None
+                        await self.tool_output_store.save(
+                            tc.call_id,
+                            stored_output
+                            if isinstance(stored_output, str) and stored_output
+                            else raw_output,
+                            anchors=anchors if isinstance(anchors, list) else None,
+                        )
 
                     # Intaris gets a middle-truncated preview (larger than
                     # the WS preview) so compaction and audit have useful

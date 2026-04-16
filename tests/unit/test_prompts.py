@@ -66,6 +66,8 @@ def test_chat_prompt_explains_truncated_output_recovery() -> None:
     assert instructions is not None
     assert "middle truncated" in instructions
     assert "Tool result cleared" in instructions
+    assert "list_tool_output_anchors(call_id=...)" in instructions
+    assert "read_tool_output_anchor(call_id=..., anchor=...)" in instructions
     assert 'search_tool_output(call_id=..., pattern="error|timeout|keyword")' in instructions
     assert "read_tool_output(call_id=..., offset=..., limit=...)" in instructions
 

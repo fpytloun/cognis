@@ -48,9 +48,11 @@ def _build_marker(total_chars: int, call_id: str | None) -> str:
     parts = [f"\n\n... [middle truncated: {total_chars:,} chars total"]
     if call_id:
         parts.append(
-            ", saved output is incomplete here; use "
-            f"search_tool_output(call_id='{call_id}', pattern='error|timeout|keyword') to find specific details "
-            f"or read_tool_output(call_id='{call_id}') to inspect sequentially"
+            ", use "
+            f"list_tool_output_anchors(call_id='{call_id}'), "
+            f"read_tool_output_anchor(call_id='{call_id}', anchor='result:1'), "
+            f"search_tool_output(call_id='{call_id}', pattern='error|timeout|keyword'), "
+            f"or read_tool_output(call_id='{call_id}')"
         )
     parts.append("] ...\n\n")
     return "".join(parts)

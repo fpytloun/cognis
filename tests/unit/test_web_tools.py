@@ -548,10 +548,21 @@ class TestWebSearchHandler:
         assert "real calendar date" in result.output
 
     def test_tool_output_descriptions_guide_recovery(self) -> None:
-        from cognis.tools.builtin.tool_output import READ_TOOL_OUTPUT, SEARCH_TOOL_OUTPUT
+        from cognis.tools.builtin.tool_output import (
+            LIST_TOOL_OUTPUT_ANCHORS,
+            READ_TOOL_OUTPUT,
+            READ_TOOL_OUTPUT_ANCHOR,
+            SEARCH_TOOL_OUTPUT,
+        )
 
         assert "truncated or cleared from context" in READ_TOOL_OUTPUT.description
+        assert (
+            "prefer list_tool_output_anchors and read_tool_output_anchor first"
+            in READ_TOOL_OUTPUT.description
+        )
         assert "Use this before read_tool_output" in SEARCH_TOOL_OUTPUT.description
+        assert "structured sections" in LIST_TOOL_OUTPUT_ANCHORS.description
+        assert "one section" in READ_TOOL_OUTPUT_ANCHOR.description
 
 
 class TestTavilyRequiredTools:
@@ -633,9 +644,45 @@ class TestTavilyBackend:
         }
         result = _format_tavily_search(data)
         assert not result.is_error
+        assert "[[answer]]" in result.output
+        assert "[[result:1]]" in result.output
         assert "Test answer" in result.output
         assert "Result 1" in result.output
         assert "https://example.com" in result.output
+        anchors = result.metadata.get("output_anchors") if result.metadata else None
+        assert isinstance(anchors, list)
+        assert anchors[0]["anchor"] == "answer"
+        assert anchors[1]["anchor"] == "result:1"
+        stored_output = result.metadata.get("stored_output") if result.metadata else None
+        assert isinstance(stored_output, str)
+        assert "[[answer]]" in stored_output
+
+    @pytest.mark.asyncio()
+    async def test_search_compacts_noisy_result_content(self) -> None:
+        from cognis.tools.executor.web.backends.tavily import _format_tavily_search
+
+        noisy = "Headline\n\n" + "Most Popular " * 150
+        result = _format_tavily_search(
+            {
+                "results": [
+                    {
+                        "title": "Result 1",
+                        "url": "https://example.com",
+                        "content": noisy,
+                        "score": 0.9,
+                    }
+                ]
+            }
+        )
+
+        assert not result.is_error
+        assert "Snippet:" in result.output
+        assert "[snippet truncated]" in result.output
+        assert "\n\nMost Popular" not in result.output
+        stored_output = result.metadata.get("stored_output") if result.metadata else None
+        assert isinstance(stored_output, str)
+        assert "Most Popular Most Popular" in stored_output
+        assert len(stored_output) > len(result.output)
 
     @pytest.mark.asyncio()
     async def test_search_no_results(self) -> None:
@@ -690,8 +737,33 @@ class TestBraveBackend:
         }
         result = _format_brave_results(data)
         assert not result.is_error
+        assert "[[result:1]]" in result.output
         assert "Brave Result" in result.output
         assert "https://example.com" in result.output
+
+    @pytest.mark.asyncio()
+    async def test_search_stored_output_keeps_three_extra_snippets(self) -> None:
+        from cognis.tools.executor.web.backends.brave import _format_brave_results
+
+        result = _format_brave_results(
+            {
+                "web": {
+                    "results": [
+                        {
+                            "title": "Brave Result",
+                            "url": "https://example.com",
+                            "description": "Desc",
+                            "extra_snippets": ["one", "two", "three", "four"],
+                        }
+                    ]
+                }
+            }
+        )
+
+        stored_output = result.metadata.get("stored_output") if result.metadata else None
+        assert isinstance(stored_output, str)
+        assert "one two three" in stored_output
+        assert "four" not in stored_output
 
     @pytest.mark.asyncio()
     async def test_search_no_results(self) -> None:

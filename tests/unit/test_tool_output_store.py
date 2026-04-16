@@ -129,3 +129,84 @@ async def test_long_lines_truncated(store: ToolOutputStore) -> None:
     result = await store.read("call_long")
     assert result is not None
     assert "line truncated" in result.content
+
+
+@pytest.mark.asyncio
+async def test_save_and_list_anchors(store: ToolOutputStore) -> None:
+    await store.save(
+        "call_anchor",
+        "[[result:1]]\nfirst\n[[result:2]]\nsecond",
+        anchors=[
+            {
+                "anchor": "result:1",
+                "label": "First",
+                "kind": "search_result",
+                "start_line": 1,
+                "end_line": 2,
+            },
+            {
+                "anchor": "result:2",
+                "label": "Second",
+                "kind": "search_result",
+                "start_line": 3,
+                "end_line": 4,
+            },
+        ],
+    )
+
+    anchors = await store.list_anchors("call_anchor")
+    assert anchors is not None
+    assert [item.anchor for item in anchors] == ["result:1", "result:2"]
+    assert anchors[0].label == "First"
+
+
+@pytest.mark.asyncio
+async def test_read_anchor_returns_section(store: ToolOutputStore) -> None:
+    await store.save(
+        "call_anchor_read",
+        "[[answer]]\nAnswer: short\n\n[[result:1]]\n[1] Title\n    URL: https://example.com\n\n[[result:2]]\n[2] Other",
+        anchors=[
+            {
+                "anchor": "answer",
+                "label": "Answer",
+                "kind": "answer",
+                "start_line": 1,
+                "end_line": 2,
+            },
+            {
+                "anchor": "result:1",
+                "label": "Title",
+                "kind": "search_result",
+                "start_line": 4,
+                "end_line": 6,
+            },
+            {
+                "anchor": "result:2",
+                "label": "Other",
+                "kind": "search_result",
+                "start_line": 8,
+                "end_line": 9,
+            },
+        ],
+    )
+
+    result = await store.read_anchor("call_anchor_read", "result:1")
+    assert result is not None
+    assert result.anchor.anchor == "result:1"
+    assert "4: [[result:1]]" in result.content
+    assert "6:     URL: https://example.com" in result.content
+    assert "8: [[result:2]]" not in result.content
+
+
+@pytest.mark.asyncio
+async def test_list_anchors_falls_back_to_inline_markers(store: ToolOutputStore) -> None:
+    await store.save(
+        "call_inline",
+        "[[result:1]]\nFirst\n\n[[result:2]]\nSecond",
+        anchors=[],
+    )
+
+    anchors = await store.list_anchors("call_inline")
+    assert anchors is not None
+    assert [item.anchor for item in anchors] == ["result:1", "result:2"]
+    assert anchors[0].kind == "search_result"

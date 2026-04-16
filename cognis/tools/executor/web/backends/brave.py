@@ -16,6 +16,7 @@ import httpx
 
 from cognis.models.tool import ToolResult
 from cognis.providers.circuit_breaker import CircuitBreaker, CircuitBreakerError
+from cognis.tools.executor.web.backends.formatting import build_search_tool_result
 
 logger = logging.getLogger(__name__)
 
@@ -134,20 +135,19 @@ def _format_brave_results(data: dict[str, Any]) -> ToolResult:
     if not results:
         return ToolResult(output="No search results found.")
 
-    lines: list[str] = []
-    for i, r in enumerate(results, 1):
-        title = r.get("title", "")
-        url = r.get("url", "")
+    formatted_results: list[dict[str, object]] = []
+    for r in results:
         description = r.get("description", "")
-        lines.append(f"[{i}] {title}")
-        lines.append(f"    URL: {url}")
-        if description:
-            lines.append(f"    {description}")
-
         extra = r.get("extra_snippets", [])
-        if extra:
-            for snippet in extra[:3]:
-                lines.append(f"    > {snippet}")
-        lines.append("")
+        snippet_parts = [str(description)] if description else []
+        if isinstance(extra, list):
+            snippet_parts.extend(str(item) for item in extra[:3] if item)
+        formatted_results.append(
+            {
+                "title": r.get("title", ""),
+                "url": r.get("url", ""),
+                "snippet": " ".join(part for part in snippet_parts if part),
+            }
+        )
 
-    return ToolResult(output="\n".join(lines))
+    return build_search_tool_result(answer=None, results=formatted_results)

@@ -73,6 +73,10 @@ _TOOL_GUIDANCE = """\
   or search tools to navigate large files.
 - If a tool result says `middle truncated` or `Tool result cleared`, the \
   visible content is incomplete.
+- For structured saved outputs such as numbered search results, use \
+  `list_tool_output_anchors(call_id=...)` first to discover anchors and \
+  `read_tool_output_anchor(call_id=..., anchor=...)` to load one section \
+  without reloading the full output.
 - When a truncated tool result includes a `call_id`, use \
   `search_tool_output(call_id=..., pattern="error|timeout|keyword")` first when you need a \
   specific error, URL, symbol, heading, date, or keyword.

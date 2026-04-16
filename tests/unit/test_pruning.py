@@ -64,6 +64,8 @@ def test_old_tool_results_pruned() -> None:
     result = prune_tool_outputs(messages, protect_tokens=1000, minimum_savings=100)
     # Old (big) result should be cleared
     assert "Tool result cleared" in result[2]["content"]
+    assert "list_tool_output_anchors" in result[2]["content"]
+    assert "read_tool_output_anchor" in result[2]["content"]
     assert "search_tool_output" in result[2]["content"]
     assert "read_tool_output" in result[2]["content"]
     assert "c1" in result[2]["content"]
@@ -115,6 +117,7 @@ def test_large_arguments_cleared() -> None:
     )
     # Tool result should be cleared
     assert "Tool result cleared" in result[2]["content"]
+    assert "list_tool_output_anchors" in result[2]["content"]
     assert "search_tool_output" in result[2]["content"]
     # Tool call arguments should also be cleared (as a JSON string)
     func = result[1]["tool_calls"][0]["function"]
