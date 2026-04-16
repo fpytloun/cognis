@@ -182,6 +182,23 @@
     return typeof val === 'string' ? val : '';
   }
 
+  function hasRecordedStepOutput(stepRun: StepRun | null): boolean {
+    if (!stepRun?.output) return false;
+    const output = stepRun.output;
+    const summary = output.summary;
+    const content = output.content;
+    const claims = output.claims;
+    const error = output.error;
+    const outcome = output.outcome;
+    return (
+      (typeof summary === 'string' && summary.trim().length > 0) ||
+      (typeof content === 'string' && content.trim().length > 0) ||
+      (Array.isArray(claims) && claims.length > 0) ||
+      (typeof error === 'string' && error.trim().length > 0) ||
+      (typeof outcome === 'object' && outcome !== null)
+    );
+  }
+
   function stepOutputClaims(stepRun: StepRun): string[] {
     const claims = stepRun.output?.claims;
     return Array.isArray(claims) ? claims.filter((c): c is string => typeof c === 'string') : [];
@@ -301,7 +318,11 @@
     return workflowToFormState(workflowDef).steps;
   });
 
-  let diagramActiveStep = $derived(task?.workflow_run?.current_step_name ?? '');
+  let diagramActiveStep = $derived.by(() => {
+    if (!task) return '';
+    if (!['running', 'evaluating'].includes(task.status)) return '';
+    return task.workflow_run?.current_step_name ?? '';
+  });
 
   /** Build step status map from step_runs (latest attempt per step) */
   let diagramStepStatuses = $derived.by(() => {
@@ -515,7 +536,7 @@
     const entries: Array<[string, boolean]> = [];
     for (const group of stepGroups) {
       const latest = group.latest;
-      entries.push([group.stepName, Boolean(latest && (stepOutputSummary(latest) || stepOutputContent(latest)))]);
+      entries.push([group.stepName, hasRecordedStepOutput(latest)]);
     }
     return Object.fromEntries(entries);
   });
@@ -1062,10 +1083,12 @@
                         <p class="mt-3 text-sm text-slate-400">No extra completion metadata was recorded for this attempt.</p>
                       {/if}
 
-                      <div class="mt-4 flex flex-wrap items-center gap-2 border-t border-slate-800 pt-3">
-                        <Button size="sm" variant="secondary" onclick={() => openOutputModal(latestAttempt)}>Show full output</Button>
-                        <span class="text-xs text-slate-500">Includes completion metadata and the finalized assistant output.</span>
-                      </div>
+                      {#if hasRecordedStepOutput(latestAttempt)}
+                        <div class="mt-4 flex flex-wrap items-center gap-2 border-t border-slate-800 pt-3">
+                          <Button size="sm" variant="secondary" onclick={() => openOutputModal(latestAttempt)}>Show full output</Button>
+                          <span class="text-xs text-slate-500">Includes completion metadata and the finalized assistant output.</span>
+                        </div>
+                      {/if}
                     </div>
 
                     {#if latestAttempt.evaluation}
@@ -1123,10 +1146,12 @@
                                 {#if summary}
                                   <div class="prose prose-sm prose-invert max-w-none text-slate-400">{@html renderMarkdown(summary)}</div>
                                 {/if}
-                                <div class="mt-3 flex flex-wrap items-center gap-2">
-                                  <Button size="sm" variant="ghost" onclick={() => openOutputModal(stepRun)}>Show full output</Button>
-                                  <span class="text-xs text-slate-500">Opens the finalized result for this attempt.</span>
-                                </div>
+                                {#if hasRecordedStepOutput(stepRun)}
+                                  <div class="mt-3 flex flex-wrap items-center gap-2">
+                                    <Button size="sm" variant="ghost" onclick={() => openOutputModal(stepRun)}>Show full output</Button>
+                                    <span class="text-xs text-slate-500">Opens the finalized result for this attempt.</span>
+                                  </div>
+                                {/if}
                               {/if}
                             </div>
                           {/each}
@@ -1386,7 +1411,9 @@
               {:else}
                 <p class="mt-3 text-sm text-slate-400">Open the full output to inspect completion metadata and the finalized assistant output.</p>
               {/if}
-              <Button class="mt-4" size="sm" variant="secondary" onclick={() => openOutputModal(latestAttempt)}>Show full output</Button>
+              {#if hasRecordedStepOutput(latestAttempt)}
+                <Button class="mt-4" size="sm" variant="secondary" onclick={() => openOutputModal(latestAttempt)}>Show full output</Button>
+              {/if}
             </div>
           </div>
         {:else}
