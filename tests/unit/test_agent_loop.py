@@ -1966,3 +1966,35 @@ async def test_step_complete_uses_only_final_assistant_message_for_content() -> 
 
     assert output is not None
     assert output.content == "Final clean briefing text."
+
+
+def test_step_prompt_respects_expected_output_without_allowing_silent_completion() -> None:
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(),
+        context_assembler=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=SimpleNamespace(),
+        event_bus=SimpleNamespace(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="summary", type="run", prompt="Write the summary."),
+        session=SimpleNamespace(session_id="sess-1", user_email="user@example.com"),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        task_title="Daily summary",
+        task_description="Summarize today.",
+        task_expected_output="No assistant message.",
+    )
+
+    prompt = agent_loop._build_step_prompt(ctx)
+
+    assert "Respect Expected output closely" in prompt
+    assert (
+        "Do not interpret Expected output alone as permission to omit the assistant deliverable entirely"
+        in prompt
+    )

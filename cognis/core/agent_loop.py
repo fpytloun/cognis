@@ -4529,7 +4529,12 @@ class AgentLoop:
         parts.append(
             "\n\n---\n"
             "When you have completed the objective, write out your findings and "
-            "deliverables as a detailed text response. Then call step_complete "
+            "deliverables as a detailed text response. Respect Expected output "
+            "closely for structure, tone, format, and level of detail. If "
+            "Expected output conflicts with the step completion contract, still "
+            "provide the minimum assistant deliverable needed to complete the "
+            "step correctly. Do not interpret Expected output alone as permission "
+            "to omit the assistant deliverable entirely. Then call step_complete "
             "with a summary, structured outputs, verifiable claims, and an "
             "outcome when the completed step should explicitly report rejection "
             "or failure."

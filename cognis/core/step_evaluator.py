@@ -76,6 +76,9 @@ Evaluation checklist:
 7. Only require artifacts explicitly requested by the step objective. Process
    guidance is not automatically a required output artifact.
 8. Use execution evidence to validate claims when it is relevant and available.
+9. Treat Expected output as strong guidance for output shape, tone, format, and
+   level of detail, but do not fail the step solely because the assistant
+   produced the minimum deliverable required by the runtime step contract.
 
 Decide:
 - "approved" — the step objective is satisfactorily met based on actual \

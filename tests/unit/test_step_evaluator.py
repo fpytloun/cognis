@@ -496,3 +496,4 @@ async def test_evaluator_prompt_separates_prose_metadata_and_execution_evidence(
     assert "step_complete metadata:" in prompt
     assert "Execution evidence:" in prompt
     assert "require step_complete metadata" in prompt
+    assert "Expected output as strong guidance for output shape" in prompt
