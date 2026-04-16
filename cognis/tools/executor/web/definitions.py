@@ -13,7 +13,11 @@ from cognis.models.tool import ToolDefinition, ToolSource
 _EXECUTOR_SOURCE = ToolSource(type="executor")
 
 
-def web_tool_definitions(available_backends: list[str]) -> list[ToolDefinition]:
+def web_tool_definitions(
+    available_backends: list[str],
+    *,
+    default_backend: str | None = None,
+) -> list[ToolDefinition]:
     """Generate web tool definitions based on configured backends.
 
     Args:
@@ -26,10 +30,29 @@ def web_tool_definitions(available_backends: list[str]) -> list[ToolDefinition]:
     has_tavily = "tavily" in available_backends
     has_brave = "brave" in available_backends
     has_multiple = len(available_backends) > 1
+    resolved_default_backend = default_backend or available_backends[0]
+    if resolved_default_backend not in available_backends:
+        resolved_default_backend = available_backends[0]
+
+    fetch_default_backend = _resolve_capable_default_backend(
+        resolved_default_backend,
+        [backend for backend in available_backends if backend != "brave"],
+    )
 
     tools: list[ToolDefinition] = [
-        _build_web_fetch(available_backends, has_tavily, has_multiple),
-        _build_web_search(available_backends, has_tavily, has_brave, has_multiple),
+        _build_web_fetch(
+            available_backends,
+            has_tavily,
+            has_multiple,
+            default_backend=fetch_default_backend,
+        ),
+        _build_web_search(
+            available_backends,
+            has_tavily,
+            has_brave,
+            has_multiple,
+            default_backend=resolved_default_backend,
+        ),
     ]
 
     if has_tavily:
@@ -44,6 +67,13 @@ def web_tool_definitions(available_backends: list[str]) -> list[ToolDefinition]:
     return tools
 
 
+def _resolve_capable_default_backend(default_backend: str, supported_backends: list[str]) -> str:
+    """Return the effective default backend for a tool with limited backend support."""
+    if default_backend in supported_backends:
+        return default_backend
+    return supported_backends[0]
+
+
 # ---------------------------------------------------------------------------
 # web_fetch
 # ---------------------------------------------------------------------------
@@ -53,6 +83,8 @@ def _build_web_fetch(
     backends: list[str],
     has_tavily: bool,
     has_multiple: bool,
+    *,
+    default_backend: str,
 ) -> ToolDefinition:
     properties: dict[str, object] = {
         "url": {"type": "string", "description": "URL to fetch"},
@@ -69,12 +101,19 @@ def _build_web_fetch(
         properties["backend"] = {
             "type": "string",
             "enum": fetch_backends,
-            "description": f"Backend to use (default: {backends[0]}). {_fetch_backend_hints(fetch_backends)}",
+            "description": (
+                f"Backend to use (default: {default_backend}). "
+                "Omit this unless you need to override the configured default. "
+                f"{_fetch_backend_hints(fetch_backends)}"
+            ),
         }
 
     desc = "Fetch content from a URL and return it as text or markdown."
     if has_tavily:
-        desc += " Use 'tavily' backend for higher-quality extraction with content reranking."
+        desc += (
+            f" The configured default backend is '{default_backend}'. "
+            "Use 'tavily' for higher-quality extraction with content reranking when you need to override it."
+        )
 
     return ToolDefinition(
         name="web_fetch",
@@ -97,6 +136,8 @@ def _build_web_search(
     has_tavily: bool,
     has_brave: bool,
     has_multiple: bool,
+    *,
+    default_backend: str,
 ) -> ToolDefinition:
     properties: dict[str, object] = {
         "query": {"type": "string", "description": "Search query"},
@@ -110,7 +151,11 @@ def _build_web_search(
         properties["backend"] = {
             "type": "string",
             "enum": backends,
-            "description": f"Backend to use (default: {backends[0]}). {_search_backend_hints(backends)}",
+            "description": (
+                f"Backend to use (default: {default_backend}). "
+                "Omit this unless you need to override the configured default. "
+                f"{_search_backend_hints(backends)}"
+            ),
         }
 
     # Tavily-specific params

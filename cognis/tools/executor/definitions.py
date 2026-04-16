@@ -342,8 +342,9 @@ WEB_FETCH_TOOL = ToolDefinition(
     description=(
         "Fetch content from a URL and return it as text or markdown. "
         "Supports configurable backends. Use 'direct' for simple page fetching "
-        "(default, free), 'tavily' for higher-quality extraction with content "
-        "reranking. The 'backend' parameter overrides the system default."
+        "(free) and 'tavily' for higher-quality extraction with content "
+        "reranking. Omit the 'backend' parameter unless you need to override "
+        "the configured system default."
     ),
     parameters={
         "type": "object",
@@ -358,8 +359,8 @@ WEB_FETCH_TOOL = ToolDefinition(
             "backend": {
                 "type": "string",
                 "description": (
-                    "Backend to use: 'direct' (default, free), 'tavily' "
-                    "(higher quality extraction). Overrides system default."
+                    "Backend to use: 'direct' (free) or 'tavily' "
+                    "(higher quality extraction). Overrides the configured system default."
                 ),
             },
         },

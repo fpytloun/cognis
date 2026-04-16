@@ -113,7 +113,7 @@ def static_tool_definitions() -> list[ToolDefinition]:
     from cognis.tools.executor.web.definitions import web_tool_definitions
 
     # Include all web tools for discovery (as if all backends were available)
-    all_web = web_tool_definitions(["direct", "tavily", "brave"])
+    all_web = web_tool_definitions(["direct", "tavily", "brave"], default_backend="direct")
     from cognis.tools.builtin.schedule import schedule_tools
 
     return [
@@ -325,7 +325,12 @@ def build_step_runtime_factory(
         # Add dynamic web tool definitions based on available backends
         from cognis.tools.executor.web.definitions import web_tool_definitions
 
-        agent_tools.extend(web_tool_definitions(web_config["web_available_backends"]))
+        agent_tools.extend(
+            web_tool_definitions(
+                web_config["web_available_backends"],
+                default_backend=web_config.get("web_backend"),
+            )
+        )
 
         # Resolve discoverable DB-backed skills for this agent and inject:
         # 1. Compact metadata into agent.skills for context assembly

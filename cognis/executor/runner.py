@@ -320,7 +320,10 @@ class ExecutorRunner:
         browser_config = config.get("browser") if isinstance(config, dict) else {}
         from cognis.tools.executor.web.definitions import web_tool_definitions
 
-        web_defs = web_tool_definitions(web_backends)
+        web_defs = web_tool_definitions(
+            web_backends,
+            default_backend=web_config_raw.get("web_backend"),
+        )
         # Store web runtime metadata for handler context
         runtime_state = "degraded" if mcp_warnings else "active"
         try:

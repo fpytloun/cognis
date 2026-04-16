@@ -225,7 +225,7 @@ class TestDynamicWebDefinitions:
     def test_tavily_adds_backend_and_params(self) -> None:
         from cognis.tools.executor.web.definitions import web_tool_definitions
 
-        defs = web_tool_definitions(["direct", "tavily"])
+        defs = web_tool_definitions(["direct", "tavily"], default_backend="tavily")
         search = next(d for d in defs if d.name == "web_search")
         props = search.parameters.get("properties", {})
         assert "backend" in props
@@ -241,12 +241,46 @@ class TestDynamicWebDefinitions:
         backend_enum = props["backend"]["enum"]
         assert "direct" in backend_enum
         assert "tavily" in backend_enum
+        assert "default: tavily" in props["backend"]["description"]
+        assert "Omit this unless you need to override" in props["backend"]["description"]
+
+    def test_fetch_uses_configured_default_backend_in_description(self) -> None:
+        from cognis.tools.executor.web.definitions import web_tool_definitions
+
+        defs = web_tool_definitions(["direct", "tavily"], default_backend="tavily")
+        fetch = next(d for d in defs if d.name == "web_fetch")
+        props = fetch.parameters.get("properties", {})
+        assert "backend" in props
+        assert "default: tavily" in props["backend"]["description"]
+        assert "configured default backend is 'tavily'" in fetch.description
+
+    def test_invalid_default_backend_falls_back_to_first_available(self) -> None:
+        from cognis.tools.executor.web.definitions import web_tool_definitions
+
+        defs = web_tool_definitions(["direct", "tavily"], default_backend="brave")
+        fetch = next(d for d in defs if d.name == "web_fetch")
+        search = next(d for d in defs if d.name == "web_search")
+        fetch_props = fetch.parameters.get("properties", {})
+        search_props = search.parameters.get("properties", {})
+        assert "default: direct" in fetch_props["backend"]["description"]
+        assert "default: direct" in search_props["backend"]["description"]
+
+    def test_fetch_brave_default_falls_back_to_direct_description(self) -> None:
+        from cognis.tools.executor.web.definitions import web_tool_definitions
+
+        defs = web_tool_definitions(["direct", "brave"], default_backend="brave")
+        fetch = next(d for d in defs if d.name == "web_fetch")
+        props = fetch.parameters.get("properties", {})
+        assert "backend" in props
+        assert props["backend"]["enum"] == ["direct"]
+        assert "default: direct" in props["backend"]["description"]
+        assert "configured default backend is 'direct'" not in fetch.description
 
     def test_tavily_only_tools_included(self) -> None:
         from cognis.tools.executor.web.definitions import web_tool_definitions
 
         defs_direct = web_tool_definitions(["direct"])
-        defs_tavily = web_tool_definitions(["direct", "tavily"])
+        defs_tavily = web_tool_definitions(["direct", "tavily"], default_backend="tavily")
         names_direct = {d.name for d in defs_direct}
         names_tavily = {d.name for d in defs_tavily}
         assert "web_crawl" not in names_direct
@@ -322,6 +356,24 @@ class TestWebFetchHandler:
             assert result.output == "test content"
             mock_backend.fetch.assert_awaited_once()
 
+    @pytest.mark.asyncio()
+    async def test_fetch_omitted_backend_uses_runtime_default(self) -> None:
+        from cognis.tools.executor.web.handlers import handle_web_fetch
+
+        with patch("cognis.tools.executor.web.handlers.resolve_fetch_backend") as mock_resolve:
+            mock_backend = AsyncMock()
+            mock_backend.fetch.return_value = ToolResult(output="test content")
+            mock_resolve.return_value = mock_backend
+
+            result = await handle_web_fetch(
+                {"url": "https://example.com", "format": "markdown"},
+                _CONTEXT_WITH_TAVILY,
+            )
+
+            assert not result.is_error
+            mock_resolve.assert_called_once_with(_CONTEXT_WITH_TAVILY.runtime_metadata, None)
+            mock_backend.fetch.assert_awaited_once()
+
 
 class TestWebSearchHandler:
     """Test the web_search handler."""
@@ -349,6 +401,22 @@ class TestWebSearchHandler:
             assert not result.is_error
             assert result.output == "search results"
             mock_backend.search.assert_awaited_once()
+
+    @pytest.mark.asyncio()
+    async def test_search_omitted_backend_uses_runtime_default(self) -> None:
+        from cognis.tools.executor.web.handlers import handle_web_search
+
+        with patch("cognis.tools.executor.web.handlers.resolve_search_backend") as mock_resolve:
+            mock_backend = AsyncMock(spec=TavilyBackend)
+            mock_backend.search.return_value = ToolResult(output="search results")
+            mock_resolve.return_value = mock_backend
+
+            result = await handle_web_search({"query": "test query"}, _CONTEXT_WITH_TAVILY)
+
+            assert not result.is_error
+            mock_resolve.assert_called_once_with(_CONTEXT_WITH_TAVILY.runtime_metadata, None)
+            mock_backend.search.assert_awaited_once()
+            assert result.metadata["tavily_query_normalized"] is False
 
     @pytest.mark.asyncio()
     async def test_search_passes_options(self) -> None:
