@@ -400,6 +400,18 @@ class ContextAssembler:
             )
 
         cached_intention = self.session_cache.get_intention(session.session_id)
+        project_instructions = _load_project_instructions(
+            workspace_root=workspace_root,
+            effective_working_directory=effective_working_directory,
+            executor_environment=executor_environment,
+        )
+        prefix_entries = await self._ensure_immutable_prefix(
+            session=session,
+            agent=agent,
+            project_instructions=project_instructions,
+            memory_labels=conversation.context.memory_labels,
+            context=cached_intention,
+        )
 
         with scoped_runtime_context(user_email=session.user_email, agent_id=session.agent_id):
             recall_task = self.memory.recall(
@@ -499,21 +511,23 @@ class ContextAssembler:
         # recall_result is guaranteed to be a dict here (we raise on Exception above).
         recall_payload: dict[str, Any] = recall_result
         recall_session_id = str(recall_payload.get("session_id") or "").strip()
-        if session.mnemory_session_id is None and recall_session_id:
-            updated = await self.session_manager.attach_mnemory_session(
-                session.session_id, recall_session_id
+        if (
+            recall_session_id
+            and session.mnemory_session_id is not None
+            and recall_session_id != session.mnemory_session_id
+        ):
+            logger.warning(
+                "context: per-turn recall returned unexpected Mnemory session id",
+                extra={
+                    "extra_data": {
+                        "session_id": session.session_id,
+                        "expected_mnemory_session_id": session.mnemory_session_id,
+                    }
+                },
             )
-            if updated:
-                session.mnemory_session_id = recall_session_id
 
         # Format mutable search results
         mutable_search_results = _format_search_results(recall_payload.get("search_results"))
-
-        project_instructions = _load_project_instructions(
-            workspace_root=workspace_root,
-            effective_working_directory=effective_working_directory,
-            executor_environment=executor_environment,
-        )
 
         # Model resolution chain: session override → agent config → system default
         model_override = self.session_cache.get_model_override(session.session_id)
@@ -559,13 +573,6 @@ class ContextAssembler:
             agent.llm_config.max_tokens
             if agent.llm_config and agent.llm_config.max_tokens is not None
             else model_info.max_output_tokens
-        )
-        prefix_entries = await self._ensure_immutable_prefix(
-            session=session,
-            agent=agent,
-            project_instructions=project_instructions,
-            memory_labels=conversation.context.memory_labels,
-            context=cached_intention,
         )
         immutable_prefix = self._compose_immutable_prefix(
             agent=agent,

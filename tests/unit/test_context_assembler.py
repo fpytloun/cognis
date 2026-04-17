@@ -7,6 +7,7 @@ from time import monotonic
 import pytest
 
 from cognis.core.context import ContextAssembler, _build_environment_info
+from cognis.core.errors import ImmutablePrefixUnavailable
 from cognis.core.followups import (
     FollowUpMode,
     FollowUpOriginKind,
@@ -135,9 +136,14 @@ class _Memory:
     def __init__(self, fail: bool = False) -> None:
         self.fail = fail
         self.search_modes: list[str] = []
+        self.identity_calls: list[dict[str, object]] = []
+        self.recall_calls: list[dict[str, object]] = []
+        self.call_order: list[str] = []
 
     async def load_session_identity(self, **kwargs: object) -> dict[str, object]:
-        del kwargs
+        self.call_order.append("identity")
+        self.identity_calls.append(dict(kwargs))
+        await asyncio.sleep(0.1)
         return {
             "session_id": "mem-1",
             "instructions": "Use memory tools carefully.",
@@ -145,6 +151,8 @@ class _Memory:
         }
 
     async def recall(self, **kwargs: object) -> dict[str, object]:
+        self.call_order.append("recall")
+        self.recall_calls.append(dict(kwargs))
         self.search_modes.append(str(kwargs["search_mode"]))
         await asyncio.sleep(0.1)
         if self.fail:
@@ -299,8 +307,17 @@ async def test_context_assembler_runs_fetches_in_parallel_and_attaches_memory_se
     )
     elapsed = monotonic() - started_at
 
-    assert elapsed < 0.25
+    assert elapsed < 0.5
+    assert memory.call_order == ["identity", "recall"]
     assert memory.search_modes == ["search"]
+    assert memory.identity_calls == [
+        {
+            "session_id": None,
+            "labels": {"project": "cognis"},
+            "context": "cached intention",
+        }
+    ]
+    assert memory.recall_calls[0]["session_id"] == "mem-1"
     assert session_manager.attached == [("session-1", "mem-1")]
     assert any('trust="untrusted"' in str(message["content"]) for message in result.messages)
 
@@ -355,11 +372,20 @@ async def test_context_assembler_loads_root_project_instructions(tmp_path: Path)
 @pytest.mark.asyncio
 async def test_context_assembler_uses_search_mode_for_follow_up_turns() -> None:
     memory = _Memory()
+    cache = _SessionCache()
+    cache.prefix_entries = [
+        ImmutablePrefixEntry(
+            role="system",
+            source="identity",
+            content="Agent identity",
+            seq=1,
+        )
+    ]
     assembler = ContextAssembler(
         memory=memory,
         guardrails=_Guardrails(),
         llm=_LLM(),
-        session_cache=_SessionCache(),
+        session_cache=cache,
         session_manager=_SessionManager(),
         max_context_tokens=4096,
         compaction_threshold=0.85,
@@ -374,6 +400,7 @@ async def test_context_assembler_uses_search_mode_for_follow_up_turns() -> None:
     )
 
     assert memory.search_modes == ["search"]
+    assert memory.identity_calls == []
 
 
 @pytest.mark.asyncio
@@ -397,6 +424,42 @@ async def test_context_assembler_raises_on_mnemory_failure() -> None:
             user_message="should fail",
             tool_definitions=[],
         )
+
+
+@pytest.mark.asyncio
+async def test_context_assembler_fails_before_search_when_bootstrap_identity_lacks_core() -> None:
+    class _MissingCoreMemory(_Memory):
+        async def load_session_identity(self, **kwargs: object) -> dict[str, object]:
+            self.call_order.append("identity")
+            self.identity_calls.append(dict(kwargs))
+            return {
+                "session_id": "mem-1",
+                "instructions": "Use memory tools carefully.",
+                "core_memories": None,
+            }
+
+    memory = _MissingCoreMemory()
+    assembler = ContextAssembler(
+        memory=memory,
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=_SessionCache(),
+        session_manager=_SessionManager(),
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+
+    with pytest.raises(ImmutablePrefixUnavailable, match="Core memories are unavailable"):
+        await assembler.assemble(
+            session=_session(),
+            conversation=_conversation(),
+            agent=_agent(),
+            user_message="should fail",
+            tool_definitions=[],
+        )
+
+    assert memory.call_order == ["identity"]
+    assert memory.recall_calls == []
 
 
 @pytest.mark.asyncio
