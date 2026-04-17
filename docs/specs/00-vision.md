@@ -69,9 +69,10 @@ models) based on agent configuration.
 Orchestration decisions are made by **deterministic system logic**. The LLM
 focuses on *what* to do; the system decides *how* to orchestrate it.
 
-The LLM has delegation tools (`delegate`, `spawn_worker`, `fork`) that submit
-**requests** to the Decision Engine. The system approves, modifies, or rejects
-these. Predictable behavior regardless of model capability.
+The LLM has a delegation tool (`delegate`) plus task/workflow orchestration
+tools that submit **requests** to deterministic controller logic. The system
+approves, modifies, or rejects these. Predictable behavior regardless of model
+capability.
 
 ### 4. Non-Blocking by Default
 

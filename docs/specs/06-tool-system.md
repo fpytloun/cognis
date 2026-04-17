@@ -30,7 +30,7 @@ source wins. Same-source duplicates are configuration errors.
 ```
 LLM returns tool calls
   │
-  ├─ Orchestration (delegate, spawn_worker, fork)
+  ├─ Orchestration (delegate, task/workflow control)
   │    → Controller handles as session management operation
   │    → Not "tool execution" — these are orchestration directives
   │
@@ -372,35 +372,8 @@ delegate_tool = ToolDefinition(
     source=ToolSource(type="builtin"),
 )
 
-# spawn_worker — Request lightweight worker for focused task
-spawn_worker_tool = ToolDefinition(
-    name="spawn_worker",
-    description="Spawn a lightweight worker for focused tasks.",
-    parameters={
-        "type": "object",
-        "properties": {
-            "task": {"type": "string"},
-            "worker_type": {"type": "string", "enum": ["research", "summarize", "code", "general"]},
-        },
-        "required": ["task"],
-    },
-    source=ToolSource(type="builtin"),
-)
-
-# fork — Request isolated child session (same agent)
-fork_tool = ToolDefinition(
-    name="fork",
-    description="Fork into isolated child session for exploration.",
-    parameters={
-        "type": "object",
-        "properties": {
-            "reason": {"type": "string"},
-            "context_summary": {"type": "string"},
-        },
-        "required": ["reason"],
-    },
-    source=ToolSource(type="builtin"),
-)
+Worker/fork delegation modes remain deferred design concepts. The only
+implemented sub-session orchestration tool today is `delegate`.
 ```
 
 These tools submit **requests** to the Decision Engine, which approves,
@@ -549,7 +522,7 @@ see all of these directly.
 ```python
 full_effective_inventory = (
     executor_native_tools           # Always available (opt-out per agent)
-    + builtin_orchestration_tools   # delegate, spawn_worker, fork
+    + builtin_orchestration_tools   # delegate + task/workflow tools
     + builtin_system_tools          # list_agents, get_status, search_tools
     + builtin_memory_tools          # memory_search, memory_add, etc.
     + builtin_workflow_tools        # step_complete, step_todo_write, etc.
@@ -685,7 +658,7 @@ permissions:
 
 ```python
 class ToolRouter:
-    ORCHESTRATION_TOOLS = {"delegate", "spawn_worker", "fork"}
+    ORCHESTRATION_TOOLS = {"delegate", ...task/workflow tools...}
     CONTROLLER_TASK_TOOLS = {"list_tasks", "get_task_status", "update_task"}
 
     async def route(self, tool_call, session, agent, executor):

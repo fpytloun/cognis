@@ -203,7 +203,7 @@ class SessionStatus(str, Enum):
 
 
 class DelegationInfo(BaseModel):
-    mode: DelegationMode              # agent, worker, fork
+    mode: DelegationMode              # delegate mode metadata (legacy worker/fork concepts deferred)
     delegated_by_session: str
     delegated_by_agent: str
     effective_agent_id: str           # For Mnemory X-Agent-Id
@@ -552,7 +552,7 @@ just the simplest workflow. Background tasks use multi-step workflows.
 
 ## Sub-Session Execution
 
-When an agent calls `spawn_worker`, `delegate`, or `fork` during a step:
+When an agent calls `delegate` during a step:
 
 1. Controller creates a child session in Cognis DB and a child Intaris
    session under the parent (via `create_child_session`)

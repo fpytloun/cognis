@@ -549,7 +549,7 @@ Notes:
 - `conversation_updated` notifies clients of metadata changes such as
   auto-generated titles. Fires asynchronously after the first turn.
 - Delegation events track sub-session lifecycle. When an agent calls
-  `spawn_worker`/`delegate`/`fork`, the controller creates a child
+  `delegate`, the controller creates a child
   Intaris session under the parent and spawns a background agent loop.
   `delegation_started` fires immediately, `delegation_completed` or
   `delegation_failed` fires when the child session finishes. The child

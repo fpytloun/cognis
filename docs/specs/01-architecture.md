@@ -131,7 +131,7 @@ delegations). Each loop:
 
 3. Process response:
    a. Text → stream to client
-   b. Orchestration tool (delegate/fork/spawn_worker) → handle as session op
+   b. Orchestration tool (delegate / task-workflow control) → handle as controller op
    c. Other tool call → evaluate via Intaris, dispatch to executor
    d. Continue LLM loop until final response
 
@@ -205,16 +205,16 @@ User message arrives
   │
   ├── LLM Classifier (if rules inconclusive, ~200ms)
   │   Fast/cheap model classifies into:
-  │     inline | delegate_worker | delegate_agent | fork | multi_task
+  │     inline | delegate | multi_task
   │   Output: task description, suggested agent, complexity
   │
   └── Orchestration Plan (deterministic from classification)
 ```
 
-The LLM agent also has delegation tools (`delegate`, `spawn_worker`, `fork`).
-These submit **requests** to the Decision Engine — the system approves,
-modifies, or rejects them. This ensures predictable orchestration regardless
-of model capability.
+The LLM agent currently has one sub-session delegation tool (`delegate`) plus
+task/workflow orchestration tools. These submit **requests** to controller
+logic — the system approves, modifies, or rejects them. This ensures
+predictable orchestration regardless of model capability.
 
 ### Session Manager
 
@@ -283,7 +283,7 @@ Routes tool calls based on their type:
 ```
 LLM returns tool calls
   │
-  ├─ Orchestration tool (delegate, fork, spawn_worker)
+  ├─ Orchestration tool (delegate / task-workflow control)
   │    → Controller handles as session management operation
   │
   ├─ Intaris-managed MCP tool (github/, slack/, remote APIs)
@@ -860,7 +860,7 @@ cognis/
 │   │
 │   ├── tools/                      # Tool system
 │   │   ├── builtin/
-│   │   │   ├── orchestration.py   # delegate, spawn_worker, fork
+│   │   │   ├── orchestration.py   # delegate, task/workflow orchestration
 │   │   │   └── system.py          # list_agents, get_status
 │   │   ├── mcp.py                  # MCP client
 │   │   ├── skills.py

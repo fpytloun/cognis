@@ -136,7 +136,7 @@ For MVP external runtimes:
 - a new `runtime_session` is created only on:
   - conversation reset/new session
   - compaction rollover
-  - explicit fork/isolation boundary
+  - explicit isolation boundary (future fork-style runtimes remain deferred)
   - delegated child-session creation
   - workflow step isolation boundary
 

@@ -321,6 +321,7 @@ class ContextAssembler:
         user_message: str,
         user_attachments: list[dict[str, Any]] | None = None,
         attachment_notice: str | None = None,
+        attachment_context: str | None = None,
         user_message_role: str = "user",
         tool_definitions: list[ToolDefinition] | None = None,
         active_delegations: list[dict[str, Any]] | None = None,
@@ -365,6 +366,7 @@ class ContextAssembler:
                 user_message=user_message,
                 user_attachments=user_attachments,
                 attachment_notice=attachment_notice,
+                attachment_context=attachment_context,
                 user_message_role=user_message_role,
                 tool_definitions=tool_definitions,
                 active_delegations=active_delegations,
@@ -728,6 +730,8 @@ class ContextAssembler:
                 )
             if attachment_notice:
                 messages.append({"role": "system", "content": attachment_notice})
+            if attachment_context:
+                messages.append({"role": "user", "content": attachment_context})
             attachment_blocks, unsupported = _native_attachment_blocks(
                 user_attachments or [], model_info
             )
@@ -773,6 +777,8 @@ class ContextAssembler:
                 # this model — must survive dedupe or the model is not
                 # told why files are missing from the request.
                 messages.append({"role": "system", "content": attachment_notice})
+            if attachment_context:
+                messages.append({"role": "user", "content": attachment_context})
 
         messages = self._prune_messages(
             messages=messages,
@@ -833,6 +839,7 @@ class ContextAssembler:
         user_message: str,
         user_attachments: list[dict[str, Any]] | None = None,
         attachment_notice: str | None = None,
+        attachment_context: str | None = None,
         user_message_role: str = "user",
         tool_definitions: list[ToolDefinition] | None = None,
         active_delegations: list[dict[str, Any]] | None = None,
@@ -1012,6 +1019,8 @@ class ContextAssembler:
                 )
             if attachment_notice:
                 messages.append({"role": "system", "content": attachment_notice})
+            if attachment_context:
+                messages.append({"role": "user", "content": attachment_context})
             attachment_blocks, unsupported = _native_attachment_blocks(
                 user_attachments or [], model_info
             )
@@ -1050,6 +1059,8 @@ class ContextAssembler:
                 )
             if attachment_notice:
                 messages.append({"role": "system", "content": attachment_notice})
+            if attachment_context:
+                messages.append({"role": "user", "content": attachment_context})
 
         messages = self._prune_messages(
             messages=messages,

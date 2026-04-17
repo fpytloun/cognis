@@ -196,6 +196,87 @@ async def test_submit_turn_ignores_task_backed_step_questions() -> None:
 
 
 @pytest.mark.asyncio
+async def test_build_attachment_notice_uses_pdf_text_fallback() -> None:
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(get_model_override=lambda _sid: None),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(
+            llm=SimpleNamespace(
+                resolve_model_target=AsyncMock(return_value=("model-a", None)),
+                get_model_info=AsyncMock(
+                    return_value=SimpleNamespace(
+                        supports_vision=False,
+                        supports_pdf_input=False,
+                        supports_audio_input=False,
+                        supports_file_input=False,
+                    )
+                ),
+            )
+        ),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+
+    async def _extract_pdf_text(_attachment: AttachmentRef) -> str | None:
+        return "Extracted text from spec.pdf:\nHello PDF"
+
+    scheduler._extract_pdf_text = _extract_pdf_text  # type: ignore[method-assign]
+
+    notice = await scheduler._build_attachment_notice(
+        session=SimpleNamespace(session_id="sess-1"),
+        agent=AgentDefinition(
+            agent_id="agent-1",
+            owner_email="user@example.com",
+            name="Agent",
+        ),
+        attachments=[
+            AttachmentRef(
+                artifact_id="art-1",
+                kind=ArtifactKind.PDF,
+                mime_type="application/pdf",
+                filename="spec.pdf",
+                size_bytes=123,
+            )
+        ],
+    )
+
+    assert notice is not None
+    assert "using extracted text fallback" in notice
+    assert "Extracted text from spec.pdf" not in notice
+
+    context = await scheduler._build_attachment_context(
+        session=SimpleNamespace(session_id="sess-1"),
+        agent=AgentDefinition(
+            agent_id="agent-1",
+            owner_email="user@example.com",
+            name="Agent",
+        ),
+        attachments=[
+            AttachmentRef(
+                artifact_id="art-1",
+                kind=ArtifactKind.PDF,
+                mime_type="application/pdf",
+                filename="spec.pdf",
+                size_bytes=123,
+            )
+        ],
+    )
+
+    assert context is not None
+    assert '<attachment_context trust="untrusted">' in context
+    assert "Extracted text from spec.pdf" in context
+
+
+@pytest.mark.asyncio
 async def test_submit_turn_only_notifies_once_per_pending_escalation() -> None:
     pause_waiter = PauseWaiter()
     pause_waiter.register(
@@ -890,6 +971,7 @@ async def test_run_turn_publishes_effective_user_message_content() -> None:
         ],
         outbound_attachments=None,
         attachment_notice=None,
+        attachment_context=None,
         system_initiated=False,
         channel_deliverable=False,
         delivery_id=None,
@@ -977,6 +1059,7 @@ async def test_run_turn_clears_pending_follow_up_when_queued_relaunch_fails() ->
         attachments=[],
         outbound_attachments=None,
         attachment_notice=None,
+        attachment_context=None,
         system_initiated=False,
         follow_up=None,
         channel_deliverable=False,

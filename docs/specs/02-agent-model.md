@@ -27,7 +27,7 @@ work by delegating to secondary agents or spawning tasks.
 | System prompt | Free text appended after the structured personality block |
 | Can delegate | Yes (to other primary or bound secondary agents) |
 | Can spawn tasks | Yes |
-| Orchestration tools | Full (delegate, spawn_worker, tasks) |
+| Orchestration tools | Full (delegate, task/workflow tools) |
 | Mnemory bootstrap | Yes (structured personality fields synced as pinned memories; falls back to system prompt when personality is empty) |
 
 ### Secondary Agents
@@ -982,7 +982,7 @@ SECONDARY_POLICY = ExecutionPolicy(
     enable_auto_compaction=True,       # Same LLM compaction as primary
     event_flush_strategy="incremental",
     skip_memory=True,                  # No Mnemory recall/remember
-    skip_orchestration=True,           # No delegate/spawn/fork tools
+    skip_orchestration=True,           # No delegate/task/workflow tools
 )
 ```
 

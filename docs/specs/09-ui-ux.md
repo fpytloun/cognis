@@ -133,7 +133,7 @@ Tab-based page with two tabs:
 Browse all registered tools grouped by category with source-aware badges:
 
 - **Executor-native** — read, write, edit, bash, glob, grep, etc. (always available)
-- **Built-in** — delegate, spawn_worker, fork, list_agents, get_status
+- **Built-in** — delegate, task/workflow tools, list_agents, get_status
 - **Local MCP** — cached observed MCP tools aggregated from the user's executor inventory
 - **Intaris MCP** — remote MCP tools proxied through Intaris
 

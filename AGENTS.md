@@ -114,7 +114,7 @@ cognis/
 │   │
 │   ├── tools/                      # Tool system
 │   │   ├── builtin/
-│   │   │   ├── orchestration.py   # delegate, spawn_worker, fork
+│   │   │   ├── orchestration.py   # delegate, task/workflow orchestration
 │   │   │   └── system.py          # list_agents, get_status
 │   │   ├── executor/
 │   │   │   ├── lsp/               # LSP diagnostics integration

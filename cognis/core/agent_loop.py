@@ -1013,6 +1013,7 @@ class StepContext:
     user_message: str = ""
     user_attachments: list[AttachmentRef] = field(default_factory=list)
     attachment_notice: str | None = None
+    attachment_context: str | None = None
     prior_context: list[dict[str, Any]] | None = None  # Prior step output messages
     interaction_mode: str = "explicit_gates"
     tool_registry: Any = None  # ToolRegistry instance for this step
@@ -1774,6 +1775,7 @@ class AgentLoop:
             user_message=effective_user_message,
             user_attachments=[item.model_dump(mode="json") for item in ctx.user_attachments],
             attachment_notice=ctx.attachment_notice,
+            attachment_context=ctx.attachment_context,
             user_message_role="system" if ctx.system_initiated else "user",
             prior_context=ctx.prior_context,
             follow_up=ctx.follow_up,

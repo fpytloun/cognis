@@ -49,7 +49,7 @@ full design.
        - Tool call → Tool Router dispatch → feed result back → loop
        - `step_complete` → signal completion to workflow engine
        - `step_request_input` → pause and return to caller (if allowed)
-       - Orchestration tool (delegate, spawn_worker, fork) → controller operation
+       - Orchestration tool (delegate / task-workflow control) → controller operation
     5. Continue until `step_complete` is called or limits hit
     6. Finalize step:
        - Record events to Intaris (with idempotency_key)

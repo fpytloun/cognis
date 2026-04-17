@@ -22,10 +22,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import html
 import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from io import BytesIO
 from time import monotonic
 from typing import Any, Protocol, runtime_checkable
 
@@ -160,6 +162,7 @@ class _QueuedMessage:
     content: str
     user_email: str
     attachments: list[dict[str, Any]] | None = None
+    attachment_context: str | None = None
     system_initiated: bool = False
     channel_deliverable: bool = False
     delivery_id: str | None = None
@@ -399,7 +402,7 @@ class TurnScheduler:
                 recoverable=False,
             )
 
-        attachment_notice = await self._build_attachment_notice(
+        attachment_notice, attachment_context = await self._build_attachment_support_messages(
             session=session,
             agent=agent,
             attachments=normalized_attachments,
@@ -442,6 +445,7 @@ class TurnScheduler:
                         attachments=[
                             item.model_dump(mode="json") for item in normalized_attachments
                         ],
+                        attachment_context=attachment_context,
                         outbound_attachments=outbound_attachments,
                         follow_up=follow_up,
                         channel_deliverable=channel_deliverable,
@@ -497,6 +501,7 @@ class TurnScheduler:
                     content=effective_content,
                     user_email=user_email,
                     attachments=[item.model_dump(mode="json") for item in normalized_attachments],
+                    attachment_context=attachment_context,
                     outbound_attachments=outbound_attachments,
                     system_initiated=system_initiated,
                     follow_up=follow_up,
@@ -540,6 +545,7 @@ class TurnScheduler:
             attachments=normalized_attachments,
             outbound_attachments=outbound_attachments,
             attachment_notice=attachment_notice,
+            attachment_context=attachment_context,
             system_initiated=system_initiated,
             follow_up=follow_up,
             channel_deliverable=channel_deliverable,
@@ -844,15 +850,15 @@ class TurnScheduler:
                 )
         return normalized, None
 
-    async def _build_attachment_notice(
+    async def _build_attachment_support_messages(
         self,
         *,
         session: SessionModel,
         agent: AgentDefinition,
         attachments: list[AttachmentRef],
-    ) -> str | None:
+    ) -> tuple[str | None, str | None]:
         if not attachments:
-            return None
+            return None, None
         explicit_model = self._session_cache.get_model_override(session.session_id) or (
             agent.llm_config.model if agent.llm_config else None
         )
@@ -893,6 +899,7 @@ class TurnScheduler:
         else:
             model_info = await self._providers.llm.get_model_info(resolved_model)
         unsupported: list[str] = []
+        pdf_fallbacks: list[str] = []
         for attachment in attachments:
             if attachment.kind == ArtifactKind.IMAGE and model_info.supports_vision:
                 continue
@@ -902,15 +909,92 @@ class TurnScheduler:
                 continue
             if attachment.kind == ArtifactKind.FILE and model_info.supports_file_input:
                 continue
+            if attachment.kind == ArtifactKind.PDF:
+                extracted = await self._extract_pdf_text(attachment)
+                if extracted:
+                    pdf_fallbacks.append(extracted)
+                    unsupported.append(f"{attachment.filename} (using extracted text fallback)")
+                    continue
             unsupported.append(f"{attachment.filename} ({attachment.kind.value})")
 
-        if not unsupported:
-            return None
-        joined = ", ".join(unsupported)
-        return (
-            f"The current model ({resolved_model}) cannot read these attachments natively: {joined}. "
-            "You must explicitly refuse to analyze those files and ask the user to switch to a compatible model if needed."
+        notice = None
+        if unsupported:
+            joined = ", ".join(unsupported)
+            notice = (
+                f"The current model ({resolved_model}) cannot read some attachments natively: {joined}. "
+                "If extracted fallback text is available, use it carefully and mention any uncertainty. "
+                "For the remaining unsupported files, explicitly refuse to analyze them and ask the user to switch to a compatible model if needed."
+            )
+        if not pdf_fallbacks:
+            return notice, None
+        context = (
+            '<attachment_context trust="untrusted">\n'
+            "PDF files were converted to best-effort extracted text because the model lacks native PDF support. "
+            "Formatting, tables, and OCR may be imperfect.\n\n"
+            + "\n\n".join(pdf_fallbacks)
+            + "\n</attachment_context>"
         )
+        return notice, context
+
+    async def _build_attachment_notice(
+        self,
+        *,
+        session: SessionModel,
+        agent: AgentDefinition,
+        attachments: list[AttachmentRef],
+    ) -> str | None:
+        notice, _ = await self._build_attachment_support_messages(
+            session=session,
+            agent=agent,
+            attachments=attachments,
+        )
+        return notice
+
+    async def _build_attachment_context(
+        self,
+        *,
+        session: SessionModel,
+        agent: AgentDefinition,
+        attachments: list[AttachmentRef],
+    ) -> str | None:
+        _notice, context = await self._build_attachment_support_messages(
+            session=session,
+            agent=agent,
+            attachments=attachments,
+        )
+        return context
+
+    async def _extract_pdf_text(self, attachment: AttachmentRef) -> str | None:
+        from cognis.store.queries import get_artifact_record
+
+        async with self._session_factory() as session:
+            row = await get_artifact_record(session, attachment.artifact_id)
+        if row is None:
+            return None
+        try:
+            content, _content_type = await self._artifact_store.async_load(
+                row.namespace,
+                row.object_id,
+                row.filename,
+            )
+            from pypdf import PdfReader
+
+            reader = PdfReader(BytesIO(content))
+            chunks: list[str] = []
+            for page in reader.pages[:8]:
+                text = (page.extract_text() or "").strip()
+                if text:
+                    chunks.append(text)
+                if sum(len(chunk) for chunk in chunks) >= 4000:
+                    break
+            if not chunks:
+                return None
+            combined = "\n\n".join(chunks)
+            safe_filename = html.escape(attachment.filename)
+            safe_text = html.escape(combined[:4000])
+            return f"Extracted text from {safe_filename}:\n{safe_text}"
+        except Exception:
+            return None
 
     def _launch_turn(
         self,
@@ -923,6 +1007,7 @@ class TurnScheduler:
         attachments: list[AttachmentRef] | None = None,
         outbound_attachments: list[dict[str, Any]] | None = None,
         attachment_notice: str | None = None,
+        attachment_context: str | None = None,
         system_initiated: bool = False,
         follow_up: FollowUpMetadata | None = None,
         channel_deliverable: bool = False,
@@ -948,6 +1033,7 @@ class TurnScheduler:
                 attachments=attachments,
                 outbound_attachments=outbound_attachments,
                 attachment_notice=attachment_notice,
+                attachment_context=attachment_context,
                 system_initiated=system_initiated,
                 follow_up=follow_up,
                 channel_deliverable=channel_deliverable,
@@ -970,6 +1056,7 @@ class TurnScheduler:
         attachments: list[AttachmentRef] | None,
         outbound_attachments: list[dict[str, Any]] | None,
         attachment_notice: str | None,
+        attachment_context: str | None,
         system_initiated: bool,
         follow_up: FollowUpMetadata | None = None,
         channel_deliverable: bool,
@@ -1105,6 +1192,7 @@ class TurnScheduler:
                 user_message=content,
                 user_attachments=attachments,
                 attachment_notice=attachment_notice,
+                attachment_context=attachment_context,
                 system_initiated=system_initiated,
                 follow_up=follow_up,
                 on_progress=on_token,

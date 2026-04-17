@@ -83,7 +83,7 @@ with proper Intaris evaluation on every call.
 
 - `cognis/core/tool_router.py`
   - Classify tool call → routing category:
-    - Orchestration tool (delegate, spawn_worker, fork) → controller handles
+    - Orchestration tool (delegate / task-workflow control) → controller handles
     - Intaris-managed MCP tool → Intaris proxy
     - Local tool → Intaris evaluate → executor dispatch
   - Non-bypassable tools always go through Intaris (even if agent has
@@ -95,8 +95,7 @@ with proper Intaris evaluation on every call.
 
 - `cognis/tools/builtin/orchestration.py`
   - `delegate` — request agent delegation (stub, wired in Stage 6)
-  - `spawn_worker` — request worker delegation (stub)
-  - `fork` — request fork delegation (stub)
+  - Future worker/fork delegation modes remain deferred and are not exposed today.
 - `cognis/tools/builtin/system.py`
   - `list_agents` — list available agents
   - `get_status` — current session and delegation status

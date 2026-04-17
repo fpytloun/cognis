@@ -64,10 +64,10 @@ surfaces mismatches in Week 0, not Week 5.
   - Batch submit for executing plans
   - Delivery config for task results/questions (same conversation, specific target, latest active, preferred channel, silent)
   - Result delivery back into conversations as synthetic task events
-- Three delegation modes: Agent, Worker, Fork
+- Delegate sub-sessions plus autonomous background tasks
 - Decision Engine (rules + LLM classifier + workflow selection)
 - Schedule entity in DB schema (implementation Phase 2, model in MVP)
-- LLM delegation tools (delegate, spawn_worker, fork) as requests to system
+- LLM delegation tool (`delegate`) plus task/workflow orchestration as requests to system
 - Mnemory integration (recall/remember, controller-mediated, JWT auth)
 - Intaris integration (evaluate/reasoning/events, controller-mediated, JWT auth)
 - Session content stored in Intaris event store (NOT in Cognis)
@@ -268,7 +268,7 @@ surfaces mismatches in Week 0, not Week 5.
 - Create child session (Cognis DB + Intaris + Mnemory)
 - Start concurrent agent loop
 - Result delivery (Intaris event + WebSocket notification)
-- Three modes: agent, worker, fork (effective_agent_id handling)
+- Delegation plus workflow-driven background tasks (effective_agent_id handling where needed)
 
 ### Phase 1.5: API Layer (Week 5-6)
 
@@ -310,7 +310,7 @@ surfaces mismatches in Week 0, not Week 5.
 ### Phase 1.7: Testing + Polish (Week 8)
 
 - Integration tests: full chat flow with Mnemory + Intaris
-- Delegation flow: worker, agent, fork
+- Delegation flow: delegate + background task delivery
 - Escalation + timeout flow
 - Context compaction test (long conversations)
 - Error handling: service failures, graceful degradation
