@@ -54,6 +54,7 @@ def prune_tool_outputs(
     protected_tokens = 0
     pruneable_result_indices: list[int] = []
     pruneable_call_ids: set[str] = set()  # call_ids of pruned results
+    pruneable_attachment_indices: list[int] = []
 
     for i in range(len(result) - 1, -1, -1):
         msg = result[i]
@@ -90,6 +91,13 @@ def prune_tool_outputs(
         if total_arg_size > arg_clear_threshold:
             pruneable_call_indices.append(i)
 
+    for i, msg in enumerate(result):
+        if not msg.get("_tool_attachment_context"):
+            continue
+        call_id = msg.get("tool_call_id") or msg.get("_tool_call_id")
+        if call_id in pruneable_call_ids:
+            pruneable_attachment_indices.append(i)
+
     # Phase 2: Calculate total savings
     total_savings = 0
     for i in pruneable_result_indices:
@@ -100,6 +108,8 @@ def prune_tool_outputs(
             if isinstance(tc, dict):
                 args = tc.get("function", {}).get("arguments", {})
                 total_savings += count(json.dumps(args, default=str))
+    for i in pruneable_attachment_indices:
+        total_savings += count(json.dumps(result[i].get("content", ""), default=str))
 
     if total_savings < minimum_savings:
         return result
@@ -142,5 +152,17 @@ def prune_tool_outputs(
             else:
                 cleared_calls.append(tc)
         result[i] = {**msg, "tool_calls": cleared_calls}
+
+    for i in pruneable_attachment_indices:
+        msg = result[i]
+        call_id = msg.get("tool_call_id") or msg.get("_tool_call_id") or "unknown"
+        result[i] = {
+            **msg,
+            "role": "system",
+            "content": (
+                "[Tool attachment context cleared from view; associated attachment output is omitted here. "
+                f"Use read_tool_output(call_id='{call_id}') or the UI attachment viewer if you need it.]"
+            ),
+        }
 
     return result

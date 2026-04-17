@@ -1431,6 +1431,41 @@ def test_build_step_prompt_includes_revision_context() -> None:
     assert workflow_state.last_revision_context is None
 
 
+def test_build_tool_attachment_context_uses_user_blocks_for_vision_models() -> None:
+    loop = AgentLoop.__new__(AgentLoop)
+    ctx = StepContext(
+        step_definition=StepDefinition(name="execute", type="run", prompt="Do work"),
+        session=SimpleNamespace(session_id="sess-1"),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        current_model_info=SimpleNamespace(
+            supports_vision=True,
+            supports_pdf_input=False,
+            supports_audio_input=False,
+            supports_file_input=False,
+        ),
+    )
+
+    message = loop._build_tool_attachment_context(
+        ctx,
+        ToolCall(call_id="call-1", name="browser_screenshot", arguments={}),
+        [
+            {
+                "artifact_id": "art-1",
+                "kind": "image",
+                "filename": "shot.png",
+                "url": "https://example.test/shot.png",
+            }
+        ],
+    )
+
+    assert message is not None
+    assert message["role"] == "user"
+    assert isinstance(message["content"], list)
+    assert message["content"][0]["type"] == "text"
+    assert message["content"][1]["type"] == "image_url"
+
+
 @pytest.mark.asyncio
 async def test_tool_call_ceiling_returns_partial_step_output_without_second_llm_turn() -> None:
     fake_llm = _ToolCallCeilingLLM()

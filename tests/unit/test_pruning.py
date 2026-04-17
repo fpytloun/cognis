@@ -160,3 +160,27 @@ def test_custom_token_counter() -> None:
     ]
     prune_tool_outputs(messages, protect_tokens=50, minimum_savings=10, token_counter=counter)
     assert calls > 0
+
+
+def test_tool_attachment_context_pruned_with_matching_tool_result() -> None:
+    big = "x" * 200_000
+    messages = [
+        _assistant_with_tool_calls([{"id": "c1", "name": "browser_screenshot"}]),
+        _tool_result("c1", big),
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Untrusted tool output"},
+                {"type": "image_url", "image_url": {"url": "https://example.test/shot.png"}},
+            ],
+            "_tool_attachment_context": True,
+            "_tool_call_id": "c1",
+        },
+        _tool_result("c2", "recent"),
+    ]
+
+    result = prune_tool_outputs(messages, protect_tokens=10, minimum_savings=100)
+
+    assert "Tool result cleared" in result[1]["content"]
+    assert result[2]["role"] == "system"
+    assert "Tool attachment context cleared" in result[2]["content"]

@@ -30,6 +30,7 @@ from cognis.core.attachment_utils import (
     strip_attachment_payload_bytes,
 )
 from cognis.core.compaction import ROTATION_TOTAL
+from cognis.core.context import _native_attachment_blocks
 from cognis.core.decision import build_routing_reminder
 from cognis.core.events import Event, EventBus, EventType
 from cognis.core.followups import FollowUpMetadata, FollowUpMode, FollowUpPolicy
@@ -5322,7 +5323,7 @@ class AgentLoop:
                 "content": result.output,
             }
         )
-        attachment_context = self._build_tool_attachment_context(tc, result.attachments)
+        attachment_context = self._build_tool_attachment_context(ctx, tc, result.attachments)
         if attachment_context is not None:
             messages.append(attachment_context)
         protected_context = result.metadata.get("protected_context") if result.metadata else None
@@ -5353,12 +5354,40 @@ class AgentLoop:
 
     def _build_tool_attachment_context(
         self,
+        ctx: StepContext,
         tc: ToolCall,
         attachments: list[dict[str, Any]] | None,
     ) -> dict[str, Any] | None:
         if not attachments:
             return None
         normalized = normalize_attachment_refs(attachments)
+        if ctx.current_model_info is not None:
+            blocks, unsupported = _native_attachment_blocks(normalized, ctx.current_model_info)
+            if blocks:
+                content_blocks: list[dict[str, Any]] = [
+                    {
+                        "type": "text",
+                        "text": (
+                            f"Untrusted tool output from {tc.name} (tool_call_id={tc.call_id}) included attachments. "
+                            "Use the following attachment content carefully."
+                        ),
+                    }
+                ]
+                content_blocks.extend(blocks)
+                if unsupported:
+                    content_blocks.append(
+                        {
+                            "type": "text",
+                            "text": "Unsupported tool attachments were omitted: "
+                            + ", ".join(unsupported),
+                        }
+                    )
+                return {
+                    "role": "user",
+                    "content": content_blocks,
+                    "_tool_attachment_context": True,
+                    "_tool_call_id": tc.call_id,
+                }
         details = [
             "- "
             + str(item.get("filename") or item.get("artifact_id") or "attachment")
@@ -5377,6 +5406,7 @@ class AgentLoop:
                 + "\n".join(details)
             ),
             "_tool_attachment_context": True,
+            "_tool_call_id": tc.call_id,
         }
 
     def _context_pressure_exceeded(
