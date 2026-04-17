@@ -34,42 +34,26 @@ class _EventReader:
             (),
             {
                 "events": [
-                    type(
-                        "Event",
-                        (),
-                        {
-                            "seq": 1,
-                            "type": "user_message",
-                            "data": {"content": "hi", "attachments": []},
-                        },
-                    )(),
-                    type(
-                        "Event",
-                        (),
-                        {
-                            "seq": 2,
-                            "type": "assistant_message",
-                            "data": {"content": "done", "attachments": []},
-                        },
-                    )(),
-                    type(
-                        "Event",
-                        (),
-                        {
-                            "seq": 3,
-                            "type": "user_message",
-                            "data": {"content": "newer user", "attachments": []},
-                        },
-                    )(),
-                    type(
-                        "Event",
-                        (),
-                        {
-                            "seq": 4,
-                            "type": "assistant_message",
-                            "data": {"content": "newer assistant", "attachments": []},
-                        },
-                    )(),
+                    {
+                        "seq": 1,
+                        "type": "user_message",
+                        "data": {"content": "hi", "attachments": []},
+                    },
+                    {
+                        "seq": 2,
+                        "type": "assistant_message",
+                        "data": {"content": "done", "attachments": []},
+                    },
+                    {
+                        "seq": 3,
+                        "type": "user_message",
+                        "data": {"content": "newer user", "attachments": []},
+                    },
+                    {
+                        "seq": 4,
+                        "type": "assistant_message",
+                        "data": {"content": "newer assistant", "attachments": []},
+                    },
                 ]
             },
         )()

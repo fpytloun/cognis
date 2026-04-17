@@ -429,26 +429,28 @@ class RememberRetryQueue:
         messages: list[dict[str, str]] = []
         if include_user_message:
             for event in reversed(event_read.events):
-                if event.type != "user_message":
+                event_type, event_seq, event_data = self._normalize_replay_event(event)
+                if event_type != "user_message":
                     continue
-                if isinstance(user_event_seq, int) and event.seq != user_event_seq:
+                if isinstance(user_event_seq, int) and event_seq != user_event_seq:
                     continue
                 content = merge_content_and_attachment_note(
-                    str(event.data.get("content", "")),
-                    [a for a in event.data.get("attachments", []) if isinstance(a, dict)],
+                    str(event_data.get("content", "")),
+                    [a for a in event_data.get("attachments", []) if isinstance(a, dict)],
                 ).strip()
                 if content:
                     messages.append({"role": "user", "content": content[:5000]})
                     break
 
         for event in reversed(event_read.events):
-            if event.type != "assistant_message":
+            event_type, event_seq, event_data = self._normalize_replay_event(event)
+            if event_type != "assistant_message":
                 continue
-            if isinstance(assistant_event_seq, int) and event.seq != assistant_event_seq:
+            if isinstance(assistant_event_seq, int) and event_seq != assistant_event_seq:
                 continue
             content = merge_content_and_attachment_note(
-                str(event.data.get("content", "")),
-                [a for a in event.data.get("attachments", []) if isinstance(a, dict)],
+                str(event_data.get("content", "")),
+                [a for a in event_data.get("attachments", []) if isinstance(a, dict)],
             ).strip()
             if content:
                 messages.append({"role": "assistant", "content": content[:5000]})
@@ -463,6 +465,21 @@ class RememberRetryQueue:
             "user_email": user_email,
             "agent_id": agent_id,
         }
+
+    @staticmethod
+    def _normalize_replay_event(event: Any) -> tuple[str, int | None, dict[str, Any]]:
+        """Return ``(type, seq, data)`` for dict or object-shaped Intaris events."""
+        if isinstance(event, dict):
+            event_type = str(event.get("type") or "")
+            raw_seq = event.get("seq")
+            event_data = event.get("data") if isinstance(event.get("data"), dict) else {}
+            return event_type, raw_seq if isinstance(raw_seq, int) else None, event_data
+
+        event_type = str(getattr(event, "type", "") or "")
+        raw_seq = getattr(event, "seq", None)
+        raw_data = getattr(event, "data", None)
+        event_data = raw_data if isinstance(raw_data, dict) else {}
+        return event_type, raw_seq if isinstance(raw_seq, int) else None, event_data
 
     @staticmethod
     def _sanitize_failure_detail(error: Exception) -> str:
