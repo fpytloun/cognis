@@ -97,6 +97,9 @@ class EventType(StrEnum):
     NOTIFICATION_CREATED = "notification_created"
     NOTIFICATION_RESOLVED = "notification_resolved"
 
+    # Session-scoped system notices
+    SYSTEM_NOTICE = "system_notice"
+
 
 class Event(BaseModel):
     """A controller-internal event."""

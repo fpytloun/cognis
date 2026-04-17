@@ -5640,6 +5640,7 @@ class AgentLoop:
             await self.remember_queue.enqueue(
                 {
                     "session_id": ctx.session.mnemory_session_id,
+                    "cognis_session_id": ctx.session.session_id,
                     "intaris_session_id": ctx.session.intaris_session_id or ctx.session.session_id,
                     "include_user_message": not ctx.system_initiated,
                     "user_event_seq": ctx.remember_user_event_seq,
@@ -5756,6 +5757,9 @@ class AgentLoop:
                         await self.remember_queue.enqueue(
                             {
                                 "session_id": ctx.session.mnemory_session_id,
+                                "cognis_session_id": ctx.session.session_id,
+                                "intaris_session_id": ctx.session.intaris_session_id
+                                or ctx.session.session_id,
                                 "messages": [
                                     {
                                         "role": "assistant",

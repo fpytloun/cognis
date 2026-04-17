@@ -1419,6 +1419,13 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
             "step_name": event.data.get("step_name"),
             "attempt": event.data.get("attempt", 1),
         }
+    if event.type == EventType.SYSTEM_NOTICE:
+        return {
+            "type": "system_message",
+            "conversation_id": conversation_id,
+            "session_id": event.data.get("session_id"),
+            "text": event.data.get("message"),
+        }
     if event.type == EventType.WORKFLOW_PROGRESS and event.data.get("event") in {
         "tool_call_started",
         "tool_call_completed",

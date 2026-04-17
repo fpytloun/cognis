@@ -14,10 +14,13 @@ from typing import Any
 import sqlalchemy as sa
 from prometheus_client import Counter, Gauge
 
+from cognis.api.error_sanitizer import sanitize_client_error_detail
 from cognis.core.attachment_utils import merge_content_and_attachment_note
+from cognis.core.events import Event, EventBus, EventType
 from cognis.logging import get_logger
+from cognis.models.session import SessionEvent
 from cognis.runtime_context import scoped_runtime_context
-from cognis.store.models import RememberQueueRow
+from cognis.store.models import RememberQueueRow, Session
 
 logger = get_logger(__name__)
 
@@ -66,12 +69,14 @@ class RememberRetryQueue:
         worker: Any,
         session_factory: Callable[[], Any] | None = None,
         event_reader: Any | None = None,
+        event_bus: EventBus | None = None,
         max_depth: int = 100,
         max_concurrent: int = 5,
     ) -> None:
         self.worker = worker
         self._session_factory = session_factory
         self._event_reader = event_reader
+        self._event_bus = event_bus
         self.max_depth = max_depth
         self.max_concurrent = max_concurrent
         self.max_retries = 5
@@ -297,7 +302,18 @@ class RememberRetryQueue:
                 if self._session_factory is None or item.item_id is None:
                     if item.attempts >= self.max_retries:
                         QUEUE_FAILED.inc()
-                        logger.warning("Remember queue item failed permanently")
+                        logger.exception(
+                            "Remember queue item failed permanently",
+                            extra={
+                                "extra_data": {
+                                    "item_id": item.item_id,
+                                    "session_id": item.payload.get("session_id"),
+                                    "user_email": item.payload.get("user_email"),
+                                    "attempts": item.attempts,
+                                    "last_error": self._sanitize_failure_detail(exc),
+                                }
+                            },
+                        )
                         return
                     item.next_retry_at = monotonic() + min(2**item.attempts, self.backoff_max)
                     async with self._lock:
@@ -311,16 +327,21 @@ class RememberRetryQueue:
                 status = "failed" if item.attempts >= self.max_retries else "pending"
                 if status == "failed":
                     QUEUE_FAILED.inc()
-                    logger.warning(
+                    last_error = self._sanitize_failure_detail(exc)
+                    logger.exception(
                         "Remember queue item failed permanently",
                         extra={
                             "extra_data": {
                                 "item_id": item.item_id,
                                 "session_id": item.payload.get("session_id"),
                                 "user_email": item.payload.get("user_email"),
+                                "attempts": item.attempts,
+                                "last_error": last_error,
                             }
                         },
                     )
+                else:
+                    last_error = self._sanitize_failure_detail(exc)
                 async with self._session_factory() as session:
                     await session.execute(
                         sa.update(RememberQueueRow)
@@ -335,12 +356,14 @@ class RememberRetryQueue:
                             next_retry_at=next_retry_at,
                             lease_token=None,
                             lease_expires_at=None,
-                            last_error=str(exc)[:500],
+                            last_error=last_error,
                             updated_at=_utcnow(),
                         )
                     )
                     await session.commit()
                     await self._update_durable_depth_metric(session)
+                if status == "failed":
+                    await self._record_failure_notice(item, last_error)
 
     async def _has_durable_work(self) -> bool:
         if self._session_factory is None:
@@ -439,4 +462,102 @@ class RememberRetryQueue:
             "messages": messages,
             "user_email": user_email,
             "agent_id": agent_id,
+        }
+
+    @staticmethod
+    def _sanitize_failure_detail(error: Exception) -> str:
+        """Return a short safe error detail for logs and user-facing notices."""
+        return sanitize_client_error_detail(error, fallback="Memory provider unavailable")[:500]
+
+    async def _record_failure_notice(self, item: RememberQueueItem, last_error: str) -> None:
+        """Record a session-scoped system notice for permanent remember failure."""
+        session_ref = await self._resolve_session_notice_context(item.payload)
+        if session_ref is None:
+            return
+
+        message = (
+            "Background memory save failed after several retries. "
+            "The assistant may not remember some details from this session. "
+            f"Reason: {last_error}"
+        )
+        user_email = str(item.payload.get("user_email") or "") or None
+        agent_id = str(item.payload.get("agent_id") or "") or None
+        try:
+            if self._event_reader is not None and hasattr(self._event_reader, "record_events"):
+                with scoped_runtime_context(user_email=user_email, agent_id=agent_id):
+                    await self._event_reader.record_events(
+                        session_id=session_ref["intaris_session_id"],
+                        events=[
+                            SessionEvent(
+                                type="lifecycle",
+                                data={
+                                    "event": "system_notice",
+                                    "message": message,
+                                    "source": "remember_queue",
+                                    "item_id": item.item_id,
+                                },
+                            )
+                        ],
+                        source="cognis",
+                        idempotency_key=f"remember-failed:{item.item_id}",
+                    )
+            if self._event_bus is not None:
+                await self._event_bus.publish(
+                    Event(
+                        type=EventType.SYSTEM_NOTICE,
+                        data={
+                            "conversation_id": session_ref["conversation_id"],
+                            "session_id": session_ref["session_id"],
+                            "message": message,
+                            "source": "remember_queue",
+                            "item_id": item.item_id,
+                        },
+                    )
+                )
+        except Exception:
+            logger.exception(
+                "Failed to record remember queue failure notice",
+                extra={
+                    "extra_data": {
+                        "item_id": item.item_id,
+                        "session_id": session_ref["session_id"],
+                        "conversation_id": session_ref["conversation_id"],
+                    }
+                },
+            )
+
+    async def _resolve_session_notice_context(
+        self, payload: dict[str, Any]
+    ) -> dict[str, str] | None:
+        """Resolve Cognis + Intaris session ids and conversation id for notices."""
+        if self._session_factory is None:
+            return None
+        cognis_session_id = str(payload.get("cognis_session_id") or "").strip()
+        intaris_session_id = str(
+            payload.get("intaris_session_id") or payload.get("source_intaris_session_id") or ""
+        ).strip()
+        if not cognis_session_id and not intaris_session_id:
+            return None
+
+        async with self._session_factory() as session:
+            stmt = sa.select(Session)
+            if cognis_session_id:
+                stmt = stmt.where(Session.session_id == cognis_session_id)
+            else:
+                stmt = stmt.where(
+                    sa.or_(
+                        Session.intaris_session_id == intaris_session_id,
+                        Session.session_id == intaris_session_id,
+                    )
+                )
+            row = (await session.execute(stmt.limit(1))).scalar_one_or_none()
+        if row is None:
+            return None
+        resolved_intaris_id = str(row.intaris_session_id or row.session_id or "").strip()
+        if not resolved_intaris_id:
+            return None
+        return {
+            "session_id": row.session_id,
+            "conversation_id": row.conversation_id,
+            "intaris_session_id": resolved_intaris_id,
         }
