@@ -21,8 +21,7 @@ from cognis.core.workflow_engine import WorkflowEngine
 from cognis.core.workflow_registry import WorkflowRegistry
 from cognis.logging import get_logger
 from cognis.models.task import TaskDelivery, TaskModel, TaskStatus
-from cognis.models.workflow import CompletionDeliveryPolicy
-from cognis.models.workflow import WorkflowState
+from cognis.models.workflow import CompletionDeliveryPolicy, WorkflowState
 from cognis.runtime_context import scoped_runtime_context
 from cognis.store.queries import (
     count_active_steps,
@@ -475,6 +474,14 @@ class TaskQueue:
                 )
             await db_session.commit()
             task = _row_to_task_model(task_row)
+
+        notification_service = getattr(self._workflow_engine, "_notification_service", None)
+        if notification_service is not None:
+            with contextlib.suppress(Exception):
+                await notification_service.mark_task_notifications_terminal(
+                    task_id,
+                    reason="task_cancelled",
+                )
 
         control = self._run_controls.get(task_id)
         if control is not None:

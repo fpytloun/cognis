@@ -177,6 +177,21 @@ describe('chat timeline helpers', () => {
     expect(completed.some((item) => item.kind === 'notice')).toBe(false);
   });
 
+  it('renders session recovery as a low-emphasis system message', () => {
+    const items = applyWebSocketEvent([], {
+      type: 'session_recovered',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      reason: 'controller_restart'
+    });
+
+    expect(items[0]).toMatchObject({
+      id: 'session-recovered:sess_1',
+      kind: 'system_message',
+      text: 'The controller recovered this conversation after a restart.'
+    });
+  });
+
   it('drops workflow prompt notices on reconnect so only replayed pending prompts remain', () => {
     const withNotice = applyWebSocketEvent([], {
       type: 'workflow_step_question',

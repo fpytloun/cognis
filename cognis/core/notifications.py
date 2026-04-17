@@ -33,6 +33,8 @@ from cognis.store.queries import get_latest_active_conversation_for_agent, get_t
 
 logger = get_logger(__name__)
 
+_ACTIVE_TASK_STATUSES = {"queued", "ready", "running", "paused"}
+
 # ---------------------------------------------------------------------------
 # Prometheus metrics
 # ---------------------------------------------------------------------------
@@ -439,6 +441,7 @@ class NotificationService:
         conversation_id: str | None = None,
     ) -> list[Notification]:
         """List pending notifications for a user, optionally filtered by conversation."""
+        stale_notification_ids: list[str] = []
         async with self._session_factory() as db:
             stmt = select(NotificationRow).where(
                 NotificationRow.user_email == user_email,
@@ -449,7 +452,24 @@ class NotificationService:
             stmt = stmt.order_by(NotificationRow.created_at.desc())
             result = await db.execute(stmt)
             rows = result.scalars().all()
-            return [_row_to_notification(row) for row in rows]
+            visible_rows: list[Notification] = []
+            task_status_cache: dict[str, str | None] = {}
+            for row in rows:
+                if row.task_id:
+                    status = task_status_cache.get(row.task_id)
+                    if row.task_id not in task_status_cache:
+                        task_row = await get_task(db, row.task_id)
+                        status = str(task_row.status) if task_row is not None else None
+                        task_status_cache[row.task_id] = status
+                    if status not in _ACTIVE_TASK_STATUSES:
+                        stale_notification_ids.append(row.notification_id)
+                        continue
+                visible_rows.append(_row_to_notification(row))
+
+        for notification_id in stale_notification_ids:
+            await self.mark_orphaned(notification_id, reason="task_terminal")
+
+        return visible_rows
 
     async def get(self, notification_id: str) -> Notification | None:
         """Get a single notification by ID."""
@@ -517,6 +537,24 @@ class NotificationService:
         )
         return True
 
+    async def mark_task_notifications_terminal(self, task_id: str, *, reason: str) -> int:
+        """Resolve any pending notifications still attached to a terminal task."""
+
+        async with self._session_factory() as db:
+            result = await db.execute(
+                select(NotificationRow.notification_id).where(
+                    NotificationRow.task_id == task_id,
+                    NotificationRow.status == "pending",
+                )
+            )
+            notification_ids = list(result.scalars().all())
+
+        resolved = 0
+        for notification_id in notification_ids:
+            if await self.mark_orphaned(notification_id, reason=reason):
+                resolved += 1
+        return resolved
+
     # ------------------------------------------------------------------
     # Startup reconciliation
     # ------------------------------------------------------------------
@@ -536,6 +574,13 @@ class NotificationService:
             stmt = select(NotificationRow).where(NotificationRow.status == "pending")
             result = await db.execute(stmt)
             rows = result.scalars().all()
+            task_status_cache: dict[str, str | None] = {}
+            for row in rows:
+                if row.task_id and row.task_id not in task_status_cache:
+                    task_row = await get_task(db, row.task_id)
+                    task_status_cache[row.task_id] = (
+                        str(task_row.status) if task_row is not None else None
+                    )
 
         count = 0
         orphaned_count = 0
@@ -547,6 +592,15 @@ class NotificationService:
                 )
                 orphaned_count += 1
                 continue
+            if row.task_id:
+                status = task_status_cache.get(row.task_id)
+                if status not in _ACTIVE_TASK_STATUSES:
+                    await self.mark_orphaned(
+                        row.notification_id,
+                        reason="task_terminal",
+                    )
+                    orphaned_count += 1
+                    continue
             # Only re-register if not already present (idempotent)
             existing = self._pause_waiter.get(row.notification_id)
             if existing is not None:

@@ -2303,6 +2303,8 @@
                   <ReasoningBlock {item} />
                 {:else if item.kind === 'delegation'}
                   <DelegationCard {item} />
+                {:else if item.kind === 'system_message'}
+                  <p class="py-1 text-center text-xs italic text-slate-500 whitespace-pre-line">{item.text}</p>
                 {:else if item.kind === 'notice'}
                   <div class="rounded-xl border border-slate-800/60 bg-slate-900/50 px-3 py-2 text-xs text-slate-400">
                     <p class="font-medium">{item.title}</p>

@@ -92,6 +92,19 @@ export interface CompactionTimelineItem {
   timestamp: string | null;
 }
 
+function createSystemMessageItem(
+  id: string,
+  text: string,
+  timestamp: string | null,
+): SystemMessageTimelineItem {
+  return {
+    id,
+    kind: 'system_message',
+    text,
+    timestamp
+  };
+}
+
 function createMessageItem(
   id: string,
   role: 'user' | 'assistant' | 'system',
@@ -401,7 +414,14 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
     }
 
     if (event.type === 'session_recovered') {
-      items.push(createNotice('Session recovered', 'The controller recovered this conversation after a restart.'));
+      const sessionId = typeof event.data.session_id === 'string' ? event.data.session_id : eid;
+      items.push(
+        createSystemMessageItem(
+          `session-recovered:${sessionId}`,
+          'The controller recovered this conversation after a restart.',
+          event.timestamp
+        )
+      );
       continue;
     }
 
@@ -893,7 +913,18 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
   }
 
   if (event.type === 'session_recovered') {
-    next.push(createNotice('Session recovered', 'The controller recovered this conversation after a restart.'));
+    const itemId = `session-recovered:${event.session_id}`;
+    const index = next.findIndex((item) => item.id === itemId && item.kind === 'system_message');
+    const systemMessage = createSystemMessageItem(
+      itemId,
+      'The controller recovered this conversation after a restart.',
+      new Date().toISOString()
+    );
+    if (index >= 0) {
+      next[index] = systemMessage;
+      return next;
+    }
+    next.push(systemMessage);
     return next;
   }
 
