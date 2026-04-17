@@ -478,7 +478,7 @@ def test_prepare_tool_exposure_respects_responses_rollout_off(monkeypatch) -> No
     assert any(tool["function"]["name"] == "search_tools" for tool in result.tools)
 
 
-def test_prepare_tool_exposure_uses_flat_deferred_responses_when_namespace_tools_unsupported() -> (
+def test_prepare_tool_exposure_uses_flat_tool_search_responses_when_namespace_tools_unsupported() -> (
     None
 ):
     mcp_tool = ToolDefinition(
@@ -503,7 +503,7 @@ def test_prepare_tool_exposure_uses_flat_deferred_responses_when_namespace_tools
         discovered_tool_ids=set(),
     )
 
-    assert result.debug_metadata["strategy"] == "openai_responses_flat_deferred"
+    assert result.debug_metadata["strategy"] == "openai_responses_flat_tool_search"
     assert all(tool["type"] != "namespace" for tool in result.tools)
     deferred_schema = next(
         tool
@@ -511,3 +511,37 @@ def test_prepare_tool_exposure_uses_flat_deferred_responses_when_namespace_tools
         if tool.get("function", {}).get("name") == sanitize_mcp_tool_name("github", "search/issues")
     )
     assert deferred_schema["function"]["defer_loading"] is True
+    assert any(tool["type"] == "tool_search" for tool in result.tools)
+
+
+def test_prepare_tool_exposure_drops_defer_loading_without_native_tool_search() -> None:
+    mcp_tool = ToolDefinition(
+        name=sanitize_mcp_tool_name("github", "search/issues"),
+        description="search",
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(type="intaris_mcp", server_name="github", raw_tool_name="search/issues"),
+        category="mcp",
+    )
+
+    result = prepare_tool_exposure(
+        inventory_tools=[_tool("read", source_type="executor", category="filesystem"), mcp_tool],
+        controller_tool_schemas=[],
+        model="gpt-5.4",
+        model_info=ModelInfo(
+            model_id="gpt-5.4",
+            supports_tool_search=False,
+            supports_responses_api=True,
+            supports_openai_namespace_tools=False,
+            max_tools=128,
+        ),
+        discovered_tool_ids=set(),
+    )
+
+    assert result.debug_metadata["strategy"] == "openai_responses_full_inventory_no_defer"
+    deferred_schema = next(
+        tool
+        for tool in result.tools
+        if tool.get("function", {}).get("name") == sanitize_mcp_tool_name("github", "search/issues")
+    )
+    assert "defer_loading" not in deferred_schema["function"]
+    assert all(tool["type"] != "tool_search" for tool in result.tools)

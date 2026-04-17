@@ -77,6 +77,12 @@ def prepare_tool_exposure(
         and model_info.supports_openai_namespace_tools
         and deferred_tools
     )
+    use_openai_flat_tool_search = bool(
+        use_openai_responses
+        and model_info.supports_tool_search
+        and not model_info.supports_openai_namespace_tools
+        and deferred_tools
+    )
     if use_openai_native_tool_search:
         alias_map = {
             schema.get("function", {}).get("name", ""): schema.get("function", {}).get("name", "")
@@ -110,13 +116,24 @@ def prepare_tool_exposure(
             {"type": "tool_search"},
         ]
         request_kwargs = {"tool_choice": "auto", "parallel_tool_calls": True}
+    elif use_openai_flat_tool_search:
+        strategy = "openai_responses_flat_tool_search"
+        visible_tools = core_without_search + deferred_tools
+        tool_schemas = [
+            *_build_inventory_schemas(
+                visible_tools,
+                alias_map,
+                deferred_tool_ids={stable_tool_id(tool) for tool in deferred_tools},
+            ),
+            {"type": "tool_search"},
+        ]
+        request_kwargs = {"tool_choice": "auto", "parallel_tool_calls": True}
     elif use_openai_responses and deferred_tools:
-        strategy = "openai_responses_flat_deferred"
+        strategy = "openai_responses_full_inventory_no_defer"
         visible_tools = core_without_search + deferred_tools
         tool_schemas = _build_inventory_schemas(
             visible_tools,
             alias_map,
-            deferred_tool_ids={stable_tool_id(tool) for tool in deferred_tools},
         )
         request_kwargs = {"tool_choice": "auto", "parallel_tool_calls": True}
     elif use_openai_responses:
