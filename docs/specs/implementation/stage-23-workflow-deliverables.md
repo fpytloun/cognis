@@ -1,4 +1,4 @@
-# Stage 20: Workflow Deliverables and Step Profiles (Tier 2+3 Harness)
+# Stage 23: Workflow Deliverables and Step Profiles (Deferred Structural Work)
 
 ## Status
 
@@ -6,13 +6,13 @@ PLANNED
 
 ## Goal
 
-Land the structural half of the harness work introduced by the Tier 1 fixes (loop guard, argument sanity, prescriptive rejections, duplicate-prompt fix, placeholder removal). Tier 1 fixed the symptoms the controller could catch at dispatch time; Stage 20 fixes the underlying contract:
+Land the structural half of the harness work introduced by the harness stabilization tracks. The stabilization stages fix the controller's correctness, capability, and operational gaps first; this stage then upgrades the workflow contract itself:
 
 1. A workflow step's user-facing output is a typed, versioned **deliverable** authored through a new controller-intercepted tool, not free assistant text.
 2. Channel delivery happens exactly once per workflow — gated on `step_complete` acceptance and evaluator approval.
 3. Specialized workflows restrict the tool surface with **step profiles** (`research`, `coding`) expressed as rule sets over a tool classification taxonomy. The default profile is `unrestricted`; user-installed MCP tools continue to just work.
 
-This stage turns specs 21 and 22 into code across backend, UI, and telemetry.
+This stage turns specs 21 and 22 into code across backend, UI, and telemetry after the harness stabilization stages are complete.
 
 ## Dependencies
 
@@ -21,7 +21,8 @@ This stage turns specs 21 and 22 into code across backend, UI, and telemetry.
 - `docs/specs/22-step-profiles.md`
 - `docs/specs/06-tool-system.md`
 - `docs/specs/09-ui-ux.md`
-- Tier 1 harness work already landed in `cognis/core/agent_loop.py`, `cognis/core/context.py`, `cognis/core/harness_guards.py`, `cognis/core/prompts.py`.
+- `docs/specs/23-harness-stabilization.md`
+- Stages 20-22 complete (correctness, capability parity, prompt cache and operational resilience).
 
 ## Scope
 

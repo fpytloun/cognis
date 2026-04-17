@@ -97,12 +97,17 @@ bring the codebase in line with the updated specs.
 | 17 | [Browser Takeover and Session Recording](stage-17-browser-takeover-recording.md) | PLANNED | Optional noVNC browser takeover, Intaris-owned recording/evidence flow, browser/desktop audit model |
 | 18 | [First-Class Agent Runtimes](stage-18-agent-runtimes.md) | PLANNED | Runtime abstraction, `runtime_runs`, executor runtime RPC, Claude runtime host, projection model, direct chat/delegation/workflow parity |
 | 19 | [Auto Routing for Agents and Workflows](stage-19-auto-routing.md) | PLANNED | `auto` / `self` routing semantics, shared routing helper, execution-envelope enforcement, classifier fallback, telemetry |
-| 20 | [Workflow Deliverables and Step Profiles](stage-20-workflow-deliverables.md) | PLANNED | Typed deliverables + `write_deliverable`, once-only channel delivery, step profiles (`research`/`coding`), tool classification, system workflow wiring |
+| 20 | [Harness Correctness and Concurrency Stabilization](stage-20-harness-correctness.md) | PLANNED | Remove shared singleton turn state, bound retry/wait loops, fix gate restart semantics, harden memory identity, preserve transcript integrity |
+| 21 | [Harness Capability Parity](stage-21-harness-capability.md) | PLANNED | Parallel read-only tools, `ripgrep`/`fd` search, background shells, finish-reason handling, token-aware truncation, step timeouts |
+| 22 | [Harness Prompt Cache and Operational Resilience](stage-22-harness-operations.md) | PLANNED | Immutable-prefix cleanup, cache-stable tool exposure, durable remember queue, multi-replica dedupe, Intaris breaker isolation |
+| 23 | [Workflow Deliverables and Step Profiles](stage-23-workflow-deliverables.md) | PLANNED | Typed deliverables + `write_deliverable`, once-only channel delivery, step profiles (`research`/`coding`), tool classification, system workflow wiring |
 
 ## Scope Boundary
 
 Stages 0-9 build the MVP. Stages 10-16 polish it into a usable product.
 Stages 6a+ align the codebase with spec refinements made during design review.
+Stages 20-22 are the harness stabilization sequence and are intended to land
+before new workflow contract work such as typed deliverables and step profiles.
 
 **Still out of scope / not yet shipped**: multi-user production hardening,
 Docker/K8s executors, A2A federation, cost tracking dashboard,
