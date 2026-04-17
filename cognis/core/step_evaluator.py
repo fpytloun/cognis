@@ -70,8 +70,11 @@ Evaluation checklist:
 4. If the objective mentions tests/validation, are they present and passing?
 5. A proper step completion may report an outcome of "success", "rejected",
    or "failed". Success is valid when the review approves the plan or work
-   with no required changes. Judge whether the step was completed correctly,
-   not whether the business result was positive.
+   with no required changes. Treat a self-reported outcome of "failed" as
+   input, not as the final authority. If the step made meaningful progress and
+   can recover with targeted revisions, prefer "revise" over agreeing that the
+   step failed. Judge whether the step was completed correctly, not whether the
+   business result was positive.
 6. Do not require step_complete metadata fields to appear inside the assistant's
    written deliverable. They are supplied separately above.
 7. Only require artifacts explicitly requested by the step objective. Process
@@ -97,6 +100,9 @@ impossible constraint, repeated identical failures)
 
 Be skeptical. Agents tend to declare victory prematurely. Partial \
 completion is a revise, not an approval.
+
+If the agent reported outcome="failed" but the work is still salvageable,
+return "revise" so the workflow can continue.
 
 Respond with JSON only: {{"decision": "...", "reasoning": "...", "feedback": "..."}}
 """

@@ -65,6 +65,7 @@ class CachedSessionState:
     memory_instructions: str | None = None
     core_memories: str | None = None
     memory_instructions_cached_at: float | None = None
+    core_memories_cached_at: float | None = None
     # Context usage from last context assembly
     last_prompt_tokens: int = 0
     max_context_tokens: int = 0
@@ -106,6 +107,8 @@ def _serialize_entry(entry: CachedSessionState) -> str:
             "initialized": entry.initialized,
             "memory_instructions": entry.memory_instructions,
             "core_memories": entry.core_memories,
+            "memory_instructions_cached_at": entry.memory_instructions_cached_at,
+            "core_memories_cached_at": entry.core_memories_cached_at,
             "last_prompt_tokens": entry.last_prompt_tokens,
             "max_context_tokens": entry.max_context_tokens,
             "context_model": entry.context_model,
@@ -130,6 +133,8 @@ def _deserialize_entry(raw: str) -> CachedSessionState:
         initialized=data.get("initialized", False),
         memory_instructions=data.get("memory_instructions"),
         core_memories=data.get("core_memories"),
+        memory_instructions_cached_at=data.get("memory_instructions_cached_at"),
+        core_memories_cached_at=data.get("core_memories_cached_at"),
         last_prompt_tokens=data.get("last_prompt_tokens", 0),
         max_context_tokens=data.get("max_context_tokens", 0),
         context_model=data.get("context_model", ""),
@@ -488,23 +493,41 @@ class SessionCache:
     ) -> tuple[str | None, str | None, bool]:
         """Return cached (instructions, core_memories, is_valid).
 
-        Returns ``is_valid=False`` when the cache is stale (older than
-        *ttl_seconds*, default 30 minutes) or when no cached values exist.
-        Always returns whatever individual fields are cached, even when
-        the cache is considered invalid — callers use the values for
-        gap-filling the immutable prefix.
+        Returns ``is_valid=False`` when any cached immutable memory field is stale
+        (older than *ttl_seconds*, default 30 minutes) or when no cached values
+        exist. Always returns whatever individual fields are cached so callers can
+        make explicit gap-filling decisions after a fresh Mnemory refresh.
         """
+
+        instructions, core_memories, instruction_valid, core_valid = self.get_cached_memory_details(
+            session_id, ttl_seconds=ttl_seconds
+        )
+        is_valid = instruction_valid and core_valid
+        return instructions, core_memories, is_valid
+
+    def get_cached_memory_details(
+        self, session_id: str, ttl_seconds: float = 1800.0
+    ) -> tuple[str | None, str | None, bool, bool]:
+        """Return cached immutable memory plus per-field validity."""
 
         entry = self.get_entry(session_id)
         if entry is None:
-            return None, None, False
+            return None, None, False, False
         if entry.memory_instructions is None and entry.core_memories is None:
-            return None, None, False
-        if entry.memory_instructions_cached_at is None:
-            return entry.memory_instructions, entry.core_memories, False
-        age = monotonic() - entry.memory_instructions_cached_at
-        is_valid = age < ttl_seconds
-        return entry.memory_instructions, entry.core_memories, is_valid
+            return None, None, False, False
+
+        instruction_valid = False
+        if (
+            entry.memory_instructions is not None
+            and entry.memory_instructions_cached_at is not None
+        ):
+            instruction_valid = (monotonic() - entry.memory_instructions_cached_at) < ttl_seconds
+
+        core_valid = False
+        if entry.core_memories is not None and entry.core_memories_cached_at is not None:
+            core_valid = (monotonic() - entry.core_memories_cached_at) < ttl_seconds
+
+        return entry.memory_instructions, entry.core_memories, instruction_valid, core_valid
 
     async def cache_memory(
         self, session_id: str, instructions: str | None, core_memories: str | None
@@ -525,17 +548,10 @@ class SessionCache:
         async with entry.lock:
             if instructions is not None:
                 entry.memory_instructions = instructions
+                entry.memory_instructions_cached_at = monotonic()
             if core_memories is not None:
                 entry.core_memories = core_memories
-            # Only bump the TTL timestamp when instructions are actually
-            # refreshed — otherwise a core-memories-only update would
-            # suppress the next instructions refresh for another 30 min.
-            if instructions is not None:
-                entry.memory_instructions_cached_at = monotonic()
-            elif entry.memory_instructions_cached_at is None:
-                # First cache write with only core_memories — set the
-                # timestamp so get_cached_memory can compute validity.
-                entry.memory_instructions_cached_at = monotonic()
+                entry.core_memories_cached_at = monotonic()
             entry.touched_at = monotonic()
         await self._redis_set(entry)
 

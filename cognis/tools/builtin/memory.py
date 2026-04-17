@@ -508,71 +508,66 @@ async def _dispatch(
     user_email: str | None,
 ) -> ToolResult:
     """Route to the appropriate Mnemory provider method."""
-    client = mem.client
-    headers = mem._headers(agent_id, user_email)
-
     if tool_name == "memory_search":
-        response = await client.post(
-            "/api/memories/search",
-            json=_filter_none(args),
-            headers=headers,
+        return _json_output(
+            await mem.search_memories_tool(
+                _filter_none(args),
+                agent_id=agent_id,
+                user_email=user_email,
+            )
         )
-        response.raise_for_status()
-        return _json_output(response.json())
 
     if tool_name == "memory_find":
-        response = await client.post(
-            "/api/memories/find",
-            json=_filter_none(args),
-            headers=headers,
+        return _json_output(
+            await mem.find_memories_tool(
+                _filter_none(args),
+                agent_id=agent_id,
+                user_email=user_email,
+            )
         )
-        response.raise_for_status()
-        return _json_output(response.json())
 
     if tool_name == "memory_ask":
-        response = await client.post(
-            "/api/memories/ask",
-            json=_filter_none(args),
-            headers=headers,
+        return _json_output(
+            await mem.ask_memories_tool(
+                _filter_none(args),
+                agent_id=agent_id,
+                user_email=user_email,
+            )
         )
-        response.raise_for_status()
-        return _json_output(response.json())
 
     if tool_name == "memory_add":
-        response = await client.post(
-            "/api/memories",
-            json=_filter_none(args),
-            headers=headers,
+        return _json_output(
+            await mem.add_memory_tool(
+                _filter_none(args),
+                agent_id=agent_id,
+                user_email=user_email,
+            )
         )
-        response.raise_for_status()
-        return _json_output(response.json())
 
     if tool_name == "memory_add_batch":
-        response = await client.post(
-            "/api/memories/batch",
-            json=_filter_none(args),
-            headers=headers,
+        return _json_output(
+            await mem.add_memory_batch_tool(
+                _filter_none(args),
+                agent_id=agent_id,
+                user_email=user_email,
+            )
         )
-        response.raise_for_status()
-        return _json_output(response.json())
 
     if tool_name == "memory_update":
-        memory_id = args.pop("memory_id", "")
-        response = await client.put(
-            f"/api/memories/{memory_id}",
-            json=_filter_none(args),
-            headers=headers,
+        memory_id = str(args.get("memory_id", "")).strip()
+        payload = _filter_none({k: v for k, v in args.items() if k != "memory_id"})
+        return _json_output(
+            await mem.update_memory_tool(
+                memory_id,
+                payload,
+                agent_id=agent_id,
+                user_email=user_email,
+            )
         )
-        response.raise_for_status()
-        return _json_output(response.json())
 
     if tool_name == "memory_delete":
-        memory_id = args.get("memory_id", "")
-        response = await client.delete(
-            f"/api/memories/{memory_id}",
-            headers=headers,
-        )
-        response.raise_for_status()
+        memory_id = str(args.get("memory_id", "")).strip()
+        await mem.delete_memory_tool(memory_id, agent_id=agent_id, user_email=user_email)
         return ToolResult(output=f"Memory {memory_id} deleted.")
 
     if tool_name == "memory_list":
@@ -582,89 +577,97 @@ async def _dispatch(
                 params[key] = args[key]
         if args.get("categories"):
             params["categories"] = ",".join(args["categories"])
-        response = await client.get(
-            "/api/memories",
-            params=params,
-            headers=headers,
+        return _json_output(
+            await mem.list_memories_tool(
+                params=params,
+                agent_id=agent_id,
+                user_email=user_email,
+            )
         )
-        response.raise_for_status()
-        return _json_output(response.json())
 
     if tool_name == "memory_categories":
-        response = await client.get("/api/categories", headers=headers)
-        response.raise_for_status()
-        return _json_output(response.json())
+        return _json_output(
+            await mem.memory_categories_tool(agent_id=agent_id, user_email=user_email)
+        )
 
     if tool_name == "memory_recent":
         params = {}
         for key in ("days", "scope", "limit", "include_decayed"):
             if args.get(key) is not None:
                 params[key] = args[key]
-        response = await client.get(
-            "/api/memories/recent",
-            params=params,
-            headers=headers,
+        return _json_output(
+            await mem.recent_memories_tool(
+                params=params,
+                agent_id=agent_id,
+                user_email=user_email,
+            )
         )
-        response.raise_for_status()
-        return _json_output(response.json())
 
     if tool_name == "memory_save_artifact":
-        memory_id = args.pop("memory_id", "")
-        response = await client.post(
-            f"/api/memories/{memory_id}/artifacts",
-            json=_filter_none(args),
-            headers=headers,
+        memory_id = str(args.get("memory_id", "")).strip()
+        payload = _filter_none({k: v for k, v in args.items() if k != "memory_id"})
+        return _json_output(
+            await mem.save_memory_artifact_tool(
+                memory_id,
+                payload,
+                agent_id=agent_id,
+                user_email=user_email,
+            )
         )
-        response.raise_for_status()
-        return _json_output(response.json())
 
     if tool_name == "memory_get_artifact":
-        memory_id = args.get("memory_id", "")
-        artifact_id = args.get("artifact_id", "")
+        memory_id = str(args.get("memory_id", "")).strip()
+        artifact_id = str(args.get("artifact_id", "")).strip()
         params = {}
         if args.get("offset") is not None:
             params["offset"] = args["offset"]
         if args.get("limit") is not None:
             params["limit"] = args["limit"]
-        response = await client.get(
-            f"/api/memories/{memory_id}/artifacts/{artifact_id}",
-            params=params,
-            headers=headers,
+        return _json_output(
+            await mem.get_memory_artifact_tool(
+                memory_id,
+                artifact_id,
+                params=params,
+                agent_id=agent_id,
+                user_email=user_email,
+            )
         )
-        response.raise_for_status()
-        return _json_output(response.json())
 
     if tool_name == "memory_list_artifacts":
-        memory_id = args.get("memory_id", "")
-        response = await client.get(
-            f"/api/memories/{memory_id}/artifacts",
-            headers=headers,
+        memory_id = str(args.get("memory_id", "")).strip()
+        return _json_output(
+            await mem.list_memory_artifacts_tool(
+                memory_id,
+                agent_id=agent_id,
+                user_email=user_email,
+            )
         )
-        response.raise_for_status()
-        return _json_output(response.json())
 
     if tool_name == "memory_get_artifact_url":
-        memory_id = args.get("memory_id", "")
-        artifact_id = args.get("artifact_id", "")
+        memory_id = str(args.get("memory_id", "")).strip()
+        artifact_id = str(args.get("artifact_id", "")).strip()
         payload: dict[str, Any] = {}
         if args.get("ttl") is not None:
             payload["ttl"] = args["ttl"]
-        response = await client.post(
-            f"/api/memories/{memory_id}/artifacts/{artifact_id}/download-token",
-            json=payload,
-            headers=headers,
+        return _json_output(
+            await mem.get_memory_artifact_url_tool(
+                memory_id,
+                artifact_id,
+                payload=payload,
+                agent_id=agent_id,
+                user_email=user_email,
+            )
         )
-        response.raise_for_status()
-        return _json_output(response.json())
 
     if tool_name == "memory_delete_artifact":
-        memory_id = args.get("memory_id", "")
-        artifact_id = args.get("artifact_id", "")
-        response = await client.delete(
-            f"/api/memories/{memory_id}/artifacts/{artifact_id}",
-            headers=headers,
+        memory_id = str(args.get("memory_id", "")).strip()
+        artifact_id = str(args.get("artifact_id", "")).strip()
+        await mem.delete_memory_artifact_tool(
+            memory_id,
+            artifact_id,
+            agent_id=agent_id,
+            user_email=user_email,
         )
-        response.raise_for_status()
         return ToolResult(output=f"Artifact {artifact_id} deleted from memory {memory_id}.")
 
     return ToolResult(output=f"Unknown memory tool: {tool_name}", is_error=True)

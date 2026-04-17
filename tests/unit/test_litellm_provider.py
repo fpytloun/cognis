@@ -510,7 +510,7 @@ async def test_litellm_provider_generate_applies_anthropic_cache_hint_to_first_m
         {
             "type": "text",
             "text": "immutable prefix",
-            "cache_control": {"type": "ephemeral"},
+            "cache_control": {"type": "ephemeral", "ttl": "1h"},
         }
     ]
     assert messages[1] == {"role": "system", "content": "mutable environment"}

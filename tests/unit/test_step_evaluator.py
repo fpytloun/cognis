@@ -462,6 +462,8 @@ async def test_evaluator_prompt_explicitly_allows_success_for_review_steps() -> 
     assert '"rejected"' in prompt
     assert '"failed"' in prompt
     assert "Success is valid when the review approves the plan or work" in prompt
+    assert 'self-reported outcome of "failed"' in prompt
+    assert "workflow can continue" in prompt
 
 
 @pytest.mark.asyncio

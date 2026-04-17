@@ -146,7 +146,11 @@ def create_app() -> FastAPI:
             config_runtime.jwt_private_key_path, config_runtime.jwt_public_key_path
         )
         providers = build_provider_registry(config_runtime, session_factory, auth_provider)
-        remember_queue = RememberRetryQueue(providers.memory)
+        remember_queue = RememberRetryQueue(
+            providers.memory,
+            session_factory=session_factory,
+            event_reader=providers.guardrails,
+        )
         await remember_queue.start()
         await _print_startup_status(config_runtime, providers, ui_build_dir)
 

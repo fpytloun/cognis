@@ -5,11 +5,12 @@ from __future__ import annotations
 import ast
 import asyncio
 import base64
+import hashlib
 import json
 from dataclasses import dataclass
 from enum import StrEnum
 from fnmatch import fnmatchcase
-from time import perf_counter
+from time import monotonic, perf_counter
 from typing import Any
 from urllib.parse import urlparse
 
@@ -45,6 +46,11 @@ TOOL_ROUTE_OUTCOMES = Counter(
     "cognis_tool_route_outcomes_total",
     "Tool route outcomes",
     labelnames=("route", "outcome"),
+)
+TOOL_DECISION_CACHE_HITS = Counter(
+    "cognis_tool_decision_cache_hits_total",
+    "Short-lived local Intaris decision-cache hits",
+    labelnames=("decision",),
 )
 IMAGE_GENERATION_TOTAL = Counter(
     "cognis_image_generation_total",
@@ -112,6 +118,8 @@ class ToolRouter:
         self._session_factory = session_factory
         self._scheduler: Any | None = None
         self.non_bypassable_patterns = non_bypassable_patterns or []
+        self._decision_cache_ttl_seconds = 15.0
+        self._decision_cache: dict[tuple[str, str, str], tuple[float, PermissionDecision]] = {}
 
     @classmethod
     async def from_session_factory(
@@ -207,13 +215,23 @@ class ToolRouter:
         if permission is Permission.ALLOW:
             return PermissionDecision(decision="approve", source="agent")
 
+        cached = self._get_cached_decision(
+            session.session_id,
+            tool_call.name,
+            tool_call.arguments,
+            registered_tool.definition.read_only,
+        )
+        if cached is not None:
+            TOOL_DECISION_CACHE_HITS.labels(decision=cached.decision).inc()
+            return cached
+
         evaluation = await self.guardrails.evaluate(
             session_id=_guardrails_session_id(session),
             tool_name=tool_call.name,
             arguments=tool_call.arguments,
             context={},
         )
-        return PermissionDecision(
+        decision_result = PermissionDecision(
             decision=evaluation.decision,
             reasoning=evaluation.reasoning,
             source="guardrails",
@@ -222,6 +240,73 @@ class ToolRouter:
             latency_ms=evaluation.latency_ms,
             call_id=evaluation.call_id,
         )
+        self._cache_decision(
+            session.session_id,
+            tool_call.name,
+            tool_call.arguments,
+            registered_tool.definition.read_only,
+            decision_result,
+        )
+        return decision_result
+
+    def _get_cached_decision(
+        self,
+        session_id: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+        read_only: bool,
+    ) -> PermissionDecision | None:
+        if not read_only:
+            return None
+        self._purge_stale_decision_cache()
+        entry = self._decision_cache.get(self._decision_cache_key(session_id, tool_name, arguments))
+        if entry is None:
+            return None
+        expires_at, decision = entry
+        if expires_at <= monotonic():
+            return None
+        return PermissionDecision(
+            decision=decision.decision,
+            reasoning=decision.reasoning,
+            source="guardrails_cache",
+            risk=decision.risk,
+            path=decision.path,
+            latency_ms=0,
+            call_id=None,
+        )
+
+    def _cache_decision(
+        self,
+        session_id: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+        read_only: bool,
+        decision: PermissionDecision,
+    ) -> None:
+        if not read_only or decision.decision != "approve":
+            return
+        self._decision_cache[self._decision_cache_key(session_id, tool_name, arguments)] = (
+            monotonic() + self._decision_cache_ttl_seconds,
+            decision,
+        )
+
+    def _purge_stale_decision_cache(self) -> None:
+        now = monotonic()
+        stale_keys = [
+            key
+            for key, (expires_at, _decision) in self._decision_cache.items()
+            if expires_at <= now
+        ]
+        for key in stale_keys:
+            self._decision_cache.pop(key, None)
+
+    @staticmethod
+    def _decision_cache_key(
+        session_id: str, tool_name: str, arguments: dict[str, Any]
+    ) -> tuple[str, str, str]:
+        payload = json.dumps(arguments, sort_keys=True, default=str, separators=(",", ":"))
+        digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]  # noqa: S324
+        return session_id, tool_name, digest
 
     async def execute(
         self,

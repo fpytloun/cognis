@@ -41,9 +41,15 @@ def test_prepare_tool_exposure_uses_anthropic_deferred_loading() -> None:
 
     assert result.debug_metadata["strategy"] == "anthropic_defer_loading"
     assert result.request_kwargs["extra_headers"]["anthropic-beta"] == "tool-search-tool-2025-10-19"
-    assert result.tools[-1]["function"]["cache_control"] == {"type": "ephemeral"}
+    cache_control_tools = [
+        tool for tool in result.tools if tool.get("function", {}).get("cache_control") is not None
+    ]
+    assert len(cache_control_tools) == 1
+    assert cache_control_tools[0]["function"]["name"] == "read"
+    assert cache_control_tools[0]["function"]["cache_control"] == {"type": "ephemeral"}
     deferred = [tool for tool in result.tools if tool["function"]["name"].startswith("mcp_")]
     assert deferred[0]["function"]["defer_loading"] is True
+    assert "x-stable-tool-id" not in cache_control_tools[0]["function"]
 
 
 def test_prepare_tool_exposure_uses_generic_search_fallback_with_discovered_tools() -> None:

@@ -197,7 +197,7 @@ def _format_compaction_summary(compaction_summary: str | None) -> str | None:
         "This is a continuation from a previous session. "
         "Here is a summary of what was discussed:\n\n"
         f"{compaction_summary}\n\n"
-        "The conversation continues below."
+        "Use this summary as background context for the continuation that follows."
     )
 
 
@@ -382,9 +382,10 @@ class ContextAssembler:
         is_first_recall = session.mnemory_session_id is None
 
         # Check if cached instructions are stale (TTL 30 min)
-        _cached_instr, _cached_core, memory_cache_valid = self.session_cache.get_cached_memory(
-            session.session_id
+        _cached_instr, _cached_core, instructions_cache_valid, core_cache_valid = (
+            self.session_cache.get_cached_memory_details(session.session_id)
         )
+        memory_cache_valid = instructions_cache_valid and core_cache_valid
         need_instructions = is_first_recall or not memory_cache_valid
         search_mode = "find" if is_first_recall else "search"
 
@@ -511,17 +512,27 @@ class ContextAssembler:
                 session.session_id, immutable_instructions, immutable_core_memories
             )
 
-        # Fill gaps from cache: partial recall (one field returned, the
-        # other not) or subsequent calls that omit both fields entirely.
-        # Ignores cache validity — immutable prefix values persist for
-        # the lifetime of the session regardless of TTL staleness.
+        # Fill gaps from cache after an immutable-memory refresh attempt only when
+        # the cache is still valid or Mnemory returned at least one refreshed
+        # immutable field. This prevents stale immutable memory from persisting
+        # indefinitely when Mnemory stops returning instructions entirely.
         if immutable_instructions is None or immutable_core_memories is None:
-            cached_instr, cached_core, _ = self.session_cache.get_cached_memory(session.session_id)
+            cached_instr, cached_core, instructions_cache_valid, core_cache_valid = (
+                self.session_cache.get_cached_memory_details(session.session_id)
+            )
             gap_filled: list[str] = []
-            if immutable_instructions is None and cached_instr is not None:
+            if (
+                immutable_instructions is None
+                and cached_instr is not None
+                and (instructions_cache_valid or raw_instructions is not None)
+            ):
                 immutable_instructions = cached_instr
                 gap_filled.append("instructions")
-            if immutable_core_memories is None and cached_core is not None:
+            if (
+                immutable_core_memories is None
+                and cached_core is not None
+                and (core_cache_valid or raw_core is not None)
+            ):
                 immutable_core_memories = cached_core
                 gap_filled.append("core_memories")
             if gap_filled:
@@ -534,9 +545,17 @@ class ContextAssembler:
                         }
                     },
                 )
+            elif need_instructions and not memory_cache_valid:
+                degraded_sources.append("memory_stale")
 
         # Format mutable search results
         mutable_search_results = _format_search_results(raw_search)
+
+        project_instructions = _load_project_instructions(
+            workspace_root=workspace_root,
+            effective_working_directory=effective_working_directory,
+            executor_environment=executor_environment,
+        )
 
         # Model resolution chain: session override → agent config → system default
         model_override = self.session_cache.get_model_override(session.session_id)
@@ -563,6 +582,7 @@ class ContextAssembler:
             immutable_instructions=immutable_instructions,
             immutable_core_memories=immutable_core_memories,
             compaction_summary=cache_entry.last_compaction_summary,
+            project_instructions=project_instructions,
         )
         system_prompt_tokens, tool_schema_tokens = self._count_static_tokens(
             resolved_model=resolved_model,
@@ -593,14 +613,6 @@ class ContextAssembler:
                 ),
             }
         )
-
-        project_instructions = _load_project_instructions(
-            workspace_root=workspace_root,
-            effective_working_directory=effective_working_directory,
-            executor_environment=executor_environment,
-        )
-        for item in project_instructions:
-            messages.append({"role": "system", "content": item})
 
         # History messages (append-only)
         history_messages = self._events_to_messages(
@@ -830,6 +842,11 @@ class ContextAssembler:
             else model_info.max_output_tokens
         )
         identity_prompt = _compose_identity_prompt(agent)
+        project_instructions = _load_project_instructions(
+            workspace_root=workspace_root,
+            effective_working_directory=effective_working_directory,
+            executor_environment=executor_environment,
+        )
         immutable_prefix = self._compose_immutable_prefix(
             agent=agent,
             prompt_context=prompt_context,
@@ -837,6 +854,7 @@ class ContextAssembler:
             immutable_instructions=None,
             immutable_core_memories=None,
             compaction_summary=cache_entry.last_compaction_summary,
+            project_instructions=project_instructions,
         )
         system_prompt_tokens, tool_schema_tokens = self._count_static_tokens(
             resolved_model=resolved_model,
@@ -865,14 +883,6 @@ class ContextAssembler:
                 ),
             }
         )
-
-        project_instructions = _load_project_instructions(
-            workspace_root=workspace_root,
-            effective_working_directory=effective_working_directory,
-            executor_environment=executor_environment,
-        )
-        for item in project_instructions:
-            messages.append({"role": "system", "content": item})
 
         history_messages = self._events_to_messages(
             self.session_cache.get_events_since_compaction(
@@ -1031,6 +1041,7 @@ class ContextAssembler:
         immutable_instructions: str | None,
         immutable_core_memories: str | None,
         compaction_summary: str | None,
+        project_instructions: list[str] | None = None,
     ) -> str | None:
         """Compose the cacheable immutable system prefix as one message."""
         sections: list[str] = []
@@ -1045,6 +1056,13 @@ class ContextAssembler:
             tagged_instructions = _tagged_section("instructions", system_instructions)
             if tagged_instructions:
                 sections.append(tagged_instructions)
+
+        if project_instructions:
+            tagged_project_instructions = _tagged_section(
+                "project_instructions", "\n\n".join(project_instructions)
+            )
+            if tagged_project_instructions:
+                sections.append(tagged_project_instructions)
 
         if immutable_instructions:
             sections.append(

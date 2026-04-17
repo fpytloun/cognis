@@ -38,7 +38,7 @@ DEFAULT_SETTINGS: Final[dict[str, tuple[str, object]]] = {
     "session.max_context_tokens": ("session", 250000),
     "session.compaction_threshold": ("session", 0.85),
     "session.compaction_preserve_turns": ("session", 10),
-    "session.max_tool_calls_per_turn": ("session", 50),
+    "session.max_tool_calls_per_turn": ("session", 200),
     "session.idle_timeout_seconds": ("session", 1800),
     "session.max_session_age_seconds": ("session", 86400),
     "session.max_delegation_depth": ("session", 5),
@@ -191,6 +191,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_task_completion_delivery_columns)
         await conn.run_sync(_ensure_step_run_execution_paths)
         await conn.run_sync(_ensure_system_agent_override_skill_columns)
+        await conn.run_sync(_ensure_harness_recovery_tables)
 
 
 def _ensure_session_lifecycle_columns(sync_conn: object) -> None:
@@ -227,6 +228,15 @@ def _ensure_api_key_columns(sync_conn: object) -> None:
 
     if "last_used_at" not in api_key_columns:
         execute(text("ALTER TABLE api_keys ADD COLUMN last_used_at TIMESTAMP WITH TIME ZONE"))
+
+
+def _ensure_harness_recovery_tables(sync_conn: object) -> None:
+    """Create durable recovery tables introduced after the MVP bootstrap."""
+
+    from cognis.store.models import FollowUpDedupeRow, RememberQueueRow
+
+    RememberQueueRow.__table__.create(bind=sync_conn, checkfirst=True)
+    FollowUpDedupeRow.__table__.create(bind=sync_conn, checkfirst=True)
 
 
 def _ensure_agent_sync_metadata_column(sync_conn: object) -> None:

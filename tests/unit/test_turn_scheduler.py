@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from cognis.core.agent_loop import PauseWaiter, PendingPause
 from cognis.core.events import EventBus, EventType
@@ -19,6 +21,7 @@ from cognis.core.turn_scheduler import TurnScheduler, _effective_user_content
 from cognis.models.agent import AgentDefinition
 from cognis.models.artifact import ArtifactKind, AttachmentRef
 from cognis.models.session import SessionStatus
+from cognis.store.models import Base
 
 
 class _RecordingObserver:
@@ -688,6 +691,87 @@ async def test_follow_up_event_retries_after_immediate_rejection() -> None:
         queries.get_conversation = original  # type: ignore[assignment]
 
     assert scheduler.submit_turn.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_follow_up_dedupe_persists_across_scheduler_instances(tmp_path: Path) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'follow-up-dedupe.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    scheduler_a = TurnScheduler(
+        session_factory=session_factory,
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+    scheduler_b = TurnScheduler(
+        session_factory=session_factory,
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+    scheduler_a.submit_turn = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    scheduler_b.submit_turn = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+    async def _get_conversation(_session, conversation_id: str):
+        return SimpleNamespace(conversation_id=conversation_id, user_email="user@example.com")
+
+    import cognis.store.queries as queries
+
+    original = queries.get_conversation
+    queries.get_conversation = _get_conversation  # type: ignore[assignment]
+    follow_up = TaskResultFollowUp(
+        follow_up_id="fup_cross_instance",
+        mode=FollowUpMode.NOTIFY,
+        origin_kind=FollowUpOriginKind.TASK_RESULT,
+        relevance_hint="unknown",
+        required_action=FollowUpRequiredAction.PRESENT_UPDATE,
+        topic_ref="task-1",
+        status=FollowUpStatus.COMPLETED,
+        task_id="task-1",
+        task_title="Background task",
+        source_type="api",
+        delivery_mode="latest_active_for_agent",
+        result_summary="Done",
+        description="",
+    )
+    try:
+        event = SimpleNamespace(
+            data={
+                "conversation_id": "conv-1",
+                "follow_up": follow_up.model_dump(mode="json"),
+            }
+        )
+        await scheduler_a._handle_follow_up_event(event)
+        await scheduler_b._handle_follow_up_event(event)
+    finally:
+        queries.get_conversation = original  # type: ignore[assignment]
+
+    scheduler_a.submit_turn.assert_awaited_once()
+    scheduler_b.submit_turn.assert_not_awaited()
+    await engine.dispose()
 
 
 @pytest.mark.asyncio

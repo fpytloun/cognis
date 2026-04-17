@@ -427,18 +427,41 @@ async def _handle_skill_load(
                 tools = ver.tools
                 templates = ver.prompt_templates
 
+    protected_context_parts = [
+        "<loaded_skill>",
+        f"<skill_id>{row.skill_id}</skill_id>",
+        f"<name>{row.name}</name>",
+    ]
+    if row.description:
+        protected_context_parts.append(f"<description>{row.description}</description>")
+    if isinstance(instructions, str) and instructions.strip():
+        protected_context_parts.append(f"<instructions>\n{instructions}\n</instructions>")
+    if tools:
+        protected_context_parts.append(
+            "<tool_summaries>\n" + json.dumps(tools, indent=2, default=str) + "\n</tool_summaries>"
+        )
+    if templates:
+        protected_context_parts.append(
+            "<prompt_templates>\n"
+            + json.dumps(templates, indent=2, default=str)
+            + "\n</prompt_templates>"
+        )
+    protected_context_parts.append("</loaded_skill>")
+
     result = {
         "skill_id": row.skill_id,
         "name": row.name,
         "description": row.description,
-        "instructions": instructions,
-        "tools": tools,
-        "prompt_templates": templates,
+        "loaded": True,
+        "tool_count": len(tools or []),
+        "template_count": len(templates or {}),
+        "message": "Skill loaded into working context for this turn.",
         "tags": row.tags or [],
     }
     return ToolResult(
         output=json.dumps(result, indent=2, default=str),
         metadata={
+            "protected_context": "\n".join(protected_context_parts),
             "discovered_tool_ids": sorted(
                 _resolved_skill_tool_ids(
                     row.skill_id,
@@ -448,7 +471,7 @@ async def _handle_skill_load(
                     instructions,
                     tools,
                 )
-            )
+            ),
         },
     )
 

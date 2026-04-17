@@ -194,6 +194,22 @@ def _registry() -> ToolRegistry:
     return registry
 
 
+def _readonly_registry() -> ToolRegistry:
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="memory_search",
+                description="memory search",
+                parameters={"type": "object", "properties": {}},
+                source=ToolSource(type="builtin"),
+                read_only=True,
+            )
+        )
+    )
+    return registry
+
+
 def _agent(tool_permissions: dict[str, Permission] | None = None) -> AgentDefinition:
     return AgentDefinition(
         agent_id="agent-a",
@@ -257,6 +273,53 @@ async def test_tool_router_dispatches_intaris_mcp() -> None:
     assert guardrails.mcp_calls == 1
     assert guardrails.last_mcp_call == ("github", "search")
     assert 'trust="untrusted"' in result.output
+
+
+@pytest.mark.asyncio
+async def test_tool_router_does_not_cache_escalate_for_read_only_tools() -> None:
+    class _EscalateThenApproveGuardrails:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def evaluate(
+            self, session_id: str, tool_name: str, arguments: dict, context: dict
+        ) -> object:
+            del session_id, tool_name, arguments, context
+            self.calls += 1
+            decision = "escalate" if self.calls == 1 else "approve"
+            return type(
+                "Evaluation",
+                (),
+                {
+                    "decision": decision,
+                    "reasoning": None,
+                    "risk": None,
+                    "path": None,
+                    "latency_ms": 0,
+                    "call_id": f"eval_{self.calls}",
+                },
+            )()
+
+    guardrails = _EscalateThenApproveGuardrails()
+    router = ToolRouter(guardrails=guardrails, non_bypassable_patterns=[])
+    tool_call = ToolCall(call_id="cache-1", name="memory_search", arguments={"query": "x"})
+
+    first = await router.evaluate_tool_call(
+        tool_call,
+        _agent({"*": Permission.EVALUATE}),
+        _session(),
+        _readonly_registry(),
+    )
+    second = await router.evaluate_tool_call(
+        tool_call,
+        _agent({"*": Permission.EVALUATE}),
+        _session(),
+        _readonly_registry(),
+    )
+
+    assert first.decision == "escalate"
+    assert second.decision == "approve"
+    assert guardrails.calls == 2
 
 
 @pytest.mark.asyncio

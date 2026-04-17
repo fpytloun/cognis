@@ -13,7 +13,6 @@ from cognis.models.tool import ToolDefinition, stable_tool_id
 from cognis.providers.llm.responses_bridge import should_use_openai_responses
 from cognis.tools.builtin.tool_search import SEARCH_TOOLS_TOOL
 
-_ANTHROPIC_MODEL_PATTERNS = re.compile(r"(claude|anthropic)", re.IGNORECASE)
 _VISIBLE_TOOL_NAME_PATTERN = re.compile(r"[^a-zA-Z0-9_-]+")
 _MAX_VISIBLE_TOOL_NAME_LENGTH = 64
 
@@ -71,9 +70,7 @@ def prepare_tool_exposure(
     ]
     max_tools = model_info.max_tools
     available_slots = None if max_tools is None else max(0, max_tools - controller_count)
-    use_anthropic_defer = bool(
-        model_info.supports_defer_loading or _ANTHROPIC_MODEL_PATTERNS.search(model)
-    )
+    use_anthropic_defer = bool(model_info.supports_defer_loading)
     use_openai_native_tool_search = bool(
         use_openai_responses and model_info.supports_tool_search and deferred_tools
     )
@@ -93,8 +90,10 @@ def prepare_tool_exposure(
             alias_map,
             deferred_tool_ids={stable_tool_id(tool) for tool in deferred_tools},
         )
-        if tool_schemas:
-            tool_schemas[-1]["function"]["cache_control"] = {"type": "ephemeral"}
+        _mark_anthropic_cache_breakpoint(
+            tool_schemas,
+            stable_anchor_tool_ids={stable_tool_id(tool) for tool in core_without_search},
+        )
         request_kwargs = {"extra_headers": {"anthropic-beta": "tool-search-tool-2025-10-19"}}
     elif use_openai_native_tool_search:
         strategy = "openai_responses_tool_search"
@@ -126,8 +125,9 @@ def prepare_tool_exposure(
             tool_schemas = tool_schemas[:available_slots]
 
     visible_tool_ids = {stable_tool_id(tool) for tool in visible_tools}
+    final_tool_schemas = _strip_internal_schema_metadata(tool_schemas)
     return ToolExposureResult(
-        tools=[*filtered_controller_tool_schemas, *tool_schemas],
+        tools=[*filtered_controller_tool_schemas, *final_tool_schemas],
         alias_map=alias_map,
         request_kwargs=request_kwargs,
         visible_tool_ids=visible_tool_ids,
@@ -163,11 +163,54 @@ def _build_inventory_schemas(
             "name": visible_name,
             "description": tool.description,
             "parameters": tool.parameters,
+            "x-stable-tool-id": stable_tool_id(tool),
         }
         if stable_tool_id(tool) in deferred_tool_ids:
             function_schema["defer_loading"] = True
         schemas.append({"type": "function", "function": function_schema})
     return schemas
+
+
+def _mark_anthropic_cache_breakpoint(
+    tool_schemas: list[dict[str, Any]],
+    *,
+    stable_anchor_tool_ids: set[str],
+) -> None:
+    """Attach Anthropic tool-array cache_control to a stable schema edge.
+
+    Prefer the last non-deferred core tool because deferred/discovered tools can
+    be appended or reordered across turns as the model explores the inventory.
+    """
+
+    if not tool_schemas:
+        return
+
+    anchor_index = len(tool_schemas) - 1
+    for index in range(len(tool_schemas) - 1, -1, -1):
+        function = tool_schemas[index].get("function")
+        if not isinstance(function, dict):
+            continue
+        tool_id = function.get("x-stable-tool-id")
+        if isinstance(tool_id, str) and tool_id in stable_anchor_tool_ids:
+            anchor_index = index
+            break
+
+    function = tool_schemas[anchor_index].get("function")
+    if isinstance(function, dict):
+        function["cache_control"] = {"type": "ephemeral"}
+
+
+def _strip_internal_schema_metadata(tool_schemas: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    sanitized: list[dict[str, Any]] = []
+    for schema in tool_schemas:
+        sanitized_schema = dict(schema)
+        function = sanitized_schema.get("function")
+        if isinstance(function, dict) and "x-stable-tool-id" in function:
+            function = dict(function)
+            function.pop("x-stable-tool-id", None)
+            sanitized_schema["function"] = function
+        sanitized.append(sanitized_schema)
+    return sanitized
 
 
 def _build_openai_deferred_namespaces(

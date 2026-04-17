@@ -5,8 +5,10 @@ from __future__ import annotations
 import pytest
 
 from cognis.core.workflow_registry import (
+    CREATIVE_WORKFLOW,
     DIRECT_WORKFLOW,
     GENERAL_TASK_WORKFLOW,
+    RESEARCH_WORKFLOW,
     SOFTWARE_DEVELOPMENT_WORKFLOW,
     SYSTEM_WORKFLOWS,
     _validate_workflow,
@@ -43,6 +45,16 @@ def test_general_task_workflow_has_single_step_with_evaluation() -> None:
     assert w.steps[0].completion is not None
     assert w.steps[0].completion.evaluate is True
     assert "smallest correct change" in w.steps[0].prompt
+    assert w.steps[0].outcome_routes == [OutcomeRoute(status="failed", action="gate")]
+
+
+def test_research_and_creative_workflows_gate_failed_outcomes() -> None:
+    for step in RESEARCH_WORKFLOW.steps:
+        assert step.outcome_routes == [OutcomeRoute(status="failed", action="gate")]
+
+    assert CREATIVE_WORKFLOW.steps[0].outcome_routes == [
+        OutcomeRoute(status="failed", action="gate")
+    ]
 
 
 def test_software_development_workflow_uses_implement_specialist() -> None:
@@ -80,7 +92,8 @@ def test_software_development_review_steps_use_outcome_routes() -> None:
             action="revise(plan)",
             max_loop_iterations=3,
             on_exhausted="gate",
-        )
+        ),
+        OutcomeRoute(status="failed", action="gate"),
     ]
     assert architect_step.input is not None
     assert architect_step.input.type == "full"
@@ -95,7 +108,8 @@ def test_software_development_review_steps_use_outcome_routes() -> None:
             action="revise(implement)",
             max_loop_iterations=3,
             on_exhausted="gate",
-        )
+        ),
+        OutcomeRoute(status="failed", action="gate"),
     ]
     assert code_review_step.input is not None
     assert code_review_step.input.type == "summary"
@@ -104,6 +118,10 @@ def test_software_development_review_steps_use_outcome_routes() -> None:
     )
     assert "Put the outcome only in step_complete" in code_review_step.prompt
     assert commit_step.outcome_routes == [OutcomeRoute(status="failed", action="gate")]
+
+    for step_name in ("plan", "implement", "update_docs", "remember"):
+        step = next(step for step in SOFTWARE_DEVELOPMENT_WORKFLOW.steps if step.name == step_name)
+        assert step.outcome_routes == [OutcomeRoute(status="failed", action="gate")]
 
 
 def test_validate_workflow_accepts_valid_definition() -> None:

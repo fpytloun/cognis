@@ -708,6 +708,69 @@ class NotificationRow(Base):
     )
 
 
+class RememberQueueRow(Base):
+    """Durable queue for deferred Mnemory remember work.
+
+    The queue is controller-owned and stores only metadata plus the serialized
+    remember payload required to retry the call after restart.
+    """
+
+    __tablename__ = "remember_queue"
+
+    item_id: Mapped[str] = mapped_column(String, primary_key=True)
+    session_id: Mapped[str] = mapped_column(String, nullable=False)
+    user_email: Mapped[str] = mapped_column(String, ForeignKey("users.email"), nullable=False)
+    agent_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False, default="pending")
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    next_retry_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
+    lease_token: Mapped[str | None] = mapped_column(String, nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    last_error: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__ = (
+        Index("ix_remember_queue_status_due", "status", "next_retry_at"),
+        Index("ix_remember_queue_session", "session_id"),
+    )
+
+
+class FollowUpDedupeRow(Base):
+    """Durable dedupe state for follow-up turn requests.
+
+    This replaces the previous in-memory-only suppression so duplicate follow-up
+    ids remain suppressed across restarts and across controller replicas.
+    """
+
+    __tablename__ = "follow_up_dedupe"
+
+    dedupe_key: Mapped[str] = mapped_column(String, primary_key=True)
+    conversation_id: Mapped[str] = mapped_column(String, nullable=False)
+    follow_up_id: Mapped[str] = mapped_column(String, nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False, default="pending")
+    expires_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__ = (
+        UniqueConstraint("conversation_id", "follow_up_id", name="uq_follow_up_dedupe_pair"),
+        Index("ix_follow_up_dedupe_expires", "expires_at"),
+        Index("ix_follow_up_dedupe_conversation", "conversation_id"),
+    )
+
+
 class ChannelDeliveryOutboxRow(Base):
     """Durable outbox for background/system channel follow-up sends.
 

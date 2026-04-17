@@ -204,7 +204,7 @@ ToolResultCallback = Callable[
 ]
 
 # Default limits
-DEFAULT_MAX_TOOL_CALLS = 50
+DEFAULT_MAX_TOOL_CALLS = 200
 DEFAULT_STEP_TIMEOUT_SECONDS = 600  # 10 minutes
 _MAX_TOOL_DATA_BYTES = 10_240  # 10 KB truncation limit for WS events
 _MAX_INTARIS_TOOL_RESULT = 50_000  # Intaris gets the middle-truncated preview
@@ -1032,6 +1032,8 @@ class StepContext:
     pending_events: list[SessionEvent] | None = None
     pending_tool_calls: dict[str, PendingToolCallState] = field(default_factory=dict)
     current_model: str | None = None
+    remember_user_event_seq: int | None = None
+    remember_assistant_event_seq: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -3170,12 +3172,10 @@ class AgentLoop:
                 )
                 break
 
-            # Check tool call limit. The reminder must be coordinated with
-            # the step_complete gate: if calling step_complete would be
-            # rejected (non-terminal todos, require_step_complete policy),
-            # pushing the model toward "call step_complete now" causes a
-            # rejection-and-repeat loop that ate the daily-brief trace.
-            # Instead, tell the model exactly which closure action applies.
+            # Enforce the ceiling silently. Budget reminders in the prompt led
+            # models to self-report failure for a controller-imposed limit,
+            # which then failed whole workflows. Preserve partial work and let
+            # the evaluator judge whether it is sufficient or needs revision.
             if tool_call_count >= max_tool_calls:
                 logger.warning(
                     "Tool call limit reached",
@@ -3186,51 +3186,26 @@ class AgentLoop:
                         }
                     },
                 )
-                incomplete_todos = self._get_incomplete_todos(ctx)
-                if incomplete_todos and ctx.policy.require_step_complete:
-                    pending_names = [
-                        str(t.get("content", "?"))
-                        for t in incomplete_todos
-                        if t.get("status") == "pending"
-                    ]
-                    in_progress_names = [
-                        str(t.get("content", "?"))
-                        for t in incomplete_todos
-                        if t.get("status") == "in_progress"
-                    ]
-                    budget_guidance = (
-                        f"Tool call budget ({max_tool_calls}) reached, but "
-                        f"{len(incomplete_todos)} todo(s) are still non-terminal "
-                        f"(pending: {len(pending_names)}, in_progress: "
-                        f"{len(in_progress_names)}). Your next action MUST be "
-                        "step_todo_write that marks every remaining todo as "
-                        "either 'completed' or 'cancelled'. Then call "
-                        "step_complete. Do not attempt new executor tool calls."
+                events_to_record.append(
+                    SessionEvent(
+                        type="lifecycle",
+                        data={
+                            "event": "tool_call_ceiling_reached",
+                            "tool_call_count": tool_call_count,
+                            "max_tool_calls": max_tool_calls,
+                            "step_name": ctx.step_definition.name,
+                        },
                     )
-                elif ctx.policy.require_step_complete:
-                    budget_guidance = (
-                        f"Tool call budget ({max_tool_calls}) reached. All "
-                        "todos are terminal. If the step is finished, call "
-                        "step_complete now with your summary. Otherwise "
-                        "continue only if you can finish without more tool "
-                        "calls."
-                    )
-                else:
-                    budget_guidance = (
-                        f"Tool call budget ({max_tool_calls}) reached. "
-                        "Wrap up with a direct reply; do not start new tool "
-                        "calls unless absolutely required to answer."
-                    )
-                messages.append(
-                    {
-                        "role": "system",
-                        "content": (
-                            "Internal controller reminder — this is not a new user "
-                            "message. Do not write a filler acknowledgment just for "
-                            "this reminder.\n\n" + budget_guidance
-                        ),
-                    }
                 )
+                step_output = StepOutput(
+                    summary=(
+                        "Stopped after reaching the tool-call ceiling. "
+                        "Partial work was preserved for evaluation."
+                    ),
+                    content="\n\n".join(assistant_content_parts),
+                    attachments=list(collected_attachments),
+                )
+                break
 
         # Finalize step — pass assistant_content_parts so Mnemory remember
         # works even when events were already flushed incrementally.
@@ -5052,6 +5027,13 @@ class AgentLoop:
                 )
                 if not append_result.ok:
                     raise RuntimeError(f"Intaris did not persist {reason}")
+                next_seq = append_result.first_seq
+                for event in batch:
+                    if event.type == "user_message":
+                        ctx.remember_user_event_seq = next_seq
+                    elif event.type == "assistant_message":
+                        ctx.remember_assistant_event_seq = next_seq
+                    next_seq += 1
                 await self.session_cache.append_recorded_events(ctx.session, batch, append_result)
                 events.clear()
                 return True
@@ -5245,6 +5227,15 @@ class AgentLoop:
                 "content": result.output,
             }
         )
+        protected_context = result.metadata.get("protected_context") if result.metadata else None
+        if isinstance(protected_context, str) and protected_context.strip():
+            messages.append(
+                {
+                    "role": "system",
+                    "content": protected_context,
+                    "_prior_context": True,
+                }
+            )
         await self.event_bus.publish(
             Event(
                 type=EventType.WORKFLOW_PROGRESS,
@@ -5413,24 +5404,24 @@ class AgentLoop:
         if not assistant_content.strip():
             return
 
-        # Build the last turn: user message + assistant response.
-        # Mnemory's remember endpoint expects OpenAI-format messages
-        # and extracts facts from both roles.  System-initiated turns
-        # (workflow steps, delegations) use internal prompts as
-        # user_message — skip those to avoid polluting user memory.
-        messages: list[dict[str, str]] = []
-        if not ctx.system_initiated and ctx.user_message and ctx.user_message.strip():
-            messages.append({"role": "user", "content": ctx.user_message[:5000]})
-        messages.append({"role": "assistant", "content": assistant_content[:5000]})
-
-        await self.remember_queue.enqueue(
-            {
-                "session_id": ctx.session.mnemory_session_id,
-                "messages": messages,
-                "user_email": ctx.session.user_email,
-                "agent_id": ctx.session.agent_id,
-            }
-        )
+        try:
+            await self.remember_queue.enqueue(
+                {
+                    "session_id": ctx.session.mnemory_session_id,
+                    "intaris_session_id": ctx.session.intaris_session_id or ctx.session.session_id,
+                    "include_user_message": not ctx.system_initiated,
+                    "user_event_seq": ctx.remember_user_event_seq,
+                    "assistant_event_seq": ctx.remember_assistant_event_seq,
+                    "user_email": ctx.session.user_email,
+                    "agent_id": ctx.session.agent_id,
+                }
+            )
+        except Exception:
+            logger.warning(
+                "agent: failed to enqueue remember work",
+                extra={"extra_data": {"session_id": ctx.session.session_id}},
+                exc_info=True,
+            )
 
     async def _auto_compact(self, ctx: StepContext) -> None:
         """Automatically compact and rotate the session post-turn.

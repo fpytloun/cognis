@@ -750,6 +750,46 @@ class _FinalAssistantContentLLM:
                 }
             ]
         }
+
+
+class _ToolCallCeilingLLM:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def count_tokens(self, text: str, model: str | None = None) -> int:
+        del model
+        return len(text)
+
+    async def get_model_info(self, model: str | None) -> SimpleNamespace:
+        del model
+        return SimpleNamespace(
+            max_tools=None,
+            supports_parallel_tool_calls=False,
+            supports_tool_choice=False,
+            supports_cache_control=False,
+            supports_defer_loading=False,
+            provider="test",
+        )
+
+    async def stream_generate(self, messages: list[dict[str, object]], **_: object):
+        del messages
+        self.calls += 1
+        yield {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_ceiling",
+                                "function": {"name": "bash", "arguments": "{}"},
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+        return
         return
 
 
@@ -1389,6 +1429,71 @@ def test_build_step_prompt_includes_revision_context() -> None:
     assert "## Revision Context" in prompt
     assert "Full review text." in prompt
     assert workflow_state.last_revision_context is None
+
+
+@pytest.mark.asyncio
+async def test_tool_call_ceiling_returns_partial_step_output_without_second_llm_turn() -> None:
+    fake_llm = _ToolCallCeilingLLM()
+
+    class _ToolRouter:
+        async def execute(self, *args: object, **kwargs: object) -> SimpleNamespace:
+            del args, kwargs
+            return SimpleNamespace(
+                output="ok",
+                is_error=False,
+                duration_ms=1,
+                metadata={},
+                attachments=[],
+            )
+
+    ctx = StepContext(
+        step_definition=StepDefinition(name="execute", type="run", prompt="Do the task."),
+        session=SimpleNamespace(
+            session_id="sess-1",
+            intaris_session_id="sess-1",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(
+            conversation_id="conv-1",
+            title=None,
+            title_source="unset",
+        ),
+        agent=AgentDefinition(
+            agent_id="agent-1",
+            owner_email="user@example.com",
+            name="Agent",
+            execution={"max_tool_calls": 1},
+        ),
+        policy=WORKFLOW_POLICY,
+        user_message="do it",
+        user_attachments=[],
+        system_initiated=False,
+    )
+
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=_ToolRouter(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+
+    output = await agent_loop.run_step(ctx)
+
+    assert output is not None
+    assert output.outcome is None
+    assert (
+        output.summary
+        == "Stopped after reaching the tool-call ceiling. Partial work was preserved for evaluation."
+    )
+    assert fake_llm.calls == 1
 
 
 def test_build_step_prompt_includes_operator_instruction() -> None:

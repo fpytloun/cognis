@@ -3,14 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from time import monotonic
 from typing import Any
 
+import sqlalchemy as sa
 from prometheus_client import Counter, Gauge
 
+from cognis.core.attachment_utils import merge_content_and_attachment_note
 from cognis.logging import get_logger
+from cognis.runtime_context import scoped_runtime_context
+from cognis.store.models import RememberQueueRow
 
 logger = get_logger(__name__)
 
@@ -18,28 +25,63 @@ QUEUE_DEPTH = Gauge("cognis_remember_queue_depth", "Current remember queue depth
 QUEUE_DROPPED = Counter("cognis_remember_queue_dropped_total", "Dropped remember queue items")
 QUEUE_FAILED = Counter("cognis_remember_queue_failed_total", "Failed remember queue items")
 QUEUE_SUCCESS = Counter("cognis_remember_queue_success_total", "Successful remember queue items")
+QUEUE_REPLAYED = Counter(
+    "cognis_remember_queue_replayed_total",
+    "Durably persisted remember queue items replayed after restart or retry",
+)
 
 
-@dataclass
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
+
+
+def _normalize_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is not None:
+        return value
+    return value.replace(tzinfo=UTC)
+
+
+@dataclass(slots=True)
 class RememberQueueItem:
     payload: dict[str, Any]
     attempts: int = 0
     next_retry_at: float = field(default_factory=monotonic)
+    item_id: str | None = None
+    lease_token: str | None = None
+    created_at: datetime | None = None
 
 
 class RememberRetryQueue:
-    """Bounded in-memory retry queue with async drain workers."""
+    """Retry queue with durable DB-backed mode and in-memory fallback.
 
-    def __init__(self, worker: Any, max_depth: int = 100, max_concurrent: int = 5) -> None:
+    Production app wiring passes a SQLAlchemy ``session_factory`` so queued
+    remember work survives restart. Narrow unit tests may omit it; in that case,
+    the queue falls back to the original in-memory behavior.
+    """
+
+    def __init__(
+        self,
+        worker: Any,
+        session_factory: Callable[[], Any] | None = None,
+        event_reader: Any | None = None,
+        max_depth: int = 100,
+        max_concurrent: int = 5,
+    ) -> None:
         self.worker = worker
+        self._session_factory = session_factory
+        self._event_reader = event_reader
         self.max_depth = max_depth
         self.max_concurrent = max_concurrent
         self.max_retries = 5
         self.backoff_max = 60.0
+        self.lease_seconds = 60
         self._items: deque[RememberQueueItem] = deque()
         self._lock = asyncio.Lock()
         self._stop_event = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
+        self._started_at = _utcnow()
 
     async def start(self) -> None:
         if self._task is None:
@@ -54,6 +96,12 @@ class RememberRetryQueue:
                 self._task.cancel()
 
     async def enqueue(self, payload: dict[str, Any]) -> None:
+        if self._session_factory is None:
+            await self._enqueue_in_memory(payload)
+            return
+        await self._enqueue_durable(payload)
+
+    async def _enqueue_in_memory(self, payload: dict[str, Any]) -> None:
         async with self._lock:
             if len(self._items) >= self.max_depth:
                 self._items.popleft()
@@ -62,38 +110,333 @@ class RememberRetryQueue:
             self._items.append(RememberQueueItem(payload=payload))
             QUEUE_DEPTH.set(len(self._items))
 
+    async def _enqueue_durable(self, payload: dict[str, Any]) -> None:
+        now = _utcnow()
+        durable_payload = self._durable_payload(payload)
+        row = RememberQueueRow(
+            item_id=f"rq_{uuid.uuid4().hex}",
+            session_id=str(durable_payload.get("session_id") or ""),
+            user_email=str(durable_payload.get("user_email") or ""),
+            agent_id=(
+                str(durable_payload.get("agent_id"))
+                if durable_payload.get("agent_id") is not None
+                else None
+            ),
+            payload=durable_payload,
+            status="pending",
+            attempts=0,
+            next_retry_at=now,
+        )
+        async with self._session_factory() as session:
+            await self._trim_durable_overflow(session)
+            session.add(row)
+            await session.commit()
+            await self._update_durable_depth_metric(session)
+
+    async def _trim_durable_overflow(self, session: Any) -> None:
+        count = await session.scalar(sa.select(sa.func.count()).select_from(RememberQueueRow))
+        if not isinstance(count, int) or count < self.max_depth:
+            return
+        overflow = count - self.max_depth + 1
+        rows = (
+            (
+                await session.execute(
+                    sa.select(RememberQueueRow)
+                    .where(RememberQueueRow.status.in_(["pending", "failed"]))
+                    .order_by(RememberQueueRow.created_at.asc())
+                    .limit(max(overflow, 1))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for row in rows:
+            await session.delete(row)
+            QUEUE_DROPPED.inc()
+        if rows:
+            logger.warning(
+                "Remember queue overflow; dropped oldest persisted items",
+                extra={"extra_data": {"dropped": len(rows)}},
+            )
+
     async def _drain_loop(self) -> None:
         semaphore = asyncio.Semaphore(self.max_concurrent)
-        while not self._stop_event.is_set() or self._items:
-            await asyncio.sleep(0.1)
-            ready: list[RememberQueueItem] = []
-            async with self._lock:
-                now = monotonic()
-                remaining: deque[RememberQueueItem] = deque()
-                while self._items:
-                    item = self._items.popleft()
-                    if item.next_retry_at <= now:
-                        ready.append(item)
-                    else:
-                        remaining.append(item)
-                self._items = remaining
-                QUEUE_DEPTH.set(len(self._items))
+        while True:
+            if self._stop_event.is_set():
+                if self._session_factory is None:
+                    if not self._items:
+                        break
+                elif not await self._has_durable_work():
+                    break
+
+            ready = (
+                await self._claim_due_durable_items(self.max_concurrent)
+                if self._session_factory is not None
+                else await self._collect_ready_in_memory()
+            )
             if not ready:
+                await asyncio.sleep(0.1)
                 continue
             await asyncio.gather(*(self._process(item, semaphore) for item in ready))
+
+    async def _collect_ready_in_memory(self) -> list[RememberQueueItem]:
+        ready: list[RememberQueueItem] = []
+        async with self._lock:
+            now = monotonic()
+            remaining: deque[RememberQueueItem] = deque()
+            while self._items:
+                item = self._items.popleft()
+                if item.next_retry_at <= now:
+                    ready.append(item)
+                else:
+                    remaining.append(item)
+            self._items = remaining
+            QUEUE_DEPTH.set(len(self._items))
+        return ready
+
+    async def _claim_due_durable_items(self, limit: int) -> list[RememberQueueItem]:
+        if self._session_factory is None:
+            return []
+        now = _utcnow()
+        claimed: list[RememberQueueItem] = []
+        async with self._session_factory() as session:
+            rows = (
+                (
+                    await session.execute(
+                        sa.select(RememberQueueRow)
+                        .where(
+                            sa.or_(
+                                sa.and_(
+                                    RememberQueueRow.status == "pending",
+                                    RememberQueueRow.next_retry_at <= now,
+                                ),
+                                sa.and_(
+                                    RememberQueueRow.status == "leased",
+                                    RememberQueueRow.lease_expires_at.is_not(None),
+                                    RememberQueueRow.lease_expires_at <= now,
+                                ),
+                            )
+                        )
+                        .order_by(
+                            RememberQueueRow.next_retry_at.asc(), RememberQueueRow.created_at.asc()
+                        )
+                        .limit(limit * 4)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+
+            for row in rows:
+                lease_token = uuid.uuid4().hex
+                updated = await session.execute(
+                    sa.update(RememberQueueRow)
+                    .execution_options(synchronize_session=False)
+                    .where(
+                        RememberQueueRow.item_id == row.item_id,
+                        sa.or_(
+                            sa.and_(
+                                RememberQueueRow.status == "pending",
+                                RememberQueueRow.next_retry_at <= now,
+                            ),
+                            sa.and_(
+                                RememberQueueRow.status == "leased",
+                                RememberQueueRow.lease_expires_at.is_not(None),
+                                RememberQueueRow.lease_expires_at <= now,
+                            ),
+                        ),
+                    )
+                    .values(
+                        status="leased",
+                        lease_token=lease_token,
+                        lease_expires_at=now + timedelta(seconds=self.lease_seconds),
+                        updated_at=now,
+                    )
+                )
+                if not updated.rowcount:
+                    continue
+                claimed.append(
+                    RememberQueueItem(
+                        item_id=row.item_id,
+                        payload=dict(row.payload or {}),
+                        attempts=row.attempts,
+                        lease_token=lease_token,
+                        created_at=row.created_at,
+                    )
+                )
+                created_at = _normalize_utc(row.created_at)
+                if (created_at is not None and created_at < self._started_at) or row.attempts > 0:
+                    QUEUE_REPLAYED.inc()
+                if len(claimed) >= limit:
+                    break
+            await session.commit()
+            await self._update_durable_depth_metric(session)
+        return claimed
 
     async def _process(self, item: RememberQueueItem, semaphore: asyncio.Semaphore) -> None:
         async with semaphore:
             try:
-                await self.worker.remember(**item.payload)
+                resolved_payload = await self._resolve_payload(item.payload)
+                await self.worker.remember(**resolved_payload)
                 QUEUE_SUCCESS.inc()
-            except Exception:
-                item.attempts += 1
-                if item.attempts >= self.max_retries:
-                    QUEUE_FAILED.inc()
-                    logger.warning("Remember queue item failed permanently")
+                if self._session_factory is None or item.item_id is None:
                     return
-                item.next_retry_at = monotonic() + min(2**item.attempts, self.backoff_max)
-                async with self._lock:
-                    self._items.append(item)
-                    QUEUE_DEPTH.set(len(self._items))
+                async with self._session_factory() as session:
+                    await session.execute(
+                        sa.delete(RememberQueueRow)
+                        .where(
+                            RememberQueueRow.item_id == item.item_id,
+                            RememberQueueRow.lease_token == item.lease_token,
+                        )
+                        .execution_options(synchronize_session=False)
+                    )
+                    await session.commit()
+                    await self._update_durable_depth_metric(session)
+            except Exception as exc:
+                item.attempts += 1
+                if self._session_factory is None or item.item_id is None:
+                    if item.attempts >= self.max_retries:
+                        QUEUE_FAILED.inc()
+                        logger.warning("Remember queue item failed permanently")
+                        return
+                    item.next_retry_at = monotonic() + min(2**item.attempts, self.backoff_max)
+                    async with self._lock:
+                        self._items.append(item)
+                        QUEUE_DEPTH.set(len(self._items))
+                    return
+
+                next_retry_at = _utcnow() + timedelta(
+                    seconds=min(2**item.attempts, self.backoff_max)
+                )
+                status = "failed" if item.attempts >= self.max_retries else "pending"
+                if status == "failed":
+                    QUEUE_FAILED.inc()
+                    logger.warning(
+                        "Remember queue item failed permanently",
+                        extra={
+                            "extra_data": {
+                                "item_id": item.item_id,
+                                "session_id": item.payload.get("session_id"),
+                                "user_email": item.payload.get("user_email"),
+                            }
+                        },
+                    )
+                async with self._session_factory() as session:
+                    await session.execute(
+                        sa.update(RememberQueueRow)
+                        .execution_options(synchronize_session=False)
+                        .where(
+                            RememberQueueRow.item_id == item.item_id,
+                            RememberQueueRow.lease_token == item.lease_token,
+                        )
+                        .values(
+                            status=status,
+                            attempts=item.attempts,
+                            next_retry_at=next_retry_at,
+                            lease_token=None,
+                            lease_expires_at=None,
+                            last_error=str(exc)[:500],
+                            updated_at=_utcnow(),
+                        )
+                    )
+                    await session.commit()
+                    await self._update_durable_depth_metric(session)
+
+    async def _has_durable_work(self) -> bool:
+        if self._session_factory is None:
+            return False
+        async with self._session_factory() as session:
+            count = await session.scalar(
+                sa.select(sa.func.count())
+                .select_from(RememberQueueRow)
+                .where(RememberQueueRow.status.in_(["pending", "leased"]))
+            )
+            return bool(count)
+
+    async def _update_durable_depth_metric(self, session: Any) -> None:
+        count = await session.scalar(
+            sa.select(sa.func.count())
+            .select_from(RememberQueueRow)
+            .where(RememberQueueRow.status.in_(["pending", "leased"]))
+        )
+        QUEUE_DEPTH.set(int(count or 0))
+
+    @staticmethod
+    def _durable_payload(payload: dict[str, Any]) -> dict[str, Any]:
+        if "messages" not in payload:
+            return dict(payload)
+        durable_payload = dict(payload)
+        durable_payload.pop("messages", None)
+        return durable_payload
+
+    async def _resolve_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if "messages" in payload:
+            return payload
+        if self._event_reader is None:
+            raise RuntimeError("Remember queue replay requires an Intaris event reader")
+
+        intaris_session_id = str(
+            payload.get("intaris_session_id") or payload.get("source_intaris_session_id") or ""
+        ).strip()
+        mnemory_session_id = str(payload.get("session_id") or "").strip()
+        if not intaris_session_id or not mnemory_session_id:
+            raise RuntimeError("Remember queue item is missing session references")
+
+        user_email = payload.get("user_email")
+        agent_id = payload.get("agent_id")
+        include_user_message = bool(payload.get("include_user_message", True))
+        user_event_seq = payload.get("user_event_seq")
+        assistant_event_seq = payload.get("assistant_event_seq")
+        requested_seqs = [
+            int(seq)
+            for seq in (user_event_seq, assistant_event_seq)
+            if isinstance(seq, int) and seq > 0
+        ]
+        after_seq = max(0, min(requested_seqs) - 1) if requested_seqs else 0
+
+        with scoped_runtime_context(user_email=user_email, agent_id=agent_id):
+            event_read = await self._event_reader.read_events(
+                session_id=intaris_session_id,
+                after_seq=after_seq,
+                limit=max(20, len(requested_seqs) + 4),
+                types=["user_message", "assistant_message"],
+                allow_missing_stream=True,
+            )
+
+        messages: list[dict[str, str]] = []
+        if include_user_message:
+            for event in reversed(event_read.events):
+                if event.type != "user_message":
+                    continue
+                if isinstance(user_event_seq, int) and event.seq != user_event_seq:
+                    continue
+                content = merge_content_and_attachment_note(
+                    str(event.data.get("content", "")),
+                    [a for a in event.data.get("attachments", []) if isinstance(a, dict)],
+                ).strip()
+                if content:
+                    messages.append({"role": "user", "content": content[:5000]})
+                    break
+
+        for event in reversed(event_read.events):
+            if event.type != "assistant_message":
+                continue
+            if isinstance(assistant_event_seq, int) and event.seq != assistant_event_seq:
+                continue
+            content = merge_content_and_attachment_note(
+                str(event.data.get("content", "")),
+                [a for a in event.data.get("attachments", []) if isinstance(a, dict)],
+            ).strip()
+            if content:
+                messages.append({"role": "assistant", "content": content[:5000]})
+                break
+
+        if not messages or all(message["role"] != "assistant" for message in messages):
+            raise RuntimeError("Could not reconstruct remember payload from Intaris events")
+
+        return {
+            "session_id": mnemory_session_id,
+            "messages": messages,
+            "user_email": user_email,
+            "agent_id": agent_id,
+        }

@@ -43,10 +43,13 @@ class IntarisProvider:
         self.auth_provider = auth_provider
         self.user_email = user_email
         self.client = httpx.AsyncClient(base_url=self.base_url, timeout=10)
-        # Separate circuit breakers: evaluate is critical-path (fail-closed),
-        # data-plane methods (record/read events) have different failure modes.
+        # Separate circuit breakers by endpoint family so a failure in one
+        # operational path does not unnecessarily poison unrelated calls.
         self.eval_breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=30.0)
-        self.data_breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=30.0)
+        self.reasoning_breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=30.0)
+        self.session_breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=30.0)
+        self.events_breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=30.0)
+        self.mcp_breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=30.0)
 
     async def _call_with_retry(
         self,
@@ -139,7 +142,7 @@ class IntarisProvider:
             _do,
             max_retries=2,
             operation=f"intaris create_session({session_id})",
-            breaker=self.data_breaker,
+            breaker=self.session_breaker,
         )
         logger.info(
             "intaris: session created",
@@ -224,7 +227,7 @@ class IntarisProvider:
             _do,
             max_retries=2,
             operation="intaris report_reasoning",
-            breaker=self.data_breaker,
+            breaker=self.reasoning_breaker,
         )
 
     async def update_session_status(
@@ -250,7 +253,7 @@ class IntarisProvider:
             _do,
             max_retries=2,
             operation=f"intaris update_session_status({session_id})",
-            breaker=self.data_breaker,
+            breaker=self.session_breaker,
         )
 
     async def checkpoint(self, session_id: str, content: str) -> None:
@@ -266,7 +269,7 @@ class IntarisProvider:
             _do,
             max_retries=2,
             operation=f"intaris checkpoint({session_id})",
-            breaker=self.data_breaker,
+            breaker=self.session_breaker,
         )
 
     async def get_session(self, session_id: str) -> IntarisSession:
@@ -282,7 +285,7 @@ class IntarisProvider:
             _do,
             max_retries=2,
             operation=f"intaris get_session({session_id})",
-            breaker=self.data_breaker,
+            breaker=self.session_breaker,
         )
 
     async def submit_decision(self, call_id: str, decision: str, note: str | None = None) -> None:
@@ -298,7 +301,7 @@ class IntarisProvider:
             _do,
             max_retries=2,
             operation="intaris submit_decision",
-            breaker=self.data_breaker,
+            breaker=self.session_breaker,
         )
 
     async def list_pending_escalations(
@@ -323,7 +326,7 @@ class IntarisProvider:
             _do,
             max_retries=2,
             operation="intaris list_pending_escalations",
-            breaker=self.data_breaker,
+            breaker=self.session_breaker,
         )
 
     async def record_events(
@@ -357,7 +360,7 @@ class IntarisProvider:
             _do,
             max_retries=3,
             operation=f"intaris record_events({session_id})",
-            breaker=self.data_breaker,
+            breaker=self.events_breaker,
         )
         logger.debug(
             "intaris: events recorded",
@@ -428,7 +431,7 @@ class IntarisProvider:
             _do,
             max_retries=3,
             operation=f"intaris read_events({session_id})",
-            breaker=self.data_breaker,
+            breaker=self.events_breaker,
         )
         logger.debug(
             "intaris: read_events complete",
@@ -472,7 +475,7 @@ class IntarisProvider:
             _do,
             max_retries=2,
             operation=f"intaris call_mcp_tool({tool_name})",
-            breaker=self.data_breaker,
+            breaker=self.mcp_breaker,
         )
 
     def _normalize_mcp_tool_result(self, payload: Any) -> ToolResult:
@@ -543,7 +546,7 @@ class IntarisProvider:
                 _do,
                 max_retries=1,
                 operation="intaris list_mcp_servers",
-                breaker=self.data_breaker,
+                breaker=self.mcp_breaker,
             )
         except Exception:
             logger.warning("intaris: list_mcp_servers failed", exc_info=True)
@@ -569,7 +572,7 @@ class IntarisProvider:
                 _do,
                 max_retries=1,
                 operation="intaris list_mcp_tools",
-                breaker=self.data_breaker,
+                breaker=self.mcp_breaker,
             )
         except Exception:
             logger.warning("intaris: list_mcp_tools failed", exc_info=True)
@@ -586,7 +589,12 @@ class IntarisProvider:
                     status="healthy",
                     latency_ms=latency_ms,
                     circuit_state=self.eval_breaker.state,
-                    details={"data_circuit_state": self.data_breaker.state},
+                    details={
+                        "reasoning_circuit_state": self.reasoning_breaker.state,
+                        "session_circuit_state": self.session_breaker.state,
+                        "events_circuit_state": self.events_breaker.state,
+                        "mcp_circuit_state": self.mcp_breaker.state,
+                    },
                 )
         except Exception as exc:
             return ProviderHealth(
@@ -594,11 +602,21 @@ class IntarisProvider:
                 status="degraded",
                 error=str(exc),
                 circuit_state=self.eval_breaker.state,
-                details={"data_circuit_state": self.data_breaker.state},
+                details={
+                    "reasoning_circuit_state": self.reasoning_breaker.state,
+                    "session_circuit_state": self.session_breaker.state,
+                    "events_circuit_state": self.events_breaker.state,
+                    "mcp_circuit_state": self.mcp_breaker.state,
+                },
             )
         return ProviderHealth(
             name="intaris",
             status="degraded",
             circuit_state=self.eval_breaker.state,
-            details={"data_circuit_state": self.data_breaker.state},
+            details={
+                "reasoning_circuit_state": self.reasoning_breaker.state,
+                "session_circuit_state": self.session_breaker.state,
+                "events_circuit_state": self.events_breaker.state,
+                "mcp_circuit_state": self.mcp_breaker.state,
+            },
         )

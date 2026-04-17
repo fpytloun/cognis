@@ -78,6 +78,7 @@ GENERAL_TASK_WORKFLOW = Workflow(
             reasoning_effort="low",
             input=StepInputConfig(type="null"),
             completion=CompletionConfig(evaluate=True, max_attempts=3),
+            outcome_routes=[OutcomeRoute(status="failed", action="gate")],
         ),
     ],
     is_system=True,
@@ -106,6 +107,7 @@ RESEARCH_WORKFLOW = Workflow(
             ),
             input=StepInputConfig(type="null"),
             completion=CompletionConfig(evaluate=True, max_attempts=5),
+            outcome_routes=[OutcomeRoute(status="failed", action="gate")],
         ),
         StepDefinition(
             name="research",
@@ -119,6 +121,7 @@ RESEARCH_WORKFLOW = Workflow(
             ),
             input=StepInputConfig(type="last", source="plan"),
             completion=CompletionConfig(evaluate=True, max_attempts=5),
+            outcome_routes=[OutcomeRoute(status="failed", action="gate")],
         ),
         StepDefinition(
             name="synthesize",
@@ -133,6 +136,7 @@ RESEARCH_WORKFLOW = Workflow(
             ),
             input=StepInputConfig(type="last", source=["plan", "research"]),
             completion=CompletionConfig(evaluate=True),
+            outcome_routes=[OutcomeRoute(status="failed", action="gate")],
         ),
     ],
     is_system=True,
@@ -166,6 +170,7 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
             ),
             input=StepInputConfig(type="null"),
             completion=CompletionConfig(evaluate=True, max_attempts=5),
+            outcome_routes=[OutcomeRoute(status="failed", action="gate")],
             # Primary agent runs this — has memory, personality, project context
         ),
         StepDefinition(
@@ -193,7 +198,8 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
                     action="revise(plan)",
                     max_loop_iterations=3,
                     on_exhausted="gate",
-                )
+                ),
+                OutcomeRoute(status="failed", action="gate"),
             ],
         ),
         StepDefinition(
@@ -208,6 +214,7 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
             ),
             input=StepInputConfig(type="summary", source=["plan", "architect_review"]),
             completion=CompletionConfig(evaluate=True, max_attempts=3),
+            outcome_routes=[OutcomeRoute(status="failed", action="gate")],
         ),
         StepDefinition(
             name="update_docs",
@@ -222,6 +229,7 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
             ),
             input=StepInputConfig(type="summary", source="implement"),
             completion=CompletionConfig(evaluate=False),
+            outcome_routes=[OutcomeRoute(status="failed", action="gate")],
         ),
         StepDefinition(
             name="code_review",
@@ -248,7 +256,8 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
                     action="revise(implement)",
                     max_loop_iterations=3,
                     on_exhausted="gate",
-                )
+                ),
+                OutcomeRoute(status="failed", action="gate"),
             ],
         ),
         StepDefinition(
@@ -279,6 +288,7 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
                 source=["plan", "implement", "code_review"],
             ),
             completion=CompletionConfig(evaluate=False),
+            outcome_routes=[OutcomeRoute(status="failed", action="gate")],
             # Primary agent — has memory tools
         ),
     ],
@@ -303,6 +313,7 @@ CREATIVE_WORKFLOW = Workflow(
             prompt="Create the requested content. Focus on quality, originality, and meeting the stated requirements.",
             input=StepInputConfig(type="null"),
             completion=CompletionConfig(evaluate=True, max_attempts=5, on_exhausted="continue"),
+            outcome_routes=[OutcomeRoute(status="failed", action="gate")],
         ),
     ],
     is_system=True,

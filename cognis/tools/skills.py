@@ -289,7 +289,16 @@ def build_available_skills_metadata(resolved: ResolvedSkillSet) -> str:
         return ""
 
     lines: list[str] = []
-    for skill in resolved.skills:
+    ordered_skills = sorted(
+        resolved.skills,
+        key=lambda skill: (
+            0 if skill.attached else 1,
+            0 if skill.auto_load else 1,
+            skill.name.lower(),
+            skill.skill_id,
+        ),
+    )
+    for skill in ordered_skills:
         tool_names = ", ".join(t.name for t in skill.tools) if skill.tools else ""
         lines.append("  <skill>")
         lines.append(f"    <name>{skill.name}</name>")

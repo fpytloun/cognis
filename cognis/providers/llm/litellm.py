@@ -107,7 +107,7 @@ def _apply_message_cache_hints(
             {
                 "type": "text",
                 "text": content,
-                "cache_control": {"type": "ephemeral"},
+                "cache_control": {"type": "ephemeral", "ttl": "1h"},
             }
         ]
     elif isinstance(content, list):
@@ -116,7 +116,7 @@ def _apply_message_cache_hints(
         if content:
             last_block = dict(content[-1]) if isinstance(content[-1], dict) else content[-1]
             if isinstance(last_block, dict):
-                last_block["cache_control"] = {"type": "ephemeral"}
+                last_block["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
                 content[-1] = last_block
         breakpoint_msg["content"] = content
 

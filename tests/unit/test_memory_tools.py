@@ -86,20 +86,24 @@ class TestMemoryToolHandlers:
     """Test memory tool handler dispatch."""
 
     def _mock_provider(self, response_data: Any = None) -> MagicMock:
-        """Create a mock Mnemory provider with an httpx-like client."""
+        """Create a mock Mnemory provider with Stage 22 provider methods."""
         provider = MagicMock()
-        provider._headers = MagicMock(return_value={"Authorization": "Bearer test"})
-
-        mock_response = AsyncMock()
-        mock_response.raise_for_status = MagicMock()
-        mock_response.json = MagicMock(return_value=response_data or {})
-
-        client = AsyncMock()
-        client.post = AsyncMock(return_value=mock_response)
-        client.get = AsyncMock(return_value=mock_response)
-        client.put = AsyncMock(return_value=mock_response)
-        client.delete = AsyncMock(return_value=mock_response)
-        provider.client = client
+        payload = response_data or {}
+        provider.search_memories_tool = AsyncMock(return_value=payload)
+        provider.find_memories_tool = AsyncMock(return_value=payload)
+        provider.ask_memories_tool = AsyncMock(return_value=payload)
+        provider.add_memory_tool = AsyncMock(return_value=payload)
+        provider.add_memory_batch_tool = AsyncMock(return_value=payload)
+        provider.update_memory_tool = AsyncMock(return_value=payload)
+        provider.delete_memory_tool = AsyncMock(return_value=None)
+        provider.list_memories_tool = AsyncMock(return_value=payload)
+        provider.memory_categories_tool = AsyncMock(return_value=payload)
+        provider.recent_memories_tool = AsyncMock(return_value=payload)
+        provider.save_memory_artifact_tool = AsyncMock(return_value=payload)
+        provider.get_memory_artifact_tool = AsyncMock(return_value=payload)
+        provider.list_memory_artifacts_tool = AsyncMock(return_value=payload)
+        provider.get_memory_artifact_url_tool = AsyncMock(return_value=payload)
+        provider.delete_memory_artifact_tool = AsyncMock(return_value=None)
 
         return provider
 
@@ -110,9 +114,9 @@ class TestMemoryToolHandlers:
             "memory_search", {"query": "test"}, provider, "agent1", "user@test.com"
         )
         assert not result.is_error
-        provider.client.post.assert_called_once()
-        call_args = provider.client.post.call_args
-        assert call_args[0][0] == "/api/memories/search"
+        provider.search_memories_tool.assert_awaited_once_with(
+            {"query": "test"}, agent_id="agent1", user_email="user@test.com"
+        )
 
     @pytest.mark.asyncio()
     async def test_memory_add(self) -> None:
@@ -121,9 +125,9 @@ class TestMemoryToolHandlers:
             "memory_add", {"content": "test fact"}, provider, "agent1", "user@test.com"
         )
         assert not result.is_error
-        provider.client.post.assert_called_once()
-        call_args = provider.client.post.call_args
-        assert call_args[0][0] == "/api/memories"
+        provider.add_memory_tool.assert_awaited_once_with(
+            {"content": "test fact"}, agent_id="agent1", user_email="user@test.com"
+        )
 
     @pytest.mark.asyncio()
     async def test_memory_delete(self) -> None:
@@ -133,7 +137,9 @@ class TestMemoryToolHandlers:
         )
         assert not result.is_error
         assert "deleted" in result.output
-        provider.client.delete.assert_called_once()
+        provider.delete_memory_tool.assert_awaited_once_with(
+            "mem_123", agent_id="agent1", user_email="user@test.com"
+        )
 
     @pytest.mark.asyncio()
     async def test_memory_list(self) -> None:
@@ -142,7 +148,9 @@ class TestMemoryToolHandlers:
             "memory_list", {"limit": 10}, provider, "agent1", "user@test.com"
         )
         assert not result.is_error
-        provider.client.get.assert_called_once()
+        provider.list_memories_tool.assert_awaited_once_with(
+            params={"limit": 10}, agent_id="agent1", user_email="user@test.com"
+        )
 
     @pytest.mark.asyncio()
     async def test_memory_categories(self) -> None:
@@ -151,6 +159,9 @@ class TestMemoryToolHandlers:
             "memory_categories", {}, provider, "agent1", "user@test.com"
         )
         assert not result.is_error
+        provider.memory_categories_tool.assert_awaited_once_with(
+            agent_id="agent1", user_email="user@test.com"
+        )
 
     @pytest.mark.asyncio()
     async def test_memory_update(self) -> None:
@@ -163,7 +174,12 @@ class TestMemoryToolHandlers:
             "user@test.com",
         )
         assert not result.is_error
-        provider.client.put.assert_called_once()
+        provider.update_memory_tool.assert_awaited_once_with(
+            "mem_123",
+            {"content": "updated"},
+            agent_id="agent1",
+            user_email="user@test.com",
+        )
 
     @pytest.mark.asyncio()
     async def test_memory_save_artifact(self) -> None:
@@ -176,7 +192,12 @@ class TestMemoryToolHandlers:
             "user@test.com",
         )
         assert not result.is_error
-        provider.client.post.assert_called_once()
+        provider.save_memory_artifact_tool.assert_awaited_once_with(
+            "mem_123",
+            {"content": "detailed report"},
+            agent_id="agent1",
+            user_email="user@test.com",
+        )
 
     @pytest.mark.asyncio()
     async def test_memory_get_artifact(self) -> None:
@@ -189,6 +210,7 @@ class TestMemoryToolHandlers:
             "user@test.com",
         )
         assert not result.is_error
+        provider.get_memory_artifact_tool.assert_awaited_once()
 
     @pytest.mark.asyncio()
     async def test_memory_get_artifact_url(self) -> None:
@@ -201,9 +223,13 @@ class TestMemoryToolHandlers:
             "user@test.com",
         )
         assert not result.is_error
-        provider.client.post.assert_called_once()
-        call_args = provider.client.post.call_args
-        assert "/download-token" in call_args[0][0]
+        provider.get_memory_artifact_url_tool.assert_awaited_once_with(
+            "mem_123",
+            "art_456",
+            payload={},
+            agent_id="agent1",
+            user_email="user@test.com",
+        )
 
     @pytest.mark.asyncio()
     async def test_memory_get_artifact_url_with_ttl(self) -> None:
@@ -216,8 +242,13 @@ class TestMemoryToolHandlers:
             "user@test.com",
         )
         assert not result.is_error
-        call_args = provider.client.post.call_args
-        assert call_args[1]["json"]["ttl"] == 7200
+        provider.get_memory_artifact_url_tool.assert_awaited_once_with(
+            "mem_123",
+            "art_456",
+            payload={"ttl": 7200},
+            agent_id="agent1",
+            user_email="user@test.com",
+        )
 
     @pytest.mark.asyncio()
     async def test_unknown_memory_tool(self) -> None:
@@ -231,7 +262,7 @@ class TestMemoryToolHandlers:
     @pytest.mark.asyncio()
     async def test_provider_error_handled(self) -> None:
         provider = self._mock_provider()
-        provider.client.post = AsyncMock(side_effect=Exception("Connection refused"))
+        provider.search_memories_tool = AsyncMock(side_effect=Exception("Connection refused"))
         result = await handle_memory_tool(
             "memory_search", {"query": "test"}, provider, "agent1", "user@test.com"
         )

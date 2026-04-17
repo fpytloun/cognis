@@ -86,6 +86,63 @@ class MnemoryProvider:
             headers["X-Agent-Id"] = resolved_agent_id
         return headers
 
+    async def _request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        json_body: dict[str, Any] | None = None,
+        params: dict[str, Any] | None = None,
+        agent_id: str | None = None,
+        user_email: str | None = None,
+        operation: str,
+        max_retries: int = 2,
+    ) -> Any:
+        async def _do() -> Any:
+            response = await self.client.request(
+                method,
+                path,
+                json=json_body,
+                params=params,
+                headers=self._headers(agent_id=agent_id, user_email=user_email),
+            )
+            response.raise_for_status()
+            return response.json()
+
+        return await self._call_with_retry(
+            _do,
+            max_retries=max_retries,
+            operation=operation,
+        )
+
+    async def _request_no_content(
+        self,
+        method: str,
+        path: str,
+        *,
+        json_body: dict[str, Any] | None = None,
+        params: dict[str, Any] | None = None,
+        agent_id: str | None = None,
+        user_email: str | None = None,
+        operation: str,
+        max_retries: int = 2,
+    ) -> None:
+        async def _do() -> None:
+            response = await self.client.request(
+                method,
+                path,
+                json=json_body,
+                params=params,
+                headers=self._headers(agent_id=agent_id, user_email=user_email),
+            )
+            response.raise_for_status()
+
+        await self._call_with_retry(
+            _do,
+            max_retries=max_retries,
+            operation=operation,
+        )
+
     async def recall(
         self,
         query: str,
@@ -263,6 +320,248 @@ class MnemoryProvider:
         except Exception:
             logger.warning("Mnemory search degraded")
             return []
+
+    async def search_memories_tool(
+        self,
+        arguments: dict[str, Any],
+        *,
+        agent_id: str | None = None,
+        user_email: str | None = None,
+    ) -> Any:
+        return await self._request_json(
+            "POST",
+            "/api/memories/search",
+            json_body=arguments,
+            agent_id=agent_id,
+            user_email=user_email,
+            operation="mnemory memory_search",
+        )
+
+    async def find_memories_tool(
+        self,
+        arguments: dict[str, Any],
+        *,
+        agent_id: str | None = None,
+        user_email: str | None = None,
+    ) -> Any:
+        return await self._request_json(
+            "POST",
+            "/api/memories/find",
+            json_body=arguments,
+            agent_id=agent_id,
+            user_email=user_email,
+            operation="mnemory memory_find",
+        )
+
+    async def ask_memories_tool(
+        self,
+        arguments: dict[str, Any],
+        *,
+        agent_id: str | None = None,
+        user_email: str | None = None,
+    ) -> Any:
+        return await self._request_json(
+            "POST",
+            "/api/memories/ask",
+            json_body=arguments,
+            agent_id=agent_id,
+            user_email=user_email,
+            operation="mnemory memory_ask",
+        )
+
+    async def add_memory_tool(
+        self,
+        arguments: dict[str, Any],
+        *,
+        agent_id: str | None = None,
+        user_email: str | None = None,
+    ) -> Any:
+        return await self._request_json(
+            "POST",
+            "/api/memories",
+            json_body=arguments,
+            agent_id=agent_id,
+            user_email=user_email,
+            operation="mnemory memory_add",
+        )
+
+    async def add_memory_batch_tool(
+        self,
+        arguments: dict[str, Any],
+        *,
+        agent_id: str | None = None,
+        user_email: str | None = None,
+    ) -> Any:
+        return await self._request_json(
+            "POST",
+            "/api/memories/batch",
+            json_body=arguments,
+            agent_id=agent_id,
+            user_email=user_email,
+            operation="mnemory memory_add_batch",
+        )
+
+    async def update_memory_tool(
+        self,
+        memory_id: str,
+        arguments: dict[str, Any],
+        *,
+        agent_id: str | None = None,
+        user_email: str | None = None,
+    ) -> Any:
+        return await self._request_json(
+            "PUT",
+            f"/api/memories/{memory_id}",
+            json_body=arguments,
+            agent_id=agent_id,
+            user_email=user_email,
+            operation="mnemory memory_update",
+        )
+
+    async def delete_memory_tool(
+        self,
+        memory_id: str,
+        *,
+        agent_id: str | None = None,
+        user_email: str | None = None,
+    ) -> None:
+        await self._request_no_content(
+            "DELETE",
+            f"/api/memories/{memory_id}",
+            agent_id=agent_id,
+            user_email=user_email,
+            operation="mnemory memory_delete_tool",
+        )
+
+    async def list_memories_tool(
+        self,
+        *,
+        params: dict[str, Any],
+        agent_id: str | None = None,
+        user_email: str | None = None,
+    ) -> Any:
+        return await self._request_json(
+            "GET",
+            "/api/memories",
+            params=params,
+            agent_id=agent_id,
+            user_email=user_email,
+            operation="mnemory memory_list",
+        )
+
+    async def memory_categories_tool(
+        self,
+        *,
+        agent_id: str | None = None,
+        user_email: str | None = None,
+    ) -> Any:
+        return await self._request_json(
+            "GET",
+            "/api/categories",
+            agent_id=agent_id,
+            user_email=user_email,
+            operation="mnemory memory_categories",
+        )
+
+    async def recent_memories_tool(
+        self,
+        *,
+        params: dict[str, Any],
+        agent_id: str | None = None,
+        user_email: str | None = None,
+    ) -> Any:
+        return await self._request_json(
+            "GET",
+            "/api/memories/recent",
+            params=params,
+            agent_id=agent_id,
+            user_email=user_email,
+            operation="mnemory memory_recent",
+        )
+
+    async def save_memory_artifact_tool(
+        self,
+        memory_id: str,
+        arguments: dict[str, Any],
+        *,
+        agent_id: str | None = None,
+        user_email: str | None = None,
+    ) -> Any:
+        return await self._request_json(
+            "POST",
+            f"/api/memories/{memory_id}/artifacts",
+            json_body=arguments,
+            agent_id=agent_id,
+            user_email=user_email,
+            operation="mnemory memory_save_artifact",
+        )
+
+    async def get_memory_artifact_tool(
+        self,
+        memory_id: str,
+        artifact_id: str,
+        *,
+        params: dict[str, Any],
+        agent_id: str | None = None,
+        user_email: str | None = None,
+    ) -> Any:
+        return await self._request_json(
+            "GET",
+            f"/api/memories/{memory_id}/artifacts/{artifact_id}",
+            params=params,
+            agent_id=agent_id,
+            user_email=user_email,
+            operation="mnemory memory_get_artifact",
+        )
+
+    async def list_memory_artifacts_tool(
+        self,
+        memory_id: str,
+        *,
+        agent_id: str | None = None,
+        user_email: str | None = None,
+    ) -> Any:
+        return await self._request_json(
+            "GET",
+            f"/api/memories/{memory_id}/artifacts",
+            agent_id=agent_id,
+            user_email=user_email,
+            operation="mnemory memory_list_artifacts",
+        )
+
+    async def get_memory_artifact_url_tool(
+        self,
+        memory_id: str,
+        artifact_id: str,
+        *,
+        payload: dict[str, Any],
+        agent_id: str | None = None,
+        user_email: str | None = None,
+    ) -> Any:
+        return await self._request_json(
+            "POST",
+            f"/api/memories/{memory_id}/artifacts/{artifact_id}/download-token",
+            json_body=payload,
+            agent_id=agent_id,
+            user_email=user_email,
+            operation="mnemory memory_get_artifact_url",
+        )
+
+    async def delete_memory_artifact_tool(
+        self,
+        memory_id: str,
+        artifact_id: str,
+        *,
+        agent_id: str | None = None,
+        user_email: str | None = None,
+    ) -> None:
+        await self._request_no_content(
+            "DELETE",
+            f"/api/memories/{memory_id}/artifacts/{artifact_id}",
+            agent_id=agent_id,
+            user_email=user_email,
+            operation="mnemory memory_delete_artifact",
+        )
 
     async def list_memories(
         self,

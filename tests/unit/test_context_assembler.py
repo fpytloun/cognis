@@ -73,6 +73,14 @@ class _SessionCache:
             return self._cached_instructions, self._cached_core, True
         return None, None, False
 
+    def get_cached_memory_details(
+        self, session_id: str, ttl_seconds: float = 1800.0
+    ) -> tuple[str | None, str | None, bool, bool]:
+        del session_id, ttl_seconds
+        if self._cached_instructions is not None or self._cached_core is not None:
+            return self._cached_instructions, self._cached_core, True, True
+        return None, None, False, False
+
     async def cache_memory(
         self, session_id: str, instructions: str | None, core_memories: str | None
     ) -> None:
@@ -289,6 +297,8 @@ async def test_context_assembler_loads_root_project_instructions(tmp_path: Path)
     assert not any(
         "Instructions from:" in content and "README.md" in content for content in system_messages
     )
+    assert "Instructions from:" in str(result.messages[0]["content"])
+    assert "AGENTS.md" in str(result.messages[0]["content"])
 
 
 @pytest.mark.asyncio

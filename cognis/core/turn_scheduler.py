@@ -25,12 +25,14 @@ import contextlib
 import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from time import monotonic
 from typing import Any, Protocol, runtime_checkable
 
 import httpx
 from prometheus_client import Counter, Histogram
+from sqlalchemy import delete, update
+from sqlalchemy.exc import IntegrityError
 
 from cognis.api.error_sanitizer import sanitize_client_error_detail
 from cognis.core.attachment_utils import normalize_attachment_refs, strip_attachment_payload_bytes
@@ -46,6 +48,7 @@ from cognis.models.artifact import ArtifactKind, AttachmentRef
 from cognis.models.session import BLOCKED_STATES, ConversationModel, SessionModel, SessionStatus
 from cognis.models.task import TaskDelivery
 from cognis.runtime_context import current_agent_id, current_user_email
+from cognis.store.models import FollowUpDedupeRow
 
 logger = get_logger(__name__)
 
@@ -78,6 +81,25 @@ MAX_QUEUED_MESSAGES = 5
 DEFAULT_TURN_LIMIT = 3
 _MAX_DEFERRED_LOCKS = 200
 FOLLOW_UP_DEDUPE_TTL_SECONDS = 600.0
+
+
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
+
+
+def _normalize_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is not None:
+        return value
+    return value.replace(tzinfo=UTC)
+
+
+def _is_expired_timestamp(value: datetime | None, *, now: datetime | None = None) -> bool:
+    normalized = _normalize_utc(value)
+    if normalized is None:
+        return True
+    return normalized <= (now or _utcnow())
 
 
 def _effective_user_content(content: str, attachments: list[AttachmentRef]) -> str:
@@ -274,9 +296,7 @@ class TurnScheduler:
         # Register for follow-up turn events
         event_bus.subscribe(EventType.FOLLOW_UP_TURN_REQUESTED, self._handle_follow_up_event)
         logger.info("turn_scheduler: registered on EventBus")
-        logger.info(
-            "turn_scheduler: follow-up dedupe is in-memory only; run a single controller instance for reliable suppression"
-        )
+        logger.info("turn_scheduler: follow-up dedupe backed by durable store when available")
 
     # ------------------------------------------------------------------
     # Observer management
@@ -533,7 +553,9 @@ class TurnScheduler:
             cleared_queue = bool(queue)
             for queued in queue:
                 if queued.follow_up is not None:
-                    self._clear_follow_up_pending(conversation_id, queued.follow_up.follow_up_id)
+                    await self._clear_follow_up_pending(
+                        conversation_id, queued.follow_up.follow_up_id
+                    )
             queue.clear()
         if control is None:
             return cleared_queue
@@ -561,7 +583,7 @@ class TurnScheduler:
         """Return the number of queued messages for a conversation."""
         return len(self._queued_messages.get(conversation_id, []))
 
-    def _purge_expired_follow_ups(self) -> None:
+    async def _purge_expired_follow_ups(self) -> None:
         now = monotonic()
         expired = [
             key
@@ -570,26 +592,117 @@ class TurnScheduler:
         ]
         for key in expired:
             self._handled_follow_ups.pop(key, None)
+        try:
+            async with self._session_factory() as db_session:
+                await db_session.execute(
+                    delete(FollowUpDedupeRow)
+                    .where(FollowUpDedupeRow.expires_at <= _utcnow())
+                    .execution_options(synchronize_session=False)
+                )
+                await db_session.commit()
+        except Exception:
+            logger.debug("turn_scheduler: durable follow-up purge unavailable", exc_info=True)
 
-    def _register_follow_up(self, conversation_id: str, follow_up_id: str) -> bool:
-        self._purge_expired_follow_ups()
+    @staticmethod
+    def _follow_up_dedupe_key(conversation_id: str, follow_up_id: str) -> str:
+        return f"{conversation_id}:{follow_up_id}"
+
+    async def _register_follow_up(self, conversation_id: str, follow_up_id: str) -> bool:
+        await self._purge_expired_follow_ups()
         key = (conversation_id, follow_up_id)
-        if key in self._pending_follow_ups:
-            FOLLOW_UP_DEDUPE_TOTAL.labels(reason="pending").inc()
-            return False
-        if key in self._handled_follow_ups:
-            FOLLOW_UP_DEDUPE_TOTAL.labels(reason="handled").inc()
-            return False
-        self._pending_follow_ups.add(key)
-        return True
+        now = _utcnow()
+        expires_at = now + timedelta(seconds=FOLLOW_UP_DEDUPE_TTL_SECONDS)
+        dedupe_key = self._follow_up_dedupe_key(conversation_id, follow_up_id)
+        try:
+            async with self._session_factory() as db_session:
+                db_session.add(
+                    FollowUpDedupeRow(
+                        dedupe_key=dedupe_key,
+                        conversation_id=conversation_id,
+                        follow_up_id=follow_up_id,
+                        status="pending",
+                        expires_at=expires_at,
+                    )
+                )
+                await db_session.commit()
+            self._pending_follow_ups.add(key)
+            return True
+        except IntegrityError:
+            async with self._session_factory() as db_session:
+                await db_session.rollback()
+                row = await db_session.get(FollowUpDedupeRow, dedupe_key)
+                if row is not None and _is_expired_timestamp(row.expires_at, now=now):
+                    refreshed = await db_session.execute(
+                        update(FollowUpDedupeRow)
+                        .where(
+                            FollowUpDedupeRow.dedupe_key == dedupe_key,
+                            FollowUpDedupeRow.expires_at <= now,
+                        )
+                        .values(status="pending", expires_at=expires_at, updated_at=now)
+                        .execution_options(synchronize_session=False)
+                    )
+                    await db_session.commit()
+                    if refreshed.rowcount:
+                        self._pending_follow_ups.add(key)
+                        return True
+                reason = row.status if row is not None else "handled"
+                FOLLOW_UP_DEDUPE_TOTAL.labels(reason=reason).inc()
+                return False
+        except Exception:
+            logger.debug("turn_scheduler: durable follow-up register unavailable", exc_info=True)
+            if key in self._pending_follow_ups:
+                FOLLOW_UP_DEDUPE_TOTAL.labels(reason="pending").inc()
+                return False
+            if key in self._handled_follow_ups:
+                FOLLOW_UP_DEDUPE_TOTAL.labels(reason="handled").inc()
+                return False
+            self._pending_follow_ups.add(key)
+            return True
 
-    def _mark_follow_up_handled(self, conversation_id: str, follow_up_id: str) -> None:
+    async def _mark_follow_up_handled(self, conversation_id: str, follow_up_id: str) -> None:
         key = (conversation_id, follow_up_id)
         self._pending_follow_ups.discard(key)
         self._handled_follow_ups[key] = monotonic()
+        dedupe_key = self._follow_up_dedupe_key(conversation_id, follow_up_id)
+        try:
+            async with self._session_factory() as db_session:
+                row = await db_session.get(FollowUpDedupeRow, dedupe_key)
+                if row is None:
+                    db_session.add(
+                        FollowUpDedupeRow(
+                            dedupe_key=dedupe_key,
+                            conversation_id=conversation_id,
+                            follow_up_id=follow_up_id,
+                            status="handled",
+                            expires_at=_utcnow() + timedelta(seconds=FOLLOW_UP_DEDUPE_TTL_SECONDS),
+                        )
+                    )
+                else:
+                    row.status = "handled"
+                    row.expires_at = _utcnow() + timedelta(seconds=FOLLOW_UP_DEDUPE_TTL_SECONDS)
+                    row.updated_at = _utcnow()
+                await db_session.commit()
+        except Exception:
+            logger.debug(
+                "turn_scheduler: durable follow-up handled mark unavailable", exc_info=True
+            )
 
-    def _clear_follow_up_pending(self, conversation_id: str, follow_up_id: str) -> None:
+    async def _clear_follow_up_pending(self, conversation_id: str, follow_up_id: str) -> None:
         self._pending_follow_ups.discard((conversation_id, follow_up_id))
+        dedupe_key = self._follow_up_dedupe_key(conversation_id, follow_up_id)
+        try:
+            async with self._session_factory() as db_session:
+                await db_session.execute(
+                    delete(FollowUpDedupeRow)
+                    .where(
+                        FollowUpDedupeRow.dedupe_key == dedupe_key,
+                        FollowUpDedupeRow.status == "pending",
+                    )
+                    .execution_options(synchronize_session=False)
+                )
+                await db_session.commit()
+        except Exception:
+            logger.debug("turn_scheduler: durable follow-up clear unavailable", exc_info=True)
 
     # ------------------------------------------------------------------
     # Follow-up turn handling (EventBus subscriber)
@@ -618,7 +731,7 @@ class TurnScheduler:
                 exc_info=True,
             )
             return
-        if not self._register_follow_up(conversation_id, follow_up.follow_up_id):
+        if not await self._register_follow_up(conversation_id, follow_up.follow_up_id):
             return
 
         # Use submit_turn for unified serialization
@@ -628,7 +741,7 @@ class TurnScheduler:
 
             row = await get_conversation(db_session, conversation_id)
         if row is None:
-            self._clear_follow_up_pending(conversation_id, follow_up.follow_up_id)
+            await self._clear_follow_up_pending(conversation_id, follow_up.follow_up_id)
             logger.warning(
                 "turn_scheduler: follow-up conversation not found",
                 extra={"extra_data": {"conversation_id": conversation_id}},
@@ -669,7 +782,7 @@ class TurnScheduler:
                 if isinstance(event.data.get("delivery_fallback_text"), str)
                 else None,
             )
-            self._clear_follow_up_pending(conversation_id, follow_up.follow_up_id)
+            await self._clear_follow_up_pending(conversation_id, follow_up.follow_up_id)
 
     # ------------------------------------------------------------------
     # Turn execution
@@ -1074,9 +1187,9 @@ class TurnScheduler:
 
             if follow_up is not None:
                 if turn_succeeded:
-                    self._mark_follow_up_handled(conversation_id, follow_up.follow_up_id)
+                    await self._mark_follow_up_handled(conversation_id, follow_up.follow_up_id)
                 else:
-                    self._clear_follow_up_pending(conversation_id, follow_up.follow_up_id)
+                    await self._clear_follow_up_pending(conversation_id, follow_up.follow_up_id)
 
             self._active_turns.pop(conversation_id, None)
             self._turn_controls.pop(conversation_id, None)
@@ -1115,12 +1228,12 @@ class TurnScheduler:
                         turn_observers=queued.turn_observers,
                     )
                     if error is not None and queued.follow_up is not None:
-                        self._clear_follow_up_pending(
+                        await self._clear_follow_up_pending(
                             conversation_id, queued.follow_up.follow_up_id
                         )
                 except Exception:
                     if queued.follow_up is not None:
-                        self._clear_follow_up_pending(
+                        await self._clear_follow_up_pending(
                             conversation_id, queued.follow_up.follow_up_id
                         )
                     logger.exception(
