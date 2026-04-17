@@ -548,8 +548,8 @@ class NotificationService:
                 orphaned_count += 1
                 continue
             # Only re-register if not already present (idempotent)
-            existing = self._pause_waiter.find_pending(pause_type=row.notification_type)
-            if existing and existing.pause_id == row.notification_id:
+            existing = self._pause_waiter.get(row.notification_id)
+            if existing is not None:
                 continue
             self._pause_waiter.register(
                 PendingPause(

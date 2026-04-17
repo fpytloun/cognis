@@ -242,6 +242,22 @@ class TestSchedulerNextFire:
         assert result.hour == 9
         assert result.day == 1
 
+    def test_cron_next_fire_preserves_dst_transition(self) -> None:
+        s = self._make_scheduler()
+        after = datetime(2026, 3, 28, 8, 30, tzinfo=UTC)
+        sched = _FakeSchedule(
+            schedule_type="cron",
+            cron_expr="0 9 * * *",
+            interval_seconds=None,
+            one_shot_at=None,
+            timezone="Europe/Prague",
+            last_fired_at=None,
+        )
+
+        result = s._compute_next_fire(sched, after)
+
+        assert result == datetime(2026, 3, 29, 7, 0, tzinfo=UTC)
+
     def test_one_shot_not_yet_fired(self) -> None:
         s = self._make_scheduler()
         now = datetime.now(UTC)

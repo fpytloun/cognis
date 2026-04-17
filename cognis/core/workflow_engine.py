@@ -23,6 +23,7 @@ from cognis.core.agent_loop import (
     WORKFLOW_POLICY,
     AgentLoop,
     PauseWaiter,
+    PendingPause,
     StepContext,
     StepInterrupted,
     TokenCallback,
@@ -264,6 +265,10 @@ class WorkflowEngine:
                     gate_result = await self._handle_gate_step(task, step_def, state, workflow)
                     if gate_result == "cancel":
                         state.status = "cancelled"
+                        state.last_operator_instruction = None
+                        break
+                    if gate_result == "fail":
+                        state.status = "failed"
                         state.last_operator_instruction = None
                         break
                     revise_target = _parse_revise_action(gate_result)
@@ -844,10 +849,41 @@ class WorkflowEngine:
             if raw:
                 gate_context[input_name] = raw
 
+        existing_pause_payload = state.pending_pause_payload or {}
+        reuse_pause = (
+            state.pending_pause_type == "gate"
+            and state.status == "paused"
+            and str(existing_pause_payload.get("step_name") or "") == step_def.name
+        )
+        pause_id = str(existing_pause_payload.get("pause_id") or "").strip() if reuse_pause else ""
+        if not pause_id:
+            pause_id = f"gate_{uuid.uuid4().hex[:12]}"
+
+        existing_notification = None
+        if reuse_pause and self._notification_service is not None:
+            existing_notification = await self._notification_service.get(pause_id)
+            if existing_notification is None:
+                reuse_pause = False
+            elif existing_notification.status == "resolved":
+                resolution = existing_notification.resolution or {}
+                action = str(resolution.get("decision") or "continue")
+                instruction = str(
+                    resolution.get("note") or resolution.get("feedback") or ""
+                ).strip()
+                GATES_TOTAL.labels(action=action).inc()
+                state.status = "running"
+                state.current_step_status = "running"
+                state.pending_pause_type = None
+                state.pending_pause_payload = None
+                if instruction and action != "cancel":
+                    state.last_operator_instruction = instruction
+                task.status = TaskStatus.RUNNING
+                await self._persist_workflow_state(task, sync_status=True)
+                return action
+
         # Pause workflow — write status + workflow_state atomically
         state.status = "paused"
         state.current_step_status = "paused"
-        pause_id = f"gate_{uuid.uuid4().hex[:12]}"
         gate_options = [opt.model_dump(mode="json") for opt in gate.options]
         state.pending_pause_type = "gate"
         state.pending_pause_payload = {
@@ -873,26 +909,40 @@ class WorkflowEngine:
             )
         )
 
-        # Create the gate via the notification service so it is persisted
-        # to DB, resolved to the source conversation, and survives restarts.
-        await self._notification_service.create(
-            notification_type="gate",
-            user_email=task.created_by,
-            conversation_id=task.source_ref or "",
-            task_id=task.task_id,
-            step_name=step_def.name,
-            notification_id=pause_id,
-            payload={
-                "message": gate.message,
-                "context": gate_context,
-                "options": gate_options,
-                "question": gate.message,
-            },
-        )
+        if not reuse_pause:
+            # Create the gate via the notification service so it is persisted
+            # to DB, resolved to the source conversation, and survives restarts.
+            await self._notification_service.create(
+                notification_type="gate",
+                user_email=task.created_by,
+                conversation_id=task.source_ref or "",
+                task_id=task.task_id,
+                step_name=step_def.name,
+                notification_id=pause_id,
+                payload={
+                    "message": gate.message,
+                    "context": gate_context,
+                    "options": gate_options,
+                    "question": gate.message,
+                },
+            )
+        elif self._pause_waiter.get(pause_id) is None:
+            self._pause_waiter.register(
+                PendingPause(
+                    pause_id=pause_id,
+                    pause_type="gate",
+                    task_id=task.task_id,
+                    step_name=step_def.name,
+                    conversation_id=task.source_ref or "",
+                    question=gate.message,
+                    options=gate_options,
+                    context=gate_context,
+                )
+            )
 
         # Trigger a follow-up turn in the source conversation so the agent
         # can explain the pause to the user (why it paused, what the options are).
-        if task.source_type == "chat" and task.source_ref:
+        if not reuse_pause and task.source_type == "chat" and task.source_ref:
             delivery_id: str | None = None
             channel_deliverable = False
             delivery_fallback_text: str | None = None
@@ -957,24 +1007,34 @@ class WorkflowEngine:
             )
 
         # Wait for resolution
+        timeout_seconds = float(max(1, gate.timeout_seconds))
         try:
-            resolution = await self._pause_waiter.wait(pause_id, timeout=3600.0)
+            resolution = await self._pause_waiter.wait(pause_id, timeout=timeout_seconds)
             action = resolution.decision
             instruction = str(
                 resolution.data.get("note") or resolution.data.get("feedback") or ""
             ).strip()
         except TimeoutError:
             logger.warning(
-                "Gate timed out after 3600s, defaulting to continue",
+                "Gate timed out",
                 extra={
                     "extra_data": {
                         "task_id": task.task_id,
                         "step": step_def.name,
                         "pause_id": pause_id,
+                        "timeout_seconds": timeout_seconds,
+                        "timeout_action": gate.timeout_action,
                     }
                 },
             )
-            action = "continue"
+            if self._notification_service is not None:
+                await self._notification_service.resolve(
+                    pause_id,
+                    gate.timeout_action,
+                    {"reason": "timeout"},
+                    user_email=task.created_by,
+                )
+            action = gate.timeout_action
             instruction = ""
 
         GATES_TOTAL.labels(action=action).inc()
@@ -1212,6 +1272,8 @@ class WorkflowEngine:
                 return "routed"
             if gate_result == "cancel":
                 return "cancelled"
+            if gate_result == "fail":
+                return "failed"
             revise_target = _parse_revise_action(gate_result)
             if revise_target is None:
                 logger.error(
@@ -1489,6 +1551,8 @@ class WorkflowEngine:
                 state.current_step_index = len(workflow.steps)
                 await self._persist_workflow_state(task)
                 return True
+            elif result == "fail":
+                return False
             revise_target = _parse_revise_action(result)
             if revise_target is not None:
                 target_idx = self._find_step_index(workflow, revise_target)

@@ -21,12 +21,12 @@ T = TypeVar("T")
 
 
 class MnemoryProvider:
-    """HTTP client for Mnemory with graceful degradation.
+    """HTTP client for Mnemory with explicit identity requirements.
 
     All methods are protected by retry with exponential backoff and a
-    circuit breaker.  On failure, read methods degrade gracefully
-    (return empty results) while write methods raise to allow upstream
-    retry queues to handle them.
+    circuit breaker. Callers must provide an explicit user identity via
+    ``scoped_runtime_context`` or a direct ``user_email`` argument. Read and
+    write failures raise so the caller can apply the correct policy.
     """
 
     def __init__(
@@ -34,7 +34,7 @@ class MnemoryProvider:
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.auth_provider = auth_provider
-        self.user_email = user_email
+        self.service_user_email = user_email
         self.client = httpx.AsyncClient(base_url=self.base_url, timeout=60)
         self.breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=30.0)
 
@@ -65,9 +65,19 @@ class MnemoryProvider:
         return await _with_retries()
 
     def _headers(
-        self, agent_id: str | None = None, user_email: str | None = None
+        self,
+        agent_id: str | None = None,
+        user_email: str | None = None,
+        *,
+        allow_system_fallback: bool = False,
     ) -> dict[str, str]:
-        subject = user_email or current_user_email.get() or self.user_email
+        subject = user_email or current_user_email.get()
+        if subject is None:
+            if not allow_system_fallback:
+                raise RuntimeError(
+                    "Mnemory call requires explicit user identity or scoped_runtime_context"
+                )
+            subject = self.service_user_email
         resolved_agent_id = agent_id or current_agent_id.get()
         headers = {
             "Authorization": f"Bearer {self.auth_provider.sign_service_jwt(subject, resolved_agent_id or 'system', ['mnemory'])}",
@@ -110,56 +120,34 @@ class MnemoryProvider:
                 }
             },
         )
-        try:
 
-            async def _do() -> dict[str, Any]:
-                response = await self.client.post(
-                    "/api/recall", json=payload, headers=self._headers()
-                )
-                response.raise_for_status()
-                return dict(response.json())
+        async def _do() -> dict[str, Any]:
+            response = await self.client.post("/api/recall", json=payload, headers=self._headers())
+            response.raise_for_status()
+            return dict(response.json())
 
-            result = await self._call_with_retry(
-                _do,
-                max_retries=2,
-                operation="mnemory recall",
-            )
-            stats = result.get("stats", {})
-            logger.info(
-                "mnemory: recall complete",
-                extra={
-                    "extra_data": {
-                        "session_id": session_id,
-                        "mnemory_session": result.get("session_id"),
-                        "has_instructions": bool(result.get("instructions")),
-                        "has_core": bool(result.get("core_memories")),
-                        "core_count": stats.get("core_count", 0),
-                        "search_count": stats.get("search_count", 0),
-                        "new_count": stats.get("new_count", 0),
-                        "latency_ms": stats.get("latency_ms", 0),
-                    }
-                },
-            )
-            return result
-        except Exception:
-            logger.warning(
-                "mnemory: recall failed",
-                extra={"extra_data": {"session_id": session_id, "search_mode": search_mode}},
-                exc_info=True,
-            )
-            return {
-                "session_id": session_id or "",
-                "instructions": None,
-                "core_memories": None,
-                "search_results": [],
-                "stats": {
-                    "core_count": 0,
-                    "search_count": 0,
-                    "new_count": 0,
-                    "known_skipped": 0,
-                    "latency_ms": 0,
-                },
-            }
+        result = await self._call_with_retry(
+            _do,
+            max_retries=2,
+            operation="mnemory recall",
+        )
+        stats = result.get("stats", {})
+        logger.info(
+            "mnemory: recall complete",
+            extra={
+                "extra_data": {
+                    "session_id": session_id,
+                    "mnemory_session": result.get("session_id"),
+                    "has_instructions": bool(result.get("instructions")),
+                    "has_core": bool(result.get("core_memories")),
+                    "core_count": stats.get("core_count", 0),
+                    "search_count": stats.get("search_count", 0),
+                    "new_count": stats.get("new_count", 0),
+                    "latency_ms": stats.get("latency_ms", 0),
+                }
+            },
+        )
+        return result
 
     async def remember(
         self,
@@ -432,7 +420,9 @@ class MnemoryProvider:
     async def health(self) -> ProviderHealth:
         start = perf_counter()
         try:
-            response = await self.client.get("/health", headers=self._headers())
+            response = await self.client.get(
+                "/health", headers=self._headers(allow_system_fallback=True)
+            )
             latency_ms = (perf_counter() - start) * 1000
             if response.is_success:
                 return ProviderHealth(

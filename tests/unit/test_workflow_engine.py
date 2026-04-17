@@ -108,6 +108,8 @@ def test_gate_config() -> None:
     )
     assert len(gate.options) == 3
     assert gate.options[1].prompt is True
+    assert gate.timeout_seconds == 3600
+    assert gate.timeout_action == "fail"
 
 
 def test_interaction_mode_none_disables_gates() -> None:

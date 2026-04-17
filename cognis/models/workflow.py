@@ -71,6 +71,8 @@ class GateConfig(BaseModel):
     message: str
     input: list[str] = []
     options: list[GateOption] = []
+    timeout_seconds: int = 3600
+    timeout_action: Literal["fail", "continue", "cancel"] = "fail"
 
 
 class CompletionConfig(BaseModel):

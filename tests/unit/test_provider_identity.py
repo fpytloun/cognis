@@ -35,6 +35,14 @@ def test_provider_headers_use_request_user_context() -> None:
         current_user_email.reset(token)
 
 
+def test_mnemory_headers_require_explicit_identity() -> None:
+    auth = _AuthProvider()
+    mnemory = MnemoryProvider("http://localhost:8050", auth)
+
+    with pytest.raises(RuntimeError, match="requires explicit user identity"):
+        mnemory._headers(agent_id="agent-a")
+
+
 @pytest.mark.asyncio
 async def test_intaris_call_mcp_tool_uses_server_and_tool_fields() -> None:
     auth = _AuthProvider()

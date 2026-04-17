@@ -18,6 +18,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from croniter import croniter
 
@@ -455,19 +456,10 @@ class Scheduler:
             yield session
 
 
-def _resolve_tz(name: str) -> timezone:
-    """Resolve a timezone name to a ``datetime.timezone``.
+def _resolve_tz(name: str) -> timezone | ZoneInfo:
+    """Resolve a timezone name while preserving DST-aware IANA semantics."""
 
-    For full IANA timezone support, ``zoneinfo`` (stdlib 3.9+) is used.
-    Falls back to UTC on unknown names.
-    """
     try:
-        import zoneinfo
-
-        zi = zoneinfo.ZoneInfo(name)
-        # Return a fixed offset for the current moment (good enough for
-        # next-fire computation; croniter handles DST internally).
-        now = datetime.now(zi)
-        return timezone(now.utcoffset() or timedelta(0))
+        return ZoneInfo(name)
     except Exception:
         return timezone(timedelta(hours=0))

@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
 
-from cognis.core.agent_loop import PauseWaiter
+from cognis.core.agent_loop import PauseResolution, PauseWaiter, PendingPause
 from cognis.core.workflow_engine import WorkflowEngine
 from cognis.models.task import TaskModel
 from cognis.models.workflow import (
+    GateConfig,
+    GateOption,
     OutcomeRoute,
     StepDefinition,
     StepOutcome,
@@ -52,6 +55,42 @@ def _build_engine() -> WorkflowEngine:
         event_bus=_EventBus(),
         pause_waiter=PauseWaiter(),
     )
+
+
+class _NotificationService:
+    def __init__(self) -> None:
+        self.created: list[dict[str, object]] = []
+        self.notifications: dict[str, SimpleNamespace] = {}
+        self.resolved: list[tuple[str, str, dict[str, object] | None, str | None]] = []
+
+    async def create(self, **kwargs: object) -> object:
+        payload = dict(kwargs)
+        self.created.append(payload)
+        notification_id = str(payload.get("notification_id"))
+        self.notifications[notification_id] = SimpleNamespace(
+            notification_id=notification_id,
+            status="pending",
+            resolution=None,
+        )
+        return SimpleNamespace()
+
+    async def get(self, notification_id: str) -> object | None:
+        return self.notifications.get(notification_id)
+
+    async def resolve(
+        self,
+        notification_id: str,
+        decision: str,
+        data: dict[str, object] | None = None,
+        *,
+        user_email: str | None = None,
+    ) -> bool:
+        self.resolved.append((notification_id, decision, data, user_email))
+        notification = self.notifications.get(notification_id)
+        if notification is not None:
+            notification.status = "resolved"
+            notification.resolution = {"decision": decision, **(data or {})}
+        return True
 
 
 def test_build_step_task_context_includes_operator_instruction() -> None:
@@ -214,6 +253,237 @@ async def test_handle_step_outcome_defaults_failed_without_route() -> None:
     )
 
     assert result == "failed"
+
+
+@pytest.mark.asyncio
+async def test_handle_gate_step_reuses_existing_pause_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    engine = _build_engine()
+    notifications = _NotificationService()
+    engine._notification_service = notifications
+    notifications.notifications["gate_existing"] = SimpleNamespace(
+        notification_id="gate_existing",
+        status="pending",
+        resolution=None,
+    )
+
+    task = TaskModel(
+        task_id="task-1",
+        title="Task",
+        created_by="user@example.com",
+        agent_id="agent-1",
+        status="paused",
+    )
+    workflow = Workflow(workflow_id="wf:test", name="Test", steps=[])
+    state = WorkflowState(
+        status="paused",
+        current_step_status="paused",
+        pending_pause_type="gate",
+        pending_pause_payload={
+            "pause_id": "gate_existing",
+            "task_id": "task-1",
+            "step_name": "review",
+            "message": "Review it",
+            "context": {},
+            "options": [{"label": "Continue", "action": "continue"}],
+        },
+    )
+    step_def = StepDefinition(
+        name="review",
+        type="gate",
+        gate=GateConfig(
+            message="Review it",
+            options=[GateOption(label="Continue", action="continue")],
+        ),
+    )
+
+    persisted: list[str] = []
+
+    async def _persist(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        persisted.append(
+            str(state.pending_pause_payload.get("pause_id")) if state.pending_pause_payload else ""
+        )
+
+    monkeypatch.setattr(engine, "_persist_workflow_state", _persist)
+    engine._pause_waiter.register(
+        PendingPause(
+            pause_id="gate_existing",
+            pause_type="gate",
+            task_id="task-1",
+            step_name="review",
+            options=[{"label": "Continue", "action": "continue"}],
+        )
+    )
+
+    async def _resolve_soon() -> None:
+        await asyncio.sleep(0.01)
+        engine._pause_waiter.resolve("gate_existing", PauseResolution(decision="continue"))
+
+    asyncio.create_task(_resolve_soon())
+    result = await engine._handle_gate_step(task, step_def, state, workflow)
+
+    assert result == "continue"
+    assert notifications.created == []
+    assert persisted[0] == "gate_existing"
+
+
+@pytest.mark.asyncio
+async def test_handle_gate_step_timeout_defaults_to_fail(monkeypatch: pytest.MonkeyPatch) -> None:
+    engine = _build_engine()
+    notifications = _NotificationService()
+    engine._notification_service = notifications
+
+    task = TaskModel(
+        task_id="task-1",
+        title="Task",
+        created_by="user@example.com",
+        agent_id="agent-1",
+    )
+    workflow = Workflow(workflow_id="wf:test", name="Test", steps=[])
+    state = WorkflowState()
+    step_def = StepDefinition(
+        name="review",
+        type="gate",
+        gate=GateConfig(
+            message="Review it",
+            timeout_seconds=1,
+            options=[GateOption(label="Continue", action="continue")],
+        ),
+    )
+
+    async def _persist(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        return None
+
+    async def _timeout(*args: object, **kwargs: object) -> PauseResolution:
+        del args, kwargs
+        raise TimeoutError
+
+    monkeypatch.setattr(engine, "_persist_workflow_state", _persist)
+    monkeypatch.setattr(engine._pause_waiter, "wait", _timeout)
+
+    result = await engine._handle_gate_step(task, step_def, state, workflow)
+
+    assert result == "fail"
+    assert len(notifications.created) == 1
+    assert notifications.resolved == [
+        (
+            notifications.created[0]["notification_id"],
+            "fail",
+            {"reason": "timeout"},
+            "user@example.com",
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_handle_gate_step_recreates_missing_notification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _build_engine()
+    notifications = _NotificationService()
+    engine._notification_service = notifications
+
+    task = TaskModel(
+        task_id="task-1",
+        title="Task",
+        created_by="user@example.com",
+        agent_id="agent-1",
+        status="paused",
+        source_type="api",
+    )
+    workflow = Workflow(workflow_id="wf:test", name="Test", steps=[])
+    state = WorkflowState(
+        status="paused",
+        current_step_status="paused",
+        pending_pause_type="gate",
+        pending_pause_payload={
+            "pause_id": "gate_missing",
+            "task_id": "task-1",
+            "step_name": "review",
+        },
+    )
+    step_def = StepDefinition(
+        name="review",
+        type="gate",
+        gate=GateConfig(
+            message="Review it",
+            options=[GateOption(label="Continue", action="continue")],
+        ),
+    )
+
+    async def _persist(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        return None
+
+    async def _resolve_soon() -> None:
+        await asyncio.sleep(0.01)
+        engine._pause_waiter.resolve("gate_missing", PauseResolution(decision="continue"))
+
+    monkeypatch.setattr(engine, "_persist_workflow_state", _persist)
+    asyncio.create_task(_resolve_soon())
+
+    result = await engine._handle_gate_step(task, step_def, state, workflow)
+
+    assert result == "continue"
+    assert len(notifications.created) == 1
+    assert notifications.created[0]["notification_id"] == "gate_missing"
+
+
+@pytest.mark.asyncio
+async def test_handle_gate_step_uses_resolved_notification_after_restart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _build_engine()
+    notifications = _NotificationService()
+    engine._notification_service = notifications
+    notifications.notifications["gate_resolved"] = SimpleNamespace(
+        notification_id="gate_resolved",
+        status="resolved",
+        resolution={"decision": "continue", "note": "Use the approved version."},
+    )
+
+    task = TaskModel(
+        task_id="task-1",
+        title="Task",
+        created_by="user@example.com",
+        agent_id="agent-1",
+        status="paused",
+    )
+    workflow = Workflow(workflow_id="wf:test", name="Test", steps=[])
+    state = WorkflowState(
+        status="paused",
+        current_step_status="paused",
+        pending_pause_type="gate",
+        pending_pause_payload={
+            "pause_id": "gate_resolved",
+            "task_id": "task-1",
+            "step_name": "review",
+        },
+    )
+    step_def = StepDefinition(
+        name="review",
+        type="gate",
+        gate=GateConfig(
+            message="Review it",
+            options=[GateOption(label="Continue", action="continue")],
+        ),
+    )
+    persisted: list[str | None] = []
+
+    async def _persist(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        persisted.append(state.pending_pause_type)
+
+    monkeypatch.setattr(engine, "_persist_workflow_state", _persist)
+
+    result = await engine._handle_gate_step(task, step_def, state, workflow)
+
+    assert result == "continue"
+    assert notifications.created == []
+    assert state.pending_pause_type is None
+    assert state.last_operator_instruction == "Use the approved version."
+    assert persisted == [None]
 
 
 @pytest.mark.asyncio
