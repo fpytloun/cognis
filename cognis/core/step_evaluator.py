@@ -104,6 +104,10 @@ completion is a revise, not an approval.
 If the agent reported outcome="failed" but the work is still salvageable,
 return "revise" so the workflow can continue.
 
+If the summary or evidence says the step hit a tool-call ceiling or context
+window before completion, treat that as incomplete work and prefer "revise"
+unless the deliverable is clearly complete and correct.
+
 Respond with JSON only: {{"decision": "...", "reasoning": "...", "feedback": "..."}}
 """
 
@@ -362,7 +366,7 @@ class StepEvaluator:
                 },
             )
 
-        decision = str(payload.get("decision", "approved")).lower()
+        decision = str(payload.get("decision", "revise")).lower()
         if decision not in {"approved", "revise", "failed"}:
             return self._forced_failed(
                 reasoning=f"invalid evaluator decision: {decision}",

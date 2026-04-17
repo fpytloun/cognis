@@ -530,6 +530,7 @@ class ToolRouter:
             )
         if route is ToolRoute.INTARIS_MCP:
             result = await self._call_intaris_mcp(tool_call, session, registry)
+            result = await self._materialize_inline_attachments(result, session, tool_call.name)
             if (
                 result.is_error
                 and result.metadata is not None

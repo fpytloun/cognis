@@ -151,10 +151,21 @@ async def create_agent_route(request: Request, payload: AgentCreateRequest) -> A
 
     definition = AgentDefinition.model_validate(agent_to_response(row).model_dump())
     try:
-        await asyncio.wait_for(
-            request.app.state.providers.memory.bootstrap_agent(definition),
-            timeout=60.0,
+        replace_identity = getattr(
+            request.app.state.providers.memory,
+            "replace_bootstrap_identity",
+            None,
         )
+        if callable(replace_identity):
+            await asyncio.wait_for(
+                replace_identity(definition, previous_content=None, allow_legacy_cleanup=True),
+                timeout=60.0,
+            )
+        else:
+            await asyncio.wait_for(
+                request.app.state.providers.memory.bootstrap_agent(definition),
+                timeout=60.0,
+            )
         await _persist_sync_metadata(request, agent_id, True)
         row.sync_metadata = _sync_metadata(True)
     except Exception as exc:

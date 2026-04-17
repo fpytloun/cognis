@@ -401,11 +401,16 @@ async def handle_edit(arguments: dict[str, Any], context: ToolExecutionContext) 
         except RuntimeError as exc:
             return ToolResult(output=str(exc), is_error=True)
         try:
-            content = path.read_text(encoding="utf-8")
+            with path.open("r", encoding="utf-8", newline="") as handle:
+                content = handle.read()
         except (OSError, PermissionError) as exc:
             return ToolResult(output=f"Cannot read file: {exc}", is_error=True)
 
-        count = content.count(old_string)
+        newline = _detect_newline(content)
+        normalized_old = _normalize_text_for_newline(old_string, newline)
+        normalized_new = _normalize_text_for_newline(new_string, newline)
+
+        count = content.count(normalized_old)
         if count == 0:
             return ToolResult(output="oldString not found in content.", is_error=True)
         if count > 1 and not replace_all:
@@ -415,12 +420,12 @@ async def handle_edit(arguments: dict[str, Any], context: ToolExecutionContext) 
             )
 
         new_content = (
-            content.replace(old_string, new_string)
+            content.replace(normalized_old, normalized_new)
             if replace_all
-            else content.replace(old_string, new_string, 1)
+            else content.replace(normalized_old, normalized_new, 1)
         )
         try:
-            path.write_text(new_content, encoding="utf-8")
+            path.write_text(new_content, encoding="utf-8", newline=newline)
             formatter_changed = await _maybe_format_file(path)
             if formatter_changed:
                 _remove_tracked_path(context, path)
@@ -431,6 +436,8 @@ async def handle_edit(arguments: dict[str, Any], context: ToolExecutionContext) 
 
         replacements = count if replace_all else 1
         output = f"Replaced {replacements} occurrence(s) in {file_path}"
+        if formatter_changed:
+            output += " (reformatted by formatter)"
         diagnostics_text = await _collect_lsp_diagnostics(context, file_path)
         if diagnostics_text:
             output += f"\n\n{diagnostics_text}"
@@ -447,7 +454,6 @@ async def handle_patch(arguments: dict[str, Any], context: ToolExecutionContext)
 
     try:
         operations = _parse_patch_operations(patch_text, context)
-        await _stage_patch_operations(operations, context)
     except (
         PatchFormatError,
         PatchConflictError,
@@ -506,11 +512,14 @@ async def handle_multiedit(arguments: dict[str, Any], context: ToolExecutionCont
     async def _multiedit() -> ToolResult:
         try:
             await _assert_can_modify_existing(context, path)
-            content = path.read_text(encoding="utf-8")
+            with path.open("r", encoding="utf-8", newline="") as handle:
+                content = handle.read()
         except RuntimeError as exc:
             return ToolResult(output=str(exc), is_error=True)
         except (OSError, PermissionError) as exc:
             return ToolResult(output=f"Cannot read file: {exc}", is_error=True)
+
+        newline = _detect_newline(content)
 
         applied = 0
         for i, edit in enumerate(edits):
@@ -520,7 +529,9 @@ async def handle_multiedit(arguments: dict[str, Any], context: ToolExecutionCont
 
             if old_string == new_string:
                 continue
-            count = content.count(old_string)
+            normalized_old = _normalize_text_for_newline(old_string, newline)
+            normalized_new = _normalize_text_for_newline(new_string, newline)
+            count = content.count(normalized_old)
             if count == 0:
                 return ToolResult(
                     output=f"Edit {i + 1}: oldString not found in content.", is_error=True
@@ -531,14 +542,14 @@ async def handle_multiedit(arguments: dict[str, Any], context: ToolExecutionCont
                     is_error=True,
                 )
             content = (
-                content.replace(old_string, new_string)
+                content.replace(normalized_old, normalized_new)
                 if replace_all
-                else content.replace(old_string, new_string, 1)
+                else content.replace(normalized_old, normalized_new, 1)
             )
             applied += 1
 
         try:
-            path.write_text(content, encoding="utf-8")
+            path.write_text(content, encoding="utf-8", newline=newline)
             formatter_changed = await _maybe_format_file(path)
             if formatter_changed:
                 _remove_tracked_path(context, path)
@@ -548,6 +559,8 @@ async def handle_multiedit(arguments: dict[str, Any], context: ToolExecutionCont
             return ToolResult(output=f"Cannot write file: {exc}", is_error=True)
 
         output = f"Applied {applied} edit(s) to {file_path}"
+        if formatter_changed:
+            output += " (reformatted by formatter)"
         diagnostics_text = await _collect_lsp_diagnostics(context, file_path)
         if diagnostics_text:
             output += f"\n\n{diagnostics_text}"
@@ -615,6 +628,12 @@ def _is_apply_patch_header(stripped: str) -> bool:
 
 def _detect_newline(text: str) -> str:
     return "\r\n" if "\r\n" in text else "\n"
+
+
+def _normalize_text_for_newline(text: str, newline: str) -> str:
+    if newline == "\n":
+        return text.replace("\r\n", "\n")
+    return text.replace("\r\n", "\n").replace("\n", newline)
 
 
 def _normalize_patch_text_for_newline(text: str, newline: str) -> str:

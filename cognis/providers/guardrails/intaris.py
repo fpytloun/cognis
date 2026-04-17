@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from collections.abc import Awaitable, Callable
 from time import perf_counter
 from typing import Any, TypeVar
@@ -25,6 +26,14 @@ from cognis.runtime_context import current_agent_id, current_user_email
 logger = get_logger(__name__)
 
 T = TypeVar("T")
+
+
+def _coerce_attachment_b64(value: str) -> str:
+    try:
+        base64.b64decode(value, validate=True)
+        return value
+    except Exception:
+        return base64.b64encode(value.encode("utf-8")).decode("ascii")
 
 
 class IntarisProvider:
@@ -489,6 +498,7 @@ class IntarisProvider:
 
         content = payload.get("content")
         text_chunks: list[str] = []
+        attachments: list[dict[str, Any]] = []
         if isinstance(content, list):
             for block in content:
                 if not isinstance(block, dict):
@@ -499,6 +509,18 @@ class IntarisProvider:
                     text = block.get("text")
                     if isinstance(text, str) and text:
                         text_chunks.append(text)
+                elif block_type == "image":
+                    attachment = self._normalize_mcp_image_block(block)
+                    if attachment is not None:
+                        attachments.append(attachment)
+                        text_chunks.append("[image attachment returned]")
+                elif block_type == "resource":
+                    attachment = self._normalize_mcp_resource_block(block)
+                    if attachment is not None:
+                        attachments.append(attachment)
+                        text_chunks.append("[resource attachment returned]")
+                    else:
+                        text_chunks.append(str(block))
                 else:
                     text_chunks.append(str(block))
         elif isinstance(content, str):
@@ -520,7 +542,51 @@ class IntarisProvider:
                 else None
             ),
             metadata=metadata or None,
+            attachments=attachments or None,
         )
+
+    def _normalize_mcp_image_block(self, block: dict[str, Any]) -> dict[str, Any] | None:
+        data = block.get("data") or block.get("image") or block.get("bytes")
+        if isinstance(data, bytes):
+            content_b64 = base64.b64encode(data).decode("ascii")
+        elif isinstance(data, str):
+            content_b64 = _coerce_attachment_b64(data)
+        else:
+            return None
+        mime_type = str(block.get("mimeType") or block.get("mime_type") or "image/png")
+        return {
+            "content_b64": content_b64,
+            "mime_type": mime_type,
+            "filename": str(block.get("filename") or "mcp-image"),
+            "kind": "image",
+        }
+
+    def _normalize_mcp_resource_block(self, block: dict[str, Any]) -> dict[str, Any] | None:
+        resource = block.get("resource")
+        if isinstance(resource, dict):
+            data = resource.get("blob") or resource.get("data")
+            mime_type = str(
+                resource.get("mimeType") or resource.get("mime_type") or "application/octet-stream"
+            )
+            filename = str(resource.get("filename") or block.get("filename") or "mcp-resource")
+        else:
+            data = block.get("data")
+            mime_type = str(
+                block.get("mimeType") or block.get("mime_type") or "application/octet-stream"
+            )
+            filename = str(block.get("filename") or "mcp-resource")
+        if isinstance(data, bytes):
+            content_b64 = base64.b64encode(data).decode("ascii")
+        elif isinstance(data, str):
+            content_b64 = _coerce_attachment_b64(data)
+        else:
+            return None
+        return {
+            "content_b64": content_b64,
+            "mime_type": mime_type,
+            "filename": filename,
+            "kind": "pdf" if mime_type == "application/pdf" else "file",
+        }
 
     async def list_mcp_servers(self, enabled_only: bool = True) -> list[dict[str, Any]]:
         """List available MCP servers from Intaris."""

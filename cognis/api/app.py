@@ -194,13 +194,19 @@ def create_app() -> FastAPI:
                 sys.stdout.flush()
 
         event_bus = EventBus()
+        pause_waiter = PauseWaiter()
+        session_lock = SessionLock()
         session_cache = SessionCache(
             providers.guardrails,
             max_entries=cache_max_entries,
             redis_url=config_runtime.redis_url,
         )
         session_manager = SessionManager(
-            session_factory, providers, session_cache, event_bus=event_bus
+            session_factory,
+            providers,
+            session_cache,
+            event_bus=event_bus,
+            session_lock=session_lock,
         )
         context_assembler = await ContextAssembler.from_session_factory(
             session_factory=session_factory,
@@ -220,8 +226,6 @@ def create_app() -> FastAPI:
             session_factory=session_factory,
             llm=providers.llm,
         )
-        pause_waiter = PauseWaiter()
-        session_lock = SessionLock()
         from cognis.core.tool_output_store import (
             FilesystemToolOutputBackend,
             S3ToolOutputBackend,

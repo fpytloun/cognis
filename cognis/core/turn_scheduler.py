@@ -289,6 +289,8 @@ class TurnScheduler:
 
         # Conversation-scoped observers (multiple allowed — e.g. multiple browser tabs)
         self._observers: dict[str, list[TurnObserver]] = defaultdict(list)
+        self._observer_failures: dict[tuple[str, int], int] = defaultdict(int)
+        self._disabled_observers: set[tuple[str, int]] = set()
 
         # Per-conversation session creation locks (bootstrap + compaction recovery)
         self._deferred_creation_locks: dict[str, asyncio.Lock] = {}
@@ -312,6 +314,8 @@ class TurnScheduler:
         if observers:
             with contextlib.suppress(ValueError):
                 observers.remove(observer)
+            self._observer_failures.pop((conversation_id, id(observer)), None)
+            self._disabled_observers.discard((conversation_id, id(observer)))
             if not observers:
                 del self._observers[conversation_id]
 
@@ -321,6 +325,8 @@ class TurnScheduler:
         for cid, observers in self._observers.items():
             with contextlib.suppress(ValueError):
                 observers.remove(observer)
+            self._observer_failures.pop((cid, id(observer)), None)
+            self._disabled_observers.discard((cid, id(observer)))
             if not observers:
                 empty_keys.append(cid)
         for cid in empty_keys:
@@ -1287,20 +1293,45 @@ class TurnScheduler:
         """Build streaming callbacks that fan out to registered observers."""
 
         async def on_token(delta: str) -> None:
-            for observer in self._iter_observers(conversation_id, turn_observers=turn_observers):
-                with contextlib.suppress(Exception):
-                    await observer.on_token(conversation_id, session_id, message_id, delta)
+            await asyncio.gather(
+                *(
+                    self._call_observer(
+                        conversation_id,
+                        observer,
+                        observer.on_token,
+                        conversation_id,
+                        session_id,
+                        message_id,
+                        delta,
+                    )
+                    for observer in self._iter_observers(
+                        conversation_id, turn_observers=turn_observers
+                    )
+                )
+            )
 
         async def on_tool_call(
             tool_name: str,
             call_id: str,
             arguments: dict[str, Any] | None = None,
         ) -> None:
-            for observer in self._iter_observers(conversation_id, turn_observers=turn_observers):
-                with contextlib.suppress(Exception):
-                    await observer.on_tool_call(
-                        conversation_id, session_id, call_id, tool_name, arguments
+            await asyncio.gather(
+                *(
+                    self._call_observer(
+                        conversation_id,
+                        observer,
+                        observer.on_tool_call,
+                        conversation_id,
+                        session_id,
+                        call_id,
+                        tool_name,
+                        arguments,
                     )
+                    for observer in self._iter_observers(
+                        conversation_id, turn_observers=turn_observers
+                    )
+                )
+            )
 
         async def on_tool_result(
             call_id: str,
@@ -1310,9 +1341,12 @@ class TurnScheduler:
             duration_ms: int | None,
             evaluation: dict[str, Any] | None = None,
         ) -> None:
-            for observer in self._iter_observers(conversation_id, turn_observers=turn_observers):
-                with contextlib.suppress(Exception):
-                    await observer.on_tool_result(
+            await asyncio.gather(
+                *(
+                    self._call_observer(
+                        conversation_id,
+                        observer,
+                        observer.on_tool_result,
                         conversation_id,
                         session_id,
                         call_id,
@@ -1322,6 +1356,11 @@ class TurnScheduler:
                         duration_ms,
                         evaluation,
                     )
+                    for observer in self._iter_observers(
+                        conversation_id, turn_observers=turn_observers
+                    )
+                )
+            )
 
         return on_token, on_tool_call, on_tool_result
 
@@ -1333,9 +1372,16 @@ class TurnScheduler:
     ) -> list[TurnObserver]:
         observers: list[TurnObserver] = list(self._observers.get(conversation_id, []))
         for observer in turn_observers or ():
-            if observer not in observers:
+            if (
+                observer not in observers
+                and (conversation_id, id(observer)) not in self._disabled_observers
+            ):
                 observers.append(observer)
-        return observers
+        return [
+            observer
+            for observer in observers
+            if (conversation_id, id(observer)) not in self._disabled_observers
+        ]
 
     async def _notify_observers(
         self,
@@ -1345,9 +1391,12 @@ class TurnScheduler:
         turn_observers: list[TurnObserver] | tuple[TurnObserver, ...] | None = None,
     ) -> None:
         """Call a method on all observers for a conversation."""
-        for observer in self._iter_observers(conversation_id, turn_observers=turn_observers):
-            with contextlib.suppress(Exception):
-                await getattr(observer, method)(*args)
+        await asyncio.gather(
+            *(
+                self._call_observer(conversation_id, observer, getattr(observer, method), *args)
+                for observer in self._iter_observers(conversation_id, turn_observers=turn_observers)
+            )
+        )
 
     async def _notify_observers_system_message(
         self,
@@ -1372,12 +1421,20 @@ class TurnScheduler:
         turn_observers: list[TurnObserver] | tuple[TurnObserver, ...] | None = None,
     ) -> None:
         """Notify observers and publish lifecycle event."""
-        for observer in self._iter_observers(
-            result.conversation_id,
-            turn_observers=turn_observers,
-        ):
-            with contextlib.suppress(Exception):
-                await observer.on_turn_complete(result)
+        await asyncio.gather(
+            *(
+                self._call_observer(
+                    result.conversation_id,
+                    observer,
+                    observer.on_turn_complete,
+                    result,
+                )
+                for observer in self._iter_observers(
+                    result.conversation_id,
+                    turn_observers=turn_observers,
+                )
+            )
+        )
 
         await self._event_bus.publish(
             Event(
@@ -1416,12 +1473,21 @@ class TurnScheduler:
         turn_observers: list[TurnObserver] | tuple[TurnObserver, ...] | None = None,
     ) -> None:
         """Notify observers and publish lifecycle event."""
-        for observer in self._iter_observers(
-            conversation_id,
-            turn_observers=turn_observers,
-        ):
-            with contextlib.suppress(Exception):
-                await observer.on_turn_error(conversation_id, error)
+        await asyncio.gather(
+            *(
+                self._call_observer(
+                    conversation_id,
+                    observer,
+                    observer.on_turn_error,
+                    conversation_id,
+                    error,
+                )
+                for observer in self._iter_observers(
+                    conversation_id,
+                    turn_observers=turn_observers,
+                )
+            )
+        )
 
         await self._event_bus.publish(
             Event(
@@ -1439,6 +1505,40 @@ class TurnScheduler:
                 },
             )
         )
+
+    async def _call_observer(
+        self,
+        conversation_id: str,
+        observer: TurnObserver,
+        callback: Any,
+        *args: Any,
+    ) -> None:
+        try:
+            await asyncio.wait_for(callback(*args), timeout=1.0)
+        except Exception:
+            key = (conversation_id, id(observer))
+            self._observer_failures[key] += 1
+            if self._observer_failures[key] >= 3:
+                logger.warning(
+                    "turn_scheduler: removing unstable observer",
+                    extra={"extra_data": {"conversation_id": conversation_id}},
+                    exc_info=True,
+                )
+                self.remove_observer(conversation_id, observer)
+                self._disabled_observers.add(key)
+            else:
+                logger.debug(
+                    "turn_scheduler: observer callback failed",
+                    extra={
+                        "extra_data": {
+                            "conversation_id": conversation_id,
+                            "failure_count": self._observer_failures[key],
+                        }
+                    },
+                    exc_info=True,
+                )
+        else:
+            self._observer_failures.pop((conversation_id, id(observer)), None)
 
     # ------------------------------------------------------------------
     # Workflow selection

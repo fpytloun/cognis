@@ -644,6 +644,15 @@ class WorkflowEngine:
                     state=state,
                 )
 
+        persisted_todos: list[dict[str, Any]] = []
+        async with self._session_factory() as db_session:
+            latest_step_run = await get_latest_step_run_for_task_step(
+                db_session, task.task_id, step_def.name
+            )
+            raw_todos = latest_step_run.todos if latest_step_run is not None else None
+            if isinstance(raw_todos, list):
+                persisted_todos = [item for item in raw_todos if isinstance(item, dict)]
+
         # Create StepRun record
         step_run_id = f"sr_{uuid.uuid4().hex}"
         async with self._session_factory() as db_session:
@@ -665,6 +674,7 @@ class WorkflowEngine:
                 status="running",
                 session_id=session.session_id,
                 intaris_session_id=session.intaris_session_id,
+                todos=persisted_todos,
                 started_at=datetime.now(UTC),
             )
             await db_session.commit()
@@ -739,6 +749,7 @@ class WorkflowEngine:
             step_index=step_index,
             cancel_event=cancel_event,
             orchestration_mode=step_orchestration,
+            todos=persisted_todos,
         )
 
         # Run agent loop
@@ -767,12 +778,17 @@ class WorkflowEngine:
         # Update StepRun record — a StepOutput with error set is a failure.
         # If evaluation is configured, set status to "evaluating" instead of
         # premature "approved" — the evaluation will set the final status.
+        completion = self._resolve_completion(step_def, workflow)
         step_failed = output is None or output.error is not None
         if step_failed:
             initial_status = "failed"
         else:
-            completion = self._resolve_completion(step_def, workflow)
-            initial_status = "evaluating" if (completion and completion.evaluate) else "approved"
+            if output.outcome is not None and output.outcome.status == "failed":
+                initial_status = "evaluating" if (completion and completion.evaluate) else "failed"
+            else:
+                initial_status = (
+                    "evaluating" if (completion and completion.evaluate) else "approved"
+                )
         async with self._session_factory() as db_session:
             await update_step_run(
                 db_session,

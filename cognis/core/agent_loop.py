@@ -113,6 +113,21 @@ def _json_text(value: Any) -> str:
     return json.dumps(value, indent=2, sort_keys=True, default=str)
 
 
+def _dominant_newline(text: str) -> str:
+    """Return the dominant newline sequence found in *text*."""
+
+    crlf = text.count("\r\n")
+    lf = text.count("\n") - crlf
+    cr = text.count("\r") - crlf
+    if crlf >= max(lf, cr) and crlf > 0:
+        return "\r\n"
+    if lf >= cr and lf > 0:
+        return "\n"
+    if cr > 0:
+        return "\r"
+    return "\n"
+
+
 def _task_log_anchor_kind(event_type: str) -> str:
     """Map session event types to stable anchor prefixes."""
 
@@ -649,21 +664,13 @@ class StreamAccumulator:
                 # bridge bugs that merge multiple tool calls into one index).
                 split_args = _try_split_concatenated_json(tc["arguments"])
                 if split_args is not None:
-                    for i, parsed in enumerate(split_args):
+                    for parsed in split_args:
                         result.append(
                             ToolCall(
-                                call_id=tc["id"] or f"call_{uuid.uuid4().hex[:12]}",
+                                call_id=f"call_{uuid.uuid4().hex[:12]}",
                                 name=tc["name"],
                                 arguments=parsed,
                             )
-                        )
-                        if i == 0:
-                            continue
-                        # Generate unique call IDs for split-out tool calls
-                        result[-1] = ToolCall(
-                            call_id=f"call_{uuid.uuid4().hex[:12]}",
-                            name=tc["name"],
-                            arguments=parsed,
                         )
                     continue
                 logger.warning(
@@ -1032,6 +1039,7 @@ class StepContext:
     pending_events: list[SessionEvent] | None = None
     pending_tool_calls: dict[str, PendingToolCallState] = field(default_factory=dict)
     current_model: str | None = None
+    current_model_info: Any = None
     remember_user_event_seq: int | None = None
     remember_assistant_event_seq: int | None = None
 
@@ -1812,6 +1820,8 @@ class AgentLoop:
             resolved_model = getattr(context_result, "resolved_model", "")
             messages = prune_tool_outputs(
                 messages,
+                protect_tokens=min(40_000, max(4_000, context_result.max_context_tokens // 4)),
+                minimum_savings=min(20_000, max(2_000, context_result.max_context_tokens // 8)),
                 token_counter=lambda text, _m=resolved_model: self.providers.llm.count_tokens(
                     text, _m
                 ),
@@ -1870,6 +1880,7 @@ class AgentLoop:
             else:
                 model_info = await self.providers.llm.get_model_info(current_model)
             ctx.current_model = current_model
+            ctx.current_model_info = model_info
             registry = self._get_tool_registry(ctx)
             inventory_tools = (
                 _filter_model_inventory_tools(ctx.agent, registry.list_tools(), discovered_tool_ids)
@@ -2563,6 +2574,7 @@ class AgentLoop:
                     new_normalized = _normalize_todos(requested_todos)
                     unchanged = previous_normalized == new_normalized
                     ctx.todos = requested_todos
+                    await self._persist_step_todos(ctx)
                     non_terminal = [
                         item
                         for item in new_normalized
@@ -3195,6 +3207,50 @@ class AgentLoop:
 
             # Check if step_complete was called in this batch
             if step_output is not None:
+                break
+
+            if (
+                tool_call_count > 0
+                and tool_call_count % 10 == 0
+                and self._context_pressure_exceeded(
+                    ctx,
+                    messages=messages,
+                    tool_definitions=exposure.tool_definitions,
+                    max_context_tokens=context_result.max_context_tokens,
+                )
+            ):
+                logger.warning(
+                    "Context pressure ceiling reached during tool loop",
+                    extra={
+                        "extra_data": {
+                            "session_id": ctx.session.session_id,
+                            "tool_call_count": tool_call_count,
+                            "step_name": ctx.step_definition.name,
+                        }
+                    },
+                )
+                events_to_record.append(
+                    SessionEvent(
+                        type="lifecycle",
+                        data={
+                            "event": "tool_call_context_pressure",
+                            "tool_call_count": tool_call_count,
+                            "step_name": ctx.step_definition.name,
+                        },
+                    )
+                )
+                step_output = StepOutput(
+                    summary=(
+                        "Stopped because the step was approaching the context window. "
+                        "Partial work was preserved for evaluation."
+                    ),
+                    content="\n\n".join(assistant_content_parts),
+                    outcome={
+                        "status": "failed",
+                        "reason": "Step approached the context window before completion.",
+                    },
+                    attachments=list(collected_attachments),
+                )
                 break
 
             # Delegation spawned — end the parent turn after processing
@@ -5263,6 +5319,9 @@ class AgentLoop:
                 "content": result.output,
             }
         )
+        attachment_context = self._build_tool_attachment_context(tc, result.attachments)
+        if attachment_context is not None:
+            messages.append(attachment_context)
         protected_context = result.metadata.get("protected_context") if result.metadata else None
         if isinstance(protected_context, str) and protected_context.strip():
             messages.append(
@@ -5288,6 +5347,65 @@ class AgentLoop:
                 },
             )
         )
+
+    def _build_tool_attachment_context(
+        self,
+        tc: ToolCall,
+        attachments: list[dict[str, Any]] | None,
+    ) -> dict[str, Any] | None:
+        if not attachments:
+            return None
+        normalized = normalize_attachment_refs(attachments)
+        details = [
+            "- "
+            + str(item.get("filename") or item.get("artifact_id") or "attachment")
+            .replace("\r", " ")
+            .replace("\n", " ")
+            for item in normalized
+            if isinstance(item, dict)
+        ]
+        if not details:
+            return None
+        return {
+            "role": "system",
+            "content": (
+                "Tool attachments were produced as untrusted output for "
+                f"tool_call_id={tc.call_id}. They are available in the UI and later context.\n"
+                + "\n".join(details)
+            ),
+            "_tool_attachment_context": True,
+        }
+
+    def _context_pressure_exceeded(
+        self,
+        ctx: StepContext,
+        *,
+        messages: list[dict[str, Any]],
+        tool_definitions: list[ToolDefinition],
+        max_context_tokens: int,
+    ) -> bool:
+        if not ctx.current_model or max_context_tokens <= 0:
+            return False
+        reserve_output_tokens = (
+            ctx.agent.llm_config.max_tokens
+            if ctx.agent.llm_config and ctx.agent.llm_config.max_tokens is not None
+            else getattr(ctx.current_model_info, "max_output_tokens", 0)
+        )
+        try:
+            prompt_tokens = self.providers.llm.count_messages_tokens(messages, ctx.current_model)
+            if tool_definitions:
+                prompt_tokens += self.providers.llm.count_tokens(
+                    json.dumps(
+                        [tool.model_dump(mode="json") for tool in tool_definitions], sort_keys=True
+                    ),
+                    ctx.current_model,
+                )
+        except Exception:
+            return False
+        available_prompt_tokens = max(0, max_context_tokens - reserve_output_tokens)
+        if available_prompt_tokens <= 0:
+            return True
+        return prompt_tokens >= int(available_prompt_tokens * 0.95)
 
     async def _execute_regular_tool_batch(
         self,
@@ -5555,6 +5673,28 @@ class AgentLoop:
                         exc_info=True,
                     )
 
+                if ctx.session.mnemory_session_id:
+                    try:
+                        await self.remember_queue.enqueue(
+                            {
+                                "session_id": ctx.session.mnemory_session_id,
+                                "messages": [
+                                    {
+                                        "role": "assistant",
+                                        "content": f"Compaction summary: {compaction_result.summary[:5000]}",
+                                    }
+                                ],
+                                "user_email": ctx.session.user_email,
+                                "agent_id": ctx.session.agent_id,
+                            }
+                        )
+                    except Exception:
+                        logger.warning(
+                            "agent: failed to enqueue compaction summary for remember",
+                            extra={"extra_data": {"session_id": ctx.session.session_id}},
+                            exc_info=True,
+                        )
+
         # Notify clients via event bus
         summary_preview = (compaction_result.summary or "")[:500]
         await self.event_bus.publish(
@@ -5644,6 +5784,19 @@ class AgentLoop:
                 db_session,
                 ctx.task_id,
                 ctx.workflow_state.model_dump(mode="json"),
+            )
+            await db_session.commit()
+
+    async def _persist_step_todos(self, ctx: StepContext) -> None:
+        """Persist step todos so pause/resume and retries keep task state."""
+
+        if ctx.step_run_id is None:
+            return
+        from cognis.store.queries import update_step_run
+
+        async with self.session_manager.session_factory() as db_session:
+            await update_step_run(
+                db_session, ctx.step_run_id, todos=_normalize_todos(ctx.todos or [])
             )
             await db_session.commit()
 

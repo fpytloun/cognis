@@ -89,11 +89,18 @@ class SessionManager:
         providers: Any,
         session_cache: Any,
         event_bus: EventBus | None = None,
+        session_lock: Any = None,
     ) -> None:
         self.session_factory = session_factory
         self.providers = providers
         self.session_cache = session_cache
         self.event_bus = event_bus
+        self.session_lock = session_lock
+
+    async def _evict_session_state(self, session_id: str) -> None:
+        await self.session_cache.evict(session_id)
+        if self.session_lock is not None:
+            self.session_lock.evict(session_id)
 
     async def create_conversation(
         self,
@@ -440,7 +447,7 @@ class SessionManager:
             except Exception:
                 await db_session.rollback()
                 raise
-        await self.session_cache.evict(session_id)
+        await self._evict_session_state(session_id)
         if updated:
             await self._sync_intaris_status(session_id, "idle")
         return updated
@@ -481,7 +488,7 @@ class SessionManager:
             except Exception:
                 await db_session.rollback()
                 raise
-        await self.session_cache.evict(session_id)
+        await self._evict_session_state(session_id)
         if updated:
             await self._sync_intaris_status(
                 session_id,
@@ -507,7 +514,7 @@ class SessionManager:
             except Exception:
                 await db_session.rollback()
                 raise
-        await self.session_cache.evict(session_id)
+        await self._evict_session_state(session_id)
         if updated:
             await self._sync_intaris_status(session_id, "failed")
         return updated
@@ -528,7 +535,7 @@ class SessionManager:
             except Exception:
                 await db_session.rollback()
                 raise
-        await self.session_cache.evict(session_id)
+        await self._evict_session_state(session_id)
         if updated:
             await self._sync_intaris_status(session_id, "cancelled")
         return updated
@@ -568,7 +575,7 @@ class SessionManager:
             except Exception:
                 await db_session.rollback()
                 raise
-        await self.session_cache.evict(session_id)
+        await self._evict_session_state(session_id)
         if updated:
             await self._sync_intaris_status(session_id, "terminated", reason=reason)
         return updated
@@ -657,7 +664,7 @@ class SessionManager:
                 raise
 
         # Evict old session cache
-        await self.session_cache.evict(current_session.session_id)
+        await self._evict_session_state(current_session.session_id)
 
         # Sync old session status to Intaris (best-effort)
         await self._sync_intaris_status(
@@ -714,7 +721,7 @@ class SessionManager:
                 raise
 
         for recovered_id in recovered_ids:
-            await self.session_cache.evict(recovered_id)
+            await self._evict_session_state(recovered_id)
         # Best-effort sync to Intaris for all recovered sessions (after commit)
         for stale_session in stale_sessions:
             if stale_session.session_id not in recovered_ids:
@@ -777,7 +784,7 @@ class SessionManager:
 
         if deleted_sessions or deleted_conversations:
             for session_row in sessions:
-                await self.session_cache.evict(session_row.session_id)
+                await self._evict_session_state(session_row.session_id)
         return deleted_conversations > 0
 
     async def _close_conversation(self, conversation_id: str, conversation_status: str) -> bool:
@@ -811,7 +818,7 @@ class SessionManager:
                 raise
 
         for session_row in sessions:
-            await self.session_cache.evict(session_row.session_id)
+            await self._evict_session_state(session_row.session_id)
             if session_row.status not in {
                 SessionStatus.COMPLETED,
                 SessionStatus.FAILED,

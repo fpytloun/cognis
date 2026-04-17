@@ -26,7 +26,7 @@ from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.artifact import ArtifactKind
 from cognis.models.session import ConversationModel, SessionModel
-from cognis.models.tool import ToolDefinition
+from cognis.models.tool import Permission, ToolDefinition
 from cognis.runtime_context import scoped_runtime_context
 from cognis.store.queries import get_setting_value
 
@@ -611,15 +611,27 @@ class ContextAssembler:
             immutable_core_memories=immutable_core_memories,
             compaction_summary=cache_entry.last_compaction_summary,
             project_instructions=project_instructions,
+            resolved_model=resolved_model,
         )
         system_prompt_tokens, tool_schema_tokens = self._count_static_tokens(
             resolved_model=resolved_model,
             immutable_prefix=immutable_prefix,
             tool_definitions=tool_definitions or [],
         )
+        max_prompt_tokens = max(0, max_context_tokens - reserve_output_tokens)
+        if immutable_prefix and system_prompt_tokens + tool_schema_tokens > max_prompt_tokens:
+            immutable_prefix = self._cap_prefix_section(
+                immutable_prefix,
+                resolved_model,
+                max(0, max_prompt_tokens - tool_schema_tokens),
+            )
+            system_prompt_tokens, tool_schema_tokens = self._count_static_tokens(
+                resolved_model=resolved_model,
+                immutable_prefix=immutable_prefix,
+                tool_definitions=tool_definitions or [],
+            )
         static_tokens = system_prompt_tokens + tool_schema_tokens
         dynamic_tokens = max(0, max_context_tokens - static_tokens - reserve_output_tokens)
-        max_prompt_tokens = max(0, max_context_tokens - reserve_output_tokens)
 
         # ----- Build messages: immutable prefix first, then mutable suffix -----
         messages: list[dict[str, Any]] = []
@@ -649,18 +661,6 @@ class ContextAssembler:
             )
         )
         messages.extend(history_messages)
-
-        # Per-turn recalled memories (mutable, appended each turn)
-        if mutable_search_results:
-            messages.append(
-                {
-                    "role": "system",
-                    "content": (
-                        '<memory_context trust="untrusted">\n'
-                        "Recalled memories:\n" + mutable_search_results + "\n</memory_context>"
-                    ),
-                }
-            )
 
         if active_delegations:
             messages.append(
@@ -705,6 +705,17 @@ class ContextAssembler:
             user_message_role=user_message_role,
             user_attachments=user_attachments,
         )
+
+        if mutable_search_results:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        '<memory_context trust="untrusted">\n'
+                        "Recalled memories:\n" + mutable_search_results + "\n</memory_context>"
+                    ),
+                }
+            )
 
         if not skip_user_message and not already_in_history:
             if routing_reminder:
@@ -911,15 +922,27 @@ class ContextAssembler:
             immutable_core_memories=None,
             compaction_summary=cache_entry.last_compaction_summary,
             project_instructions=project_instructions,
+            resolved_model=resolved_model,
         )
         system_prompt_tokens, tool_schema_tokens = self._count_static_tokens(
             resolved_model=resolved_model,
             immutable_prefix=immutable_prefix,
             tool_definitions=tool_definitions or [],
         )
+        max_prompt_tokens = max(0, max_context_tokens - reserve_output_tokens)
+        if immutable_prefix and system_prompt_tokens + tool_schema_tokens > max_prompt_tokens:
+            immutable_prefix = self._cap_prefix_section(
+                immutable_prefix,
+                resolved_model,
+                max(0, max_prompt_tokens - tool_schema_tokens),
+            )
+            system_prompt_tokens, tool_schema_tokens = self._count_static_tokens(
+                resolved_model=resolved_model,
+                immutable_prefix=immutable_prefix,
+                tool_definitions=tool_definitions or [],
+            )
         static_tokens = system_prompt_tokens + tool_schema_tokens
         dynamic_tokens = max(0, max_context_tokens - static_tokens - reserve_output_tokens)
-        max_prompt_tokens = max(0, max_context_tokens - reserve_output_tokens)
 
         # Build messages: immutable prefix + env + history
         messages: list[dict[str, Any]] = []
@@ -1098,6 +1121,7 @@ class ContextAssembler:
         immutable_core_memories: str | None,
         compaction_summary: str | None,
         project_instructions: list[str] | None = None,
+        resolved_model: str,
     ) -> str | None:
         """Compose the cacheable immutable system prefix as one message."""
         sections: list[str] = []
@@ -1107,7 +1131,17 @@ class ContextAssembler:
             if tagged_identity:
                 sections.append(tagged_identity)
 
-        system_instructions = build_system_instructions(prompt_context, agent_id=agent.agent_id)
+        include_work_routing = True
+        if agent.permissions is not None:
+            include_work_routing = (
+                agent.permissions.resolve_permission("delegate", tool_id="delegate")
+                is not Permission.DENY
+            )
+        system_instructions = build_system_instructions(
+            prompt_context,
+            agent_id=agent.agent_id,
+            include_work_routing=include_work_routing,
+        )
         if system_instructions:
             tagged_instructions = _tagged_section("instructions", system_instructions)
             if tagged_instructions:
@@ -1122,13 +1156,13 @@ class ContextAssembler:
 
         if immutable_instructions:
             sections.append(
-                f"<memory_instructions>\n{immutable_instructions}\n</memory_instructions>"
+                f"<memory_instructions>\n{self._cap_prefix_section(immutable_instructions, resolved_model, 4000)}\n</memory_instructions>"
             )
 
         if immutable_core_memories:
             sections.append(
                 '<memory_context trust="untrusted">\n'
-                + immutable_core_memories
+                + self._cap_prefix_section(immutable_core_memories, resolved_model, 4000)
                 + "\n</memory_context>"
             )
 
@@ -1154,6 +1188,32 @@ class ContextAssembler:
                 sections.append(tagged_summary)
 
         return "\n\n".join(section for section in sections if section) or None
+
+    def _cap_prefix_section(self, text: str, resolved_model: str, max_tokens: int) -> str:
+        if not text:
+            return text
+        try:
+            if self.llm.count_tokens(text, resolved_model) <= max_tokens:
+                return text
+        except Exception:
+            return text[: max_tokens * 4]
+
+        low = 0
+        high = len(text)
+        best = text[: max_tokens * 4]
+        while low <= high:
+            mid = (low + high) // 2
+            candidate = text[:mid]
+            try:
+                tokens = self.llm.count_tokens(candidate, resolved_model)
+            except Exception:
+                return best
+            if tokens <= max_tokens:
+                best = candidate
+                low = mid + 1
+            else:
+                high = mid - 1
+        return best.rstrip() + "\n[truncated to fit immutable prefix budget]"
 
     def _count_static_tokens(
         self,
@@ -1712,14 +1772,7 @@ def _is_protected_context_message(message: dict[str, Any]) -> bool:
 # Instruction adaptation: MCP tool names → Cognis builtin tool names
 # ---------------------------------------------------------------------------
 
-# Mnemory instructions reference MCP tool names (search_memories, add_memory,
-# etc.) but Cognis exposes builtin tools with different names (memory_search,
-# memory_add, etc.).  This mapping translates instruction text so the LLM
-# can connect the guidance to the actual tools it has available.
-#
-# Ordered longest-first within each group to prevent partial-match collisions
-# (e.g. "add_memories" must be replaced before "add_memory").
-_MCP_TO_COGNIS_TOOL_NAMES: list[tuple[str, str]] = [
+_MCP_MEMORY_TOOL_ALIASES: tuple[tuple[str, str], ...] = (
     ("get_recent_memories", "memory_recent"),
     ("search_memories", "memory_search"),
     ("find_memories", "memory_find"),
@@ -1735,24 +1788,8 @@ _MCP_TO_COGNIS_TOOL_NAMES: list[tuple[str, str]] = [
     ("delete_artifact", "memory_delete_artifact"),
     ("list_artifacts", "memory_list_artifacts"),
     ("get_artifact", "memory_get_artifact"),
-]
-
-# MCP tools that don't exist in Cognis — handled automatically by the
-# controller.  References in instructions are annotated so the LLM knows
-# these are not callable.  List (not set) for deterministic iteration.
-_MCP_NONEXISTENT_TOOLS: list[str] = ["initialize_memory", "get_core_memories"]
-
-# Pre-compiled regex patterns for each mapping (word-boundary safe).
-_TOOL_NAME_PATTERNS: list[tuple[re.Pattern[str], str]] = [
-    (re.compile(rf"\b{re.escape(mcp_name)}\b"), cognis_name)
-    for mcp_name, cognis_name in _MCP_TO_COGNIS_TOOL_NAMES
-]
-
-# Pre-compiled patterns for non-existent tools.
-_NONEXISTENT_TOOL_PATTERNS: list[tuple[re.Pattern[str], str]] = [
-    (re.compile(rf"\b{re.escape(name)}\b"), f"{name} (not available)")
-    for name in _MCP_NONEXISTENT_TOOLS
-]
+)
+_NONEXISTENT_MEMORY_TOOLS: tuple[str, ...] = ("initialize_memory", "get_core_memories")
 
 
 def _adapt_memory_instructions(instructions: str) -> str:
@@ -1765,15 +1802,20 @@ def _adapt_memory_instructions(instructions: str) -> str:
     Also annotates references to tools that don't exist in Cognis
     (initialize_memory, get_core_memories) with "(not available)".
     """
+    from cognis.tools.builtin.memory import MEMORY_TOOL_NAMES
+
     text = instructions
-
-    # Annotate references to non-existent tools first (before renaming).
-    for pattern, replacement in _NONEXISTENT_TOOL_PATTERNS:
-        text = pattern.sub(replacement, text)
-
-    # Replace MCP tool names with Cognis builtin names.
-    for pattern, replacement in _TOOL_NAME_PATTERNS:
-        text = pattern.sub(replacement, text)
+    available_aliases = [
+        (mcp_name, cognis_name)
+        for mcp_name, cognis_name in _MCP_MEMORY_TOOL_ALIASES
+        if cognis_name in MEMORY_TOOL_NAMES
+    ]
+    for name in _NONEXISTENT_MEMORY_TOOLS:
+        pattern = re.compile(rf"\b{re.escape(name)}\b")
+        text = pattern.sub(f"{name} (not available)", text)
+    for mcp_name, cognis_name in available_aliases:
+        pattern = re.compile(rf"\b{re.escape(mcp_name)}\b")
+        text = pattern.sub(cognis_name, text)
 
     return text
 

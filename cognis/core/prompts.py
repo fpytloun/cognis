@@ -322,6 +322,7 @@ def build_system_instructions(
     context: PromptContext,
     *,
     agent_id: str | None = None,
+    include_work_routing: bool = True,
 ) -> str | None:
     """Assemble context-appropriate system instructions.
 
@@ -341,7 +342,9 @@ def build_system_instructions(
     sections: list[str] = [_CORE_BEHAVIOR, _TOOL_GUIDANCE, _CONTEXT_AWARENESS]
 
     if context == PromptContext.CHAT:
-        sections.extend([_EXECUTION_BIAS, _WORK_ROUTING])
+        sections.append(_EXECUTION_BIAS)
+        if include_work_routing:
+            sections.append(_WORK_ROUTING)
     elif context == PromptContext.TASK_STEP:
         sections.append(_STEP_EXECUTION)
     elif context == PromptContext.DELEGATION:

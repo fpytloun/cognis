@@ -791,6 +791,9 @@ class LiteLLMProvider:
         provider: LLMProviderRow | None,
         model_info: ModelInfo,
     ) -> dict[str, Any]:
+        request_kwargs = dict(request_kwargs)
+        request_kwargs.pop("max_retries", None)
+        request_kwargs.pop("num_retries", None)
         prepared = apply_reasoning_config(
             request_kwargs,
             model_id=model_id,
@@ -829,6 +832,9 @@ class LiteLLMProvider:
         request_kwargs = _merge_request_kwargs(
             await self._resolve_provider_kwargs(provider), kwargs
         )
+        retry_count = request_kwargs.pop("max_retries", None)
+        if retry_count is None:
+            retry_count = request_kwargs.pop("num_retries", None)
         request_kwargs = self._prepare_generation_request_kwargs(
             request_kwargs,
             model_id=resolved_model,
@@ -843,6 +849,8 @@ class LiteLLMProvider:
             request_kwargs = dict(request_kwargs)
             request_kwargs["cognis_llm_api"] = "responses"
         if self._should_route_to_executor(provider):
+            if isinstance(retry_count, int):
+                request_kwargs["max_retries"] = retry_count
             return await self._executor_generate(
                 prefixed_model,
                 prepared_messages,
@@ -867,6 +875,7 @@ class LiteLLMProvider:
                 model=prefixed_model,
                 input=messages_to_responses_input(prepared_messages),
                 stream=False,
+                max_retries=int(retry_count) if isinstance(retry_count, int) else 3,
                 operation=f"generate.responses({prefixed_model})",
                 **responses_request_kwargs(request_kwargs),
             )
@@ -876,6 +885,7 @@ class LiteLLMProvider:
             model=prefixed_model,
             messages=prepared_messages,
             stream=False,
+            max_retries=int(retry_count) if isinstance(retry_count, int) else 3,
             operation=f"generate({prefixed_model})",
             **request_kwargs,
         )
@@ -934,6 +944,9 @@ class LiteLLMProvider:
         request_kwargs = _merge_request_kwargs(
             await self._resolve_provider_kwargs(provider), kwargs
         )
+        retry_count = request_kwargs.pop("max_retries", None)
+        if retry_count is None:
+            retry_count = request_kwargs.pop("num_retries", None)
         request_kwargs = self._prepare_generation_request_kwargs(
             request_kwargs,
             model_id=resolved_model,
@@ -948,6 +961,8 @@ class LiteLLMProvider:
             request_kwargs = dict(request_kwargs)
             request_kwargs["cognis_llm_api"] = "responses"
         if self._should_route_to_executor(provider):
+            if isinstance(retry_count, int):
+                request_kwargs["max_retries"] = retry_count
             async for chunk in self._executor_stream_generate(
                 prefixed_model,
                 prepared_messages,
@@ -974,6 +989,7 @@ class LiteLLMProvider:
                 model=prefixed_model,
                 input=messages_to_responses_input(prepared_messages),
                 stream=True,
+                max_retries=int(retry_count) if isinstance(retry_count, int) else 3,
                 operation=f"stream_generate.responses({prefixed_model})",
                 **responses_request_kwargs(request_kwargs),
             )
@@ -996,6 +1012,7 @@ class LiteLLMProvider:
             model=prefixed_model,
             messages=prepared_messages,
             stream=True,
+            max_retries=int(retry_count) if isinstance(retry_count, int) else 3,
             operation=f"stream_generate({prefixed_model})",
             **request_kwargs,
         )
@@ -1176,8 +1193,17 @@ class LiteLLMProvider:
             return enriched
 
     async def get_cost(self, usage: TokenUsage, model: str) -> Cost:
+        model_info = await self.get_model_info(model)
+        input_rate = (model_info.input_cost_per_mtok or 0.0) / 1_000_000
+        output_rate = (model_info.output_cost_per_mtok or 0.0) / 1_000_000
+        input_cost = round(usage.prompt_tokens * input_rate, 6)
+        output_cost = round(usage.completion_tokens * output_rate, 6)
         return Cost(
-            model=model, provider="litellm", total_cost=0.0, input_cost=0.0, output_cost=0.0
+            model=model,
+            provider="litellm",
+            input_cost=input_cost,
+            output_cost=output_cost,
+            total_cost=round(input_cost + output_cost, 6),
         )
 
     async def health(self) -> ProviderHealth:
