@@ -130,6 +130,67 @@ def test_stream_accumulator_handles_multiple_tool_calls() -> None:
     assert tool_calls[1].name == "tool_b"
 
 
+def test_stream_accumulator_retry_restore_deduplicates_replayed_tool_chunks() -> None:
+    acc = StreamAccumulator()
+    acc.feed(
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_retry",
+                                "function": {"name": "step_complete", "arguments": '{"summ'},
+                            }
+                        ],
+                    },
+                }
+            ],
+        }
+    )
+
+    restored = StreamAccumulator()
+    restored.restore_tool_call_state(acc.clone_tool_call_state())
+    restored.feed(
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_retry",
+                                "function": {"name": "step_complete", "arguments": '{"summ'},
+                            }
+                        ],
+                    },
+                }
+            ],
+        }
+    )
+    restored.feed(
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "function": {"arguments": 'ary": "done"}'},
+                            }
+                        ],
+                    },
+                }
+            ],
+        }
+    )
+
+    tool_calls = restored.get_tool_calls()
+    assert len(tool_calls) == 1
+    assert tool_calls[0].arguments == {"summary": "done"}
+
+
 def test_stream_accumulator_handles_empty_chunks() -> None:
     acc = StreamAccumulator()
     result = acc.feed({"choices": []})
@@ -176,6 +237,15 @@ async def test_session_lock_evict() -> None:
     lock.evict("sess_1")
     # No error expected
     lock.evict("nonexistent")
+
+
+@pytest.mark.asyncio
+async def test_session_lock_reports_stale_unlocked_sessions() -> None:
+    lock = SessionLock()
+    await lock.acquire("sess_1")
+    lock.release("sess_1")
+
+    assert lock.stale_unlocked_session_ids(max_idle_seconds=0) == ["sess_1"]
 
 
 # ---------------------------------------------------------------------------

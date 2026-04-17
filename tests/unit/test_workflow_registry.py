@@ -207,6 +207,11 @@ def test_validate_workflow_rejects_gate_without_config() -> None:
         _validate_workflow(workflow)
 
 
+def test_step_definition_rejects_invalid_reasoning_effort() -> None:
+    with pytest.raises(ValueError, match="reasoning_effort must be one of"):
+        StepDefinition(name="plan", type="run", reasoning_effort="medimum")
+
+
 def test_validate_workflow_rejects_unknown_outcome_route_target() -> None:
     workflow = Workflow(
         workflow_id="test:bad-outcome-route",

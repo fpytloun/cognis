@@ -376,7 +376,7 @@ def _build_runtime_handler(
 
         async def local_mcp_handler(
             arguments: dict[str, Any], context: ToolExecutionContext
-        ) -> str:
+        ) -> Any:
             del context
             client = mcp_clients[runtime_mcp_server_key(tool.source)]
             raw_tool_name = tool.source.raw_tool_name or tool.name

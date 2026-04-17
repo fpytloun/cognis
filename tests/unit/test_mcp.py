@@ -10,6 +10,7 @@ import pytest
 from cognis.models.tool import MCPServerConfig, ToolSource, sanitize_mcp_tool_name
 from cognis.tools.mcp import (
     StdioMCPClient,
+    _normalize_call_result,
     _safe_message,
     _strip_empty_optionals,
     mcp_tools_to_definitions,
@@ -103,11 +104,29 @@ async def test_mcp_client_lists_and_calls_tools(tmp_path: Path) -> None:
     await client.close()
 
     assert tools[0]["name"] == "inspect"
-    assert output == "hello\n[image content omitted]"
+    assert output.output == "hello\n[Image attachment available: image_attachment.png]"
+    assert output.attachments is not None
+    assert output.attachments[0]["mime_type"] == "image/png"
 
     definitions = mcp_tools_to_definitions("filesystem", tools, timeout_seconds=2)
     assert definitions[0].name == sanitize_mcp_tool_name("filesystem", "inspect")
     assert definitions[0].source.raw_tool_name == "inspect"
+
+
+def test_normalize_call_result_emits_binary_attachment() -> None:
+    result = _normalize_call_result(
+        {
+            "content": [
+                {"type": "text", "text": "hello"},
+                {"type": "image", "mimeType": "image/png", "data": "YWJj"},
+            ]
+        }
+    )
+
+    assert result.output == "hello"
+    assert result.attachments is not None
+    assert result.attachments[0]["content_b64"] == "YWJj"
+    assert result.attachments[0]["mime_type"] == "image/png"
 
 
 @pytest.mark.asyncio

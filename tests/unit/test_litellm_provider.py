@@ -533,6 +533,39 @@ def test_litellm_provider_count_messages_tokens_falls_back_when_token_counter_fa
     assert count > 0
 
 
+def test_litellm_provider_count_tokens_uses_litellm_for_anthropic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = LiteLLMProvider(object())  # type: ignore[arg-type]
+    captured: dict[str, object] = {}
+
+    def _fake_counter(**kwargs: object) -> int:
+        captured.update(kwargs)
+        return 42
+
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.token_counter", _fake_counter)
+
+    count = provider.count_tokens("hello world", "claude-sonnet-4-20250514")
+
+    assert count == 42
+    assert captured["model"] == "claude-sonnet-4-20250514"
+    assert captured["messages"] == [{"role": "user", "content": "hello world"}]
+
+
+def test_litellm_provider_count_tokens_falls_back_for_gemini_on_counter_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = LiteLLMProvider(object())  # type: ignore[arg-type]
+    monkeypatch.setattr(
+        "cognis.providers.llm.litellm.litellm.token_counter",
+        lambda **_: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    count = provider.count_tokens("hello world", "gemini-2.5-pro")
+
+    assert count == max(1, len("hello world") // 4)
+
+
 @pytest.mark.asyncio
 async def test_litellm_provider_test_provider_sanitizes_errors(
     monkeypatch: pytest.MonkeyPatch, tmp_path: object

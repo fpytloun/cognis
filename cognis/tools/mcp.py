@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import json
+import mimetypes
 import os
 import re
 import threading
@@ -20,7 +22,13 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.client.streamable_http import streamable_http_client
 
 from cognis.logging import get_logger
-from cognis.models.tool import MCPServerConfig, ToolDefinition, ToolSource, sanitize_mcp_tool_name
+from cognis.models.tool import (
+    MCPServerConfig,
+    ToolDefinition,
+    ToolResult,
+    ToolSource,
+    sanitize_mcp_tool_name,
+)
 from cognis.tools.argument_normalization import strip_empty_optional_values
 
 logger = get_logger(__name__)
@@ -67,7 +75,7 @@ class MCPClient(Protocol):
 
     async def list_tools(self) -> list[dict[str, Any]]: ...
 
-    async def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> str: ...
+    async def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> Any: ...
 
     async def close(self, *, suppress_cancelled: bool = False) -> None: ...
 
@@ -194,8 +202,8 @@ class _SessionMCPClient:
         logger.debug("MCP: %s tool names: %s", self.config.name, [t["name"] for t in tools])
         return tools
 
-    async def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> str:
-        """Execute a tool and return the normalized result string."""
+    async def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> Any:
+        """Execute a tool and return the normalized result payload."""
 
         if self._session is None:
             raise RuntimeError("MCP client is not started")
@@ -494,26 +502,47 @@ def _strip_empty_optionals(
     return strip_empty_optional_values(arguments, schema)
 
 
-def _normalize_call_result(result: Any) -> str:
-    """Normalize a CallToolResult from the MCP SDK into a string."""
+def _normalize_call_result(result: Any) -> ToolResult:
+    """Normalize a CallToolResult from the MCP SDK into a ToolResult.
+
+    Text blocks are preserved in ``output``. Binary/image/resource blocks are
+    surfaced as inline attachments so the normal artifact-materialization path
+    can persist them and expose them back to the model as attachment context.
+    """
     content = getattr(result, "content", None)
     if isinstance(content, list):
         parts: list[str] = []
+        attachments: list[dict[str, Any]] = []
         for item in content:
-            item_type = getattr(item, "type", None)
+            item_type = _item_value(item, "type")
             if item_type == "text":
                 parts.append(str(getattr(item, "text", "")))
             elif item_type == "image":
-                parts.append("[image content omitted]")
+                attachment = _mcp_content_attachment(item, default_prefix="image")
+                if attachment is not None:
+                    attachments.append(attachment)
+                    parts.append(f"[Image attachment available: {attachment['filename']}]")
+                else:
+                    parts.append("[image content unavailable]")
             elif item_type == "resource":
-                parts.append("[resource content omitted]")
+                attachment = _mcp_content_attachment(item, default_prefix="resource")
+                if attachment is not None:
+                    attachments.append(attachment)
+                    parts.append(f"[Resource attachment available: {attachment['filename']}]")
+                else:
+                    resource_text = _mcp_resource_text(item)
+                    if resource_text:
+                        parts.append(resource_text)
+                    else:
+                        parts.append("[resource content unavailable]")
             else:
                 try:
                     parts.append(json.dumps(item, sort_keys=True, default=str))
                 except Exception:
                     parts.append(str(item))
-        if parts:
-            return "\n".join(parts)
+        if parts or attachments:
+            output = "\n".join(parts) if parts else "[Binary MCP content attached]"
+            return ToolResult(output=output, attachments=attachments or None)
     # Fallback: try dict-style access (older SDK versions)
     if isinstance(result, dict):
         raw_content = result.get("content")
@@ -523,9 +552,81 @@ def _normalize_call_result(result: Any) -> str:
                 for item in raw_content
                 if isinstance(item, dict) and item.get("type") == "text"
             ]
-            if texts:
-                return "\n".join(texts)
-    return str(result)
+            attachments = [
+                attachment
+                for attachment in (
+                    _mcp_content_attachment(
+                        item, default_prefix=str(item.get("type") or "attachment")
+                    )
+                    for item in raw_content
+                    if isinstance(item, dict) and item.get("type") in {"image", "resource"}
+                )
+                if attachment is not None
+            ]
+            if texts or attachments:
+                output = "\n".join(texts) if texts else "[Binary MCP content attached]"
+                return ToolResult(output=output, attachments=attachments or None)
+    return ToolResult(output=str(result))
+
+
+def _mcp_content_attachment(item: Any, *, default_prefix: str) -> dict[str, Any] | None:
+    """Convert an MCP image/resource block to an inline attachment."""
+    content_b64 = _coerce_attachment_payload(item)
+    if content_b64 is None:
+        return None
+    mime_type = _coerce_mime_type(item, default_prefix=default_prefix)
+    filename = _coerce_filename(item, mime_type=mime_type, default_prefix=default_prefix)
+    return {
+        "content_b64": content_b64,
+        "mime_type": mime_type,
+        "filename": filename,
+        "purpose": "mcp_tool_result",
+    }
+
+
+def _coerce_attachment_payload(item: Any) -> str | None:
+    for key in ("data", "blob", "content_b64", "base64"):
+        value = _item_value(item, key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if isinstance(value, (bytes, bytearray)) and value:
+            return base64.b64encode(bytes(value)).decode("ascii")
+    return None
+
+
+def _coerce_mime_type(item: Any, *, default_prefix: str) -> str:
+    mime_type = _item_value(item, "mimeType") or _item_value(item, "mime_type")
+    if isinstance(mime_type, str) and mime_type.strip():
+        return mime_type.strip()
+    return "image/png" if default_prefix == "image" else "application/octet-stream"
+
+
+def _coerce_filename(item: Any, *, mime_type: str, default_prefix: str) -> str:
+    raw_name = (
+        _item_value(item, "filename")
+        or _item_value(item, "name")
+        or _item_value(item, "title")
+        or _item_value(item, "uri")
+    )
+    if isinstance(raw_name, str) and raw_name.strip():
+        candidate = raw_name.strip().rsplit("/", 1)[-1]
+        if candidate:
+            return candidate
+    extension = mimetypes.guess_extension(mime_type) or ""
+    return f"{default_prefix}_attachment{extension}"
+
+
+def _mcp_resource_text(item: Any) -> str:
+    value = _item_value(item, "text")
+    if isinstance(value, str) and value.strip():
+        return value
+    return ""
+
+
+def _item_value(item: Any, key: str) -> Any:
+    if isinstance(item, dict):
+        return item.get(key)
+    return getattr(item, key, None)
 
 
 def _safe_message(message: str, *, limit: int = _MAX_SAFE_STDERR_LENGTH) -> str:

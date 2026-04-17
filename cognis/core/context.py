@@ -1425,6 +1425,8 @@ def events_to_messages(events: list[Any]) -> list[dict[str, Any]]:
                         "role": "tool",
                         "tool_call_id": call_id,
                         "content": output,
+                        "_tool_name": event_data.get("name"),
+                        "_protected_tool_output": bool(event_data.get("protect_from_pruning")),
                     }
                 )
         elif event_type == "delegation":
@@ -1800,7 +1802,6 @@ _MCP_MEMORY_TOOL_ALIASES: tuple[tuple[str, str], ...] = (
     ("list_artifacts", "memory_list_artifacts"),
     ("get_artifact", "memory_get_artifact"),
 )
-_NONEXISTENT_MEMORY_TOOLS: tuple[str, ...] = ("initialize_memory", "get_core_memories")
 
 
 def _adapt_memory_instructions(instructions: str) -> str:
@@ -1821,7 +1822,32 @@ def _adapt_memory_instructions(instructions: str) -> str:
         for mcp_name, cognis_name in _MCP_MEMORY_TOOL_ALIASES
         if cognis_name in MEMORY_TOOL_NAMES
     ]
-    for name in _NONEXISTENT_MEMORY_TOOLS:
+    available_names = {name for name, _ in available_aliases}
+    known_cognis_names = set(MEMORY_TOOL_NAMES)
+    candidate_names = {
+        match.group(0)
+        for match in re.finditer(r"\b[a-z][a-z0-9_]{2,}\b", instructions)
+        if match.group(0).startswith(
+            (
+                "get_",
+                "search_",
+                "find_",
+                "ask_",
+                "add_",
+                "update_",
+                "delete_",
+                "list_",
+                "save_",
+                "initialize_",
+            )
+        )
+    }
+    unavailable_names = sorted(
+        name
+        for name in candidate_names
+        if name not in available_names and name not in known_cognis_names
+    )
+    for name in unavailable_names:
         pattern = re.compile(rf"\b{re.escape(name)}\b")
         text = pattern.sub(f"{name} (not available)", text)
     for mcp_name, cognis_name in available_aliases:

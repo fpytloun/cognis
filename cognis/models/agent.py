@@ -6,9 +6,10 @@ from datetime import datetime
 from fnmatch import fnmatchcase
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from cognis.logging import get_logger
+from cognis.models.config import NORMALIZED_REASONING_LEVELS
 from cognis.models.tool import Permission
 
 logger = get_logger(__name__)
@@ -119,6 +120,22 @@ class AgentLLMConfig(BaseModel):
     max_tokens: int | None = None
     reasoning_effort: str | None = None
     model_routing: dict[str, str] | None = None
+
+    @field_validator("reasoning_effort")
+    @classmethod
+    def _validate_reasoning_effort(cls, value: str | None) -> str | None:
+        """Reject reasoning_effort values outside the normalised set."""
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("reasoning_effort must be a string or null")
+        normalized = value.strip().lower()
+        if not normalized:
+            return None
+        if normalized not in NORMALIZED_REASONING_LEVELS:
+            allowed = ", ".join(NORMALIZED_REASONING_LEVELS)
+            raise ValueError(f"reasoning_effort must be one of {allowed}; got {value!r}")
+        return normalized
 
 
 def _matches_any(tool_name: str, patterns: list[str] | None) -> bool:

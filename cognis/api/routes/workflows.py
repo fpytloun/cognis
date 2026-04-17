@@ -18,6 +18,7 @@ from cognis.core.workflow_management import (
     duplicate_visible_workflow,
     update_user_workflow,
 )
+from cognis.models.config import NORMALIZED_REASONING_LEVELS
 from cognis.store.queries import (
     delete_system_workflow_override,
     get_system_workflow_override,
@@ -161,7 +162,19 @@ async def _update_system_workflow_route(
         override: dict[str, object] = {}
         reasoning_effort = step_payload.get("reasoning_effort")
         if isinstance(reasoning_effort, str) and reasoning_effort:
-            override["reasoning_effort"] = reasoning_effort
+            normalized_effort = reasoning_effort.strip().lower()
+            if normalized_effort and normalized_effort not in NORMALIZED_REASONING_LEVELS:
+                allowed = ", ".join(NORMALIZED_REASONING_LEVELS)
+                raise api_exception(
+                    status_code=422,
+                    code="invalid_reasoning_effort",
+                    message=(
+                        f"Step {step_name!r} reasoning_effort must be one of "
+                        f"{allowed}; got {reasoning_effort!r}."
+                    ),
+                )
+            if normalized_effort:
+                override["reasoning_effort"] = normalized_effort
         completion = step_payload.get("completion")
         if isinstance(completion, dict):
             max_attempts = completion.get("max_attempts")

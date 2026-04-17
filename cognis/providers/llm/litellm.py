@@ -96,6 +96,14 @@ LLM_CACHE_CONTROL_APPLIED_TOTAL = Counter(
     "Anthropic-style cache_control hints applied to immutable prompt prefix.",
     labelnames=("gated_by",),
 )
+LLM_TOKENIZER_USED_TOTAL = Counter(
+    "cognis_tokenizer_used_total",
+    "Tokenizer backend used for model token estimation.",
+    labelnames=("provider", "backend"),
+)
+
+
+_GEMINI_MODEL_PATTERNS = re.compile(r"(gemini|vertex_ai|google)", re.IGNORECASE)
 
 
 def _supports_image_response_format(model: str) -> bool:
@@ -277,6 +285,25 @@ class LiteLLMProvider:
         self._model_info_cache: dict[str, tuple[ModelInfo, float]] = {}
         self._model_provider_cache: dict[str, tuple[str | None, float]] = {}
         self._proxy_model_info_cache: dict[str, tuple[dict[str, dict[str, Any]], float]] = {}
+        self._tokenizer_backend_cache: dict[str, tuple[str, str]] = {}
+
+    @staticmethod
+    def _tokenizer_family(model: str) -> str:
+        normalized = model.rsplit("/", 1)[-1].lower()
+        if _ANTHROPIC_MODEL_PATTERNS.search(normalized):
+            return "anthropic"
+        if _GEMINI_MODEL_PATTERNS.search(normalized):
+            return "gemini"
+        if normalized.startswith(("gpt-", "o1", "o3", "o4")) or "openai" in normalized:
+            return "openai"
+        return "unknown"
+
+    def _record_tokenizer_backend(self, model: str, family: str, backend: str) -> None:
+        cached = self._tokenizer_backend_cache.get(model)
+        if cached == (family, backend):
+            return
+        self._tokenizer_backend_cache[model] = (family, backend)
+        LLM_TOKENIZER_USED_TOTAL.labels(provider=family, backend=backend).inc()
 
     async def resolve_model(
         self,
@@ -1031,13 +1058,24 @@ class LiteLLMProvider:
             yield {"error": str(exc), "mid_stream_failure": True}
 
     def count_tokens(self, text: str, model: str) -> int:
+        family = self._tokenizer_family(model)
         try:
-            import tiktoken
+            if family == "openai":
+                import tiktoken
 
-            encoding = tiktoken.encoding_for_model(model)
-            return len(encoding.encode(text))
+                encoding = tiktoken.encoding_for_model(model)
+                count = len(encoding.encode(text))
+                self._record_tokenizer_backend(model, family, "tiktoken")
+                return count
+            if family in {"anthropic", "gemini"}:
+                messages = [{"role": "user", "content": text}]
+                count = int(litellm.token_counter(model=model, messages=messages))
+                self._record_tokenizer_backend(model, family, "litellm_native")
+                return count
         except Exception:
-            return max(1, len(text) // 4)
+            pass
+        self._record_tokenizer_backend(model, family, "chars_div_4")
+        return max(1, len(text) // 4)
 
     def count_messages_tokens(self, messages: list[dict[str, Any]], model: str) -> int:
         try:

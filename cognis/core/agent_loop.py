@@ -18,6 +18,7 @@ import uuid
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from time import monotonic
 from typing import Any
 
 from prometheus_client import Counter, Histogram
@@ -178,6 +179,11 @@ HARNESS_GUARD_TRIPS = Counter(
 STEP_COMPLETE_REJECTIONS = Counter(
     "cognis_step_complete_rejections_total",
     "step_complete calls rejected by the controller",
+    labelnames=("reason",),
+)
+SESSION_LOCKS_EVICTED_TOTAL = Counter(
+    "cognis_session_locks_evicted_total",
+    "SessionLock entries evicted from the per-session lock map.",
     labelnames=("reason",),
 )
 AUTO_COMPACTION_DURATION = Histogram(
@@ -443,6 +449,7 @@ def _append_tool_result_event(
     is_error: bool,
     duration_ms: int | None = None,
     tool_id: str | None = None,
+    protect_from_pruning: bool = False,
 ) -> None:
     """Record a tool_result event to the Intaris event batch.
 
@@ -465,6 +472,7 @@ def _append_tool_result_event(
                 "result": truncated,
                 "output_size": len(output),
                 "has_full_output": False,
+                "protect_from_pruning": protect_from_pruning,
             },
         )
     )
@@ -600,6 +608,14 @@ class StreamAccumulator:
         self.usage: dict[str, int] | None = None
         self.finish_reason: str = "stop"
 
+    def clone_tool_call_state(self) -> dict[int, dict[str, Any]]:
+        """Return a shallow copy of the accumulated tool-call state."""
+        return {idx: dict(entry) for idx, entry in self.tool_calls.items()}
+
+    def restore_tool_call_state(self, state: dict[int, dict[str, Any]] | None) -> None:
+        """Restore accumulated tool-call state from a previous attempt."""
+        self.tool_calls = {idx: dict(entry) for idx, entry in (state or {}).items()}
+
     def feed(self, chunk: dict[str, Any]) -> str | None:
         """Feed a stream chunk. Returns text delta if present."""
         choices = chunk.get("choices")
@@ -642,7 +658,17 @@ class StreamAccumulator:
                 if func.get("name"):
                     entry["name"] = func["name"]
                 if func.get("arguments"):
-                    entry["arguments"] += func["arguments"]
+                    incoming_arguments = func["arguments"]
+                    existing_arguments = entry["arguments"]
+                    # Mid-stream retries may restart the same tool-call delta
+                    # from the beginning. Prefer the longer shared prefix over
+                    # blindly concatenating duplicate chunks.
+                    if existing_arguments.startswith(incoming_arguments):
+                        pass
+                    elif incoming_arguments.startswith(existing_arguments):
+                        entry["arguments"] = incoming_arguments
+                    else:
+                        entry["arguments"] += incoming_arguments
                     if len(entry["arguments"]) > _MAX_TOOL_CALL_ARGUMENT_CHARS:
                         raise ValueError(
                             f"Tool call arguments exceeded {_MAX_TOOL_CALL_ARGUMENT_CHARS} characters"
@@ -809,6 +835,7 @@ class SessionLock:
 
     def __init__(self) -> None:
         self._locks: dict[str, asyncio.Lock] = {}
+        self._last_touched: dict[str, float] = {}
         self._meta_lock = asyncio.Lock()
 
     async def acquire(self, session_id: str) -> asyncio.Lock:
@@ -817,6 +844,7 @@ class SessionLock:
             if session_id not in self._locks:
                 self._locks[session_id] = asyncio.Lock()
             lock = self._locks[session_id]
+            self._last_touched[session_id] = monotonic()
         await lock.acquire()
         return lock
 
@@ -825,10 +853,26 @@ class SessionLock:
         lock = self._locks.get(session_id)
         if lock and lock.locked():
             lock.release()
+        self._last_touched[session_id] = monotonic()
 
-    def evict(self, session_id: str) -> None:
+    def evict(self, session_id: str, *, reason: str = "close_session") -> None:
         """Remove a session's lock entry."""
-        self._locks.pop(session_id, None)
+        removed = self._locks.pop(session_id, None)
+        self._last_touched.pop(session_id, None)
+        if removed is not None:
+            SESSION_LOCKS_EVICTED_TOTAL.labels(reason=reason).inc()
+
+    def stale_unlocked_session_ids(self, *, max_idle_seconds: float) -> list[str]:
+        """Return unlocked session ids idle longer than ``max_idle_seconds``."""
+        now = monotonic()
+        stale: list[str] = []
+        for session_id, lock in self._locks.items():
+            if lock.locked():
+                continue
+            last_touched = self._last_touched.get(session_id, now)
+            if now - last_touched >= max_idle_seconds:
+                stale.append(session_id)
+        return stale
 
 
 # ---------------------------------------------------------------------------
@@ -1809,6 +1853,7 @@ class AgentLoop:
         step_reprompt_count = 0
         mid_stream_retries = 0
         _MAX_MID_STREAM_RETRIES = 2
+        saved_partial_tool_calls: dict[int, dict[str, Any]] | None = None
         discovered_tool_ids = self._get_initial_discovered_tool_ids(ctx)
         collected_attachments: list[dict[str, Any]] = []
         continued_assistant_content = ""
@@ -1913,6 +1958,8 @@ class AgentLoop:
 
             # Stream LLM response
             accumulator = StreamAccumulator()
+            if mid_stream_retries > 0:
+                accumulator.restore_tool_call_state(saved_partial_tool_calls)
             mid_stream_error: str | None = None
             async for chunk in self.providers.llm.stream_generate(
                 messages,
@@ -1932,6 +1979,7 @@ class AgentLoop:
 
             if mid_stream_error:
                 if mid_stream_retries < _MAX_MID_STREAM_RETRIES:
+                    saved_partial_tool_calls = accumulator.clone_tool_call_state()
                     mid_stream_retries += 1
                     logger.warning(
                         "agent: mid-stream failure, retrying LLM call (%d/%d)",
@@ -1946,32 +1994,21 @@ class AgentLoop:
                     )
                     # Retry is transparent to the user — no visible message.
                     await asyncio.sleep(1.0 * mid_stream_retries)
-                    continue  # retry — messages is clean, accumulator is fresh next iteration
+                    continue  # retry — keep partial tool-call state, drop partial text
 
-                # Retries exhausted — capture partial content (if any) and
-                # record a lifecycle event so the failure appears as a system
-                # message in the UI, not as assistant text.
+                # Retries exhausted — do not record partial assistant text.
+                # Partial free text pollutes history more than it helps.
                 partial_content = accumulator.get_content()
-                if partial_content or collected_attachments:
+                if partial_content:
                     events_to_record.append(
                         SessionEvent(
-                            type="assistant_message",
+                            type="lifecycle",
                             data={
-                                "content": partial_content,
-                                "attachments": strip_attachment_payload_bytes(
-                                    collected_attachments
-                                ),
+                                "event": "assistant_message_aborted",
+                                "partial_length": len(partial_content),
                             },
                         )
                     )
-                    if partial_content:
-                        assistant_content_parts.append(partial_content)
-                    memory_text = merge_content_and_attachment_note(
-                        partial_content,
-                        strip_attachment_payload_bytes(collected_attachments),
-                    )
-                    if memory_text.strip():
-                        assistant_memory_parts.append(memory_text)
 
                 logger.warning(
                     "agent: mid-stream failure after retries exhausted",
@@ -2004,6 +2041,7 @@ class AgentLoop:
                 break  # Exit while loop → _finalize_step runs normally
 
             finish_reason = accumulator.finish_reason
+            saved_partial_tool_calls = None
             content = continued_assistant_content + accumulator.get_content()
             tool_calls = accumulator.get_tool_calls()
             if continuation_reminder_index is not None and continuation_reminder_index < len(
@@ -5291,6 +5329,9 @@ class AgentLoop:
                     "output_size": original_size or len(result.output),
                     "has_full_output": has_saved_output,
                     "evaluation": eval_meta,
+                    "protect_from_pruning": bool(
+                        result.metadata and result.metadata.get("protected_context")
+                    ),
                 },
             )
         )
@@ -5321,6 +5362,10 @@ class AgentLoop:
                 "role": "tool",
                 "tool_call_id": tc.call_id,
                 "content": result.output,
+                "_tool_name": tc.name,
+                "_protected_tool_output": bool(
+                    result.metadata and result.metadata.get("protected_context")
+                ),
             }
         )
         attachment_context = self._build_tool_attachment_context(ctx, tc, result.attachments)

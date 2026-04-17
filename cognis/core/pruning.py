@@ -60,6 +60,8 @@ def prune_tool_outputs(
         msg = result[i]
         if msg.get("role") != "tool":
             continue
+        if msg.get("_protected_tool_output"):
+            continue
         content = msg.get("content", "")
         tokens = count(content) if isinstance(content, str) else 0
         if protected_tokens + tokens <= protect_tokens:

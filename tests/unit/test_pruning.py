@@ -184,3 +184,21 @@ def test_tool_attachment_context_pruned_with_matching_tool_result() -> None:
     assert "Tool result cleared" in result[1]["content"]
     assert result[2]["role"] == "system"
     assert "Tool attachment context cleared" in result[2]["content"]
+
+
+def test_protected_tool_outputs_are_not_pruned() -> None:
+    big = "x" * 200_000
+    messages = [
+        {
+            "role": "tool",
+            "tool_call_id": "skill_1",
+            "content": big,
+            "_protected_tool_output": True,
+        },
+        _tool_result("c2", "recent"),
+    ]
+
+    result = prune_tool_outputs(messages, protect_tokens=10, minimum_savings=100)
+
+    assert result[0]["content"] == big
+    assert result[1]["content"] == "recent"

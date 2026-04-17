@@ -18,11 +18,24 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
+from prometheus_client import Counter
 from pydantic import BaseModel
 
 from cognis.logging import get_logger
 
 logger = get_logger(__name__)
+
+_EVENT_SUBSCRIBER_ERRORS_TOTAL = Counter(
+    "cognis_event_subscriber_errors_total",
+    "Errors raised by EventBus subscribers.",
+    labelnames=("subscriber_type",),
+)
+_EVENT_SUBSCRIBERS_AUTO_REMOVED_TOTAL = Counter(
+    "cognis_event_subscribers_auto_removed_total",
+    "EventBus subscribers removed after repeated failures.",
+    labelnames=("subscriber_type", "reason"),
+)
+_MAX_SUBSCRIBER_ERRORS = 5
 
 # Type alias for async event handlers.
 EventHandler = Callable[["Event"], Coroutine[Any, Any, None]]
@@ -108,6 +121,7 @@ class EventBus:
     def __init__(self) -> None:
         self._handlers: dict[EventType, list[EventHandler]] = defaultdict(list)
         self._global_handlers: list[EventHandler] = []
+        self._handler_error_counts: dict[int, int] = {}
 
     def subscribe(self, event_type: EventType, handler: EventHandler) -> None:
         """Register a handler for a specific event type."""
@@ -123,6 +137,16 @@ class EventBus:
         if handlers:
             with contextlib.suppress(ValueError):
                 handlers.remove(handler)
+        self._handler_error_counts.pop(id(handler), None)
+
+    def unsubscribe_all(self, handler: EventHandler) -> None:
+        """Remove a handler from all subscriptions."""
+        for handlers in self._handlers.values():
+            with contextlib.suppress(ValueError):
+                handlers.remove(handler)
+        with contextlib.suppress(ValueError):
+            self._global_handlers.remove(handler)
+        self._handler_error_counts.pop(id(handler), None)
 
     async def publish(self, event: Event) -> None:
         """Publish an event to all matching handlers.
@@ -140,11 +164,43 @@ class EventBus:
             return_exceptions=True,
         )
         for i, result in enumerate(results):
-            if isinstance(result, Exception):
+            handler = handlers[i]
+            handler_id = id(handler)
+            subscriber_type = _subscriber_type(handler)
+            if result is True:
+                self._handler_error_counts.pop(handler_id, None)
+                continue
+            if isinstance(result, Exception) or result is False:
+                failures = self._handler_error_counts.get(handler_id, 0) + 1
+                self._handler_error_counts[handler_id] = failures
+                _EVENT_SUBSCRIBER_ERRORS_TOTAL.labels(subscriber_type=subscriber_type).inc()
                 logger.warning(
                     "Event handler error",
-                    extra={"extra_data": {"event_type": event.type, "handler_index": i}},
+                    extra={
+                        "extra_data": {
+                            "event_type": event.type,
+                            "handler_index": i,
+                            "consecutive_errors": failures,
+                            "subscriber_type": subscriber_type,
+                        }
+                    },
                 )
+                if failures >= _MAX_SUBSCRIBER_ERRORS:
+                    self.unsubscribe_all(handler)
+                    _EVENT_SUBSCRIBERS_AUTO_REMOVED_TOTAL.labels(
+                        subscriber_type=subscriber_type,
+                        reason="consecutive_errors",
+                    ).inc()
+                    logger.warning(
+                        "Event handler auto-removed after repeated failures",
+                        extra={
+                            "extra_data": {
+                                "event_type": event.type,
+                                "subscriber_type": subscriber_type,
+                                "consecutive_errors": failures,
+                            }
+                        },
+                    )
 
     def handler_count(self, event_type: EventType | None = None) -> int:
         """Return the number of registered handlers."""
@@ -154,12 +210,25 @@ class EventBus:
         return len(self._handlers.get(event_type, [])) + len(self._global_handlers)
 
 
-async def _safe_call(handler: EventHandler, event: Event) -> None:
+def _subscriber_type(handler: EventHandler) -> str:
+    """Best-effort label for metrics and logs."""
+    subscriber_type = getattr(handler, "__subscriber_type__", None)
+    if isinstance(subscriber_type, str) and subscriber_type.strip():
+        return subscriber_type.strip().lower()
+    bound_self = getattr(handler, "__self__", None)
+    if bound_self is not None:
+        return type(bound_self).__name__.lower()
+    return getattr(handler, "__name__", "function").lower()
+
+
+async def _safe_call(handler: EventHandler, event: Event) -> bool:
     """Call a handler, catching all exceptions."""
     try:
         await handler(event)
+        return True
     except Exception:
         logger.exception(
             "Event handler raised exception",
             extra={"extra_data": {"event_type": event.type}},
         )
+        return False

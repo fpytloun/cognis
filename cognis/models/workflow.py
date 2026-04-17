@@ -8,6 +8,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from cognis.models.config import NORMALIZED_REASONING_LEVELS
+
 
 class InteractionMode(BaseModel):
     """Controls whether steps can dynamically request caller input."""
@@ -193,6 +195,27 @@ class StepDefinition(BaseModel):
     gate: GateConfig | None = None
     on_reject: OnRejectConfig | None = None
     outcome_routes: list[OutcomeRoute] = Field(default_factory=list)
+
+    @field_validator("reasoning_effort")
+    @classmethod
+    def _validate_reasoning_effort(cls, value: str | None) -> str | None:
+        """Reject reasoning_effort values outside the normalised set.
+
+        Silent typos (e.g. ``"medimum"``) would otherwise be dropped at the
+        provider layer with no signal to the author. Raise early at load
+        time so workflow edits fail loudly.
+        """
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("reasoning_effort must be a string or null")
+        normalized = value.strip().lower()
+        if not normalized:
+            return None
+        if normalized not in NORMALIZED_REASONING_LEVELS:
+            allowed = ", ".join(NORMALIZED_REASONING_LEVELS)
+            raise ValueError(f"reasoning_effort must be one of {allowed}; got {value!r}")
+        return normalized
 
     @field_validator("input", mode="before")
     @classmethod

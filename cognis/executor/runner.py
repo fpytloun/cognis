@@ -1069,7 +1069,7 @@ class ExecutorRunner:
         return discovered
 
     def _build_mcp_handler(self, tool: ToolDefinition) -> Any:
-        async def _handler(arguments: dict[str, Any], _: Any) -> str:
+        async def _handler(arguments: dict[str, Any], _: Any) -> Any:
             client = self._mcp_clients[runtime_mcp_server_key(tool.source)]
             raw_tool_name = tool.source.raw_tool_name or tool.name
             return await client.call_tool(raw_tool_name, arguments)

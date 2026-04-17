@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import secrets
 import sys
@@ -196,6 +197,7 @@ def create_app() -> FastAPI:
         event_bus = EventBus()
         pause_waiter = PauseWaiter()
         session_lock = SessionLock()
+        session_lock_sweeper_task: asyncio.Task[None] | None = None
         session_cache = SessionCache(
             providers.guardrails,
             max_entries=cache_max_entries,
@@ -519,8 +521,24 @@ def create_app() -> FastAPI:
 
         await channel_delivery.start()
 
+        async def _session_lock_sweeper() -> None:
+            interval_seconds = 900.0
+            idle_seconds = 900.0
+            while True:
+                await asyncio.sleep(interval_seconds)
+                for session_id in session_lock.stale_unlocked_session_ids(
+                    max_idle_seconds=idle_seconds
+                ):
+                    session_lock.evict(session_id, reason="sweeper")
+
+        session_lock_sweeper_task = asyncio.create_task(_session_lock_sweeper())
+
         yield
 
+        if session_lock_sweeper_task is not None:
+            session_lock_sweeper_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await session_lock_sweeper_task
         await artifact_maintenance.stop()
         await channel_delivery.stop()
         await channel_manager.stop_all()

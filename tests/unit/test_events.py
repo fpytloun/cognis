@@ -100,3 +100,24 @@ def test_event_bus_handler_count() -> None:
 
     assert bus.handler_count(EventType.TASK_CREATED) == 2  # h1 + global h1
     assert bus.handler_count() == 3  # h1 + h2 + global h1
+
+
+@pytest.mark.asyncio
+async def test_event_bus_auto_removes_repeatedly_failing_handler() -> None:
+    bus = EventBus()
+    good_received: list[Event] = []
+
+    async def bad_handler(event: Event) -> None:
+        raise RuntimeError(f"boom {event.type}")
+
+    async def good_handler(event: Event) -> None:
+        good_received.append(event)
+
+    bus.subscribe(EventType.TASK_CREATED, bad_handler)
+    bus.subscribe(EventType.TASK_CREATED, good_handler)
+
+    for _ in range(6):
+        await bus.publish(Event(type=EventType.TASK_CREATED, data={}))
+
+    assert len(good_received) == 6
+    assert bus.handler_count(EventType.TASK_CREATED) == 1
