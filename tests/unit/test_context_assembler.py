@@ -14,6 +14,7 @@ from cognis.core.followups import (
     FollowUpStatus,
     TaskResultFollowUp,
 )
+from cognis.core.immutable_prefix import ImmutablePrefixEntry
 from cognis.core.prompts import PromptContext
 from cognis.core.runtime import ExecutorEnvironmentSnapshot
 from cognis.models.agent import AgentDefinition, AgentLLMConfig
@@ -36,8 +37,9 @@ class _SessionCache:
         self.cold = cold
         self.entry = None if cold else _CacheEntry()
         self.refresh_calls = 0
-        self._cached_instructions: str | None = None
-        self._cached_core: str | None = None
+        self.prefix_entries: list[ImmutablePrefixEntry] = []
+        self.prefix_repair_needed = False
+        self.last_repair_attempt_at: float | None = None
 
     async def refresh(self, session: SessionModel) -> object:
         del session
@@ -65,31 +67,59 @@ class _SessionCache:
         del session_id, types
         return []
 
-    def get_cached_memory(
-        self, session_id: str, ttl_seconds: float = 1800.0
-    ) -> tuple[str | None, str | None, bool]:
-        del session_id, ttl_seconds
-        if self._cached_instructions is not None or self._cached_core is not None:
-            return self._cached_instructions, self._cached_core, True
-        return None, None, False
-
-    def get_cached_memory_details(
-        self, session_id: str, ttl_seconds: float = 1800.0
-    ) -> tuple[str | None, str | None, bool, bool]:
-        del session_id, ttl_seconds
-        if self._cached_instructions is not None or self._cached_core is not None:
-            return self._cached_instructions, self._cached_core, True, True
-        return None, None, False, False
-
-    async def cache_memory(
-        self, session_id: str, instructions: str | None, core_memories: str | None
-    ) -> None:
+    def get_prefix_entries(self, session_id: str) -> list[ImmutablePrefixEntry]:
         del session_id
-        # Merge semantics: None means "not returned", preserve existing.
-        if instructions is not None:
-            self._cached_instructions = instructions
-        if core_memories is not None:
-            self._cached_core = core_memories
+        return list(self.prefix_entries)
+
+    def needs_prefix_repair(self, session_id: str) -> bool:
+        del session_id
+        return self.prefix_repair_needed
+
+    def get_last_repair_attempt_at(self, session_id: str) -> float | None:
+        del session_id
+        return self.last_repair_attempt_at
+
+    async def note_repair_attempt(self, session_id: str) -> None:
+        del session_id
+        self.last_repair_attempt_at = monotonic()
+
+    async def append_recorded_events(
+        self, session: SessionModel, events: list, result: object
+    ) -> None:
+        del session
+        seq = int(getattr(result, "first_seq", 0))
+        for event in events:
+            if event.type not in {"system_message", "developer_message"}:
+                continue
+            self.prefix_entries.append(
+                ImmutablePrefixEntry(
+                    role=str(event.data.get("role") or "developer"),
+                    source=str(event.data.get("source") or ""),
+                    content=str(event.data.get("content") or ""),
+                    seq=seq,
+                )
+            )
+            seq += 1
+
+    async def store_prefix_snapshot(
+        self,
+        session_id: str,
+        entries: list[ImmutablePrefixEntry],
+        *,
+        snapshot_seq: int,
+        snapshot_source: str,
+    ) -> None:
+        del session_id, snapshot_seq, snapshot_source
+        self.prefix_entries = list(entries)
+        self.prefix_repair_needed = False
+
+    async def mark_prefix_repair_needed(self, session_id: str) -> None:
+        del session_id
+        self.prefix_repair_needed = True
+
+    def get_compaction_summary(self, session_id: str) -> str | None:
+        del session_id
+        return "summary"
 
     def get_model_override(self, session_id: str) -> str | None:
         del session_id
@@ -105,6 +135,14 @@ class _Memory:
     def __init__(self, fail: bool = False) -> None:
         self.fail = fail
         self.search_modes: list[str] = []
+
+    async def load_session_identity(self, **kwargs: object) -> dict[str, object]:
+        del kwargs
+        return {
+            "session_id": "mem-1",
+            "instructions": "Use memory tools carefully.",
+            "core_memories": "prefers Python",
+        }
 
     async def recall(self, **kwargs: object) -> dict[str, object]:
         self.search_modes.append(str(kwargs["search_mode"]))
@@ -126,6 +164,19 @@ class _Guardrails:
             "IntarisSession",
             (),
             {"intention": "fresh intention", "title": None, "updated_at": None},
+        )()
+
+    async def record_events(self, **kwargs: object) -> object:
+        events = list(kwargs.get("events", []))
+        return type(
+            "AppendResult",
+            (),
+            {
+                "ok": True,
+                "count": len(events),
+                "first_seq": 1,
+                "last_seq": len(events),
+            },
         )()
 
 
@@ -249,7 +300,7 @@ async def test_context_assembler_runs_fetches_in_parallel_and_attaches_memory_se
     elapsed = monotonic() - started_at
 
     assert elapsed < 0.25
-    assert memory.search_modes == ["find"]
+    assert memory.search_modes == ["search"]
     assert session_manager.attached == [("session-1", "mem-1")]
     assert any('trust="untrusted"' in str(message["content"]) for message in result.messages)
 
@@ -593,12 +644,18 @@ async def test_context_assembler_includes_composed_identity_prompt() -> None:
 @pytest.mark.asyncio
 async def test_context_assembler_consolidates_immutable_prefix_into_first_message() -> None:
     class _MemoryWithInstructions:
-        async def recall(self, **kwargs: object) -> dict[str, object]:
+        async def load_session_identity(self, **kwargs: object) -> dict[str, object]:
             del kwargs
             return {
                 "session_id": "mem-1",
                 "instructions": "Use remember tool to store durable facts.",
                 "core_memories": "Prefers Python and pytest.",
+            }
+
+        async def recall(self, **kwargs: object) -> dict[str, object]:
+            del kwargs
+            return {
+                "session_id": "mem-1",
                 "search_results": [{"memory": "Mutable recalled memory", "score": 0.9}],
             }
 
@@ -693,35 +750,33 @@ async def test_context_assembler_skip_memory_path_uses_consolidated_immutable_pr
 
 
 @pytest.mark.asyncio
-async def test_context_assembler_preserves_core_memories_on_partial_refresh() -> None:
-    """When Mnemory returns instructions but not core_memories (e.g. TTL
-    refresh on a subsequent call), the previously cached core_memories
-    must survive — they are part of the immutable prefix.
-    """
+async def test_context_assembler_ignores_per_turn_identity_fields_after_bootstrap() -> None:
+    """Per-turn recall must not mutate the immutable prefix after bootstrap."""
 
     call_count = 0
 
     class _PartialMemory:
-        """First call returns both; second returns only instructions."""
+        """Bootstrap identity stays fixed even if per-turn recall disagrees later."""
 
         search_modes: list[str] = []
+
+        async def load_session_identity(self, **kwargs: object) -> dict[str, object]:
+            del kwargs
+            return {
+                "session_id": "mem-1",
+                "instructions": "Use remember tool to store facts.",
+                "core_memories": "## Agent Identity\n- I am a helpful assistant",
+            }
 
         async def recall(self, **kwargs: object) -> dict[str, object]:
             nonlocal call_count
             call_count += 1
             self.search_modes.append(str(kwargs["search_mode"]))
             await asyncio.sleep(0.01)
-            if call_count == 1:
-                return {
-                    "session_id": "mem-1",
-                    "instructions": "Use remember tool to store facts.",
-                    "core_memories": "## Agent Identity\n- I am a helpful assistant",
-                    "search_results": [{"memory": "Uses pytest", "score": 0.9}],
-                }
-            # Subsequent call: instructions refreshed, core_memories absent
             return {
                 "session_id": "mem-1",
-                "instructions": "Use remember tool to store facts.",
+                "instructions": "DO NOT USE THIS NEW INSTRUCTION",
+                "core_memories": "DO NOT REPLACE EXISTING CORE",
                 "search_results": [],
             }
 
@@ -737,7 +792,6 @@ async def test_context_assembler_preserves_core_memories_on_partial_refresh() ->
         compaction_threshold=0.85,
     )
 
-    # First call: both instructions and core_memories returned and cached
     result1 = await assembler.assemble(
         session=_session(),
         conversation=_conversation(),
@@ -748,8 +802,6 @@ async def test_context_assembler_preserves_core_memories_on_partial_refresh() ->
     core_in_first = [m for m in result1.messages if "Agent Identity" in str(m.get("content", ""))]
     assert len(core_in_first) == 1, "Core memories should be in first turn context"
 
-    # Second call: instructions returned but NOT core_memories.
-    # The cached core_memories must still appear in the context.
     result2 = await assembler.assemble(
         session=_session(mnemory_session_id="mem-1"),
         conversation=_conversation(),
@@ -758,9 +810,11 @@ async def test_context_assembler_preserves_core_memories_on_partial_refresh() ->
         tool_definitions=[],
     )
     core_in_second = [m for m in result2.messages if "Agent Identity" in str(m.get("content", ""))]
-    assert len(core_in_second) == 1, (
-        "Core memories must survive partial recall — they are part of the immutable prefix"
-    )
+    assert len(core_in_second) == 1
+    prefix = str(result2.messages[0]["content"])
+    assert "DO NOT USE THIS NEW INSTRUCTION" not in prefix
+    assert "DO NOT REPLACE EXISTING CORE" not in prefix
+    assert memory.search_modes == ["search", "search"]
 
 
 @pytest.mark.asyncio

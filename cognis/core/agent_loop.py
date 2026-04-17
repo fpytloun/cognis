@@ -33,6 +33,7 @@ from cognis.core.attachment_utils import (
 from cognis.core.compaction import ROTATION_TOTAL
 from cognis.core.context import _native_attachment_blocks
 from cognis.core.decision import build_routing_reminder
+from cognis.core.errors import ImmutablePrefixUnavailable
 from cognis.core.events import Event, EventBus, EventType
 from cognis.core.followups import FollowUpMetadata, FollowUpMode, FollowUpPolicy
 from cognis.core.harness_guards import (
@@ -189,6 +190,11 @@ SESSION_LOCKS_EVICTED_TOTAL = Counter(
 AUTO_COMPACTION_DURATION = Histogram(
     "cognis_auto_compaction_duration_seconds",
     "Duration of automatic post-turn compaction (compact + rotate + cache)",
+)
+AUDIT_EVENTS_TOTAL = Counter(
+    "cognis_audit_events_total",
+    "LLM exposure audit events recorded to Intaris.",
+    labelnames=("type", "source"),
 )
 AUTO_COMPACTION_TIMEOUT_SECONDS = 15
 
@@ -1088,6 +1094,7 @@ class StepContext:
     current_model_info: Any = None
     remember_user_event_seq: int | None = None
     remember_assistant_event_seq: int | None = None
+    turn_id: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -1214,6 +1221,9 @@ class AgentLoop:
         except StepInterrupted:
             # Emergency flush: persist any accumulated events before
             # the cancellation propagates — events represent real work.
+            await self._emergency_flush_events(ctx, ctx.pending_events)
+            raise
+        except ImmutablePrefixUnavailable:
             await self._emergency_flush_events(ctx, ctx.pending_events)
             raise
         except Exception as exc:
@@ -1665,6 +1675,7 @@ class AgentLoop:
         events_to_record: list[SessionEvent] = []
         ctx.pending_events = events_to_record
         ctx.pending_tool_calls.clear()
+        ctx.turn_id = f"turn_{uuid.uuid4().hex[:12]}"
         messages: list[dict[str, Any]] = []
         assistant_content_parts: list[str] = []  # User-visible assistant output only
         assistant_memory_parts: list[str] = []  # Include attachment notes for memory/compaction
@@ -1733,7 +1744,22 @@ class AgentLoop:
             user_msg_event = SessionEvent(
                 type="user_message",
                 data={
+                    "role": "user",
                     "content": recorded_user_message,
+                    "content_type": "text",
+                    "source": "user_input",
+                    "turn_id": ctx.turn_id,
+                    "hash": hashlib.sha256(
+                        json.dumps(
+                            {
+                                "role": "user",
+                                "content": recorded_user_message,
+                                "source": "user_input",
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest(),
                     "attachments": [
                         item.model_dump(mode="json", exclude={"url"})
                         for item in ctx.user_attachments
@@ -1813,25 +1839,66 @@ class AgentLoop:
             advice = build_routing_reminder(effective_user_message)
             routing_reminder = advice.reminder if advice is not None else None
 
-        context_result = await self.context_assembler.assemble(
-            session=ctx.session,
-            conversation=ctx.conversation,
-            agent=ctx.agent,
-            user_message=effective_user_message,
-            user_attachments=[item.model_dump(mode="json") for item in ctx.user_attachments],
-            attachment_notice=ctx.attachment_notice,
-            attachment_context=ctx.attachment_context,
-            user_message_role="system" if ctx.system_initiated else "user",
-            prior_context=ctx.prior_context,
-            follow_up=ctx.follow_up,
-            routing_reminder=routing_reminder,
-            skip_memory=ctx.policy.skip_memory,
-            prompt_context=_prompt_ctx,
-            executor_environment=ctx.executor_environment,
-            workspace_root=ctx.workspace_root,
-            effective_working_directory=ctx.working_directory,
-        )
+        try:
+            context_result = await self.context_assembler.assemble(
+                session=ctx.session,
+                conversation=ctx.conversation,
+                agent=ctx.agent,
+                user_message=effective_user_message,
+                user_attachments=[item.model_dump(mode="json") for item in ctx.user_attachments],
+                attachment_notice=ctx.attachment_notice,
+                attachment_context=ctx.attachment_context,
+                user_message_role="system" if ctx.system_initiated else "user",
+                prior_context=ctx.prior_context,
+                follow_up=ctx.follow_up,
+                routing_reminder=routing_reminder,
+                skip_memory=ctx.policy.skip_memory,
+                prompt_context=_prompt_ctx,
+                executor_environment=ctx.executor_environment,
+                workspace_root=ctx.workspace_root,
+                effective_working_directory=ctx.working_directory,
+            )
+        except ImmutablePrefixUnavailable:
+            await self._record_system_notice_audit(
+                ctx,
+                "Immutable prefix is unavailable for this session.",
+                turn_id=ctx.turn_id,
+            )
+            await self.event_bus.publish(
+                Event(
+                    type=EventType.SYSTEM_NOTICE,
+                    data={
+                        "conversation_id": ctx.conversation.conversation_id,
+                        "session_id": ctx.session.session_id,
+                        "text": "Immutable prefix is unavailable for this session.",
+                    },
+                )
+            )
+            raise
         messages = context_result.messages
+        pending_audit_messages = list(getattr(context_result, "audit_messages", []) or [])
+
+        def _queue_audit_message(*, role: str, source: str, content: str) -> None:
+            pending_audit_messages.append(
+                {
+                    "position": len(messages) - 1,
+                    "role": role,
+                    "content": content,
+                    "source": source,
+                    "content_type": "text",
+                    "hash": hashlib.sha256(
+                        json.dumps(
+                            {
+                                "role": role,
+                                "content": content,
+                                "source": source,
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest(),
+                }
+            )
 
         # Record user message event (unless already recorded early for
         # intention tracking above).  System-initiated follow-up turns
@@ -1961,6 +2028,11 @@ class AgentLoop:
             if mid_stream_retries > 0:
                 accumulator.restore_tool_call_state(saved_partial_tool_calls)
             mid_stream_error: str | None = None
+            await self._record_outgoing_audit_messages(
+                ctx,
+                pending_audit_messages,
+                on_token=on_token,
+            )
             async for chunk in self.providers.llm.stream_generate(
                 messages,
                 model=model_for_llm,
@@ -2105,6 +2177,12 @@ class AgentLoop:
                         ),
                     }
                 )
+                pending_audit_messages = []
+                _queue_audit_message(
+                    role="developer",
+                    source="follow_up_boundary",
+                    content=str(messages[continuation_reminder_index]["content"]),
+                )
                 continue
 
             current_assistant_message_index: int | None = None
@@ -2184,6 +2262,11 @@ class AgentLoop:
                                 ),
                             }
                         )
+                        _queue_audit_message(
+                            role="developer",
+                            source="tool_reminder",
+                            content=str(messages[-1]["content"]),
+                        )
                         continue
                     # Todos done (or max re-prompts reached) — complete
                     step_output = StepOutput(
@@ -2212,6 +2295,11 @@ class AgentLoop:
                                 "repeat prior text unnecessarily."
                             ),
                         }
+                    )
+                    _queue_audit_message(
+                        role="developer",
+                        source="tool_reminder",
+                        content=str(messages[-1]["content"]),
                     )
                     continue
                 else:
@@ -2496,6 +2584,11 @@ class AgentLoop:
                                     "already recorded and the evaluator will read it."
                                 ),
                             }
+                        )
+                        _queue_audit_message(
+                            role="developer",
+                            source="tool_reminder",
+                            content=str(messages[-1]["content"]),
                         )
 
                         await self._flush_events_incremental(
@@ -5186,6 +5279,89 @@ class AgentLoop:
                     exc_info=True,
                 )
                 await self._wait_for_intaris_recovery(ctx, operation=reason, on_token=on_token)
+
+    async def _record_outgoing_audit_messages(
+        self,
+        ctx: StepContext,
+        audit_messages: list[dict[str, Any]],
+        *,
+        on_token: TokenCallback | None = None,
+    ) -> None:
+        if not audit_messages or not ctx.turn_id:
+            return
+        events = [
+            SessionEvent(
+                type="system_message" if item.get("role") == "system" else "developer_message",
+                data={
+                    "role": item.get("role"),
+                    "content": item.get("content"),
+                    "content_type": item.get("content_type", "text"),
+                    "source": item.get("source"),
+                    "turn_id": ctx.turn_id,
+                    "position": item.get("position"),
+                    "hash": item.get("hash"),
+                },
+            )
+            for item in audit_messages
+            if isinstance(item.get("content"), str) and isinstance(item.get("source"), str)
+        ]
+        if not events:
+            audit_messages.clear()
+            return
+        metric_labels = [
+            (event.type, str(event.data.get("source") or "unknown")) for event in events
+        ]
+        await self._record_events_strict(
+            ctx,
+            events,
+            reason=f"turn_audit:{ctx.turn_id}",
+            on_token=on_token,
+        )
+        for event_type, source in metric_labels:
+            AUDIT_EVENTS_TOTAL.labels(type=event_type, source=source).inc()
+        audit_messages.clear()
+
+    async def _record_system_notice_audit(
+        self,
+        ctx: StepContext,
+        message: str,
+        *,
+        turn_id: str | None,
+    ) -> None:
+        notice_event = SessionEvent(
+            type="system_message",
+            data={
+                "role": "system",
+                "content": message,
+                "content_type": "text",
+                "source": "system_notice",
+                "turn_id": turn_id,
+                "hash": hashlib.sha256(
+                    json.dumps(
+                        {
+                            "role": "system",
+                            "content": message,
+                            "source": "system_notice",
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest(),
+            },
+        )
+        try:
+            await self._record_events_strict(
+                ctx,
+                [notice_event],
+                reason=f"system_notice:{turn_id or 'none'}",
+            )
+            AUDIT_EVENTS_TOTAL.labels(type="system_message", source="system_notice").inc()
+        except Exception:
+            logger.warning(
+                "agent: failed to record system notice audit",
+                extra={"extra_data": {"session_id": ctx.session.session_id}},
+                exc_info=True,
+            )
 
     async def _report_reasoning_strict(
         self,

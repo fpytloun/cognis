@@ -32,6 +32,14 @@ from cognis.models.tool import (
 
 
 class MemoryProvider(Protocol):
+    async def load_session_identity(
+        self,
+        *,
+        session_id: str | None = None,
+        labels: dict[str, Any] | None = None,
+        context: str | None = None,
+    ) -> dict[str, Any]: ...
+
     async def recall(
         self,
         query: str,

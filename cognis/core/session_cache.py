@@ -21,6 +21,11 @@ from typing import Any
 
 from prometheus_client import Counter, Gauge
 
+from cognis.core.immutable_prefix import (
+    PREFIX_EVENT_TYPES,
+    ImmutablePrefixEntry,
+    sort_prefix_entries,
+)
 from cognis.logging import get_logger
 from cognis.models.session import EventAppendResult, SessionEvent, SessionModel
 
@@ -61,11 +66,11 @@ class CachedSessionState:
     touched_at: float = field(default_factory=monotonic)
     initialized: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    # Cached memory content from first Mnemory recall (immutable prefix)
-    memory_instructions: str | None = None
-    core_memories: str | None = None
-    memory_instructions_cached_at: float | None = None
-    core_memories_cached_at: float | None = None
+    prefix_entries: list[ImmutablePrefixEntry] = field(default_factory=list)
+    context_snapshot_seq: int = 0
+    context_snapshot_source: str | None = None
+    prefix_repair_needed: bool = False
+    last_repair_attempt_at: float | None = None
     # Context usage from last context assembly
     last_prompt_tokens: int = 0
     max_context_tokens: int = 0
@@ -79,7 +84,7 @@ class CachedSessionState:
 # Redis L2 serialization helpers
 # ---------------------------------------------------------------------------
 
-_REDIS_KEY_PREFIX = "cognis:session-cache:v1:"
+_REDIS_KEY_PREFIX = "cognis:session-cache:v2:"
 _REDIS_DEFAULT_TTL = 3600  # 1 hour
 
 
@@ -105,10 +110,19 @@ def _serialize_entry(entry: CachedSessionState) -> str:
             "intention": entry.intention,
             "intention_updated_at": entry.intention_updated_at,
             "initialized": entry.initialized,
-            "memory_instructions": entry.memory_instructions,
-            "core_memories": entry.core_memories,
-            "memory_instructions_cached_at": entry.memory_instructions_cached_at,
-            "core_memories_cached_at": entry.core_memories_cached_at,
+            "prefix_entries": [
+                {
+                    "role": item.role,
+                    "source": item.source,
+                    "content": item.content,
+                    "seq": item.seq,
+                }
+                for item in entry.prefix_entries
+            ],
+            "context_snapshot_seq": entry.context_snapshot_seq,
+            "context_snapshot_source": entry.context_snapshot_source,
+            "prefix_repair_needed": entry.prefix_repair_needed,
+            "last_repair_attempt_at": entry.last_repair_attempt_at,
             "last_prompt_tokens": entry.last_prompt_tokens,
             "max_context_tokens": entry.max_context_tokens,
             "context_model": entry.context_model,
@@ -131,10 +145,20 @@ def _deserialize_entry(raw: str) -> CachedSessionState:
         intention=data.get("intention"),
         intention_updated_at=data.get("intention_updated_at"),
         initialized=data.get("initialized", False),
-        memory_instructions=data.get("memory_instructions"),
-        core_memories=data.get("core_memories"),
-        memory_instructions_cached_at=data.get("memory_instructions_cached_at"),
-        core_memories_cached_at=data.get("core_memories_cached_at"),
+        prefix_entries=[
+            ImmutablePrefixEntry(
+                role=str(item.get("role") or "developer"),
+                source=str(item.get("source") or ""),
+                content=str(item.get("content") or ""),
+                seq=int(item.get("seq") or 0),
+            )
+            for item in data.get("prefix_entries", [])
+            if isinstance(item, dict)
+        ],
+        context_snapshot_seq=data.get("context_snapshot_seq", 0),
+        context_snapshot_source=data.get("context_snapshot_source"),
+        prefix_repair_needed=bool(data.get("prefix_repair_needed", False)),
+        last_repair_attempt_at=data.get("last_repair_attempt_at"),
         last_prompt_tokens=data.get("last_prompt_tokens", 0),
         max_context_tokens=data.get("max_context_tokens", 0),
         context_model=data.get("context_model", ""),
@@ -277,6 +301,17 @@ class SessionCache:
                     allow_missing_stream=True,
                 )
                 self._apply_intaris_events(entry, event_read.events)
+                if any(
+                    str(raw_event.get("type") or "") == "context_snapshot"
+                    for raw_event in event_read.events
+                ):
+                    full_read = await self.guardrails.read_events(
+                        session_id=entry.intaris_session_id,
+                        after_seq=0,
+                        allow_missing_stream=True,
+                    )
+                    self._rebuild_prefix_from_raw_events(entry, full_read.events)
+                    entry.last_event_seq = max(entry.last_event_seq, full_read.last_seq)
                 entry.last_event_seq = max(entry.last_event_seq, event_read.last_seq)
                 logger.debug(
                     "cache: warm refresh complete",
@@ -303,12 +338,14 @@ class SessionCache:
         entry = await self._ensure_entry(session)
         async with entry.lock:
             next_seq = append_result.first_seq
+            recorded_events: list[CachedEvent] = []
             for event in events:
-                self._apply_cached_event(
-                    entry,
-                    CachedEvent(seq=next_seq, type=event.type, data=dict(event.data)),
-                )
+                cached_event = CachedEvent(seq=next_seq, type=event.type, data=dict(event.data))
+                recorded_events.append(cached_event)
+                self._apply_cached_event(entry, cached_event)
                 next_seq += 1
+            if any(item.type in PREFIX_EVENT_TYPES for item in recorded_events):
+                self._rebuild_prefix_from_cached_events(entry, recorded_events)
             entry.last_event_seq = max(entry.last_event_seq, append_result.last_seq)
             entry.initialized = True
             entry.touched_at = monotonic()
@@ -474,6 +511,75 @@ class SessionCache:
         entry = self.get_entry(session_id)
         return None if entry is None else entry.last_compaction_summary
 
+    def get_prefix_entries(self, session_id: str) -> list[ImmutablePrefixEntry]:
+        """Return the current immutable prefix constituents for a session."""
+
+        entry = self.get_entry(session_id)
+        if entry is None:
+            return []
+        return list(sort_prefix_entries(entry.prefix_entries))
+
+    def needs_prefix_repair(self, session_id: str) -> bool:
+        """Return whether the cache knows the session is missing a prefix snapshot."""
+
+        entry = self.get_entry(session_id)
+        return bool(entry and entry.prefix_repair_needed)
+
+    def get_last_repair_attempt_at(self, session_id: str) -> float | None:
+        """Return the monotonic timestamp of the last repair attempt, if any."""
+
+        entry = self.get_entry(session_id)
+        return None if entry is None else entry.last_repair_attempt_at
+
+    async def note_repair_attempt(self, session_id: str) -> None:
+        """Record that a repair attempt was made for this session."""
+
+        entry = self.get_entry(session_id)
+        if entry is None:
+            return
+        async with entry.lock:
+            entry.last_repair_attempt_at = monotonic()
+            entry.touched_at = monotonic()
+        await self._redis_set(entry)
+
+    async def store_prefix_snapshot(
+        self,
+        session_id: str,
+        entries: list[ImmutablePrefixEntry],
+        *,
+        snapshot_seq: int,
+        snapshot_source: str,
+    ) -> None:
+        """Persist the active immutable-prefix snapshot in the cache."""
+
+        entry = self.get_entry(session_id)
+        if entry is None:
+            return
+        async with entry.lock:
+            entry.prefix_entries = sort_prefix_entries(list(entries))
+            entry.context_snapshot_seq = snapshot_seq
+            entry.context_snapshot_source = snapshot_source
+            entry.prefix_repair_needed = False
+            compaction_summary = entry.last_compaction_summary
+            for prefix_entry in entry.prefix_entries:
+                if prefix_entry.source == "compaction_summary":
+                    compaction_summary = prefix_entry.content
+                    break
+            entry.last_compaction_summary = compaction_summary
+            entry.touched_at = monotonic()
+        await self._redis_set(entry)
+
+    async def mark_prefix_repair_needed(self, session_id: str) -> None:
+        """Mark a session as requiring prefix repair on the next turn."""
+
+        entry = self.get_entry(session_id)
+        if entry is None:
+            return
+        async with entry.lock:
+            entry.prefix_repair_needed = True
+            entry.touched_at = monotonic()
+        await self._redis_set(entry)
+
     def get_events_since_compaction(
         self, session_id: str, types: list[str] | None = None
     ) -> list[CachedEvent]:
@@ -487,73 +593,6 @@ class SessionCache:
             allowed = set(types)
             events = [event for event in events if event.type in allowed]
         return list(events)
-
-    def get_cached_memory(
-        self, session_id: str, ttl_seconds: float = 1800.0
-    ) -> tuple[str | None, str | None, bool]:
-        """Return cached (instructions, core_memories, is_valid).
-
-        Returns ``is_valid=False`` when any cached immutable memory field is stale
-        (older than *ttl_seconds*, default 30 minutes) or when no cached values
-        exist. Always returns whatever individual fields are cached so callers can
-        make explicit gap-filling decisions after a fresh Mnemory refresh.
-        """
-
-        instructions, core_memories, instruction_valid, core_valid = self.get_cached_memory_details(
-            session_id, ttl_seconds=ttl_seconds
-        )
-        is_valid = instruction_valid and core_valid
-        return instructions, core_memories, is_valid
-
-    def get_cached_memory_details(
-        self, session_id: str, ttl_seconds: float = 1800.0
-    ) -> tuple[str | None, str | None, bool, bool]:
-        """Return cached immutable memory plus per-field validity."""
-
-        entry = self.get_entry(session_id)
-        if entry is None:
-            return None, None, False, False
-        if entry.memory_instructions is None and entry.core_memories is None:
-            return None, None, False, False
-
-        instruction_valid = False
-        if (
-            entry.memory_instructions is not None
-            and entry.memory_instructions_cached_at is not None
-        ):
-            instruction_valid = (monotonic() - entry.memory_instructions_cached_at) < ttl_seconds
-
-        core_valid = False
-        if entry.core_memories is not None and entry.core_memories_cached_at is not None:
-            core_valid = (monotonic() - entry.core_memories_cached_at) < ttl_seconds
-
-        return entry.memory_instructions, entry.core_memories, instruction_valid, core_valid
-
-    async def cache_memory(
-        self, session_id: str, instructions: str | None, core_memories: str | None
-    ) -> None:
-        """Merge memory instructions and core memories into the cache.
-
-        Uses merge semantics: only non-``None`` values overwrite the
-        existing cached fields.  A ``None`` value means "not returned
-        this time" and preserves whatever was previously cached.  This
-        prevents partial Mnemory recall responses (e.g. instructions
-        refreshed but core_memories omitted) from wiping the immutable
-        prefix.
-        """
-
-        entry = self.get_entry(session_id)
-        if entry is None:
-            return
-        async with entry.lock:
-            if instructions is not None:
-                entry.memory_instructions = instructions
-                entry.memory_instructions_cached_at = monotonic()
-            if core_memories is not None:
-                entry.core_memories = core_memories
-                entry.core_memories_cached_at = monotonic()
-            entry.touched_at = monotonic()
-        await self._redis_set(entry)
 
     # ------------------------------------------------------------------
     # Internal
@@ -615,6 +654,7 @@ class SessionCache:
             allow_missing_stream=True,
         )
         self._apply_intaris_events(entry, event_read.events)
+        self._rebuild_prefix_from_raw_events(entry, event_read.events)
         entry.last_event_seq = event_read.last_seq
         entry.initialized = True
 
@@ -632,7 +672,126 @@ class SessionCache:
             self._apply_cached_event(entry, cached_event)
         entry.initialized = True
 
+    def _rebuild_prefix_from_cached_events(
+        self,
+        entry: CachedSessionState,
+        cached_events: list[CachedEvent],
+    ) -> None:
+        latest_snapshot = max(
+            (item for item in cached_events if item.type == "context_snapshot"),
+            key=lambda item: item.seq,
+            default=None,
+        )
+        if latest_snapshot is None:
+            return
+
+        existing_by_seq = {item.seq: item for item in entry.prefix_entries}
+        for event in cached_events:
+            if event.type in {"system_message", "developer_message"}:
+                data = event.data
+                content = data.get("content")
+                source = data.get("source")
+                role = data.get("role")
+                if isinstance(content, str) and isinstance(source, str) and isinstance(role, str):
+                    existing_by_seq[event.seq] = ImmutablePrefixEntry(
+                        role=role,
+                        source=source,
+                        content=content,
+                        seq=event.seq,
+                    )
+
+        snapshot_data = latest_snapshot.data
+        rebuilt_entries: list[ImmutablePrefixEntry] = []
+        for item in snapshot_data.get("entries", []):
+            if not isinstance(item, dict):
+                continue
+            seq = int(item.get("seq", 0))
+            prefix_entry = existing_by_seq.get(seq)
+            if prefix_entry is not None:
+                rebuilt_entries.append(prefix_entry)
+
+        entry.prefix_entries = sort_prefix_entries(rebuilt_entries)
+        entry.context_snapshot_seq = latest_snapshot.seq
+        snapshot_source = snapshot_data.get("source")
+        entry.context_snapshot_source = (
+            snapshot_source if isinstance(snapshot_source, str) else None
+        )
+        entry.prefix_repair_needed = False
+        compaction_summary = entry.last_compaction_summary
+        for prefix_entry in entry.prefix_entries:
+            if prefix_entry.source == "compaction_summary":
+                compaction_summary = prefix_entry.content
+                break
+        entry.last_compaction_summary = compaction_summary
+
+    def _rebuild_prefix_from_raw_events(
+        self,
+        entry: CachedSessionState,
+        raw_events: list[dict[str, Any]],
+    ) -> None:
+        latest_snapshot: dict[str, Any] | None = None
+        for raw_event in raw_events:
+            if raw_event.get("type") != "context_snapshot":
+                continue
+            if latest_snapshot is None or int(raw_event.get("seq", 0)) >= int(
+                latest_snapshot.get("seq", 0)
+            ):
+                latest_snapshot = raw_event
+
+        if latest_snapshot is None:
+            entry.prefix_entries = []
+            entry.context_snapshot_seq = 0
+            entry.context_snapshot_source = None
+            entry.prefix_repair_needed = bool(raw_events)
+            return
+
+        seq_to_message: dict[int, dict[str, Any]] = {}
+        for raw_event in raw_events:
+            if raw_event.get("type") not in {"system_message", "developer_message"}:
+                continue
+            seq_to_message[int(raw_event.get("seq", 0))] = raw_event
+
+        snapshot_data = latest_snapshot.get("data", {})
+        rebuilt_entries: list[ImmutablePrefixEntry] = []
+        for item in snapshot_data.get("entries", []):
+            if not isinstance(item, dict):
+                continue
+            seq = int(item.get("seq", 0))
+            message = seq_to_message.get(seq)
+            if message is None:
+                continue
+            data = message.get("data", {})
+            content = data.get("content")
+            source = data.get("source") or item.get("source")
+            role = data.get("role") or item.get("role")
+            if (
+                not isinstance(content, str)
+                or not isinstance(source, str)
+                or not isinstance(role, str)
+            ):
+                continue
+            rebuilt_entries.append(
+                ImmutablePrefixEntry(role=role, source=source, content=content, seq=seq)
+            )
+
+        entry.prefix_entries = sort_prefix_entries(rebuilt_entries)
+        entry.context_snapshot_seq = int(latest_snapshot.get("seq", 0))
+        snapshot_source = snapshot_data.get("source")
+        entry.context_snapshot_source = (
+            snapshot_source if isinstance(snapshot_source, str) else None
+        )
+        entry.prefix_repair_needed = False
+        compaction_summary = entry.last_compaction_summary
+        for prefix_entry in entry.prefix_entries:
+            if prefix_entry.source == "compaction_summary":
+                compaction_summary = prefix_entry.content
+                break
+        entry.last_compaction_summary = compaction_summary
+
     def _apply_cached_event(self, entry: CachedSessionState, event: CachedEvent) -> None:
+        if event.type in PREFIX_EVENT_TYPES:
+            entry.last_event_seq = max(entry.last_event_seq, event.seq)
+            return
         if event.type == "compaction_summary":
             summary = event.data.get("summary")
             entry.last_compaction_summary = summary if isinstance(summary, str) else None

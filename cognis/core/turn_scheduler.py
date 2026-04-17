@@ -39,6 +39,7 @@ from sqlalchemy.exc import IntegrityError
 from cognis.api.error_sanitizer import sanitize_client_error_detail
 from cognis.core.attachment_utils import normalize_attachment_refs, strip_attachment_payload_bytes
 from cognis.core.compaction import ROTATION_TOTAL
+from cognis.core.errors import ImmutablePrefixUnavailable
 from cognis.core.events import Event, EventBus, EventType
 from cognis.core.followups import (
     FollowUpMetadata,
@@ -1880,6 +1881,13 @@ async def classify_turn_error(providers: Any, error: Exception) -> TurnError:
             message="Could not create a session. Try again or check the diagnostics page.",
             recoverable=True,
             detail={"error_detail": safe_detail},
+        )
+    if isinstance(error, ImmutablePrefixUnavailable):
+        return TurnError(
+            code="immutable_prefix_unavailable",
+            message="Immutable prefix is unavailable for this session.",
+            recoverable=False,
+            detail={"error_detail": safe_detail, "reason": error.reason},
         )
     if isinstance(error, ValueError) and "no llm model configured" in lowered:
         return TurnError(

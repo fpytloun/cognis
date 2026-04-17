@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from cognis.core.immutable_prefix import ImmutablePrefixEntry
 from cognis.core.session_cache import SessionCache
 from cognis.models.session import EventAppendResult, SessionEvent, SessionModel
 
@@ -14,10 +15,12 @@ class _Guardrails:
         self,
         session_id: str,
         after_seq: int = 0,
+        limit: int = 0,
+        types: list[str] | None = None,
+        last_n: int | None = None,
         allow_missing_stream: bool = False,
     ) -> object:
-        del session_id
-        del allow_missing_stream
+        del session_id, allow_missing_stream, limit, types, last_n
         self.calls.append(after_seq)
         if after_seq == 0:
             return type(
@@ -33,8 +36,45 @@ class _Guardrails:
                             "data": {"summary": "compact"},
                         },
                         {"seq": 4, "type": "user_message", "data": {"content": "recent"}},
+                        {
+                            "seq": 10,
+                            "type": "developer_message",
+                            "data": {
+                                "role": "developer",
+                                "source": "memory_instructions",
+                                "content": "Use memory carefully.",
+                            },
+                        },
+                        {
+                            "seq": 11,
+                            "type": "developer_message",
+                            "data": {
+                                "role": "developer",
+                                "source": "core_memories",
+                                "content": "Prefers Python.",
+                            },
+                        },
+                        {
+                            "seq": 12,
+                            "type": "context_snapshot",
+                            "data": {
+                                "source": "bootstrap",
+                                "entries": [
+                                    {
+                                        "role": "developer",
+                                        "source": "memory_instructions",
+                                        "seq": 10,
+                                    },
+                                    {
+                                        "role": "developer",
+                                        "source": "core_memories",
+                                        "seq": 11,
+                                    },
+                                ],
+                            },
+                        },
                     ],
-                    "last_seq": 4,
+                    "last_seq": 12,
                     "has_more": False,
                 },
             )()
@@ -70,11 +110,15 @@ async def test_session_cache_cold_and_warm_paths() -> None:
     assert entry.last_compaction_seq == 3
     assert entry.last_compaction_summary == "compact"
     assert [event.seq for event in entry.events] == [4]
+    assert [item.source for item in cache.get_prefix_entries("session-1")] == [
+        "memory_instructions",
+        "core_memories",
+    ]
 
     warm_entry = await cache.refresh(_session())
 
     assert warm_entry is entry
-    assert guardrails.calls == [0, 4]
+    assert guardrails.calls == [0, 12]
     assert [event.seq for event in warm_entry.events] == [4, 5]
 
 
@@ -98,64 +142,47 @@ async def test_session_cache_appends_recorded_events_and_applies_compaction() ->
 
 
 @pytest.mark.asyncio
-async def test_cache_memory_preserves_existing_when_new_is_none() -> None:
-    """cache_memory uses merge semantics: None means 'not returned'."""
+async def test_store_prefix_snapshot_replaces_active_prefix() -> None:
     cache = SessionCache(_Guardrails(), max_entries=10)
     session = _session()
     await cache.refresh(session)
 
-    # Populate both fields
-    await cache.cache_memory(session.session_id, "instructions-v1", "core-v1")
-    instr, core, valid = cache.get_cached_memory(session.session_id)
-    assert instr == "instructions-v1"
-    assert core == "core-v1"
-    assert valid is True
+    await cache.store_prefix_snapshot(
+        session.session_id,
+        [
+            ImmutablePrefixEntry(
+                role="developer",
+                source="memory_instructions",
+                content="Instructions v2",
+                seq=20,
+            ),
+            ImmutablePrefixEntry(
+                role="developer",
+                source="core_memories",
+                content="Core v2",
+                seq=21,
+            ),
+        ],
+        snapshot_seq=22,
+        snapshot_source="repair",
+    )
 
-    # Partial update: only instructions refreshed, core_memories=None
-    await cache.cache_memory(session.session_id, "instructions-v2", None)
-    instr, core, valid = cache.get_cached_memory(session.session_id)
-    assert instr == "instructions-v2"
-    assert core == "core-v1"  # preserved, not wiped
-    assert valid is True
-
-    # Partial update: only core_memories refreshed, instructions=None
-    await cache.cache_memory(session.session_id, None, "core-v2")
-    instr, core, valid = cache.get_cached_memory(session.session_id)
-    assert instr == "instructions-v2"  # preserved
-    assert core == "core-v2"
-    assert valid is True
+    assert [item.content for item in cache.get_prefix_entries(session.session_id)] == [
+        "Instructions v2",
+        "Core v2",
+    ]
+    assert cache.needs_prefix_repair(session.session_id) is False
 
 
 @pytest.mark.asyncio
-async def test_cache_memory_overwrites_when_new_is_not_none() -> None:
-    """Non-None values always overwrite the cached field."""
+async def test_mark_prefix_repair_needed_sets_flag() -> None:
     cache = SessionCache(_Guardrails(), max_entries=10)
     session = _session()
     await cache.refresh(session)
 
-    await cache.cache_memory(session.session_id, "old-instr", "old-core")
-    await cache.cache_memory(session.session_id, "new-instr", "new-core")
+    await cache.mark_prefix_repair_needed(session.session_id)
 
-    instr, core, valid = cache.get_cached_memory(session.session_id)
-    assert instr == "new-instr"
-    assert core == "new-core"
-    assert valid is True
-
-
-@pytest.mark.asyncio
-async def test_cache_memory_both_none_preserves_all() -> None:
-    """Calling cache_memory(None, None) preserves all existing values."""
-    cache = SessionCache(_Guardrails(), max_entries=10)
-    session = _session()
-    await cache.refresh(session)
-
-    await cache.cache_memory(session.session_id, "instr", "core")
-    await cache.cache_memory(session.session_id, None, None)
-
-    instr, core, valid = cache.get_cached_memory(session.session_id)
-    assert instr == "instr"
-    assert core == "core"
-    assert valid is True
+    assert cache.needs_prefix_repair(session.session_id) is True
 
 
 @pytest.mark.asyncio

@@ -32,6 +32,12 @@ from cognis.core.agent_loop import (
 )
 from cognis.core.events import Event, EventBus, EventType
 from cognis.core.followups import FollowUpMetadata, FollowUpPolicy
+from cognis.core.immutable_prefix import (
+    PREFIX_EVENT_TYPES,
+    ImmutablePrefixEntry,
+    build_context_snapshot_event,
+    build_prefix_message_events,
+)
 from cognis.core.runtime import ResolvedStepRuntime
 from cognis.core.step_evaluator import StepEvaluator, is_evaluator_malfunction
 from cognis.core.workflow_registry import WorkflowRegistry
@@ -2187,6 +2193,8 @@ class WorkflowEngine:
                     after_seq=0,
                 )
                 for raw_event in sorted(event_read.events, key=lambda e: int(e.get("seq", 0))):
+                    if str(raw_event.get("type") or "") in PREFIX_EVENT_TYPES:
+                        continue
                     source_events.append(
                         CachedEvent(
                             seq=int(raw_event.get("seq", 0)),
@@ -2223,6 +2231,74 @@ class WorkflowEngine:
             await self._session_cache.seed_events(
                 target_session, source_events, append_result.last_seq
             )
+            prefix_entries = self._session_cache.get_prefix_entries(source_cognis_session_id or "")
+            if prefix_entries:
+                message_events = build_prefix_message_events(
+                    [
+                        ImmutablePrefixEntry(
+                            role=entry.role,
+                            source=entry.source,
+                            content=entry.content,
+                        )
+                        for entry in prefix_entries
+                    ],
+                )
+                message_result = await self._providers.guardrails.record_events(
+                    session_id=target_intaris_id,
+                    events=message_events,
+                    source="cognis",
+                    idempotency_key=f"{target_session.session_id}:immutable_prefix:fork:messages",
+                )
+                if message_result.ok:
+                    resolved_entries = [
+                        ImmutablePrefixEntry(
+                            role=entry.role,
+                            source=entry.source,
+                            content=entry.content,
+                            seq=message_result.first_seq + index,
+                        )
+                        for index, entry in enumerate(prefix_entries)
+                    ]
+                    snapshot_event = build_context_snapshot_event(
+                        resolved_entries,
+                        snapshot_source="fork",
+                        extras={"source_step": source_label},
+                    )
+                    snapshot_result = await self._providers.guardrails.record_events(
+                        session_id=target_intaris_id,
+                        events=[snapshot_event],
+                        source="cognis",
+                        idempotency_key=f"{target_session.session_id}:immutable_prefix:fork:snapshot",
+                    )
+                else:
+                    snapshot_result = None
+                if snapshot_result is not None and snapshot_result.ok:
+                    await self._session_cache.append_recorded_events(
+                        target_session,
+                        message_events,
+                        message_result,
+                    )
+                    await self._session_cache.append_recorded_events(
+                        target_session,
+                        [snapshot_event],
+                        snapshot_result,
+                    )
+                    await self._session_cache.store_prefix_snapshot(
+                        target_session.session_id,
+                        resolved_entries,
+                        snapshot_seq=snapshot_result.last_seq,
+                        snapshot_source="fork",
+                    )
+                elif snapshot_result is not None:
+                    logger.warning(
+                        "workflow: failed to persist fork snapshot event",
+                        extra={"extra_data": {"target_session": target_session.session_id}},
+                    )
+                else:
+                    logger.warning(
+                        "workflow: failed to persist fork prefix messages",
+                        extra={"extra_data": {"target_session": target_session.session_id}},
+                    )
             logger.info(
                 "workflow: forked source events into step session",
                 extra={

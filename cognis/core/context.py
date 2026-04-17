@@ -7,17 +7,26 @@ import datetime
 import html
 import json
 import re
+from hashlib import sha256
 from pathlib import Path
+from time import monotonic
 from typing import Any
 
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cognis.core.attachment_utils import attachment_note as _attachment_note
+from cognis.core.errors import ImmutablePrefixUnavailable
 from cognis.core.followups import (
     FollowUpMetadata,
     build_history_boundary_message,
     render_follow_up_block,
+)
+from cognis.core.immutable_prefix import (
+    ImmutablePrefixEntry,
+    build_context_snapshot_event,
+    build_prefix_message_events,
+    sort_prefix_entries,
 )
 from cognis.core.prompts import PromptContext, build_system_instructions
 from cognis.core.runtime import ExecutorEnvironmentSnapshot, build_local_executor_environment
@@ -68,6 +77,7 @@ class ContextAssemblyResult(BaseModel):
     """Fully assembled LLM context and metadata."""
 
     messages: list[dict[str, Any]]
+    audit_messages: list[dict[str, Any]] = Field(default_factory=list)
     degraded: bool = False
     degraded_sources: list[str] = Field(default_factory=list)
     resolved_model: str
@@ -77,6 +87,15 @@ class ContextAssemblyResult(BaseModel):
     max_context_tokens: int = 0
     recommend_compaction: bool = False
     cache_breakpoint_index: int | None = None
+
+
+def _audit_hash(role: str, content: str, source: str) -> str:
+    payload = json.dumps(
+        {"role": role, "content": content, "source": source},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _filter_attachments_by_names(
@@ -381,15 +400,6 @@ class ContextAssembler:
             )
 
         cached_intention = self.session_cache.get_intention(session.session_id)
-        is_first_recall = session.mnemory_session_id is None
-
-        # Check if cached instructions are stale (TTL 30 min)
-        _cached_instr, _cached_core, instructions_cache_valid, core_cache_valid = (
-            self.session_cache.get_cached_memory_details(session.session_id)
-        )
-        memory_cache_valid = instructions_cache_valid and core_cache_valid
-        need_instructions = is_first_recall or not memory_cache_valid
-        search_mode = "find" if is_first_recall else "search"
 
         with scoped_runtime_context(user_email=session.user_email, agent_id=session.agent_id):
             recall_task = self.memory.recall(
@@ -397,10 +407,10 @@ class ContextAssembler:
                 session_id=session.mnemory_session_id,
                 labels=conversation.context.memory_labels,
                 context=cached_intention,
-                search_mode=search_mode,
-                include_instructions=need_instructions,
+                search_mode="search",
+                include_instructions=False,
                 managed=True,
-                instruction_mode="personality" if need_instructions else None,
+                instruction_mode=None,
             )
             refresh_task = self.session_cache.refresh(session)
             intention_task = self.guardrails.get_session(
@@ -484,8 +494,6 @@ class ContextAssembler:
                     )
 
         # ----- Memory handling: split into immutable and mutable parts -----
-        immutable_instructions: str | None = None
-        immutable_core_memories: str | None = None
         mutable_search_results: str | None = None
 
         # recall_result is guaranteed to be a dict here (we raise on Exception above).
@@ -498,60 +506,8 @@ class ContextAssembler:
             if updated:
                 session.mnemory_session_id = recall_session_id
 
-        # Extract the three memory parts from the recall response
-        raw_instructions = recall_payload.get("instructions")
-        raw_core = recall_payload.get("core_memories")
-        raw_search = recall_payload.get("search_results")
-
-        if isinstance(raw_instructions, str) and raw_instructions.strip():
-            immutable_instructions = _adapt_memory_instructions(raw_instructions.strip())
-        if isinstance(raw_core, str) and raw_core.strip():
-            immutable_core_memories = raw_core.strip()
-
-        # Cache any new immutable parts (merge — None values preserve existing).
-        if immutable_instructions is not None or immutable_core_memories is not None:
-            await self.session_cache.cache_memory(
-                session.session_id, immutable_instructions, immutable_core_memories
-            )
-
-        # Fill gaps from cache after an immutable-memory refresh attempt only when
-        # the cache is still valid or Mnemory returned at least one refreshed
-        # immutable field. This prevents stale immutable memory from persisting
-        # indefinitely when Mnemory stops returning instructions entirely.
-        if immutable_instructions is None or immutable_core_memories is None:
-            cached_instr, cached_core, instructions_cache_valid, core_cache_valid = (
-                self.session_cache.get_cached_memory_details(session.session_id)
-            )
-            gap_filled: list[str] = []
-            if (
-                immutable_instructions is None
-                and cached_instr is not None
-                and (instructions_cache_valid or raw_instructions is not None)
-            ):
-                immutable_instructions = cached_instr
-                gap_filled.append("instructions")
-            if (
-                immutable_core_memories is None
-                and cached_core is not None
-                and (core_cache_valid or raw_core is not None)
-            ):
-                immutable_core_memories = cached_core
-                gap_filled.append("core_memories")
-            if gap_filled:
-                logger.debug(
-                    "context: filled immutable prefix gaps from cache",
-                    extra={
-                        "extra_data": {
-                            "session_id": session.session_id,
-                            "gap_filled": gap_filled,
-                        }
-                    },
-                )
-            elif need_instructions and not memory_cache_valid:
-                degraded_sources.append("memory_stale")
-
         # Format mutable search results
-        mutable_search_results = _format_search_results(raw_search)
+        mutable_search_results = _format_search_results(recall_payload.get("search_results"))
 
         project_instructions = _load_project_instructions(
             workspace_root=workspace_root,
@@ -604,15 +560,17 @@ class ContextAssembler:
             if agent.llm_config and agent.llm_config.max_tokens is not None
             else model_info.max_output_tokens
         )
-        identity_prompt = _compose_identity_prompt(agent)
+        prefix_entries = await self._ensure_immutable_prefix(
+            session=session,
+            agent=agent,
+            project_instructions=project_instructions,
+            memory_labels=conversation.context.memory_labels,
+            context=cached_intention,
+        )
         immutable_prefix = self._compose_immutable_prefix(
             agent=agent,
             prompt_context=prompt_context,
-            identity_prompt=identity_prompt,
-            immutable_instructions=immutable_instructions,
-            immutable_core_memories=immutable_core_memories,
-            compaction_summary=cache_entry.last_compaction_summary,
-            project_instructions=project_instructions,
+            prefix_entries=prefix_entries,
             resolved_model=resolved_model,
         )
         system_prompt_tokens, tool_schema_tokens = self._count_static_tokens(
@@ -653,6 +611,8 @@ class ContextAssembler:
                     workspace_root=workspace_root,
                     effective_working_directory=effective_working_directory,
                 ),
+                "_audit_source": "environment_info",
+                "_audit_role": "system",
             }
         )
 
@@ -666,7 +626,12 @@ class ContextAssembler:
 
         if active_delegations:
             messages.append(
-                {"role": "system", "content": _format_active_delegations(active_delegations)}
+                {
+                    "role": "system",
+                    "content": _format_active_delegations(active_delegations),
+                    "_audit_source": "delegation_result",
+                    "_audit_role": "developer",
+                }
             )
 
         # Prior context from caller (e.g. prior workflow step output).
@@ -674,6 +639,8 @@ class ContextAssembler:
         if prior_context:
             for msg in prior_context:
                 msg["_prior_context"] = True
+                msg.setdefault("_audit_source", "workflow_step_context")
+                msg.setdefault("_audit_role", msg.get("role", "developer"))
             messages.extend(prior_context)
             logger.debug(
                 "context: injecting prior step context",
@@ -686,6 +653,8 @@ class ContextAssembler:
                     "role": "system",
                     "content": build_history_boundary_message(),
                     "_follow_up_context": True,
+                    "_audit_source": "follow_up_boundary",
+                    "_audit_role": "developer",
                 }
             )
             messages.append(
@@ -693,6 +662,8 @@ class ContextAssembler:
                     "role": "system",
                     "content": render_follow_up_block(follow_up),
                     "_follow_up_context": True,
+                    "_audit_source": "follow_up_boundary",
+                    "_audit_role": "developer",
                 }
             )
 
@@ -716,6 +687,8 @@ class ContextAssembler:
                         '<memory_context trust="untrusted">\n'
                         "Recalled memories:\n" + mutable_search_results + "\n</memory_context>"
                     ),
+                    "_audit_source": "memory_search",
+                    "_audit_role": "developer",
                 }
             )
 
@@ -726,12 +699,28 @@ class ContextAssembler:
                         "role": "system",
                         "content": routing_reminder,
                         "_routing_reminder": True,
+                        "_audit_source": "routing_reminder",
+                        "_audit_role": "developer",
                     }
                 )
             if attachment_notice:
-                messages.append({"role": "system", "content": attachment_notice})
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": attachment_notice,
+                        "_audit_source": "attachment_notice",
+                        "_audit_role": "developer",
+                    }
+                )
             if attachment_context:
-                messages.append({"role": "user", "content": attachment_context})
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": attachment_context,
+                        "_audit_source": "attachment_notice",
+                        "_audit_role": "user",
+                    }
+                )
             attachment_blocks, unsupported = _native_attachment_blocks(
                 user_attachments or [], model_info
             )
@@ -770,15 +759,31 @@ class ContextAssembler:
                         "role": "system",
                         "content": routing_reminder,
                         "_routing_reminder": True,
+                        "_audit_source": "routing_reminder",
+                        "_audit_role": "developer",
                     }
                 )
             if attachment_notice:
                 # Controller diagnostic about unsupported attachments for
                 # this model — must survive dedupe or the model is not
                 # told why files are missing from the request.
-                messages.append({"role": "system", "content": attachment_notice})
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": attachment_notice,
+                        "_audit_source": "attachment_notice",
+                        "_audit_role": "developer",
+                    }
+                )
             if attachment_context:
-                messages.append({"role": "user", "content": attachment_context})
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": attachment_context,
+                        "_audit_source": "attachment_notice",
+                        "_audit_role": "user",
+                    }
+                )
 
         messages = self._prune_messages(
             messages=messages,
@@ -786,6 +791,8 @@ class ContextAssembler:
             max_prompt_tokens=max_prompt_tokens,
             tool_schema_tokens=tool_schema_tokens,
         )
+
+        audit_messages = self._collect_audit_messages(messages)
 
         # Recompute cache breakpoint after pruning while internal markers are still present.
         cache_breakpoint_index = _find_cache_breakpoint(messages)
@@ -796,6 +803,8 @@ class ContextAssembler:
             msg.pop("_prior_context", None)
             msg.pop("_follow_up_context", None)
             msg.pop("_routing_reminder", None)
+            msg.pop("_audit_source", None)
+            msg.pop("_audit_role", None)
 
         prompt_tokens = (
             self.llm.count_messages_tokens(messages, resolved_model) + tool_schema_tokens
@@ -819,6 +828,7 @@ class ContextAssembler:
         )
         return ContextAssemblyResult(
             messages=messages,
+            audit_messages=audit_messages,
             degraded=bool(degraded_sources),
             degraded_sources=sorted(set(degraded_sources)),
             resolved_model=resolved_model,
@@ -915,20 +925,23 @@ class ContextAssembler:
             if agent.llm_config and agent.llm_config.max_tokens is not None
             else model_info.max_output_tokens
         )
-        identity_prompt = _compose_identity_prompt(agent)
         project_instructions = _load_project_instructions(
             workspace_root=workspace_root,
             effective_working_directory=effective_working_directory,
             executor_environment=executor_environment,
         )
+        prefix_entries = await self._ensure_immutable_prefix(
+            session=session,
+            agent=agent,
+            project_instructions=project_instructions,
+            memory_labels=conversation.context.memory_labels,
+            context=None,
+            allow_empty_memory=True,
+        )
         immutable_prefix = self._compose_immutable_prefix(
             agent=agent,
             prompt_context=prompt_context,
-            identity_prompt=identity_prompt,
-            immutable_instructions=None,
-            immutable_core_memories=None,
-            compaction_summary=cache_entry.last_compaction_summary,
-            project_instructions=project_instructions,
+            prefix_entries=prefix_entries,
             resolved_model=resolved_model,
         )
         system_prompt_tokens, tool_schema_tokens = self._count_static_tokens(
@@ -967,6 +980,8 @@ class ContextAssembler:
                     workspace_root=workspace_root,
                     effective_working_directory=effective_working_directory,
                 ),
+                "_audit_source": "environment_info",
+                "_audit_role": "system",
             }
         )
 
@@ -983,6 +998,8 @@ class ContextAssembler:
         if prior_context:
             for msg in prior_context:
                 msg["_prior_context"] = True
+                msg.setdefault("_audit_source", "workflow_step_context")
+                msg.setdefault("_audit_role", msg.get("role", "developer"))
             messages.extend(prior_context)
 
         if follow_up is not None:
@@ -991,6 +1008,8 @@ class ContextAssembler:
                     "role": "system",
                     "content": build_history_boundary_message(),
                     "_follow_up_context": True,
+                    "_audit_source": "follow_up_boundary",
+                    "_audit_role": "developer",
                 }
             )
             messages.append(
@@ -998,6 +1017,8 @@ class ContextAssembler:
                     "role": "system",
                     "content": render_follow_up_block(follow_up),
                     "_follow_up_context": True,
+                    "_audit_source": "follow_up_boundary",
+                    "_audit_role": "developer",
                 }
             )
 
@@ -1015,12 +1036,28 @@ class ContextAssembler:
                         "role": "system",
                         "content": routing_reminder,
                         "_routing_reminder": True,
+                        "_audit_source": "routing_reminder",
+                        "_audit_role": "developer",
                     }
                 )
             if attachment_notice:
-                messages.append({"role": "system", "content": attachment_notice})
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": attachment_notice,
+                        "_audit_source": "attachment_notice",
+                        "_audit_role": "developer",
+                    }
+                )
             if attachment_context:
-                messages.append({"role": "user", "content": attachment_context})
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": attachment_context,
+                        "_audit_source": "attachment_notice",
+                        "_audit_role": "user",
+                    }
+                )
             attachment_blocks, unsupported = _native_attachment_blocks(
                 user_attachments or [], model_info
             )
@@ -1055,12 +1092,28 @@ class ContextAssembler:
                         "role": "system",
                         "content": routing_reminder,
                         "_routing_reminder": True,
+                        "_audit_source": "routing_reminder",
+                        "_audit_role": "developer",
                     }
                 )
             if attachment_notice:
-                messages.append({"role": "system", "content": attachment_notice})
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": attachment_notice,
+                        "_audit_source": "attachment_notice",
+                        "_audit_role": "developer",
+                    }
+                )
             if attachment_context:
-                messages.append({"role": "user", "content": attachment_context})
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": attachment_context,
+                        "_audit_source": "attachment_notice",
+                        "_audit_role": "user",
+                    }
+                )
 
         messages = self._prune_messages(
             messages=messages,
@@ -1069,6 +1122,7 @@ class ContextAssembler:
             tool_schema_tokens=tool_schema_tokens,
         )
 
+        audit_messages = self._collect_audit_messages(messages)
         cache_breakpoint_index = _find_cache_breakpoint(messages)
 
         for msg in messages:
@@ -1076,6 +1130,8 @@ class ContextAssembler:
             msg.pop("_prior_context", None)
             msg.pop("_follow_up_context", None)
             msg.pop("_routing_reminder", None)
+            msg.pop("_audit_source", None)
+            msg.pop("_audit_role", None)
         prompt_tokens = (
             self.llm.count_messages_tokens(messages, resolved_model) + tool_schema_tokens
         )
@@ -1095,6 +1151,7 @@ class ContextAssembler:
         )
         return ContextAssemblyResult(
             messages=messages,
+            audit_messages=audit_messages,
             degraded=bool(degraded_sources),
             degraded_sources=sorted(set(degraded_sources)),
             resolved_model=resolved_model,
@@ -1122,20 +1179,232 @@ class ContextAssembler:
             return metadata
         return None
 
+    async def _ensure_immutable_prefix(
+        self,
+        *,
+        session: SessionModel,
+        agent: AgentDefinition,
+        project_instructions: list[str],
+        memory_labels: dict[str, str],
+        context: str | None,
+        allow_empty_memory: bool = False,
+    ) -> list[ImmutablePrefixEntry]:
+        cached_entries = self.session_cache.get_prefix_entries(session.session_id)
+        if cached_entries and not self.session_cache.needs_prefix_repair(session.session_id):
+            return cached_entries
+
+        repair_needed = self.session_cache.needs_prefix_repair(session.session_id)
+        snapshot_source = "repair" if repair_needed else "bootstrap"
+        if snapshot_source == "repair":
+            last_attempt = self.session_cache.get_last_repair_attempt_at(session.session_id)
+            if last_attempt is not None and (monotonic() - last_attempt) < 300.0:
+                raise ImmutablePrefixUnavailable(
+                    "Immutable prefix repair is cooling down.",
+                    reason="cooldown",
+                )
+
+        try:
+            instructions: str | None = None
+            core_memories: str | None = None
+            recall_session_id = session.mnemory_session_id
+            if not allow_empty_memory:
+                with scoped_runtime_context(
+                    user_email=session.user_email, agent_id=session.agent_id
+                ):
+                    identity_payload = await self.memory.load_session_identity(
+                        session_id=session.mnemory_session_id,
+                        labels=memory_labels,
+                        context=context,
+                    )
+                raw_instructions = identity_payload.get("instructions")
+                raw_core = identity_payload.get("core_memories")
+                recall_session_id = (
+                    str(identity_payload.get("session_id") or "").strip() or recall_session_id
+                )
+                if isinstance(raw_instructions, str) and raw_instructions.strip():
+                    instructions = _adapt_memory_instructions(raw_instructions.strip())
+                if isinstance(raw_core, str) and raw_core.strip():
+                    core_memories = raw_core.strip()
+                if not core_memories:
+                    raise ImmutablePrefixUnavailable(
+                        "Core memories are unavailable for this session.",
+                        reason="missing_core",
+                    )
+                if session.mnemory_session_id is None and recall_session_id:
+                    updated = await self.session_manager.attach_mnemory_session(
+                        session.session_id,
+                        recall_session_id,
+                    )
+                    if updated:
+                        session.mnemory_session_id = recall_session_id
+
+            prefix_entries = self._compose_prefix_entries(
+                agent=agent,
+                project_instructions=project_instructions,
+                memory_instructions=instructions,
+                core_memories=core_memories,
+                compaction_summary=self.session_cache.get_compaction_summary(session.session_id),
+            )
+            if not prefix_entries:
+                return []
+
+            intaris_session_id = session.intaris_session_id or session.session_id
+            message_events = build_prefix_message_events(prefix_entries)
+            idempotency_key = f"{intaris_session_id}:immutable_prefix:{snapshot_source}:messages"
+            with scoped_runtime_context(user_email=session.user_email, agent_id=session.agent_id):
+                append_result = await self.guardrails.record_events(
+                    session_id=intaris_session_id,
+                    events=message_events,
+                    source="cognis",
+                    idempotency_key=idempotency_key,
+                )
+            if not append_result.ok:
+                raise ImmutablePrefixUnavailable(
+                    "Immutable prefix could not be persisted.",
+                    reason="record_failed",
+                )
+
+            resolved_entries = [
+                ImmutablePrefixEntry(
+                    role=entry.role,
+                    source=entry.source,
+                    content=entry.content,
+                    seq=append_result.first_seq + index,
+                )
+                for index, entry in enumerate(sort_prefix_entries(prefix_entries))
+            ]
+            snapshot_event = build_context_snapshot_event(
+                resolved_entries,
+                snapshot_source=snapshot_source,
+                extras={
+                    "mnemory_session_id": recall_session_id,
+                    "agent_id": agent.agent_id,
+                },
+            )
+            with scoped_runtime_context(user_email=session.user_email, agent_id=session.agent_id):
+                snapshot_result = await self.guardrails.record_events(
+                    session_id=intaris_session_id,
+                    events=[snapshot_event],
+                    source="cognis",
+                    idempotency_key=f"{intaris_session_id}:immutable_prefix:{snapshot_source}:snapshot",
+                )
+            if not snapshot_result.ok:
+                raise ImmutablePrefixUnavailable(
+                    "Immutable prefix snapshot could not be persisted.",
+                    reason="record_failed",
+                )
+            await self.session_cache.append_recorded_events(session, message_events, append_result)
+            await self.session_cache.append_recorded_events(
+                session, [snapshot_event], snapshot_result
+            )
+            await self.session_cache.store_prefix_snapshot(
+                session.session_id,
+                resolved_entries,
+                snapshot_seq=snapshot_result.last_seq,
+                snapshot_source=snapshot_source,
+            )
+            return resolved_entries
+        except Exception:
+            if snapshot_source == "repair":
+                await self.session_cache.note_repair_attempt(session.session_id)
+            raise
+
+    def _compose_prefix_entries(
+        self,
+        *,
+        agent: AgentDefinition,
+        project_instructions: list[str],
+        memory_instructions: str | None,
+        core_memories: str | None,
+        compaction_summary: str | None,
+    ) -> list[ImmutablePrefixEntry]:
+        entries: list[ImmutablePrefixEntry] = []
+        identity_prompt = _compose_identity_prompt(agent)
+        if identity_prompt:
+            entries.append(
+                ImmutablePrefixEntry(role="system", source="identity", content=identity_prompt)
+            )
+        if project_instructions:
+            entries.append(
+                ImmutablePrefixEntry(
+                    role="developer",
+                    source="project_instructions",
+                    content="\n\n".join(project_instructions),
+                )
+            )
+        if memory_instructions:
+            entries.append(
+                ImmutablePrefixEntry(
+                    role="developer",
+                    source="memory_instructions",
+                    content=memory_instructions,
+                )
+            )
+        if core_memories:
+            entries.append(
+                ImmutablePrefixEntry(
+                    role="developer",
+                    source="core_memories",
+                    content=core_memories,
+                )
+            )
+        if compaction_summary:
+            entries.append(
+                ImmutablePrefixEntry(
+                    role="developer",
+                    source="compaction_summary",
+                    content=compaction_summary,
+                )
+            )
+        return sort_prefix_entries(entries)
+
+    @staticmethod
+    def _prefix_content(
+        prefix_entries: list[ImmutablePrefixEntry],
+        source: str,
+    ) -> str | None:
+        for entry in sort_prefix_entries(prefix_entries):
+            if entry.source == source:
+                return entry.content
+        return None
+
+    @staticmethod
+    def _collect_audit_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        audit_messages: list[dict[str, Any]] = []
+        for index, message in enumerate(messages):
+            audit_source = message.get("_audit_source")
+            content = message.get("content")
+            if not isinstance(audit_source, str) or not isinstance(content, str):
+                continue
+            role = str(message.get("_audit_role") or message.get("role") or "system")
+            audit_messages.append(
+                {
+                    "position": index,
+                    "role": role,
+                    "content": content,
+                    "source": audit_source,
+                    "content_type": "text",
+                    "hash": _audit_hash(role, content, audit_source),
+                }
+            )
+        return audit_messages
+
     def _compose_immutable_prefix(
         self,
         *,
         agent: AgentDefinition,
         prompt_context: PromptContext,
-        identity_prompt: str | None,
-        immutable_instructions: str | None,
-        immutable_core_memories: str | None,
-        compaction_summary: str | None,
-        project_instructions: list[str] | None = None,
+        prefix_entries: list[ImmutablePrefixEntry],
         resolved_model: str,
     ) -> str | None:
         """Compose the cacheable immutable system prefix as one message."""
         sections: list[str] = []
+
+        identity_prompt = self._prefix_content(prefix_entries, "identity")
+        project_instructions = self._prefix_content(prefix_entries, "project_instructions")
+        immutable_instructions = self._prefix_content(prefix_entries, "memory_instructions")
+        immutable_core_memories = self._prefix_content(prefix_entries, "core_memories")
+        compaction_summary = self._prefix_content(prefix_entries, "compaction_summary")
 
         if identity_prompt:
             tagged_identity = _tagged_section("identity", identity_prompt)
@@ -1160,7 +1429,7 @@ class ContextAssembler:
 
         if project_instructions:
             tagged_project_instructions = _tagged_section(
-                "project_instructions", "\n\n".join(project_instructions)
+                "project_instructions", project_instructions
             )
             if tagged_project_instructions:
                 sections.append(tagged_project_instructions)

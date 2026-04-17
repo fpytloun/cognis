@@ -206,6 +206,26 @@ class MnemoryProvider:
         )
         return result
 
+    async def load_session_identity(
+        self,
+        *,
+        session_id: str | None = None,
+        labels: dict[str, Any] | None = None,
+        context: str | None = None,
+    ) -> dict[str, Any]:
+        """Load immutable session identity from Mnemory using the recall contract."""
+
+        return await self.recall(
+            query="",
+            session_id=session_id,
+            labels=labels,
+            context=context,
+            search_mode="find",
+            include_instructions=True,
+            managed=True,
+            instruction_mode="personality",
+        )
+
     async def remember(
         self,
         session_id: str,

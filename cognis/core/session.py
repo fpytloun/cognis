@@ -10,6 +10,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cognis.core.events import Event, EventBus, EventType
 from cognis.core.followups import FollowUpPolicy
+from cognis.core.immutable_prefix import (
+    ImmutablePrefixEntry,
+    build_context_snapshot_event,
+    build_prefix_message_events,
+)
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.session import (
@@ -612,6 +617,11 @@ class SessionManager:
             },
         )
 
+        get_prefix_entries = getattr(self.session_cache, "get_prefix_entries", None)
+        prefix_entries = (
+            get_prefix_entries(current_session.session_id) if callable(get_prefix_entries) else []
+        )
+
         async with self.session_factory() as db_session:
             try:
                 # 1. Mark current session completed
@@ -676,6 +686,73 @@ class SessionManager:
 
         new_session_row.intaris_session_id = new_session_row.session_id
         new_session = _to_session_model(new_session_row)
+        if prefix_entries:
+            rotated_prefix: list[ImmutablePrefixEntry] = [
+                entry for entry in prefix_entries if entry.source != "compaction_summary"
+            ]
+            if compaction_summary:
+                rotated_prefix.append(
+                    ImmutablePrefixEntry(
+                        role="developer",
+                        source="compaction_summary",
+                        content=compaction_summary,
+                    )
+                )
+            message_events = build_prefix_message_events(rotated_prefix)
+            append_result = await self.providers.guardrails.record_events(
+                session_id=new_session.intaris_session_id or new_session.session_id,
+                events=message_events,
+                source="cognis",
+                idempotency_key=f"{new_session.session_id}:immutable_prefix:compaction:messages",
+            )
+            if append_result.ok:
+                resolved_entries = [
+                    ImmutablePrefixEntry(
+                        role=entry.role,
+                        source=entry.source,
+                        content=entry.content,
+                        seq=append_result.first_seq + index,
+                    )
+                    for index, entry in enumerate(rotated_prefix)
+                ]
+                snapshot_event = build_context_snapshot_event(
+                    resolved_entries,
+                    snapshot_source="compaction",
+                    extras={"parent_session_id": current_session.session_id},
+                )
+                snapshot_result = await self.providers.guardrails.record_events(
+                    session_id=new_session.intaris_session_id or new_session.session_id,
+                    events=[snapshot_event],
+                    source="cognis",
+                    idempotency_key=f"{new_session.session_id}:immutable_prefix:compaction:snapshot",
+                )
+                if snapshot_result.ok:
+                    append_recorded_events = getattr(
+                        self.session_cache, "append_recorded_events", None
+                    )
+                    if callable(append_recorded_events):
+                        await append_recorded_events(new_session, message_events, append_result)
+                        await append_recorded_events(new_session, [snapshot_event], snapshot_result)
+                    store_prefix_snapshot = getattr(
+                        self.session_cache, "store_prefix_snapshot", None
+                    )
+                    if callable(store_prefix_snapshot):
+                        await store_prefix_snapshot(
+                            new_session.session_id,
+                            resolved_entries,
+                            snapshot_seq=snapshot_result.last_seq,
+                            snapshot_source="compaction",
+                        )
+                else:
+                    logger.warning(
+                        "session: failed to persist compaction snapshot event",
+                        extra={"extra_data": {"session_id": new_session.session_id}},
+                    )
+            else:
+                logger.warning(
+                    "session: failed to persist compaction prefix messages",
+                    extra={"extra_data": {"session_id": new_session.session_id}},
+                )
 
         logger.info(
             "session: rotation completed",
