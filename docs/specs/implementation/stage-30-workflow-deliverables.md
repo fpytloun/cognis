@@ -12,13 +12,19 @@ Land the structural half of the harness work introduced by the harness stabiliza
 2. Channel delivery happens exactly once per workflow — gated on `step_complete` acceptance and evaluator approval.
 3. Specialized workflows restrict the tool surface with **step profiles** (`research`, `coding`) expressed as rule sets over a tool classification taxonomy. The default profile is `unrestricted`; user-installed MCP tools continue to just work.
 
-This stage turns specs 21 and 22 into code across backend, UI, and telemetry after the harness stabilization stages are complete.
+This stage turns specs 21 and 22 into code across backend, UI, and telemetry
+after the harness stabilization stages are complete.
+
+It also prepares the workflow contract consumed by the later workflow-first
+composition stage: composed workflows will rely on typed deliverables and
+profile-aware tool exposure rather than inventing a separate execution shape.
 
 ## Dependencies
 
 - `docs/specs/14-workflow-engine.md`
 - `docs/specs/21-workflow-deliverables.md`
 - `docs/specs/22-step-profiles.md`
+- `docs/specs/27-workflow-composer.md`
 - `docs/specs/06-tool-system.md`
 - `docs/specs/09-ui-ux.md`
 - `docs/specs/23-harness-stabilization.md`
@@ -47,10 +53,10 @@ This stage turns specs 21 and 22 into code across backend, UI, and telemetry aft
 
 - `reporting` and `communication` profiles (no shipped system workflow needs them).
 - Trust flag on MCP servers.
-- Daily-brief workflow migration (user-level workflow; separate PR).
 - A `read_deliverable` reader tool for cross-step content fetch.
 - DB-editable profile rule sets.
 - Federation/A2A changes to deliverable handling.
+- `compose_and_run_workflow`, ephemeral workflows, or skill decomposition.
 
 ## Deliverables
 
@@ -89,7 +95,7 @@ This stage turns specs 21 and 22 into code across backend, UI, and telemetry aft
 
 ### 5. System workflow wiring
 
-- `cognis/core/workflow_registry.py` — set `step_profile` and `require_deliverable` on every shipped step per the mapping in spec 22, section "System Workflow Mapping". No changes to workflow IDs, names, or step sequences.
+- `cognis/core/workflow_registry.py` — set `step_profile` and `require_deliverable` on every shipped step per the mapping in spec 22, section "System Workflow Mapping". This includes the coding workflow family later consumed by the composer. No changes to workflow IDs, names, or step sequences.
 
 ### 6. API and WebSocket
 
@@ -226,7 +232,7 @@ Files likely touched:
 
 Tasks:
 
-1. Set `step_profile` and `require_deliverable` on every step of all five shipped workflows per the mapping in spec 22.
+1. Set `step_profile` and `require_deliverable` on every step of all shipped workflows per the mapping in spec 22.
 2. Verify `system:direct` keeps `require_deliverable=False` and stays `unrestricted`.
 3. Verify `system:software-development.commit`/`remember` keep `require_deliverable=False`.
 
@@ -310,7 +316,7 @@ Tasks:
 
 - `system:direct` end-to-end chat flow unchanged for users; no deliverable required; `write_deliverable` not exposed.
 - `system:general-task` `step_complete` is rejected with `deliverable_missing` when the model skips the tool; succeeds once the deliverable is buffered.
-- `system:research` and `system:software-development` do not expose filesystem/shell tools in research steps and do not expose unrelated destructive MCP tools in coding steps; unclassified user MCP tools are hidden with a UI include-anyway affordance.
+- `system:research` and the coding-family workflows (`system:software-development`, `system:bug-fix`, `system:code-research`) do not expose unrelated tools outside their mapped profiles; unclassified user MCP tools are hidden with a UI include-anyway affordance.
 - A workflow with an evaluator `revise` loop produces the user-facing channel message exactly once.
 - Every restrictive profile exposes `write_deliverable`; writing it never fails because of profile filtering.
 - `mcp_tool_classifications` is empty by default; new MCP servers connect and work in `unrestricted` without any admin action.
@@ -340,3 +346,8 @@ Tasks:
 - `read_deliverable` reader tool for cross-step content fetch.
 - DB-editable profile rule sets.
 - Federation semantics for deliverables.
+
+## Follow-on Stage
+
+After this stage, Stage 31 can build workflow-first composition on top of the
+deliverable and profile contract shipped here.

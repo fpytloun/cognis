@@ -18,8 +18,10 @@ The symptoms were observable in production as:
 
 This spec defines the correctness fixes at the provider layer, independent
 from the broader harness stabilization work. It is the fourth and final
-stabilization stage before the deferred structural work (typed deliverables
-and step profiles) lands in [`30-workflow-deliverables implementation`](implementation/stage-30-workflow-deliverables.md).
+stabilization stage before the deferred structural work (typed deliverables,
+step profiles, and workflow-first composition) lands in
+[`30-workflow-deliverables implementation`](implementation/stage-30-workflow-deliverables.md)
+and the later composition stage.
 
 ## Related Specs
 
@@ -127,6 +129,7 @@ implicit dependency on DB insert order.
 - UI redesign beyond surfacing the session `/thinking` override in
   `/info` and session state
 - typed deliverables and step profiles (deferred to Stage 30)
+- workflow-first composition (deferred to the post-Stage-30 composition stage)
 
 ## Tracks and Required Changes
 

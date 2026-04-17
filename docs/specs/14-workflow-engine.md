@@ -8,6 +8,7 @@ verification, and how the controller manages transitions between them.
 
 This document covers:
 - workflow as a portable process template
+- workflow lifecycle (persistent vs ephemeral)
 - step types and execution semantics
 - explicit step completion and evaluation
 - gate/pause steps
@@ -64,6 +65,14 @@ For MVP, use one unified execution capacity model. If a step is running,
 it consumes one active slot regardless of whether that time is spent in LLM
 calls, tools, or helper sub-sessions. This keeps queueing and scheduling
 simple while still respecting real system limits.
+
+### 7. The main agent decides when to compose
+
+Main-chat workflow composition is agent-owned, not controller-classifier-owned.
+The primary agent decides when to answer inline, when to create a
+`system:general-task`, and when to compose a richer workflow via
+`compose_and_run_workflow`. The workflow engine remains the execution runtime
+for all of those paths.
 
 ## Task Lifecycle
 
@@ -129,6 +138,7 @@ Submitting a draft moves it to `queued`. Batch submit is supported
 | Source | Trigger | Result |
 |--------|---------|--------|
 | **Chat delegation** | Decision Engine classifies → "delegate" | Task with `source_type=chat`, `source_ref=conversation_id` |
+| **Agent composition** | Main agent calls `compose_and_run_workflow` or `create_task` | Task with `source_type=agent`, `source_ref=conversation_id` |
 | **API** | `POST /api/v1/tasks` | Task with `source_type=api` |
 | **Scheduler** | Cron fires | Schedule creates Task with `source_type=scheduler`, `source_ref=schedule_id` |
 | **Webhook** | External event received | Task with `source_type=webhook`, `source_ref=webhook_id` |
@@ -282,9 +292,20 @@ class Workflow:
     interaction: InteractionMode
     defaults: WorkflowDefaults
     steps: list[StepDefinition]
+    lifecycle: str = "persistent"  # "persistent" | "ephemeral"
+    archived_at: datetime | None = None
     is_system: bool            # bundled with Cognis, read-only
     owner_email: str | None    # NULL for system workflows
 ```
+
+Lifecycle semantics:
+
+- `persistent` workflows are part of the normal workflow library and may be
+  selected by users, tasks, schedules, or the classifier.
+- `ephemeral` workflows are durable for execution and audit but hidden from the
+  normal library and classifier candidates.
+- completed ephemeral workflows may be promoted by opening the workflow editor
+  with their values pre-populated and saving a new persistent copy.
 
 ### StepDefinition
 
@@ -908,10 +929,17 @@ When the Decision Engine classifies a request as "delegate":
 
 ### How a workflow is selected
 
-1. **User explicit**: "use Code with Review" in chat or UI dropdown
-2. **Agent default**: agent has a `default_workflow_id`
-3. **Automatic**: Decision Engine classifier matches task description against
-   available workflows' `criteria` fields
+1. **User explicit**: "use Software Development" or "use Bug Fix" in chat or UI dropdown
+2. **Main agent composition**: the primary agent may call
+   `compose_and_run_workflow` and author an ephemeral or persistent workflow for
+   this request using full conversation context.
+3. **Agent default**: agent has a `default_workflow_id`
+4. **Automatic task selection**: classifier matches a task description against
+   available persistent workflows' `criteria` fields
+
+`system:general-task` remains the unstructured, single-step-with-evaluation
+workflow used when work should run in the background but explicit decomposition
+does not add enough value.
 
 ### Agent workflow configuration
 
@@ -938,6 +966,16 @@ steps:
     completion: {evaluate: false}
 ```
 
+**General Task** — one bounded execution step with semantic evaluation:
+```yaml
+name: General Task
+steps:
+  - name: execute
+    type: run
+    input: {type: "null"}
+    completion: {evaluate: true, max_attempts: 3, on_exhausted: gate}
+```
+
 **Research** — plan, research, synthesize, evaluate:
 ```yaml
 name: Research
@@ -960,9 +998,9 @@ steps:
     completion: {evaluate: true}
 ```
 
-**Code with Review** — the structured coding workflow:
+**Software Development** — full feature-oriented coding workflow:
 ```yaml
-name: Code with Review
+name: Software Development
 steps:
   - name: plan
     type: run
@@ -1005,6 +1043,47 @@ steps:
     completion: {evaluate: false}
 ```
 
+**Bug Fix** — shorter coding workflow for narrow fixes:
+```yaml
+name: Bug Fix
+steps:
+  - name: reproduce
+    type: run
+    prompt: "Reproduce the reported bug and isolate the failure..."
+    input: {type: "null"}
+    completion: {evaluate: true, max_attempts: 2}
+  - name: fix
+    type: run
+    prompt: "Implement the smallest correct fix..."
+    input: {type: summary, source: reproduce}
+    completion: {evaluate: true, max_attempts: 3}
+  - name: verify
+    type: run
+    prompt: "Run focused verification and confirm the original failure is resolved..."
+    input: {type: summary, source: [reproduce, fix]}
+    completion: {evaluate: true, max_attempts: 2}
+  - name: commit
+    type: run
+    prompt: "Create a conventional commit when requested..."
+    completion: {evaluate: false}
+```
+
+**Code Research** — read-heavy coding workflow with no code changes:
+```yaml
+name: Code Research
+steps:
+  - name: explore
+    type: run
+    prompt: "Inspect the relevant code paths, interfaces, and evidence..."
+    input: {type: "null"}
+    completion: {evaluate: true, max_attempts: 2}
+  - name: synthesize
+    type: run
+    prompt: "Produce a clear explanation of how the code works, with references and caveats..."
+    input: {type: summary, source: explore}
+    completion: {evaluate: true, max_attempts: 2}
+```
+
 **Creative** — generate with evaluation loop:
 ```yaml
 name: Creative
@@ -1023,6 +1102,10 @@ Users can:
 - Duplicate → creates editable copy
 - Create from scratch via UI form editor
 - Export/import as YAML files
+
+Agents can also create workflows through `create_workflow` and
+`compose_and_run_workflow`. The latter usually creates `ephemeral` workflows for
+one-off execution.
 
 ## Database Schema
 

@@ -11,13 +11,15 @@ Step profiles give workflow authors a simple way to restrict the tool surface a 
 - per-step `tool_overrides` (include/exclude)
 - the exposure resolution order and its relationship to deferred loading / tool search
 
-Related specs: [`06-tool-system.md`](06-tool-system.md), [`14-workflow-engine.md`](14-workflow-engine.md), [`21-workflow-deliverables.md`](21-workflow-deliverables.md).
+Related specs: [`06-tool-system.md`](06-tool-system.md), [`14-workflow-engine.md`](14-workflow-engine.md), [`21-workflow-deliverables.md`](21-workflow-deliverables.md), [`27-workflow-composer.md`](27-workflow-composer.md).
 
 ## Motivation
 
 Profiles are **a focus hint, not a security boundary**. Cognis already has security primitives: non-bypassable guardrails, user-scoped executors, and the Intaris evaluate path. Profiles address a different problem — reducing cognitive load on the model for specialized workflows where a tighter surface measurably improves behavior.
 
-The daily-brief regression made this concrete: the model had `edit`, `multiedit`, and `patch` available during a briefing task and produced `multiedit(file_path="/dev/null", edits=[])` no-ops. Narrowing the surface is the structural fix.
+Coding workflows made this concrete: a research-only explanation step had
+`edit`, `multiedit`, and `patch` available, so the model spent tokens exploring
+write paths it never needed. Narrowing the surface is the structural fix.
 
 Two constraints shape the design:
 
@@ -189,6 +191,10 @@ Profiles are orthogonal to tool exposure strategy (deferred loading, tool search
 
 The `deliverable` category (containing only `write_deliverable`) is always included in every restrictive profile's allowed set. Authors never need to override it. This guarantees deliverables work under `research` and `coding` as uniformly as under `unrestricted`.
 
+Composed workflows use the same profile contract. The workflow composer should
+reuse profile choices from referenced templates and step fragments instead of
+defaulting every composed step to `unrestricted`.
+
 ## System Workflow Mapping
 
 Shipped mapping for v1 (see [`21-workflow-deliverables.md`](21-workflow-deliverables.md) for `require_deliverable` column):
@@ -199,6 +205,8 @@ Shipped mapping for v1 (see [`21-workflow-deliverables.md`](21-workflow-delivera
 | `system:general-task` | `execute` | `unrestricted` |
 | `system:research` | all three | `research` |
 | `system:software-development` | all seven | `coding` |
+| `system:bug-fix` | all four | `coding` |
+| `system:code-research` | both steps | `coding` |
 | `system:creative` | `generate` | `unrestricted` |
 
 Rationale: `direct`/`general-task`/`creative` remain fully permissive so user MCPs work out of the box. `research` and `software-development` are the two cases where a tight surface is a clear win, and both are system-authored, so the restriction is scoped to shipped behavior.

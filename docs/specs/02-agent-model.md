@@ -27,8 +27,12 @@ work by delegating to secondary agents or spawning tasks.
 | System prompt | Free text appended after the structured personality block |
 | Can delegate | Yes (to other primary or bound secondary agents) |
 | Can spawn tasks | Yes |
-| Orchestration tools | Full (delegate, task/workflow tools) |
+| Orchestration tools | Full (delegate, task/workflow tools, workflow composition) |
 | Mnemory bootstrap | Yes (structured personality fields synced as pinned memories; falls back to system prompt when personality is empty) |
+
+Every primary agent also receives the always-attached `cognis-orchestrator`
+system skill. It teaches the agent when to stay inline, when to use
+`system:general-task`, and when to call `compose_and_run_workflow`.
 
 ### Secondary Agents
 
@@ -697,6 +701,35 @@ Respond with a single JSON object:
 }
 ```
 
+#### `system:workflow_composer`
+
+Composes a workflow definition from the main agent's distilled intent, context,
+visible workflow templates, and relevant skills.
+
+- **Tools**: none
+- **Hidden**: true
+
+```
+You are a workflow composer. Produce a single JSON object describing the
+smallest correct workflow for the requested work. Reuse existing coding,
+research, and user workflow templates when they fit. Prefer proportional
+structure over generic single-step execution.
+```
+
+#### `system:skill_decomposer`
+
+Derives step fragments from an instruction-only skill when the workflow
+composer needs structure but the skill does not declare `steps:` explicitly.
+
+- **Tools**: none
+- **Hidden**: true
+
+```
+You are a skill decomposer. Given a skill's instructions and the current
+intent, produce a compact set of reusable workflow step fragments as JSON.
+Return only structure, no explanations.
+```
+
 ## Workflow Step Agent Override
 
 Workflow steps can specify a secondary agent to handle that step instead
@@ -916,6 +949,24 @@ Workflow(
 )
 ```
 
+### `system:bug-fix`
+
+Shorter coding workflow for narrow fixes where architecture review would be
+overhead. Typical shape:
+
+- `reproduce` — confirm the bug and isolate the failure
+- `fix` — implement the minimal correct change
+- `verify` — run focused verification/tests
+- `commit` — create a conventional commit if requested
+
+### `system:code-research`
+
+Read-heavy coding workflow for understanding or explaining a codebase area
+without making changes. Typical shape:
+
+- `explore` — inspect the relevant code paths and evidence
+- `synthesize` — produce the explanation/report deliverable
+
 ### `system:creative`
 
 Content generation with evaluation loop. Unchanged.
@@ -935,6 +986,8 @@ SYSTEM_AGENTS: dict[str, AgentDefinition] = {
     "system:compaction": AgentDefinition(..., hidden=True),
     "system:classifier": AgentDefinition(..., hidden=True),
     "system:evaluator": AgentDefinition(..., hidden=True),
+    "system:workflow_composer": AgentDefinition(..., hidden=True),
+    "system:skill_decomposer": AgentDefinition(..., hidden=True),
 }
 
 
@@ -1212,10 +1265,12 @@ Served at:
 
 Skills are DB-managed instruction + tool bundles with import/export support.
 Skills provide instructions (injected into LLM context when activated), tool
-definitions, and prompt templates. Loaded on demand to keep context lean.
+definitions, prompt templates, and optional workflow material (`steps:` and
+workflow templates). Loaded on demand to keep context lean.
 
-For the MVP skill loader, `agent.skills` is stored inline as JSON with
-`items[*].tool_names` references to existing builtin/static tool names.
-MCP tool references are ignored in MVP and reserved for future phases.
+Official `SKILL.md` compatibility remains the baseline. Cognis-specific
+workflow extensions are optional. When a skill does not declare reusable
+workflow structure explicitly, the hidden `system:skill_decomposer` agent may
+derive step fragments on demand for `compose_and_run_workflow`.
 
 See [06-tool-system.md](06-tool-system.md) for the full skill system design.

@@ -262,6 +262,7 @@ POST   /api/v1/skills                         → Create skill
 GET    /api/v1/skills/:id                     → Get skill detail
 PUT    /api/v1/skills/:id                     → Update skill
 DELETE /api/v1/skills/:id                     → Delete skill (DB-managed only)
+POST   /api/v1/skills/:id/suggest-steps       → Suggest workflow step fragments from instructions
 POST   /api/v1/skills/:id/export             → Export skill as YAML
 POST   /api/v1/skills/import                  → Import skill from YAML
 ```
@@ -316,7 +317,7 @@ returned by the REST API.
 ```
 GET    /api/v1/tasks                              → List tasks (filterable by status, agent, priority, queue)
 POST   /api/v1/tasks                              → Create task (draft by default, or queued via source_type=chat)
-GET    /api/v1/tasks/:id                          → Task detail + workflow progress + step runs + dependencies + delivery config
+GET    /api/v1/tasks/:id                          → Task detail + workflow progress + step runs + dependencies + delivery config + workflow lifecycle metadata
 PATCH  /api/v1/tasks/:id                          → Update (title, description, priority, agent, workflow, delivery)
 DELETE /api/v1/tasks/:id                          → Cancel and remove
 POST   /api/v1/tasks/:id/submit                   → Move draft → queued (start execution)
@@ -418,7 +419,11 @@ GET    /api/v1/workflows/:id                  → Workflow details + steps
 PUT    /api/v1/workflows/:id                  → Update workflow
 DELETE /api/v1/workflows/:id                  → Delete workflow (user only)
 POST   /api/v1/workflows/:id/duplicate        → Duplicate workflow
+POST   /api/v1/workflows/:id/promote          → Return pre-populated workflow draft from an ephemeral workflow
 ```
+
+Workflow listing defaults to persistent, non-archived workflows. Debugging and
+agent introspection can opt into ephemeral workflows with `?include_ephemeral=true`.
 
 ### Workflow Runs
 
@@ -494,6 +499,8 @@ socket authenticates so stalled connections are detected proactively.
 {type: "escalation_expired", call_id}
 
 // Workflow progress
+{type: "workflow_composed", conversation_id, task_id, workflow_id, workflow_name,
+ lifecycle, steps}
 {type: "workflow_step_started", task_id, step_name, step_type, attempt}
 {type: "workflow_step_completed", task_id, step_name, attempt, output_summary}
 {type: "workflow_step_rejected", task_id, step_name, attempt, feedback}

@@ -3,7 +3,8 @@
 ## Purpose
 
 This document defines the implementation plan for runtime-supported auto
-selection of agents and workflows in Cognis.
+selection of agents and workflows in Cognis once a delegation or task-creation
+path has already been chosen.
 
 It turns the current prompt guidance around delegation, system specialists,
 and `wait` behavior into deterministic controller behavior shared by:
@@ -11,6 +12,10 @@ and `wait` behavior into deterministic controller behavior shared by:
 - direct delegation via `delegate`
 - task creation via `create_task`
 - workflow agent selection when the workflow or caller does not force an agent
+
+This spec does **not** decide whether the main chat agent should answer inline,
+use `system:general-task`, or call `compose_and_run_workflow`. That choice is
+owned by the main agent per [`27-workflow-composer.md`](27-workflow-composer.md).
 
 It depends on:
 
@@ -33,7 +38,7 @@ It depends on:
 - eligible candidate filtering for system and user agents
 - execution-envelope intersection so child execution cannot widen capability
 - runtime-led `wait` handling
-- classifier prompt/input schema for mode + workflow + agent selection
+- classifier prompt/input schema for workflow + agent selection
 - routing telemetry and regression tests
 
 ### Out of scope for the first implementation wave
@@ -44,6 +49,7 @@ It depends on:
 - cost dashboards or operator routing controls beyond basic feature flags and
   metrics
 - replacing workflow selection with a completely separate routing subsystem
+- main-chat workflow composition or turn-level compose-vs-inline selection
 
 ## Goals
 
@@ -53,6 +59,7 @@ It depends on:
 4. Allow system specialists and eligible user agents to participate in routing.
 5. Keep direct conversations responsive by making `wait` runtime-led.
 6. Keep classifier behavior advisory and bounded.
+7. Do not move main-chat workflow composition into controller-owned routing.
 
 ## Architectural Decisions
 
@@ -103,7 +110,6 @@ This pipeline is used by:
 
 ### Selection classes
 
-- `inline` — no child execution
 - `delegate` with `self`
 - `delegate` with a specialist or eligible user agent
 - `task` with selected workflow and execution agent
@@ -196,14 +202,13 @@ definition changes.
 
 ## Unified classifier
 
-One classifier may choose mode, workflow, agent, and advisory `wait`, with the
-controller retaining authority.
+One classifier may choose workflow, agent, and advisory `wait` for delegation
+and task-creation paths, with the controller retaining authority.
 
 ### Suggested response schema
 
 ```json
 {
-  "mode": "inline | delegate | task",
   "agent_selection": "auto | self | explicit",
   "selected_agent_id": "system:explore | system:research | system:code-review | system:architect | system:implement | <user-agent-id> | null",
   "selected_workflow_id": "<workflow-id> | null",

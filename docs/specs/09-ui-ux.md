@@ -60,6 +60,20 @@ Inline cards showing background work:
 
 Expandable to show progress steps and tool calls.
 
+### Workflow Composition Cards
+
+When the main agent decides to compose an ephemeral workflow for the current
+request, the chat timeline shows an inline card before background execution
+begins:
+
+```
+[workflow] Composed workflow: Bug Fix              [View] [Promote]
+    Lifecycle: Ephemeral | Steps: reproduce -> fix -> verify -> commit
+```
+
+This card is the user's proof that the agent chose structured execution rather
+than a generic background task.
+
 ### Tool Call Indicators
 ```
 [wrench] read_file("src/auth.py")  Approved | 0.3s
@@ -153,9 +167,11 @@ List all available skills (DB-managed + filesystem):
 
 - Each skill shows: name, description, tool count, source (db/file), tags
 - Skill detail: instructions preview, bundled tool names, prompt templates
+- Skill detail also shows optional `steps:` / workflow-template metadata
 - Create/edit skill definitions (DB-managed only; file-sourced are read-only)
 - Import/export skills as YAML
 - Delete skills (DB-managed only)
+- "Suggest step decomposition" action for instruction-only skills
 
 ## Settings Page
 
@@ -341,7 +357,7 @@ step-by-step progress:
 
 ```
 Task: "Implement user authentication"
-Workflow: Code with Review
+Workflow: Software Development
 Agent: Aria
 Dependencies: ← "Design API schema" (completed)
 
@@ -376,6 +392,7 @@ Task cards show:
 - Current status indicator
 - Priority badge
 - Workflow name
+- Workflow lifecycle badge (`persistent` / `ephemeral`)
 - Dependency indicator (waiting, met, or none)
 - Delivery indicator (same conversation, specific target, preferred channel, silent)
 - Quick actions (submit, pause, cancel, open detail)
@@ -448,6 +465,11 @@ Power users can create and edit workflows via a form-based editor:
 - visual pipeline preview
 - duplicate from existing workflow button
 - export/import as YAML
+- open-from-task flow that pre-populates a new workflow draft from an ephemeral
+  workflow run
+
+The workflow library defaults to persistent workflows only. A debug toggle can
+show ephemeral and archived workflows for inspection.
 
 ### Agent workflow settings
 

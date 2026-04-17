@@ -957,6 +957,14 @@ cost until discovered.
 Skills are DB-managed instruction + tool bundles with import/export support.
 Agents can also manage skills via a built-in LLM tool.
 
+Cognis remains compatible with the official `SKILL.md` style used by other
+harnesses. A skill may therefore be:
+
+- an instruction-only bundle that is loaded inline
+- a bundle with tool recipes
+- an instruction bundle that also declares reusable workflow material for the
+  workflow composer
+
 ```python
 class Skill(BaseModel):
     skill_id: str
@@ -965,6 +973,8 @@ class Skill(BaseModel):
     instructions: str              # Markdown, injected into context
     tools: list[ToolDefinition] = []
     prompt_templates: dict[str, str] = {}
+    steps: list[dict[str, Any]] = []
+    workflow_templates: list[dict[str, Any]] = []
     source: str                    # "db", "file"
     attach_to_all_agents: bool = False
     owner_email: str | None = None
@@ -981,6 +991,8 @@ CREATE TABLE skills (
     instructions TEXT NOT NULL,
     tools       JSON,              -- list of ToolDefinition dicts
     prompt_templates JSON,
+    steps       JSON,
+    workflow_templates JSON,
     tags        JSON,
     auto_load   INTEGER NOT NULL DEFAULT 0,  -- internal storage for attach_to_all_agents
     owner_email TEXT REFERENCES users(email),
@@ -997,6 +1009,9 @@ Skills are managed via:
 3. **Import/Export** — YAML format for GitOps workflows
 4. **LLM Tool** — `skill_write` built-in tool for agent self-management
 
+The import/export surface preserves plain `SKILL.md` compatibility. Cognis-only
+workflow extensions such as `steps:` and `workflow_templates:` are optional.
+
 ### Runtime Model
 
 Skills have three distinct runtime states:
@@ -1007,6 +1022,20 @@ Skills have three distinct runtime states:
    agents. These are highlighted in the prompt as preferred defaults.
 3. **Forced/Inherited** — workflow or delegation scoped attachments that can be
    injected into a sub-session explicitly.
+
+Skills may also participate in three execution shapes:
+
+1. **Inline guidance** — `instructions` loaded into a direct turn or
+   `system:general-task` execution.
+2. **Workflow fragment** — `steps:` consumed by `system:workflow_composer` as
+   reusable step material.
+3. **Workflow skeleton** — `workflow_templates:` consumed by the composer as a
+   full-process starting point.
+
+If a visible skill has no declared `steps:`, Cognis may still derive step
+fragments on demand through the hidden `system:skill_decomposer` agent. That
+derived structure is advisory to the composer and is never written back unless a
+user or agent explicitly saves it.
 
 Discoverability and attachment are intentionally separate. Agents should
 usually choose from prompt-announced skills and call `skill_load` directly
@@ -1041,6 +1070,10 @@ skills/
     templates/
       release-notes.md
 ```
+
+These filesystem skills use the same compatibility rules: plain `SKILL.md`
+content loads as instructions, and optional Cognis extensions can add
+`steps:` or `workflow_templates:` without changing the base format.
 
 ## Complete Tool Call Flow
 

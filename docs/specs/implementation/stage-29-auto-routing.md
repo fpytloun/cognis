@@ -7,11 +7,16 @@ PLANNED
 ## Goal
 
 Implement controller-owned auto-routing for delegation and task creation so
-Cognis can pick the right execution shape, workflow, and agent while
-preserving explicit user intent, workflow constraints, and capability ceilings.
+Cognis can pick the right workflow and agent once child execution has already
+been chosen, while preserving explicit user intent, workflow constraints, and
+capability ceilings.
 
 This stage turns the routing implementation plan into code with deterministic
 fallbacks, execution-envelope enforcement, and routing telemetry.
+
+This stage does **not** decide whether the main chat agent should answer
+inline, use `system:general-task`, or call `compose_and_run_workflow`. That
+decision remains agent-owned per [`../27-workflow-composer.md`](../27-workflow-composer.md).
 
 ## Dependencies
 
@@ -39,6 +44,7 @@ fallbacks, execution-envelope enforcement, and routing telemetry.
 - major redesign of the tool surface beyond current `bash` strategy
 - advanced operator dashboards beyond required routing metrics and logs
 - large UI redesigns unrelated to exposing the new routing semantics
+- main-chat compose-vs-inline decisions or workflow authoring
 
 ## Deliverables
 
@@ -69,7 +75,8 @@ fallbacks, execution-envelope enforcement, and routing telemetry.
 
 ### 5. Classifier fallback
 
-- unified classifier contract for mode/workflow/agent selection
+- unified classifier contract for workflow/agent selection in delegation and
+  task-creation paths
 - timeout and confidence thresholds
 - deterministic fallback behavior
 

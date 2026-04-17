@@ -17,8 +17,8 @@ behavior in production:
   allowed set
 
 This spec captures the scope of a final harness-polish stage before the
-deferred structural work (typed deliverables, step profiles, browser takeover,
-agent runtimes, auto routing) is taken up.
+deferred structural work (typed deliverables, step profiles, workflow-first
+composition, browser takeover, agent runtimes, auto routing) is taken up.
 
 ## Related Specs
 
@@ -74,6 +74,7 @@ refuse them at load time.
 - `Cost` accuracy for reasoning tokens (same as above)
 - Bedrock/Vertex reasoning-family detection improvements
 - typed deliverables, `write_deliverable`, step profiles (deferred)
+- workflow-first composition (deferred)
 - browser takeover / noVNC / session recording (deferred)
 - agent runtimes (deferred)
 - auto routing (deferred)
@@ -193,6 +194,7 @@ After this stage ships, the deferred structural stages follow:
 - first-class agent runtimes
 - auto routing for agents and workflows
 - workflow deliverables and step profiles
+- workflow-first composition
 
 Tracker numbering is updated so these deferred stages come after the
 harness-polish stage.

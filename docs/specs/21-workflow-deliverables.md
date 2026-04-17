@@ -4,6 +4,9 @@
 
 Workflow steps produce **deliverables** — typed, versioned artifacts that are the one and only user-facing output of a workflow step. Deliverables are authored via the controller-intercepted `write_deliverable` tool, stored durably, optionally evaluated, and delivered to the caller's channel exactly once per workflow.
 
+This contract applies equally to persistent system/user workflows and to
+ephemeral workflows composed on demand by the main agent.
+
 This document defines:
 
 - the deliverable domain model and lifecycle
@@ -14,7 +17,7 @@ This document defines:
 - data ownership and storage
 - the relationship to free-text assistant output
 
-Related specs: [`14-workflow-engine.md`](14-workflow-engine.md), [`22-step-profiles.md`](22-step-profiles.md), [`06-tool-system.md`](06-tool-system.md), [`09-ui-ux.md`](09-ui-ux.md).
+Related specs: [`14-workflow-engine.md`](14-workflow-engine.md), [`22-step-profiles.md`](22-step-profiles.md), [`06-tool-system.md`](06-tool-system.md), [`09-ui-ux.md`](09-ui-ux.md), [`27-workflow-composer.md`](27-workflow-composer.md).
 
 ## Motivation
 
@@ -59,7 +62,7 @@ The `write_deliverable` tool result returns a short preview and version id only.
 
 ### 6. Workflow-only
 
-`write_deliverable` is visible only inside workflow-execution contexts (workflow steps, including delegated sub-sessions running inside a workflow). It is not exposed in direct chat, where the assistant message is the reply.
+`write_deliverable` is visible only inside workflow-execution contexts (workflow steps, including delegated sub-sessions running inside a workflow, whether persistent or ephemeral). It is not exposed in direct chat, where the assistant message is the reply.
 
 ## Domain Model
 

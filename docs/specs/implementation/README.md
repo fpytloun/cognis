@@ -104,6 +104,7 @@ bring the codebase in line with the updated specs.
 | 28 | [First-Class Agent Runtimes](stage-28-agent-runtimes.md) | PLANNED | Runtime abstraction, `runtime_runs`, executor runtime RPC, Claude runtime host, projection model, direct chat/delegation/workflow parity |
 | 29 | [Auto Routing for Agents and Workflows](stage-29-auto-routing.md) | PLANNED | `auto` / `self` routing semantics, shared routing helper, execution-envelope enforcement, classifier fallback, telemetry |
 | 30 | [Workflow Deliverables and Step Profiles](stage-30-workflow-deliverables.md) | PLANNED | Typed deliverables + `write_deliverable`, once-only channel delivery, step profiles (`research`/`coding`), tool classification, system workflow wiring |
+| 31 | [Workflow-First Composition and Ephemeral Workflows](stage-31-workflow-composition.md) | PLANNED | `compose_and_run_workflow`, hidden workflow-composer and skill-decomposer agents, ephemeral workflow lifecycle, coding workflow family, skill `steps:` extension, promote-from-task UX |
 
 ## Scope Boundary
 
@@ -112,9 +113,9 @@ Stages 6a+ align the codebase with spec refinements made during design review.
 Stages 20-23 are the harness and provider stabilization sequence. Stage 25 is
 the final harness polish pass that closes verified gaps remaining after the
 stabilization sweep. Stage 26 lands the LLM-exposure auditing change (Intaris
-and Cognis together) before the rest of the deferred work. Stages 27-30 are
+and Cognis together) before the rest of the deferred work. Stages 27-31 are
 the deferred structural work (browser takeover, agent runtimes, auto routing,
-typed deliverables and step profiles) that follows.
+typed deliverables and step profiles, workflow-first composition) that follows.
 
 **Still out of scope / not yet shipped**: multi-user production hardening,
 Docker/K8s executors, A2A federation, cost tracking dashboard,

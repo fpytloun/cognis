@@ -10,7 +10,8 @@ The current architecture is directionally correct: controller-owned sessions,
 executor-owned tool execution, deferred tool exposure, Intaris-enforced
 guardrails, Mnemory-backed memory, and workflow-driven task execution.
 The review also found several real issues that must be resolved before the
-next structural layer such as typed deliverables and step profiles lands.
+next structural layer such as typed deliverables, step profiles, and
+workflow-first composition lands.
 
 This spec defines three near-term tracks:
 
@@ -18,8 +19,8 @@ This spec defines three near-term tracks:
 2. capability parity for real coding/research harness use
 3. prompt-cache, memory, and operational resilience refinement
 
-Deliverables and step profiles remain valid future work, but they are
-explicitly deferred until these tracks are complete.
+Deliverables, step profiles, and workflow-first composition remain valid future
+work, but they are explicitly deferred until these tracks are complete.
 
 ## Related Specs
 
@@ -34,6 +35,7 @@ explicitly deferred until these tracks are complete.
 - [`20-auto-routing-implementation-plan.md`](20-auto-routing-implementation-plan.md)
 - [`21-workflow-deliverables.md`](21-workflow-deliverables.md)
 - [`22-step-profiles.md`](22-step-profiles.md)
+- [`27-workflow-composer.md`](27-workflow-composer.md)
 
 ## Why This Stage Comes First
 
@@ -46,8 +48,9 @@ operator confidence more than missing product features:
 4. weak multi-replica and crash-recovery behavior
 5. workflow/task semantics that are sound in design but fragile in failure
 
-Adding typed deliverables or restrictive tool profiles on top of these issues
-would increase complexity before the base harness is reliable enough.
+Adding typed deliverables, restrictive tool profiles, or workflow composition on
+top of these issues would increase complexity before the base harness is
+reliable enough.
 
 ## Review Findings Summary
 
