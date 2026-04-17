@@ -40,6 +40,7 @@ TASK_TOOL_NAMES = {
     "get_task",
     "get_task_output",
     "get_task_step_output",
+    "get_task_step_logs",
     "respond_task_input",
     "update_task",
     "cancel_task",
@@ -368,9 +369,10 @@ CANCEL_TASK_TOOL = ToolDefinition(
 GET_TASK_OUTPUT_TOOL = ToolDefinition(
     name="get_task_output",
     description=(
-        "Get the full output of a completed task. Returns the content "
-        "produced by the final workflow step including full text, claims, "
-        "and structured outputs. Use get_task first to check task status."
+        "Get the final output of a completed task. Returns a compact anchored summary "
+        "of the latest approved delivering step, including content, claims, and structured "
+        "outputs. Use list_tool_output_anchors or read_tool_output_anchor on this tool call "
+        "for deeper sections when needed."
     ),
     parameters={
         "type": "object",
@@ -390,8 +392,10 @@ GET_TASK_OUTPUT_TOOL = ToolDefinition(
 GET_TASK_STEP_OUTPUT_TOOL = ToolDefinition(
     name="get_task_step_output",
     description=(
-        "Get the full output of a specific workflow step. Use get_task "
-        "first to see available step names and their statuses."
+        "Get the output of a specific workflow step attempt. Returns a compact anchored "
+        "summary with the step output, evaluation, and todos. Use get_task first to inspect "
+        "available steps and attempts, then use list_tool_output_anchors or read_tool_output_anchor "
+        "on this tool call for deeper sections."
     ),
     parameters={
         "type": "object",
@@ -403,6 +407,51 @@ GET_TASK_STEP_OUTPUT_TOOL = ToolDefinition(
             "step_name": {
                 "type": "string",
                 "description": "Name of the step (e.g., 'plan', 'research', 'synthesize').",
+            },
+            "attempt": {
+                "type": "integer",
+                "description": "Optional attempt number. Omit to inspect the latest attempt.",
+            },
+        },
+        "required": ["task_id", "step_name"],
+    },
+    source=ToolSource(type="builtin"),
+    category="orchestration",
+    read_only=True,
+)
+
+GET_TASK_STEP_LOGS_TOOL = ToolDefinition(
+    name="get_task_step_logs",
+    description=(
+        "Inspect the recorded execution log for a specific workflow step attempt. Returns a compact "
+        "anchored event timeline including assistant messages, reasoning, tool calls, and tool results. "
+        "Use read_tool_output_anchor on this tool call to drill into specific events, and use any call_id "
+        "you find there with read_tool_output or search_tool_output to inspect full tool output."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": "ID of the task.",
+            },
+            "step_name": {
+                "type": "string",
+                "description": "Name of the step to inspect.",
+            },
+            "attempt": {
+                "type": "integer",
+                "description": "Optional attempt number. Omit to inspect the latest attempt.",
+            },
+            "after_seq": {
+                "type": "integer",
+                "description": "Optional session event cursor. Use 0 for the start of the step session.",
+                "default": 0,
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum session events to inspect. Default: 50.",
+                "default": 50,
             },
         },
         "required": ["task_id", "step_name"],
@@ -489,6 +538,7 @@ _ALL_TASK_TOOLS = [
     GET_TASK_TOOL,
     GET_TASK_OUTPUT_TOOL,
     GET_TASK_STEP_OUTPUT_TOOL,
+    GET_TASK_STEP_LOGS_TOOL,
     RESPOND_TASK_INPUT_TOOL,
     UPDATE_TASK_TOOL,
     CANCEL_TASK_TOOL,

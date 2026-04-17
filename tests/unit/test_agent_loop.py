@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -16,17 +17,18 @@ from cognis.core.agent_loop import (
     PauseResolution,
     PauseWaiter,
     PendingPause,
+    PendingToolCallState,
     SessionLock,
     StepContext,
     StreamAccumulator,
-    _validate_step_completion_notification,
     _controller_builtin_enabled,
     _filter_model_inventory_tools,
+    _validate_step_completion_notification,
 )
 from cognis.core.runtime import ResolvedStepRuntime, build_local_executor_environment
 from cognis.models.agent import AgentDefinition, AgentPermissions
-from cognis.models.session import EventAppendResult, ReasoningReportResult
-from cognis.models.tool import Permission, ToolCall, ToolDefinition, ToolSource
+from cognis.models.session import EventAppendResult, ReasoningReportResult, SessionEvent
+from cognis.models.tool import Permission, ToolCall, ToolDefinition, ToolResult, ToolSource
 from cognis.models.workflow import (
     CompletionDeliveryPolicy,
     StepDefinition,
@@ -216,6 +218,148 @@ async def test_pause_waiter_resolve_unknown() -> None:
 def test_pause_waiter_pending_count() -> None:
     waiter = PauseWaiter()
     assert waiter.pending_count() == 0
+
+
+@pytest.mark.asyncio
+async def test_run_step_uses_step_local_pending_events_on_concurrent_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=SimpleNamespace(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+
+    captured: dict[str, list[dict[str, object]]] = {}
+    ready = asyncio.Event()
+    started: list[str] = []
+
+    async def _fake_execute_step(
+        ctx: StepContext,
+        *,
+        on_token: object = None,
+        on_tool_call: object = None,
+        on_tool_result: object = None,
+    ) -> None:
+        del on_token, on_tool_call, on_tool_result
+        ctx.pending_events = [
+            SessionEvent(
+                type="lifecycle",
+                data={"event": "system_notice", "message": f"pending-{ctx.session.session_id}"},
+            )
+        ]
+        started.append(ctx.session.session_id)
+        if len(started) == 2:
+            ready.set()
+        await ready.wait()
+        raise RuntimeError(f"boom-{ctx.session.session_id}")
+
+    async def _fake_record_events_strict(
+        ctx: StepContext,
+        events: list[SessionEvent],
+        *,
+        reason: str,
+        on_token: object = None,
+    ) -> bool:
+        del reason, on_token
+        captured[ctx.session.session_id] = [event.data for event in events]
+        events.clear()
+        return True
+
+    monkeypatch.setattr(agent_loop, "_execute_step", _fake_execute_step)
+    monkeypatch.setattr(agent_loop, "_record_events_strict", _fake_record_events_strict)
+
+    ctx_a = StepContext(
+        step_definition=StepDefinition(name="a", type="run"),
+        session=SimpleNamespace(session_id="sess-a", intaris_session_id="sess-a"),
+        conversation=SimpleNamespace(conversation_id="conv-a"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="A"),
+        policy=CHAT_POLICY,
+    )
+    ctx_b = StepContext(
+        step_definition=StepDefinition(name="b", type="run"),
+        session=SimpleNamespace(session_id="sess-b", intaris_session_id="sess-b"),
+        conversation=SimpleNamespace(conversation_id="conv-b"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="B"),
+        policy=CHAT_POLICY,
+    )
+
+    output_a, output_b = await asyncio.gather(
+        agent_loop.run_step(ctx_a), agent_loop.run_step(ctx_b)
+    )
+
+    assert output_a is not None and output_b is not None
+    assert output_a.error == "RuntimeError: boom-sess-a"
+    assert output_b.error == "RuntimeError: boom-sess-b"
+    assert [item["message"] for item in captured["sess-a"]] == [
+        "pending-sess-a",
+        "Step failed: RuntimeError: boom-sess-a",
+    ]
+    assert [item["message"] for item in captured["sess-b"]] == [
+        "pending-sess-b",
+        "Step failed: RuntimeError: boom-sess-b",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_emergency_flush_repairs_interrupted_tool_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=SimpleNamespace(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    captured: list[SessionEvent] = []
+
+    async def _fake_record_events_strict(
+        ctx: StepContext,
+        events: list[SessionEvent],
+        *,
+        reason: str,
+        on_token: object = None,
+    ) -> bool:
+        del ctx, reason, on_token
+        captured.extend(events)
+        events.clear()
+        return True
+
+    monkeypatch.setattr(agent_loop, "_record_events_strict", _fake_record_events_strict)
+
+    ctx = StepContext(
+        step_definition=StepDefinition(name="step", type="run"),
+        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+    )
+    pending_call = ToolCall(call_id="call-1", name="bash", arguments={"command": "sleep 10"})
+    ctx.pending_tool_calls[pending_call.call_id] = PendingToolCallState(
+        tool_call=pending_call,
+        tool_id="bash",
+    )
+
+    await agent_loop._emergency_flush_events(ctx, [])
+
+    assert len(captured) == 1
+    assert captured[0].type == "tool_result"
+    assert captured[0].data["call_id"] == "call-1"
+    assert captured[0].data["is_error"] is True
+    assert "interrupted before a result was recorded" in str(captured[0].data["result"])
 
 
 def test_filter_model_inventory_tools_excludes_controller_and_denied_tools() -> None:
@@ -622,6 +766,14 @@ class _NoopEventBus:
 class _NoopGuardrails:
     async def record_events(self, **_: object) -> EventAppendResult:
         return EventAppendResult(ok=True, count=1, first_seq=1, last_seq=1)
+
+    async def read_events(self, **_: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            events=[],
+            last_seq=0,
+            has_more=False,
+            missing_stream_fallback_used=False,
+        )
 
     async def report_reasoning(self, **_: object) -> ReasoningReportResult:
         return ReasoningReportResult(ok=True)
@@ -2055,6 +2207,349 @@ async def test_get_task_tool_rejects_cross_user_task_even_for_system_agent(
 
     assert result.is_error is True
     assert json.loads(result.output)["message"] == "Task belongs to a different agent."
+
+
+@pytest.mark.asyncio
+async def test_controller_tool_output_store_persists_anchored_outputs() -> None:
+    class _Store:
+        def __init__(self) -> None:
+            self.saved: list[tuple[str, str, list[dict[str, object]] | None]] = []
+
+        async def save(
+            self,
+            call_id: str,
+            output: str,
+            *,
+            anchors: list[dict[str, object]] | None = None,
+        ) -> None:
+            self.saved.append((call_id, output, anchors))
+
+    store = _Store()
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=SimpleNamespace(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+        tool_output_store=store,
+    )
+
+    result = ToolResult(
+        output="preview",
+        metadata={
+            "stored_output": "[[overview]]\nFull output",
+            "output_anchors": [
+                {
+                    "anchor": "overview",
+                    "label": "Overview",
+                    "kind": "overview",
+                    "start_line": 1,
+                    "end_line": 2,
+                }
+            ],
+        },
+    )
+
+    await agent_loop._save_tool_output_if_available("call-1", result)
+
+    assert store.saved == [
+        (
+            "call-1",
+            "[[overview]]\nFull output",
+            [
+                {
+                    "anchor": "overview",
+                    "label": "Overview",
+                    "kind": "overview",
+                    "start_line": 1,
+                    "end_line": 2,
+                }
+            ],
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_get_task_step_output_returns_anchored_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=SimpleNamespace(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-1", intaris_session_id="sess-1", user_email="user@example.com"
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+    )
+
+    async def _get_task(*args: object, **kwargs: object) -> SimpleNamespace:
+        del args, kwargs
+        return SimpleNamespace(task_id="task-1", created_by="user@example.com", agent_id="agent-1")
+
+    async def _list_step_runs(*args: object, **kwargs: object) -> list[SimpleNamespace]:
+        del args, kwargs
+        long_content = "Detailed implementation plan. " * 80
+        return [
+            SimpleNamespace(
+                step_run_id="sr-old",
+                step_name="plan",
+                status="approved",
+                attempt=2,
+                session_id="sess-step-old",
+                conversation_id="conv-task-1",
+                started_at=datetime(2026, 1, 1, tzinfo=UTC),
+                completed_at=datetime(2026, 1, 1, 0, 4, tzinfo=UTC),
+                output={
+                    "summary": "Old plan",
+                    "content": "Old duplicate attempt content.",
+                    "claims": ["Old claim"],
+                    "outputs": {"milestones": 2},
+                },
+                evaluation={"decision": "approved", "feedback": None},
+                todos=[{"content": "Old todo", "status": "completed"}],
+            ),
+            SimpleNamespace(
+                step_run_id="sr-1",
+                step_name="plan",
+                status="approved",
+                attempt=2,
+                session_id="sess-step-1",
+                conversation_id="conv-task-1",
+                started_at=datetime(2026, 1, 1, tzinfo=UTC),
+                completed_at=datetime(2026, 1, 1, 0, 5, tzinfo=UTC),
+                output={
+                    "summary": "Plan finished",
+                    "content": long_content,
+                    "claims": ["Reviewed requirements", "Defined milestones"],
+                    "outputs": {"milestones": 3},
+                },
+                evaluation={"decision": "approved", "feedback": None},
+                todos=[{"content": "Outline milestones", "status": "completed"}],
+            ),
+        ]
+
+    monkeypatch.setattr("cognis.store.queries.get_task", _get_task)
+    monkeypatch.setattr("cognis.store.queries.list_step_runs_for_task", _list_step_runs)
+
+    result = await agent_loop._handle_task_tool(
+        ToolCall(
+            call_id="call-1",
+            name="get_task_step_output",
+            arguments={"task_id": "task-1", "step_name": "plan", "attempt": 2},
+        ),
+        ctx=ctx,
+        events_to_record=[],
+    )
+
+    assert result.is_error is False
+    payload = json.loads(result.output)
+    assert payload["step_run_id"] == "sr-1"
+    assert payload["content"].endswith("[snippet truncated]")
+    assert "content" in payload["available_anchors"]
+    assert result.metadata is not None
+    assert "[[content]]" in str(result.metadata["stored_output"])
+    assert "Detailed implementation plan." in str(result.metadata["stored_output"])
+    assert any(anchor["anchor"] == "content" for anchor in result.metadata["output_anchors"])
+
+
+@pytest.mark.asyncio
+async def test_get_task_step_logs_returns_anchored_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=SimpleNamespace(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-1", intaris_session_id="sess-1", user_email="user@example.com"
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+    )
+
+    async def _get_task(*args: object, **kwargs: object) -> SimpleNamespace:
+        del args, kwargs
+        return SimpleNamespace(task_id="task-1", created_by="user@example.com", agent_id="agent-1")
+
+    async def _list_step_runs(*args: object, **kwargs: object) -> list[SimpleNamespace]:
+        del args, kwargs
+        return [
+            SimpleNamespace(
+                step_run_id="sr-1",
+                step_name="plan",
+                status="approved",
+                attempt=1,
+                session_id="sess-step-1",
+                intaris_session_id=None,
+                output={"summary": "Old attempt"},
+            ),
+            SimpleNamespace(
+                step_run_id="sr-2",
+                step_name="plan",
+                status="approved",
+                attempt=2,
+                session_id=None,
+                intaris_session_id="intaris-step-2",
+                output={"summary": "Latest attempt"},
+            ),
+        ]
+
+    async def _read_events(**kwargs: object) -> SimpleNamespace:
+        assert kwargs["session_id"] == "intaris-step-2"
+        assert kwargs["after_seq"] == 0
+        return SimpleNamespace(
+            events=[
+                {
+                    "seq": 1,
+                    "type": "assistant_message",
+                    "data": {"content": "Planning approach"},
+                    "ts": "2026-01-01T00:00:00Z",
+                },
+                {
+                    "seq": 2,
+                    "type": "tool_call",
+                    "data": {
+                        "name": "bash",
+                        "call_id": "tool-call-1",
+                        "arguments": '{"command": "git status"}',
+                    },
+                    "ts": "2026-01-01T00:00:01Z",
+                },
+                {
+                    "seq": 3,
+                    "type": "tool_result",
+                    "data": {
+                        "name": "bash",
+                        "call_id": "tool-call-1",
+                        "is_error": False,
+                        "duration_ms": 120,
+                        "result": "On branch main",
+                        "has_full_output": True,
+                    },
+                    "ts": "2026-01-01T00:00:02Z",
+                },
+            ],
+            last_seq=3,
+            has_more=True,
+            missing_stream_fallback_used=False,
+        )
+
+    monkeypatch.setattr("cognis.store.queries.get_task", _get_task)
+    monkeypatch.setattr("cognis.store.queries.list_step_runs_for_task", _list_step_runs)
+    monkeypatch.setattr(agent_loop.providers.guardrails, "read_events", _read_events)
+
+    result = await agent_loop._handle_task_tool(
+        ToolCall(
+            call_id="call-1",
+            name="get_task_step_logs",
+            arguments={"task_id": "task-1", "step_name": "plan", "attempt": 2},
+        ),
+        ctx=ctx,
+        events_to_record=[],
+    )
+
+    assert result.is_error is False
+    assert "[[overview]]" in result.output
+    assert result.metadata is not None
+    stored_output = str(result.metadata["stored_output"])
+    assert "[[tool_call:1]]" in stored_output
+    assert "tool-call-1" in stored_output
+    assert any(anchor["anchor"] == "tool_result:1" for anchor in result.metadata["output_anchors"])
+
+
+@pytest.mark.asyncio
+async def test_get_task_step_logs_returns_structured_error_on_read_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=SimpleNamespace(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-1", intaris_session_id="sess-1", user_email="user@example.com"
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+    )
+
+    async def _get_task(*args: object, **kwargs: object) -> SimpleNamespace:
+        del args, kwargs
+        return SimpleNamespace(task_id="task-1", created_by="user@example.com", agent_id="agent-1")
+
+    async def _list_step_runs(*args: object, **kwargs: object) -> list[SimpleNamespace]:
+        del args, kwargs
+        return [
+            SimpleNamespace(
+                step_run_id="sr-2",
+                step_name="plan",
+                status="approved",
+                attempt=2,
+                session_id=None,
+                intaris_session_id="intaris-step-2",
+                output={"summary": "Latest attempt"},
+            )
+        ]
+
+    async def _read_events(**kwargs: object) -> SimpleNamespace:
+        del kwargs
+        raise RuntimeError("Intaris unavailable")
+
+    monkeypatch.setattr("cognis.store.queries.get_task", _get_task)
+    monkeypatch.setattr("cognis.store.queries.list_step_runs_for_task", _list_step_runs)
+    monkeypatch.setattr(agent_loop.providers.guardrails, "read_events", _read_events)
+
+    result = await agent_loop._handle_task_tool(
+        ToolCall(
+            call_id="call-1",
+            name="get_task_step_logs",
+            arguments={"task_id": "task-1", "step_name": "plan", "attempt": 2},
+        ),
+        ctx=ctx,
+        events_to_record=[],
+    )
+
+    assert result.is_error is True
+    assert "Failed to read step logs" in json.loads(result.output)["error"]
 
 
 @pytest.mark.asyncio

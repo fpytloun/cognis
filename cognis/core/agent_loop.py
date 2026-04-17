@@ -23,6 +23,7 @@ from typing import Any
 from prometheus_client import Counter, Histogram
 from pydantic import ValidationError
 
+from cognis.core.anchored_output import AnchoredTextBuilder, compact_snippet
 from cognis.core.attachment_utils import (
     merge_content_and_attachment_note,
     normalize_attachment_refs,
@@ -87,6 +88,7 @@ logger = get_logger(__name__)
 
 _BOOTSTRAP_INTENTION_WAIT_MS = 1500
 _INTARIS_RETRY_POLL_SECONDS = 5.0
+_INTARIS_MAX_RECOVERY_WAIT_SECONDS = 60.0
 
 
 def _user_message_for_recording(content: str, attachments: list[AttachmentRef]) -> str:
@@ -95,6 +97,36 @@ def _user_message_for_recording(content: str, attachments: list[AttachmentRef]) 
     if not attachments:
         return content
     return "User attached files."
+
+
+def _indent_block(text: str, *, prefix: str = "    ") -> list[str]:
+    """Render multiline text as an indented block."""
+
+    if not text:
+        return []
+    return [f"{prefix}{line}" for line in text.splitlines()]
+
+
+def _json_text(value: Any) -> str:
+    """Render a JSON-serializable value as pretty text."""
+
+    return json.dumps(value, indent=2, sort_keys=True, default=str)
+
+
+def _task_log_anchor_kind(event_type: str) -> str:
+    """Map session event types to stable anchor prefixes."""
+
+    mapping = {
+        "assistant_message": "assistant",
+        "user_message": "user",
+        "reasoning": "reasoning",
+        "tool_call": "tool_call",
+        "tool_result": "tool_result",
+        "lifecycle": "lifecycle",
+        "delegation": "delegation",
+        "system_message": "system_message",
+    }
+    return mapping.get(event_type, "event")
 
 
 # Prometheus metrics
@@ -418,6 +450,44 @@ def _append_tool_result_event(
             },
         )
     )
+
+
+@dataclass
+class PendingToolCallState:
+    """Tracks a tool call whose transcript entry lacks a matching result."""
+
+    tool_call: ToolCall
+    tool_id: str | None = None
+
+
+def _track_pending_tool_call(ctx: StepContext, tc: ToolCall, *, tool_id: str | None = None) -> None:
+    """Mark a tool call as awaiting a result event."""
+
+    ctx.pending_tool_calls[tc.call_id] = PendingToolCallState(tool_call=tc, tool_id=tool_id)
+
+
+def _resolve_pending_tool_call(ctx: StepContext, call_id: str) -> None:
+    """Mark a tool call as having a recorded result event."""
+
+    ctx.pending_tool_calls.pop(call_id, None)
+
+
+def _append_interrupted_tool_results(ctx: StepContext, events: list[SessionEvent]) -> int:
+    """Close any in-flight tool calls before flushing interrupted state."""
+
+    repaired = 0
+    pending_calls = list(ctx.pending_tool_calls.values())
+    ctx.pending_tool_calls.clear()
+    for pending in pending_calls:
+        _append_tool_result_event(
+            events,
+            pending.tool_call,
+            "Tool execution was interrupted before a result was recorded.",
+            True,
+            tool_id=pending.tool_id,
+        )
+        repaired += 1
+    return repaired
 
 
 def _controller_tool_definition(tool_name: str) -> ToolDefinition:
@@ -943,6 +1013,8 @@ class StepContext:
     )
     # Harness guards (step-scoped; reset per step execution).
     loop_guard_state: LoopGuardState = field(default_factory=LoopGuardState)
+    pending_events: list[SessionEvent] | None = None
+    pending_tool_calls: dict[str, PendingToolCallState] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -985,10 +1057,6 @@ class AgentLoop:
         self._task_queue: Any = None
         self._step_runtime_factory = step_runtime_factory
         self._follow_up_policy = FollowUpPolicy(llm=getattr(providers, "llm", None))
-        # Emergency event flush support — tracks pending events across
-        # _execute_step and run_step for exception-path persistence.
-        self._pending_events: list[SessionEvent] | None = None
-        self._pending_events_ctx: StepContext | None = None
         # Track active child sessions per parent session for /stop cancellation
         self._active_children: dict[str, dict[str, asyncio.Task[Any]]] = {}
         self._children_lock = asyncio.Lock()
@@ -1040,7 +1108,7 @@ class AgentLoop:
         except StepInterrupted:
             # Emergency flush: persist any accumulated events before
             # the cancellation propagates — events represent real work.
-            await self._emergency_flush_events(ctx, self._pending_events)
+            await self._emergency_flush_events(ctx, ctx.pending_events)
             raise
         except Exception as exc:
             logger.exception(
@@ -1050,7 +1118,11 @@ class AgentLoop:
             # Record a system_notice so the failure is visible in the
             # step session logs (UI chat timeline).
             error_msg = f"{type(exc).__name__}: {exc}"
-            self._pending_events.append(
+            pending_events = ctx.pending_events
+            if pending_events is None:
+                pending_events = []
+                ctx.pending_events = pending_events
+            pending_events.append(
                 SessionEvent(
                     type="lifecycle",
                     data={
@@ -1061,7 +1133,7 @@ class AgentLoop:
             )
             # Emergency flush: persist any accumulated events (including
             # the error notice) before reporting failure.
-            await self._emergency_flush_events(ctx, self._pending_events)
+            await self._emergency_flush_events(ctx, pending_events)
             STEPS_TOTAL.labels(step_type=ctx.step_definition.type, status="error").inc()
             # Return a StepOutput with the error so it can be stored and
             # displayed in the UI instead of silently returning None.
@@ -1485,9 +1557,8 @@ class AgentLoop:
         todo_reprompt_count = 0
         step_output: StepOutput | None = None
         events_to_record: list[SessionEvent] = []
-        # Store on instance for emergency flush access from run_step
-        self._pending_events = events_to_record
-        self._pending_events_ctx = ctx
+        ctx.pending_events = events_to_record
+        ctx.pending_tool_calls.clear()
         messages: list[dict[str, Any]] = []
         assistant_content_parts: list[str] = []  # User-visible assistant output only
         assistant_memory_parts: list[str] = []  # Include attachment notes for memory/compaction
@@ -2389,6 +2460,7 @@ class AgentLoop:
                         reason="tool_call:step_request_input",
                         on_token=on_token,
                     )
+                    _track_pending_tool_call(ctx, tc, tool_id=tool_id)
                     if (
                         ctx.interaction_mode != "step_requests"
                         or not ctx.step_definition.allow_questions
@@ -2402,6 +2474,7 @@ class AgentLoop:
                         _append_tool_result_event(
                             events_to_record, tc, err_content, True, tool_id=tool_id
                         )
+                        _resolve_pending_tool_call(ctx, tc.call_id)
                         await self._flush_events_incremental(
                             ctx,
                             events_to_record,
@@ -2422,6 +2495,7 @@ class AgentLoop:
                         _append_tool_result_event(
                             events_to_record, tc, rec_content, False, tool_id=tool_id
                         )
+                        _resolve_pending_tool_call(ctx, tc.call_id)
                         await self._flush_events_incremental(
                             ctx,
                             events_to_record,
@@ -2494,6 +2568,7 @@ class AgentLoop:
                         _append_tool_result_event(
                             events_to_record, tc, resp_content, False, tool_id=tool_id
                         )
+                        _resolve_pending_tool_call(ctx, tc.call_id)
                         await self._flush_events_incremental(
                             ctx,
                             events_to_record,
@@ -2518,6 +2593,7 @@ class AgentLoop:
                         _append_tool_result_event(
                             events_to_record, tc, timeout_content, True, tool_id=tool_id
                         )
+                        _resolve_pending_tool_call(ctx, tc.call_id)
                         await self._flush_events_incremental(
                             ctx,
                             events_to_record,
@@ -2538,6 +2614,7 @@ class AgentLoop:
                         reason=f"tool_call:{tc.name}",
                         on_token=on_token,
                     )
+                    _track_pending_tool_call(ctx, tc, tool_id=tool_id)
                     pause_id = f"auth_{uuid.uuid4().hex[:12]}"
                     timeout_seconds = int(tc.arguments.get("timeout_seconds", 600) or 600)
                     auth_payload: dict[str, Any] = {
@@ -2610,6 +2687,7 @@ class AgentLoop:
                             _append_tool_result_event(
                                 events_to_record, tc, err_content, True, tool_id=tool_id
                             )
+                            _resolve_pending_tool_call(ctx, tc.call_id)
                             await self._flush_events_incremental(
                                 ctx,
                                 events_to_record,
@@ -2632,6 +2710,7 @@ class AgentLoop:
                             _append_tool_result_event(
                                 events_to_record, tc, err_content, True, tool_id=tool_id
                             )
+                            _resolve_pending_tool_call(ctx, tc.call_id)
                             await self._flush_events_incremental(
                                 ctx,
                                 events_to_record,
@@ -2660,6 +2739,7 @@ class AgentLoop:
                         _append_tool_result_event(
                             events_to_record, tc, resp_content, False, tool_id=tool_id
                         )
+                        _resolve_pending_tool_call(ctx, tc.call_id)
                         await self._flush_events_incremental(
                             ctx,
                             events_to_record,
@@ -2688,6 +2768,7 @@ class AgentLoop:
                         _append_tool_result_event(
                             events_to_record, tc, timeout_content, True, tool_id=tool_id
                         )
+                        _resolve_pending_tool_call(ctx, tc.call_id)
                         await self._flush_events_incremental(
                             ctx,
                             events_to_record,
@@ -2836,6 +2917,7 @@ class AgentLoop:
                         on_tool_call=on_tool_call,
                         on_tool_result=on_tool_result,
                     )
+                    await self._save_tool_output_if_available(tc.call_id, orch_result)
                     messages.append(
                         {
                             "role": "tool",
@@ -2906,6 +2988,7 @@ class AgentLoop:
                         reason=f"tool_call:{tool_id}",
                         on_token=on_token,
                     )
+                    _track_pending_tool_call(ctx, tc, tool_id=tool_id)
 
                     result = await self.tool_router.execute(
                         tc.model_copy(
@@ -2932,15 +3015,8 @@ class AgentLoop:
                     stored_output = (
                         result.metadata.get("stored_output") if result.metadata else None
                     )
-                    if (stored_output or raw_output) and self.tool_output_store is not None:
-                        anchors = result.metadata.get("output_anchors") if result.metadata else None
-                        await self.tool_output_store.save(
-                            tc.call_id,
-                            stored_output
-                            if isinstance(stored_output, str) and stored_output
-                            else raw_output,
-                            anchors=anchors if isinstance(anchors, list) else None,
-                        )
+                    if stored_output or raw_output:
+                        await self._save_tool_output_if_available(tc.call_id, result)
 
                     # Intaris gets a middle-truncated preview (larger than
                     # the WS preview) so compaction and audit have useful
@@ -2952,6 +3028,7 @@ class AgentLoop:
                         result.metadata.get("original_size") if result.metadata else None
                     )
                     eval_meta = result.metadata.get("evaluation") if result.metadata else None
+                    has_saved_output = bool(raw_output or stored_output)
                     events_to_record.append(
                         SessionEvent(
                             type="tool_result",
@@ -2968,11 +3045,12 @@ class AgentLoop:
                                 "duration_ms": result.duration_ms,
                                 "result": intaris_preview,
                                 "output_size": original_size or len(result.output),
-                                "has_full_output": raw_output is not None,
+                                "has_full_output": has_saved_output,
                                 "evaluation": eval_meta,
                             },
                         )
                     )
+                    _resolve_pending_tool_call(ctx, tc.call_id)
                     await self._flush_events_incremental(
                         ctx,
                         events_to_record,
@@ -3120,8 +3198,8 @@ class AgentLoop:
         else:
             STEPS_TOTAL.labels(step_type=ctx.step_definition.type, status="failed").inc()
 
-        self._pending_events = None
-        self._pending_events_ctx = None
+        ctx.pending_events = None
+        ctx.pending_tool_calls.clear()
         return step_output
 
     # ------------------------------------------------------------------
@@ -3635,6 +3713,7 @@ class AgentLoop:
             task_workflow_run_response,
         )
         from cognis.store.queries import (
+            get_session_row,
             get_task,
             list_step_runs_for_task,
             list_tasks_for_agent,
@@ -3792,10 +3871,26 @@ class AgentLoop:
             task_model = _task_row_to_model(task_row)
             step_run_summaries = [
                 {
+                    "step_run_id": getattr(sr, "step_run_id", None),
                     "step_name": sr.step_name,
                     "status": sr.status,
                     "attempt": sr.attempt,
+                    "session_id": getattr(sr, "session_id", None),
+                    "conversation_id": getattr(sr, "conversation_id", None),
+                    "started_at": str(getattr(sr, "started_at", None))
+                    if getattr(sr, "started_at", None)
+                    else None,
+                    "completed_at": str(getattr(sr, "completed_at", None))
+                    if getattr(sr, "completed_at", None)
+                    else None,
                     "summary": (sr.output or {}).get("summary", "") if sr.output else "",
+                    "evaluation_decision": (
+                        (sr.evaluation or {}).get("decision")
+                        if getattr(sr, "evaluation", None)
+                        else None
+                    ),
+                    "has_output": bool(getattr(sr, "output", None)),
+                    "has_logs": bool(getattr(sr, "session_id", None)),
                 }
                 for sr in step_rows
             ]
@@ -3855,19 +3950,10 @@ class AgentLoop:
             # Find the last completed step with output
             completed = [sr for sr in reversed(step_rows) if sr.status == "approved" and sr.output]
             if completed:
-                output = completed[0].output
-                return ToolResult(
-                    output=json.dumps(
-                        {
-                            "step_name": completed[0].step_name,
-                            "summary": output.get("summary", ""),
-                            "content": output.get("content", ""),
-                            "claims": output.get("claims", []),
-                            "outputs": output.get("outputs", {}),
-                        },
-                        default=str,
-                    ),
-                )
+                return self._build_task_step_output_result(task_id=task_id, step_run=completed[0])
+            compact_output = "No output available."
+            anchors: list[dict[str, object]] = []
+            stored_output = compact_output
             return ToolResult(
                 output=json.dumps(
                     {
@@ -3875,13 +3961,21 @@ class AgentLoop:
                         "content": "",
                         "claims": [],
                         "outputs": {},
+                        "available_anchors": [],
                     }
                 ),
+                metadata={
+                    "stored_output": stored_output,
+                    "output_anchors": anchors,
+                },
             )
 
         elif tc.name == "get_task_step_output":
             task_id = tc.arguments.get("task_id", "")
             step_name = tc.arguments.get("step_name", "")
+            attempt, attempt_error = self._parse_attempt_argument(tc.arguments.get("attempt"))
+            if attempt_error is not None:
+                return ToolResult(output=json.dumps({"error": attempt_error}), is_error=True)
             async with self.session_manager.session_factory() as db:
                 task_row = await get_task(db, task_id)
                 if task_row is None:
@@ -3894,28 +3988,103 @@ class AgentLoop:
                         is_error=True,
                     )
                 step_rows = await list_step_runs_for_task(db, task_id)
-            matching = [sr for sr in step_rows if sr.step_name == step_name]
-            if not matching:
+            selected_run, select_error = self._select_step_run(
+                step_rows,
+                step_name=step_name,
+                attempt=attempt,
+            )
+            if selected_run is None:
+                return ToolResult(output=json.dumps({"error": select_error}), is_error=True)
+            return self._build_task_step_output_result(task_id=task_id, step_run=selected_run)
+
+        elif tc.name == "get_task_step_logs":
+            task_id = tc.arguments.get("task_id", "")
+            step_name = tc.arguments.get("step_name", "")
+            attempt, attempt_error = self._parse_attempt_argument(tc.arguments.get("attempt"))
+            if attempt_error is not None:
+                return ToolResult(output=json.dumps({"error": attempt_error}), is_error=True)
+            after_seq = tc.arguments.get("after_seq", 0)
+            limit = tc.arguments.get("limit", 50)
+            try:
+                after_seq = int(after_seq)
+                limit = int(limit)
+            except (TypeError, ValueError):
                 return ToolResult(
-                    output=json.dumps({"error": f"No step '{step_name}' found for this task."}),
+                    output=json.dumps({"error": "after_seq and limit must be integers."}),
                     is_error=True,
                 )
-            latest = matching[-1]
-            output = latest.output or {}
-            return ToolResult(
-                output=json.dumps(
-                    {
-                        "step_name": latest.step_name,
-                        "status": latest.status,
-                        "attempt": latest.attempt,
-                        "summary": output.get("summary", ""),
-                        "content": output.get("content", ""),
-                        "claims": output.get("claims", []),
-                        "outputs": output.get("outputs", {}),
-                        "error": output.get("error"),
-                    },
-                    default=str,
-                ),
+            if after_seq < 0:
+                return ToolResult(
+                    output=json.dumps({"error": "after_seq must be 0 or greater."}),
+                    is_error=True,
+                )
+            if limit <= 0:
+                return ToolResult(
+                    output=json.dumps({"error": "limit must be a positive integer."}),
+                    is_error=True,
+                )
+            async with self.session_manager.session_factory() as db:
+                task_row = await get_task(db, task_id)
+                if task_row is None:
+                    return ToolResult(
+                        output=json.dumps({"error": "Task not found."}), is_error=True
+                    )
+                if not await self._can_access_task(task_row, ctx):
+                    return ToolResult(
+                        output=json.dumps({"error": "Task belongs to a different agent."}),
+                        is_error=True,
+                    )
+                step_rows = await list_step_runs_for_task(db, task_id)
+                selected_run, select_error = self._select_step_run(
+                    step_rows,
+                    step_name=step_name,
+                    attempt=attempt,
+                )
+                if selected_run is None:
+                    return ToolResult(output=json.dumps({"error": select_error}), is_error=True)
+                intaris_session_id = getattr(selected_run, "intaris_session_id", None)
+                if not intaris_session_id and getattr(selected_run, "session_id", None):
+                    session_row = await get_session_row(db, selected_run.session_id)
+                    if session_row is not None:
+                        intaris_session_id = (
+                            session_row.intaris_session_id or session_row.session_id
+                        )
+            if not intaris_session_id:
+                return ToolResult(
+                    output=json.dumps(
+                        {
+                            "error": (
+                                "No step session is recorded for this attempt yet, so there are no logs to inspect."
+                            )
+                        }
+                    ),
+                    is_error=True,
+                )
+            try:
+                event_result = await self.providers.guardrails.read_events(
+                    session_id=intaris_session_id,
+                    after_seq=after_seq,
+                    limit=min(limit, 200),
+                    allow_missing_stream=True,
+                )
+            except Exception as exc:
+                return ToolResult(
+                    output=json.dumps(
+                        {
+                            "error": f"Failed to read step logs: {type(exc).__name__}: {exc}",
+                        }
+                    ),
+                    is_error=True,
+                )
+            return self._build_task_step_logs_result(
+                task_id=task_id,
+                step_run=selected_run,
+                events=list(event_result.events),
+                last_seq=event_result.last_seq,
+                has_more=event_result.has_more,
+                after_seq=after_seq,
+                limit=min(limit, 200),
+                missing_stream=bool(getattr(event_result, "missing_stream_fallback_used", False)),
             )
 
         elif tc.name == "respond_task_input":
@@ -4201,6 +4370,375 @@ class AgentLoop:
             return await registry.is_secondary_bound(current_agent_id, task_agent_id)
         return False
 
+    async def _save_tool_output_if_available(self, call_id: str, result: ToolResult) -> None:
+        """Persist full tool output and anchors when metadata provides them."""
+
+        if self.tool_output_store is None or not result.metadata:
+            return
+        stored_output = result.metadata.get("stored_output")
+        raw_output = result.metadata.get("_raw_output")
+        if isinstance(stored_output, str) and stored_output:
+            content = stored_output
+        elif isinstance(raw_output, str) and raw_output:
+            content = raw_output
+        else:
+            return
+        anchors = result.metadata.get("output_anchors")
+        await self.tool_output_store.save(
+            call_id,
+            content,
+            anchors=anchors if isinstance(anchors, list) else None,
+        )
+
+    @staticmethod
+    def _parse_attempt_argument(raw_attempt: Any) -> tuple[int | None, str | None]:
+        """Parse an optional step attempt number from tool arguments."""
+
+        if raw_attempt in (None, ""):
+            return None, None
+        if isinstance(raw_attempt, bool):
+            return None, "attempt must be a positive integer."
+        try:
+            attempt = int(raw_attempt)
+        except (TypeError, ValueError):
+            return None, "attempt must be a positive integer."
+        if attempt <= 0:
+            return None, "attempt must be a positive integer."
+        return attempt, None
+
+    @staticmethod
+    def _select_step_run(
+        step_rows: list[Any],
+        *,
+        step_name: str,
+        attempt: int | None,
+    ) -> tuple[Any | None, str | None]:
+        """Resolve a task step attempt by step name and optional attempt number."""
+
+        matching = [row for row in step_rows if row.step_name == step_name]
+        if not matching:
+            return None, f"No step '{step_name}' found for this task."
+        if attempt is None:
+            return matching[-1], None
+        for row in reversed(matching):
+            if int(getattr(row, "attempt", 0) or 0) == attempt:
+                return row, None
+        return None, f"Step '{step_name}' does not have attempt {attempt}."
+
+    @staticmethod
+    def _build_task_step_output_result(*, task_id: str, step_run: Any) -> ToolResult:
+        """Build a backward-compatible task step output plus anchored metadata."""
+
+        compact_builder = AnchoredTextBuilder()
+        stored_builder = AnchoredTextBuilder()
+        output = step_run.output or {}
+        evaluation = step_run.evaluation or {}
+        todos = step_run.todos or []
+
+        overview_lines = [
+            f"Task ID: {task_id}",
+            f"Step: {step_run.step_name}",
+            f"Attempt: {step_run.attempt}",
+            f"Status: {step_run.status}",
+        ]
+        if getattr(step_run, "step_run_id", None):
+            overview_lines.append(f"Step run ID: {step_run.step_run_id}")
+        if getattr(step_run, "session_id", None):
+            overview_lines.append(f"Session ID: {step_run.session_id}")
+        if getattr(step_run, "conversation_id", None):
+            overview_lines.append(f"Conversation ID: {step_run.conversation_id}")
+        if getattr(step_run, "started_at", None):
+            overview_lines.append(f"Started: {step_run.started_at}")
+        if getattr(step_run, "completed_at", None):
+            overview_lines.append(f"Completed: {step_run.completed_at}")
+        compact_builder.add_section(
+            "overview",
+            kind="overview",
+            label="Overview",
+            lines=overview_lines,
+        )
+        stored_builder.add_section(
+            "overview",
+            kind="overview",
+            label="Overview",
+            lines=overview_lines,
+        )
+
+        summary = str(output.get("summary") or "").strip()
+        if summary:
+            compact_builder.add_section(
+                "summary",
+                kind="summary",
+                label="Summary",
+                lines=[compact_snippet(summary, max_chars=700)],
+            )
+            stored_builder.add_section(
+                "summary",
+                kind="summary",
+                label="Summary",
+                lines=_indent_block(summary, prefix=""),
+            )
+
+        content = str(output.get("content") or "").strip()
+        if content:
+            compact_builder.add_section(
+                "content",
+                kind="content",
+                label="Content",
+                lines=[compact_snippet(content, max_chars=900)],
+            )
+            stored_builder.add_section(
+                "content",
+                kind="content",
+                label="Content",
+                lines=_indent_block(content, prefix=""),
+            )
+
+        claims = output.get("claims") if isinstance(output.get("claims"), list) else []
+        if claims:
+            compact_builder.add_section(
+                "claims",
+                kind="claims",
+                label="Claims",
+                lines=[f"- {compact_snippet(str(item), max_chars=240)}" for item in claims],
+            )
+            stored_builder.add_section(
+                "claims",
+                kind="claims",
+                label="Claims",
+                lines=[f"- {item}" for item in claims],
+            )
+
+        outputs = output.get("outputs") if isinstance(output.get("outputs"), dict) else {}
+        if outputs:
+            compact_builder.add_section(
+                "outputs",
+                kind="outputs",
+                label="Structured outputs",
+                lines=_indent_block(compact_snippet(_json_text(outputs), max_chars=900), prefix=""),
+            )
+            stored_builder.add_section(
+                "outputs",
+                kind="outputs",
+                label="Structured outputs",
+                lines=_indent_block(_json_text(outputs), prefix=""),
+            )
+
+        error = str(output.get("error") or "").strip()
+        if error:
+            compact_builder.add_section(
+                "error",
+                kind="error",
+                label="Error",
+                lines=[compact_snippet(error, max_chars=900)],
+            )
+            stored_builder.add_section(
+                "error",
+                kind="error",
+                label="Error",
+                lines=_indent_block(error, prefix=""),
+            )
+
+        if evaluation:
+            compact_builder.add_section(
+                "evaluation",
+                kind="evaluation",
+                label="Evaluation",
+                lines=_indent_block(
+                    compact_snippet(_json_text(evaluation), max_chars=900), prefix=""
+                ),
+            )
+            stored_builder.add_section(
+                "evaluation",
+                kind="evaluation",
+                label="Evaluation",
+                lines=_indent_block(_json_text(evaluation), prefix=""),
+            )
+
+        if todos:
+            compact_builder.add_section(
+                "todos",
+                kind="todos",
+                label="Todos",
+                lines=_indent_block(compact_snippet(_json_text(todos), max_chars=900), prefix=""),
+            )
+            stored_builder.add_section(
+                "todos",
+                kind="todos",
+                label="Todos",
+                lines=_indent_block(_json_text(todos), prefix=""),
+            )
+
+        compact_output, anchors = compact_builder.build()
+        stored_output, _ = stored_builder.build()
+        compact_claims = [compact_snippet(str(item), max_chars=240) for item in claims]
+        outputs_payload = output.get("outputs", {})
+        if isinstance(outputs_payload, dict):
+            outputs_json = _json_text(outputs_payload)
+            if len(outputs_json) > 1000:
+                outputs_payload = {
+                    "_truncated": True,
+                    "preview": compact_snippet(outputs_json, max_chars=900),
+                }
+        payload = {
+            "task_id": task_id,
+            "step_run_id": getattr(step_run, "step_run_id", None),
+            "step_name": step_run.step_name,
+            "status": step_run.status,
+            "attempt": step_run.attempt,
+            "session_id": getattr(step_run, "session_id", None),
+            "conversation_id": getattr(step_run, "conversation_id", None),
+            "summary": compact_snippet(summary, max_chars=700) if summary else "",
+            "content": compact_snippet(content, max_chars=900) if content else "",
+            "claims": compact_claims,
+            "outputs": outputs_payload,
+            "error": output.get("error"),
+            "evaluation": evaluation or None,
+            "todos": todos or [],
+            "available_anchors": [anchor["anchor"] for anchor in anchors],
+        }
+        return ToolResult(
+            output=json.dumps(payload, default=str),
+            metadata={
+                "stored_output": stored_output or compact_output,
+                "output_anchors": anchors,
+            },
+        )
+
+    @staticmethod
+    def _build_task_step_logs_result(
+        *,
+        task_id: str,
+        step_run: Any,
+        events: list[dict[str, Any]],
+        last_seq: int,
+        has_more: bool,
+        after_seq: int,
+        limit: int,
+        missing_stream: bool,
+    ) -> ToolResult:
+        """Build an anchored tool result for a task step session log."""
+
+        compact_builder = AnchoredTextBuilder()
+        stored_builder = AnchoredTextBuilder()
+        overview_lines = [
+            f"Task ID: {task_id}",
+            f"Step: {step_run.step_name}",
+            f"Attempt: {step_run.attempt}",
+            f"Session ID: {step_run.session_id or 'n/a'}",
+            f"Events returned: {len(events)}",
+            f"after_seq: {after_seq}",
+            f"limit: {limit}",
+            f"last_seq: {last_seq}",
+            f"has_more: {str(has_more).lower()}",
+        ]
+        if missing_stream:
+            overview_lines.append("Warning: the session event stream was missing in Intaris.")
+        if has_more:
+            overview_lines.append(
+                f"Next page: call get_task_step_logs again with after_seq={last_seq}."
+            )
+        compact_builder.add_section(
+            "overview",
+            kind="overview",
+            label="Overview",
+            lines=overview_lines,
+        )
+        stored_builder.add_section(
+            "overview",
+            kind="overview",
+            label="Overview",
+            lines=overview_lines,
+        )
+
+        counts: dict[str, int] = {}
+        for event in events:
+            event_type = str(event.get("type") or "event")
+            kind = _task_log_anchor_kind(event_type)
+            counts[kind] = counts.get(kind, 0) + 1
+            anchor = f"{kind}:{counts[kind]}"
+            data = event.get("data") if isinstance(event.get("data"), dict) else {}
+            seq = event.get("seq")
+            timestamp = event.get("ts") or event.get("timestamp")
+            label_parts = [event_type]
+            if event_type in {"tool_call", "tool_result"} and data.get("name"):
+                label_parts.append(str(data.get("name")))
+            elif event_type in {"assistant_message", "user_message", "reasoning"}:
+                label_parts.append(f"#{counts[kind]}")
+            label = " - ".join(label_parts)
+            compact_lines = [f"Event: {event_type}"]
+            stored_lines = [f"Event: {event_type}"]
+            if seq is not None:
+                compact_lines.append(f"Seq: {seq}")
+                stored_lines.append(f"Seq: {seq}")
+            if timestamp:
+                compact_lines.append(f"Timestamp: {timestamp}")
+                stored_lines.append(f"Timestamp: {timestamp}")
+
+            if event_type == "tool_call":
+                compact_lines.append(f"Tool: {data.get('name') or 'unknown'}")
+                stored_lines.append(f"Tool: {data.get('name') or 'unknown'}")
+                if data.get("call_id"):
+                    compact_lines.append(f"Call ID: {data['call_id']}")
+                    stored_lines.append(f"Call ID: {data['call_id']}")
+                arguments = str(data.get("arguments") or "").strip()
+                if arguments:
+                    compact_lines.append(f"Arguments: {compact_snippet(arguments, max_chars=800)}")
+                    stored_lines.append("Arguments:")
+                    stored_lines.extend(_indent_block(arguments, prefix=""))
+            elif event_type == "tool_result":
+                compact_lines.append(f"Tool: {data.get('name') or 'unknown'}")
+                stored_lines.append(f"Tool: {data.get('name') or 'unknown'}")
+                if data.get("call_id"):
+                    compact_lines.append(f"Call ID: {data['call_id']}")
+                    stored_lines.append(f"Call ID: {data['call_id']}")
+                compact_lines.append(f"Status: {'error' if data.get('is_error') else 'ok'}")
+                stored_lines.append(f"Status: {'error' if data.get('is_error') else 'ok'}")
+                if data.get("duration_ms") is not None:
+                    compact_lines.append(f"Duration: {data['duration_ms']}ms")
+                    stored_lines.append(f"Duration: {data['duration_ms']}ms")
+                if data.get("has_full_output") and data.get("call_id"):
+                    note = (
+                        "Full tool output is available. Use the call_id above with "
+                        "read_tool_output, search_tool_output, or list_tool_output_anchors."
+                    )
+                    compact_lines.append(note)
+                    stored_lines.append(note)
+                result_text = str(data.get("result") or "").strip()
+                if result_text:
+                    compact_lines.append(f"Result: {compact_snippet(result_text, max_chars=900)}")
+                    stored_lines.append("Result:")
+                    stored_lines.extend(_indent_block(result_text, prefix=""))
+            elif event_type in {"assistant_message", "user_message", "reasoning"}:
+                content = str(data.get("content") or "").strip()
+                if content:
+                    compact_lines.append(compact_snippet(content, max_chars=900))
+                    stored_lines.extend(_indent_block(content, prefix=""))
+            elif event_type == "lifecycle":
+                if data:
+                    compact_lines.append(compact_snippet(_json_text(data), max_chars=900))
+                    stored_lines.extend(_indent_block(_json_text(data), prefix=""))
+            else:
+                if data:
+                    compact_lines.append(compact_snippet(_json_text(data), max_chars=900))
+                    stored_lines.extend(_indent_block(_json_text(data), prefix=""))
+
+            compact_builder.add_section(anchor, kind=kind, label=label, lines=compact_lines)
+            stored_builder.add_section(anchor, kind=kind, label=label, lines=stored_lines)
+
+        compact_output, anchors = compact_builder.build()
+        stored_output, _ = stored_builder.build()
+        if not events and not missing_stream:
+            compact_output = compact_output or "No events recorded for this step session yet."
+            stored_output = stored_output or compact_output
+        return ToolResult(
+            output=compact_output or "No events recorded for this step session yet.",
+            metadata={
+                "stored_output": stored_output or compact_output,
+                "output_anchors": anchors,
+            },
+        )
+
     async def _handle_workflow_tool(
         self,
         tc: ToolCall,
@@ -4337,35 +4875,39 @@ class AgentLoop:
         execution.  Errors are caught and logged — this method NEVER
         raises, so it cannot mask the original exception.
         """
-        if not events:
+        event_batch = events if events is not None else []
+        repaired_count = _append_interrupted_tool_results(ctx, event_batch)
+        if not event_batch:
             return
-        pending_count = len(events)
+        pending_count = len(event_batch)
         try:
-            if await self._record_events_strict(ctx, events, reason="emergency_flush"):
+            if await self._record_events_strict(ctx, event_batch, reason="emergency_flush"):
                 logger.info(
                     "agent: emergency flush persisted events",
                     extra={
                         "extra_data": {
                             "session_id": ctx.session.session_id,
                             "event_count": pending_count,
+                            "repaired_tool_results": repaired_count,
                         }
                     },
                 )
         except Exception:
             logger.warning(
                 "agent: emergency flush failed — %d events lost",
-                len(events),
+                len(event_batch),
                 extra={
                     "extra_data": {
                         "session_id": ctx.session.session_id,
-                        "lost_event_types": [e.type for e in events[:10]],
+                        "lost_event_types": [e.type for e in event_batch[:10]],
+                        "repaired_tool_results": repaired_count,
                     }
                 },
                 exc_info=True,
             )
         finally:
-            self._pending_events = None
-            self._pending_events_ctx = None
+            ctx.pending_events = None
+            ctx.pending_tool_calls.clear()
 
     @staticmethod
     def _intaris_batch_idempotency_key(
@@ -4390,8 +4932,15 @@ class AgentLoop:
         on_token: TokenCallback | None = None,
     ) -> None:
         notified = False
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _INTARIS_MAX_RECOVERY_WAIT_SECONDS
         while True:
             self._raise_if_cancelled(ctx)
+            if loop.time() >= deadline:
+                raise TimeoutError(
+                    f"Timed out waiting for Intaris recovery during {operation} after "
+                    f"{int(_INTARIS_MAX_RECOVERY_WAIT_SECONDS)}s"
+                )
             try:
                 health = await self.providers.guardrails.health()
             except Exception:
