@@ -216,7 +216,11 @@ def _split_events(events: list[Any], preserve_turns: int) -> tuple[list[Any], li
         index for index, event in enumerate(events) if event.type == "user_message"
     ]
     if len(user_event_indices) <= preserve_turns:
-        return [], list(events)
+        preserve_events = min(max(50, preserve_turns * 20), 200)
+        if len(events) <= preserve_events:
+            return [], list(events)
+        keep_from = len(events) - preserve_events
+        return list(events[:keep_from]), list(events[keep_from:])
     keep_from = user_event_indices[-preserve_turns]
     return list(events[:keep_from]), list(events[keep_from:])
 

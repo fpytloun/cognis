@@ -43,7 +43,7 @@ from cognis.tools.executor.filesystem import (
 )
 from cognis.tools.executor.lsp.tool import handle_lsp
 from cognis.tools.executor.search import handle_glob, handle_grep
-from cognis.tools.executor.shell import handle_bash
+from cognis.tools.executor.shell import handle_bash, handle_bash_kill, handle_bash_output
 from cognis.tools.executor.web import (
     handle_web_crawl,
     handle_web_fetch,
@@ -325,6 +325,10 @@ BASH_TOOL = ToolDefinition(
                 "type": "object",
                 "description": "Optional environment variables for the command. Values may be resolved transiently from credential refs.",
             },
+            "run_in_background": {
+                "type": "boolean",
+                "description": "Start the command in the background and return a shell_id for later polling.",
+            },
         },
         "required": ["command"],
     },
@@ -333,6 +337,43 @@ BASH_TOOL = ToolDefinition(
     read_only=False,
     non_bypassable=True,
     timeout_seconds=120,
+)
+
+BASH_OUTPUT_TOOL = ToolDefinition(
+    name="bash_output",
+    description="Read new output from a background bash session created with bash(run_in_background=true).",
+    parameters={
+        "type": "object",
+        "properties": {
+            "shell_id": {"type": "string", "description": "Background shell session id."},
+            "cursor": {
+                "type": "integer",
+                "description": "Optional output cursor from the previous bash_output call. Defaults to 0.",
+            },
+        },
+        "required": ["shell_id"],
+    },
+    source=_EXECUTOR_SOURCE,
+    category="shell",
+    read_only=True,
+    timeout_seconds=30,
+)
+
+BASH_KILL_TOOL = ToolDefinition(
+    name="bash_kill",
+    description="Stop a background bash session created with bash(run_in_background=true).",
+    parameters={
+        "type": "object",
+        "properties": {
+            "shell_id": {"type": "string", "description": "Background shell session id."},
+        },
+        "required": ["shell_id"],
+    },
+    source=_EXECUTOR_SOURCE,
+    category="shell",
+    read_only=False,
+    non_bypassable=True,
+    timeout_seconds=30,
 )
 
 # -- Web tools -----------------------------------------------------------------
@@ -553,6 +594,8 @@ ALL_EXECUTOR_TOOLS: list[ToolDefinition] = [
     GLOB_TOOL,
     GREP_TOOL,
     BASH_TOOL,
+    BASH_OUTPUT_TOOL,
+    BASH_KILL_TOOL,
     DOCUMENT_GENERATE_TOOL,
     ARTIFACT_PUBLISH_TOOL,
     *browser_tool_definitions(),
@@ -572,6 +615,8 @@ _HANDLER_MAP: dict[
     "glob": handle_glob,
     "grep": handle_grep,
     "bash": handle_bash,
+    "bash_output": handle_bash_output,
+    "bash_kill": handle_bash_kill,
     "document_generate": handle_document_generate,
     "artifact_publish": handle_artifact_publish,
     "browser_open": handle_browser_open,

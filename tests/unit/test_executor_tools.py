@@ -25,7 +25,7 @@ from cognis.tools.executor.filesystem import (
 )
 from cognis.tools.executor.lsp.tool import handle_lsp
 from cognis.tools.executor.search import handle_glob, handle_grep
-from cognis.tools.executor.shell import handle_bash
+from cognis.tools.executor.shell import handle_bash, handle_bash_kill, handle_bash_output
 from cognis.tools.registry import ToolExecutionContext
 
 _DUMMY_CONTEXT = ToolExecutionContext(
@@ -757,6 +757,32 @@ class TestGlobTool:
         assert "home.py" in result.output
         assert "cwd.py" not in result.output
 
+    @pytest.mark.asyncio()
+    async def test_glob_fd_searches_only_requested_base(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from cognis.tools.executor import search as search_module
+
+        captured: list[str] = []
+
+        class _Process:
+            returncode = 0
+
+            async def communicate(self) -> tuple[bytes, bytes]:
+                return (b"", b"")
+
+        async def _fake_exec(*args: str, **_: object) -> _Process:
+            captured.extend(args)
+            return _Process()
+
+        monkeypatch.setattr(search_module, "_FD_PATH", "/usr/bin/fdfind")
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+
+        await handle_glob({"pattern": "*.py", "path": str(tmp_path)}, _DUMMY_CONTEXT)
+
+        assert str(tmp_path) in captured
+        assert "." not in captured
+
 
 class TestGrepTool:
     """Test the grep search tool."""
@@ -951,6 +977,40 @@ class TestBashTool:
 
         assert not result.is_error
         assert str(home_dir) in result.output
+
+    @pytest.mark.asyncio()
+    async def test_background_bash_uses_shared_runtime_metadata(self) -> None:
+        shared_runtime_metadata: dict[str, Any] = {}
+        start_ctx = ToolExecutionContext(
+            executor_handle=ExecutorHandle(executor_id="test", executor_type="in_process"),
+            runtime_metadata={},
+            shared_runtime_metadata=shared_runtime_metadata,
+        )
+        start = await handle_bash(
+            {
+                "command": "python -u -c \"import time; print('hello'); time.sleep(5)\"",
+                "run_in_background": True,
+            },
+            start_ctx,
+        )
+
+        assert not start.is_error
+        shell_id = str((start.metadata or {}).get("shell_id"))
+        assert shell_id.startswith("shell_")
+
+        await asyncio.sleep(0.2)
+        read_ctx = ToolExecutionContext(
+            executor_handle=ExecutorHandle(executor_id="test", executor_type="in_process"),
+            runtime_metadata={},
+            shared_runtime_metadata=shared_runtime_metadata,
+        )
+        output = await handle_bash_output({"shell_id": shell_id}, read_ctx)
+        assert not output.is_error
+        assert "hello" in output.output or "no new output" in output.output.lower()
+
+        stopped = await handle_bash_kill({"shell_id": shell_id}, read_ctx)
+        assert not stopped.is_error
+        assert shell_id in stopped.output
 
 
 class TestListDirectoryTool:

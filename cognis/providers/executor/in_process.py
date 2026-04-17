@@ -36,6 +36,7 @@ from cognis.tools.executor.lsp import (
     build_lsp_unavailable_report,
     cleanup_lsp_manager,
 )
+from cognis.tools.executor.shell import cleanup_shell_manager
 from cognis.tools.mcp import (
     MCPClient,
     build_mcp_client,
@@ -126,6 +127,7 @@ class InProcessExecutorConnection:
             context = ToolExecutionContext(
                 executor_handle=self.handle,
                 runtime_metadata={**self.runtime_metadata, **tool_call.runtime_metadata},
+                shared_runtime_metadata=self.runtime_metadata,
                 execution_scope_id=tool_call.execution_scope_id or self.handle.executor_id,
             )
             result = await handler(tool_call.arguments, context)
@@ -270,6 +272,13 @@ class InProcessExecutorProvider:
                     "browser: cleanup error during executor cancel",
                     extra={"extra_data": {"executor_id": handle.executor_id}},
                 )
+        try:
+            await cleanup_shell_manager(runtime.connection.runtime_metadata)
+        except Exception:
+            _logger.debug(
+                "shell: cleanup error during executor cancel",
+                extra={"extra_data": {"executor_id": handle.executor_id}},
+            )
 
     async def list_active(self) -> list[ExecutorHandle]:
         """List active executor handles."""

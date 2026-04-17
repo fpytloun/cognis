@@ -126,7 +126,7 @@ async def test_evaluator_returns_revise() -> None:
 
 
 @pytest.mark.asyncio
-async def test_evaluator_timeout_defaults_to_approved() -> None:
+async def test_evaluator_timeout_forces_failure() -> None:
     evaluator = StepEvaluator(llm=_LLM(delay=1.0), evaluator_timeout_seconds=0.01)
 
     result = await evaluator.evaluate(
@@ -135,12 +135,13 @@ async def test_evaluator_timeout_defaults_to_approved() -> None:
         step_inputs={},
     )
 
-    assert result.decision == "approved"
+    assert result.decision == "failed"
+    assert is_evaluator_malfunction(result) is True
     assert "timed out" in result.reasoning.lower()
 
 
 @pytest.mark.asyncio
-async def test_evaluator_error_defaults_to_approved() -> None:
+async def test_evaluator_error_forces_failure() -> None:
     evaluator = StepEvaluator(llm=_LLM(fail=True), evaluator_timeout_seconds=5.0)
 
     result = await evaluator.evaluate(
@@ -149,8 +150,9 @@ async def test_evaluator_error_defaults_to_approved() -> None:
         step_inputs={},
     )
 
-    assert result.decision == "approved"
-    assert "error" in result.reasoning.lower()
+    assert result.decision == "failed"
+    assert is_evaluator_malfunction(result) is True
+    assert "failed" in result.reasoning.lower()
 
 
 @pytest.mark.asyncio
@@ -394,7 +396,7 @@ async def test_evaluator_retry_failure_after_empty_fails_evaluation() -> None:
 
 
 @pytest.mark.asyncio
-async def test_evaluator_invalid_decision_defaults_to_approved() -> None:
+async def test_evaluator_invalid_decision_fails_evaluation() -> None:
     response = json.dumps({"decision": "maybe", "reasoning": "not sure"})
     evaluator = StepEvaluator(llm=_LLM(response=response), evaluator_timeout_seconds=5.0)
 
@@ -404,7 +406,8 @@ async def test_evaluator_invalid_decision_defaults_to_approved() -> None:
         step_inputs={},
     )
 
-    assert result.decision == "approved"
+    assert result.decision == "failed"
+    assert is_evaluator_malfunction(result) is True
 
 
 @pytest.mark.asyncio

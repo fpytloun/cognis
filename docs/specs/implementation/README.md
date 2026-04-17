@@ -98,7 +98,7 @@ bring the codebase in line with the updated specs.
 | 18 | [First-Class Agent Runtimes](stage-18-agent-runtimes.md) | PLANNED | Runtime abstraction, `runtime_runs`, executor runtime RPC, Claude runtime host, projection model, direct chat/delegation/workflow parity |
 | 19 | [Auto Routing for Agents and Workflows](stage-19-auto-routing.md) | PLANNED | `auto` / `self` routing semantics, shared routing helper, execution-envelope enforcement, classifier fallback, telemetry |
 | 20 | [Harness Correctness and Concurrency Stabilization](stage-20-harness-correctness.md) | PLANNED | Remove shared singleton turn state, bound retry/wait loops, fix gate restart semantics, harden memory identity, preserve transcript integrity |
-| 21 | [Harness Capability Parity](stage-21-harness-capability.md) | PLANNED | Parallel read-only tools, `ripgrep`/`fd` search, background shells, finish-reason handling, token-aware truncation, step timeouts |
+| 21 | [Harness Capability Parity](stage-21-harness-capability.md) | DONE | Parallel read-only tools, `ripgrep`/`fd` search, background shells, finish-reason handling, token-aware truncation, step timeouts; landed ahead of Stage 20 by explicit implementation choice |
 | 22 | [Harness Prompt Cache and Operational Resilience](stage-22-harness-operations.md) | PLANNED | Immutable-prefix cleanup, cache-stable tool exposure, durable remember queue, multi-replica dedupe, Intaris breaker isolation |
 | 23 | [Workflow Deliverables and Step Profiles](stage-23-workflow-deliverables.md) | PLANNED | Typed deliverables + `write_deliverable`, once-only channel delivery, step profiles (`research`/`coding`), tool classification, system workflow wiring |
 

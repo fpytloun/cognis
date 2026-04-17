@@ -94,6 +94,7 @@ class ToolRouter:
         self,
         guardrails: Any,
         non_bypassable_patterns: list[str] | None = None,
+        llm: Any | None = None,
         memory: Any | None = None,
         credentials_provider: Any | None = None,
         tool_output_store: Any | None = None,
@@ -102,6 +103,7 @@ class ToolRouter:
         session_factory: Any | None = None,
     ) -> None:
         self.guardrails = guardrails
+        self.llm = llm
         self.memory = memory
         self.credentials_provider = credentials_provider
         self.tool_output_store = tool_output_store
@@ -116,6 +118,7 @@ class ToolRouter:
         cls,
         guardrails: Any,
         session_factory: async_sessionmaker[AsyncSession],
+        llm: Any | None = None,
         memory: Any | None = None,
         credentials_provider: Any | None = None,
         tool_output_store: Any | None = None,
@@ -128,6 +131,7 @@ class ToolRouter:
             patterns = await get_setting_value(session, "security.non_bypassable_tools", [])
         return cls(
             guardrails=guardrails,
+            llm=llm,
             non_bypassable_patterns=_coerce_patterns(patterns),
             memory=memory,
             credentials_provider=credentials_provider,
@@ -259,11 +263,18 @@ class ToolRouter:
                 ToolResult(output="Unknown tool.", is_error=True),
                 50_000,
                 call_id=cid,
+                runtime_metadata=tool_call.runtime_metadata,
             )
         if route is ToolRoute.ORCHESTRATION:
             result, _child = await handle_delegate_tool_call(tool_call)
             TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome="success").inc()
-            return self._sanitize_result(tool_call.name, result, 50_000, call_id=cid)
+            return self._sanitize_result(
+                tool_call.name,
+                result,
+                50_000,
+                call_id=cid,
+                runtime_metadata=tool_call.runtime_metadata,
+            )
         if route is ToolRoute.MEMORY:
             if self.memory is None:
                 result = ToolResult(output="Memory provider not available.", is_error=True)
@@ -279,7 +290,13 @@ class ToolRouter:
                 )
             outcome = "success" if not result.is_error else "failure"
             TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome=outcome).inc()
-            return self._sanitize_result(tool_call.name, result, 50_000, call_id=cid)
+            return self._sanitize_result(
+                tool_call.name,
+                result,
+                50_000,
+                call_id=cid,
+                runtime_metadata=tool_call.runtime_metadata,
+            )
         if route is ToolRoute.TOOL_OUTPUT:
             if self.tool_output_store is None:
                 result = ToolResult(output="Tool output store not available.", is_error=True)
@@ -291,7 +308,13 @@ class ToolRouter:
                 )
             outcome = "success" if not result.is_error else "failure"
             TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome=outcome).inc()
-            return self._sanitize_result(tool_call.name, result, 50_000, call_id=cid)
+            return self._sanitize_result(
+                tool_call.name,
+                result,
+                50_000,
+                call_id=cid,
+                runtime_metadata=tool_call.runtime_metadata,
+            )
         if route is ToolRoute.IMAGE:
             if self.image_generation_provider is None:
                 result = ToolResult(
@@ -321,7 +344,13 @@ class ToolRouter:
                 status=outcome,
             ).inc()
             TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome=outcome).inc()
-            return self._sanitize_result(tool_call.name, result, 100_000, call_id=cid)
+            return self._sanitize_result(
+                tool_call.name,
+                result,
+                100_000,
+                call_id=cid,
+                runtime_metadata=tool_call.runtime_metadata,
+            )
         if route is ToolRoute.SKILL_MANAGEMENT:
             # Skill management mutations go through guardrails evaluation
             # (non-bypassable tools are always evaluated).
@@ -346,6 +375,7 @@ class ToolRouter:
                     ),
                     50_000,
                     call_id=cid,
+                    runtime_metadata=tool_call.runtime_metadata,
                 )
             if decision.decision == "escalate":
                 TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome="escalated").inc()
@@ -358,6 +388,7 @@ class ToolRouter:
                     ),
                     50_000,
                     call_id=cid,
+                    runtime_metadata=tool_call.runtime_metadata,
                 )
             if self._session_factory is None:
                 result = ToolResult(output="Skill management not available.", is_error=True)
@@ -382,7 +413,13 @@ class ToolRouter:
             result = result.model_copy(update={"metadata": combined_meta})
             outcome = "success" if not result.is_error else "failure"
             TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome=outcome).inc()
-            return self._sanitize_result(tool_call.name, result, 50_000, call_id=cid)
+            return self._sanitize_result(
+                tool_call.name,
+                result,
+                50_000,
+                call_id=cid,
+                runtime_metadata=tool_call.runtime_metadata,
+            )
         if route is ToolRoute.SCHEDULE:
             if self._session_factory is None:
                 result = ToolResult(output="Schedule management not available.", is_error=True)
@@ -399,7 +436,13 @@ class ToolRouter:
                 )
             outcome = "success" if not result.is_error else "failure"
             TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome=outcome).inc()
-            return self._sanitize_result(tool_call.name, result, 50_000, call_id=cid)
+            return self._sanitize_result(
+                tool_call.name,
+                result,
+                50_000,
+                call_id=cid,
+                runtime_metadata=tool_call.runtime_metadata,
+            )
         if route is ToolRoute.INTARIS_MCP:
             result = await self._call_intaris_mcp(tool_call, session, registry)
             if (
@@ -429,6 +472,7 @@ class ToolRouter:
                 result,
                 _tool_max_size(registry, tool_call.name),
                 call_id=cid,
+                runtime_metadata=tool_call.runtime_metadata,
             )
 
         try:
@@ -441,6 +485,7 @@ class ToolRouter:
                 self._credential_error_result(exc),
                 _tool_max_size(registry, tool_call.name),
                 call_id=cid,
+                runtime_metadata=tool_call.runtime_metadata,
             )
 
         decision = await self.evaluate_tool_call(tool_call, agent, session, registry)
@@ -465,6 +510,7 @@ class ToolRouter:
                 denied_result,
                 _tool_max_size(registry, tool_call.name),
                 call_id=cid,
+                runtime_metadata=tool_call.runtime_metadata,
             )
         if decision.decision == "escalate":
             TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome="escalated").inc()
@@ -478,12 +524,16 @@ class ToolRouter:
                 escalated_result,
                 _tool_max_size(registry, tool_call.name),
                 call_id=cid,
+                runtime_metadata=tool_call.runtime_metadata,
             )
 
         registered_tool = registry.get(tool_call.name)
         if registered_tool is None:
             return self._sanitize_result(
-                tool_call.name, ToolResult(output="Unknown tool.", is_error=True), 50_000
+                tool_call.name,
+                ToolResult(output="Unknown tool.", is_error=True),
+                50_000,
+                runtime_metadata=tool_call.runtime_metadata,
             )
         scoped_tool_call = tool_call.model_copy(update={"execution_scope_id": session.session_id})
 
@@ -512,6 +562,7 @@ class ToolRouter:
                 result,
                 registered_tool.definition.max_result_size,
                 call_id=cid,
+                runtime_metadata=tool_call.runtime_metadata,
             )
         try:
             result = await asyncio.wait_for(
@@ -533,6 +584,7 @@ class ToolRouter:
                 result,
                 registered_tool.definition.max_result_size,
                 call_id=cid,
+                runtime_metadata=tool_call.runtime_metadata,
             )
         # Attach evaluation metadata to the result
         if result.metadata is None:
@@ -549,6 +601,7 @@ class ToolRouter:
             result,
             registered_tool.definition.max_result_size,
             call_id=cid,
+            runtime_metadata=tool_call.runtime_metadata,
         )
 
     async def _execute_local_handler(
@@ -578,6 +631,7 @@ class ToolRouter:
         context = ToolExecutionContext(
             executor_handle=executor_handle,
             runtime_metadata=runtime_metadata,
+            shared_runtime_metadata=getattr(executor, "runtime_metadata", None),
             execution_scope_id=tool_call.execution_scope_id,
         )
         normalized_arguments = strip_empty_optional_values(
@@ -940,14 +994,36 @@ class ToolRouter:
         max_size: int,
         *,
         call_id: str | None = None,
+        runtime_metadata: dict[str, Any] | None = None,
     ) -> ToolResult:
         raw_output = result.output
-        output, was_truncated = middle_truncate(raw_output, max_size, call_id=call_id)
+        token_counter = None
+        max_tokens = None
+        model = None
+        if runtime_metadata is not None:
+            resolved_model = runtime_metadata.get("resolved_model")
+            if isinstance(resolved_model, str) and resolved_model.strip():
+                model = resolved_model
+        if self.llm is not None and model is not None:
+
+            def token_counter(text: str, _model: str = model) -> int:
+                return self.llm.count_tokens(text, _model)
+
+            max_tokens = max(256, max_size // 4)
+        output, was_truncated = middle_truncate(
+            raw_output,
+            max_size,
+            call_id=call_id,
+            token_counter=token_counter,
+            max_tokens=max_tokens,
+        )
         wrapped = f'<tool_result name="{tool_name}" trust="untrusted">\n{output}\n</tool_result>'
         metadata = dict(result.metadata or {})
         metadata["wrapped"] = True
         metadata["truncated"] = was_truncated
         metadata["original_size"] = len(raw_output)
+        if max_tokens is not None:
+            metadata["token_budget"] = max_tokens
         # Preserve raw output for the ToolOutputStore (before wrapping/truncation).
         # The agent loop reads this to save the full output to disk.
         metadata["_raw_output"] = raw_output

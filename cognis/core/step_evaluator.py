@@ -141,7 +141,8 @@ class StepEvaluator:
         """Run semantic evaluation on a step's output.
 
         Returns StepEvaluation with decision: approved, revise, or failed.
-        On timeout or transport error, defaults to 'approved' (fail-open).
+        On timeout or transport error, returns a forced failed evaluator
+        malfunction rather than silently approving incomplete work.
         Empty or truncated evaluator output is treated as an evaluator failure.
         """
         prompt = self._build_prompt(
@@ -240,23 +241,21 @@ class StepEvaluator:
                 return evaluation
             except TimeoutError:
                 logger.warning(
-                    "Step evaluator timed out, defaulting to approved",
+                    "Step evaluator timed out, forcing failure",
                     extra={"extra_data": {"step": step_definition.name}},
                 )
-                return StepEvaluation(
-                    decision="approved",
-                    reasoning="Evaluator timed out — defaulting to approved",
-                    evaluated_at=datetime.now(UTC),
+                return self._forced_failed(
+                    reasoning="Evaluator timed out before producing a usable judgment",
+                    feedback="Evaluator timed out before a usable judgment was produced.",
                 )
             except Exception:
                 logger.exception(
-                    "Step evaluator failed, defaulting to approved",
+                    "Step evaluator failed, forcing malfunction failure",
                     extra={"extra_data": {"step": step_definition.name}},
                 )
-                return StepEvaluation(
-                    decision="approved",
-                    reasoning="Evaluator error — defaulting to approved",
-                    evaluated_at=datetime.now(UTC),
+                return self._forced_failed(
+                    reasoning="Evaluator failed before producing a usable judgment",
+                    feedback="Evaluator failed before a usable judgment was produced.",
                 )
 
     def _build_prompt(
@@ -358,7 +357,10 @@ class StepEvaluator:
 
         decision = str(payload.get("decision", "approved")).lower()
         if decision not in {"approved", "revise", "failed"}:
-            decision = "approved"
+            return self._forced_failed(
+                reasoning=f"invalid evaluator decision: {decision}",
+                feedback="Evaluator returned an invalid decision.",
+            )
 
         evaluation = StepEvaluation(
             decision=decision,

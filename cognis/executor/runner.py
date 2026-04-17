@@ -34,6 +34,7 @@ from cognis.tools.executor.lsp import (
     cleanup_lsp_manager,
     resolve_lsp_runtime_config,
 )
+from cognis.tools.executor.shell import cleanup_shell_manager
 from cognis.tools.mcp import (
     MCPClient,
     MCPClientError,
@@ -111,6 +112,8 @@ class ExecutorRunner:
             if lsp_manager is not None:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await cleanup_lsp_manager(lsp_manager, executor_id=self.config.executor_id)
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await cleanup_shell_manager(self._runtime_metadata)
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._close_mcp_clients()
             if self._channel_handler is not None:
@@ -688,6 +691,7 @@ class ExecutorRunner:
                             else {}
                         ),
                     },
+                    shared_runtime_metadata=self._runtime_metadata,
                     execution_scope_id=str(
                         params.get("execution_scope_id")
                         or f"{self.config.executor_id}:{self._runtime_metadata.get('user_email', 'runtime')}"

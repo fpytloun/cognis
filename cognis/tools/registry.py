@@ -25,6 +25,7 @@ class ToolExecutionContext:
 
     executor_handle: ExecutorHandle
     runtime_metadata: dict[str, Any] = field(default_factory=dict)
+    shared_runtime_metadata: dict[str, Any] | None = None
     execution_scope_id: str | None = None
 
 

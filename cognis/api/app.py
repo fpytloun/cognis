@@ -274,6 +274,7 @@ def create_app() -> FastAPI:
         tool_router = await ToolRouter.from_session_factory(
             providers.guardrails,
             session_factory,
+            llm=providers.llm,
             memory=providers.memory,
             credentials_provider=providers.credentials,
             tool_output_store=tool_output_store,

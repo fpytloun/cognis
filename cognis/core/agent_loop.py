@@ -209,6 +209,8 @@ DEFAULT_STEP_TIMEOUT_SECONDS = 600  # 10 minutes
 _MAX_TOOL_DATA_BYTES = 10_240  # 10 KB truncation limit for WS events
 _MAX_INTARIS_TOOL_RESULT = 50_000  # Intaris gets the middle-truncated preview
 _MAX_TODO_REPROMPTS = 3  # Max re-prompts for incomplete todos before force-completing
+_MAX_STEP_COMPLETE_REPROMPTS = 3
+_MAX_TOOL_CALL_ARGUMENT_CHARS = 256_000
 
 
 def _normalize_todo_status(status: Any) -> str:
@@ -460,6 +462,12 @@ class PendingToolCallState:
     tool_id: str | None = None
 
 
+@dataclass(slots=True)
+class _PreparedRegularToolCall:
+    tool_call: ToolCall
+    tool_id: str
+
+
 def _track_pending_tool_call(ctx: StepContext, tc: ToolCall, *, tool_id: str | None = None) -> None:
     """Mark a tool call as awaiting a result event."""
 
@@ -574,6 +582,7 @@ class StreamAccumulator:
         self.content_parts: list[str] = []
         self.tool_calls: dict[int, dict[str, Any]] = {}
         self.usage: dict[str, int] | None = None
+        self.finish_reason: str = "stop"
 
     def feed(self, chunk: dict[str, Any]) -> str | None:
         """Feed a stream chunk. Returns text delta if present."""
@@ -590,6 +599,9 @@ class StreamAccumulator:
             return None
 
         delta = choices[0].get("delta", {})
+        finish_reason = choices[0].get("finish_reason")
+        if isinstance(finish_reason, str) and finish_reason:
+            self.finish_reason = finish_reason
 
         # Text content
         text_delta: str | None = delta.get("content")
@@ -615,6 +627,10 @@ class StreamAccumulator:
                     entry["name"] = func["name"]
                 if func.get("arguments"):
                     entry["arguments"] += func["arguments"]
+                    if len(entry["arguments"]) > _MAX_TOOL_CALL_ARGUMENT_CHARS:
+                        raise ValueError(
+                            f"Tool call arguments exceeded {_MAX_TOOL_CALL_ARGUMENT_CHARS} characters"
+                        )
 
         return text_delta
 
@@ -1015,6 +1031,7 @@ class StepContext:
     loop_guard_state: LoopGuardState = field(default_factory=LoopGuardState)
     pending_events: list[SessionEvent] | None = None
     pending_tool_calls: dict[str, PendingToolCallState] = field(default_factory=dict)
+    current_model: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -1101,9 +1118,42 @@ class AgentLoop:
             },
         )
         await self.session_lock.acquire(ctx.session.session_id)
+        timeout_seconds = DEFAULT_STEP_TIMEOUT_SECONDS
+        if ctx.agent.execution:
+            timeout_seconds = int(
+                ctx.agent.execution.get("step_timeout_seconds", DEFAULT_STEP_TIMEOUT_SECONDS)
+            )
         try:
-            return await self._execute_step(
-                ctx, on_token=on_token, on_tool_call=on_tool_call, on_tool_result=on_tool_result
+            return await asyncio.wait_for(
+                self._execute_step(
+                    ctx,
+                    on_token=on_token,
+                    on_tool_call=on_tool_call,
+                    on_tool_result=on_tool_result,
+                ),
+                timeout=max(1, timeout_seconds),
+            )
+        except TimeoutError:
+            error_msg = f"Step timed out after {timeout_seconds}s"
+            pending_events = ctx.pending_events
+            if pending_events is None:
+                pending_events = []
+                ctx.pending_events = pending_events
+            _append_interrupted_tool_results(ctx, pending_events)
+            pending_events.append(
+                SessionEvent(
+                    type="lifecycle",
+                    data={"event": "system_notice", "message": error_msg},
+                )
+            )
+            await self._emergency_flush_events(ctx, pending_events)
+            STEPS_TOTAL.labels(step_type=ctx.step_definition.type, status="error").inc()
+            return StepOutput(
+                summary="Step timed out",
+                error=error_msg,
+                session_id=ctx.session.session_id,
+                intaris_session_id=ctx.session.intaris_session_id or ctx.session.session_id,
+                completed_at=datetime.now(UTC),
             )
         except StepInterrupted:
             # Emergency flush: persist any accumulated events before
@@ -1743,11 +1793,14 @@ class AgentLoop:
         )
 
         # Main agentic loop
-        reprompted = False
+        step_reprompt_count = 0
         mid_stream_retries = 0
         _MAX_MID_STREAM_RETRIES = 2
         discovered_tool_ids = self._get_initial_discovered_tool_ids(ctx)
         collected_attachments: list[dict[str, Any]] = []
+        continued_assistant_content = ""
+        continuation_message_index: int | None = None
+        continuation_reminder_index: int | None = None
         while True:
             self._raise_if_cancelled(ctx)
 
@@ -1779,6 +1832,7 @@ class AgentLoop:
                 llm_kwargs["reasoning_effort"] = reasoning_effort
 
             model_info = await self.providers.llm.get_model_info(model_for_llm or resolved_model)
+            ctx.current_model = model_for_llm or resolved_model
             registry = self._get_tool_registry(ctx)
             inventory_tools = (
                 _filter_model_inventory_tools(ctx.agent, registry.list_tools(), discovered_tool_ids)
@@ -1897,8 +1951,16 @@ class AgentLoop:
                     )
                 break  # Exit while loop → _finalize_step runs normally
 
-            content = accumulator.get_content()
+            finish_reason = accumulator.finish_reason
+            content = continued_assistant_content + accumulator.get_content()
             tool_calls = accumulator.get_tool_calls()
+            if continuation_reminder_index is not None and continuation_reminder_index < len(
+                messages
+            ):
+                reminder = messages[continuation_reminder_index]
+                if reminder.get("role") == "system":
+                    messages.pop(continuation_reminder_index)
+                continuation_reminder_index = None
             for tc in tool_calls:
                 mapped_name = exposure.alias_map.get(tc.name, tc.name)
                 if mapped_name != tc.name:
@@ -1914,6 +1976,49 @@ class AgentLoop:
                     )
                     tc.name = mapped_name
 
+            if finish_reason == "content_filter":
+                error_notice = (
+                    "The model response was blocked by the provider content filter. "
+                    "Please revise the request or continue with a narrower follow-up."
+                )
+                events_to_record.append(
+                    SessionEvent(
+                        type="lifecycle",
+                        data={"event": "system_notice", "message": error_notice},
+                    )
+                )
+                if on_token:
+                    await on_token(f"\n\n{error_notice}")
+                await self._flush_events_incremental(
+                    ctx,
+                    events_to_record,
+                    reason="content_filter",
+                    on_token=on_token,
+                )
+                break
+
+            if finish_reason == "length" and not tool_calls:
+                if continuation_message_index is None:
+                    continuation_message_index = len(messages)
+                    messages.append({"role": "assistant", "content": content})
+                else:
+                    messages[continuation_message_index] = {"role": "assistant", "content": content}
+                continued_assistant_content = content
+                continuation_reminder_index = len(messages)
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "Internal controller reminder — the previous response hit the output "
+                            "limit. Continue exactly from where you left off. Do not repeat or "
+                            "restart prior text."
+                        ),
+                    }
+                )
+                continue
+
+            current_assistant_message_index: int | None = None
+
             # Record assistant message
             if content or collected_attachments:
                 events_to_record.append(
@@ -1926,9 +2031,19 @@ class AgentLoop:
                     )
                 )
                 if content:
-                    messages.append({"role": "assistant", "content": content})
+                    if continuation_message_index is not None:
+                        current_assistant_message_index = continuation_message_index
+                        messages[continuation_message_index] = {
+                            "role": "assistant",
+                            "content": content,
+                        }
+                    else:
+                        current_assistant_message_index = len(messages)
+                        messages.append({"role": "assistant", "content": content})
                     assistant_content_parts.append(content)
                     last_assistant_content = content
+                    continued_assistant_content = ""
+                    continuation_message_index = None
                 memory_text = merge_content_and_attachment_note(
                     content,
                     strip_attachment_payload_bytes(collected_attachments),
@@ -1992,10 +2107,10 @@ class AgentLoop:
                         completed_at=datetime.now(UTC),
                     )
                     break
-                elif not reprompted:
+                elif step_reprompt_count < _MAX_STEP_COMPLETE_REPROMPTS:
                     # Non-direct (sub-session / workflow step): require step_complete
                     STEP_REPROMPTS.inc()
-                    reprompted = True
+                    step_reprompt_count += 1
                     messages.append(
                         {
                             "role": "system",
@@ -2003,7 +2118,8 @@ class AgentLoop:
                                 "Internal controller reminder — this is not a new user message. "
                                 "Do not write a filler acknowledgment just for this reminder. "
                                 "If the step is finished, call step_complete now with your summary. "
-                                "Otherwise continue the work until it is actually complete."
+                                "Otherwise continue the work until it is actually complete. Do not "
+                                "repeat prior text unnecessarily."
                             ),
                         }
                     )
@@ -2016,7 +2132,11 @@ class AgentLoop:
             # Process tool calls
             if tool_calls and content:
                 # Add assistant message with tool calls for chat history
-                messages[-1] = {
+                target_index = current_assistant_message_index
+                if target_index is None:
+                    target_index = len(messages)
+                    messages.append({"role": "assistant", "content": content})
+                messages[target_index] = {
                     "role": "assistant",
                     "content": content,
                     "tool_calls": [
@@ -2048,9 +2168,9 @@ class AgentLoop:
                 )
 
             delegation_spawned = False
+            prepared_regular_batch: list[_PreparedRegularToolCall] = []
             for tc in tool_calls:
                 self._raise_if_cancelled(ctx)
-                tool_call_count += 1
                 tool_id = _tool_id_for_call(tc.name, registry)
                 STEP_TOOL_CALLS.labels(tool_name=tool_id).inc()
 
@@ -2067,6 +2187,18 @@ class AgentLoop:
                 # (name, args) key, not success/failure).
                 loop_message = check_loop_guard(ctx.loop_guard_state, tc.name, tc.arguments)
                 if loop_message is not None:
+                    if prepared_regular_batch:
+                        await self._execute_regular_tool_batch(
+                            ctx,
+                            prepared_regular_batch,
+                            events_to_record=events_to_record,
+                            messages=messages,
+                            collected_attachments=collected_attachments,
+                            discovered_tool_ids=discovered_tool_ids,
+                            on_token=on_token,
+                            on_tool_result=on_tool_result,
+                        )
+                        prepared_regular_batch.clear()
                     HARNESS_GUARD_TRIPS.labels(guard="loop", tool_name=tool_id).inc()
                     _append_tool_call_event(events_to_record, tc, tool_id)
                     loop_payload = loop_guard_rejection_payload(tc.name, tc.arguments, loop_message)
@@ -2096,6 +2228,18 @@ class AgentLoop:
                 if tc.name not in _CONTROLLER_INTERCEPTED_TOOLS:
                     violation = check_argument_sanity(tc.name, tc.arguments)
                     if violation is not None:
+                        if prepared_regular_batch:
+                            await self._execute_regular_tool_batch(
+                                ctx,
+                                prepared_regular_batch,
+                                events_to_record=events_to_record,
+                                messages=messages,
+                                collected_attachments=collected_attachments,
+                                discovered_tool_ids=discovered_tool_ids,
+                                on_token=on_token,
+                                on_tool_result=on_tool_result,
+                            )
+                            prepared_regular_batch.clear()
                         HARNESS_GUARD_TRIPS.labels(guard="argument_sanity", tool_name=tool_id).inc()
                         _append_tool_call_event(events_to_record, tc, tool_id)
                         sanity_payload = argument_sanity_rejection_payload(
@@ -2127,6 +2271,24 @@ class AgentLoop:
                 # Record the (name, args) tuple so future calls can detect
                 # identical-in-a-row repeats.
                 record_tool_call(ctx.loop_guard_state, tc.name, tc.arguments)
+
+                if self._should_count_tool_call(tc.name):
+                    tool_call_count += 1
+
+                if prepared_regular_batch and (
+                    tc.name in _CONTROLLER_INTERCEPTED_TOOLS or is_orchestration_tool(tc.name)
+                ):
+                    await self._execute_regular_tool_batch(
+                        ctx,
+                        prepared_regular_batch,
+                        events_to_record=events_to_record,
+                        messages=messages,
+                        collected_attachments=collected_attachments,
+                        discovered_tool_ids=discovered_tool_ids,
+                        on_token=on_token,
+                        on_tool_result=on_tool_result,
+                    )
+                    prepared_regular_batch.clear()
 
                 # Controller tool interception
                 if tc.name == STEP_COMPLETE:
@@ -2953,148 +3115,45 @@ class AgentLoop:
                     continue
 
                 else:
-                    # Regular tool call — route through tool router
-                    await self.event_bus.publish(
-                        Event(
-                            type=EventType.WORKFLOW_PROGRESS,
-                            data={
-                                "event": "tool_call_started",
-                                "task_id": ctx.task_id,
-                                "session_id": ctx.session.session_id,
-                                "step_name": ctx.step_definition.name,
-                                "step_run_id": ctx.step_run_id,
-                                "call_id": tc.call_id,
-                                "tool_name": tc.name,
-                                "tool_id": tool_id,
-                            },
+                    prepared_call = _PreparedRegularToolCall(tool_call=tc, tool_id=tool_id)
+                    if self._is_parallelizable_regular_tool_call(ctx, tc, registry):
+                        prepared_regular_batch.append(prepared_call)
+                        continue
+                    if prepared_regular_batch:
+                        await self._execute_regular_tool_batch(
+                            ctx,
+                            prepared_regular_batch,
+                            events_to_record=events_to_record,
+                            messages=messages,
+                            collected_attachments=collected_attachments,
+                            discovered_tool_ids=discovered_tool_ids,
+                            on_token=on_token,
+                            on_tool_result=on_tool_result,
                         )
-                    )
-                    events_to_record.append(
-                        SessionEvent(
-                            type="tool_call",
-                            data={
-                                "name": tc.name,
-                                "tool_id": tool_id,
-                                "call_id": tc.call_id,
-                                "arguments": _truncate_tool_data(
-                                    json.dumps(tc.arguments, default=str)
-                                ),
-                            },
-                        )
-                    )
-                    await self._flush_events_incremental(
+                        prepared_regular_batch.clear()
+                    await self._execute_regular_tool_batch(
                         ctx,
-                        events_to_record,
-                        reason=f"tool_call:{tool_id}",
+                        [prepared_call],
+                        events_to_record=events_to_record,
+                        messages=messages,
+                        collected_attachments=collected_attachments,
+                        discovered_tool_ids=discovered_tool_ids,
                         on_token=on_token,
-                    )
-                    _track_pending_tool_call(ctx, tc, tool_id=tool_id)
-
-                    result = await self.tool_router.execute(
-                        tc.model_copy(
-                            update={"runtime_metadata": self._tool_runtime_metadata(ctx)}
-                        ),
-                        ctx.session,
-                        ctx.agent,
-                        self._get_tool_registry(ctx),
-                        self._get_executor(ctx),
-                    )
-                    self._record_execution_evidence(ctx, tool_name=tc.name, result=result)
-
-                    # -------------------------------------------------------
-                    # Escalation blocking: pause and wait for user approval
-                    # -------------------------------------------------------
-                    result = await self._handle_escalation(
-                        result, tc, ctx, events_to_record, on_tool_result
+                        on_tool_result=on_tool_result,
                     )
 
-                    # Save full output to the tool output store for later
-                    # exploration via read_tool_output / search_tool_output.
-                    # The raw output (before XML wrapping) is what we store.
-                    raw_output = result.metadata.get("_raw_output") if result.metadata else None
-                    stored_output = (
-                        result.metadata.get("stored_output") if result.metadata else None
-                    )
-                    if stored_output or raw_output:
-                        await self._save_tool_output_if_available(tc.call_id, result)
-
-                    # Intaris gets a middle-truncated preview (larger than
-                    # the WS preview) so compaction and audit have useful
-                    # context without bloating the event stream.
-                    intaris_preview, _ = middle_truncate(
-                        result.output, _MAX_INTARIS_TOOL_RESULT, call_id=tc.call_id
-                    )
-                    original_size = (
-                        result.metadata.get("original_size") if result.metadata else None
-                    )
-                    eval_meta = result.metadata.get("evaluation") if result.metadata else None
-                    has_saved_output = bool(raw_output or stored_output)
-                    events_to_record.append(
-                        SessionEvent(
-                            type="tool_result",
-                            data={
-                                "call_id": tc.call_id,
-                                "audit_call_id": (
-                                    eval_meta.get("call_id")
-                                    if isinstance(eval_meta, dict)
-                                    else None
-                                ),
-                                "name": tc.name,
-                                "tool_id": tool_id,
-                                "is_error": result.is_error,
-                                "duration_ms": result.duration_ms,
-                                "result": intaris_preview,
-                                "output_size": original_size or len(result.output),
-                                "has_full_output": has_saved_output,
-                                "evaluation": eval_meta,
-                            },
-                        )
-                    )
-                    _resolve_pending_tool_call(ctx, tc.call_id)
-                    await self._flush_events_incremental(
-                        ctx,
-                        events_to_record,
-                        reason=f"tool_result:{tool_id}",
-                        on_token=on_token,
-                    )
-                    ws_preview = _truncate_tool_data(result.output)
-                    if on_tool_result:
-                        await on_tool_result(
-                            tc.call_id,
-                            tc.name,
-                            ws_preview,
-                            result.is_error,
-                            result.duration_ms,
-                            eval_meta,
-                        )
-                    if result.attachments:
-                        collected_attachments.extend(normalize_attachment_refs(result.attachments))
-                    if result.metadata:
-                        self._merge_discovered_tool_ids(discovered_tool_ids, result.metadata)
-                        self._apply_skill_attachment_metadata(ctx, result.metadata)
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tc.call_id,
-                            "content": result.output,
-                        }
-                    )
-                    await self.event_bus.publish(
-                        Event(
-                            type=EventType.WORKFLOW_PROGRESS,
-                            data={
-                                "event": "tool_call_completed",
-                                "task_id": ctx.task_id,
-                                "session_id": ctx.session.session_id,
-                                "step_name": ctx.step_definition.name,
-                                "step_run_id": ctx.step_run_id,
-                                "call_id": tc.call_id,
-                                "tool_name": tc.name,
-                                "tool_id": tool_id,
-                                "is_error": result.is_error,
-                            },
-                        )
-                    )
+            if prepared_regular_batch:
+                await self._execute_regular_tool_batch(
+                    ctx,
+                    prepared_regular_batch,
+                    events_to_record=events_to_record,
+                    messages=messages,
+                    collected_attachments=collected_attachments,
+                    discovered_tool_ids=discovered_tool_ids,
+                    on_token=on_token,
+                    on_tool_result=on_tool_result,
+                )
+                prepared_regular_batch.clear()
 
             # Check if step_complete was called in this batch
             if step_output is not None:
@@ -5056,6 +5115,226 @@ class AgentLoop:
             if todo.get("status") not in ("completed", "cancelled")
         ]
 
+    @staticmethod
+    def _should_count_tool_call(tool_name: str) -> bool:
+        return tool_name not in CONTROLLER_TOOLS
+
+    def _is_parallelizable_regular_tool_call(
+        self,
+        ctx: StepContext,
+        tc: ToolCall,
+        registry: Any | None,
+    ) -> bool:
+        if registry is None or tc.name in CONTROLLER_TOOLS or is_orchestration_tool(tc.name):
+            return False
+        registered = registry.get(tc.name)
+        if registered is None or not registered.definition.read_only:
+            return False
+        if self.tool_router._is_non_bypassable(  # noqa: SLF001
+            registered.definition.name,
+            registered.definition.non_bypassable,
+        ):
+            return False
+        permission = Permission.EVALUATE
+        if ctx.agent.permissions is not None:
+            permission = ctx.agent.permissions.resolve_permission(
+                tc.name,
+                tool_id=stable_tool_id(registered.definition),
+            )
+        return permission is Permission.ALLOW
+
+    async def _execute_regular_tool(
+        self,
+        ctx: StepContext,
+        tc: ToolCall,
+    ) -> ToolResult:
+        try:
+            return await self.tool_router.execute(
+                tc.model_copy(update={"runtime_metadata": self._tool_runtime_metadata(ctx)}),
+                ctx.session,
+                ctx.agent,
+                self._get_tool_registry(ctx),
+                self._get_executor(ctx),
+            )
+        except Exception as exc:
+            return ToolResult(output=f"Tool execution failed: {str(exc)[:1000]}", is_error=True)
+
+    async def _finalize_regular_tool_result(
+        self,
+        ctx: StepContext,
+        *,
+        tc: ToolCall,
+        tool_id: str,
+        result: ToolResult,
+        events_to_record: list[SessionEvent],
+        messages: list[dict[str, Any]],
+        collected_attachments: list[dict[str, Any]],
+        discovered_tool_ids: set[str],
+        on_token: TokenCallback | None,
+        on_tool_result: ToolResultCallback | None,
+    ) -> None:
+        self._record_execution_evidence(ctx, tool_name=tc.name, result=result)
+        result = await self._handle_escalation(result, tc, ctx, events_to_record, on_tool_result)
+
+        raw_output = result.metadata.get("_raw_output") if result.metadata else None
+        stored_output = result.metadata.get("stored_output") if result.metadata else None
+        if stored_output or raw_output:
+            await self._save_tool_output_if_available(tc.call_id, result)
+
+        token_counter = None
+        if ctx.current_model:
+
+            def token_counter(text: str, _m: str = ctx.current_model) -> int:
+                return self.providers.llm.count_tokens(text, _m)
+
+        intaris_preview, _ = middle_truncate(
+            result.output,
+            _MAX_INTARIS_TOOL_RESULT,
+            call_id=tc.call_id,
+            token_counter=token_counter,
+            max_tokens=max(256, _MAX_INTARIS_TOOL_RESULT // 4) if token_counter else None,
+        )
+        original_size = result.metadata.get("original_size") if result.metadata else None
+        eval_meta = result.metadata.get("evaluation") if result.metadata else None
+        has_saved_output = bool(raw_output or stored_output)
+        events_to_record.append(
+            SessionEvent(
+                type="tool_result",
+                data={
+                    "call_id": tc.call_id,
+                    "audit_call_id": (
+                        eval_meta.get("call_id") if isinstance(eval_meta, dict) else None
+                    ),
+                    "name": tc.name,
+                    "tool_id": tool_id,
+                    "is_error": result.is_error,
+                    "duration_ms": result.duration_ms,
+                    "result": intaris_preview,
+                    "output_size": original_size or len(result.output),
+                    "has_full_output": has_saved_output,
+                    "evaluation": eval_meta,
+                },
+            )
+        )
+        _resolve_pending_tool_call(ctx, tc.call_id)
+        await self._flush_events_incremental(
+            ctx,
+            events_to_record,
+            reason=f"tool_result:{tool_id}",
+            on_token=on_token,
+        )
+        ws_preview = _truncate_tool_data(result.output)
+        if on_tool_result:
+            await on_tool_result(
+                tc.call_id,
+                tc.name,
+                ws_preview,
+                result.is_error,
+                result.duration_ms,
+                eval_meta,
+            )
+        if result.attachments:
+            collected_attachments.extend(normalize_attachment_refs(result.attachments))
+        if result.metadata:
+            self._merge_discovered_tool_ids(discovered_tool_ids, result.metadata)
+            self._apply_skill_attachment_metadata(ctx, result.metadata)
+        messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": tc.call_id,
+                "content": result.output,
+            }
+        )
+        await self.event_bus.publish(
+            Event(
+                type=EventType.WORKFLOW_PROGRESS,
+                data={
+                    "event": "tool_call_completed",
+                    "task_id": ctx.task_id,
+                    "session_id": ctx.session.session_id,
+                    "step_name": ctx.step_definition.name,
+                    "step_run_id": ctx.step_run_id,
+                    "call_id": tc.call_id,
+                    "tool_name": tc.name,
+                    "tool_id": tool_id,
+                    "is_error": result.is_error,
+                },
+            )
+        )
+
+    async def _execute_regular_tool_batch(
+        self,
+        ctx: StepContext,
+        batch: list[_PreparedRegularToolCall],
+        *,
+        events_to_record: list[SessionEvent],
+        messages: list[dict[str, Any]],
+        collected_attachments: list[dict[str, Any]],
+        discovered_tool_ids: set[str],
+        on_token: TokenCallback | None,
+        on_tool_result: ToolResultCallback | None,
+    ) -> None:
+        for item in batch:
+            await self.event_bus.publish(
+                Event(
+                    type=EventType.WORKFLOW_PROGRESS,
+                    data={
+                        "event": "tool_call_started",
+                        "task_id": ctx.task_id,
+                        "session_id": ctx.session.session_id,
+                        "step_name": ctx.step_definition.name,
+                        "step_run_id": ctx.step_run_id,
+                        "call_id": item.tool_call.call_id,
+                        "tool_name": item.tool_call.name,
+                        "tool_id": item.tool_id,
+                    },
+                )
+            )
+            events_to_record.append(
+                SessionEvent(
+                    type="tool_call",
+                    data={
+                        "name": item.tool_call.name,
+                        "tool_id": item.tool_id,
+                        "call_id": item.tool_call.call_id,
+                        "arguments": _truncate_tool_data(
+                            json.dumps(item.tool_call.arguments, default=str)
+                        ),
+                    },
+                )
+            )
+            _track_pending_tool_call(ctx, item.tool_call, tool_id=item.tool_id)
+
+        await self._flush_events_incremental(
+            ctx,
+            events_to_record,
+            reason="tool_call:batch",
+            on_token=on_token,
+        )
+
+        if len(batch) == 1:
+            results: list[ToolResult] = [await self._execute_regular_tool(ctx, batch[0].tool_call)]
+        else:
+            results = list(
+                await asyncio.gather(
+                    *(self._execute_regular_tool(ctx, item.tool_call) for item in batch)
+                )
+            )
+
+        for item, result in zip(batch, results, strict=False):
+            await self._finalize_regular_tool_result(
+                ctx,
+                tc=item.tool_call,
+                tool_id=item.tool_id,
+                result=result,
+                events_to_record=events_to_record,
+                messages=messages,
+                collected_attachments=collected_attachments,
+                discovered_tool_ids=discovered_tool_ids,
+                on_token=on_token,
+                on_tool_result=on_tool_result,
+            )
+
     async def _flush_events_incremental(
         self,
         ctx: StepContext,
@@ -5360,6 +5639,8 @@ class AgentLoop:
             metadata["workspace_root"] = ctx.workspace_root
         if ctx.working_directory:
             metadata["working_directory"] = ctx.working_directory
+        if ctx.current_model:
+            metadata["resolved_model"] = ctx.current_model
         return metadata
 
     def _record_execution_evidence(
