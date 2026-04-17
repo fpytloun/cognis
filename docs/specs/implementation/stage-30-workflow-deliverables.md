@@ -1,4 +1,4 @@
-# Stage 29: Workflow Deliverables and Step Profiles (Deferred Structural Work)
+# Stage 30: Workflow Deliverables and Step Profiles (Deferred Structural Work)
 
 ## Status
 
@@ -25,6 +25,7 @@ This stage turns specs 21 and 22 into code across backend, UI, and telemetry aft
 - `docs/specs/24-provider-stabilization.md`
 - Stages 20-23 complete (correctness, capability parity, operational resilience, provider and model stabilization).
 - Stage 25 complete (harness polish).
+- Stage 26 complete (LLM-exposure auditing in Intaris).
 
 ## Scope
 

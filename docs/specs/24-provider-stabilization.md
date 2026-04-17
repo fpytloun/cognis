@@ -19,7 +19,7 @@ The symptoms were observable in production as:
 This spec defines the correctness fixes at the provider layer, independent
 from the broader harness stabilization work. It is the fourth and final
 stabilization stage before the deferred structural work (typed deliverables
-and step profiles) lands in [`29-workflow-deliverables implementation`](implementation/stage-29-workflow-deliverables.md).
+and step profiles) lands in [`30-workflow-deliverables implementation`](implementation/stage-30-workflow-deliverables.md).
 
 ## Related Specs
 
@@ -123,10 +123,10 @@ implicit dependency on DB insert order.
 - cost tracking, `Cost` calculation, and per-turn usage persistence
 - additional sampling knobs (`top_k`, `frequency_penalty`,
   `presence_penalty`) beyond `top_p`
-- deeper runtime-abstraction changes from specs 17-19 (deferred Stages 26-28)
+- deeper runtime-abstraction changes from specs 17-19 (deferred Stages 27-29)
 - UI redesign beyond surfacing the session `/thinking` override in
   `/info` and session state
-- typed deliverables and step profiles (deferred to Stage 29)
+- typed deliverables and step profiles (deferred to Stage 30)
 
 ## Tracks and Required Changes
 
@@ -326,4 +326,4 @@ from logs.
 - Typed deliverables and step profiles (see
   [`21-workflow-deliverables.md`](21-workflow-deliverables.md),
   [`22-step-profiles.md`](22-step-profiles.md) — implemented in
-  [`stage-29-workflow-deliverables.md`](implementation/stage-29-workflow-deliverables.md)).
+  [`stage-30-workflow-deliverables.md`](implementation/stage-30-workflow-deliverables.md)).
