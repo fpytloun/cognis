@@ -51,6 +51,7 @@ _SYSTEM_AGENT_LLM_FIELDS = {
     "provider_id",
     "model",
     "temperature",
+    "top_p",
     "max_tokens",
     "reasoning_effort",
 }
@@ -691,7 +692,6 @@ async def generate_agent_field(request: Request, payload: GenerateFieldRequest) 
             f"{field_instruction} "
             f"Output ONLY the expanded field value, nothing else."
         )
-        temperature = 0.6
     else:
         user_msg = f"Generate the '{field}' field for this agent.\n\nAgent context:\n{ctx_summary}"
         system_msg = (
@@ -699,7 +699,6 @@ async def generate_agent_field(request: Request, payload: GenerateFieldRequest) 
             f"Output ONLY the field value, nothing else. No quotes, no field name prefix, "
             f"no explanation."
         )
-        temperature = 0.8
 
     try:
         response = await llm.generate(
@@ -708,8 +707,6 @@ async def generate_agent_field(request: Request, payload: GenerateFieldRequest) 
                 {"role": "user", "content": user_msg},
             ],
             task_type="default",
-            temperature=temperature,
-            max_tokens=500,
         )
         choices = response.get("choices", [])
         if choices:

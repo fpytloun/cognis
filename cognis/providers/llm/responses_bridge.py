@@ -93,12 +93,17 @@ def messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str
                 )
             continue
         if role == "tool":
+            call_id = message.get("tool_call_id")
+            if not isinstance(call_id, str) or not call_id.strip():
+                logger.warning(
+                    "Dropping tool message without tool_call_id for Responses API",
+                    extra={"extra_data": {"message_index": index}},
+                )
+                continue
             items.append(
                 {
                     "type": "function_call_output",
-                    "call_id": normalize_tool_call_id(
-                        message.get("tool_call_id"), message.get("tool_call_id"), str(index)
-                    ),
+                    "call_id": normalize_tool_call_id(call_id, call_id, str(index)),
                     "output": content if isinstance(content, str) else json.dumps(content),
                 }
             )
@@ -114,13 +119,13 @@ def responses_request_kwargs(request_kwargs: dict[str, Any]) -> dict[str, Any]:
     filtered.pop("cognis_llm_api", None)
     response_format = filtered.pop("response_format", None)
     if response_format is not None and "text" not in filtered and "text_format" not in filtered:
-        filtered["text"] = {
-            "format": response_format
-            if isinstance(response_format, dict)
-            else {"type": str(response_format)}
-        }
+        normalized_format = _normalize_response_format(response_format)
+        if normalized_format is not None:
+            filtered["text"] = {"format": normalized_format}
     if "max_tokens" in filtered and "max_output_tokens" not in filtered:
         filtered["max_output_tokens"] = filtered.pop("max_tokens")
+    if "max_completion_tokens" in filtered and "max_output_tokens" not in filtered:
+        filtered["max_output_tokens"] = filtered.pop("max_completion_tokens")
     tools = filtered.get("tools")
     if isinstance(tools, list):
         filtered["tools"] = [_tool_to_responses_tool(tool) for tool in tools]
@@ -569,10 +574,26 @@ def _extract_usage(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(usage, dict):
         return {}
     return {
-        "prompt_tokens": usage.get("prompt_tokens") or usage.get("input_tokens", 0),
-        "completion_tokens": usage.get("completion_tokens") or usage.get("output_tokens", 0),
+        "prompt_tokens": usage.get("input_tokens", usage.get("prompt_tokens", 0)),
+        "completion_tokens": usage.get("output_tokens", usage.get("completion_tokens", 0)),
         "total_tokens": usage.get("total_tokens", 0),
     }
+
+
+def _normalize_response_format(response_format: Any) -> dict[str, Any] | None:
+    if isinstance(response_format, dict):
+        return response_format
+    if isinstance(response_format, str):
+        normalized = response_format.strip().lower()
+        if normalized in {"json", "json_object"}:
+            return {"type": "json_object"}
+        if normalized == "text":
+            return {"type": "text"}
+        logger.warning(
+            "Ignoring unsupported Responses API response_format",
+            extra={"extra_data": {"response_format": normalized}},
+        )
+    return None
 
 
 def _extract_message_item_text(item: dict[str, Any]) -> str:

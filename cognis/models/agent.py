@@ -115,6 +115,7 @@ class AgentLLMConfig(BaseModel):
     model: str | None = None
     provider_id: str | None = None
     temperature: float | None = None
+    top_p: float | None = None
     max_tokens: int | None = None
     reasoning_effort: str | None = None
     model_routing: dict[str, str] | None = None

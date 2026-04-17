@@ -368,6 +368,7 @@ def _system_agent(
                 "llm_config.provider_id",
                 "llm_config.model",
                 "llm_config.temperature",
+                "llm_config.top_p",
                 "llm_config.max_tokens",
                 "llm_config.reasoning_effort",
                 "skills",

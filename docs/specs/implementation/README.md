@@ -100,7 +100,7 @@ bring the codebase in line with the updated specs.
 | 20 | [Harness Correctness and Concurrency Stabilization](stage-20-harness-correctness.md) | DONE | Remove shared singleton turn state, bound retry/wait loops, fix gate restart semantics, harden memory identity, preserve transcript integrity |
 | 21 | [Harness Capability Parity](stage-21-harness-capability.md) | DONE | Parallel read-only tools, `ripgrep`/`fd` search, background shells, finish-reason handling, token-aware truncation, step timeouts |
 | 22 | [Harness Prompt Cache and Operational Resilience](stage-22-harness-operations.md) | IN PROGRESS | Immutable-prefix cleanup, cache-stable tool exposure, durable remember queue, multi-replica dedupe, Intaris breaker isolation |
-| 23 | [Provider and Model Handling Stabilization](stage-23-provider-stabilization.md) | PLANNED | Reasoning-effort translation, sampling-parameter stripping, `max_tokens`→`max_completion_tokens`, capability-flag gating for cache/beta headers, deterministic provider resolution, Responses bridge hardening |
+| 23 | [Provider and Model Handling Stabilization](stage-23-provider-stabilization.md) | DONE | Reasoning-effort translation, sampling-parameter stripping, `max_tokens`→`max_completion_tokens`, capability-flag gating for cache/beta headers, deterministic provider resolution, Responses bridge hardening |
 | 24 | [Workflow Deliverables and Step Profiles](stage-24-workflow-deliverables.md) | PLANNED | Typed deliverables + `write_deliverable`, once-only channel delivery, step profiles (`research`/`coding`), tool classification, system workflow wiring |
 
 ## Scope Boundary

@@ -221,9 +221,18 @@ class LLMProvider(Protocol):
         **kwargs: Any,
     ) -> AsyncIterator[dict[str, Any]]: ...
     async def resolve_model(
-        self, explicit_model: str | None = None, task_type: str = "default"
+        self,
+        explicit_model: str | None = None,
+        task_type: str = "default",
+        explicit_provider_id: str | None = None,
     ) -> str: ...
-    async def get_model_info(self, model_id: str) -> ModelInfo: ...
+    async def resolve_model_target(
+        self,
+        explicit_model: str | None = None,
+        task_type: str = "default",
+        explicit_provider_id: str | None = None,
+    ) -> tuple[str, str | None]: ...
+    async def get_model_info(self, model_id: str, provider_id: str | None = None) -> ModelInfo: ...
     async def transcribe(
         self,
         audio_bytes: bytes,

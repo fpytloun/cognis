@@ -123,7 +123,11 @@ class CompactionStrategy:
         ]
 
         try:
-            response = await self.llm.generate(prompt_messages, task_type="compaction")
+            response = await self.llm.generate(
+                prompt_messages,
+                task_type="compaction",
+                reasoning_effort="minimal",
+            )
             summary = extract_text_from_response(response).strip()
             if not summary:
                 raise ValueError("LLM compaction returned empty summary")

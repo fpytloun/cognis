@@ -41,6 +41,7 @@ def test_prepare_tool_exposure_uses_anthropic_deferred_loading() -> None:
 
     assert result.debug_metadata["strategy"] == "anthropic_defer_loading"
     assert result.request_kwargs["extra_headers"]["anthropic-beta"] == "tool-search-tool-2025-10-19"
+    assert result.request_kwargs["disable_parallel_tool_use"] is False
     cache_control_tools = [
         tool for tool in result.tools if tool.get("function", {}).get("cache_control") is not None
     ]
@@ -129,6 +130,7 @@ def test_prepare_tool_exposure_uses_openai_responses_full_inventory() -> None:
             model_id="gpt-5.4",
             supports_tool_search=True,
             supports_responses_api=True,
+            supports_openai_namespace_tools=True,
             max_tools=128,
         ),
         discovered_tool_ids=set(),
@@ -190,6 +192,7 @@ def test_prepare_tool_exposure_marks_skill_tools_deferred_for_responses() -> Non
             model_id="gpt-5.4",
             supports_tool_search=True,
             supports_responses_api=True,
+            supports_openai_namespace_tools=True,
             max_tools=128,
         ),
         discovered_tool_ids=set(),
@@ -222,6 +225,7 @@ def test_prepare_tool_exposure_uses_openai_tool_search_with_deferred_namespaces(
             model_id="gpt-5.4",
             supports_tool_search=True,
             supports_responses_api=True,
+            supports_openai_namespace_tools=True,
             max_tools=128,
         ),
         discovered_tool_ids=set(),
@@ -256,6 +260,7 @@ def test_prepare_tool_exposure_sanitizes_skill_visible_names() -> None:
             model_id="gpt-5.4",
             supports_tool_search=True,
             supports_responses_api=True,
+            supports_openai_namespace_tools=True,
             max_tools=128,
         ),
         discovered_tool_ids=set(),
@@ -290,6 +295,7 @@ def test_prepare_tool_exposure_openai_tool_search_updates_alias_map_for_namespac
             model_id="gpt-5.4",
             supports_tool_search=True,
             supports_responses_api=True,
+            supports_openai_namespace_tools=True,
             max_tools=128,
         ),
         discovered_tool_ids=set(),
@@ -361,6 +367,7 @@ def test_prepare_tool_exposure_strips_controller_search_tool_for_responses() -> 
             model_id="gpt-5.4",
             supports_tool_search=True,
             supports_responses_api=True,
+            supports_openai_namespace_tools=True,
             max_tools=128,
         ),
         discovered_tool_ids=set(),
@@ -391,6 +398,7 @@ def test_prepare_tool_exposure_strips_controller_search_tool_for_responses_full_
             model_id="gpt-5.4",
             supports_tool_search=True,
             supports_responses_api=True,
+            supports_openai_namespace_tools=True,
             max_tools=128,
         ),
         discovered_tool_ids=set(),
@@ -424,6 +432,7 @@ def test_prepare_tool_exposure_dedupes_openai_namespace_names() -> None:
             model_id="gpt-5.4",
             supports_tool_search=True,
             supports_responses_api=True,
+            supports_openai_namespace_tools=True,
             max_tools=128,
         ),
         discovered_tool_ids=set(),
@@ -456,10 +465,49 @@ def test_prepare_tool_exposure_respects_responses_rollout_off(monkeypatch) -> No
         controller_tool_schemas=[controller_search_schema],
         model="gpt-5.4",
         model_info=ModelInfo(
-            model_id="gpt-5.4", supports_tool_search=True, supports_responses_api=True, max_tools=3
+            model_id="gpt-5.4",
+            supports_tool_search=True,
+            supports_responses_api=True,
+            supports_openai_namespace_tools=True,
+            max_tools=3,
         ),
         discovered_tool_ids={stable_tool_id(mcp_tool)},
     )
 
     assert result.debug_metadata["strategy"] == "generic_search_tools"
     assert any(tool["function"]["name"] == "search_tools" for tool in result.tools)
+
+
+def test_prepare_tool_exposure_uses_flat_deferred_responses_when_namespace_tools_unsupported() -> (
+    None
+):
+    mcp_tool = ToolDefinition(
+        name=sanitize_mcp_tool_name("github", "search/issues"),
+        description="search",
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(type="intaris_mcp", server_name="github", raw_tool_name="search/issues"),
+        category="mcp",
+    )
+
+    result = prepare_tool_exposure(
+        inventory_tools=[_tool("read", source_type="executor", category="filesystem"), mcp_tool],
+        controller_tool_schemas=[],
+        model="gpt-5.4",
+        model_info=ModelInfo(
+            model_id="gpt-5.4",
+            supports_tool_search=True,
+            supports_responses_api=True,
+            supports_openai_namespace_tools=False,
+            max_tools=128,
+        ),
+        discovered_tool_ids=set(),
+    )
+
+    assert result.debug_metadata["strategy"] == "openai_responses_flat_deferred"
+    assert all(tool["type"] != "namespace" for tool in result.tools)
+    deferred_schema = next(
+        tool
+        for tool in result.tools
+        if tool.get("function", {}).get("name") == sanitize_mcp_tool_name("github", "search/issues")
+    )
+    assert deferred_schema["function"]["defer_loading"] is True

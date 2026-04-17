@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import os
 import re
@@ -13,6 +14,7 @@ from typing import Any, cast
 
 import httpx
 import litellm
+from prometheus_client import Counter
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
@@ -27,7 +29,13 @@ from cognis.models.config import (
     SpeechToTextResult,
     TokenUsage,
 )
-from cognis.providers.llm.reasoning import apply_reasoning_config, reasoning_efforts_for_model
+from cognis.providers.llm.reasoning import (
+    PreparedReasoningConfig,
+    apply_reasoning_config,
+    auxiliary_reasoning_effort_for_family,
+    detect_reasoning_family,
+    reasoning_efforts_for_model,
+)
 from cognis.providers.llm.responses_bridge import (
     messages_to_responses_input,
     normalize_openai_model_name,
@@ -44,7 +52,8 @@ logger = get_logger(__name__)
 MODEL_CACHE_TTL_SECONDS = 60.0
 PROXY_MODEL_INFO_CACHE_TTL = 300.0  # 5 minutes for successful proxy /model/info fetches
 PROXY_MODEL_INFO_NEGATIVE_TTL = 30.0  # 30 seconds negative cache for failures
-SAFE_PROVIDER_KWARGS = {"api_base", "api_version", "base_url", "max_retries", "timeout"}
+SAFE_PROVIDER_KWARGS = {"api_base", "api_version", "base_url", "timeout"}
+_CACHE_MISS = object()
 
 # Preset-to-litellm model prefix mapping.  LiteLLM uses the prefix to
 # determine which provider API to use.  Standard presets (openai, anthropic)
@@ -68,6 +77,26 @@ _IMAGE_GEN_STRATEGY: dict[str, str] = {
 # Anthropic model name patterns for prompt caching support
 _ANTHROPIC_MODEL_PATTERNS = re.compile(r"(claude|anthropic)", re.IGNORECASE)
 
+LLM_REASONING_EFFORT_USED_TOTAL = Counter(
+    "cognis_llm_reasoning_effort_used_total",
+    "Reasoning effort values sent to providers.",
+    labelnames=("family", "level"),
+)
+LLM_SAMPLING_PARAMS_STRIPPED_TOTAL = Counter(
+    "cognis_llm_sampling_params_stripped_total",
+    "Sampling parameters stripped from provider requests.",
+    labelnames=("reason",),
+)
+LLM_MAX_TOKENS_TRANSLATED_TOTAL = Counter(
+    "cognis_llm_max_tokens_translated_total",
+    "Count of max_tokens to max_completion_tokens translations.",
+)
+LLM_CACHE_CONTROL_APPLIED_TOTAL = Counter(
+    "cognis_llm_cache_control_applied_total",
+    "Anthropic-style cache_control hints applied to immutable prompt prefix.",
+    labelnames=("gated_by",),
+)
+
 
 def _supports_image_response_format(model: str) -> bool:
     normalized = model.rsplit("/", 1)[-1].lower()
@@ -77,6 +106,7 @@ def _supports_image_response_format(model: str) -> bool:
 def _apply_message_cache_hints(
     messages: list[dict[str, Any]],
     model: str,
+    model_info: ModelInfo,
     cache_breakpoint_index: int | None,
 ) -> list[dict[str, Any]]:
     """Apply provider-specific prompt cache hints to the immutable prefix.
@@ -91,7 +121,7 @@ def _apply_message_cache_hints(
 
     if cache_breakpoint_index is None or cache_breakpoint_index < 0:
         return messages
-    if not _ANTHROPIC_MODEL_PATTERNS.search(model):
+    if not model_info.supports_prompt_caching:
         return messages
     if cache_breakpoint_index >= len(messages):
         return messages
@@ -121,6 +151,7 @@ def _apply_message_cache_hints(
         breakpoint_msg["content"] = content
 
     result[cache_breakpoint_index] = breakpoint_msg
+    LLM_CACHE_CONTROL_APPLIED_TOTAL.labels(gated_by="capability_flag").inc()
     return result
 
 
@@ -181,8 +212,14 @@ def _normalize_proxy_model_info(info: dict[str, Any]) -> dict[str, Any]:
         normalized["supports_pdf_input"] = bool(info["supports_pdf_input"])
     if "supports_reasoning" in info:
         normalized["supports_reasoning"] = bool(info["supports_reasoning"])
+    if "supports_extended_thinking" in info:
+        normalized["supports_extended_thinking"] = bool(info["supports_extended_thinking"])
     if "supports_prompt_caching" in info:
         normalized["supports_prompt_caching"] = bool(info["supports_prompt_caching"])
+    if "supports_openai_namespace_tools" in info:
+        normalized["supports_openai_namespace_tools"] = bool(
+            info["supports_openai_namespace_tools"]
+        )
     if "supports_tool_choice" in info and info.get("supports_function_calling"):
         normalized["supports_tools"] = True
     # Cost conversion: per-token → per-million-tokens (rounded to avoid float drift)
@@ -195,6 +232,32 @@ def _normalize_proxy_model_info(info: dict[str, Any]) -> dict[str, Any]:
             float(info["output_cost_per_token"]) * 1_000_000, 6
         )
     return normalized
+
+
+def _looks_like_extended_thinking_model(model_id: str, preset: str) -> bool:
+    normalized = normalize_openai_model_name(model_id)
+    if preset != "anthropic" and not _ANTHROPIC_MODEL_PATTERNS.search(normalized):
+        return False
+    return any(
+        token in normalized
+        for token in (
+            "claude-3-7",
+            "sonnet-4",
+            "sonnet-4.5",
+            "sonnet-4-5",
+            "opus-4",
+            "opus-4.5",
+            "opus-4-5",
+        )
+    )
+
+
+def _merge_live_bool(
+    live: dict[str, Any], merged: dict[str, Any], key: str, *, fallback: bool = False
+) -> bool:
+    if key in live and live.get(key) is not None:
+        return bool(live.get(key))
+    return bool(merged.get(key, fallback) or fallback)
 
 
 class LiteLLMProvider:
@@ -210,43 +273,100 @@ class LiteLLMProvider:
         self._secrets = secrets_provider
         self._inference_router = inference_router
         self._cache_lock = asyncio.Lock()
-        self._resolved_model_cache: dict[str, tuple[str, float]] = {}
+        self._resolved_model_cache: dict[str, tuple[tuple[str, str | None], float]] = {}
         self._model_info_cache: dict[str, tuple[ModelInfo, float]] = {}
+        self._model_provider_cache: dict[str, tuple[str | None, float]] = {}
         self._proxy_model_info_cache: dict[str, tuple[dict[str, dict[str, Any]], float]] = {}
 
     async def resolve_model(
-        self, explicit_model: str | None = None, task_type: str = "default"
+        self,
+        explicit_model: str | None = None,
+        task_type: str = "default",
+        explicit_provider_id: str | None = None,
     ) -> str:
-        resolved_model, _ = await self._resolve_model_target(explicit_model, task_type=task_type)
+        resolved_model, _ = await self._resolve_model_target(
+            explicit_model,
+            task_type=task_type,
+            explicit_provider_id=explicit_provider_id,
+        )
         return resolved_model
 
+    async def resolve_model_target(
+        self,
+        explicit_model: str | None = None,
+        task_type: str = "default",
+        explicit_provider_id: str | None = None,
+    ) -> tuple[str, str | None]:
+        resolved_model, provider = await self._resolve_model_target(
+            explicit_model,
+            task_type=task_type,
+            explicit_provider_id=explicit_provider_id,
+        )
+        return resolved_model, (provider.provider_id if provider is not None else None)
+
     async def _resolve_model_target(
-        self, explicit_model: str | None = None, task_type: str = "default"
+        self,
+        explicit_model: str | None = None,
+        task_type: str = "default",
+        explicit_provider_id: str | None = None,
     ) -> tuple[str, LLMProviderRow | None]:
+        if explicit_provider_id is not None:
+            async with self.session_factory() as session:
+                provider = await session.get(LLMProviderRow, explicit_provider_id)
+            if provider is None:
+                raise ValueError(f"LLM provider {explicit_provider_id!r} not found")
+            if explicit_model is not None:
+                return explicit_model, provider
+            default_model = dict(provider.config).get("default_model")
+            if isinstance(default_model, str) and default_model:
+                return default_model, provider
+            raise ValueError(
+                f"LLM provider {explicit_provider_id!r} does not define a default_model"
+            )
         if explicit_model is not None:
             async with self.session_factory() as session:
                 provider = await self._find_provider_for_model(session, explicit_model)
             return explicit_model, provider
-        cached_model = await self._get_cached_resolved_model(task_type)
-        if cached_model is not None:
+        cached_target = await self._get_cached_resolved_model(task_type)
+        if cached_target is not None:
+            cached_model, cached_provider_id = cached_target
             async with self.session_factory() as session:
-                provider = await self._find_provider_for_model(session, cached_model)
-            return cached_model, provider
+                provider = (
+                    await session.get(LLMProviderRow, cached_provider_id)
+                    if cached_provider_id is not None
+                    else await self._find_provider_for_model(session, cached_model)
+                )
+            if cached_provider_id is None or provider is not None:
+                return cached_model, provider
+            async with self._cache_lock:
+                self._resolved_model_cache.pop(task_type, None)
         async with self.session_factory() as session:
             route = await session.get(ModelRouting, task_type)
             if route is not None:
                 resolved = cast(str, route.model)
-                await self._set_cached_resolved_model(task_type, resolved)
                 provider = None
                 if route.provider_id is not None:
                     provider = await session.get(LLMProviderRow, route.provider_id)
+                    if provider is None:
+                        raise ValueError(
+                            f"Model routing for task_type={task_type!r} references missing provider "
+                            f"{route.provider_id!r}"
+                        )
                 if provider is None:
                     provider = await self._find_provider_for_model(session, resolved)
+                await self._set_cached_resolved_model(
+                    task_type,
+                    resolved,
+                    provider.provider_id if provider is not None else None,
+                )
                 return resolved, provider
             # Try provider marked as default (is_default=True)
             default_provider = (
                 await session.execute(
-                    select(LLMProviderRow).where(LLMProviderRow.is_default.is_(True)).limit(1)
+                    select(LLMProviderRow)
+                    .where(LLMProviderRow.is_default.is_(True))
+                    .order_by(LLMProviderRow.provider_id.asc())
+                    .limit(1)
                 )
             ).scalar_one_or_none()
             # Fall back to provider with ID "default" for backward compat
@@ -256,18 +376,47 @@ class LiteLLMProvider:
                 config = dict(default_provider.config)
                 default_model = config.get("default_model")
                 if isinstance(default_model, str):
-                    await self._set_cached_resolved_model(task_type, default_model)
+                    await self._set_cached_resolved_model(
+                        task_type,
+                        default_model,
+                        default_provider.provider_id,
+                    )
                     return default_model, default_provider
         raise ValueError("No LLM model configured")
 
-    async def get_model_info(self, model_id: str) -> ModelInfo:
-        cached_model_info = await self._get_cached_model_info(model_id)
+    async def get_model_info(self, model_id: str, provider_id: str | None = None) -> ModelInfo:
+        cache_key = self._model_info_cache_key(model_id, provider_id)
+        cached_model_info = await self._get_cached_model_info(cache_key)
         if cached_model_info is not None:
             return cached_model_info
 
         async with self.session_factory() as session:
+            provider = await session.get(LLMProviderRow, provider_id) if provider_id else None
+            if provider_id is not None and provider is None:
+                logger.warning(
+                    "Requested model metadata for missing provider",
+                    extra={"extra_data": {"provider_id": provider_id, "model_id": model_id}},
+                )
+                await self._set_cached_model_info(cache_key, DEFAULT_MODEL_INFO)
+                return DEFAULT_MODEL_INFO
+            if provider is not None:
+                config = dict(provider.config)
+                row_models = config.get("models", [])
+                if isinstance(row_models, list):
+                    for model in row_models:
+                        if isinstance(model, dict) and model.get("model_id") == model_id:
+                            model_info = await self._merge_litellm_model_info(
+                                model_id, provider, model
+                            )
+                            await self._set_cached_model_info(cache_key, model_info)
+                            return model_info
+                model_info = await self._merge_litellm_model_info(model_id, provider, {})
+                await self._set_cached_model_info(cache_key, model_info)
+                return model_info
             rows = (await session.execute(select(LLMProviderRow))).scalars().all()
             for row in rows:
+                if provider_id is not None and row.provider_id != provider_id:
+                    continue
                 config = dict(row.config)
                 row_models = config.get("models", [])
                 if not isinstance(row_models, list):
@@ -278,20 +427,21 @@ class LiteLLMProvider:
                     if model.get("model_id") != model_id:
                         continue
                     model_info = await self._merge_litellm_model_info(model_id, row, model)
-                    await self._set_cached_model_info(model_id, model_info)
+                    await self._set_cached_model_info(cache_key, model_info)
                     return model_info
 
-            provider = await self._find_provider_for_model(session, model_id)
+            if provider is None:
+                provider = await self._find_provider_for_model(session, model_id)
             if provider is not None:
                 model_info = await self._merge_litellm_model_info(model_id, provider, {})
-                await self._set_cached_model_info(model_id, model_info)
+                await self._set_cached_model_info(cache_key, model_info)
                 return model_info
 
         logger.warning(
             "LLM model metadata missing; using conservative defaults",
             extra={"extra_data": {"model_id": model_id}},
         )
-        await self._set_cached_model_info(model_id, DEFAULT_MODEL_INFO)
+        await self._set_cached_model_info(cache_key, DEFAULT_MODEL_INFO)
         return DEFAULT_MODEL_INFO
 
     async def transcribe(
@@ -431,28 +581,10 @@ class LiteLLMProvider:
         )
 
     async def find_provider_for_model(self, model_id: str) -> str | None:
-        """Return the ``provider_id`` that owns *model_id*, or ``None``.
-
-        Returns ``None`` when the model exists in multiple providers to
-        avoid silently pinning routing to an arbitrary provider.
-        """
+        """Return the deterministic ``provider_id`` that owns *model_id*."""
         async with self.session_factory() as session:
             rows = (await session.execute(select(LLMProviderRow))).scalars().all()
-        matches: list[str] = []
-        for row in rows:
-            config = dict(row.config)
-            if config.get("default_model") == model_id:
-                matches.append(row.provider_id)
-                continue
-            row_models = config.get("models", [])
-            if isinstance(row_models, list):
-                for model in row_models:
-                    if isinstance(model, dict) and model.get("model_id") == model_id:
-                        matches.append(row.provider_id)
-                        break
-        if len(matches) == 1:
-            return matches[0]
-        return None  # ambiguous or not found
+        return self._select_provider_id_for_model(rows, model_id)
 
     async def _merge_litellm_model_info(
         self,
@@ -494,31 +626,63 @@ class LiteLLMProvider:
                         or merged.get("context_window"),
                         "max_output_tokens": live.get("max_output_tokens")
                         or merged.get("max_output_tokens"),
-                        "supports_tools": bool(
-                            live.get("supports_function_calling")
-                            or "tools" in (live.get("supported_openai_params") or [])
+                        "supports_tools": _merge_live_bool(
+                            live,
+                            merged,
+                            "supports_tools",
+                            fallback=bool(
+                                live.get("supports_function_calling")
+                                or "tools" in (live.get("supported_openai_params") or [])
+                            ),
                         ),
-                        "supports_streaming": "stream"
-                        in (live.get("supported_openai_params") or [])
-                        or merged.get("supports_streaming"),
-                        "supports_vision": bool(live.get("supports_vision")),
-                        "supports_audio_input": bool(live.get("supports_audio_input")),
-                        "supports_pdf_input": bool(live.get("supports_pdf_input")),
-                        "supports_file_input": bool(live.get("supports_file_input", False)),
-                        "supports_reasoning": bool(live.get("supports_reasoning")),
-                        "supports_prompt_caching": bool(live.get("supports_prompt_caching")),
-                        "supports_tool_search": bool(
-                            live.get("supports_tool_search")
-                            or live.get("supports_builtin_tool_search")
-                            or merged.get("supports_tool_search")
+                        "supports_streaming": _merge_live_bool(
+                            live,
+                            merged,
+                            "supports_streaming",
+                            fallback="stream" in (live.get("supported_openai_params") or []),
                         ),
-                        "supports_defer_loading": bool(
-                            live.get("supports_defer_loading")
-                            or merged.get("supports_defer_loading")
+                        "supports_vision": _merge_live_bool(live, merged, "supports_vision"),
+                        "supports_audio_input": _merge_live_bool(
+                            live,
+                            merged,
+                            "supports_audio_input",
                         ),
-                        "supports_responses_api": bool(
-                            live.get("supports_responses_api")
-                            or merged.get("supports_responses_api")
+                        "supports_pdf_input": _merge_live_bool(live, merged, "supports_pdf_input"),
+                        "supports_file_input": _merge_live_bool(
+                            live, merged, "supports_file_input"
+                        ),
+                        "supports_reasoning": _merge_live_bool(live, merged, "supports_reasoning"),
+                        "supports_extended_thinking": _merge_live_bool(
+                            live,
+                            merged,
+                            "supports_extended_thinking",
+                            fallback=_looks_like_extended_thinking_model(model_id, preset),
+                        ),
+                        "supports_prompt_caching": _merge_live_bool(
+                            live,
+                            merged,
+                            "supports_prompt_caching",
+                        ),
+                        "supports_tool_search": _merge_live_bool(
+                            live,
+                            merged,
+                            "supports_tool_search",
+                            fallback=bool(live.get("supports_builtin_tool_search")),
+                        ),
+                        "supports_defer_loading": _merge_live_bool(
+                            live,
+                            merged,
+                            "supports_defer_loading",
+                        ),
+                        "supports_responses_api": _merge_live_bool(
+                            live,
+                            merged,
+                            "supports_responses_api",
+                        ),
+                        "supports_openai_namespace_tools": _merge_live_bool(
+                            live,
+                            merged,
+                            "supports_openai_namespace_tools",
                         ),
                         "supported_openai_params": list(live.get("supported_openai_params") or []),
                         "max_tools": live.get("max_tools") or merged.get("max_tools"),
@@ -585,6 +749,8 @@ class LiteLLMProvider:
             "supports_prompt_caching": is_anthropic,
             "supports_tool_search": supports_responses_api,
             "supports_responses_api": supports_responses_api,
+            "supports_extended_thinking": False,
+            "supports_openai_namespace_tools": False,
             "max_tools": 128 if is_openai_like else None,
         }
 
@@ -605,6 +771,37 @@ class LiteLLMProvider:
             rollout_mode=self._responses_rollout_mode(),
         )
 
+    def _record_reasoning_metrics(self, prepared: PreparedReasoningConfig) -> None:
+        if prepared.effective_effort:
+            LLM_REASONING_EFFORT_USED_TOTAL.labels(
+                family=prepared.family,
+                level=prepared.effective_effort,
+            ).inc()
+        if prepared.stripped_params:
+            for _ in prepared.stripped_params:
+                LLM_SAMPLING_PARAMS_STRIPPED_TOTAL.labels(reason="reasoning_model").inc()
+        if prepared.translated_max_tokens:
+            LLM_MAX_TOKENS_TRANSLATED_TOTAL.inc()
+
+    def _prepare_generation_request_kwargs(
+        self,
+        request_kwargs: dict[str, Any],
+        *,
+        model_id: str,
+        provider: LLMProviderRow | None,
+        model_info: ModelInfo,
+    ) -> dict[str, Any]:
+        prepared = apply_reasoning_config(
+            request_kwargs,
+            model_id=model_id,
+            provider_preset=(
+                str(dict(provider.config).get("preset", "")).lower() if provider else ""
+            ),
+            model_info=model_info,
+        )
+        self._record_reasoning_metrics(prepared)
+        return prepared.request_kwargs
+
     async def generate(
         self,
         messages: list[dict[str, Any]],
@@ -615,23 +812,31 @@ class LiteLLMProvider:
     ) -> dict[str, Any]:
         from cognis.providers.llm.retry import with_llm_retry
 
-        resolved_model, provider = await self._resolve_model_target(model, task_type=task_type)
+        explicit_provider_id = cast(str | None, kwargs.pop("provider_id", None))
+        resolved_model, provider = await self._resolve_model_target(
+            model,
+            task_type=task_type,
+            explicit_provider_id=explicit_provider_id,
+        )
+        if provider is None:
+            raise ValueError(f"No LLM provider found for model {resolved_model!r}")
 
         prefixed_model = self._apply_model_prefix(resolved_model, provider)
-        model_info = await self.get_model_info(resolved_model)
+        model_info = await self.get_model_info(
+            resolved_model,
+            provider_id=provider.provider_id if provider is not None else None,
+        )
         request_kwargs = _merge_request_kwargs(
             await self._resolve_provider_kwargs(provider), kwargs
         )
-        request_kwargs = apply_reasoning_config(
+        request_kwargs = self._prepare_generation_request_kwargs(
             request_kwargs,
             model_id=resolved_model,
-            provider_preset=(
-                str(dict(provider.config).get("preset", "")).lower() if provider else ""
-            ),
+            provider=provider,
             model_info=model_info,
         )
         prepared_messages = _apply_message_cache_hints(
-            messages, resolved_model, cache_breakpoint_index
+            messages, resolved_model, model_info, cache_breakpoint_index
         )
         use_responses_api = self._should_use_responses_api(resolved_model, model_info, provider)
         if use_responses_api:
@@ -712,23 +917,31 @@ class LiteLLMProvider:
     ) -> AsyncIterator[dict[str, Any]]:
         from cognis.providers.llm.retry import with_llm_retry
 
-        resolved_model, provider = await self._resolve_model_target(model, task_type=task_type)
+        explicit_provider_id = cast(str | None, kwargs.pop("provider_id", None))
+        resolved_model, provider = await self._resolve_model_target(
+            model,
+            task_type=task_type,
+            explicit_provider_id=explicit_provider_id,
+        )
+        if provider is None:
+            raise ValueError(f"No LLM provider found for model {resolved_model!r}")
 
         prefixed_model = self._apply_model_prefix(resolved_model, provider)
-        model_info = await self.get_model_info(resolved_model)
+        model_info = await self.get_model_info(
+            resolved_model,
+            provider_id=provider.provider_id if provider is not None else None,
+        )
         request_kwargs = _merge_request_kwargs(
             await self._resolve_provider_kwargs(provider), kwargs
         )
-        request_kwargs = apply_reasoning_config(
+        request_kwargs = self._prepare_generation_request_kwargs(
             request_kwargs,
             model_id=resolved_model,
-            provider_preset=(
-                str(dict(provider.config).get("preset", "")).lower() if provider else ""
-            ),
+            provider=provider,
             model_info=model_info,
         )
         prepared_messages = _apply_message_cache_hints(
-            messages, resolved_model, cache_breakpoint_index
+            messages, resolved_model, model_info, cache_breakpoint_index
         )
         use_responses_api = self._should_use_responses_api(resolved_model, model_info, provider)
         if use_responses_api:
@@ -968,6 +1181,12 @@ class LiteLLMProvider:
         )
 
     async def health(self) -> ProviderHealth:
+        async with self.session_factory() as session:
+            provider_count = len((await session.execute(select(LLMProviderRow))).scalars().all())
+        if provider_count == 0:
+            return ProviderHealth(
+                name="llm", status="unhealthy", error="No LLM providers configured"
+            )
         try:
             resolved_model = await self.resolve_model(task_type="default")
         except Exception as exc:
@@ -992,12 +1211,30 @@ class LiteLLMProvider:
             raise ValueError("Provider default_model is not configured")
 
         prefixed_model = self._apply_model_prefix(default_model, provider)
+        model_info = await self.get_model_info(default_model, provider_id=provider.provider_id)
         request_kwargs = await self._resolve_provider_kwargs(provider)
         configured_timeout = request_kwargs.get("timeout")
         request_kwargs["timeout"] = (
             min(timeout_seconds, configured_timeout)
             if isinstance(configured_timeout, int)
             else timeout_seconds
+        )
+        base_max_tokens = 1024 if model_info.supports_reasoning else 256
+        request_kwargs["max_tokens"] = max(
+            base_max_tokens, int(request_kwargs.get("max_tokens", 0) or 0)
+        )
+        if model_info.supports_reasoning:
+            request_kwargs["reasoning_effort"] = auxiliary_reasoning_effort_for_family(
+                detect_reasoning_family(
+                    default_model,
+                    provider_preset=str(config.get("preset", "")).lower(),
+                )
+            )
+        request_kwargs = self._prepare_generation_request_kwargs(
+            request_kwargs,
+            model_id=default_model,
+            provider=provider,
+            model_info=model_info,
         )
         started_at = monotonic()
         tested_at = datetime.now(UTC)
@@ -1012,13 +1249,12 @@ class LiteLLMProvider:
                     executor_labels=config.get("executor_labels")
                     if isinstance(config, dict)
                     else None,
-                    request_kwargs={**request_kwargs, "max_tokens": 5},
+                    request_kwargs=request_kwargs,
                 )
             else:
                 await litellm.acompletion(
                     model=prefixed_model,
                     messages=test_messages,
-                    max_tokens=5,
                     stream=False,
                     **request_kwargs,
                 )
@@ -1053,18 +1289,41 @@ class LiteLLMProvider:
         }
 
     async def _find_provider_for_model(self, session: Any, model_id: str) -> LLMProviderRow | None:
+        cached_provider_id = await self._get_cached_provider_id(model_id)
+        if cached_provider_id is not _CACHE_MISS:
+            if cached_provider_id is None:
+                return None
+            cached_provider = await session.get(LLMProviderRow, cached_provider_id)
+            if cached_provider is not None:
+                return cached_provider
         rows = (await session.execute(select(LLMProviderRow))).scalars().all()
-        for row in rows:
-            config = dict(row.config)
-            if config.get("default_model") == model_id:
-                return cast(LLMProviderRow, row)
-            row_models = config.get("models", [])
-            if not isinstance(row_models, list):
-                continue
-            for model in row_models:
-                if isinstance(model, dict) and model.get("model_id") == model_id:
-                    return cast(LLMProviderRow, row)
-        return None
+        provider_id = self._select_provider_id_for_model(rows, model_id)
+        await self._set_cached_provider_id(model_id, provider_id)
+        if provider_id is None:
+            return None
+        return await session.get(LLMProviderRow, provider_id)
+
+    @staticmethod
+    def _provider_matches_model(row: LLMProviderRow, model_id: str) -> bool:
+        config = dict(row.config)
+        if config.get("default_model") == model_id:
+            return True
+        row_models = config.get("models", [])
+        if not isinstance(row_models, list):
+            return False
+        return any(
+            isinstance(model, dict) and model.get("model_id") == model_id for model in row_models
+        )
+
+    @classmethod
+    def _select_provider_id_for_model(cls, rows: list[LLMProviderRow], model_id: str) -> str | None:
+        matches = [row for row in rows if cls._provider_matches_model(row, model_id)]
+        if not matches:
+            return None
+        matches.sort(
+            key=lambda row: (0 if bool(getattr(row, "is_default", False)) else 1, row.provider_id)
+        )
+        return matches[0].provider_id
 
     @staticmethod
     def _apply_model_prefix(model: str, provider: LLMProviderRow | None) -> str:
@@ -1233,7 +1492,7 @@ class LiteLLMProvider:
         message = re.sub(r"(?i)(api[_ -]?key\s*[=:]\s*)([^\s,;]+)", r"\1[redacted]", message)
         return f"{error.__class__.__name__}: {message}"[:500]
 
-    async def _get_cached_resolved_model(self, task_type: str) -> str | None:
+    async def _get_cached_resolved_model(self, task_type: str) -> tuple[str, str | None] | None:
         async with self._cache_lock:
             cached = self._resolved_model_cache.get(task_type)
             if cached is None:
@@ -1244,10 +1503,12 @@ class LiteLLMProvider:
                 return None
             return value
 
-    async def _set_cached_resolved_model(self, task_type: str, model_id: str) -> None:
+    async def _set_cached_resolved_model(
+        self, task_type: str, model_id: str, provider_id: str | None
+    ) -> None:
         async with self._cache_lock:
             self._resolved_model_cache[task_type] = (
-                model_id,
+                (model_id, provider_id),
                 monotonic() + MODEL_CACHE_TTL_SECONDS,
             )
 
@@ -1266,6 +1527,28 @@ class LiteLLMProvider:
         async with self._cache_lock:
             self._model_info_cache[model_id] = (
                 model_info,
+                monotonic() + MODEL_CACHE_TTL_SECONDS,
+            )
+
+    @staticmethod
+    def _model_info_cache_key(model_id: str, provider_id: str | None) -> str:
+        return f"{provider_id or '*'}::{model_id}"
+
+    async def _get_cached_provider_id(self, model_id: str) -> str | None | object:
+        async with self._cache_lock:
+            cached = self._model_provider_cache.get(model_id)
+            if cached is None:
+                return _CACHE_MISS
+            value, expires_at = cached
+            if expires_at < monotonic():
+                self._model_provider_cache.pop(model_id, None)
+                return _CACHE_MISS
+            return value
+
+    async def _set_cached_provider_id(self, model_id: str, provider_id: str | None) -> None:
+        async with self._cache_lock:
+            self._model_provider_cache[model_id] = (
+                provider_id,
                 monotonic() + MODEL_CACHE_TTL_SECONDS,
             )
 
@@ -1292,7 +1575,8 @@ class LiteLLMProvider:
         """
         import httpx
 
-        cache_key = base_url.rstrip("/")
+        api_hash = hashlib.sha256(api_key.encode()).hexdigest()[:12] if api_key else "anonymous"
+        cache_key = f"{base_url.rstrip('/')}#{api_hash}"
 
         if not bypass_cache:
             async with self._cache_lock:
@@ -1309,14 +1593,17 @@ class LiteLLMProvider:
 
         try:
             async with httpx.AsyncClient(timeout=10) as client:
-                response = await client.get(f"{cache_key}/model/info", headers=headers)
+                response = await client.get(f"{base_url.rstrip('/')}/model/info", headers=headers)
                 response.raise_for_status()
                 data = response.json()
         except Exception:
             logger.warning(
                 "Failed to fetch proxy model info",
                 extra={
-                    "extra_data": {"base_url": re.sub(r"://[^@/]+@", "://[redacted]@", cache_key)}
+                    "extra_data": {
+                        "base_url": re.sub(r"://[^@/]+@", "://[redacted]@", base_url.rstrip("/")),
+                        "api_hash": api_hash,
+                    }
                 },
                 exc_info=True,
             )
@@ -1348,7 +1635,8 @@ class LiteLLMProvider:
             "Populated proxy model info cache",
             extra={
                 "extra_data": {
-                    "base_url": re.sub(r"://[^@/]+@", "://[redacted]@", cache_key),
+                    "base_url": re.sub(r"://[^@/]+@", "://[redacted]@", base_url.rstrip("/")),
+                    "api_hash": api_hash,
                     "model_count": len(result),
                 }
             },
@@ -1431,6 +1719,8 @@ class LiteLLMProvider:
         """
 
         resolved_model, provider = await self._resolve_model_target(model, task_type=task_type)
+        if provider is None:
+            raise ValueError(f"No LLM provider found for image generation model {resolved_model!r}")
         prefixed_model = self._apply_model_prefix(resolved_model, provider)
         request_kwargs = await self._resolve_provider_kwargs(provider)
 

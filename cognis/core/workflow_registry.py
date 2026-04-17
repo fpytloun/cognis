@@ -17,6 +17,7 @@ from cognis.models.workflow import (
     WorkflowDefaults,
     resolve_effective_input,
 )
+from cognis.providers.llm.reasoning import normalize_reasoning_effort
 from cognis.store.queries import (
     create_workflow,
     get_system_workflow_override,
@@ -446,7 +447,15 @@ class WorkflowRegistry:
                 continue
             reasoning_effort = raw_override.get("reasoning_effort")
             if isinstance(reasoning_effort, str):
-                step.reasoning_effort = reasoning_effort
+                normalized_effort = normalize_reasoning_effort(reasoning_effort)
+                if normalized_effort is None:
+                    warnings.append(
+                        f"Override for step '{step_name}' has unsupported reasoning_effort "
+                        f"{reasoning_effort!r}; override is ignored."
+                    )
+                    normalized_effort = None
+                if normalized_effort is not None:
+                    step.reasoning_effort = normalized_effort
             completion_override = raw_override.get("completion")
             if isinstance(completion_override, dict):
                 if step.completion is None:

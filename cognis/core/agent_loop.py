@@ -1822,6 +1822,7 @@ class AgentLoop:
             model_for_llm = self.session_cache.get_model_override(ctx.session.session_id) or (
                 ctx.agent.llm_config.model if ctx.agent.llm_config else None
             )
+            provider_for_llm = ctx.agent.llm_config.provider_id if ctx.agent.llm_config else None
 
             reasoning_effort = (
                 self.session_cache.get_reasoning_effort_override(ctx.session.session_id)
@@ -1832,9 +1833,43 @@ class AgentLoop:
             llm_kwargs: dict[str, Any] = {}
             if reasoning_effort:
                 llm_kwargs["reasoning_effort"] = reasoning_effort
+            if ctx.agent.llm_config:
+                if ctx.agent.llm_config.temperature is not None:
+                    llm_kwargs["temperature"] = ctx.agent.llm_config.temperature
+                if ctx.agent.llm_config.top_p is not None:
+                    llm_kwargs["top_p"] = ctx.agent.llm_config.top_p
 
-            model_info = await self.providers.llm.get_model_info(model_for_llm or resolved_model)
-            ctx.current_model = model_for_llm or resolved_model
+            current_model = model_for_llm or resolved_model
+            current_provider_id: str | None = None
+            if hasattr(self.providers.llm, "resolve_model_target"):
+                try:
+                    (
+                        current_model,
+                        current_provider_id,
+                    ) = await self.providers.llm.resolve_model_target(
+                        explicit_model=model_for_llm,
+                        task_type="default",
+                        explicit_provider_id=provider_for_llm,
+                    )
+                except TypeError:
+                    (
+                        current_model,
+                        current_provider_id,
+                    ) = await self.providers.llm.resolve_model_target(
+                        explicit_model=model_for_llm,
+                        task_type="default",
+                    )
+            if current_provider_id is not None:
+                try:
+                    model_info = await self.providers.llm.get_model_info(
+                        current_model,
+                        provider_id=current_provider_id,
+                    )
+                except TypeError:
+                    model_info = await self.providers.llm.get_model_info(current_model)
+            else:
+                model_info = await self.providers.llm.get_model_info(current_model)
+            ctx.current_model = current_model
             registry = self._get_tool_registry(ctx)
             inventory_tools = (
                 _filter_model_inventory_tools(ctx.agent, registry.list_tools(), discovered_tool_ids)
@@ -1844,7 +1879,7 @@ class AgentLoop:
             exposure = prepare_tool_exposure(
                 inventory_tools=inventory_tools,
                 controller_tool_schemas=controller_tool_schemas,
-                model=model_for_llm or resolved_model,
+                model=current_model,
                 model_info=model_info,
                 discovered_tool_ids=discovered_tool_ids,
             )
@@ -1869,6 +1904,7 @@ class AgentLoop:
                 messages,
                 model=model_for_llm,
                 task_type="default",
+                provider_id=provider_for_llm,
                 tools=exposure.tools,
                 cache_breakpoint_index=cache_breakpoint,
                 **llm_kwargs,

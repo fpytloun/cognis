@@ -77,10 +77,50 @@ async def test_litellm_provider_raises_when_no_model_is_configured(tmp_path: obj
 
 
 @pytest.mark.asyncio
+async def test_litellm_provider_raises_when_model_route_provider_is_missing(
+    tmp_path: object,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+
+    class _FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            del exc_type, exc, tb
+            return False
+
+        async def get(self, model, key):
+            if model is ModelRouting and key == "default":
+                return ModelRouting(task_type="default", provider_id="missing", model="gpt-4o-mini")
+            return None
+
+    provider = LiteLLMProvider(session_factory)
+    provider.session_factory = lambda: _FakeSession()  # type: ignore[assignment]
+
+    with pytest.raises(ValueError, match="references missing provider"):
+        await provider.resolve_model(task_type="default")
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_litellm_provider_image_generate_omits_response_format_for_gpt_image_1(
     tmp_path: object, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="openai",
+                display_name="OpenAI",
+                location="controller",
+                backend="litellm",
+                config={"preset": "openai", "default_model": "gpt-image-1"},
+                status="active",
+            )
+        )
+        await session.commit()
     provider = LiteLLMProvider(session_factory)
 
     captured: dict[str, object] = {}
@@ -106,6 +146,18 @@ async def test_litellm_provider_image_generate_keeps_response_format_for_other_m
     tmp_path: object, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="openai",
+                display_name="OpenAI",
+                location="controller",
+                backend="litellm",
+                config={"preset": "openai", "default_model": "dall-e-3"},
+                status="active",
+            )
+        )
+        await session.commit()
     provider = LiteLLMProvider(session_factory)
 
     captured: dict[str, object] = {}
@@ -233,31 +285,169 @@ async def test_litellm_provider_infers_anthropic_capabilities(tmp_path: object) 
 
 
 def test_reasoning_translation_maps_openai_max_to_xhigh() -> None:
-    kwargs = apply_reasoning_config(
+    prepared = apply_reasoning_config(
         {"reasoning_effort": "max"},
         model_id="gpt-5.4",
         provider_preset="openai",
         model_info=DEFAULT_MODEL_INFO.model_copy(update={"supports_reasoning": True}),
     )
 
-    assert kwargs["reasoning_effort"] == "xhigh"
+    assert prepared.request_kwargs["reasoning_effort"] == "xhigh"
+    assert prepared.effective_effort == "xhigh"
 
 
 def test_reasoning_translation_uses_adaptive_default_for_claude_46() -> None:
-    kwargs = apply_reasoning_config(
+    prepared = apply_reasoning_config(
         {"reasoning_effort": "default"},
         model_id="claude-opus-4.6",
         provider_preset="anthropic",
         model_info=DEFAULT_MODEL_INFO.model_copy(update={"supports_reasoning": True}),
     )
 
-    assert kwargs["thinking"] == {"type": "adaptive"}
+    assert prepared.request_kwargs["thinking"] == {"type": "adaptive"}
+    assert prepared.effective_effort == "adaptive"
+
+
+def test_reasoning_translation_drops_default_for_openai_models() -> None:
+    prepared = apply_reasoning_config(
+        {"reasoning_effort": "default", "temperature": 0.2},
+        model_id="gpt-5.4",
+        provider_preset="openai",
+        model_info=DEFAULT_MODEL_INFO.model_copy(update={"supports_reasoning": True}),
+    )
+
+    assert "reasoning_effort" not in prepared.request_kwargs
+    assert "temperature" not in prepared.request_kwargs
+
+
+def test_reasoning_translation_maps_none_to_minimal_for_openai() -> None:
+    prepared = apply_reasoning_config(
+        {"reasoning_effort": "none"},
+        model_id="gpt-5.4",
+        provider_preset="openai",
+        model_info=DEFAULT_MODEL_INFO.model_copy(update={"supports_reasoning": True}),
+    )
+
+    assert prepared.request_kwargs["reasoning_effort"] == "minimal"
+    assert prepared.effective_effort == "minimal"
+
+
+def test_reasoning_translation_maps_none_to_google_thinking_budget_zero() -> None:
+    prepared = apply_reasoning_config(
+        {"reasoning_effort": "none"},
+        model_id="gemini-2.5-pro",
+        provider_preset="gemini",
+        model_info=DEFAULT_MODEL_INFO.model_copy(update={"supports_reasoning": True}),
+    )
+
+    assert prepared.request_kwargs["thinking_config"] == {"thinking_budget": 0}
+
+
+def test_reasoning_translation_strips_sampling_and_translates_max_tokens() -> None:
+    prepared = apply_reasoning_config(
+        {
+            "reasoning_effort": "low",
+            "temperature": 0.3,
+            "top_p": 0.9,
+            "max_tokens": 222,
+        },
+        model_id="gpt-5.4",
+        provider_preset="openai",
+        model_info=DEFAULT_MODEL_INFO.model_copy(update={"supports_reasoning": True}),
+    )
+
+    assert "temperature" not in prepared.request_kwargs
+    assert "top_p" not in prepared.request_kwargs
+    assert "max_tokens" not in prepared.request_kwargs
+    assert prepared.request_kwargs["max_completion_tokens"] == 222
+    assert prepared.translated_max_tokens is True
+
+
+def test_reasoning_translation_enforces_anthropic_budget_floor() -> None:
+    prepared = apply_reasoning_config(
+        {"reasoning_effort": "medium", "max_tokens": 4000},
+        model_id="claude-sonnet-4-20250514",
+        provider_preset="anthropic",
+        model_info=DEFAULT_MODEL_INFO.model_copy(
+            update={"supports_reasoning": True, "supports_extended_thinking": True}
+        ),
+    )
+
+    assert prepared.request_kwargs["thinking"] == {"type": "enabled", "budget_tokens": 8192}
+    assert prepared.request_kwargs["max_tokens"] == 9216
+
+
+def test_reasoning_translation_uses_provider_preset_for_aliased_openai_reasoning_models() -> None:
+    prepared = apply_reasoning_config(
+        {"reasoning_effort": "low", "max_tokens": 222},
+        model_id="internal-reasoner",
+        provider_preset="openai",
+        model_info=DEFAULT_MODEL_INFO.model_copy(update={"supports_reasoning": True}),
+    )
+
+    assert prepared.family == "openai"
+    assert prepared.request_kwargs["reasoning_effort"] == "low"
+    assert prepared.request_kwargs["max_completion_tokens"] == 222
+
+
+def test_reasoning_translation_skips_non_reasoning_claude_models() -> None:
+    prepared = apply_reasoning_config(
+        {"reasoning_effort": "low"},
+        model_id="claude-3-5-haiku-latest",
+        provider_preset="anthropic",
+        model_info=DEFAULT_MODEL_INFO.model_copy(
+            update={"supports_reasoning": False, "supports_extended_thinking": False}
+        ),
+    )
+
+    assert "thinking" not in prepared.request_kwargs
+    assert prepared.effective_effort is None
+
+
+def test_reasoning_translation_uses_adaptive_default_for_aliased_claude_46_models() -> None:
+    prepared = apply_reasoning_config(
+        {"reasoning_effort": "default"},
+        model_id="internal-claude",
+        provider_preset="anthropic",
+        model_info=DEFAULT_MODEL_INFO.model_copy(
+            update={
+                "supports_reasoning": True,
+                "supports_extended_thinking": True,
+                "display_name": "Claude Opus 4.6 Alias",
+            }
+        ),
+    )
+
+    assert prepared.family == "anthropic_adaptive"
+    assert prepared.request_kwargs["thinking"] == {"type": "adaptive"}
+
+
+def test_reasoning_translation_respects_explicit_false_for_matching_model_ids() -> None:
+    prepared = apply_reasoning_config(
+        {"reasoning_effort": "low", "temperature": 0.2, "top_p": 0.7},
+        model_id="gpt-5.4",
+        provider_preset="openai",
+        model_info=DEFAULT_MODEL_INFO.model_copy(
+            update={"model_id": "gpt-5.4", "supports_reasoning": False}
+        ),
+    )
+
+    assert prepared.request_kwargs["temperature"] == 0.2
+    assert prepared.request_kwargs["top_p"] == 0.7
+    assert "reasoning_effort" not in prepared.request_kwargs
 
 
 def test_reasoning_efforts_for_reasoning_model_return_normalized_levels() -> None:
     assert reasoning_efforts_for_model(
         "gpt-5.4", provider_preset="openai", supports_reasoning=True
     ) == ["default", "none", "minimal", "low", "medium", "high", "max"]
+
+
+def test_reasoning_efforts_respect_explicit_false() -> None:
+    assert (
+        reasoning_efforts_for_model("gpt-5.4", provider_preset="openai", supports_reasoning=False)
+        == []
+    )
 
 
 def test_responses_request_kwargs_preserves_namespace_and_tool_search_tools() -> None:
@@ -311,6 +501,7 @@ async def test_litellm_provider_infers_openai_responses_capabilities_for_proxy_m
 
     assert model_info.supports_responses_api is True
     assert model_info.supports_tool_search is True
+    assert model_info.supports_openai_namespace_tools is False
     await engine.dispose()
 
 
@@ -515,6 +706,62 @@ async def test_litellm_provider_generate_applies_anthropic_cache_hint_to_first_m
     ]
     assert messages[1] == {"role": "system", "content": "mutable environment"}
     assert messages[2] == {"role": "user", "content": "hi"}
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_litellm_provider_generate_skips_cache_hint_when_capability_disabled(
+    tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="default",
+                display_name="Anthropic-ish Proxy",
+                location="controller",
+                backend="litellm",
+                config={
+                    "default_model": "claude-sonnet-4-20250514",
+                    "models": [
+                        {
+                            "model_id": "claude-sonnet-4-20250514",
+                            "supports_prompt_caching": False,
+                        }
+                    ],
+                },
+                status="active",
+            )
+        )
+        await session.commit()
+
+    captured: dict[str, object] = {}
+
+    async def _fake_completion(**kwargs: object) -> object:
+        captured.update(kwargs)
+
+        class _Response:
+            def model_dump(self) -> dict[str, object]:
+                return {"choices": [{"message": {"content": "ok"}}]}
+
+        return _Response()
+
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.acompletion", _fake_completion)
+
+    provider = LiteLLMProvider(session_factory)
+    await provider.generate(
+        messages=[
+            {"role": "system", "content": "immutable prefix"},
+            {"role": "user", "content": "hi"},
+        ],
+        model="claude-sonnet-4-20250514",
+        cache_breakpoint_index=0,
+    )
+
+    messages = captured["messages"]
+    assert isinstance(messages, list)
+    assert messages[0] == {"role": "system", "content": "immutable prefix"}
     await engine.dispose()
 
 
@@ -1167,13 +1414,13 @@ async def test_litellm_provider_discover_models_rejects_executor_location(
 
 
 @pytest.mark.asyncio
-async def test_litellm_provider_health_reports_degraded_without_model(tmp_path: object) -> None:
+async def test_litellm_provider_health_reports_unhealthy_without_model(tmp_path: object) -> None:
     engine, session_factory = await _session_factory(tmp_path)
     provider = LiteLLMProvider(session_factory)
 
     health = await provider.health()
 
-    assert health.status == "degraded"
+    assert health.status == "unhealthy"
     await engine.dispose()
 
 
@@ -1186,7 +1433,7 @@ async def test_litellm_provider_cached_resolution_expires(
         session.add(ModelRouting(task_type="default", provider_id=None, model="gpt-4o-mini"))
         await session.commit()
 
-    time_points = iter([1.0, 70.0, 70.0])
+    time_points = iter([1.0, 1.0, 70.0, 70.0, 70.0])
     monkeypatch.setattr("cognis.providers.llm.litellm.monotonic", lambda: next(time_points))
 
     provider = LiteLLMProvider(session_factory)
@@ -1305,7 +1552,9 @@ def test_normalize_proxy_model_info_maps_fields() -> None:
         "supports_audio_input": False,
         "supports_pdf_input": True,
         "supports_reasoning": False,
+        "supports_extended_thinking": True,
         "supports_prompt_caching": True,
+        "supports_openai_namespace_tools": True,
         "input_cost_per_token": 0.0000025,
         "output_cost_per_token": 0.00001,
     }
@@ -1317,7 +1566,9 @@ def test_normalize_proxy_model_info_maps_fields() -> None:
     assert result["supports_audio_input"] is False
     assert result["supports_pdf_input"] is True
     assert result["supports_reasoning"] is False
+    assert result["supports_extended_thinking"] is True
     assert result["supports_prompt_caching"] is True
+    assert result["supports_openai_namespace_tools"] is True
     assert result["input_cost_per_mtok"] == 2.5
     assert result["output_cost_per_mtok"] == 10.0
 
@@ -1437,6 +1688,41 @@ async def test_fetch_proxy_model_info_negative_cache(
     result2 = await provider._fetch_proxy_model_info("http://localhost:4000", "key")
     assert result2 == {}
     assert call_count == 1  # No additional HTTP call
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_fetch_proxy_model_info_cache_isolated_by_api_key(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    provider = LiteLLMProvider(session_factory)
+
+    call_count = 0
+
+    async def _fake_get(self, url, **kwargs):
+        nonlocal call_count
+        call_count += 1
+
+        class FakeResponse:
+            status_code = 200
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"data": [{"model_name": "m1", "model_info": {"max_input_tokens": 100}}]}
+
+        return FakeResponse()
+
+    import httpx
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", _fake_get)
+
+    await provider._fetch_proxy_model_info("http://localhost:4000", "key-a")
+    await provider._fetch_proxy_model_info("http://localhost:4000", "key-b")
+
+    assert call_count == 2
     await engine.dispose()
 
 
@@ -1660,4 +1946,279 @@ async def test_find_provider_for_model(tmp_path: object) -> None:
     assert await provider.find_provider_for_model("gpt-4o-mini") == "openai"
     assert await provider.find_provider_for_model("gpt-4o") == "openai"
     assert await provider.find_provider_for_model("nonexistent") is None
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_find_provider_for_model_prefers_default_then_provider_id(tmp_path: object) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add_all(
+            [
+                LLMProvider(
+                    provider_id="zzz",
+                    display_name="Zed",
+                    location="controller",
+                    backend="litellm",
+                    config={"preset": "openai", "models": [{"model_id": "gpt-5.4"}]},
+                    status="active",
+                ),
+                LLMProvider(
+                    provider_id="aaa",
+                    display_name="Aye",
+                    location="controller",
+                    backend="litellm",
+                    config={"preset": "openai", "models": [{"model_id": "gpt-5.4"}]},
+                    is_default=True,
+                    status="active",
+                ),
+            ]
+        )
+        await session.commit()
+
+    provider = LiteLLMProvider(session_factory)
+
+    assert await provider.find_provider_for_model("gpt-5.4") == "aaa"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_find_provider_for_model_recovers_from_stale_provider_cache(tmp_path: object) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="openai",
+                display_name="OpenAI",
+                location="controller",
+                backend="litellm",
+                config={"preset": "openai", "models": [{"model_id": "gpt-5.4"}]},
+                status="active",
+            )
+        )
+        await session.commit()
+
+    provider = LiteLLMProvider(session_factory)
+    await provider._set_cached_provider_id("gpt-5.4", "missing-provider")
+
+    async with session_factory() as session:
+        row = await provider._find_provider_for_model(session, "gpt-5.4")
+
+    assert row is not None
+    assert row.provider_id == "openai"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_resolved_model_cache_preserves_pinned_route_provider(tmp_path: object) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add_all(
+            [
+                LLMProvider(
+                    provider_id="provider-a",
+                    display_name="Provider A",
+                    location="controller",
+                    backend="litellm",
+                    config={"preset": "openai", "models": [{"model_id": "shared-model"}]},
+                    status="active",
+                ),
+                LLMProvider(
+                    provider_id="provider-b",
+                    display_name="Provider B",
+                    location="controller",
+                    backend="litellm",
+                    config={"preset": "litellm_proxy", "models": [{"model_id": "shared-model"}]},
+                    status="active",
+                ),
+                ModelRouting(task_type="default", provider_id="provider-b", model="shared-model"),
+            ]
+        )
+        await session.commit()
+
+    provider = LiteLLMProvider(session_factory)
+
+    first = await provider.resolve_model_target(task_type="default")
+    second = await provider.resolve_model_target(task_type="default")
+
+    assert first == ("shared-model", "provider-b")
+    assert second == ("shared-model", "provider-b")
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_resolve_model_target_honors_explicit_provider_id(tmp_path: object) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="provider-b",
+                display_name="Provider B",
+                location="controller",
+                backend="litellm",
+                config={"preset": "litellm_proxy", "default_model": "shared-model"},
+                status="active",
+            )
+        )
+        await session.commit()
+
+    provider = LiteLLMProvider(session_factory)
+
+    resolved = await provider.resolve_model_target(
+        task_type="default", explicit_provider_id="provider-b"
+    )
+
+    assert resolved == ("shared-model", "provider-b")
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_get_model_info_uses_provider_default_model_metadata_when_models_list_omits_entry(
+    tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="provider-b",
+                display_name="Provider B",
+                location="controller",
+                backend="litellm",
+                config={"preset": "litellm_proxy", "default_model": "shared-model"},
+                status="active",
+            )
+        )
+        await session.commit()
+
+    monkeypatch.setattr(
+        "cognis.providers.llm.litellm.litellm.get_model_info",
+        lambda **_: {
+            "max_input_tokens": 123456,
+            "max_output_tokens": 7890,
+            "supports_reasoning": True,
+            "supports_prompt_caching": True,
+        },
+    )
+
+    provider = LiteLLMProvider(session_factory)
+
+    model_info = await provider.get_model_info("shared-model", provider_id="provider-b")
+
+    assert model_info.context_window == 123456
+    assert model_info.max_output_tokens == 7890
+    assert model_info.supports_prompt_caching is True
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_resolve_model_target_recovers_from_stale_cached_provider_id(
+    tmp_path: object,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add_all(
+            [
+                LLMProvider(
+                    provider_id="provider-b",
+                    display_name="Provider B",
+                    location="controller",
+                    backend="litellm",
+                    config={"preset": "litellm_proxy", "models": [{"model_id": "shared-model"}]},
+                    status="active",
+                ),
+                ModelRouting(task_type="default", provider_id="provider-b", model="shared-model"),
+            ]
+        )
+        await session.commit()
+
+    provider = LiteLLMProvider(session_factory)
+    await provider._set_cached_resolved_model("default", "shared-model", "missing-provider")
+
+    resolved = await provider.resolve_model_target(task_type="default")
+
+    assert resolved == ("shared-model", "provider-b")
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_get_model_info_is_scoped_by_provider_id(tmp_path: object) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add_all(
+            [
+                LLMProvider(
+                    provider_id="provider-a",
+                    display_name="Provider A",
+                    location="controller",
+                    backend="litellm",
+                    config={
+                        "preset": "openai",
+                        "default_model": "shared-model",
+                        "models": [
+                            {
+                                "model_id": "shared-model",
+                                "supports_responses_api": False,
+                                "supports_prompt_caching": False,
+                            }
+                        ],
+                    },
+                    status="active",
+                ),
+                LLMProvider(
+                    provider_id="provider-b",
+                    display_name="Provider B",
+                    location="controller",
+                    backend="litellm",
+                    config={
+                        "preset": "litellm_proxy",
+                        "default_model": "shared-model",
+                        "models": [
+                            {
+                                "model_id": "shared-model",
+                                "supports_responses_api": True,
+                                "supports_prompt_caching": True,
+                            }
+                        ],
+                    },
+                    status="active",
+                ),
+            ]
+        )
+        await session.commit()
+
+    provider = LiteLLMProvider(session_factory)
+
+    info_a = await provider.get_model_info("shared-model", provider_id="provider-a")
+    info_b = await provider.get_model_info("shared-model", provider_id="provider-b")
+
+    assert info_a.supports_responses_api is False
+    assert info_b.supports_responses_api is True
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_get_model_info_with_missing_provider_id_does_not_fall_back(tmp_path: object) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="provider-a",
+                display_name="Provider A",
+                location="controller",
+                backend="litellm",
+                config={
+                    "preset": "openai",
+                    "models": [{"model_id": "shared-model", "supports_responses_api": True}],
+                },
+                status="active",
+            )
+        )
+        await session.commit()
+
+    provider = LiteLLMProvider(session_factory)
+
+    model_info = await provider.get_model_info("shared-model", provider_id="missing-provider")
+
+    assert model_info == DEFAULT_MODEL_INFO
     await engine.dispose()

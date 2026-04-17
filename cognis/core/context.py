@@ -560,11 +560,39 @@ class ContextAssembler:
         # Model resolution chain: session override → agent config → system default
         model_override = self.session_cache.get_model_override(session.session_id)
         explicit_model = model_override or (agent.llm_config.model if agent.llm_config else None)
-        resolved_model = await self.llm.resolve_model(
-            explicit_model=explicit_model,
-            task_type="default",
-        )
-        model_info = await self.llm.get_model_info(resolved_model)
+        explicit_provider_id = agent.llm_config.provider_id if agent.llm_config else None
+        provider_id: str | None = None
+        if hasattr(self.llm, "resolve_model_target"):
+            try:
+                resolved_model, provider_id = await self.llm.resolve_model_target(
+                    explicit_model=explicit_model,
+                    task_type="default",
+                    explicit_provider_id=explicit_provider_id,
+                )
+            except TypeError:
+                resolved_model, provider_id = await self.llm.resolve_model_target(
+                    explicit_model=explicit_model,
+                    task_type="default",
+                )
+        else:
+            try:
+                resolved_model = await self.llm.resolve_model(
+                    explicit_model=explicit_model,
+                    task_type="default",
+                    explicit_provider_id=explicit_provider_id,
+                )
+            except TypeError:
+                resolved_model = await self.llm.resolve_model(
+                    explicit_model=explicit_model,
+                    task_type="default",
+                )
+        if provider_id is not None:
+            try:
+                model_info = await self.llm.get_model_info(resolved_model, provider_id=provider_id)
+            except TypeError:
+                model_info = await self.llm.get_model_info(resolved_model)
+        else:
+            model_info = await self.llm.get_model_info(resolved_model)
         if model_info.model_id == "unknown":
             degraded_sources.append("model_info")
 
@@ -827,11 +855,39 @@ class ContextAssembler:
         # Model resolution
         model_override = self.session_cache.get_model_override(session.session_id)
         explicit_model = model_override or (agent.llm_config.model if agent.llm_config else None)
-        resolved_model = await self.llm.resolve_model(
-            explicit_model=explicit_model,
-            task_type="default",
-        )
-        model_info = await self.llm.get_model_info(resolved_model)
+        explicit_provider_id = agent.llm_config.provider_id if agent.llm_config else None
+        provider_id: str | None = None
+        if hasattr(self.llm, "resolve_model_target"):
+            try:
+                resolved_model, provider_id = await self.llm.resolve_model_target(
+                    explicit_model=explicit_model,
+                    task_type="default",
+                    explicit_provider_id=explicit_provider_id,
+                )
+            except TypeError:
+                resolved_model, provider_id = await self.llm.resolve_model_target(
+                    explicit_model=explicit_model,
+                    task_type="default",
+                )
+        else:
+            try:
+                resolved_model = await self.llm.resolve_model(
+                    explicit_model=explicit_model,
+                    task_type="default",
+                    explicit_provider_id=explicit_provider_id,
+                )
+            except TypeError:
+                resolved_model = await self.llm.resolve_model(
+                    explicit_model=explicit_model,
+                    task_type="default",
+                )
+        if provider_id is not None:
+            try:
+                model_info = await self.llm.get_model_info(resolved_model, provider_id=provider_id)
+            except TypeError:
+                model_info = await self.llm.get_model_info(resolved_model)
+        else:
+            model_info = await self.llm.get_model_info(resolved_model)
         if model_info.model_id == "unknown":
             degraded_sources.append("model_info")
 

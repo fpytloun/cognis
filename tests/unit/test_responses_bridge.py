@@ -4,6 +4,7 @@ import pytest
 
 from cognis.providers.llm.responses_bridge import (
     messages_to_responses_input,
+    responses_request_kwargs,
     responses_stream_to_chat_chunks,
     responses_to_chat_response,
 )
@@ -125,6 +126,40 @@ def test_responses_to_chat_response_marks_incomplete_as_length() -> None:
 
     assert result["choices"][0]["finish_reason"] == "length"
     assert result["response_status"] == "incomplete"
+
+
+def test_messages_to_responses_input_drops_tool_messages_without_tool_call_id() -> None:
+    result = messages_to_responses_input(
+        [
+            {"role": "assistant", "tool_calls": []},
+            {"role": "tool", "content": "hello"},
+        ]
+    )
+
+    assert result == [{"role": "assistant", "content": ""}]
+
+
+def test_responses_request_kwargs_ignores_unsupported_string_response_format() -> None:
+    result = responses_request_kwargs({"response_format": "xml"})
+
+    assert "text" not in result
+
+
+def test_responses_to_chat_response_prefers_input_output_usage_fields() -> None:
+    payload = {
+        "status": "completed",
+        "usage": {
+            "prompt_tokens": 1,
+            "completion_tokens": 2,
+            "input_tokens": 7,
+            "output_tokens": 8,
+            "total_tokens": 15,
+        },
+    }
+
+    result = responses_to_chat_response(payload)
+
+    assert result["usage"] == {"prompt_tokens": 7, "completion_tokens": 8, "total_tokens": 15}
 
 
 @pytest.mark.asyncio

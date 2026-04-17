@@ -72,7 +72,10 @@ def prepare_tool_exposure(
     available_slots = None if max_tools is None else max(0, max_tools - controller_count)
     use_anthropic_defer = bool(model_info.supports_defer_loading)
     use_openai_native_tool_search = bool(
-        use_openai_responses and model_info.supports_tool_search and deferred_tools
+        use_openai_responses
+        and model_info.supports_tool_search
+        and model_info.supports_openai_namespace_tools
+        and deferred_tools
     )
     if use_openai_native_tool_search:
         alias_map = {
@@ -94,7 +97,10 @@ def prepare_tool_exposure(
             tool_schemas,
             stable_anchor_tool_ids={stable_tool_id(tool) for tool in core_without_search},
         )
-        request_kwargs = {"extra_headers": {"anthropic-beta": "tool-search-tool-2025-10-19"}}
+        request_kwargs = {
+            "extra_headers": {"anthropic-beta": "tool-search-tool-2025-10-19"},
+            "disable_parallel_tool_use": False,
+        }
     elif use_openai_native_tool_search:
         strategy = "openai_responses_tool_search"
         visible_tools = core_without_search + deferred_tools
@@ -104,10 +110,23 @@ def prepare_tool_exposure(
             {"type": "tool_search"},
         ]
         request_kwargs = {"tool_choice": "auto", "parallel_tool_calls": True}
+    elif use_openai_responses and deferred_tools:
+        strategy = "openai_responses_flat_deferred"
+        visible_tools = core_without_search + deferred_tools
+        tool_schemas = _build_inventory_schemas(
+            visible_tools,
+            alias_map,
+            deferred_tool_ids={stable_tool_id(tool) for tool in deferred_tools},
+        )
+        request_kwargs = {"tool_choice": "auto", "parallel_tool_calls": True}
     elif use_openai_responses:
         strategy = "openai_responses_full_inventory"
         visible_tools = core_without_search + deferred_tools
-        tool_schemas = _build_inventory_schemas(visible_tools, alias_map)
+        tool_schemas = _build_inventory_schemas(
+            visible_tools,
+            alias_map,
+            deferred_tool_ids={stable_tool_id(tool) for tool in deferred_tools},
+        )
         request_kwargs = {"tool_choice": "auto", "parallel_tool_calls": True}
     else:
         strategy = "generic_search_tools"
