@@ -908,3 +908,50 @@ async def test_execute_workflow_updates_current_step_run_id_after_retry_reset(
 
     assert result.status == "completed"
     assert updated_ids == ["sr-current"]
+
+
+@pytest.mark.asyncio
+async def test_execute_workflow_fails_when_active_runtime_exceeds_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _build_engine()
+    task = TaskModel(
+        task_id="task-timeout",
+        title="Timeout",
+        created_by="user@example.com",
+        agent_id="agent-1",
+        workflow_id="wf:test",
+        workflow_state=WorkflowState(current_step_index=0),
+    )
+    workflow = Workflow(
+        workflow_id="wf:test",
+        name="Timeout Workflow",
+        steps=[StepDefinition(name="execute", type="run")],
+    )
+
+    async def _execute_run_step(*args: object, **kwargs: object):
+        del args, kwargs
+        await asyncio.sleep(0.05)
+        return StepOutput(summary="done", content="done"), "sr-timeout"
+
+    async def _noop(*args: object, **kwargs: object) -> None:
+        return None
+
+    async def _fail_running_step_runs_for_task(*args: object, **kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(engine, "_execute_run_step", _execute_run_step)
+    monkeypatch.setattr(engine, "_persist_task_final", _noop)
+    monkeypatch.setattr(engine, "_cleanup_step_sessions", _noop)
+    monkeypatch.setattr(engine, "_deliver_task_result", _noop)
+    monkeypatch.setattr(
+        "cognis.core.workflow_engine.fail_running_step_runs_for_task",
+        _fail_running_step_runs_for_task,
+    )
+    monkeypatch.setattr("cognis.core.workflow_engine.DEFAULT_MAX_WORKFLOW_SECONDS", 0.01)
+
+    result = await engine.execute_workflow(task, workflow)
+
+    assert result.status == "failed"
+    assert result.workflow_state is not None
+    assert result.workflow_state.status == "failed"

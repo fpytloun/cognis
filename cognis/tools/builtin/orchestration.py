@@ -745,6 +745,7 @@ async def handle_delegate_tool_call(
     session: Any | None = None,
     agent: Any | None = None,
     agent_registry: Any | None = None,
+    wait: bool | None = None,
 ) -> tuple[ToolResult, SessionModel | None]:
     """Handle the delegate tool call — creates a child session.
 
@@ -804,33 +805,37 @@ async def handle_delegate_tool_call(
                     )
 
         try:
+            effective_wait = bool(args.get("wait", False) if wait is None else wait)
             child_session = await session_manager.create_child_session(
                 parent_session=session,
-                mode="delegate",
+                mode="delegate_sync" if effective_wait else "delegate_async",
                 task_description=args.get("task", ""),
                 agent_id=args.get("agent_id") or getattr(agent, "agent_id", ""),
                 effective_agent_id=args.get("agent_id") or getattr(agent, "agent_id", ""),
                 expected_output=args.get("expected_output"),
             )
-            wait = args.get("wait", False)
             return (
                 ToolResult(
                     output=json.dumps(
                         {
                             "status": "accepted",
                             "mode": "delegate",
-                            "wait": wait,
+                            "wait": effective_wait,
                             "call_id": tool_call.call_id,
                             "session_id": child_session.session_id,
                             "message": (
                                 "Delegation created. Waiting for completion."
-                                if wait
+                                if effective_wait
                                 else "Delegation created. Working in background."
                             ),
                         },
                         sort_keys=True,
                     ),
-                    metadata={"orchestration": True, "mode": "delegate", "wait": wait},
+                    metadata={
+                        "orchestration": True,
+                        "mode": "delegate",
+                        "wait": effective_wait,
+                    },
                 ),
                 child_session,
             )

@@ -3602,6 +3602,7 @@ class AgentLoop:
             session=ctx.session,
             agent=ctx.agent,
             agent_registry=_agent_registry,
+            wait=wait,
         )
 
         if child_session is None:

@@ -58,6 +58,7 @@ from cognis.runtime_context import (
 )
 from cognis.store.queries import (
     create_step_run,
+    fail_running_step_runs_for_task,
     get_latest_active_conversation_for_agent,
     get_latest_step_run_for_task_step,
     update_step_run,
@@ -74,6 +75,8 @@ WORKFLOWS_TOTAL = Counter(
     "Workflow executions",
     labelnames=("workflow_name", "status"),
 )
+
+DEFAULT_MAX_WORKFLOW_SECONDS = 14400.0
 WORKFLOW_DURATION = Histogram(
     "cognis_workflow_duration_seconds",
     "Workflow duration",
@@ -225,9 +228,22 @@ class WorkflowEngine:
         Returns the updated TaskModel.
         """
         start_time = datetime.now(UTC)
-        max_workflow_seconds = 14400.0  # 4 hours default
+        max_workflow_seconds = DEFAULT_MAX_WORKFLOW_SECONDS
+        loop_time = asyncio.get_running_loop()
+        active_elapsed_seconds = 0.0
         state = task.workflow_state or WorkflowState()
         task.workflow_state = state
+
+        async def _await_with_workflow_budget(awaitable: Any) -> Any:
+            nonlocal active_elapsed_seconds
+            remaining = max_workflow_seconds - active_elapsed_seconds
+            if remaining <= 0:
+                raise TimeoutError
+            started = loop_time.time()
+            try:
+                return await asyncio.wait_for(awaitable, timeout=remaining)
+            finally:
+                active_elapsed_seconds += loop_time.time() - started
 
         logger.info(
             "Starting workflow execution",
@@ -243,14 +259,13 @@ class WorkflowEngine:
         try:
             while state.current_step_index < len(workflow.steps):
                 # Check overall workflow timeout
-                elapsed = (datetime.now(UTC) - start_time).total_seconds()
-                if elapsed > max_workflow_seconds:
+                if active_elapsed_seconds > max_workflow_seconds:
                     logger.error(
                         "Workflow execution timed out",
                         extra={
                             "extra_data": {
                                 "task_id": task.task_id,
-                                "elapsed_seconds": elapsed,
+                                "elapsed_seconds": active_elapsed_seconds,
                                 "max_seconds": max_workflow_seconds,
                             }
                         },
@@ -320,13 +335,15 @@ class WorkflowEngine:
                         continue
 
                 # Run step
-                step_execution = await self._execute_run_step(
-                    task,
-                    step_def,
-                    state,
-                    workflow,
-                    on_progress=on_progress,
-                    cancel_event=cancel_event,
+                step_execution = await _await_with_workflow_budget(
+                    self._execute_run_step(
+                        task,
+                        step_def,
+                        state,
+                        workflow,
+                        on_progress=on_progress,
+                        cancel_event=cancel_event,
+                    )
                 )
                 if isinstance(step_execution, tuple):
                     step_result, step_run_id = step_execution
@@ -364,12 +381,14 @@ class WorkflowEngine:
                 # Evaluate if configured
                 completion = self._resolve_completion(step_def, workflow)
                 if completion and completion.evaluate:
-                    evaluation = await self._evaluate_step(
-                        step_def,
-                        step_result,
-                        state,
-                        task,
-                        workflow,
+                    evaluation = await _await_with_workflow_budget(
+                        self._evaluate_step(
+                            step_def,
+                            step_result,
+                            state,
+                            task,
+                            workflow,
+                        )
                     )
 
                     # Persist evaluation and update step_run status based
@@ -564,6 +583,30 @@ class WorkflowEngine:
                 task.status = TaskStatus.PAUSED
                 await self._persist_workflow_state(task)
                 WORKFLOWS_TOTAL.labels(workflow_name=workflow.name, status=task.status).inc()
+        except TimeoutError:
+            logger.error(
+                "Workflow execution timed out during active work",
+                extra={"extra_data": {"task_id": task.task_id}},
+            )
+            state.status = "failed"
+            state.current_step_status = None
+            state.pending_pause_type = None
+            state.pending_pause_payload = None
+            task.status = TaskStatus.FAILED
+            task.completed_at = datetime.now(UTC)
+            task.result_summary = (
+                f"Workflow timed out after {int(active_elapsed_seconds)}s of active execution"
+            )
+            async with self._session_factory() as db_session:
+                await fail_running_step_runs_for_task(
+                    db_session,
+                    task.task_id,
+                    datetime.now(UTC),
+                    final_status="failed",
+                )
+                await db_session.commit()
+            await self._persist_task_final(task)
+            WORKFLOWS_TOTAL.labels(workflow_name=workflow.name, status="failed").inc()
         except Exception:
             logger.exception(
                 "Workflow execution failed",

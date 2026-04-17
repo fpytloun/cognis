@@ -9,6 +9,7 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cognis.core.events import Event, EventBus, EventType
+from cognis.core.followups import FollowUpPolicy
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.session import (
@@ -693,6 +694,7 @@ class SessionManager:
 
         updated_before = datetime.now(UTC) - timedelta(seconds=stale_after_seconds)
         recovered_ids: list[str] = []
+        recovered_child_sessions: list[Any] = []
         async with self.session_factory() as db_session:
             try:
                 stale_sessions = await queries.list_stale_active_sessions(
@@ -713,6 +715,7 @@ class SessionManager:
                         db_session,
                         parent_session_id=stale_session.session_id,
                         completed_at=datetime.now(UTC),
+                        recovered_children=recovered_child_sessions,
                     )
                     recovered_ids.extend(child_ids)
                 await db_session.commit()
@@ -747,6 +750,31 @@ class SessionManager:
                         Event(
                             type=EventType.SESSION_RECOVERED,
                             data={"session_id": recovered_id},
+                        )
+                    )
+                follow_up_policy = FollowUpPolicy(llm=None)
+                for child_session in recovered_child_sessions:
+                    if str(getattr(child_session, "delegation_mode", "")) not in {
+                        "delegate_async",
+                        "delegate",
+                    }:
+                        continue
+                    follow_up = follow_up_policy.build_delegation_follow_up(
+                        conversation_id=child_session.conversation_id,
+                        child_session_id=child_session.session_id,
+                        status="failed",
+                        result_summary="Background delegation stopped because the controller restarted.",
+                    )
+                    await self.event_bus.publish(
+                        Event(
+                            type=EventType.FOLLOW_UP_TURN_REQUESTED,
+                            data={
+                                "conversation_id": child_session.conversation_id,
+                                "follow_up": follow_up.model_dump(mode="json"),
+                                "channel_deliverable": False,
+                                "delivery_id": None,
+                                "delivery_fallback_text": None,
+                            },
                         )
                     )
         return recovered_ids
@@ -875,6 +903,7 @@ class SessionManager:
         *,
         parent_session_id: str,
         completed_at: datetime,
+        recovered_children: list[Any] | None = None,
     ) -> list[str]:
         recovered_ids: list[str] = []
         child_sessions = await queries.list_child_sessions(db_session, parent_session_id)
@@ -888,11 +917,14 @@ class SessionManager:
                     result_summary="controller restart; parent recovered",
                 )
                 recovered_ids.append(child_session.session_id)
+                if recovered_children is not None:
+                    recovered_children.append(child_session)
             recovered_ids.extend(
                 await self._fail_active_descendants(
                     db_session,
                     parent_session_id=child_session.session_id,
                     completed_at=completed_at,
+                    recovered_children=recovered_children,
                 )
             )
         return recovered_ids
