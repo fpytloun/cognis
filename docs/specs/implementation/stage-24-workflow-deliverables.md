@@ -1,4 +1,4 @@
-# Stage 23: Workflow Deliverables and Step Profiles (Deferred Structural Work)
+# Stage 24: Workflow Deliverables and Step Profiles (Deferred Structural Work)
 
 ## Status
 
@@ -6,7 +6,7 @@ PLANNED
 
 ## Goal
 
-Land the structural half of the harness work introduced by the harness stabilization tracks. The stabilization stages fix the controller's correctness, capability, and operational gaps first; this stage then upgrades the workflow contract itself:
+Land the structural half of the harness work introduced by the harness stabilization tracks. The stabilization stages fix the controller's correctness, capability, operational, and provider-layer gaps first; this stage then upgrades the workflow contract itself:
 
 1. A workflow step's user-facing output is a typed, versioned **deliverable** authored through a new controller-intercepted tool, not free assistant text.
 2. Channel delivery happens exactly once per workflow — gated on `step_complete` acceptance and evaluator approval.
@@ -22,7 +22,8 @@ This stage turns specs 21 and 22 into code across backend, UI, and telemetry aft
 - `docs/specs/06-tool-system.md`
 - `docs/specs/09-ui-ux.md`
 - `docs/specs/23-harness-stabilization.md`
-- Stages 20-22 complete (correctness, capability parity, prompt cache and operational resilience).
+- `docs/specs/24-provider-stabilization.md`
+- Stages 20-23 complete (correctness, capability parity, operational resilience, provider and model stabilization).
 
 ## Scope
 
