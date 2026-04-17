@@ -94,22 +94,25 @@ bring the codebase in line with the updated specs.
 | Stage | Name | Status | Notes |
 |-------|------|--------|-------|
 | 6a | [Step Input Context Assembly](stage-6a-workflow-context.md) | DONE | null/full/summary/last input types, iteration semantics, step output storage, same-session retry |
-| 17 | [Browser Takeover and Session Recording](stage-17-browser-takeover-recording.md) | PLANNED | Optional noVNC browser takeover, Intaris-owned recording/evidence flow, browser/desktop audit model |
-| 18 | [First-Class Agent Runtimes](stage-18-agent-runtimes.md) | PLANNED | Runtime abstraction, `runtime_runs`, executor runtime RPC, Claude runtime host, projection model, direct chat/delegation/workflow parity |
-| 19 | [Auto Routing for Agents and Workflows](stage-19-auto-routing.md) | PLANNED | `auto` / `self` routing semantics, shared routing helper, execution-envelope enforcement, classifier fallback, telemetry |
 | 20 | [Harness Correctness and Concurrency Stabilization](stage-20-harness-correctness.md) | DONE | Remove shared singleton turn state, bound retry/wait loops, fix gate restart semantics, harden memory identity, preserve transcript integrity |
 | 21 | [Harness Capability Parity](stage-21-harness-capability.md) | DONE | Parallel read-only tools, `ripgrep`/`fd` search, background shells, finish-reason handling, token-aware truncation, step timeouts |
-| 22 | [Harness Prompt Cache and Operational Resilience](stage-22-harness-operations.md) | IN PROGRESS | Immutable-prefix cleanup, cache-stable tool exposure, durable remember queue, multi-replica dedupe, Intaris breaker isolation |
+| 22 | [Harness Prompt Cache and Operational Resilience](stage-22-harness-operations.md) | DONE | Immutable-prefix cleanup, cache-stable tool exposure, durable remember queue, multi-replica dedupe, Intaris breaker isolation (skill-load context protection completed in Stage 25) |
 | 23 | [Provider and Model Handling Stabilization](stage-23-provider-stabilization.md) | DONE | Reasoning-effort translation, sampling-parameter stripping, `max_tokens`→`max_completion_tokens`, capability-flag gating for cache/beta headers, deterministic provider resolution, Responses bridge hardening |
-| 24 | [Workflow Deliverables and Step Profiles](stage-24-workflow-deliverables.md) | PLANNED | Typed deliverables + `write_deliverable`, once-only channel delivery, step profiles (`research`/`coding`), tool classification, system workflow wiring |
+| 25 | [Harness Polish and Remaining Gap Fill](stage-25-harness-polish.md) | PLANNED | MCP image/resource passthrough, skill-load context protection, mid-stream recovery reversal, provider-native tokenizer, session-lock sweeper, EventBus dead-subscriber eviction, dynamic MCP nonexistent-tool prompt, workflow `reasoning_effort` validator |
+| 26 | [Browser Takeover and Session Recording](stage-26-browser-takeover-recording.md) | PLANNED | Optional noVNC browser takeover, Intaris-owned recording/evidence flow, browser/desktop audit model |
+| 27 | [First-Class Agent Runtimes](stage-27-agent-runtimes.md) | PLANNED | Runtime abstraction, `runtime_runs`, executor runtime RPC, Claude runtime host, projection model, direct chat/delegation/workflow parity |
+| 28 | [Auto Routing for Agents and Workflows](stage-28-auto-routing.md) | PLANNED | `auto` / `self` routing semantics, shared routing helper, execution-envelope enforcement, classifier fallback, telemetry |
+| 29 | [Workflow Deliverables and Step Profiles](stage-29-workflow-deliverables.md) | PLANNED | Typed deliverables + `write_deliverable`, once-only channel delivery, step profiles (`research`/`coding`), tool classification, system workflow wiring |
 
 ## Scope Boundary
 
 Stages 0-9 build the MVP. Stages 10-16 polish it into a usable product.
 Stages 6a+ align the codebase with spec refinements made during design review.
-Stages 20-23 are the harness and provider stabilization sequence and are intended
-to land before new workflow contract work such as typed deliverables and step
-profiles (Stage 24).
+Stages 20-23 are the harness and provider stabilization sequence. Stage 25 is
+the final harness polish pass that closes verified gaps remaining after the
+stabilization sweep. Stages 26-29 are deferred structural work (browser
+takeover, agent runtimes, auto routing, typed deliverables and step profiles)
+that is intentionally held until the polish pass is complete.
 
 **Still out of scope / not yet shipped**: multi-user production hardening,
 Docker/K8s executors, A2A federation, cost tracking dashboard,

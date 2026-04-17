@@ -27,3 +27,4 @@
 | `22-step-profiles.md` | Step profiles (`unrestricted`, `research`, `coding`), tool classification taxonomy, per-step overrides |
 | `23-harness-stabilization.md` | Stabilization and refinement plan for harness correctness, capability parity, prompt caching, memory freshness, and operational resilience |
 | `24-provider-stabilization.md` | LLM provider/model handling correctness: reasoning-effort translation, sampling-parameter stripping, capability-flag gating, deterministic provider resolution, Responses bridge hardening |
+| `25-harness-polish.md` | Final harness polish pass: MCP image/resource passthrough, skill-load context protection, mid-stream recovery reversal, provider-native tokenizer, session-lock sweeper, EventBus dead-subscriber eviction, dynamic MCP nonexistent-tool prompt, workflow `reasoning_effort` validator |

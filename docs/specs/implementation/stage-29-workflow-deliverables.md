@@ -1,4 +1,4 @@
-# Stage 24: Workflow Deliverables and Step Profiles (Deferred Structural Work)
+# Stage 29: Workflow Deliverables and Step Profiles (Deferred Structural Work)
 
 ## Status
 
@@ -24,6 +24,7 @@ This stage turns specs 21 and 22 into code across backend, UI, and telemetry aft
 - `docs/specs/23-harness-stabilization.md`
 - `docs/specs/24-provider-stabilization.md`
 - Stages 20-23 complete (correctness, capability parity, operational resilience, provider and model stabilization).
+- Stage 25 complete (harness polish).
 
 ## Scope
 

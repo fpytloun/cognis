@@ -1,4 +1,4 @@
-# Stage 17: Browser Takeover and Session Recording
+# Stage 26: Browser Takeover and Session Recording
 
 ## Status
 
