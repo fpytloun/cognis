@@ -906,6 +906,33 @@ class TestDirectBackend:
             result = await backend.fetch("https://example.com")
             assert result.is_error
 
+    @pytest.mark.asyncio()
+    async def test_search_defaults_to_us_en_region(self) -> None:
+        backend = DirectBackend()
+
+        async def _call(fn):
+            return await fn()
+
+        with (
+            patch("cognis.tools.executor.web.backends.direct._search_breaker") as mock_breaker,
+            patch(
+                "cognis.tools.executor.web.backends.direct._ddg_search",
+                new=AsyncMock(return_value=ToolResult(output="ok")),
+            ) as mock_ddg_search,
+        ):
+            mock_breaker.call = AsyncMock(side_effect=_call)
+
+            result = await backend.search("test query")
+
+        assert not result.is_error
+        mock_ddg_search.assert_awaited_once_with(
+            "test query",
+            max_results=8,
+            region="us-en",
+            safesearch="moderate",
+            timelimit=None,
+        )
+
 
 class TestTavilyBackend:
     """Test the Tavily backend."""

@@ -78,7 +78,7 @@ class DirectBackend:
             return ToolResult(output="No search query provided.", is_error=True)
 
         opts = options or {}
-        region = opts.get("region", "wt-wt")
+        region = opts.get("region", "us-en")
         safesearch = opts.get("safesearch", "moderate")
         timelimit = opts.get("timelimit")  # d, w, m, y
 
@@ -113,7 +113,7 @@ async def _ddg_search(
     query: str,
     *,
     max_results: int = 8,
-    region: str = "wt-wt",
+    region: str = "us-en",
     safesearch: str = "moderate",
     timelimit: str | None = None,
 ) -> ToolResult:
