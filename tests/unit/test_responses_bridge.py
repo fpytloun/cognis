@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from cognis.core.agent_loop import StreamAccumulator
 from cognis.providers.llm.responses_bridge import (
     messages_to_responses_input,
     responses_request_kwargs,
@@ -280,3 +281,64 @@ async def test_responses_stream_to_chat_chunks_emits_refusal() -> None:
     chunks = [chunk async for chunk in responses_stream_to_chat_chunks(_stream())]
 
     assert chunks[0]["choices"][0]["delta"]["refusal"] == "Cannot comply"
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_to_chat_chunks_dedupes_replayed_function_call_events() -> None:
+    async def _stream():
+        yield {
+            "type": "response.output_item.added",
+            "item": {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "step_todo_write",
+            },
+        }
+        yield {
+            "type": "response.function_call_arguments.delta",
+            "item_id": "fc_1",
+            "delta": '{"todos":[{"content":"Load `daily-brief`',
+        }
+        # Provider replay re-adds the same item and restarts from an overlapping prefix.
+        yield {
+            "type": "response.output_item.added",
+            "item": {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "step_todo_write",
+            },
+        }
+        yield {
+            "type": "response.function_call_arguments.delta",
+            "item_id": "fc_1",
+            "delta": 'Load `daily-brief` skill","status":"completed"}]}',
+        }
+        yield {
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "step_todo_write",
+                "arguments": (
+                    '{"todos":[{"content":"Load `daily-brief` skill","status":"completed"}]}'
+                ),
+            },
+        }
+        yield {
+            "type": "response.completed",
+            "response": {"status": "completed", "usage": {"total_tokens": 9}},
+        }
+
+    acc = StreamAccumulator()
+    async for chunk in responses_stream_to_chat_chunks(_stream()):
+        acc.feed(chunk)
+
+    calls = acc.get_tool_calls()
+    assert len(calls) == 1
+    assert calls[0].name == "step_todo_write"
+    assert calls[0].arguments == {
+        "todos": [{"content": "Load `daily-brief` skill", "status": "completed"}]
+    }

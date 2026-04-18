@@ -13,6 +13,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
+from cognis.json_stream import merge_incremental_json_fragment
 from cognis.logging import get_logger
 from cognis.models.config import ModelInfo
 
@@ -242,11 +243,11 @@ async def responses_stream_to_chat_chunks(
                 item = _get_output_item(event)
                 if item is None:
                     continue
-                state.register_item(item)
-                message_chunk = state.message_delta(item)
+                _, is_new = state.register_item(item)
+                message_chunk = state.message_delta(item, emit_initial=is_new)
                 if message_chunk is not None:
                     yield message_chunk
-                initial_chunk = state.initial_tool_delta(item)
+                initial_chunk = state.initial_tool_delta(item, emit_name=is_new)
                 if initial_chunk is not None:
                     yield initial_chunk
                 continue
@@ -345,22 +346,37 @@ class _ResponsesStreamState:
             return self._emitted_refusal
         return self._emitted_content
 
-    def register_item(self, item: dict[str, Any]) -> None:
+    def register_item(self, item: dict[str, Any]) -> tuple[dict[str, Any] | None, bool]:
         item_id = str(item.get("id") or item.get("call_id") or "")
         if not item_id:
-            return
+            return None, False
+        existing = self._items.get(item_id)
+        if existing is not None:
+            if item.get("name"):
+                existing["name"] = str(item.get("name") or existing["name"])
+            initial_arguments = str(item.get("arguments") or "")
+            if initial_arguments:
+                existing["arguments"] = merge_incremental_json_fragment(
+                    str(existing.get("arguments") or ""),
+                    initial_arguments,
+                )
+            return existing, False
         index = self._next_tool_index
         self._next_tool_index += 1
-        self._items[item_id] = {
+        state = {
             "call_id": normalize_tool_call_id(item.get("call_id"), item.get("id"), item_id),
             "name": str(item.get("name") or "unknown_tool"),
             "arguments": str(item.get("arguments") or ""),
             "emitted": 0,
             "index": index,
         }
+        self._items[item_id] = state
+        return state, True
 
-    def message_delta(self, item: dict[str, Any]) -> dict[str, Any] | None:
+    def message_delta(self, item: dict[str, Any], *, emit_initial: bool) -> dict[str, Any] | None:
         if str(item.get("type")) != "message":
+            return None
+        if not emit_initial:
             return None
         text = _extract_message_item_text(item)
         if not text:
@@ -408,14 +424,14 @@ class _ResponsesStreamState:
         self.note_text_emitted(field, text)
         return {"choices": [{"delta": {field: text}}]}
 
-    def initial_tool_delta(self, item: dict[str, Any]) -> dict[str, Any] | None:
+    def initial_tool_delta(self, item: dict[str, Any], *, emit_name: bool) -> dict[str, Any] | None:
         if str(item.get("type")) != "function_call":
             return None
         item_id = str(item.get("id") or item.get("call_id") or "")
         state = self._items.get(item_id)
         if state is None:
             return None
-        chunk = {
+        chunk: dict[str, Any] = {
             "choices": [
                 {
                     "delta": {
@@ -423,18 +439,22 @@ class _ResponsesStreamState:
                             {
                                 "index": state["index"],
                                 "id": state["call_id"],
-                                "function": {"name": state["name"]},
+                                "function": {},
                             }
                         ]
                     }
                 }
             ]
         }
-        if state["arguments"]:
-            chunk["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"] = state[
-                "arguments"
-            ]
-            state["emitted"] = len(state["arguments"])
+        function = chunk["choices"][0]["delta"]["tool_calls"][0]["function"]
+        if emit_name:
+            function["name"] = state["name"]
+        unseen_arguments = str(state["arguments"])[int(state["emitted"]) :]
+        if unseen_arguments:
+            function["arguments"] = unseen_arguments
+            state["emitted"] += len(unseen_arguments)
+        if not function:
+            return None
         self.tool_call_emissions += 1
         return chunk
 
@@ -444,8 +464,13 @@ class _ResponsesStreamState:
         delta = event.get("delta")
         if state is None or not isinstance(delta, str) or not delta:
             return None
-        state["arguments"] += delta
-        state["emitted"] += len(delta)
+        existing_arguments = str(state.get("arguments") or "")
+        merged_arguments = merge_incremental_json_fragment(existing_arguments, delta)
+        appended_delta = merged_arguments[len(existing_arguments) :]
+        state["arguments"] = merged_arguments
+        if not appended_delta:
+            return None
+        state["emitted"] += len(appended_delta)
         return {
             "choices": [
                 {
@@ -454,7 +479,7 @@ class _ResponsesStreamState:
                             {
                                 "index": state["index"],
                                 "id": state["call_id"],
-                                "function": {"arguments": delta},
+                                "function": {"arguments": appended_delta},
                             }
                         ]
                     }
@@ -470,11 +495,16 @@ class _ResponsesStreamState:
         if state is None:
             return None
         final_arguments = str(item.get("arguments") or "")
-        if len(final_arguments) <= int(state.get("emitted", 0)):
+        merged_arguments = merge_incremental_json_fragment(
+            str(state.get("arguments") or ""),
+            final_arguments,
+        )
+        emitted = int(state.get("emitted", 0))
+        if len(merged_arguments) <= emitted:
             return None
-        delta = final_arguments[int(state["emitted"]) :]
-        state["arguments"] = final_arguments
-        state["emitted"] = len(final_arguments)
+        delta = merged_arguments[emitted:]
+        state["arguments"] = merged_arguments
+        state["emitted"] = len(merged_arguments)
         return {
             "choices": [
                 {

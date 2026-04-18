@@ -58,6 +58,20 @@ def test_longer_restart_replaces_shorter_prefix() -> None:
     assert calls[0].arguments == {"todos": []}
 
 
+def test_overlap_restart_appends_only_unseen_suffix() -> None:
+    acc = StreamAccumulator()
+    _feed_tool_delta(acc, '{"todos":[{"content":"Load `daily-brief`')
+    _feed_tool_delta(
+        acc,
+        'Load `daily-brief` skill","status":"completed"}]}',
+    )
+    calls = acc.get_tool_calls()
+    assert len(calls) == 1
+    assert calls[0].arguments == {
+        "todos": [{"content": "Load `daily-brief` skill", "status": "completed"}]
+    }
+
+
 def test_two_concatenated_objects_split_into_separate_calls() -> None:
     acc = StreamAccumulator()
     _feed_tool_delta(acc, '{"query":"a"}')

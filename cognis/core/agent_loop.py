@@ -51,6 +51,7 @@ from cognis.core.title_policy import sync_intaris_title
 from cognis.core.tool_arguments import ToolArgumentError, validate_tool_arguments
 from cognis.core.tool_exposure import prepare_tool_exposure
 from cognis.core.truncation import middle_truncate
+from cognis.json_stream import merge_incremental_json_fragment
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.artifact import AttachmentRef
@@ -667,15 +668,10 @@ class StreamAccumulator:
                 if func.get("arguments"):
                     incoming_arguments = func["arguments"]
                     existing_arguments = entry["arguments"]
-                    # Mid-stream retries may restart the same tool-call delta
-                    # from the beginning. Prefer the longer shared prefix over
-                    # blindly concatenating duplicate chunks.
-                    if existing_arguments.startswith(incoming_arguments):
-                        pass
-                    elif incoming_arguments.startswith(existing_arguments):
-                        entry["arguments"] = incoming_arguments
-                    else:
-                        entry["arguments"] += incoming_arguments
+                    entry["arguments"] = merge_incremental_json_fragment(
+                        existing_arguments,
+                        incoming_arguments,
+                    )
                     if len(entry["arguments"]) > _MAX_TOOL_CALL_ARGUMENT_CHARS:
                         raise ValueError(
                             f"Tool call arguments exceeded {_MAX_TOOL_CALL_ARGUMENT_CHARS} characters"
