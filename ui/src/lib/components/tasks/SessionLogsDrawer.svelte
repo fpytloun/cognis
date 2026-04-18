@@ -37,6 +37,7 @@
   let timeline = $state<TimelineItem[]>([]);
   let lastSeq = $state(0);
   let pollDelayMs = $state(SESSION_LOG_POLL_INTERVAL_MS);
+  let currentSessionStatus = $state<string | null>(null);
 
   let initialLoadDone = $state(false);
   let timelineEl = $state<HTMLDivElement | null>(null);
@@ -63,12 +64,28 @@
     scrollToBottom(true);
   }
 
+  function hasStreamingTimelineItem(items: TimelineItem[]): boolean {
+    return items.some((item) => {
+      if (item.kind === 'message' || item.kind === 'reasoning') {
+        return item.streaming === true;
+      }
+      return false;
+    });
+  }
+
+  async function refreshSessionStatus(): Promise<void> {
+    const sessions = await api.conversations.sessions(conversationId);
+    currentSessionStatus = sessions.find((session) => session.session_id === sessionId)?.status ?? null;
+  }
+
   async function loadEvents(refresh = false): Promise<void> {
     // Only show loading spinner on the first load — background refreshes
     // update the timeline in-place without blanking the UI.
     if (!initialLoadDone) loading = true;
     error = '';
     try {
+      await refreshSessionStatus();
+
       if (refresh || !initialLoadDone) {
         const history: MessageEvent[] = [];
         let afterSeq = 0;
@@ -205,7 +222,7 @@
         <button class="sticky bottom-2 left-1/2 z-10 -translate-x-1/2 rounded-full border border-slate-700 bg-slate-900/90 p-2 shadow-lg transition hover:bg-slate-800" onclick={jumpToBottom} type="button" title="Scroll to latest">
           <ArrowDown class="h-4 w-4 text-slate-300" />
         </button>
-      {:else if !loading && !error}
+      {:else if !loading && !error && currentSessionStatus === 'active' && !hasStreamingTimelineItem(timeline)}
         <div class="sticky bottom-2 left-1/2 z-10 w-fit -translate-x-1/2">
           <LiveDots label="Reading latest logs" size="sm" />
         </div>
