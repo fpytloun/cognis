@@ -140,7 +140,7 @@ cannot silently corrupt behavior under horizontal deployment.
 - step profiles and tool classification filtering
 - workflow composability primitives such as sub-workflows or parallel step
   groups
-- full runtime abstraction changes from specs 17-19 (deferred Stages 27-29)
+- full runtime abstraction changes from specs 17-19 (deferred Stage 28)
 - product/UI redesign outside what is needed to surface stabilization behavior
 
 ## Track A: Correctness and Concurrency Stabilization

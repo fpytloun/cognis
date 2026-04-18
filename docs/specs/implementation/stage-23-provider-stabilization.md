@@ -13,7 +13,7 @@ resolution all produce valid, deterministic provider API calls.
 This stage implements [`../24-provider-stabilization.md`](../24-provider-stabilization.md)
 across backend code, tests, and telemetry. It completes the
 four-stage harness stabilization sequence before the deferred typed
-deliverables and step-profile work in Stage 30.
+deliverables and step-profile work in Stage 31.
 
 ## Dependencies
 
@@ -56,8 +56,8 @@ deliverables and step-profile work in Stage 30.
 
 - cost tracking, `Cost` calculation, per-turn usage persistence
 - sampling knobs beyond `temperature` and `top_p`
-- runtime-abstraction changes from specs 17-19 (deferred Stages 27-29)
-- typed deliverables and step profiles (Stage 30)
+- runtime-abstraction changes from specs 17-19 (deferred Stage 28)
+- typed deliverables and step profiles (Stage 31)
 
 ## Deliverables
 

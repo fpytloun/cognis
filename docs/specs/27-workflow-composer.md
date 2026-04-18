@@ -348,7 +348,7 @@ The composer should prefer:
 
 This work should land after:
 
-1. Stage 30 — workflow deliverables and step profiles
+1. Stage 31 — workflow deliverables and step profiles
 
-It does **not** require Stage 29 auto-routing because composition is initiated
+It does **not** require Stage 30 auto-routing because composition is initiated
 by the main agent rather than by controller-owned routing.

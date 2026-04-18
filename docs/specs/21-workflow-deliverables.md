@@ -310,7 +310,7 @@ See [`09-ui-ux.md`](09-ui-ux.md) for the general UX spec. Additions for delivera
 ## Migration and Backward Compatibility
 
 - New tables/columns are additive; legacy rows read with `NULL` deliverable_id and `profile_applied=NULL`.
-- Existing workflows without `step_profile`/`require_deliverable` deserialize with `unrestricted`/`True`; user-authored workflows that never called `write_deliverable` will hit `deliverable_missing` rejections on first run. This is the intended behavior — it surfaces the contract change. Existing **system** workflows are updated in the deferred [Stage 30 implementation](implementation/stage-30-workflow-deliverables.md) commit 7, so no manual migration is required for shipped workflows.
+- Existing workflows without `step_profile`/`require_deliverable` deserialize with `unrestricted`/`True`; user-authored workflows that never called `write_deliverable` will hit `deliverable_missing` rejections on first run. This is the intended behavior — it surfaces the contract change. Existing **system** workflows are updated in the deferred [Stage 31 implementation](implementation/stage-31-workflow-deliverables.md) commit 7, so no manual migration is required for shipped workflows.
 - For workflows that should keep legacy behavior during migration, authors can set `require_deliverable=False` on every step; this reverts the behavior to pre-Tier-3 (free text + step_complete).
 
 ## Non-Goals

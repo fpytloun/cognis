@@ -185,12 +185,44 @@ Semantics:
 
 Cognis authenticates to Mnemory using **JWT with audience claims**:
 - `Authorization: Bearer <jwt>` — JWT issued by Cognis
-- JWT `sub` = user email (maps to Mnemory `X-User-Id`)
+- JWT `sub` = acting user email (the caller)
 - JWT `aud` includes `"mnemory"` — audience claim prevents token misuse
+- JWT `aow` (optional) = agent-owner email, present only when the
+  acting user is not the agent owner (shared-agent turn). See
+  [28-agent-sharing.md](28-agent-sharing.md).
 - `X-Agent-Id: <agent>` header for agent scoping
+- `X-Agent-Owner: <email>` header on every agent-scoped call. Value
+  mirrors the `aow` claim when present; otherwise equals `sub`.
 
 JWT validation in Mnemory is a Phase 0 prerequisite (M1). Mnemory accepts
 both JWT and API key for backward compatibility with standalone usage.
+
+### Memory keying with acting-user and agent-owner
+
+Mnemory keys every memory by both **user** (whose episode / perspective
+the record describes) and **owner** (which agent namespace the record
+belongs to):
+
+| Record | `user` | `owner` | Written when |
+|---|---|---|---|
+| Agent identity / pinned personality | `agent.owner_email` | `agent.owner_email` | `bootstrap_agent` / sync personality |
+| Owner's episodic on own agent | `owner_email` | `owner_email` | owner's turn (today's default) |
+| Grantee's episodic on shared agent | `grantee_email` | `agent.owner_email` | shared-agent turn |
+| User's personal memory outside an agent | `user_email` | `user_email` | personal memory calls without agent context |
+
+Recall for a turn with `(user=U, owner=O, agent_id=A)` returns the
+union of records matching `(user=O, owner=O, agent_id=A)` — shared
+identity — and records matching `(user=U, owner=O, agent_id=A)` — the
+acting user's own episodic trace on that agent. Recall outside an
+agent context (personal memory, `X-Agent-Owner` absent) queries only
+records with `user=U` and default `owner=U`; it never returns
+`owner ≠ U` records.
+
+Existing records where `user == owner` retain today's behavior. The
+migration is a one-off backfill stamping `owner = user` on every
+pre-existing record. See
+[28-agent-sharing.md](28-agent-sharing.md#mnemory-side-semantic-contract)
+for the full contract.
 
 ### Integration Flow
 
@@ -569,9 +601,16 @@ Response:
 
 Cognis authenticates to Intaris using **JWT with audience claims**:
 - `Authorization: Bearer <jwt>` — JWT issued by Cognis
-- JWT `sub` = user email (maps to Intaris `user_id`)
+- JWT `sub` = acting user email (the caller)
 - JWT `aud` includes `"intaris"` — audience claim prevents token misuse
+- JWT `aow` (optional) = agent-owner email, present only when the
+  acting user is not the agent owner. See
+  [28-agent-sharing.md](28-agent-sharing.md). Intaris has no MVP
+  behavior for this claim; it is shipped now so owner-authored
+  policies can land later without a protocol change.
 - `X-Agent-Id: <agent>` header for agent identity
+- `X-Agent-Owner: <email>` header, same value semantics as the
+  Mnemory call. Passthrough only in MVP.
 
 JWT validation in Intaris is a Phase 0 prerequisite (I5). Intaris accepts
 both JWT and API key for backward compatibility with standalone usage.

@@ -462,6 +462,31 @@ CREATE TABLE agents (
     updated_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+-- User-to-user agent sharing grants (see docs/specs/28-agent-sharing.md).
+-- Grantee schema is polymorphic from day one; only `user` is wired in MVP.
+CREATE TABLE agent_grants (
+    grant_id             TEXT PRIMARY KEY,
+    agent_id             TEXT NOT NULL REFERENCES agents(agent_id) ON DELETE CASCADE,
+    grantee_type         TEXT NOT NULL CHECK (grantee_type IN ('user', 'group')),
+    grantee_user_email   TEXT NULL REFERENCES users(email),
+    grantee_group_id     TEXT NULL,                              -- reserved (Phase 2)
+    permission           TEXT NOT NULL CHECK (permission IN ('use')),
+    executor_scope       TEXT NOT NULL CHECK (executor_scope IN ('owner_executor', 'grantee_executor')),
+    granted_by           TEXT NOT NULL REFERENCES users(email),
+    granted_at           TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    revoked_at           TIMESTAMP NULL,
+    note                 TEXT NULL,
+    CHECK (
+        (grantee_type = 'user'  AND grantee_user_email IS NOT NULL AND grantee_group_id IS NULL)
+     OR (grantee_type = 'group' AND grantee_group_id   IS NOT NULL AND grantee_user_email IS NULL)
+    ),
+    UNIQUE (agent_id, grantee_type, grantee_user_email, grantee_group_id)
+);
+CREATE INDEX ix_agent_grants_grantee_user ON agent_grants (grantee_user_email)
+    WHERE revoked_at IS NULL;
+CREATE INDEX ix_agent_grants_agent ON agent_grants (agent_id)
+    WHERE revoked_at IS NULL;
+
 -- Conversation metadata (session content is in Intaris)
 CREATE TABLE conversations (
     conversation_id TEXT PRIMARY KEY,

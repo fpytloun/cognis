@@ -102,9 +102,10 @@ bring the codebase in line with the updated specs.
 | 26 | [LLM-Exposure Auditing in Intaris](stage-26-llm-exposure-audit.md) | PLANNED | New `system_message`/`developer_message`/`context_snapshot` Intaris events, full per-turn LLM-exposure audit, Intaris-anchored immutable prefix, removal of `memory_stale` and per-field TTL, hard-fail on missing core memories |
 | 27 | [Browser Takeover and Session Recording](stage-27-browser-takeover-recording.md) | PLANNED | Optional noVNC browser takeover, Intaris-owned recording/evidence flow, browser/desktop audit model |
 | 28 | [First-Class Agent Runtimes](stage-28-agent-runtimes.md) | PLANNED | Runtime abstraction, `runtime_runs`, executor runtime RPC, Claude runtime host, projection model, direct chat/delegation/workflow parity |
-| 29 | [Auto Routing for Agents and Workflows](stage-29-auto-routing.md) | PLANNED | `auto` / `self` routing semantics, shared routing helper, execution-envelope enforcement, classifier fallback, telemetry |
-| 30 | [Workflow Deliverables and Step Profiles](stage-30-workflow-deliverables.md) | PLANNED | Typed deliverables + `write_deliverable`, once-only channel delivery, step profiles (`research`/`coding`), tool classification, system workflow wiring |
-| 31 | [Workflow-First Composition and Ephemeral Workflows](stage-31-workflow-composition.md) | PLANNED | `compose_and_run_workflow`, hidden workflow-composer and skill-decomposer agents, ephemeral workflow lifecycle, coding workflow family, skill `steps:` extension, promote-from-task UX |
+| 29 | [Agent Sharing](stage-29-agent-sharing.md) | PLANNED | User-to-user agent sharing, `agent_grants` table, two-headed runtime identity (acting user + agent owner), Mnemory `(user, owner)` keying, owner-configurable executor scope per share, no admin bypass for user-owned resources |
+| 30 | [Auto Routing for Agents and Workflows](stage-30-auto-routing.md) | PLANNED | `auto` / `self` routing semantics, shared routing helper, execution-envelope enforcement, classifier fallback, telemetry |
+| 31 | [Workflow Deliverables and Step Profiles](stage-31-workflow-deliverables.md) | PLANNED | Typed deliverables + `write_deliverable`, once-only channel delivery, step profiles (`research`/`coding`), tool classification, system workflow wiring |
+| 32 | [Workflow-First Composition and Ephemeral Workflows](stage-32-workflow-composition.md) | PLANNED | `compose_and_run_workflow`, hidden workflow-composer and skill-decomposer agents, ephemeral workflow lifecycle, coding workflow family, skill `steps:` extension, promote-from-task UX |
 
 ## Scope Boundary
 
@@ -113,9 +114,13 @@ Stages 6a+ align the codebase with spec refinements made during design review.
 Stages 20-23 are the harness and provider stabilization sequence. Stage 25 is
 the final harness polish pass that closes verified gaps remaining after the
 stabilization sweep. Stage 26 lands the LLM-exposure auditing change (Intaris
-and Cognis together) before the rest of the deferred work. Stages 27-31 are
-the deferred structural work (browser takeover, agent runtimes, auto routing,
-typed deliverables and step profiles, workflow-first composition) that follows.
+and Cognis together) before the rest of the deferred work. Stages 27-32 are
+the deferred structural work (browser takeover, agent runtimes, agent
+sharing, auto routing, typed deliverables and step profiles, workflow-first
+composition) that follows. Stage 29 (agent sharing) is scheduled ahead of the
+workflow-deliverable and composition stages because it introduces the
+two-headed runtime identity, access resolver, and Mnemory owner scope that
+those later stages build on top of.
 
 **Still out of scope / not yet shipped**: multi-user production hardening,
 Docker/K8s executors, A2A federation, cost tracking dashboard,

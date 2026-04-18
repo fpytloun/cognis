@@ -216,14 +216,14 @@ Error codes: `not_found` (404), `forbidden` (403), `session_ended` /
 ### Agents
 
 ```
-GET    /api/v1/agents                         → List agents
+GET    /api/v1/agents                         → List owned agents + agents shared with caller
 POST   /api/v1/agents                         → Create agent
-GET    /api/v1/agents/:id                     → Get details
-PUT    /api/v1/agents/:id                     → Update
-DELETE /api/v1/agents/:id                     → Archive
-POST   /api/v1/agents/:id/activate           → Activate draft
-POST   /api/v1/agents/:id/suspend            → Suspend
-POST   /api/v1/agents/:id/sync-personality   → Sync to Mnemory
+GET    /api/v1/agents/:id                     → Get details (owner: full; grantee: read-only)
+PUT    /api/v1/agents/:id                     → Update (owner only)
+DELETE /api/v1/agents/:id                     → Archive (owner only; cascades grants)
+POST   /api/v1/agents/:id/activate           → Activate draft (owner only)
+POST   /api/v1/agents/:id/suspend            → Suspend (owner only)
+POST   /api/v1/agents/:id/sync-personality   → Sync to Mnemory (owner only)
 GET    /api/v1/agents/:id/card                → A2A Agent Card (deferred unless public discovery metadata is available)
 ```
 
@@ -231,6 +231,51 @@ Agent responses also include read-only Mnemory bootstrap fields:
 - `personality_synced`
 - `personality_sync_error`
 - `personality_sync_checked_at`
+
+Agent responses additionally expose the sharing perspective of the
+caller:
+- `is_shared_with_me` — true when accessed via an active grant rather
+  than ownership.
+- `shared_by_email` — agent owner (when shared).
+- `granted_permission` — currently always `"use"` when shared.
+- `executor_scope` — `"owner_executor"` or `"grantee_executor"` when
+  shared; null otherwise.
+- `is_readonly_for_caller` — true for grantees, false for owners.
+
+Access to agent-scoped routes uses `check_agent_access(required=...)`.
+Ownership and active `use` grants are the only paths; the admin role
+is **not** a third path for user-owned agents. See
+[28-agent-sharing.md](28-agent-sharing.md).
+
+#### Agent sharing
+
+```
+GET    /api/v1/agents/:id/shares                   → List active grants (owner only)
+POST   /api/v1/agents/:id/shares                   → Create grant (owner only)
+PATCH  /api/v1/agents/:id/shares/:grant_id         → Update grant (owner only)
+DELETE /api/v1/agents/:id/shares/:grant_id         → Revoke grant (owner only)
+GET    /api/v1/users/me/shared-with-me             → List agents shared with caller
+```
+
+Grant create body:
+
+```json
+{
+  "grantee_email": "alice@example.com",
+  "permission": "use",
+  "executor_scope": "owner_executor",
+  "include_bound_secondaries": ["secondary_id_1", "secondary_id_2"],
+  "note": "Family assistant"
+}
+```
+
+`include_bound_secondaries` is an owner convenience: for each listed
+non-system secondary bound to this agent, the server opens an
+identical grant to the same grantee in the same transaction.
+
+Revocation (`DELETE`) soft-marks the grant with `revoked_at = now()`
+and pauses the grantee's active schedules and non-terminal tasks
+against the agent with reason `access_revoked`.
 
 ### Sessions
 

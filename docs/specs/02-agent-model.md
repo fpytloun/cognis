@@ -94,7 +94,10 @@ class AgentDefinition(BaseModel):
 
     # Ownership
     owner_email: str                       # User who owns this agent
-    visibility: str = "private"            # private | shared | public
+    # Sharing with other users is expressed through the `agent_grants`
+    # table (see docs/specs/28-agent-sharing.md), not a visibility
+    # enum. A public-discovery flag may be added later alongside Agent
+    # Cards; it is not part of the sharing model.
 
     # System prompt (free text)
     system_prompt: str | None = None
@@ -1176,24 +1179,44 @@ CREATE TABLE agent_secondary_bindings (
 An agent is always owned by a single user (`owner_email`). System agents
 have a synthetic owner (the first admin user or a system email).
 
-Future sharing model:
+User-to-user sharing is defined in
+[28-agent-sharing.md](28-agent-sharing.md). The short version:
 
-- `use` — another user can chat with the agent, create tasks with it
-- `edit` — another user can also modify the agent definition
-
-This is resource sharing, not user-memory sharing.
+- A separate `agent_grants` table records "owner O has granted grantee
+  G permission `use` on agent A". Active grants confer **use only**:
+  the grantee can start conversations, create tasks, create schedules,
+  and read the configuration — but cannot edit, delete, reshare, or
+  trigger identity re-sync.
+- The owner picks per-share whether the agent runs on the owner's
+  executor pool (isolated, owner-provisioned tools/secrets) or on the
+  grantee's executor pool.
+- Non-system secondary agents bound to a shared primary require their
+  own explicit share for each grantee; the share UI warns the owner
+  about this dependency at share time.
+- The `admin` role **does not** bypass these checks. Admin is a
+  system-level role; it is not a super-peer over other users' agents.
+- Group/team grantees are scheduled for a later phase; the grants
+  table is already polymorphic to absorb them without a migration.
 
 ### Memory visibility model for shared agents
 
-When an agent is shared:
+Mnemory is extended to key every record by both `user` (whose
+episode) and `owner` (which agent namespace). For a grantee G
+talking to agent A owned by O:
 
-- **Assistant memories** are shared with every user who has `use` access.
-  These define the agent's identity, learned knowledge, and behavior.
-- **User memories** remain private to the user who initiated the
-  conversation or task.
+- **Identity and core memories** live under `(user=O, owner=O)` and
+  are visible to every grantee who has `use` on A.
+- **Grantee's episodic memory on A** lives under `(user=G, owner=O)`
+  and is visible only to G (and never leaks into G's personal
+  memory namespace or between grantees).
+- **The owner's personal memory outside A** lives under
+  `(user=O, owner=O)` (without A context) and never leaks to
+  grantees. Conversely, grantees' personal memory outside A never
+  leaks to O.
 
-A shared agent has a shared assistant brain, but each user keeps their
-own private user context.
+A shared agent has a shared assistant brain and shared identity, but
+each user keeps their own private episodic context and their own
+private personal memory.
 
 ## Agent Lifecycle
 

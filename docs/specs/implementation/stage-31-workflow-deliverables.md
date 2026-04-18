@@ -1,4 +1,4 @@
-# Stage 30: Workflow Deliverables and Step Profiles (Deferred Structural Work)
+# Stage 31: Workflow Deliverables and Step Profiles (Deferred Structural Work)
 
 ## Status
 
@@ -349,5 +349,5 @@ Tasks:
 
 ## Follow-on Stage
 
-After this stage, Stage 31 can build workflow-first composition on top of the
+After this stage, Stage 32 can build workflow-first composition on top of the
 deliverable and profile contract shipped here.

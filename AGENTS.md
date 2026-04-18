@@ -435,6 +435,7 @@ uv run alembic -c cognis/store/migrations/alembic.ini downgrade -1
 | `api_keys` | `key_id` | API keys for programmatic access |
 | `agents` | `agent_id` | Agent definitions (primary/secondary types, system flag) |
 | `agent_secondary_bindings` | `(primary_agent_id, secondary_agent_id)` | Junction table for primary→secondary agent bindings |
+| `agent_grants` | `grant_id` | User-to-user agent sharing grants (polymorphic grantee; user wired, group reserved) |
 | `conversations` | `conversation_id` | Conversation metadata |
 | `sessions` | `session_id` | Session metadata (NO event seq/compaction fields) |
 | `tasks` | `task_id` | Durable work items (kanban cards, queue items) |
@@ -576,6 +577,7 @@ Full architecture and design specifications are in `docs/specs/`:
 | `15-browser-credentials.md` | Browser automation, credential records, auth request flows, and cloud-native executor behavior |
 | `21-workflow-deliverables.md` | Typed deliverables, `write_deliverable` tool, step_complete gate, once-only channel delivery |
 | `22-step-profiles.md` | Step profiles (`unrestricted`/`research`/`coding`), tool classification, per-step overrides |
+| `28-agent-sharing.md` | User-to-user agent sharing, `agent_grants`, two-headed runtime identity, Mnemory `(user, owner)` keying, no admin bypass for user-owned resources |
 
 **Read the relevant spec before making changes in that area.**
 
@@ -586,6 +588,7 @@ Full architecture and design specifications are in `docs/specs/`:
 - **Never log message content, tool args, memory content, or secrets.**
 - **Never use sync I/O in the controller.** Everything is async.
 - **Never bypass Intaris for non-bypassable tools.** Even `"*": "allow"` permissions don't skip guardrails for these.
+- **No admin bypass for user-owned resources.** The `admin` role grants authority over system settings, providers, users, and audit — not over other users' agents, conversations, tasks, schedules, memories, or secrets. Access to a user-owned agent is through ownership or an explicit `agent_grants` grant, never through role alone. See `docs/specs/28-agent-sharing.md`.
 - **Never push to main/master without explicit approval.**
 - **Always use `git add -u`** (tracked files only), never `git add -A`.
 - **Always follow Conventional Commits** for commit messages.

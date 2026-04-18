@@ -52,6 +52,7 @@ Service JWT (issued per-request or short-lived batch):
 {
   "sub": "filip@pytloun.cz",
   "agent_id": "aria",
+  "aow": "owner@example.com",
   "aud": ["mnemory", "intaris"],
   "iss": "cognis",
   "exp": 1711503600
@@ -60,6 +61,13 @@ Service JWT (issued per-request or short-lived batch):
 
 The `aud` (audience) claim prevents confused-deputy attacks. Each service
 checks that its name is in the audience list.
+
+The `aow` (agent-owner) claim is optional. It is present only when the
+acting user (`sub`) is **not** the agent owner — i.e., a shared-agent
+turn. When omitted, consumers MUST treat it as equal to `sub`. This
+claim carries the `(user, owner)` distinction that Mnemory uses to
+key memories and that Intaris will eventually use for owner-scoped
+policies. See [28-agent-sharing.md](28-agent-sharing.md).
 
 JWT validation is a Phase 0 prerequisite for both Mnemory (M1) and Intaris
 (I5). Both services accept JWT alongside API keys for backward compatibility
@@ -203,11 +211,43 @@ concern, documented in [11-deployment.md](11-deployment.md).
 
 ```python
 class UserRole(str, Enum):
-    ADMIN = "admin"      # Full system access
+    ADMIN = "admin"      # System-level authority (see below)
     USER = "user"        # Own agents, own conversations
     VIEWER = "viewer"    # Read-only
     SERVICE = "service"  # API access, no UI
 ```
+
+#### Admin authority
+
+The `admin` role confers **system-level** authority, not peer-level
+authority over other users' resources. Admins can:
+
+- Manage users (`/api/v1/admin/users/*`, CLI `admin` commands).
+- Configure LLM providers, model routing, executors (global), system
+  settings, MCP servers, and skills shipped with the install.
+- Manage system agents and their overrides.
+- Read system-level audit log and reconcile endpoints.
+- Approve break-glass recovery via direct DB access (CLI).
+
+Admins **cannot** — purely on the basis of their role — read or act
+on another user's:
+
+- Agents, agent configuration, or agent bindings
+- Conversations, sessions, tasks, schedules
+- Personal memories (Mnemory records with `user == the other user`)
+- Secrets
+- API keys
+
+An admin may gain access to another user's agent only through the
+same mechanism as any other user: an explicit `agent_grants` share
+by that agent's owner. This rule is called out explicitly because
+many SaaS products ship a super-admin bypass; Cognis does not. See
+[28-agent-sharing.md](28-agent-sharing.md) for the full access
+matrix.
+
+Break-glass (legitimate cross-user operations for support or legal
+response) is performed via direct DB / CLI access by an operator,
+which is traceable and distinct from an in-app role.
 
 ### User Management
 
@@ -235,31 +275,41 @@ or delete the last admin user.
 
 ### Resource Authorization
 
-In MVP, all data is effectively scoped by the authenticated user's email.
+All data is scoped by the authenticated user's email.
 
 ```sql
 SELECT * FROM conversations WHERE user_email = ? AND conversation_id = ?;
 ```
 
-Future shared-agent model:
-- agent ownership stays with one `owner_email`
-- agent sharing grants other users `use` or `edit` permissions
-- assistant memory remains agent-scoped/shared
-- user memory remains scoped to the conversation/task initiator only
+Agent-scoped routes use `check_agent_access(required=...)` rather
+than a raw `owner_email == caller` filter. Access is granted by:
 
-All Mnemory/Intaris calls still need explicit actor context. The controller
-must always know:
-- **actor** — who triggered the current action
-- **initiator** — whose private user memory is allowed for this conversation/task
+- ownership (`agent.owner_email == caller`), or
+- an active `use` grant for the caller in `agent_grants`.
 
-Legacy conceptual example:
-```sql
--- personal MVP conversation
-SELECT * FROM conversations WHERE user_email = ? AND conversation_id = ?;
-```
+Admin role is **not** a third path. See the *Admin authority*
+subsection above and [28-agent-sharing.md](28-agent-sharing.md) for
+the full matrix.
 
-The controller enforces user scoping on all Mnemory/Intaris calls by setting
-the correct `X-User-Id` and `X-Agent-Id` headers.
+The runtime carries two identities per turn:
+
+- **acting user** (JWT `sub`) — who triggered the turn
+- **agent owner** (`agent.owner_email`, propagated via `aow` claim
+  and `X-Agent-Owner` header when different from `sub`)
+
+Mnemory keys records by both dimensions, so:
+
+- the agent's identity/core memories always resolve to the owner's
+  namespace regardless of caller,
+- the caller's episodic memory on the shared agent is scoped to the
+  caller,
+- no caller's personal memory outside the agent context leaks into
+  the agent's namespace, and
+- the owner's personal memory never leaks to grantees.
+
+The controller enforces this by setting `X-Agent-Id` and
+`X-Agent-Owner` on every Mnemory/Intaris call and by emitting the
+optional `aow` claim when it differs from `sub`.
 
 ## Multi-Tenancy
 

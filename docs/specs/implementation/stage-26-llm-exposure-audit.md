@@ -50,7 +50,7 @@ Single landing. No feature flag. No phased rollout.
 - Cognis DB schema changes
 - Mnemory API additions
 - Admin audit UI inside Cognis
-- Workflow deliverables and step profiles (deferred to Stage 30)
+- Workflow deliverables and step profiles (deferred to Stage 31)
 
 ## Deliverables
 

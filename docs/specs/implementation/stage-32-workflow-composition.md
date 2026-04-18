@@ -1,4 +1,4 @@
-# Stage 31: Workflow-First Composition and Ephemeral Workflows
+# Stage 32: Workflow-First Composition and Ephemeral Workflows
 
 ## Status
 
@@ -24,7 +24,7 @@ practical as the default harness primitive for non-trivial work.
 - `docs/specs/21-workflow-deliverables.md`
 - `docs/specs/22-step-profiles.md`
 - `docs/specs/27-workflow-composer.md`
-- Stage 30 complete (deliverables and step profiles)
+- Stage 31 complete (deliverables and step profiles)
 
 ## Scope
 
