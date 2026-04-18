@@ -335,28 +335,28 @@
               <text x={x + NODE_W - 17} y={y + NODE_H - 9} text-anchor="middle" class="fill-amber-300 text-[8px] font-semibold">{attempt}</text>
             {/if}
             {#if isTaskMode && (hasLogs || hasOutput)}
-              <foreignObject x={x + 8} y={y + 8} width="44" height="20">
+              <foreignObject x={x + 4} y={y + 4} width="64" height="30">
                 <div class="flex gap-1">
                 {#if hasOutput}
                 <button
-                  class="flex h-5 w-5 items-center justify-center rounded-md border border-slate-600/80 bg-slate-950/90 text-slate-200 transition hover:border-violet-400/60 hover:text-white"
+                  class="flex h-7 w-7 md:h-5 md:w-5 items-center justify-center rounded-md border border-slate-600/80 bg-slate-950/90 text-slate-200 transition hover:border-violet-400/60 hover:text-white"
                   onclick={(event) => handleStepOutputClick(event, step.name)}
                   type="button"
                   aria-label={`Open full output for ${step.name}`}
                   title="Open full output"
                 >
-                  <FileSearch class="h-3 w-3" />
+                  <FileSearch class="h-4 w-4 md:h-3 md:w-3" />
                 </button>
                 {/if}
                 {#if hasLogs}
                 <button
-                  class="flex h-5 w-5 items-center justify-center rounded-md border border-slate-600/80 bg-slate-950/90 text-slate-200 transition hover:border-sky-400/60 hover:text-white"
+                  class="flex h-7 w-7 md:h-5 md:w-5 items-center justify-center rounded-md border border-slate-600/80 bg-slate-950/90 text-slate-200 transition hover:border-sky-400/60 hover:text-white"
                   onclick={(event) => handleStepLogsClick(event, step.name)}
                   type="button"
                   aria-label={`Open logs for ${step.name}`}
                   title="Open logs"
                 >
-                  <Logs class="h-3 w-3" />
+                  <Logs class="h-4 w-4 md:h-3 md:w-3" />
                 </button>
                 {/if}
                 </div>
@@ -415,28 +415,28 @@
               <text x={x + NODE_W - 17} y={y + NODE_H - 9} text-anchor="middle" class="fill-sky-300 text-[8px] font-semibold">{attempt}</text>
             {/if}
             {#if isTaskMode && (hasLogs || hasOutput)}
-              <foreignObject x={x + 8} y={y + 8} width="44" height="20">
+              <foreignObject x={x + 4} y={y + 4} width="64" height="30">
                 <div class="flex gap-1">
                 {#if hasOutput}
                 <button
-                  class="flex h-5 w-5 items-center justify-center rounded-md border border-slate-600/80 bg-slate-950/90 text-slate-200 transition hover:border-violet-400/60 hover:text-white"
+                  class="flex h-7 w-7 md:h-5 md:w-5 items-center justify-center rounded-md border border-slate-600/80 bg-slate-950/90 text-slate-200 transition hover:border-violet-400/60 hover:text-white"
                   onclick={(event) => handleStepOutputClick(event, step.name)}
                   type="button"
                   aria-label={`Open full output for ${step.name}`}
                   title="Open full output"
                 >
-                  <FileSearch class="h-3 w-3" />
+                  <FileSearch class="h-4 w-4 md:h-3 md:w-3" />
                 </button>
                 {/if}
                 {#if hasLogs}
                 <button
-                  class="flex h-5 w-5 items-center justify-center rounded-md border border-slate-600/80 bg-slate-950/90 text-slate-200 transition hover:border-sky-400/60 hover:text-white"
+                  class="flex h-7 w-7 md:h-5 md:w-5 items-center justify-center rounded-md border border-slate-600/80 bg-slate-950/90 text-slate-200 transition hover:border-sky-400/60 hover:text-white"
                   onclick={(event) => handleStepLogsClick(event, step.name)}
                   type="button"
                   aria-label={`Open logs for ${step.name}`}
                   title="Open logs"
                 >
-                  <Logs class="h-3 w-3" />
+                  <Logs class="h-4 w-4 md:h-3 md:w-3" />
                 </button>
                 {/if}
                 </div>

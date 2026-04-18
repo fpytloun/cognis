@@ -13,7 +13,7 @@
   export let onSave: () => void;
 </script>
 
-<div class="grid gap-6 xl:grid-cols-[0.85fr_1.15fr]">
+<div class="grid gap-6 lg:grid-cols-[0.85fr_1.15fr]">
   <Card class="p-5">
     <p class="text-xs uppercase tracking-[0.24em] text-slate-500">Verified senders</p>
     <h2 class="mt-1 text-lg font-semibold text-white">Manual override</h2>

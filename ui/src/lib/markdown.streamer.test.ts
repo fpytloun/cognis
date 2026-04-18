@@ -56,4 +56,29 @@ describe('createMarkdownStreamer', () => {
     const html = s.render(content);
     expect(html).toContain('paragraph');
   });
+
+  it('handles empty tail without crashing', () => {
+    const s = createMarkdownStreamer();
+    // Content ending with trailing whitespace should not produce garbage.
+    const html = s.render('Block one.\n\n   ');
+    expect(html).toContain('Block one');
+  });
+
+  it('treats tilde-fenced code blocks identically to backtick fences', () => {
+    const backtickContent = '```\nhello\n```\n\nAfter.';
+    const tildeContent = '~~~\nhello\n~~~\n\nAfter.';
+    const backtickHtml = createMarkdownStreamer().finalize(backtickContent);
+    const tildeHtml = createMarkdownStreamer().finalize(tildeContent);
+    // Both should produce equivalent block structure: a fenced code block
+    // followed by a paragraph. The number of <pre>/<p> tags must match; the
+    // cached block boundary behavior must be identical between fence styles.
+    const preCount = (s: string) => (s.match(/<pre\b/g) ?? []).length;
+    const pCount = (s: string) => (s.match(/<p\b/g) ?? []).length;
+    expect(preCount(backtickHtml)).toBe(preCount(tildeHtml));
+    expect(pCount(backtickHtml)).toBe(pCount(tildeHtml));
+    expect(backtickHtml).toContain('hello');
+    expect(tildeHtml).toContain('hello');
+    expect(backtickHtml).toContain('After');
+    expect(tildeHtml).toContain('After');
+  });
 });

@@ -56,7 +56,9 @@
         </p>
       </div>
       {#if mobile || mode !== 'closed'}
-        <Button aria-label="Close channel editor" variant="secondary" size="sm" onclick={onClose}>
+        <!-- On mobile the editor is a full-screen overlay; the Close button
+             needs a generous tap target. On desktop it stays compact. -->
+        <Button aria-label="Close channel editor" variant="secondary" size={mobile ? 'default' : 'sm'} onclick={onClose}>
           <ArrowLeft class="mr-2 h-4 w-4" /> Close
         </Button>
       {/if}

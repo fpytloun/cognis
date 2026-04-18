@@ -129,7 +129,7 @@
       </button>
 
       {#if primaryExpanded}
-        <div class="mt-3 grid gap-4 xl:grid-cols-2">
+        <div class="mt-3 grid gap-4 lg:grid-cols-2">
           {#each primaryAgents as agent}
             {@render agentCard(agent)}
           {:else}
@@ -156,7 +156,7 @@
       </button>
 
       {#if secondaryExpanded}
-        <div class="mt-3 grid gap-4 xl:grid-cols-2">
+        <div class="mt-3 grid gap-4 lg:grid-cols-2">
           {#each secondaryAgents as agent}
             {@render agentCard(agent)}
           {:else}

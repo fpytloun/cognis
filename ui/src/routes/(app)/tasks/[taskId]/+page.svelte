@@ -147,7 +147,9 @@
   }
 
   function isMobileViewport(): boolean {
-    return typeof window !== 'undefined' && window.matchMedia('(max-width: 1279px)').matches;
+    // Aligns with Tailwind's `lg` breakpoint (1024px), which is the app-wide
+    // mobile/desktop pivot after the PWA overhaul.
+    return typeof window !== 'undefined' && window.matchMedia('(max-width: 1023px)').matches;
   }
 
   function openStepDetail(stepName: string, options: { mobileDrawer?: boolean } = {}): void {
@@ -821,7 +823,7 @@
       <p class="rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-100">{error}</p>
     {/if}
 
-    <div class="grid gap-5 xl:grid-cols-[minmax(0,1fr)_380px]">
+    <div class="grid gap-5 lg:grid-cols-[minmax(0,1fr)_380px]">
       <div class="space-y-5">
         <!-- Pipeline diagram -->
         {#if diagramSteps.length > 0}
@@ -852,7 +854,7 @@
                   {#if stepHasLogs[selectedStepGroup.stepName]}
                     <Button size="sm" variant="ghost" onclick={() => openSessionLogsForStep(selectedStepGroup.stepName)}>Open logs</Button>
                   {/if}
-                  <Button class="xl:hidden" size="sm" variant="secondary" onclick={() => openStepDetail(selectedStepGroup.stepName)}>
+                  <Button class="lg:hidden" size="sm" variant="secondary" onclick={() => openStepDetail(selectedStepGroup.stepName)}>
                     <PanelRightOpen class="mr-1.5 h-3.5 w-3.5" />
                     Step detail
                   </Button>
@@ -865,7 +867,7 @@
                   <div class="mt-3 flex flex-wrap items-center gap-2">
                     {#each dependencyTasks as dependency}
                       <button
-                        class="inline-flex items-center gap-2 rounded-full border border-slate-700 bg-slate-950/80 px-3 py-1.5 text-xs text-slate-200 transition hover:border-slate-600 hover:text-white"
+                        class="inline-flex items-center gap-2 rounded-full border border-slate-700 bg-slate-950/80 px-3.5 py-2 text-sm text-slate-200 transition hover:border-slate-600 hover:text-white md:py-1.5 md:text-xs"
                         onclick={() => goto(`/tasks/${dependency.taskId}`)}
                         type="button"
                       >
@@ -1226,7 +1228,7 @@
         </Card>
       </div>
 
-      <div class="space-y-4 xl:hidden">
+      <div class="space-y-4 lg:hidden">
         <details class="group rounded-3xl border border-slate-800 bg-slate-950/40 p-4" open>
           <summary class="flex cursor-pointer list-none items-center justify-between gap-3 text-sm font-medium text-white">
             Task meta
@@ -1270,7 +1272,7 @@
       </div>
 
       <!-- Sidebar -->
-      <div class="hidden space-y-5 xl:block">
+      <div class="hidden space-y-5 lg:block">
         <!-- Origin -->
         <Card class="p-5">
           <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Origin</p>
@@ -1422,7 +1424,7 @@
   </section>
 
   {#if mobileStepDetailOpen && selectedStepGroup}
-    <div class="fixed inset-0 z-40 xl:hidden" role="presentation">
+    <div class="fixed inset-0 z-40 lg:hidden" role="presentation">
       <button class="absolute inset-0 bg-slate-950/80" onclick={closeMobileStepDetail} type="button" aria-label="Close step detail"></button>
       <div class="absolute inset-x-0 bottom-0 max-h-[82vh] overflow-y-auto rounded-t-[2rem] border-t border-slate-700 bg-slate-950 p-5 shadow-2xl">
         <div class="flex items-start justify-between gap-3">

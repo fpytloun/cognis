@@ -1913,11 +1913,11 @@
 {#if initializing}
   <LoadingState label="Loading conversation" description="Fetching history, restoring workflow prompts, and preparing the live stream." />
 {:else}
-  <div class={`relative flex h-full min-h-0 flex-col gap-3 overflow-hidden ${chatSidebarCollapsed ? '' : 'xl:grid xl:grid-cols-[320px_minmax(0,1fr)] xl:gap-4'}`}>
+  <div class={`relative flex h-full min-h-0 flex-col gap-3 overflow-hidden ${chatSidebarCollapsed ? '' : 'lg:grid lg:grid-cols-[320px_minmax(0,1fr)] lg:gap-4'}`}>
     {#if mobileListOpen}
       <button
         aria-label="Close conversation list"
-        class="fixed inset-0 z-30 bg-slate-950/80 backdrop-blur-sm xl:hidden"
+        class="fixed inset-0 z-30 bg-slate-950/80 backdrop-blur-sm lg:hidden"
         onclick={closeMobileList}
         type="button"
         transition:fade={{ duration: 180 }}
@@ -1928,12 +1928,12 @@
     <aside
       aria-label="Conversation list"
       aria-modal={mobileListOpen ? 'true' : undefined}
-      class={`fixed inset-y-3 left-3 z-40 flex w-[min(22rem,calc(100vw-1.5rem))] min-h-0 flex-col rounded-[1.75rem] border border-slate-800/80 bg-slate-900/95 shadow-card backdrop-blur transition-transform duration-200 ease-out xl:static xl:z-auto xl:w-auto xl:translate-x-0 xl:rounded-3xl xl:bg-slate-900/70 ${chatSidebarCollapsed ? 'xl:hidden' : 'xl:flex'} ${mobileListOpen || !currentConversation ? 'translate-x-0' : '-translate-x-[120%] pointer-events-none xl:pointer-events-auto'}`}
+      class={`fixed inset-y-3 left-3 z-40 flex w-[min(22rem,calc(100vw-1.5rem))] min-h-0 flex-col rounded-[1.75rem] border border-slate-800/80 bg-slate-900/95 shadow-card backdrop-blur transition-transform duration-200 ease-out lg:static lg:z-auto lg:w-auto lg:translate-x-0 lg:rounded-3xl lg:bg-slate-900/70 ${chatSidebarCollapsed ? 'lg:hidden' : 'lg:flex'} ${mobileListOpen || !currentConversation ? 'translate-x-0' : '-translate-x-[120%] pointer-events-none lg:pointer-events-auto'}`}
       role={mobileListOpen ? 'dialog' : undefined}
     >
       <!-- Static top: filters -->
       <div class="shrink-0 space-y-3 p-4 pb-2 sm:p-4">
-        <div class="flex items-center justify-between xl:hidden">
+        <div class="flex items-center justify-between lg:hidden">
           <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Conversations</p>
           <div class="flex items-center gap-2">
             <Button aria-label="Toggle filters" size="sm" variant="secondary" onclick={() => (mobileFilterOpen = !mobileFilterOpen)}>
@@ -1960,7 +1960,7 @@
             <Button class="w-full justify-center" size="sm" onclick={() => goto('/settings?tab=providers')}>Open provider settings</Button>
           </div>
         {:else}
-          <div class={`space-y-3 ${mobileFilterOpen ? 'block' : 'hidden xl:block'}`}>
+          <div class={`space-y-3 ${mobileFilterOpen ? 'block' : 'hidden lg:block'}`}>
           <label class="block space-y-1">
             <span class="text-xs font-medium uppercase tracking-widest text-slate-500">Agent</span>
             <select
@@ -2066,7 +2066,7 @@
       </div>
 
       <!-- Static bottom: collapse button -->
-      <div class="hidden shrink-0 border-t border-slate-800/60 p-3 xl:block">
+      <div class="hidden shrink-0 border-t border-slate-800/60 p-3 lg:block">
         <button
           class="flex w-full items-center justify-center gap-2 rounded-xl py-1.5 text-xs text-slate-400 transition hover:bg-slate-800 hover:text-white"
           onclick={toggleChatSidebar}
@@ -2082,7 +2082,7 @@
     <!-- Main chat area -->
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <section
-      class="relative flex min-h-0 flex-1 flex-col rounded-[1.75rem] border border-slate-800/80 bg-slate-900/70 shadow-card backdrop-blur xl:rounded-3xl"
+      class="relative flex min-h-0 flex-1 flex-col rounded-[1.75rem] border border-slate-800/80 bg-slate-900/70 shadow-card backdrop-blur lg:rounded-3xl"
       ondragenter={handleDragEnter}
       ondragleave={handleDragLeave}
       ondragover={handleDragOver}
@@ -2106,7 +2106,7 @@
             <div class="flex items-center gap-2">
               {#if chatSidebarCollapsed}
                 <button
-                  class="hidden rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-800 hover:text-white xl:inline-flex"
+                  class="hidden rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-800 hover:text-white lg:inline-flex"
                   onclick={toggleChatSidebar}
                   type="button"
                   title="Show conversations"
@@ -2114,7 +2114,7 @@
                   <ChevronsRight class="h-4 w-4" />
                 </button>
               {/if}
-              <div class="xl:hidden">
+              <div class="lg:hidden">
                 <Button aria-label="Open conversations" size="sm" variant="secondary" onclick={openMobileList}>
                   <ArrowLeft class="h-4 w-4" />
                 </Button>

@@ -88,3 +88,21 @@ When installed:
 - Tapping the hamburger button in the header opens a right-side sheet drawer with the full navigation. The sheet supports swipe-down-to-dismiss.
 - The composer uses 16 px text on mobile so iOS Safari does not zoom the viewport when you focus it.
 - The bottom tab bar, composer, and floating action bars respect the `safe-area-inset-bottom` so they sit above the Home Indicator on iPhones.
+
+### Tasks on mobile
+
+- The Task board uses a column picker (Draft / Queued / Running / Paused / Done) so one column fills the viewport at a time, instead of horizontal-scrolling a 1200px kanban. Tap the column chip to switch.
+- Multi-select still works: tap once to select, tap again to deselect. The bulk action bar wraps and floats above the bottom tab bar.
+- Drag-and-drop between columns is desktop only. On mobile, open the task detail and use the state buttons (Submit, Pause, Cancel) to move work through the queue.
+
+### Workflows on mobile
+
+- The workflow list stacks above the editor; tap a workflow to open it.
+- Each step has up / down arrow buttons for reorder. HTML5 drag-and-drop is still available on desktop but is a no-op on iOS Safari, so the arrows are the canonical touch-friendly control.
+- A sticky action bar at the bottom of the screen keeps Save one tap away, even at the end of a long step editor. More actions (New, Duplicate, Export YAML, Delete) are behind the "Actions" button on the same bar.
+- Tooltips (the `?` help icons) reveal on tap — hover-only tooltips are gone.
+
+### Settings on mobile
+
+- The 9-tab section strip becomes a horizontally scrollable pill row instead of wrapping to three lines.
+- On the Executors tab, the per-executor "Individual tools" picker is now a searchable Sheet (tap "Configure" on the executor card) so you can find and toggle a tool without scanning a grid of 30+ chips.

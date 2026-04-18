@@ -106,7 +106,9 @@
   }
 
   function usesMobileEditorOverlay(): boolean {
-    return typeof window !== 'undefined' && window.innerWidth < 1280;
+    // Aligns with Tailwind's `lg` breakpoint (1024px) and the new app-wide
+    // mobile/desktop pivot.
+    return typeof window !== 'undefined' && window.innerWidth < 1024;
   }
 
   function openEditor(): void {
@@ -561,8 +563,8 @@
     </div>
 
     {#if activeTab === 'accounts'}
-      <div class="grid gap-6 xl:grid-cols-[1.15fr_0.85fr]">
-        <div class={`${mobileEditorOpen ? 'hidden xl:block' : 'block'}`}>
+      <div class="grid gap-6 lg:grid-cols-[1.15fr_0.85fr]">
+        <div class={`${mobileEditorOpen ? 'hidden lg:block' : 'block'}`}>
           <ChannelAccountsView
             accounts={accounts}
             metas={metaMap}
@@ -577,7 +579,7 @@
           />
         </div>
 
-        <div class={`${mobileEditorOpen || editorMode !== 'closed' ? 'block' : 'hidden xl:block'}`}>
+        <div class={`${mobileEditorOpen || editorMode !== 'closed' ? 'block' : 'hidden lg:block'}`}>
           {#if editorMode === 'closed'}
             <Card class="p-6 text-sm text-slate-300">
               <p class="text-xs uppercase tracking-[0.24em] text-slate-500">Account editor</p>

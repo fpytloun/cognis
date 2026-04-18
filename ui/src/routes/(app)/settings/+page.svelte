@@ -16,6 +16,7 @@
   import Button from '$lib/components/ui/Button.svelte';
   import Card from '$lib/components/ui/Card.svelte';
   import Input from '$lib/components/ui/Input.svelte';
+  import Sheet from '$lib/components/ui/Sheet.svelte';
   import { getIntarisUiUrl, getMnemoryUiUrl } from '$lib/config';
   import { confirmAction } from '$lib/stores/confirm';
   import { addToast } from '$lib/stores/toasts';
@@ -106,6 +107,47 @@
   let showExecutorForm = $state(false);
   let executorForm = $state({ executor_id: '', name: '', executor_type: 'in_process', labels: '', status: 'active' });
   let executorToken = $state<ExecutorTokenResponse | null>(null);
+  // Mobile tool-picker sheet: holds the executor id whose tool list should be
+  // open, plus the current search query inside that picker. Setting both to
+  // null/empty closes the sheet.
+  let toolPickerExecutorId = $state<string | null>(null);
+  let toolPickerQuery = $state('');
+  // Serialize executor tool updates so rapid taps don't race each other on
+  // a stale `exec.enabled_tools` snapshot. We accumulate the latest tool
+  // list per executor and flush it via a single in-flight promise chain.
+  const toolUpdateQueues = new Map<string, { pending: string[]; inFlight: Promise<void> | null }>();
+
+  async function queueExecutorToolUpdate(executorId: string, nextTools: string[]): Promise<void> {
+    const current = toolUpdateQueues.get(executorId) ?? { pending: nextTools, inFlight: null };
+    current.pending = nextTools;
+    toolUpdateQueues.set(executorId, current);
+    if (current.inFlight) return;
+
+    const run = async (): Promise<void> => {
+      while (true) {
+        const entry = toolUpdateQueues.get(executorId);
+        if (!entry) return;
+        const toFlush = entry.pending;
+        try {
+          await api.executor.update(executorId, { enabled_tools: toFlush });
+        } catch (err) {
+          addToast(asApiError(err).message, 'error', 4_000, 'Unable to update tools');
+          toolUpdateQueues.delete(executorId);
+          await refreshPageState();
+          return;
+        }
+        // If nothing new arrived while the request was in flight, we're done.
+        const after = toolUpdateQueues.get(executorId);
+        if (!after || after.pending === toFlush) {
+          toolUpdateQueues.delete(executorId);
+          await refreshPageState();
+          return;
+        }
+      }
+    };
+    current.inFlight = run();
+    await current.inFlight;
+  }
   let mcpServerConfigs = $state<MCPServerConfigResponse[]>([]);
   let showMcpForm = $state(false);
   let editingMcpServer = $state<MCPServerConfigResponse | null>(null);
@@ -1269,7 +1311,7 @@
     {/if}
 
     {#if activeTab === 'providers'}
-      <div class="grid gap-5 xl:grid-cols-[340px_minmax(0,1fr)]">
+      <div class="grid gap-5 lg:grid-cols-[340px_minmax(0,1fr)]">
         <Card class="p-5">
           <div class="space-y-4">
             <div>
@@ -1622,7 +1664,7 @@
         </div>
       </Card>
     {:else if activeTab === 'secrets'}
-      <div class="grid gap-5 xl:grid-cols-[360px_minmax(0,1fr)]">
+      <div class="grid gap-5 lg:grid-cols-[360px_minmax(0,1fr)]">
         <Card class="p-5">
           <div class="space-y-4">
             <p class="text-sm leading-6 text-slate-400">
@@ -1676,7 +1718,7 @@
           </div>
         </Card>
       </div>
-      <div class="mt-5 grid gap-5 xl:grid-cols-[360px_minmax(0,1fr)]">
+      <div class="mt-5 grid gap-5 lg:grid-cols-[360px_minmax(0,1fr)]">
         <Card class="p-5">
           <div class="space-y-4">
             <p class="text-sm leading-6 text-slate-400">
@@ -1755,7 +1797,7 @@
         </Card>
       </div>
     {:else if activeTab === 'web'}
-      <div class="grid gap-5 xl:grid-cols-[360px_minmax(0,1fr)]">
+      <div class="grid gap-5 lg:grid-cols-[360px_minmax(0,1fr)]">
         <!-- Left: backend selector -->
         <Card class="p-5">
           <div class="space-y-4">
@@ -2063,10 +2105,24 @@
               </div>
             </div>
 
-            <!-- Individual tool toggles -->
+            <!-- Individual tool toggles.
+                 Mobile: "Configure individual tools" button opens a Sheet
+                 with a search field + scrollable list so the 30-40 tiny
+                 chips don't overwhelm small viewports.
+                 Desktop: grid as before. -->
             <div>
-              <span class="text-xs uppercase tracking-wider text-slate-400">Individual tools</span>
-              <div class="mt-2 grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-1.5">
+              <div class="flex items-center justify-between gap-3">
+                <span class="text-xs uppercase tracking-wider text-slate-400">Individual tools</span>
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  class="md:hidden"
+                  onclick={() => { toolPickerExecutorId = exec.executor_id; toolPickerQuery = ''; }}
+                >
+                  Configure ({(exec.enabled_tools || []).filter((t: string) => t !== '*').length})
+                </Button>
+              </div>
+              <div class="mt-2 hidden grid-cols-2 md:grid md:grid-cols-3 lg:grid-cols-4 gap-1.5">
                 {#each executorTools as tool}
                   {@const enabledByGroup = (exec.enabled_tool_groups || []).includes(tool.category)}
                   {@const enabledByName = (exec.enabled_tools || []).includes(tool.name) || (exec.enabled_tools || []).includes('*')}
@@ -2556,7 +2612,7 @@
             </div>
           </Card>
 
-          <div class="grid gap-5 xl:grid-cols-[360px_minmax(0,1fr)]">
+          <div class="grid gap-5 lg:grid-cols-[360px_minmax(0,1fr)]">
             <Card class="p-5">
               <div class="space-y-3">
                 <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Health</p>
@@ -2873,7 +2929,7 @@
         </Card>
       </div>
     {:else}
-      <div class="grid gap-5 xl:grid-cols-[minmax(0,1fr)_420px]">
+      <div class="grid gap-5 lg:grid-cols-[minmax(0,1fr)_420px]">
         <Card class="p-5">
           <div class="space-y-4">
             <div>
@@ -2937,6 +2993,80 @@
       </div>
     {/if}
   </section>
+{/if}
+
+<!-- Mobile searchable tool picker for executor tools.
+     Opens when the "Configure (N)" button under Individual tools is tapped.
+     Re-uses the same per-tool toggle logic as the desktop grid. -->
+{#if toolPickerExecutorId}
+  {@const exec = executorConfigs.find((e) => e.executor_id === toolPickerExecutorId)}
+  {#if exec}
+    {@const query = toolPickerQuery.trim().toLowerCase()}
+    {@const filteredTools = query
+      ? executorTools.filter((t) => t.name.toLowerCase().includes(query) || (t.description ?? '').toLowerCase().includes(query) || t.category.toLowerCase().includes(query))
+      : executorTools}
+    <Sheet open={true} onClose={() => (toolPickerExecutorId = null)} side="bottom" label={`Configure tools for ${exec.name}`}>
+      {#snippet header()}
+        <div class="space-y-3">
+          <div>
+            <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Executor</p>
+            <h3 class="mt-1 text-lg font-semibold text-white">{exec.name}</h3>
+          </div>
+          <Input type="search" bind:value={toolPickerQuery} placeholder="Search tools by name, description, or group…" aria-label="Filter tools" />
+        </div>
+      {/snippet}
+      <div class="space-y-1.5">
+        {#each filteredTools as tool}
+          {@const enabledByGroup = (exec.enabled_tool_groups || []).includes(tool.category)}
+          {@const enabledByName = (exec.enabled_tools || []).includes(tool.name) || (exec.enabled_tools || []).includes('*')}
+          {@const enabled = enabledByGroup || enabledByName}
+          <button
+            type="button"
+            class="w-full rounded-xl border px-3 py-3 text-left transition-colors {enabled ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-100' : 'bg-slate-900 border-slate-700 text-slate-300 hover:border-slate-600'}"
+            onclick={() => {
+              if (enabledByGroup) return;
+              // Compute the target list from the latest state: pending queue
+              // if one is in flight, otherwise the current executor snapshot.
+              // This prevents rapid taps from clobbering each other.
+              const pending = toolUpdateQueues.get(exec.executor_id)?.pending;
+              const base = pending ?? (exec.enabled_tools || []);
+              const tools = [...base].filter((t: string) => t !== '*');
+              const idx = tools.indexOf(tool.name);
+              if (idx >= 0) {
+                tools.splice(idx, 1);
+              } else {
+                tools.push(tool.name);
+              }
+              void queueExecutorToolUpdate(exec.executor_id, tools);
+            }}
+          >
+            <div class="flex items-center justify-between gap-3">
+              <span class="font-mono text-sm text-slate-100">{tool.name}</span>
+              <span class="shrink-0 rounded-full border border-slate-700 px-2 py-0.5 text-[10px] uppercase tracking-wider text-slate-400">{tool.category}</span>
+            </div>
+            {#if tool.description}
+              <p class="mt-1.5 text-xs text-slate-400">{tool.description}</p>
+            {/if}
+            <div class="mt-1.5 flex flex-wrap gap-2 text-[11px]">
+              {#if enabledByGroup}
+                <span class="text-amber-300">via group</span>
+              {:else if enabled}
+                <span class="text-emerald-300">enabled</span>
+              {:else}
+                <span class="text-slate-500">disabled</span>
+              {/if}
+              {#if tool.non_bypassable}
+                <span class="text-amber-400">non-bypassable</span>
+              {/if}
+            </div>
+          </button>
+        {/each}
+        {#if filteredTools.length === 0}
+          <p class="py-6 text-center text-sm text-slate-500">No tools match "{toolPickerQuery}".</p>
+        {/if}
+      </div>
+    </Sheet>
+  {/if}
 {/if}
 
 <!-- Secret creation modal -->

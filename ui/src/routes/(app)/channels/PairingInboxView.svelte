@@ -17,7 +17,7 @@
   export let onReject: (requestId: string) => void;
 </script>
 
-<div class="grid gap-6 xl:grid-cols-[1.2fr_0.8fr]">
+<div class="grid gap-6 lg:grid-cols-[1.2fr_0.8fr]">
   <div class="space-y-4">
     <div>
       <p class="text-xs uppercase tracking-[0.24em] text-slate-500">Pairing inbox</p>

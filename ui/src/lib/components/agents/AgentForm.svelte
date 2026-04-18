@@ -288,7 +288,7 @@
 </script>
 
 <form class="space-y-5" onsubmit={handleSubmit}>
-  <div class="grid gap-5 xl:grid-cols-[minmax(0,1fr)_360px]">
+  <div class="grid gap-5 lg:grid-cols-[minmax(0,1fr)_360px]">
     <div class="space-y-5">
       <!-- Identity -->
       <Card class="p-5">

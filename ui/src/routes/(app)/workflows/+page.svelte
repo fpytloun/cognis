@@ -1,12 +1,14 @@
 <script lang="ts">
   import { beforeNavigate } from '$app/navigation';
   import { onMount } from 'svelte';
+  import { ArrowDown, ArrowUp, MoreVertical } from 'lucide-svelte';
 
   import { api, asApiError } from '$lib/api/client';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import Card from '$lib/components/ui/Card.svelte';
   import Input from '$lib/components/ui/Input.svelte';
+  import Sheet from '$lib/components/ui/Sheet.svelte';
   import Tooltip from '$lib/components/ui/Tooltip.svelte';
   import WorkflowDiagram from '$lib/components/workflows/WorkflowDiagram.svelte';
   import { confirmAction } from '$lib/stores/confirm';
@@ -35,6 +37,7 @@
   let form: WorkflowFormState = createEmptyWorkflowForm();
   let dragIndex = -1;
   let initialSnapshot = JSON.stringify(form);
+  let mobileWorkflowActionsOpen = false;
 
   function canEditSystemWorkflowField(field: 'stepReasoning' | 'stepMaxAttempts'): boolean {
     if (!selectedWorkflow?.is_system) return true;
@@ -235,6 +238,22 @@
     dragIndex = -1;
   }
 
+  /**
+   * Explicit reorder via up/down buttons. Works on any input type (touch,
+   * keyboard, mouse) whereas HTML5 `draggable` is a no-op on iOS Safari and
+   * awkward on Android Chrome. Desktop users can still use the native drag
+   * handles; mobile users get the arrow buttons.
+   */
+  function moveStepBy(index: number, delta: -1 | 1): void {
+    if (selectedWorkflow?.is_system) return;
+    const target = index + delta;
+    if (target < 0 || target >= form.steps.length) return;
+    const steps = [...form.steps];
+    const [moved] = steps.splice(index, 1);
+    steps.splice(target, 0, moved);
+    form.steps = steps;
+  }
+
   function downloadCurrentWorkflow(): void {
     const blob = new Blob([exportWorkflowYaml(form)], { type: 'text/yaml;charset=utf-8' });
     const url = URL.createObjectURL(blob);
@@ -277,13 +296,18 @@
 {#if loading}
   <LoadingState label="Loading workflows" description="Fetching system templates and user-editable workflow definitions." />
 {:else}
-  <section class="space-y-5 overflow-x-hidden">
+  <!-- Extra bottom padding on mobile reserves room for the sticky action bar
+       (Save + Actions) so the last step editor card isn't hidden behind it. -->
+  <section class="space-y-5 overflow-x-hidden pb-24 lg:pb-0">
     <div class="flex flex-wrap items-center justify-between gap-3">
       <div class="min-w-0">
         <p class="text-sm uppercase tracking-[0.25em] text-slate-400">Workflow registry</p>
         <h1 class="mt-1 text-2xl font-semibold text-white">Workflows</h1>
       </div>
-      <div class="flex flex-wrap gap-2">
+      <!-- Desktop action bar. Mobile gets a fixed sticky bar at the bottom
+           of the viewport so Save is always one tap away even at the end of
+           a long step editor. -->
+      <div class="hidden lg:flex flex-wrap gap-2">
         <Button variant="secondary" onclick={newWorkflow}>New workflow</Button>
         <Button variant="secondary" onclick={duplicateSelectedWorkflow} disabled={!selectedWorkflow}>Duplicate</Button>
         <Button variant="secondary" onclick={downloadCurrentWorkflow}>Export YAML</Button>
@@ -296,7 +320,9 @@
       <p class="rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-100">{error}</p>
     {/if}
 
-    <div class="grid gap-5 xl:grid-cols-[320px_minmax(0,1fr)]">
+    <!-- Two-column layout at lg+. Below lg the workflow list stacks above
+         the editor for a usable single-column mobile flow. -->
+    <div class="grid gap-5 lg:grid-cols-[320px_minmax(0,1fr)]">
       <aside class="space-y-5">
         <Card class="p-4">
           <div class="space-y-2">
@@ -380,7 +406,7 @@
             <span class="inline-flex items-center gap-2">
               Selection criteria
               <Tooltip text="Natural language description of when this workflow should be auto-selected by the classifier. Used by the Decision Engine to match incoming tasks to workflows.">
-                <span class="cursor-help text-slate-500">(?)</span>
+                <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-700 text-xs text-slate-400 hover:text-slate-200 focus-visible:border-slate-400 md:h-5 md:w-5">?</button>
               </Tooltip>
             </span>
             <textarea bind:value={form.criteria} class="min-h-[90px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}></textarea>
@@ -395,7 +421,7 @@
               <span class="inline-flex items-center gap-2">
                 Interaction mode
                 <Tooltip text="Controls when the workflow can pause for human input. 'Autonomous' never pauses. 'Gates only' pauses at defined gate steps. 'Steps can ask' also allows run steps to request input mid-execution.">
-                  <span class="cursor-help text-slate-500">(?)</span>
+                  <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-700 text-xs text-slate-400 hover:text-slate-200 focus-visible:border-slate-400 md:h-5 md:w-5">?</button>
                 </Tooltip>
               </span>
               <select bind:value={form.interactionMode} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}>
@@ -408,7 +434,7 @@
               <span class="inline-flex items-center gap-2">
                 Default max attempts
                 <Tooltip text="How many times a step can retry after evaluation rejection before triggering the 'on exhausted' action. Applies to all steps unless overridden per step.">
-                  <span class="cursor-help text-slate-500">(?)</span>
+                  <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-700 text-xs text-slate-400 hover:text-slate-200 focus-visible:border-slate-400 md:h-5 md:w-5">?</button>
                 </Tooltip>
               </span>
               <Input bind:value={form.defaultMaxAttempts} disabled={!!selectedWorkflow?.is_system} type="number" />
@@ -417,7 +443,7 @@
               <span class="inline-flex items-center gap-2">
                 On exhausted
                 <Tooltip text="What happens when a step exhausts all retry attempts. 'Continue anyway' advances to the next step. 'Fail task' marks the entire task as failed. 'Ask human' pauses and notifies the user for a decision.">
-                  <span class="cursor-help text-slate-500">(?)</span>
+                  <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-700 text-xs text-slate-400 hover:text-slate-200 focus-visible:border-slate-400 md:h-5 md:w-5">?</button>
                 </Tooltip>
               </span>
               <select bind:value={form.defaultOnExhausted} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}>
@@ -432,7 +458,7 @@
             <span class="inline-flex items-center gap-2">
               Evaluate steps by default
               <Tooltip text="When enabled, an evaluator LLM checks whether each step's objective was met before advancing to the next step. Disable for simple or fire-and-forget steps.">
-                <span class="cursor-help text-slate-500">(?)</span>
+                <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-700 text-xs text-slate-400 hover:text-slate-200 focus-visible:border-slate-400 md:h-5 md:w-5">?</button>
               </Tooltip>
             </span>
           </label>
@@ -440,7 +466,7 @@
             <span class="inline-flex items-center gap-2">
               Completion notification behavior
               <Tooltip text="Default delivery sends results through the normal conversation flow. Direct channel delivery sends the final result straight to the resolved target channel. Allow silent completion lets the agent finish without notifying when nothing user-actionable happened.">
-                <span class="cursor-help text-slate-500">(?)</span>
+                <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-700 text-xs text-slate-400 hover:text-slate-200 focus-visible:border-slate-400 md:h-5 md:w-5">?</button>
               </Tooltip>
             </span>
             <div class="grid gap-3 md:grid-cols-[minmax(0,1fr)_auto]">
@@ -469,10 +495,33 @@
           <div class="mt-4 space-y-4">
             {#each form.steps as step, index}
               <article class="rounded-2xl border border-slate-800 bg-slate-950/70 p-4" draggable={!selectedWorkflow?.is_system} ondragstart={() => (dragIndex = index)} ondragover={(event) => event.preventDefault()} ondrop={() => moveStep(index)}>
-                <!-- Step header: name, type, step number badge -->
+                <!-- Step header: name, type, step number badge, reorder
+                     buttons. The up/down buttons are the touch-friendly
+                     counterpart to HTML5 `draggable` (which is a no-op on
+                     iOS Safari and flaky on Android Chrome). -->
                 <div class="mb-3 flex flex-wrap items-center gap-3">
                   <span class="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-slate-800 text-[11px] font-medium text-slate-400">{index + 1}</span>
                   <span class="min-w-0 flex-1 break-words text-sm font-medium text-slate-100">{step.name || `Step ${index + 1}`}</span>
+                  <div class="flex shrink-0 items-center gap-1">
+                    <button
+                      type="button"
+                      aria-label="Move step up"
+                      class="inline-flex h-10 w-10 items-center justify-center rounded-xl text-slate-300 hover:bg-slate-800 hover:text-white disabled:opacity-40 md:h-8 md:w-8"
+                      disabled={!!selectedWorkflow?.is_system || index === 0}
+                      onclick={() => moveStepBy(index, -1)}
+                    >
+                      <ArrowUp class="h-4 w-4" />
+                    </button>
+                    <button
+                      type="button"
+                      aria-label="Move step down"
+                      class="inline-flex h-10 w-10 items-center justify-center rounded-xl text-slate-300 hover:bg-slate-800 hover:text-white disabled:opacity-40 md:h-8 md:w-8"
+                      disabled={!!selectedWorkflow?.is_system || index === form.steps.length - 1}
+                      onclick={() => moveStepBy(index, 1)}
+                    >
+                      <ArrowDown class="h-4 w-4" />
+                    </button>
+                  </div>
                   <span class="shrink-0 rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-widest {step.type === 'gate' ? 'border-amber-600/40 text-amber-400' : 'border-slate-700 text-slate-400'}">{step.type === 'gate' ? 'Gate' : 'Run'}</span>
                   {#if step.agentOverride && step.type === 'run'}
                     <span class="break-all rounded-full border border-sky-500/30 bg-sky-500/10 px-2 py-0.5 text-[10px] text-sky-300">{step.agentOverride}</span>
@@ -498,7 +547,7 @@
                     <span class="inline-flex items-center gap-2">
                       Agent override
                       <Tooltip text="Run this step with a different agent instead of the task's primary agent. Useful for specialized steps like code review or architecture review.">
-                        <span class="cursor-help text-slate-500">(?)</span>
+                        <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-700 text-xs text-slate-400 hover:text-slate-200 focus-visible:border-slate-400 md:h-5 md:w-5">?</button>
                       </Tooltip>
                     </span>
                     <select bind:value={step.agentOverride} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}>
@@ -535,7 +584,7 @@
                     <span class="inline-flex items-center gap-2">
                       Input from previous steps
                       <Tooltip text="What context from previous steps flows into this step. 'Step output' passes the completion summary (recommended). 'Summary' generates an LLM summary. 'Full history' passes the entire session (expensive, rarely needed). 'None' starts with fresh context.">
-                        <span class="cursor-help text-slate-500">(?)</span>
+                        <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-700 text-xs text-slate-400 hover:text-slate-200 focus-visible:border-slate-400 md:h-5 md:w-5">?</button>
                       </Tooltip>
                     </span>
                     <select bind:value={step.inputMode} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}>
@@ -550,7 +599,7 @@
                     <span class="inline-flex items-center gap-2">
                       Source steps
                       <Tooltip text="Comma-separated names of steps to pull input from. Leave empty to use the immediately preceding step. Only applies when input mode is not 'None'.">
-                        <span class="cursor-help text-slate-500">(?)</span>
+                        <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-700 text-xs text-slate-400 hover:text-slate-200 focus-visible:border-slate-400 md:h-5 md:w-5">?</button>
                       </Tooltip>
                     </span>
                     <Input bind:value={step.inputText} disabled={!!selectedWorkflow?.is_system || step.inputMode === 'null'} placeholder={step.inputMode === 'full' ? 'plan' : 'plan, review'} />
@@ -564,7 +613,7 @@
                       <span class="inline-flex items-center gap-2">
                         Max attempts
                         <Tooltip text="How many times this step can retry after evaluation rejection before triggering the 'on exhausted' action.">
-                          <span class="cursor-help text-slate-500">(?)</span>
+                          <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-700 text-xs text-slate-400 hover:text-slate-200 focus-visible:border-slate-400 md:h-5 md:w-5">?</button>
                         </Tooltip>
                       </span>
                       <Input bind:value={step.maxAttempts} disabled={!canEditSystemWorkflowField('stepMaxAttempts')} type="number" />
@@ -573,7 +622,7 @@
                       <span class="inline-flex items-center gap-2">
                         On exhausted
                         <Tooltip text="What happens when this step exhausts all retry attempts.">
-                          <span class="cursor-help text-slate-500">(?)</span>
+                          <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-700 text-xs text-slate-400 hover:text-slate-200 focus-visible:border-slate-400 md:h-5 md:w-5">?</button>
                         </Tooltip>
                       </span>
                       <select bind:value={step.onExhausted} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}>
@@ -590,7 +639,7 @@
                       <span class="inline-flex items-center gap-2">
                         Evaluate completion
                         <Tooltip text="When enabled, an evaluator LLM checks if the step objective was met before advancing. Rejected steps are sent back for revision.">
-                          <span class="cursor-help text-slate-500">(?)</span>
+                          <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-700 text-xs text-slate-400 hover:text-slate-200 focus-visible:border-slate-400 md:h-5 md:w-5">?</button>
                         </Tooltip>
                       </span>
                     </label>
@@ -600,7 +649,7 @@
                         <span class="inline-flex items-center gap-2">
                           Allow questions
                           <Tooltip text="Let the agent ask clarifying questions mid-step. The workflow pauses until the user responds. Only available when interaction mode is 'Steps can ask'.">
-                            <span class="cursor-help text-slate-500">(?)</span>
+                            <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-700 text-xs text-slate-400 hover:text-slate-200 focus-visible:border-slate-400 md:h-5 md:w-5">?</button>
                           </Tooltip>
                         </span>
                       </label>
@@ -618,7 +667,7 @@
                     <span class="inline-flex items-center gap-2">
                       Gate options
                       <Tooltip text="One option per line in 'Label|action' format. Actions: 'continue' advances, 'revise(step_name)' loops back. Example: Approve|continue">
-                        <span class="cursor-help text-slate-500">(?)</span>
+                        <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-700 text-xs text-slate-400 hover:text-slate-200 focus-visible:border-slate-400 md:h-5 md:w-5">?</button>
                       </Tooltip>
                     </span>
                     <textarea bind:value={step.gateOptionsText} class="min-h-[90px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 font-mono text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system} placeholder="Approve|continue&#10;Request changes|revise(plan)"></textarea>
@@ -631,7 +680,7 @@
                     <summary class="cursor-pointer text-sm font-medium text-slate-300 hover:text-slate-100">
                       Evaluator retry loop
                       <Tooltip text="Configure what happens when the evaluator says the step output is incomplete. Without a target, the agent retries in place within the same step.">
-                        <span class="cursor-help text-slate-500">(?)</span>
+                        <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-700 text-xs text-slate-400 hover:text-slate-200 focus-visible:border-slate-400 md:h-5 md:w-5">?</button>
                       </Tooltip>
                     </summary>
                     <div class="mt-3 grid gap-4 md:grid-cols-3">
@@ -666,7 +715,7 @@
                     <summary class="cursor-pointer text-sm font-medium text-slate-300 hover:text-slate-100">
                       Outcome routing
                       <Tooltip text="Configure what happens after a valid step completion reports a business outcome. This is separate from evaluator retries: an approved review can still report outcome.status='rejected' and send work back.">
-                        <span class="cursor-help text-slate-500">(?)</span>
+                        <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-700 text-xs text-slate-400 hover:text-slate-200 focus-visible:border-slate-400 md:h-5 md:w-5">?</button>
                       </Tooltip>
                     </summary>
                     <div class="mt-3 space-y-4">
@@ -787,5 +836,41 @@
         </Card>
       </div>
     </div>
+
+    <!-- Mobile-only sticky action bar. Anchored above the bottom tab bar
+         via safe-area. Primary action is Save; secondary actions collapse
+         behind an overflow menu in a Sheet. -->
+    <div
+      class="fixed inset-x-0 z-30 border-t border-slate-800/80 bg-slate-950/95 px-3 py-2 backdrop-blur lg:hidden"
+      style="bottom: calc(env(safe-area-inset-bottom, 0px) + 56px); padding-bottom: 6px;"
+    >
+      <div class="flex items-center gap-2">
+        <Button
+          variant="secondary"
+          size="sm"
+          onclick={() => (mobileWorkflowActionsOpen = true)}
+          aria-label="More workflow actions"
+        >
+          <MoreVertical class="h-4 w-4" />
+          <span class="ml-1">Actions</span>
+        </Button>
+        <Button
+          class="flex-1 justify-center"
+          onclick={saveWorkflow}
+          disabled={saving || (!!selectedWorkflow?.is_system && (selectedWorkflow.editable_fields?.length ?? 0) === 0)}
+        >
+          {saving ? 'Saving…' : selectedWorkflow?.is_system ? 'Save overrides' : 'Save workflow'}
+        </Button>
+      </div>
+    </div>
+
+    <Sheet open={mobileWorkflowActionsOpen} onClose={() => (mobileWorkflowActionsOpen = false)} side="bottom" label="Workflow actions">
+      <div class="space-y-2">
+        <Button class="w-full justify-center" variant="secondary" onclick={() => { mobileWorkflowActionsOpen = false; void newWorkflow(); }}>New workflow</Button>
+        <Button class="w-full justify-center" variant="secondary" onclick={() => { mobileWorkflowActionsOpen = false; void duplicateSelectedWorkflow(); }} disabled={!selectedWorkflow}>Duplicate</Button>
+        <Button class="w-full justify-center" variant="secondary" onclick={() => { mobileWorkflowActionsOpen = false; downloadCurrentWorkflow(); }}>Export YAML</Button>
+        <Button class="w-full justify-center" variant="danger" onclick={() => { mobileWorkflowActionsOpen = false; void deleteSelectedWorkflow(); }} disabled={!selectedWorkflow || selectedWorkflow.is_system}>Delete</Button>
+      </div>
+    </Sheet>
   </section>
 {/if}

@@ -29,7 +29,7 @@
       <div>
         <p class="text-xs uppercase tracking-[0.25em] text-slate-400">{getCategoryLabel(group.category)}</p>
       </div>
-      <div class="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+      <div class="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
         {#each group.docs as doc}
           <a class="rounded-2xl border border-slate-800 bg-slate-950/70 p-5 transition hover:border-sky-400/50 hover:bg-slate-950/90" href={`/docs/${doc.slug}`}>
             <p class="font-medium text-white">{doc.title}</p>
