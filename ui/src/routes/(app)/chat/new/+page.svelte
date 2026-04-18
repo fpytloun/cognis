@@ -3,14 +3,17 @@
   import { page } from '$app/stores';
   import { onMount } from 'svelte';
 
-  import Button from '$lib/components/ui/Button.svelte';
+  import NewChatModal from '$lib/components/NewChatModal.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import { api } from '$lib/api/client';
+  import { CHAT_STORAGE_KEYS, isRestorableChatConversation } from '$lib/chat-page';
   import type { Agent, HealthResponse } from '$lib/types/api';
 
   let loading = true;
   let error = '';
+  let creating = false;
   let agents: Agent[] = [];
+  let selectedAgentId = '';
   let health: HealthResponse | null = null;
 
   function isLlmUnavailableForSetup(): boolean {
@@ -18,51 +21,74 @@
     return llmDetails.includes('no llm model configured') || llmDetails.includes('not configured');
   }
 
-  function getSelectedAgentId(): string {
-    const primary = agents.filter((a) => a.agent_type === 'primary');
+  async function resolveInitialAgentId(allAgents: Agent[]): Promise<string> {
+    const primary = allAgents.filter((agent) => agent.agent_type === 'primary' && agent.status === 'active');
     const requestedAgentId = $page.url.searchParams.get('agent_id');
-    if (requestedAgentId && primary.some((a) => a.agent_id === requestedAgentId)) {
+    if (requestedAgentId && primary.some((agent) => agent.agent_id === requestedAgentId)) {
       return requestedAgentId;
     }
+
     if (typeof window !== 'undefined') {
-      const stored = window.localStorage.getItem('cognis-chat-selected-agent');
-      if (stored && primary.some((a) => a.agent_id === stored && a.status === 'active')) {
-        return stored;
+      const storedAgentId = window.localStorage.getItem(CHAT_STORAGE_KEYS.selectedAgent);
+      if (storedAgentId && primary.some((agent) => agent.agent_id === storedAgentId)) {
+        return storedAgentId;
+      }
+
+      const lastOpenedConversationId = window.localStorage.getItem(CHAT_STORAGE_KEYS.lastOpenedConversation);
+      if (lastOpenedConversationId) {
+        try {
+          const conversation = await api.conversations.detail(lastOpenedConversationId);
+          if (isRestorableChatConversation(conversation) && primary.some((agent) => agent.agent_id === conversation.agent_id)) {
+            return conversation.agent_id;
+          }
+          window.localStorage.removeItem(CHAT_STORAGE_KEYS.lastOpenedConversation);
+        } catch {
+          window.localStorage.removeItem(CHAT_STORAGE_KEYS.lastOpenedConversation);
+        }
       }
     }
-    return primary.find((a) => a.status === 'active')?.agent_id ?? primary[0]?.agent_id ?? '';
+
+    return primary[0]?.agent_id ?? '';
   }
 
   async function createConversation(): Promise<void> {
-    const agentId = getSelectedAgentId();
-    if (!agentId) {
+    if (!selectedAgentId) {
       error = 'Create an agent first before starting a conversation.';
-      loading = false;
       return;
     }
 
     if (isLlmUnavailableForSetup()) {
       error = 'Configure an LLM provider before starting a conversation.';
-      loading = false;
       return;
     }
 
-    const conversation = await api.conversations.create({
-      agent_id: agentId,
-      context: {
-        type: 'web',
-        ref: null,
-        platform_data: {},
-        memory_labels: {}
+    creating = true;
+    error = '';
+    try {
+      const conversation = await api.conversations.create({
+        agent_id: selectedAgentId,
+        context: {
+          type: 'web',
+          ref: null,
+          platform_data: {},
+          memory_labels: {}
+        }
+      });
+
+      if (typeof window !== 'undefined') {
+        window.localStorage.setItem(CHAT_STORAGE_KEYS.selectedAgent, selectedAgentId);
       }
-    });
 
-    // Persist the agent choice
-    if (typeof window !== 'undefined') {
-      window.localStorage.setItem('cognis-chat-selected-agent', agentId);
+      await goto(`/chat/${conversation.conversation_id}`, { replaceState: true });
+    } catch (caughtError) {
+      error = caughtError instanceof Error ? caughtError.message : 'Unable to start a new conversation.';
+    } finally {
+      creating = false;
     }
+  }
 
-    await goto(`/chat/${conversation.conversation_id}`, { replaceState: true });
+  async function cancel(): Promise<void> {
+    await goto('/chat', { replaceState: true });
   }
 
   onMount(() => {
@@ -70,9 +96,9 @@
       try {
         health = await api.system.health();
         agents = await api.agents.listAll();
-        await createConversation();
+        selectedAgentId = await resolveInitialAgentId(agents);
       } catch (caughtError) {
-        error = caughtError instanceof Error ? caughtError.message : 'Unable to start a new conversation.';
+        error = caughtError instanceof Error ? caughtError.message : 'Unable to prepare a new conversation.';
       } finally {
         loading = false;
       }
@@ -85,13 +111,17 @@
 </svelte:head>
 
 {#if loading}
-  <LoadingState label="Starting conversation" description="Creating a new web conversation for your selected agent." />
-{:else if error}
-  <section class="rounded-3xl border border-amber-500/30 bg-amber-500/10 px-6 py-10 text-center text-sm text-amber-100">
-    <p>{error}</p>
-    <div class="mt-4 flex justify-center gap-3">
-      <Button onclick={() => goto('/agents')}>Open agents</Button>
-      <Button variant="secondary" onclick={() => goto('/chat')}>Back to chat</Button>
-    </div>
-  </section>
+  <LoadingState label="Preparing new chat" description="Loading agents and your recent chat context." />
+{:else}
+  <NewChatModal
+    {agents}
+    bind:selectedAgentId
+    title="Start a new chat"
+    description="Pick the primary agent for this new web conversation. The current filter or your last opened conversation is preselected when possible."
+    confirmLabel="Create conversation"
+    busy={creating}
+    {error}
+    oncancel={() => void cancel()}
+    onconfirm={() => void createConversation()}
+  />
 {/if}

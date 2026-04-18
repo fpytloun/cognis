@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   getNextHistoryAfterSeq,
   getConversationRetryScope,
+  isRestorableChatConversation,
   isCurrentConversationLoad,
   nextPollDelayMs,
   nextConversationLoadId
@@ -56,5 +57,11 @@ describe('chat page helpers', () => {
 
     expect(nextDelay).toBeGreaterThanOrEqual(5100);
     expect(nextDelay).toBeLessThanOrEqual(6900);
+  });
+
+  it('only restores active web conversations as the last opened chat', () => {
+    expect(isRestorableChatConversation({ status: 'active', context: { type: 'web' } })).toBe(true);
+    expect(isRestorableChatConversation({ status: 'archived', context: { type: 'web' } })).toBe(false);
+    expect(isRestorableChatConversation({ status: 'active', context: { type: 'slack' } })).toBe(false);
   });
 });

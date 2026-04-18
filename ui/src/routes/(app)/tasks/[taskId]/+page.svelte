@@ -251,6 +251,33 @@
     return typeof val === 'string' ? val : '';
   }
 
+  function activeStepTodos(stepRun: StepRun): Array<{ content: string; status: string; priority: string }> {
+    const todos = Array.isArray(stepRun.todos) ? stepRun.todos : [];
+    return todos
+      .map((todo: Record<string, unknown>) => {
+        const content = typeof todo.content === 'string' ? todo.content.trim() : '';
+        if (!content) return null;
+        return {
+          content,
+          status: typeof todo.status === 'string' ? todo.status : 'pending',
+          priority: typeof todo.priority === 'string' ? todo.priority : 'medium'
+        };
+      })
+      .filter((todo): todo is { content: string; status: string; priority: string } => todo !== null)
+      .filter((todo: { content: string; status: string; priority: string }) => !['completed', 'cancelled'].includes(todo.status));
+  }
+
+  function todoStatusClass(status: string): string {
+    if (status === 'in_progress') return 'border-sky-500/30 bg-sky-500/10 text-sky-100';
+    return 'border-amber-500/30 bg-amber-500/10 text-amber-100';
+  }
+
+  function todoPriorityClass(priority: string): string {
+    if (priority === 'high') return 'text-rose-300';
+    if (priority === 'low') return 'text-slate-400';
+    return 'text-slate-300';
+  }
+
   function openSessionLogs(stepRun: StepRun): void {
     const sessionId = String(stepRun.output?.session_id ?? stepRun.session_id ?? '');
     if (!sessionId || !task) return;
@@ -1073,6 +1100,26 @@
                       </div>
                     {/if}
 
+                    {#if activeStepTodos(latestAttempt).length > 0}
+                      {@const todos = activeStepTodos(latestAttempt)}
+                      <div class="mt-4 rounded-2xl border border-slate-800 bg-slate-900/60 px-4 py-3">
+                        <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Open todos</p>
+                        <div class="mt-3 space-y-2">
+                          {#each todos as todo}
+                            <div class="rounded-2xl border px-3 py-3 text-sm {todoStatusClass(todo.status)}">
+                              <div class="flex flex-wrap items-center justify-between gap-2">
+                                <span class="font-medium">{todo.content}</span>
+                                <div class="flex items-center gap-2 text-[10px] uppercase tracking-[0.18em]">
+                                  <span class="rounded-full border border-current/20 px-2 py-0.5">{todo.status.replace('_', ' ')}</span>
+                                  <span class={todoPriorityClass(todo.priority)}>{todo.priority}</span>
+                                </div>
+                              </div>
+                            </div>
+                          {/each}
+                        </div>
+                      </div>
+                    {/if}
+
                     <div class="mt-4 rounded-2xl border border-slate-800 bg-slate-900/60 px-4 py-3">
                       <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Completion metadata</p>
                       {#if claims.length > 0}
@@ -1191,7 +1238,7 @@
               <dl class="mt-3 space-y-2">
                 <div class="flex justify-between gap-3"><dt class="text-slate-500">Source</dt><dd>{sourceLabel}</dd></div>
                 {#if sourceConversation}
-                  <div class="flex justify-between gap-3"><dt class="text-slate-500">Conversation</dt><dd><a href="/chat?conversation={sourceConversation.conversation_id}" class="text-sky-400 hover:text-sky-300 hover:underline">{sourceConversation.title ?? 'Untitled'}</a></dd></div>
+                  <div class="flex justify-between gap-3"><dt class="text-slate-500">Conversation</dt><dd><a href="/chat/{sourceConversation.conversation_id}" class="text-sky-400 hover:text-sky-300 hover:underline">{sourceConversation.title ?? 'Untitled'}</a></dd></div>
                 {/if}
                 <div class="flex justify-between gap-3"><dt class="text-slate-500">Agent</dt><dd class="inline-flex items-center gap-2"><AgentAvatar name={agentName(task.agent_id)} avatarUrl={taskAgent?.avatar_url ?? null} class="h-5 w-5 rounded-lg" />{agentName(task.agent_id)}</dd></div>
                 <div class="flex justify-between gap-3"><dt class="text-slate-500">Workflow</dt><dd>{workflowName(task.workflow_id)}</dd></div>
@@ -1236,7 +1283,7 @@
               <div class="flex justify-between gap-3">
                 <dt class="text-slate-500">Conversation</dt>
                 <dd>
-                  <a href="/chat?conversation={sourceConversation.conversation_id}" class="text-sky-400 hover:text-sky-300 hover:underline">
+                  <a href="/chat/{sourceConversation.conversation_id}" class="text-sky-400 hover:text-sky-300 hover:underline">
                     {sourceConversation.title ?? 'Untitled'}
                   </a>
                 </dd>

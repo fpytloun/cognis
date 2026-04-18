@@ -5,6 +5,7 @@
   import LoadingState from '$lib/components/LoadingState.svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import { api } from '$lib/api/client';
+  import { CHAT_STORAGE_KEYS, isRestorableChatConversation } from '$lib/chat-page';
   import type { Agent } from '$lib/types/api';
 
   let loading = true;
@@ -14,7 +15,7 @@
   function getSelectedAgentId(agents: Agent[]): string {
     const primary = agents.filter((a) => a.agent_type === 'primary');
     if (typeof window !== 'undefined') {
-      const stored = window.localStorage.getItem('cognis-chat-selected-agent');
+      const stored = window.localStorage.getItem(CHAT_STORAGE_KEYS.selectedAgent);
       if (stored && primary.some((a) => a.agent_id === stored && a.status === 'active')) {
         return stored;
       }
@@ -25,6 +26,22 @@
   onMount(() => {
     void (async () => {
       try {
+        if (typeof window !== 'undefined') {
+          const lastOpenedConversationId = window.localStorage.getItem(CHAT_STORAGE_KEYS.lastOpenedConversation);
+          if (lastOpenedConversationId) {
+            try {
+              const conversation = await api.conversations.detail(lastOpenedConversationId);
+              if (isRestorableChatConversation(conversation)) {
+                await goto(`/chat/${lastOpenedConversationId}`, { replaceState: true });
+                return;
+              }
+              window.localStorage.removeItem(CHAT_STORAGE_KEYS.lastOpenedConversation);
+            } catch {
+              window.localStorage.removeItem(CHAT_STORAGE_KEYS.lastOpenedConversation);
+            }
+          }
+        }
+
         const agents = await api.agents.listAll();
         const agentId = getSelectedAgentId(agents);
         if (!agentId) {

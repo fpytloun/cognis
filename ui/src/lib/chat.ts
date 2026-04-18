@@ -934,6 +934,9 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
 
   if (event.type === 'workflow_gate' || event.type === 'workflow_step_question') {
     const isDirectQuestion = event.type === 'workflow_step_question' && !event.task_id;
+    if (isDirectQuestion) {
+      return next;
+    }
     const noticeId = event.notification_id
       ? `notice:${event.type}:${event.notification_id}`
       : undefined;

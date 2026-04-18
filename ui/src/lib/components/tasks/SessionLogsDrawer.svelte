@@ -12,6 +12,7 @@
   import { normalizeHistory, type TimelineItem } from '$lib/chat';
   import ChatMessage from '$lib/components/ChatMessage.svelte';
   import DelegationCard from '$lib/components/DelegationCard.svelte';
+  import LiveDots from '$lib/components/LiveDots.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import ReasoningBlock from '$lib/components/ReasoningBlock.svelte';
   import ToolCallBlock from '$lib/components/ToolCallBlock.svelte';
@@ -153,6 +154,9 @@
       <div>
         <p class="text-xs uppercase tracking-widest text-slate-500">Session logs</p>
         <h3 class="text-sm font-semibold text-white">{stepName || sessionId}</h3>
+        <div class="mt-2">
+          <LiveDots inline={true} size="sm" tone={userScrolledUp ? 'amber' : 'sky'} label={userScrolledUp ? 'Live follow paused' : 'Following latest'} />
+        </div>
       </div>
       <div class="flex items-center gap-2">
         <Button size="sm" variant="secondary" onclick={() => loadEvents(true)}>Refresh</Button>
@@ -201,6 +205,10 @@
         <button class="sticky bottom-2 left-1/2 z-10 -translate-x-1/2 rounded-full border border-slate-700 bg-slate-900/90 p-2 shadow-lg transition hover:bg-slate-800" onclick={jumpToBottom} type="button" title="Scroll to latest">
           <ArrowDown class="h-4 w-4 text-slate-300" />
         </button>
+      {:else if !loading && !error}
+        <div class="sticky bottom-2 left-1/2 z-10 w-fit -translate-x-1/2">
+          <LiveDots label="Reading latest logs" size="sm" />
+        </div>
       {/if}
     </div>
   </aside>

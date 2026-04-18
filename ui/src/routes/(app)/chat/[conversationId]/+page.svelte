@@ -11,7 +11,9 @@
   import CompactionCard from '$lib/components/CompactionCard.svelte';
   import DelegationCard from '$lib/components/DelegationCard.svelte';
   import EscalationPrompt from '$lib/components/EscalationPrompt.svelte';
+  import LiveDots from '$lib/components/LiveDots.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
+  import NewChatModal from '$lib/components/NewChatModal.svelte';
   import ReasoningBlock from '$lib/components/ReasoningBlock.svelte';
   import ToolCallBlock from '$lib/components/ToolCallBlock.svelte';
   import Button from '$lib/components/ui/Button.svelte';
@@ -24,6 +26,7 @@
     isCurrentConversationLoad,
     nextConversationLoadId,
     nextPollDelayMs,
+    CHAT_STORAGE_KEYS,
     SESSION_LOG_BOOTSTRAP_MAX_PAGES,
     SESSION_LOG_PAGE_SIZE,
     SESSION_LOG_POLL_INTERVAL_MS
@@ -38,9 +41,10 @@
     applyWebSocketEvent,
     finalizeReasoningItems,
     normalizeHistory,
-    type TimelineItem
+    type TimelineItem,
+    type ToolCallTimelineItem
   } from '$lib/chat';
-  import type { Agent, AttachmentRef, ContextUsage, Conversation, Escalation, MessageEvent, Session } from '$lib/types/api';
+  import type { Agent, AttachmentRef, ContextUsage, Conversation, Escalation, MessageEvent, Notification, Session } from '$lib/types/api';
   import { wsClient } from '$lib/ws/client';
 
   let initializing = $state(true);
@@ -80,12 +84,17 @@
   const escalationTimeoutSeconds = 300;
   let escalations = $state<Escalation[]>([]);
   let escalationBusyCallId = $state<string | null>(null);
+  let escalationResolutionPending = $state<Escalation | null>(null);
   let escalationError = $state('');
   let escalationCountdownTimer: number | null = null;
   let awaitingAssistantStart = $state(false);
   let turnInProgress = $state(false);
   let lastSubmittedMessage = '';
   let lastRecoverableMessage = $state('');
+  let showNewChatModal = $state(false);
+  let newChatAgentId = $state('');
+  let newChatCreating = $state(false);
+  let newChatError = $state('');
   let editingTitle = $state(false);
   let editTitleValue = $state('');
   let sessionIdCopied = $state(false);
@@ -126,7 +135,17 @@
     options: string[];
     context: string;
   }
+
+  interface ChatTodo {
+    content: string;
+    status: string;
+    priority: string;
+  }
+
   let pendingDirectQuestion = $state<PendingDirectQuestion | null>(null);
+  let directQuestionSubmitting = $state(false);
+  let chatTodoDrawerOpen = $state(true);
+  let retainedChatTodos = $state<ChatTodo[]>([]);
 
   const sessionIds = new Set<string>();
 
@@ -171,6 +190,173 @@
     const status = activeSessionStatus();
     return status !== null && BLOCKED_SESSION_STATES.has(status);
   }
+
+  function normalizeToolName(name: string): string {
+    return name.toLowerCase().replace(/_/g, '');
+  }
+
+  function directQuestionOptions(options: unknown): string[] {
+    if (!Array.isArray(options)) return [];
+    return options
+      .map((option) => {
+        if (typeof option === 'string') return option;
+        if (option && typeof option === 'object') {
+          const label = (option as Record<string, unknown>).label;
+          return typeof label === 'string' ? label : '';
+        }
+        return '';
+      })
+      .filter((option) => option.length > 0);
+  }
+
+  function directQuestionContext(context: unknown): string {
+    if (typeof context === 'string') return context;
+    if (context && typeof context === 'object') {
+      const text = (context as Record<string, unknown>).context ?? (context as Record<string, unknown>).note;
+      return typeof text === 'string' ? text : '';
+    }
+    return '';
+  }
+
+  function pendingDirectQuestionFromParts(
+    notificationId: string,
+    stepName: string | undefined,
+    question: unknown,
+    options: unknown,
+    context: unknown,
+  ): PendingDirectQuestion {
+    return {
+      notificationId,
+      stepName,
+      question: typeof question === 'string' && question.trim().length > 0
+        ? question.trim()
+        : 'The assistant needs more input to continue.',
+      options: directQuestionOptions(options),
+      context: directQuestionContext(context)
+    };
+  }
+
+  function pendingDirectQuestionFromNotification(notification: Notification): PendingDirectQuestion | null {
+    if (notification.notification_type !== 'step_question' || notification.task_id || notification.status !== 'pending') {
+      return null;
+    }
+    return pendingDirectQuestionFromParts(
+      notification.notification_id,
+      notification.step_name ?? undefined,
+      notification.payload.question,
+      notification.payload.options,
+      notification.payload.context,
+    );
+  }
+
+  function parseChatTodos(value: unknown): ChatTodo[] {
+    if (!Array.isArray(value)) return [];
+    return value
+      .map((item) => {
+        if (!item || typeof item !== 'object') return null;
+        const record = item as Record<string, unknown>;
+        const content = typeof record.content === 'string' ? record.content.trim() : '';
+        if (!content) return null;
+        return {
+          content,
+          status: typeof record.status === 'string' ? record.status : 'pending',
+          priority: typeof record.priority === 'string' ? record.priority : 'medium'
+        } satisfies ChatTodo;
+      })
+      .filter((item): item is ChatTodo => item !== null);
+  }
+
+  function parsedToolResult(item: ToolCallTimelineItem): Record<string, unknown> | null {
+    if (typeof item.result !== 'string') return null;
+    try {
+      const parsed = JSON.parse(item.result.replace(/^<tool_result[^>]*>\n?/, '').replace(/\n?<\/tool_result>\s*$/, ''));
+      return parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function latestChatTodos(items: TimelineItem[]): ChatTodo[] {
+    let lowerBound = 0;
+    for (let index = items.length - 1; index >= 0; index -= 1) {
+      const item = items[index];
+      if (item?.kind === 'message' && item.role === 'user') {
+        lowerBound = index;
+        break;
+      }
+    }
+
+    for (let index = items.length - 1; index >= 0; index -= 1) {
+      if (index < lowerBound) break;
+      const item = items[index];
+      if (item?.kind !== 'tool_call') continue;
+      const toolName = normalizeToolName(item.toolName);
+      if (toolName === 'steptodowrite') {
+        const parsed = parsedToolResult(item);
+        if (Array.isArray(parsed?.todos)) {
+          return parseChatTodos(parsed.todos);
+        }
+        if (item.status === 'started' && Array.isArray(item.arguments?.todos)) {
+          return parseChatTodos(item.arguments.todos);
+        }
+        return [];
+      }
+      if (toolName === 'steptodolist') {
+        const parsed = parsedToolResult(item);
+        if (Array.isArray(parsed?.todos)) {
+          return parseChatTodos(parsed.todos);
+        }
+        return [];
+      }
+    }
+    return [];
+  }
+
+  function todoStatusClass(status: string): string {
+    if (status === 'completed') return 'border-emerald-500/30 bg-emerald-500/10 text-emerald-100';
+    if (status === 'cancelled') return 'border-slate-700 bg-slate-900 text-slate-400';
+    if (status === 'in_progress') return 'border-sky-500/30 bg-sky-500/10 text-sky-100';
+    return 'border-amber-500/30 bg-amber-500/10 text-amber-100';
+  }
+
+  function todoPriorityClass(priority: string): string {
+    if (priority === 'high') return 'text-rose-300';
+    if (priority === 'low') return 'text-slate-400';
+    return 'text-slate-300';
+  }
+
+  function sortEscalations(items: Escalation[]): Escalation[] {
+    return [...items].sort((left, right) => (left.received_at ?? 0) - (right.received_at ?? 0));
+  }
+
+  function persistLastOpenedConversation(conversation: Conversation): void {
+    if (typeof window === 'undefined') return;
+    if (conversation.status === 'active' && isWebConversation(conversation)) {
+      window.localStorage.setItem(CHAT_STORAGE_KEYS.lastOpenedConversation, conversation.conversation_id);
+    }
+  }
+
+  const terminalTodoStatuses = new Set(['completed', 'cancelled']);
+
+  let chatTodos = $derived.by(() => {
+    const latestTodos = latestChatTodos(timeline);
+    if (latestTodos.length > 0) {
+      return latestTodos;
+    }
+    if (pendingDirectQuestion !== null || directQuestionSubmitting) {
+      return retainedChatTodos;
+    }
+    return [];
+  });
+  let activeChatTodos = $derived.by(() => chatTodos.filter((todo) => !terminalTodoStatuses.has(todo.status)));
+  let shouldShowChatTodoDrawer = $derived(activeChatTodos.length > 0 && (turnInProgress || pendingDirectQuestion !== null || directQuestionSubmitting));
+  let chatTodoCounts = $derived.by(() => ({
+    inProgress: activeChatTodos.filter((todo) => todo.status === 'in_progress').length,
+    pending: activeChatTodos.filter((todo) => todo.status === 'pending').length,
+  }));
+  let showTurnProgress = $derived.by(() =>
+    turnInProgress && !timeline.some((item) => item.kind === 'message' && item.role === 'assistant' && item.streaming)
+  );
 
   function contextTypeBadge(conversation: Conversation): string {
     const t = conversation.context?.type ?? 'unknown';
@@ -217,17 +403,17 @@
 
   function persistEnterToSendPreference(): void {
     if (typeof window === 'undefined') return;
-    window.localStorage.setItem('cognis-chat-enter-to-send', enterToSend ? '1' : '0');
+    window.localStorage.setItem(CHAT_STORAGE_KEYS.enterToSend, enterToSend ? '1' : '0');
   }
 
   function restoreEnterToSendPreference(): void {
     if (typeof window === 'undefined') return;
-    enterToSend = window.localStorage.getItem('cognis-chat-enter-to-send') !== '0';
+    enterToSend = window.localStorage.getItem(CHAT_STORAGE_KEYS.enterToSend) !== '0';
   }
 
   function restoreSelectedAgent(): void {
     if (typeof window === 'undefined') return;
-    const stored = window.localStorage.getItem('cognis-chat-selected-agent');
+    const stored = window.localStorage.getItem(CHAT_STORAGE_KEYS.selectedAgent);
     if (stored && agents.some((a) => a.agent_id === stored && a.status === 'active')) {
       selectedAgentId = stored;
     } else {
@@ -238,10 +424,10 @@
   function persistSelectedAgent(): void {
     if (typeof window === 'undefined' || !selectedAgentId) return;
     if (selectedAgentId === 'all') {
-      window.localStorage.removeItem('cognis-chat-selected-agent');
+      window.localStorage.removeItem(CHAT_STORAGE_KEYS.selectedAgent);
       return;
     }
-    window.localStorage.setItem('cognis-chat-selected-agent', selectedAgentId);
+    window.localStorage.setItem(CHAT_STORAGE_KEYS.selectedAgent, selectedAgentId);
   }
 
   function conversationIdFromRoute(): string {
@@ -396,11 +582,40 @@
           item.timeout_seconds = item.timeout_seconds ?? escalationTimeoutSeconds;
         }
       }
-      escalations = filtered;
+      const pendingStillExists = escalationResolutionPending
+        ? filtered.some((item) => item.call_id === escalationResolutionPending?.call_id)
+        : false;
+      if (escalationResolutionPending && !pendingStillExists) {
+        if (escalationBusyCallId === escalationResolutionPending.call_id) {
+          escalationBusyCallId = null;
+        }
+        escalationResolutionPending = null;
+      }
+      escalations = sortEscalations(
+        escalationResolutionPending
+          ? filtered.filter((item) => item.call_id !== escalationResolutionPending?.call_id)
+          : filtered
+      );
       escalationError = '';
       startEscalationCountdown();
     } catch (caughtError) {
       escalationError = asApiError(caughtError).message;
+    }
+  }
+
+  async function refreshPendingDirectQuestion(): Promise<void> {
+    if (!currentConversation || document.hidden) return;
+    try {
+      const directQuestion = (await api.notifications.list(currentConversation.conversation_id))
+        .filter((item) => item.notification_type === 'step_question' && item.status === 'pending' && item.task_id === null)
+        .map((item) => pendingDirectQuestionFromNotification(item))
+        .find((item): item is PendingDirectQuestion => item !== null) ?? null;
+      pendingDirectQuestion = directQuestion;
+      if (directQuestion === null) {
+        directQuestionSubmitting = false;
+      }
+    } catch {
+      // Ignore notification refresh failures here — they should not block chat.
     }
   }
 
@@ -464,25 +679,25 @@
 
   async function persistSelectedChannel(): Promise<void> {
     if (typeof window === 'undefined') return;
-    window.localStorage.setItem('cognis-chat-selected-channel', selectedChannel);
+    window.localStorage.setItem(CHAT_STORAGE_KEYS.selectedChannel, selectedChannel);
     await loadConversationPage(true);
   }
 
   function restoreSelectedChannel(): void {
     if (typeof window === 'undefined') return;
-    const stored = window.localStorage.getItem('cognis-chat-selected-channel');
+    const stored = window.localStorage.getItem(CHAT_STORAGE_KEYS.selectedChannel);
     if (stored) selectedChannel = stored;
   }
 
   function restoreChatSidebarState(): void {
     if (typeof window === 'undefined') return;
-    chatSidebarCollapsed = window.localStorage.getItem('cognis-chat-sidebar-collapsed') === '1';
+    chatSidebarCollapsed = window.localStorage.getItem(CHAT_STORAGE_KEYS.sidebarCollapsed) === '1';
   }
 
   function toggleChatSidebar(): void {
     chatSidebarCollapsed = !chatSidebarCollapsed;
     if (typeof window !== 'undefined') {
-      window.localStorage.setItem('cognis-chat-sidebar-collapsed', chatSidebarCollapsed ? '1' : '0');
+      window.localStorage.setItem(CHAT_STORAGE_KEYS.sidebarCollapsed, chatSidebarCollapsed ? '1' : '0');
     }
   }
 
@@ -600,13 +815,15 @@
     }
 
     if (!sessionsError) {
-      await refreshEscalations();
+      await Promise.all([refreshEscalations(), refreshPendingDirectQuestion()]);
       if (isStaleConversationLoad(requestId)) {
         return;
       }
     } else {
       escalations = [];
       escalationError = '';
+      pendingDirectQuestion = null;
+      directQuestionSubmitting = false;
     }
 
     requestAnimationFrame(() => {
@@ -658,6 +875,7 @@
     historyError = '';
     sessionsError = '';
     escalationError = '';
+    escalationResolutionPending = null;
     mobileHeaderDetailsOpen = false;
     mobileListOpen = false;
     document.body.style.overflow = '';
@@ -674,6 +892,7 @@
 
       activeConversationId = conversationId;
       currentConversation = conversation;
+      persistLastOpenedConversation(conversation);
       if (!conversations.some((item) => item.conversation_id === conversation.conversation_id)) {
         conversations = [conversation, ...conversations];
       }
@@ -681,6 +900,7 @@
       turnInProgress = false;
       awaitingAssistantStart = false;
       pendingDirectQuestion = null;
+      directQuestionSubmitting = false;
       lastRecoverableMessage = '';
       editingTitle = false;
       contextUsage = null;
@@ -711,7 +931,9 @@
       sessions = [];
       timeline = [];
       escalations = [];
+      escalationResolutionPending = null;
       pendingDirectQuestion = null;
+      directQuestionSubmitting = false;
       sessionIds.clear();
     } finally {
       if (!isStaleConversationLoad(requestId)) {
@@ -743,17 +965,46 @@
     }
   }
 
+  function preferredNewConversationAgentId(): string {
+    const primaryAgents = agents.filter((agent) => agent.status === 'active' && agent.agent_type === 'primary');
+    if (selectedAgentId !== 'all' && primaryAgents.some((agent) => agent.agent_id === selectedAgentId)) {
+      return selectedAgentId;
+    }
+    const currentAgentId = currentConversation?.agent_id ?? '';
+    if (currentAgentId && primaryAgents.some((agent) => agent.agent_id === currentAgentId)) {
+      return currentAgentId;
+    }
+    if (typeof window !== 'undefined') {
+      const stored = window.localStorage.getItem(CHAT_STORAGE_KEYS.selectedAgent);
+      if (stored && primaryAgents.some((agent) => agent.agent_id === stored)) {
+        return stored;
+      }
+    }
+    return primaryAgents[0]?.agent_id ?? '';
+  }
+
+  function openNewConversationModal(): void {
+    newChatError = '';
+    newChatAgentId = preferredNewConversationAgentId();
+    showNewChatModal = true;
+  }
+
+  function closeNewConversationModal(): void {
+    if (newChatCreating) return;
+    showNewChatModal = false;
+    newChatError = '';
+  }
+
   async function createNewConversation(): Promise<void> {
-    const agentId = selectedAgentId !== 'all'
-      ? selectedAgentId
-      : agents.find((agent) => agent.status === 'active' && agent.agent_type === 'primary')?.agent_id ?? '';
+    const agentId = newChatAgentId || preferredNewConversationAgentId();
 
     if (!agentId) {
-      error = 'Create or activate an agent before starting a conversation.';
+      newChatError = 'Create or activate an agent before starting a conversation.';
       return;
     }
 
-    persistSelectedAgent();
+    newChatCreating = true;
+    newChatError = '';
 
     try {
       const conversation = await api.conversations.create({
@@ -765,12 +1016,17 @@
           memory_labels: {}
         }
       });
+      selectedAgentId = agentId;
+      persistSelectedAgent();
       await refreshSidebarData();
+      showNewChatModal = false;
       addToast('Conversation created.', 'success');
       await goto(`/chat/${conversation.conversation_id}`);
     } catch (caughtError) {
-      error = asApiError(caughtError).message;
-      addToast(error, 'error', 4_000, 'Unable to create conversation');
+      newChatError = asApiError(caughtError).message;
+      addToast(newChatError, 'error', 4_000, 'Unable to create conversation');
+    } finally {
+      newChatCreating = false;
     }
   }
 
@@ -925,6 +1181,7 @@
   async function handleSend(): Promise<void> {
     const content = composer.trim();
     if ((!content && composerAttachments.length === 0) || !currentConversation || isReadOnly(currentConversation)) return;
+    if (pendingDirectQuestion && directQuestionSubmitting) return;
     const shouldRestoreInlineFocus = composerExpanded;
 
     const isSlashCommand = SYSTEM_SLASH_COMMANDS.some((cmd) => content.startsWith(cmd));
@@ -956,12 +1213,12 @@
     userScrolledUp = false;
     scrollToBottom();
     if (pendingDirectQuestion && !isSlashCommand) {
+      directQuestionSubmitting = true;
       wsClient.respondStepQuestion(
         pendingDirectQuestion.notificationId,
         content,
         pendingDirectQuestion.stepName
       );
-      pendingDirectQuestion = null;
       return;
     }
     wsClient.sendMessage(currentConversation.conversation_id, content, attachments);
@@ -1112,6 +1369,9 @@
   }
 
   async function handleEscalationDecision(callId: string, decision: 'approve' | 'deny'): Promise<void> {
+    const current = escalations.find((item) => item.call_id === callId) ?? null;
+    if (current === null) return;
+    escalationResolutionPending = current;
     escalationBusyCallId = callId;
     wsClient.resolveEscalation(callId, decision);
   }
@@ -1170,6 +1430,12 @@
       error = socketErrorMessage(event);
       awaitingAssistantStart = false;
       turnInProgress = false;
+      directQuestionSubmitting = false;
+      if (escalationBusyCallId) {
+        escalationBusyCallId = null;
+        escalationResolutionPending = null;
+        void refreshEscalations();
+      }
       if (event.code === 'turn_cancelled') {
         pendingDirectQuestion = null;
       }
@@ -1186,7 +1452,10 @@
     if (event.type === 'message_complete' || event.type === 'workflow_completed' || event.type === 'workflow_failed' || event.type === 'workflow_cancelled') {
       awaitingAssistantStart = false;
       turnInProgress = false;
-      pendingDirectQuestion = null;
+      if (directQuestionSubmitting) {
+        pendingDirectQuestion = null;
+      }
+      directQuestionSubmitting = false;
       timeline = finalizeReasoningItems(timeline);
       // Update context usage from message_complete
       if (event.type === 'message_complete' && event.context_usage) {
@@ -1215,8 +1484,8 @@
     // Escalation push events
     if (event.type === 'escalation') {
       const existing = escalations.find((e) => e.call_id === event.call_id);
-      if (!existing) {
-        escalations = [...escalations, {
+      if (!existing && escalationResolutionPending?.call_id !== event.call_id) {
+        escalations = sortEscalations([...escalations, {
           call_id: event.call_id,
           session_id: event.session_id ?? null,
           tool_name: event.tool_name,
@@ -1226,7 +1495,7 @@
           risk: event.risk,
           timeout_seconds: event.timeout_seconds,
           received_at: Date.now(),
-        }];
+        }]);
         startEscalationCountdown();
         scrollToBottom();
       }
@@ -1236,6 +1505,7 @@
     if (event.type === 'escalation_resolved') {
       escalations = escalations.filter((e) => e.call_id !== event.call_id);
       escalationBusyCallId = null;
+      escalationResolutionPending = null;
       if (escalations.length === 0) stopEscalationCountdown();
       return;
     }
@@ -1285,29 +1555,23 @@
     }
 
     if (event.type === 'workflow_step_question' && !event.task_id && event.notification_id) {
-      pendingDirectQuestion = {
-        notificationId: event.notification_id,
-        stepName: event.step_name,
-        question: event.question?.trim() || 'The assistant needs more input to continue.',
-        options: Array.isArray(event.options)
-          ? event.options
-              .map((option) => {
-                if (typeof option === 'string') return option;
-                if (option && typeof option === 'object') {
-                  const label = (option as Record<string, unknown>).label;
-                  if (typeof label === 'string') return label;
-                }
-                return '';
-              })
-              .filter((value) => value.length > 0)
-          : [],
-        context:
-          typeof event.context === 'string'
-            ? event.context
-            : event.context && typeof event.context === 'object' && typeof event.context.context === 'string'
-              ? event.context.context
-              : ''
-      };
+      pendingDirectQuestion = pendingDirectQuestionFromParts(
+        event.notification_id,
+        event.step_name,
+        event.question,
+        event.options,
+        event.context,
+      );
+      directQuestionSubmitting = false;
+      awaitingAssistantStart = false;
+      turnInProgress = false;
+    }
+
+    if (event.type === 'workflow_step_question_resolved') {
+      if (pendingDirectQuestion && event.notification_id === pendingDirectQuestion.notificationId) {
+        pendingDirectQuestion = null;
+      }
+      directQuestionSubmitting = false;
     }
 
     timeline = applyWebSocketEvent(timeline, event);
@@ -1422,6 +1686,23 @@
   });
 
   $effect(() => {
+    if (shouldShowChatTodoDrawer) {
+      chatTodoDrawerOpen = true;
+    }
+  });
+
+  $effect(() => {
+    const latestTodos = latestChatTodos(timeline);
+    if (latestTodos.length > 0) {
+      retainedChatTodos = latestTodos;
+      return;
+    }
+    if (!turnInProgress && pendingDirectQuestion === null && !directQuestionSubmitting) {
+      retainedChatTodos = [];
+    }
+  });
+
+  $effect(() => {
     if (!mobileListOpen) {
       return;
     }
@@ -1470,6 +1751,7 @@
     visibilityHandler = () => {
       if (!document.hidden) {
         void refreshEscalations();
+        void refreshPendingDirectQuestion();
       }
     };
     document.addEventListener('visibilitychange', visibilityHandler);
@@ -1582,7 +1864,7 @@
           <h2 class="text-sm font-semibold text-white">History</h2>
           <button
             class="text-xs font-medium text-sky-400 transition hover:text-sky-300"
-            onclick={createNewConversation}
+            onclick={openNewConversationModal}
             type="button"
           >+ New</button>
         </div>
@@ -1980,7 +2262,17 @@
           {/if}
 
           <!-- Escalation prompts (sequential: show one at a time) -->
-          {#if escalations.length > 0}
+          {#if escalationResolutionPending}
+            <div class="rounded-3xl border border-amber-500/30 bg-amber-500/10 px-4 py-4 shadow-card">
+              <div class="flex flex-wrap items-center justify-between gap-4">
+                <div>
+                  <p class="text-xs font-medium uppercase tracking-[0.25em] text-amber-200">Approval submitted</p>
+                  <h3 class="mt-1 text-base font-semibold text-white">{escalationResolutionPending.tool_name ?? 'Escalated action'}</h3>
+                </div>
+                <LiveDots inline={true} size="sm" tone="amber" label="Waiting for controller acknowledgement" />
+              </div>
+            </div>
+          {:else if escalations.length > 0}
             {@const current = escalations[0]}
             <div class="space-y-3">
               <EscalationPrompt
@@ -1994,13 +2286,9 @@
             </div>
           {/if}
 
-          {#if turnInProgress && awaitingAssistantStart}
+          {#if showTurnProgress}
             <div class="flex items-center gap-3 px-2 py-2">
-              <div class="flex items-center gap-1.5 rounded-2xl border border-slate-800 bg-slate-900/80 px-4 py-2.5">
-                <span class="h-2 w-2 animate-bounce rounded-full bg-sky-400 [animation-delay:0ms]"></span>
-                <span class="h-2 w-2 animate-bounce rounded-full bg-sky-400 [animation-delay:150ms]"></span>
-                <span class="h-2 w-2 animate-bounce rounded-full bg-sky-400 [animation-delay:300ms]"></span>
-              </div>
+              <LiveDots />
             </div>
           {/if}
 
@@ -2037,6 +2325,46 @@
             {/if}
           </div>
         {:else}
+          <div class="shrink-0 space-y-3">
+          {#if shouldShowChatTodoDrawer}
+            <div class="overflow-hidden rounded-[1.5rem] border border-slate-800/80 bg-slate-900/90 sm:rounded-3xl">
+              <button class="flex w-full items-center justify-between gap-3 px-4 py-3 text-left transition hover:bg-slate-800/40" onclick={() => { chatTodoDrawerOpen = !chatTodoDrawerOpen; }} type="button">
+                <div>
+                  <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Current step todos</p>
+                  <p class="mt-1 text-sm text-slate-300">
+                    {activeChatTodos.length} active
+                    {#if chatTodoCounts.inProgress > 0}
+                      · {chatTodoCounts.inProgress} in progress
+                    {/if}
+                    {#if chatTodoCounts.pending > 0}
+                      · {chatTodoCounts.pending} pending
+                    {/if}
+                  </p>
+                </div>
+                {#if chatTodoDrawerOpen}
+                  <ChevronUp class="h-4 w-4 text-slate-500" />
+                {:else}
+                  <ChevronDown class="h-4 w-4 text-slate-500" />
+                {/if}
+              </button>
+              {#if chatTodoDrawerOpen}
+                <div class="space-y-2 border-t border-slate-800/60 px-4 py-3">
+                  {#each activeChatTodos as todo}
+                    <div class="rounded-2xl border px-3 py-3 text-sm {todoStatusClass(todo.status)}">
+                      <div class="flex flex-wrap items-center justify-between gap-2">
+                        <span class="font-medium">{todo.content}</span>
+                        <div class="flex items-center gap-2 text-[10px] uppercase tracking-[0.18em]">
+                          <span class="rounded-full border border-current/20 px-2 py-0.5">{todo.status.replace('_', ' ')}</span>
+                          <span class={todoPriorityClass(todo.priority)}>{todo.priority}</span>
+                        </div>
+                      </div>
+                    </div>
+                  {/each}
+                </div>
+              {/if}
+            </div>
+          {/if}
+
           <form class="shrink-0 space-y-3 rounded-[1.5rem] border border-slate-800/80 bg-slate-900/90 p-3 sm:rounded-3xl sm:p-4" onsubmit={(event) => { event.preventDefault(); void handleSend(); }}>
             <!-- Slash command suggestions dropdown -->
             {#if slashSuggestionsVisible}
@@ -2056,7 +2384,12 @@
 
             {#if pendingDirectQuestion}
               <div class="rounded-2xl border border-sky-500/30 bg-sky-500/10 px-4 py-3 text-sm text-sky-50">
-                <p class="font-semibold">Assistant requested more input</p>
+                <div class="flex items-center justify-between gap-3">
+                  <p class="font-semibold">Assistant requested more input</p>
+                  {#if directQuestionSubmitting}
+                    <LiveDots inline={true} size="sm" label="Answering" />
+                  {/if}
+                </div>
                 <p class="mt-1 leading-6">{pendingDirectQuestion.question}</p>
                 {#if pendingDirectQuestion.context}
                   <p class="mt-2 text-xs text-sky-100/80">{pendingDirectQuestion.context}</p>
@@ -2067,6 +2400,7 @@
                       <button
                         class="rounded-full border border-sky-400/30 bg-sky-400/10 px-3 py-1 text-xs text-sky-100 transition hover:bg-sky-400/20"
                         type="button"
+                        disabled={directQuestionSubmitting}
                         onclick={() => { composer = option; syncComposerHeight(); focusActiveComposer(); }}
                       >
                         {option}
@@ -2093,7 +2427,7 @@
                 bind:this={composerElement}
                 bind:value={composer}
                 class="min-h-[56px] w-full resize-none rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 pr-12 text-sm text-slate-100 placeholder:text-slate-500"
-                disabled={!currentConversation || isReadOnly(currentConversation) || isLlmUnavailableForSetup()}
+                disabled={!currentConversation || isReadOnly(currentConversation) || isLlmUnavailableForSetup() || directQuestionSubmitting}
                 onkeydown={handleComposerKeydown}
                 oninput={() => { updateSlashSuggestions(); syncComposerHeight(); }}
                 onpaste={(event) => void handlePaste(event)}
@@ -2104,7 +2438,7 @@
                 class="absolute bottom-3 right-3 inline-flex h-7 w-7 items-center justify-center rounded-full border border-slate-700 bg-slate-900/90 text-slate-400 transition hover:border-slate-600 hover:text-slate-100 disabled:opacity-50"
                 title="Expand composer"
                 aria-label="Expand composer"
-                disabled={!currentConversation || isReadOnly(currentConversation) || isLlmUnavailableForSetup()}
+                disabled={!currentConversation || isReadOnly(currentConversation) || isLlmUnavailableForSetup() || directQuestionSubmitting}
                 onclick={() => void openExpandedComposer()}
               >
                 <Maximize2 class="h-3.5 w-3.5" />
@@ -2117,7 +2451,7 @@
               </label>
               <div class="flex flex-wrap justify-end gap-2">
                 <input bind:this={attachmentInput} class="hidden" type="file" multiple onchange={(event) => void handleAttachmentSelect(event)} />
-                <Button size="sm" variant="secondary" type="button" onclick={() => attachmentInput?.click()}>
+                <Button size="sm" variant="secondary" type="button" disabled={directQuestionSubmitting} onclick={() => attachmentInput?.click()}>
                   <Paperclip class="h-4 w-4 sm:mr-2" /> <span class="hidden sm:inline">Attach</span>
                 </Button>
                 {#if turnInProgress}
@@ -2126,16 +2460,17 @@
                   </Button>
                 {/if}
                 {#if pendingDirectQuestion}
-                  <Button size="sm" variant="secondary" type="button" onclick={() => { composer = '/stop'; void handleSend(); }}>
+                  <Button size="sm" variant="secondary" type="button" disabled={directQuestionSubmitting} onclick={() => { composer = '/stop'; void handleSend(); }}>
                     Stop
                   </Button>
                 {/if}
-                <Button size="sm" type="submit" disabled={(!composer.trim() && composerAttachments.length === 0) || !currentConversation || isReadOnly(currentConversation) || isLlmUnavailableForSetup()}>
-                  {pendingDirectQuestion ? 'Answer' : 'Send'}
+                <Button size="sm" type="submit" disabled={(!composer.trim() && composerAttachments.length === 0) || !currentConversation || isReadOnly(currentConversation) || isLlmUnavailableForSetup() || directQuestionSubmitting}>
+                  {directQuestionSubmitting ? 'Sending...' : pendingDirectQuestion ? 'Answer' : 'Send'}
                 </Button>
               </div>
             </div>
           </form>
+          </div>
         {/if}
       </div>
 
@@ -2196,7 +2531,7 @@
                 bind:this={expandedComposerElement}
                 bind:value={composer}
                 class="min-h-[55vh] w-full resize-none rounded-3xl border border-slate-800 bg-slate-900/60 px-5 py-4 text-sm leading-6 text-slate-100 placeholder:text-slate-500"
-                disabled={!currentConversation || isReadOnly(currentConversation) || isLlmUnavailableForSetup()}
+                disabled={!currentConversation || isReadOnly(currentConversation) || isLlmUnavailableForSetup() || directQuestionSubmitting}
                 onkeydown={handleExpandedComposerKeydown}
                 oninput={updateSlashSuggestions}
                 onpaste={(event) => void handlePaste(event)}
@@ -2208,20 +2543,31 @@
                   <span>Press Enter to send</span>
                 </label>
                 <div class="flex flex-wrap justify-end gap-2">
-                  <Button size="sm" variant="secondary" type="button" onclick={() => attachmentInput?.click()}>
+                  <Button size="sm" variant="secondary" type="button" disabled={directQuestionSubmitting} onclick={() => attachmentInput?.click()}>
                     <Paperclip class="h-4 w-4 sm:mr-2" /> <span class="hidden sm:inline">Attach</span>
                   </Button>
                   <Button size="sm" variant="secondary" type="button" onclick={() => void closeExpandedComposer()}>
                     Close
                   </Button>
-                  <Button size="sm" type="button" disabled={(!composer.trim() && composerAttachments.length === 0) || !currentConversation || isReadOnly(currentConversation) || isLlmUnavailableForSetup()} onclick={() => void handleSend()}>
-                    {pendingDirectQuestion ? 'Answer' : 'Send'}
+                  <Button size="sm" type="button" disabled={(!composer.trim() && composerAttachments.length === 0) || !currentConversation || isReadOnly(currentConversation) || isLlmUnavailableForSetup() || directQuestionSubmitting} onclick={() => void handleSend()}>
+                    {directQuestionSubmitting ? 'Sending...' : pendingDirectQuestion ? 'Answer' : 'Send'}
                   </Button>
                 </div>
               </div>
             </div>
           </div>
         </div>
+      {/if}
+
+      {#if showNewChatModal}
+        <NewChatModal
+          agents={agents}
+          bind:selectedAgentId={newChatAgentId}
+          busy={newChatCreating}
+          error={newChatError}
+          oncancel={closeNewConversationModal}
+          onconfirm={() => void createNewConversation()}
+        />
       {/if}
 
       <!-- Sub-session drawer overlay -->
@@ -2248,6 +2594,9 @@
             <div class="min-w-0 flex-1">
               <p class="text-xs font-medium uppercase tracking-[0.2em] text-slate-400">Sub-session</p>
               <p class="mt-0.5 truncate font-mono text-xs text-slate-500">{subSessionId.slice(0, 16)}</p>
+              <div class="mt-2">
+                <LiveDots inline={true} size="sm" label="Following latest" />
+              </div>
             </div>
             <button
               class="flex items-center gap-1 text-xs text-slate-500 transition hover:text-sky-300"

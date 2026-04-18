@@ -129,18 +129,14 @@ describe('chat timeline helpers', () => {
     });
   });
 
-  it('renders direct-chat clarification notices without task wording', () => {
+  it('does not duplicate direct-chat clarification prompts in the timeline', () => {
     const items = applyWebSocketEvent([], {
       type: 'workflow_step_question',
       notification_id: 'notif_1',
       question: 'Which repository should I use?'
     });
 
-    expect(items[0]).toMatchObject({
-      kind: 'notice',
-      title: 'Assistant requested more input',
-      description: 'Which repository should I use?'
-    });
+    expect(items).toHaveLength(0);
   });
 
   it('removes a workflow gate notice when the notification is resolved', () => {

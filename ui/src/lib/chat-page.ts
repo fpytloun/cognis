@@ -3,6 +3,14 @@ export interface ConversationRetryScope {
   history: boolean;
 }
 
+export const CHAT_STORAGE_KEYS = {
+  enterToSend: 'cognis-chat-enter-to-send',
+  selectedAgent: 'cognis-chat-selected-agent',
+  selectedChannel: 'cognis-chat-selected-channel',
+  sidebarCollapsed: 'cognis-chat-sidebar-collapsed',
+  lastOpenedConversation: 'cognis-chat-last-opened-conversation'
+} as const;
+
 export const SESSION_LOG_PAGE_SIZE = 200;
 export const SESSION_LOG_BOOTSTRAP_MAX_PAGES = 5;
 export const SESSION_LOG_POLL_INTERVAL_MS = 3000;
@@ -43,4 +51,11 @@ export function getNextHistoryAfterSeq(response: {
 
   const lastItem = response.items[response.items.length - 1];
   return typeof lastItem?.seq === 'number' ? lastItem.seq : 0;
+}
+
+export function isRestorableChatConversation(conversation: {
+  status?: string | null;
+  context?: { type?: string | null } | null;
+} | null | undefined): boolean {
+  return conversation?.status === 'active' && (conversation.context?.type ?? '').toLowerCase() === 'web';
 }

@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { ToolCallTimelineItem } from '$lib/chat';
+  import LiveDots from '$lib/components/LiveDots.svelte';
 
   let { item } = $props<{ item: ToolCallTimelineItem }>();
 
@@ -7,8 +8,17 @@
   let inputExpanded = $state(false);
   let outputExpanded = $state(false);
   let evalExpanded = $state(false);
+  let autoExpanded = $state(false);
 
   const LINES_PER_PAGE = 50;
+  const startsExpanded = $derived(item.toolName.toLowerCase().replace(/_/g, '') === 'steprequestinput');
+
+  $effect(() => {
+    if (startsExpanded && !autoExpanded) {
+      expanded = true;
+      autoExpanded = true;
+    }
+  });
 
   function toggle(): void {
     expanded = !expanded;
@@ -18,13 +28,21 @@
     return s.length > max ? `${s.slice(0, max)}...` : s;
   }
 
+  function normalizedToolName(): string {
+    return item.toolName.toLowerCase().replace(/_/g, '');
+  }
+
+  function isStepRequestInput(): boolean {
+    return normalizedToolName() === 'steprequestinput';
+  }
+
   function subtitle(): string {
     if (!item.arguments) {
       return '';
     }
     const args = item.arguments;
     // Normalize: strip underscores for matching (web_fetch -> webfetch)
-    const name = item.toolName.toLowerCase().replace(/_/g, '');
+    const name = normalizedToolName();
 
     // File operations
     if (name.includes('read') || name.includes('write') || name.includes('edit') || name.includes('patch') || name.includes('multiedit') || name === 'listdirectory') {
@@ -140,6 +158,54 @@
     if (risk === 'medium') return 'text-yellow-400';
     return 'text-slate-400';
   }
+
+  function stepRequestQuestion(): string {
+    return typeof item.arguments?.question === 'string' ? item.arguments.question : '';
+  }
+
+  function stepRequestOptions(): string[] {
+    if (!Array.isArray(item.arguments?.options)) return [];
+    return item.arguments.options
+      .map((option: unknown) => {
+        if (typeof option === 'string') return option;
+        if (option && typeof option === 'object') {
+          const label = (option as Record<string, unknown>).label;
+          return typeof label === 'string' ? label : '';
+        }
+        return '';
+      })
+      .filter((option: string) => option.length > 0);
+  }
+
+  function stepRequestContext(): string {
+    const context = item.arguments?.context;
+    if (typeof context === 'string') return context;
+    if (context && typeof context === 'object') {
+      const text = (context as Record<string, unknown>).context ?? (context as Record<string, unknown>).note;
+      return typeof text === 'string' ? text : '';
+    }
+    return '';
+  }
+
+  function parsedToolResult(): Record<string, unknown> | null {
+    if (item.result == null) return null;
+    try {
+      const parsed = JSON.parse(cleanResult(item.result));
+      return parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function stepRequestResponse(): string {
+    const response = parsedToolResult()?.response;
+    return typeof response === 'string' ? response : '';
+  }
+
+  function stepRequestError(): string {
+    const error = parsedToolResult()?.error;
+    return typeof error === 'string' ? error : '';
+  }
 </script>
 
 <article class={`rounded-2xl border bg-slate-900/80 text-sm shadow-card ${borderColor()}`}>
@@ -173,39 +239,81 @@
   <!-- Expanded content -->
   {#if expanded}
     <div class="space-y-3 border-t border-slate-800/60 px-4 py-3">
-      {#if item.arguments && Object.keys(item.arguments).length > 0}
-        {@const inputData = paginatedText(formatArguments(), inputExpanded)}
+      {#if isStepRequestInput()}
         <div>
-          <p class="mb-1 text-xs font-medium uppercase tracking-widest text-slate-500">Input</p>
-          <pre class="max-h-[40vh] overflow-auto rounded-lg border border-slate-800/60 bg-slate-950/60 p-3 text-xs leading-5 text-slate-300">{inputData.text}</pre>
-          {#if inputData.hiddenCount > 0}
-            <button
-              class="mt-1 text-xs text-sky-400 hover:text-sky-300"
-              onclick={() => { inputExpanded = !inputExpanded; }}
-              type="button"
-            >
-              {inputExpanded ? 'Show less' : `Show all (${inputData.totalLines} lines)`}
-            </button>
-          {/if}
+          <p class="mb-1 text-xs font-medium uppercase tracking-widest text-slate-500">Question</p>
+          <div class="rounded-2xl border border-sky-500/20 bg-sky-500/5 px-4 py-3 text-sm text-sky-50">
+            <p class="leading-6">{stepRequestQuestion() || 'The agent requested more input.'}</p>
+            {#if stepRequestContext()}
+              <p class="mt-2 text-xs text-sky-100/80">{stepRequestContext()}</p>
+            {/if}
+            {#if stepRequestOptions().length > 0}
+              <div class="mt-3 flex flex-wrap gap-2">
+                {#each stepRequestOptions() as option}
+                  <span class="rounded-full border border-sky-400/30 bg-sky-400/10 px-3 py-1 text-[11px] text-sky-100">{option}</span>
+                {/each}
+              </div>
+            {/if}
+          </div>
         </div>
-      {/if}
 
-      {#if item.result != null}
-        {@const cleaned = cleanResult(item.result)}
-        {@const outputData = paginatedText(cleaned, outputExpanded)}
         <div>
-          <p class="mb-1 text-xs font-medium uppercase tracking-widest text-slate-500">Output</p>
-          <pre class={`max-h-[40vh] overflow-auto rounded-lg border bg-slate-950/60 p-3 text-xs leading-5 ${item.isError ? 'border-rose-500/30 text-rose-300' : 'border-slate-800/60 text-slate-300'}`}>{outputData.text}</pre>
-          {#if outputData.hiddenCount > 0}
-            <button
-              class="mt-1 text-xs text-sky-400 hover:text-sky-300"
-              onclick={() => { outputExpanded = !outputExpanded; }}
-              type="button"
-            >
-              {outputExpanded ? 'Show less' : `Show all (${outputData.totalLines} lines)`}
-            </button>
+          <p class="mb-1 text-xs font-medium uppercase tracking-widest text-slate-500">Resolution</p>
+          {#if item.status === 'started'}
+            <div class="rounded-2xl border border-slate-800/60 bg-slate-950/60 px-4 py-3">
+              <LiveDots label="Waiting for user input" size="sm" inline={true} />
+            </div>
+          {:else if stepRequestError()}
+            <div class="rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
+              {stepRequestError()}
+            </div>
+          {:else if stepRequestResponse()}
+            <div class="rounded-2xl border border-emerald-500/20 bg-emerald-500/5 px-4 py-3 text-sm text-emerald-50">
+              <p class="text-xs font-medium uppercase tracking-widest text-emerald-300">User answer</p>
+              <p class="mt-2 whitespace-pre-wrap leading-6">{stepRequestResponse()}</p>
+            </div>
+          {:else}
+            <div class="rounded-2xl border border-slate-800/60 bg-slate-950/60 px-4 py-3 text-sm text-slate-400">
+              No resolution was recorded for this input request.
+            </div>
           {/if}
         </div>
+
+      {:else}
+        {#if item.arguments && Object.keys(item.arguments).length > 0}
+          {@const inputData = paginatedText(formatArguments(), inputExpanded)}
+          <div>
+            <p class="mb-1 text-xs font-medium uppercase tracking-widest text-slate-500">Input</p>
+            <pre class="max-h-[40vh] overflow-auto rounded-lg border border-slate-800/60 bg-slate-950/60 p-3 text-xs leading-5 text-slate-300">{inputData.text}</pre>
+            {#if inputData.hiddenCount > 0}
+              <button
+                class="mt-1 text-xs text-sky-400 hover:text-sky-300"
+                onclick={() => { inputExpanded = !inputExpanded; }}
+                type="button"
+              >
+                {inputExpanded ? 'Show less' : `Show all (${inputData.totalLines} lines)`}
+              </button>
+            {/if}
+          </div>
+        {/if}
+
+        {#if item.result != null}
+          {@const cleaned = cleanResult(item.result)}
+          {@const outputData = paginatedText(cleaned, outputExpanded)}
+          <div>
+            <p class="mb-1 text-xs font-medium uppercase tracking-widest text-slate-500">Output</p>
+            <pre class={`max-h-[40vh] overflow-auto rounded-lg border bg-slate-950/60 p-3 text-xs leading-5 ${item.isError ? 'border-rose-500/30 text-rose-300' : 'border-slate-800/60 text-slate-300'}`}>{outputData.text}</pre>
+            {#if outputData.hiddenCount > 0}
+              <button
+                class="mt-1 text-xs text-sky-400 hover:text-sky-300"
+                onclick={() => { outputExpanded = !outputExpanded; }}
+                type="button"
+              >
+                {outputExpanded ? 'Show less' : `Show all (${outputData.totalLines} lines)`}
+              </button>
+            {/if}
+          </div>
+        {/if}
       {/if}
 
       <!-- Evaluation metadata (from Intaris) -->

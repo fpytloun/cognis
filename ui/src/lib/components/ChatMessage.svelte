@@ -2,6 +2,7 @@
   import { Check, Copy } from 'lucide-svelte';
   import { onMount } from 'svelte';
   import type { MessageTimelineItem } from '$lib/chat';
+  import LiveDots from '$lib/components/LiveDots.svelte';
   import { addToast } from '$lib/stores/toasts';
   import { formatAbsoluteTime, formatCompactTime } from '$lib/time';
 
@@ -168,7 +169,7 @@
     </div>
     <div class="flex items-center gap-2">
       {#if item.streaming}
-        <span>streaming</span>
+        <LiveDots inline={true} label="Live" size="sm" tone={item.role === 'assistant' ? 'sky' : 'slate'} />
       {/if}
       {#if item.role === 'assistant' && !item.streaming}
         <button
