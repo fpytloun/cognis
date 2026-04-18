@@ -2120,7 +2120,7 @@ class AgentLoop:
                 if reminder.get("role") == "system":
                     messages.pop(continuation_reminder_index)
                 continuation_reminder_index = None
-            for tc in tool_calls:
+            for tc_index, tc in enumerate(tool_calls):
                 mapped_name = exposure.alias_map.get(tc.name, tc.name)
                 if mapped_name != tc.name:
                     logger.debug(
@@ -2344,7 +2344,7 @@ class AgentLoop:
 
             delegation_spawned = False
             prepared_regular_batch: list[_PreparedRegularToolCall] = []
-            for tc in tool_calls:
+            for tc_index, tc in enumerate(tool_calls):
                 self._raise_if_cancelled(ctx)
                 tool_id = _tool_id_for_call(tc.name, registry)
                 STEP_TOOL_CALLS.labels(tool_name=tool_id).inc()
@@ -2603,6 +2603,40 @@ class AgentLoop:
                             content=str(messages[-1]["content"]),
                         )
 
+                        await self._flush_events_incremental(
+                            ctx,
+                            events_to_record,
+                            reason="tool_result:step_complete",
+                            on_token=on_token,
+                        )
+                        if on_tool_result:
+                            await on_tool_result(tc.call_id, tc.name, err_content, True, None, None)
+                        continue
+
+                    trailing_tool_calls = tool_calls[tc_index + 1 :]
+                    if trailing_tool_calls:
+                        STEP_COMPLETE_REJECTIONS.labels(
+                            reason="step_complete_not_last_tool_call"
+                        ).inc()
+                        trailing_names = [call.name for call in trailing_tool_calls]
+                        err_content = json.dumps(
+                            {
+                                "status": "rejected",
+                                "reason": "step_complete_not_last_tool_call",
+                                "message": (
+                                    "step_complete must be the final tool call in a response. "
+                                    f"This response still has trailing tool calls: {trailing_names}. "
+                                    "Execute or omit those calls before calling step_complete again."
+                                ),
+                                "trailing_tool_calls": trailing_names,
+                            }
+                        )
+                        messages.append(
+                            {"role": "tool", "tool_call_id": tc.call_id, "content": err_content}
+                        )
+                        _append_tool_result_event(
+                            events_to_record, tc, err_content, True, tool_id=tool_id
+                        )
                         await self._flush_events_incremental(
                             ctx,
                             events_to_record,

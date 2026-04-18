@@ -342,3 +342,114 @@ async def test_responses_stream_to_chat_chunks_dedupes_replayed_function_call_ev
     assert calls[0].arguments == {
         "todos": [{"content": "Load `daily-brief` skill", "status": "completed"}]
     }
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_to_chat_chunks_emits_done_only_function_call() -> None:
+    async def _stream():
+        yield {
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "id": "fc_done",
+                "call_id": "call_done",
+                "name": "step_complete",
+                "arguments": '{"summary":"done"}',
+            },
+        }
+        yield {
+            "type": "response.completed",
+            "response": {"status": "completed", "usage": {"total_tokens": 4}},
+        }
+
+    acc = StreamAccumulator()
+    async for chunk in responses_stream_to_chat_chunks(_stream()):
+        acc.feed(chunk)
+
+    calls = acc.get_tool_calls()
+    assert len(calls) == 1
+    assert calls[0].name == "step_complete"
+    assert calls[0].call_id == "call_done"
+    assert calls[0].arguments == {"summary": "done"}
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_to_chat_chunks_backfills_completed_only_function_call() -> None:
+    async def _stream():
+        yield {
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "function_call",
+                        "id": "fc_completed",
+                        "call_id": "call_completed",
+                        "name": "step_complete",
+                        "arguments": '{"summary":"done from completed"}',
+                    }
+                ],
+                "usage": {"total_tokens": 5},
+            },
+        }
+
+    acc = StreamAccumulator()
+    async for chunk in responses_stream_to_chat_chunks(_stream()):
+        acc.feed(chunk)
+
+    calls = acc.get_tool_calls()
+    assert len(calls) == 1
+    assert calls[0].name == "step_complete"
+    assert calls[0].call_id == "call_completed"
+    assert calls[0].arguments == {"summary": "done from completed"}
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_to_chat_chunks_dedupes_replay_when_item_id_changes() -> None:
+    async def _stream():
+        yield {
+            "type": "response.output_item.added",
+            "item": {
+                "type": "function_call",
+                "id": "fc_original",
+                "call_id": "call_shared",
+                "name": "step_complete",
+            },
+        }
+        yield {
+            "type": "response.function_call_arguments.delta",
+            "item_id": "fc_original",
+            "delta": '{"summary":"done',
+        }
+        yield {
+            "type": "response.output_item.added",
+            "item": {
+                "type": "function_call",
+                "id": "fc_retry",
+                "call_id": "call_shared",
+                "name": "step_complete",
+            },
+        }
+        yield {
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "id": "fc_retry",
+                "call_id": "call_shared",
+                "name": "step_complete",
+                "arguments": '{"summary":"done"}',
+            },
+        }
+        yield {
+            "type": "response.completed",
+            "response": {"status": "completed", "usage": {"total_tokens": 6}},
+        }
+
+    acc = StreamAccumulator()
+    async for chunk in responses_stream_to_chat_chunks(_stream()):
+        acc.feed(chunk)
+
+    calls = acc.get_tool_calls()
+    assert len(calls) == 1
+    assert calls[0].call_id == "call_shared"
+    assert calls[0].arguments == {"summary": "done"}

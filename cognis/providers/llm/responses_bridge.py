@@ -247,7 +247,7 @@ async def responses_stream_to_chat_chunks(
                 message_chunk = state.message_delta(item, emit_initial=is_new)
                 if message_chunk is not None:
                     yield message_chunk
-                initial_chunk = state.initial_tool_delta(item, emit_name=is_new)
+                initial_chunk = state.initial_tool_delta(item, emit_name=True)
                 if initial_chunk is not None:
                     yield initial_chunk
                 continue
@@ -259,6 +259,10 @@ async def responses_stream_to_chat_chunks(
             if event_type == "response.function_call_arguments.done":
                 item = _get_output_item(event)
                 if item is not None:
+                    state.register_item(item)
+                    initial_chunk = state.initial_tool_delta(item, emit_name=True)
+                    if initial_chunk is not None:
+                        yield initial_chunk
                     final_chunk = state.finalize_item(item)
                     if final_chunk is not None:
                         yield final_chunk
@@ -267,9 +271,13 @@ async def responses_stream_to_chat_chunks(
                 item = _get_output_item(event)
                 if item is None:
                     continue
+                state.register_item(item)
                 message_chunk = state.finalize_message_item(item)
                 if message_chunk is not None:
                     yield message_chunk
+                initial_chunk = state.initial_tool_delta(item, emit_name=True)
+                if initial_chunk is not None:
+                    yield initial_chunk
                 final_chunk = state.finalize_item(item)
                 if final_chunk is not None:
                     yield final_chunk
@@ -277,6 +285,8 @@ async def responses_stream_to_chat_chunks(
             if event_type in {"response.completed", "response.completed.synthetic"}:
                 response_payload = _to_dict(event.get("response") or event)
                 for fallback_chunk in state.final_message_fallback(response_payload):
+                    yield fallback_chunk
+                for fallback_chunk in state.final_tool_fallback(response_payload):
                     yield fallback_chunk
                 state.completed_seen = True
                 yield {
@@ -312,6 +322,7 @@ async def responses_stream_to_chat_chunks(
 class _ResponsesStreamState:
     def __init__(self) -> None:
         self._items: dict[str, dict[str, Any]] = {}
+        self._item_aliases: dict[str, str] = {}
         self._next_tool_index = 0
         self._emitted_content = ""
         self._emitted_reasoning = ""
@@ -347,10 +358,10 @@ class _ResponsesStreamState:
         return self._emitted_content
 
     def register_item(self, item: dict[str, Any]) -> tuple[dict[str, Any] | None, bool]:
-        item_id = str(item.get("id") or item.get("call_id") or "")
-        if not item_id:
+        item_key, aliases = self._item_identity(item)
+        if not item_key:
             return None, False
-        existing = self._items.get(item_id)
+        existing = self._resolve_item_state(item_key, *aliases)
         if existing is not None:
             if item.get("name"):
                 existing["name"] = str(item.get("name") or existing["name"])
@@ -360,18 +371,48 @@ class _ResponsesStreamState:
                     str(existing.get("arguments") or ""),
                     initial_arguments,
                 )
+            self._bind_item_aliases(existing["state_key"], aliases)
             return existing, False
         index = self._next_tool_index
         self._next_tool_index += 1
         state = {
-            "call_id": normalize_tool_call_id(item.get("call_id"), item.get("id"), item_id),
+            "state_key": item_key,
+            "call_id": normalize_tool_call_id(item.get("call_id"), item.get("id"), item_key),
             "name": str(item.get("name") or "unknown_tool"),
+            "name_emitted": False,
             "arguments": str(item.get("arguments") or ""),
             "emitted": 0,
             "index": index,
         }
-        self._items[item_id] = state
+        self._items[item_key] = state
+        self._bind_item_aliases(item_key, aliases)
         return state, True
+
+    def _item_identity(self, item: dict[str, Any]) -> tuple[str, list[str]]:
+        raw_item_id = str(item.get("id") or "").strip()
+        raw_call_id = str(item.get("call_id") or "").strip()
+        fallback_seed = raw_call_id or raw_item_id or self._next_tool_index
+        normalized_call_id = normalize_tool_call_id(
+            raw_call_id or None,
+            raw_item_id or None,
+            fallback_seed,
+        )
+        aliases = [alias for alias in {raw_item_id, raw_call_id, normalized_call_id} if alias]
+        return normalized_call_id, aliases
+
+    def _bind_item_aliases(self, state_key: str, aliases: list[str]) -> None:
+        for alias in aliases:
+            self._item_aliases[alias] = state_key
+
+    def _resolve_item_state(self, *aliases: str) -> dict[str, Any] | None:
+        for alias in aliases:
+            if not alias:
+                continue
+            state_key = self._item_aliases.get(alias, alias)
+            state = self._items.get(state_key)
+            if state is not None:
+                return state
+        return None
 
     def message_delta(self, item: dict[str, Any], *, emit_initial: bool) -> dict[str, Any] | None:
         if str(item.get("type")) != "message":
@@ -427,8 +468,8 @@ class _ResponsesStreamState:
     def initial_tool_delta(self, item: dict[str, Any], *, emit_name: bool) -> dict[str, Any] | None:
         if str(item.get("type")) != "function_call":
             return None
-        item_id = str(item.get("id") or item.get("call_id") or "")
-        state = self._items.get(item_id)
+        item_key, aliases = self._item_identity(item)
+        state = self._resolve_item_state(item_key, *aliases)
         if state is None:
             return None
         chunk: dict[str, Any] = {
@@ -447,8 +488,9 @@ class _ResponsesStreamState:
             ]
         }
         function = chunk["choices"][0]["delta"]["tool_calls"][0]["function"]
-        if emit_name:
+        if emit_name and not bool(state.get("name_emitted")):
             function["name"] = state["name"]
+            state["name_emitted"] = True
         unseen_arguments = str(state["arguments"])[int(state["emitted"]) :]
         if unseen_arguments:
             function["arguments"] = unseen_arguments
@@ -460,7 +502,7 @@ class _ResponsesStreamState:
 
     def arguments_delta(self, event: dict[str, Any]) -> dict[str, Any] | None:
         item_id = str(event.get("item_id") or "")
-        state = self._items.get(item_id)
+        state = self._resolve_item_state(item_id)
         delta = event.get("delta")
         if state is None or not isinstance(delta, str) or not delta:
             return None
@@ -490,8 +532,8 @@ class _ResponsesStreamState:
     def finalize_item(self, item: dict[str, Any]) -> dict[str, Any] | None:
         if str(item.get("type")) != "function_call":
             return None
-        item_id = str(item.get("id") or item.get("call_id") or "")
-        state = self._items.get(item_id)
+        item_key, aliases = self._item_identity(item)
+        state = self._resolve_item_state(item_key, *aliases)
         if state is None:
             return None
         final_arguments = str(item.get("arguments") or "")
@@ -520,6 +562,30 @@ class _ResponsesStreamState:
                 }
             ]
         }
+
+    def final_tool_fallback(self, response_payload: dict[str, Any]) -> list[dict[str, Any]]:
+        envelope = _extract_response_envelope(response_payload)
+        chunks: list[dict[str, Any]] = []
+        for index, tool_call in enumerate(envelope.tool_calls):
+            function = tool_call.get("function") or {}
+            fallback_id = str(tool_call.get("id") or f"fallback_call_{index}")
+            item = {
+                "type": "function_call",
+                "id": fallback_id,
+                "call_id": fallback_id,
+                "name": str(function.get("name") or "unknown_tool"),
+                "arguments": str(function.get("arguments") or "{}"),
+            }
+            self.register_item(item)
+            initial_chunk = self.initial_tool_delta(item, emit_name=True)
+            if initial_chunk is not None:
+                self.completed_fallback_used = True
+                chunks.append(initial_chunk)
+            final_chunk = self.finalize_item(item)
+            if final_chunk is not None:
+                self.completed_fallback_used = True
+                chunks.append(final_chunk)
+        return chunks
 
 
 def _extract_response_envelope(payload: dict[str, Any]) -> NormalizedResponseEnvelope:
