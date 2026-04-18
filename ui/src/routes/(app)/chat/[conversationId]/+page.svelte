@@ -23,7 +23,11 @@
   import {
     getConversationRetryScope,
     getNextHistoryAfterSeq,
+    isMissingSessionError,
     isCurrentConversationLoad,
+    isPreSessionChatConversation,
+    shouldAdoptConversationSessionId,
+    shouldSuppressPreSessionSocketError,
     nextConversationLoadId,
     nextPollDelayMs,
     CHAT_STORAGE_KEYS,
@@ -374,6 +378,9 @@
   let showTurnProgress = $derived.by(() =>
     turnInProgress && !timeline.some((item) => item.kind === 'message' && item.role === 'assistant' && item.streaming)
   );
+  let isPreSessionConversation = $derived.by(() =>
+    isPreSessionChatConversation(currentConversation, sessions.length)
+  );
 
   function contextTypeBadge(conversation: Conversation): string {
     const t = conversation.context?.type ?? 'unknown';
@@ -404,6 +411,18 @@
       return 'Answer the pending clarification request to continue.';
     }
     return event.message;
+  }
+
+  function syncConversationActiveSession(activeSessionId: string | null | undefined): void {
+    if (!currentConversation || !activeSessionId || currentConversation.active_session_id === activeSessionId) {
+      return;
+    }
+    currentConversation = { ...currentConversation, active_session_id: activeSessionId };
+    const index = conversations.findIndex((conversation) => conversation.conversation_id === currentConversation?.conversation_id);
+    if (index >= 0) {
+      conversations[index] = { ...conversations[index], active_session_id: activeSessionId };
+      conversations = [...conversations];
+    }
   }
 
   async function loadConversationPage(reset = false): Promise<void> {
@@ -808,23 +827,37 @@
     sessionsError = '';
     historyError = '';
 
+    const previousConversation = currentConversation;
+    let nextSessions = reloadSessions ? [] : sessions;
+    let nextActiveSessionId = previousConversation?.active_session_id ?? null;
+
     if (reloadSessions && sessionResult.status === 'fulfilled') {
-      sessions = sessionResult.value;
+      nextSessions = sessionResult.value;
+      sessions = nextSessions;
       resetSessionFilter();
     } else if (reloadSessions && sessionResult.status === 'rejected') {
       sessions = [];
+      nextSessions = [];
       sessionIds.clear();
-      sessionsError = asApiError(sessionResult.reason).message;
+      const nextError = asApiError(sessionResult.reason).message;
+      if (!(isPreSessionChatConversation(previousConversation, 0) && isMissingSessionError(nextError))) {
+        sessionsError = nextError;
+      }
     }
 
     if (reloadHistory && historyResult.status === 'fulfilled') {
+      nextActiveSessionId = historyResult.value.active_session_id ?? nextActiveSessionId;
       timeline = normalizeHistory(historyResult.value.items);
+      syncConversationActiveSession(nextActiveSessionId);
       syncVisibleWindow();
       userScrolledUp = false;
     } else if (reloadHistory && historyResult.status === 'rejected') {
       timeline = [];
       syncVisibleWindow();
-      historyError = asApiError(historyResult.reason).message;
+      const nextError = asApiError(historyResult.reason).message;
+      if (!(isPreSessionChatConversation(previousConversation, nextSessions.length) && isMissingSessionError(nextError))) {
+        historyError = nextError;
+      }
     }
 
     if (shouldResubscribe) {
@@ -836,7 +869,15 @@
       );
     }
 
-    if (!sessionsError) {
+    const nextConversation = currentConversation ?? previousConversation;
+    const skipNotificationRefresh = isPreSessionChatConversation(
+      nextConversation
+        ? { ...nextConversation, active_session_id: nextActiveSessionId }
+        : null,
+      nextSessions.length,
+    );
+
+    if (!sessionsError && !skipNotificationRefresh) {
       await Promise.all([refreshEscalations(), refreshPendingDirectQuestion()]);
       if (isStaleConversationLoad(requestId)) {
         return;
@@ -948,10 +989,13 @@
       }
 
       api.conversations.markRead(conversationId).catch(() => {});
-      currentConversation = { ...conversation, has_unread: false };
+      currentConversation = {
+        ...(currentConversation ?? conversation),
+        has_unread: false,
+      };
       const idx = conversations.findIndex((c) => c.conversation_id === conversationId);
-      if (idx >= 0) {
-        conversations[idx] = { ...conversations[idx], has_unread: false };
+      if (idx >= 0 && currentConversation) {
+        conversations[idx] = { ...conversations[idx], has_unread: false, active_session_id: currentConversation.active_session_id };
         conversations = [...conversations];
       }
     } catch (caughtError) {
@@ -1494,7 +1538,20 @@
     }
 
     if (event.type === 'error') {
-      error = socketErrorMessage(event);
+      const nextError = socketErrorMessage(event);
+      if (shouldSuppressPreSessionSocketError({
+        code: event.code,
+        message: nextError,
+        conversation: currentConversation,
+        sessionCount: sessions.length,
+      })) {
+        error = '';
+        awaitingAssistantStart = false;
+        turnInProgress = false;
+        directQuestionSubmitting = false;
+        return;
+      }
+      error = nextError;
       awaitingAssistantStart = false;
       turnInProgress = false;
       directQuestionSubmitting = false;
@@ -1514,6 +1571,13 @@
 
     if (event.type === 'chunk' || event.type === 'tool_call' || event.type === 'delegation_started' || event.type === 'reasoning') {
       awaitingAssistantStart = false;
+    }
+
+    if (
+      'session_id' in event
+      && shouldAdoptConversationSessionId(currentConversation?.active_session_id, event.type, event.session_id)
+    ) {
+      syncConversationActiveSession(event.session_id);
     }
 
     if (event.type === 'message_complete' || event.type === 'workflow_completed' || event.type === 'workflow_failed' || event.type === 'workflow_cancelled') {
@@ -2285,7 +2349,7 @@
           </div>
         {/if}
 
-        {#if sessionsError}
+        {#if sessionsError && !isPreSessionConversation}
           <div class="rounded-2xl border border-amber-500/30 bg-amber-500/10 px-3 py-3 text-sm text-amber-100">
             <div class="flex flex-wrap items-center justify-between gap-3">
               <p>Session details are temporarily unavailable: {sessionsError}</p>
@@ -2294,7 +2358,7 @@
           </div>
         {/if}
 
-        {#if historyError}
+        {#if historyError && !isPreSessionConversation}
           <div class="rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
             <div class="flex flex-wrap items-center justify-between gap-3">
               <p>Conversation history is temporarily unavailable: {historyError}</p>

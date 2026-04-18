@@ -59,3 +59,44 @@ export function isRestorableChatConversation(conversation: {
 } | null | undefined): boolean {
   return conversation?.status === 'active' && (conversation.context?.type ?? '').toLowerCase() === 'web';
 }
+
+export function isPreSessionChatConversation(conversation: {
+  status?: string | null;
+  context?: { type?: string | null } | null;
+  active_session_id?: string | null;
+} | null | undefined, sessionCount = 0): boolean {
+  return isRestorableChatConversation(conversation)
+    && !conversation?.active_session_id
+    && sessionCount === 0;
+}
+
+export function isMissingSessionError(message: string | null | undefined): boolean {
+  const normalized = (message ?? '').trim().toLowerCase();
+  return normalized.includes('session not found');
+}
+
+export function shouldAdoptConversationSessionId(
+  currentActiveSessionId: string | null | undefined,
+  eventType: string,
+  eventSessionId: string | null | undefined,
+): boolean {
+  return !currentActiveSessionId
+    && (eventType === 'message_complete' || eventType === 'session_recovered')
+    && typeof eventSessionId === 'string'
+    && eventSessionId.length > 0;
+}
+
+export function shouldSuppressPreSessionSocketError(params: {
+  code?: string | null;
+  message?: string | null;
+  conversation: {
+    status?: string | null;
+    context?: { type?: string | null } | null;
+    active_session_id?: string | null;
+  } | null | undefined;
+  sessionCount: number;
+}): boolean {
+  return params.code === 'not_found'
+    && isPreSessionChatConversation(params.conversation, params.sessionCount)
+    && isMissingSessionError(params.message);
+}
