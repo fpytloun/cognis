@@ -2485,7 +2485,10 @@
             {/if}
           </div>
         {:else}
-          <div class="shrink-0 space-y-3">
+          <!-- Composer container. `--kb-offset` is published by the viewport
+               store using visualViewport; on iOS this pushes the composer
+               above the on-screen keyboard so the input stays visible. -->
+          <div class="shrink-0 space-y-3" style="padding-bottom: var(--kb-offset, 0px);">
           {#if shouldShowChatTodoDrawer}
             <div class="overflow-hidden rounded-[1.5rem] border border-slate-800/80 bg-slate-900/90 sm:rounded-3xl">
               <button class="flex w-full items-center justify-between gap-3 px-4 py-3 text-left transition hover:bg-slate-800/40" onclick={() => { chatTodoDrawerOpen = !chatTodoDrawerOpen; }} type="button">
@@ -2586,8 +2589,11 @@
               <textarea
                 bind:this={composerElement}
                 bind:value={composer}
-                class="min-h-[56px] w-full resize-none rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 pr-12 text-sm text-slate-100 placeholder:text-slate-500"
+                class="min-h-[56px] w-full resize-none rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 pr-14 text-base text-slate-100 placeholder:text-slate-500 md:text-sm"
                 disabled={!currentConversation || isReadOnly(currentConversation) || isLlmUnavailableForSetup() || directQuestionSubmitting}
+                enterkeyhint="send"
+                autocapitalize="sentences"
+                spellcheck="true"
                 onkeydown={handleComposerKeydown}
                 oninput={() => { updateSlashSuggestions(); syncComposerHeight(); }}
                 onpaste={(event) => void handlePaste(event)}
@@ -2595,13 +2601,13 @@
               ></textarea>
               <button
                 type="button"
-                class="absolute bottom-3 right-3 inline-flex h-7 w-7 items-center justify-center rounded-full border border-slate-700 bg-slate-900/90 text-slate-400 transition hover:border-slate-600 hover:text-slate-100 disabled:opacity-50"
+                class="absolute bottom-2 right-2 inline-flex h-11 w-11 items-center justify-center rounded-full border border-slate-700 bg-slate-900/90 text-slate-300 transition hover:border-slate-600 hover:text-slate-100 disabled:opacity-50 md:h-8 md:w-8"
                 title="Expand composer"
                 aria-label="Expand composer"
                 disabled={!currentConversation || isReadOnly(currentConversation) || isLlmUnavailableForSetup() || directQuestionSubmitting}
                 onclick={() => void openExpandedComposer()}
               >
-                <Maximize2 class="h-3.5 w-3.5" />
+                <Maximize2 class="h-4 w-4 md:h-3.5 md:w-3.5" />
               </button>
             </div>
             <div class="flex flex-wrap items-center justify-between gap-3">
@@ -2690,7 +2696,7 @@
               <textarea
                 bind:this={expandedComposerElement}
                 bind:value={composer}
-                class="min-h-[55vh] w-full resize-none rounded-3xl border border-slate-800 bg-slate-900/60 px-5 py-4 text-sm leading-6 text-slate-100 placeholder:text-slate-500"
+                class="min-h-[55vh] w-full resize-none rounded-3xl border border-slate-800 bg-slate-900/60 px-5 py-4 text-base leading-6 text-slate-100 placeholder:text-slate-500 md:text-sm"
                 disabled={!currentConversation || isReadOnly(currentConversation) || isLlmUnavailableForSetup() || directQuestionSubmitting}
                 onkeydown={handleExpandedComposerKeydown}
                 oninput={updateSlashSuggestions}

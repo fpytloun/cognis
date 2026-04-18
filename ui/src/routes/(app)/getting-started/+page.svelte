@@ -3,7 +3,9 @@
   import { onMount } from 'svelte';
 
   import { api, asApiError } from '$lib/api/client';
-  import { getDocHref, getOnboardingDocs } from '$lib/docs';
+  // Use metadata-only registry to avoid pulling the full docs markdown chunk
+  // (~71 KB) into the getting-started route.
+  import { getDocHref, getOnboardingDocsMeta } from '$lib/docs-registry';
   import { deriveGettingStartedSteps, setGettingStartedDismissed } from '$lib/getting-started';
   import { auth } from '$lib/stores/auth';
   import LoadingState from '$lib/components/LoadingState.svelte';
@@ -11,7 +13,7 @@
   import Card from '$lib/components/ui/Card.svelte';
   import type { SystemDiagnostics } from '$lib/types/api';
 
-  const guideLinks = getOnboardingDocs();
+  const guideLinks = getOnboardingDocsMeta();
 
   let loading = true;
   let error = '';

@@ -1,0 +1,21 @@
+{
+  "name": "Cognis",
+  "short_name": "Cognis",
+  "description": "Cognis — decoupled control plane for AI agents",
+  "start_url": "/chat",
+  "scope": "/",
+  "display": "standalone",
+  "display_override": ["standalone", "minimal-ui"],
+  "orientation": "any",
+  "background_color": "#020617",
+  "theme_color": "#020617",
+  "categories": ["productivity", "developer"],
+  "icons": [
+    { "src": "/pwa/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ],
+  "shortcuts": [
+    { "name": "New chat", "short_name": "New chat", "url": "/chat/new" },
+    { "name": "Tasks", "short_name": "Tasks", "url": "/tasks" },
+    { "name": "Agents", "short_name": "Agents", "url": "/agents" }
+  ]
+}

@@ -1,35 +1,63 @@
-import docsOverviewMarkdown from '../../../docs/README.md?raw';
-import architectureMarkdown from '../../../docs/guide/architecture.md?raw';
-import channelsMarkdown from '../../../docs/guide/channels.md?raw';
-import providersMarkdown from '../../../docs/guide/configuring-providers.md?raw';
-import agentsMarkdown from '../../../docs/guide/creating-agents.md?raw';
-import executorsMarkdown from '../../../docs/guide/executors.md?raw';
-import gettingStartedMarkdown from '../../../docs/guide/getting-started.md?raw';
-import tasksMarkdown from '../../../docs/guide/managing-tasks.md?raw';
-import settingsMarkdown from '../../../docs/guide/settings.md?raw';
-import troubleshootingMarkdown from '../../../docs/guide/troubleshooting.md?raw';
-import toolsAndSkillsMarkdown from '../../../docs/guide/tools-and-skills.md?raw';
-import chatMarkdown from '../../../docs/guide/using-chat.md?raw';
-import workflowsMarkdown from '../../../docs/guide/workflows.md?raw';
-import agentToolInheritanceSvg from '../../../docs/assets/images/cognis-agent-tool-inheritance.svg?url';
-import channelPairingFlowSvg from '../../../docs/assets/images/cognis-channel-pairing-flow.svg?url';
-import controllerExecutorSplitSvg from '../../../docs/assets/images/cognis-controller-executor-split.svg?url';
-import ecosystemOverviewSvg from '../../../docs/assets/images/cognis-ecosystem-overview.svg?url';
-import workflowLifecycleSvg from '../../../docs/assets/images/cognis-workflow-task-lifecycle.svg?url';
+/**
+ * Docs content loader (lazy).
+ *
+ * This module re-exports metadata-only helpers from `docs-registry` and adds
+ * lazy loaders for the actual markdown. The heavy eager imports of
+ * 13 `?raw` markdown files live exclusively in this file and are loaded
+ * on demand via `import.meta.glob(..., { eager: true })` so that callers
+ * who only need metadata (e.g. `/getting-started` page) can import from
+ * `docs-registry` and avoid pulling the docs bundle.
+ *
+ * Legacy shape `embeddedDocs: EmbeddedDoc[]` is preserved for existing tests.
+ */
 
-export const DOC_CATEGORIES = ['getting-started', 'workspace', 'operations'] as const;
+import {
+  type DocCategory,
+  type DocMeta,
+  DOC_CATEGORIES,
+  ONBOARDING_DOC_SLUGS,
+  embeddedDocsMeta,
+  getCategoryLabel,
+  getDocHref,
+  getDocMeta,
+  getDocsByCategoryMeta,
+  getOnboardingDocsMeta,
+  getRelatedDocsMeta
+} from './docs-registry';
 
-export type DocCategory = (typeof DOC_CATEGORIES)[number];
+// Eager glob of the guide markdown. Vite will ship these as one shared chunk
+// that is loaded by the `/docs` routes only. Pages that merely need DocMeta
+// can import from `docs-registry.ts` and avoid this module.
+const markdownModules = import.meta.glob('../../../docs/guide/*.md', {
+  query: '?raw',
+  import: 'default',
+  eager: true
+}) as Record<string, string>;
 
-export interface EmbeddedDoc {
-  slug: string;
-  title: string;
-  description: string;
-  category: DocCategory;
-  sourcePath: string;
+const overviewModules = import.meta.glob('../../../docs/README.md', {
+  query: '?raw',
+  import: 'default',
+  eager: true
+}) as Record<string, string>;
+
+// SVG asset urls (diagrams referenced from guides).
+const assetUrlModules = import.meta.glob('../../../docs/assets/images/*.svg', {
+  query: '?url',
+  import: 'default',
+  eager: true
+}) as Record<string, string>;
+
+// Re-exports from the registry for convenience.
+export {
+  DOC_CATEGORIES,
+  type DocCategory,
+  getCategoryLabel,
+  getDocHref
+} from './docs-registry';
+
+export interface EmbeddedDoc extends DocMeta {
   content: string;
   rawContent?: string;
-  relatedSlugs?: string[];
 }
 
 export interface DocsOverview {
@@ -38,21 +66,6 @@ export interface DocsOverview {
   content: string;
   rawContent?: string;
 }
-
-const ONBOARDING_DOC_SLUGS = [
-  'getting-started',
-  'architecture',
-  'configuring-providers',
-  'creating-agents',
-  'settings',
-  'using-chat',
-  'managing-tasks',
-  'workflows',
-  'channels',
-  'executors',
-  'tools-and-skills',
-  'troubleshooting'
-] as const;
 
 const DOC_ROUTE_RE = /^\/docs\/([a-z0-9-]+)$/;
 const ALLOWED_APP_ROUTE_RE = /^\/(docs(\/[a-z0-9-]+)?|settings(\?.*)?|agents(\/.*)?|chat(\/.*)?|tasks(\/.*)?|workflows(\/.*)?|tools(\/.*)?|channels(\/.*)?)$/;
@@ -74,39 +87,20 @@ const EMBEDDED_DOC_ROUTE_BY_SOURCE_PATH: Record<string, string> = {
   'docs/guide/troubleshooting.md': '/docs/troubleshooting'
 };
 
-const DOC_ASSET_URLS: Record<string, string> = {
-  'docs/assets/images/cognis-agent-tool-inheritance.svg': agentToolInheritanceSvg,
-  'docs/assets/images/cognis-channel-pairing-flow.svg': channelPairingFlowSvg,
-  'docs/assets/images/cognis-controller-executor-split.svg': controllerExecutorSplitSvg,
-  'docs/assets/images/cognis-ecosystem-overview.svg': ecosystemOverviewSvg,
-  'docs/assets/images/cognis-workflow-task-lifecycle.svg': workflowLifecycleSvg
-};
-
-// Relative links to repo files that cannot be bundled as Vite assets.
-// These are rewritten to GitHub URLs at render time and allowed by the
-// validator.  Add new entries here when a guide links to a repo path
-// outside docs/ (e.g. deploy/, examples/).
 const GITHUB_REPO_URL = 'https://github.com/fpytloun/cognis';
-const DOC_REPO_URLS = new Set([
-  'deploy/systemd',
-  'deploy/systemd/README.md'
-]);
+const DOC_REPO_URLS = new Set(['deploy/systemd', 'deploy/systemd/README.md']);
 
 function normalizeDocPath(path: string): string {
   const parts = path.split('/');
   const normalized: string[] = [];
-
   for (const part of parts) {
-    if (!part || part === '.') {
-      continue;
-    }
+    if (!part || part === '.') continue;
     if (part === '..') {
       normalized.pop();
       continue;
     }
     normalized.push(part);
   }
-
   return normalized.join('/');
 }
 
@@ -127,177 +121,77 @@ function getGitHubRepoUrl(path: string): string {
   return `${GITHUB_REPO_URL}/${segment}/main/${normalized}`;
 }
 
+function lookupAssetUrl(repoPath: string): string | null {
+  // Glob keys look like "../../../docs/assets/images/xyz.svg"; map to repo-relative paths.
+  for (const [globKey, url] of Object.entries(assetUrlModules)) {
+    const rel = globKey.replace(/^(\.\.\/)+/, '');
+    if (rel === repoPath) return url;
+  }
+  return null;
+}
+
+function getMarkdownForSourcePath(sourcePath: string): string {
+  if (sourcePath === 'docs/README.md') {
+    const key = Object.keys(overviewModules)[0];
+    return overviewModules[key] ?? '';
+  }
+  for (const [globKey, content] of Object.entries(markdownModules)) {
+    const rel = globKey.replace(/^(\.\.\/)+/, '');
+    if (rel === sourcePath) return content;
+  }
+  return '';
+}
+
 function resolveRelativeMarkdownTarget(sourcePath: string, rawTarget: string): string | null {
   if (
-    rawTarget.startsWith('#')
-    || rawTarget.startsWith('/')
-    || rawTarget.startsWith('http://')
-    || rawTarget.startsWith('https://')
-    || rawTarget.startsWith('mailto:')
-    || rawTarget.startsWith('data:')
+    rawTarget.startsWith('#') ||
+    rawTarget.startsWith('/') ||
+    rawTarget.startsWith('http://') ||
+    rawTarget.startsWith('https://') ||
+    rawTarget.startsWith('mailto:') ||
+    rawTarget.startsWith('data:')
   ) {
     return null;
   }
-
   const resolvedTarget = resolveDocRelativePath(sourcePath, rawTarget);
-  const bundledAsset = DOC_ASSET_URLS[resolvedTarget];
-  if (bundledAsset) {
-    return bundledAsset;
-  }
-
+  const bundledAsset = lookupAssetUrl(resolvedTarget);
+  if (bundledAsset) return bundledAsset;
   const embeddedDocRoute = EMBEDDED_DOC_ROUTE_BY_SOURCE_PATH[resolvedTarget];
-  if (embeddedDocRoute) {
-    return embeddedDocRoute;
-  }
-
+  if (embeddedDocRoute) return embeddedDocRoute;
   const normalized = resolvedTarget.replace(/\/$/, '');
   if (normalized.startsWith('docs/specs/') || DOC_REPO_URLS.has(normalized)) {
     return getGitHubRepoUrl(resolvedTarget);
   }
-
   return null;
 }
 
 function rewriteMarkdownTargets(sourcePath: string, markdown: string): string {
   return markdown.replace(MARKDOWN_LINK_RE, (fullMatch, rawTarget: string) => {
     const rewrittenTarget = resolveRelativeMarkdownTarget(sourcePath, rawTarget);
-    if (!rewrittenTarget) {
-      return fullMatch;
-    }
-
+    if (!rewrittenTarget) return fullMatch;
     return fullMatch.replace(rawTarget, rewrittenTarget);
   });
 }
 
-export const docsOverview: DocsOverview = {
-  title: 'Documentation',
-  sourcePath: 'docs/README.md',
-  rawContent: docsOverviewMarkdown,
-  content: rewriteMarkdownTargets('docs/README.md', docsOverviewMarkdown)
-};
+export const docsOverview: DocsOverview = (() => {
+  const sourcePath = 'docs/README.md';
+  const raw = getMarkdownForSourcePath(sourcePath);
+  return {
+    title: 'Documentation',
+    sourcePath,
+    rawContent: raw,
+    content: rewriteMarkdownTargets(sourcePath, raw)
+  };
+})();
 
-export const embeddedDocs: EmbeddedDoc[] = [
-  {
-    slug: 'getting-started',
-    title: 'Getting Started',
-    description: 'Set up Mnemory, Intaris, Cognis, a provider, and your first agent.',
-    category: 'getting-started',
-    sourcePath: 'docs/guide/getting-started.md',
-    rawContent: gettingStartedMarkdown,
-    content: rewriteMarkdownTargets('docs/guide/getting-started.md', gettingStartedMarkdown),
-    relatedSlugs: ['architecture', 'configuring-providers', 'creating-agents', 'using-chat']
-  },
-  {
-    slug: 'architecture',
-    title: 'Architecture',
-    description: 'See how Cognis works with Mnemory, Intaris, and executors.',
-    category: 'getting-started',
-    sourcePath: 'docs/guide/architecture.md',
-    rawContent: architectureMarkdown,
-    content: rewriteMarkdownTargets('docs/guide/architecture.md', architectureMarkdown),
-    relatedSlugs: ['executors', 'channels', 'workflows']
-  },
-  {
-    slug: 'configuring-providers',
-    title: 'Configuring Providers',
-    description: 'Add LLM providers, test connectivity, and tune routing decisions.',
-    category: 'getting-started',
-    sourcePath: 'docs/guide/configuring-providers.md',
-    rawContent: providersMarkdown,
-    content: rewriteMarkdownTargets('docs/guide/configuring-providers.md', providersMarkdown),
-    relatedSlugs: ['getting-started', 'settings', 'executors', 'creating-agents']
-  },
-  {
-    slug: 'creating-agents',
-    title: 'Creating Agents',
-    description: 'Define identity, personality, tools, executors, and workflow options.',
-    category: 'workspace',
-    sourcePath: 'docs/guide/creating-agents.md',
-    rawContent: agentsMarkdown,
-    content: rewriteMarkdownTargets('docs/guide/creating-agents.md', agentsMarkdown),
-    relatedSlugs: ['configuring-providers', 'using-chat', 'executors', 'tools-and-skills']
-  },
-  {
-    slug: 'settings',
-    title: 'Settings',
-    description: 'Configure providers, routing, secrets, executors, diagnostics, and users.',
-    category: 'workspace',
-    sourcePath: 'docs/guide/settings.md',
-    rawContent: settingsMarkdown,
-    content: rewriteMarkdownTargets('docs/guide/settings.md', settingsMarkdown),
-    relatedSlugs: ['configuring-providers', 'executors', 'tools-and-skills', 'troubleshooting']
-  },
-  {
-    slug: 'using-chat',
-    title: 'Using Chat',
-    description: 'Understand streaming replies, tool activity, approvals, and delegation.',
-    category: 'workspace',
-    sourcePath: 'docs/guide/using-chat.md',
-    rawContent: chatMarkdown,
-    content: rewriteMarkdownTargets('docs/guide/using-chat.md', chatMarkdown),
-    relatedSlugs: ['getting-started', 'managing-tasks', 'creating-agents']
-  },
-  {
-    slug: 'managing-tasks',
-    title: 'Managing Tasks',
-    description: 'Track queued or running work, workflow progress, and delivery back to chat.',
-    category: 'workspace',
-    sourcePath: 'docs/guide/managing-tasks.md',
-    rawContent: tasksMarkdown,
-    content: rewriteMarkdownTargets('docs/guide/managing-tasks.md', tasksMarkdown),
-    relatedSlugs: ['workflows', 'using-chat']
-  },
-  {
-    slug: 'workflows',
-    title: 'Workflows',
-    description: 'Create reusable execution templates with steps, gates, and revision loops.',
-    category: 'workspace',
-    sourcePath: 'docs/guide/workflows.md',
-    rawContent: workflowsMarkdown,
-    content: rewriteMarkdownTargets('docs/guide/workflows.md', workflowsMarkdown),
-    relatedSlugs: ['managing-tasks', 'creating-agents']
-  },
-  {
-    slug: 'tools-and-skills',
-    title: 'Tools and Skills',
-    description: 'Inspect the tool registry, MCP-backed capabilities, and reusable skills.',
-    category: 'workspace',
-    sourcePath: 'docs/guide/tools-and-skills.md',
-    rawContent: toolsAndSkillsMarkdown,
-    content: rewriteMarkdownTargets('docs/guide/tools-and-skills.md', toolsAndSkillsMarkdown),
-    relatedSlugs: ['settings', 'creating-agents', 'executors']
-  },
-  {
-    slug: 'channels',
-    title: 'Channels',
-    description: 'Connect agents to external platforms and understand pairing and trust.',
-    category: 'operations',
-    sourcePath: 'docs/guide/channels.md',
-    rawContent: channelsMarkdown,
-    content: rewriteMarkdownTargets('docs/guide/channels.md', channelsMarkdown),
-    relatedSlugs: ['executors', 'troubleshooting']
-  },
-  {
-    slug: 'executors',
-    title: 'Executors',
-    description: 'Choose where tools run and how remote executor placement affects agents.',
-    category: 'operations',
-    sourcePath: 'docs/guide/executors.md',
-    rawContent: executorsMarkdown,
-    content: rewriteMarkdownTargets('docs/guide/executors.md', executorsMarkdown),
-    relatedSlugs: ['channels', 'configuring-providers', 'creating-agents']
-  },
-  {
-    slug: 'troubleshooting',
-    title: 'Troubleshooting',
-    description: 'Resolve common setup, provider, executor, and UI problems.',
-    category: 'operations',
-    sourcePath: 'docs/guide/troubleshooting.md',
-    rawContent: troubleshootingMarkdown,
-    content: rewriteMarkdownTargets('docs/guide/troubleshooting.md', troubleshootingMarkdown),
-    relatedSlugs: ['getting-started', 'configuring-providers', 'executors']
-  }
-];
+export const embeddedDocs: EmbeddedDoc[] = embeddedDocsMeta.map((meta) => {
+  const raw = getMarkdownForSourcePath(meta.sourcePath);
+  return {
+    ...meta,
+    rawContent: raw,
+    content: rewriteMarkdownTargets(meta.sourcePath, raw)
+  };
+});
 
 export function getEmbeddedDocs(): EmbeddedDoc[] {
   return embeddedDocs;
@@ -307,36 +201,23 @@ export function getEmbeddedDoc(slug: string): EmbeddedDoc | null {
   return embeddedDocs.find((doc) => doc.slug === slug) ?? null;
 }
 
-export function getDocHref(slug: string): string {
-  return `/docs/${slug}`;
-}
-
 export function getOnboardingDocs(): EmbeddedDoc[] {
-  return ONBOARDING_DOC_SLUGS.map((slug) => getEmbeddedDoc(slug)).filter((doc): doc is EmbeddedDoc => doc !== null);
+  return getOnboardingDocsMeta()
+    .map((meta) => getEmbeddedDoc(meta.slug))
+    .filter((d): d is EmbeddedDoc => d !== null);
 }
 
-export function getRelatedDocs(doc: EmbeddedDoc): EmbeddedDoc[] {
-  return (doc.relatedSlugs ?? [])
-    .map((slug) => getEmbeddedDoc(slug))
-    .filter((candidate): candidate is EmbeddedDoc => candidate !== null);
+export function getRelatedDocs(doc: EmbeddedDoc | DocMeta): EmbeddedDoc[] {
+  return getRelatedDocsMeta(doc)
+    .map((meta) => getEmbeddedDoc(meta.slug))
+    .filter((d): d is EmbeddedDoc => d !== null);
 }
 
 export function getDocsByCategory(): Array<{ category: DocCategory; docs: EmbeddedDoc[] }> {
-  return DOC_CATEGORIES.map((category) => ({
+  return getDocsByCategoryMeta().map(({ category, docs }) => ({
     category,
-    docs: embeddedDocs.filter((doc) => doc.category === category)
-  })).filter((group) => group.docs.length > 0);
-}
-
-export function getCategoryLabel(category: DocCategory): string {
-  switch (category) {
-    case 'getting-started':
-      return 'Getting Started';
-    case 'workspace':
-      return 'Workspace';
-    case 'operations':
-      return 'Operations';
-  }
+    docs: docs.map((meta) => getEmbeddedDoc(meta.slug)).filter((d): d is EmbeddedDoc => d !== null)
+  }));
 }
 
 export function extractMarkdownTitle(markdown: string): string | null {
@@ -360,33 +241,25 @@ export function validateEmbeddedDocs(): string[] {
   ];
 
   for (const doc of embeddedDocs) {
-    if (slugSet.has(doc.slug)) {
-      errors.push(`Duplicate doc slug: ${doc.slug}`);
-    }
+    if (slugSet.has(doc.slug)) errors.push(`Duplicate doc slug: ${doc.slug}`);
     slugSet.add(doc.slug);
 
-    if (sourcePathSet.has(doc.sourcePath)) {
-      errors.push(`Duplicate doc source path: ${doc.sourcePath}`);
-    }
+    if (sourcePathSet.has(doc.sourcePath)) errors.push(`Duplicate doc source path: ${doc.sourcePath}`);
     sourcePathSet.add(doc.sourcePath);
 
     if (!DOC_CATEGORIES.includes(doc.category)) {
       errors.push(`Invalid doc category for ${doc.slug}: ${doc.category}`);
     }
-
     if (doc.sourcePath.includes('docs/specs/')) {
       errors.push(`Forbidden docs/specs source path: ${doc.sourcePath}`);
     }
-
     if (!doc.content.trim()) {
       errors.push(`Doc content is empty: ${doc.slug}`);
     }
-
     const markdownTitle = extractMarkdownTitle(doc.content);
     if (markdownTitle !== doc.title) {
       errors.push(`Doc title mismatch for ${doc.slug}: expected "${doc.title}" but found "${markdownTitle ?? 'missing'}"`);
     }
-
     for (const relatedSlug of doc.relatedSlugs ?? []) {
       if (!allowedSlugs.has(relatedSlug)) {
         errors.push(`Doc ${doc.slug} references missing related slug: ${relatedSlug}`);
@@ -401,16 +274,11 @@ export function validateEmbeddedDocs(): string[] {
         errors.push(`GitHub blob links are not allowed in ${doc.sourcePath}: ${target}`);
         continue;
       }
-
       if (target.startsWith('#')) {
         errors.push(`Heading anchor links are not supported in ${doc.sourcePath}: ${target}`);
         continue;
       }
-
-      if (target.startsWith('http://') || target.startsWith('https://')) {
-        continue;
-      }
-
+      if (target.startsWith('http://') || target.startsWith('https://')) continue;
       if (target.startsWith('/')) {
         const docsRouteMatch = target.match(DOC_ROUTE_RE);
         if (docsRouteMatch) {
@@ -420,18 +288,13 @@ export function validateEmbeddedDocs(): string[] {
           }
           continue;
         }
-
         if (!ALLOWED_APP_ROUTE_RE.test(target)) {
           errors.push(`Unsupported app route in ${doc.sourcePath}: ${target}`);
         }
         continue;
       }
-
       const rewrittenRelativeTarget = resolveRelativeMarkdownTarget(doc.sourcePath, target);
-      if (rewrittenRelativeTarget) {
-        continue;
-      }
-
+      if (rewrittenRelativeTarget) continue;
       errors.push(`Relative links or assets are not allowed in ${doc.sourcePath}: ${target}`);
     }
   }
@@ -440,7 +303,6 @@ export function validateEmbeddedDocs(): string[] {
 }
 
 const registryErrors = validateEmbeddedDocs();
-
 if (registryErrors.length > 0) {
   throw new Error(`Embedded docs validation failed:\n${registryErrors.join('\n')}`);
 }

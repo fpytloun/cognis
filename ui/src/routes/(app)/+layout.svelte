@@ -2,7 +2,6 @@
   import { goto } from '$app/navigation';
   import { page } from '$app/stores';
   import { onMount } from 'svelte';
-  import { fade } from 'svelte/transition';
   import {
     Bot,
     BookOpen,
@@ -30,8 +29,10 @@
   import ShortcutHelp from '$lib/components/ShortcutHelp.svelte';
   import ToastViewport from '$lib/components/ToastViewport.svelte';
   import ConfirmDialog from '$lib/components/ui/ConfirmDialog.svelte';
+  import Sheet from '$lib/components/ui/Sheet.svelte';
   import Badge from '$lib/components/ui/Badge.svelte';
   import Button from '$lib/components/ui/Button.svelte';
+  import BottomTabBar from '$lib/components/BottomTabBar.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import { closeShortcutHelp, openShortcutHelp, requestCancelActiveTurn, requestChatComposerFocus, shortcutHelpOpen } from '$lib/shortcuts';
   import { auth } from '$lib/stores/auth';
@@ -54,23 +55,15 @@
   let bootstrapped = $state(false);
   let diagnostics = $state<SystemDiagnostics | null>(null);
   let mobileNavOpen = $state(false);
-  let mobileNavPreviouslyFocused = $state<HTMLElement | null>(null);
   let sidebarCollapsed = $state(false);
   let sidebarHovered = $state(false);
 
   function openMobileNav(): void {
-    mobileNavPreviouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    requestAnimationFrame(() => {
-      mobileNavOpen = true;
-      document.body.style.overflow = 'hidden';
-    });
+    mobileNavOpen = true;
   }
 
   function closeMobileNav(): void {
     mobileNavOpen = false;
-    document.body.style.overflow = '';
-    mobileNavPreviouslyFocused?.focus();
-    mobileNavPreviouslyFocused = null;
   }
 
   function restoreSidebarState(): void {
@@ -79,8 +72,9 @@
     if (stored !== null) {
       sidebarCollapsed = stored === '1';
     } else {
-      // Default: collapsed below xl (1280px), expanded at xl+
-      sidebarCollapsed = window.innerWidth < 1280;
+      // Default: collapsed below lg (1024px), expanded at lg+. Lower pivot than
+      // the old xl (1280px) so 1024–1279 px laptops get the side-by-side layout.
+      sidebarCollapsed = window.innerWidth < 1024;
     }
   }
 
@@ -256,10 +250,10 @@
   <ConfirmDialog />
   <ShortcutHelp />
   <div class="h-[100dvh] overflow-hidden">
-    <div class="mx-auto flex h-[100dvh] max-w-[1600px] gap-3 overflow-hidden px-2 py-2 sm:px-3 sm:py-3 lg:gap-6 lg:px-6 lg:py-4">
+    <div class="mx-auto flex h-[100dvh] max-w-[1600px] gap-3 overflow-hidden px-2 py-2 pb-[calc(56px+env(safe-area-inset-bottom))] sm:px-3 sm:py-3 lg:gap-6 lg:px-6 lg:py-4 lg:pb-4">
       <!-- svelte-ignore a11y_no_static_element_interactions -->
       <aside
-        class={`hidden min-h-0 shrink-0 overflow-hidden whitespace-nowrap rounded-3xl border border-slate-800/80 bg-slate-900/80 shadow-card backdrop-blur transition-all duration-200 ease-in-out md:flex md:flex-col md:justify-between ${sidebarExpanded ? 'w-72 p-5' : 'w-16 p-3'}`}
+        class={`hidden min-h-0 shrink-0 overflow-hidden whitespace-nowrap rounded-3xl border border-slate-800/80 bg-slate-900/80 shadow-card backdrop-blur transition-all duration-200 ease-in-out lg:flex lg:flex-col lg:justify-between ${sidebarExpanded ? 'w-72 p-5' : 'w-16 p-3'}`}
         onmouseenter={() => { sidebarHovered = true; }}
         onmouseleave={() => { sidebarHovered = false; }}
       >
@@ -319,8 +313,8 @@
       <main class="flex min-h-0 flex-1 flex-col gap-3 overflow-hidden rounded-[1.75rem] border border-slate-800/80 bg-slate-950/70 p-3 shadow-card backdrop-blur sm:rounded-3xl sm:p-4 lg:gap-4 lg:p-6" id="main-content">
         <header class="sticky top-0 z-10 flex shrink-0 items-center justify-between gap-2 rounded-2xl border border-slate-800/80 bg-slate-900/95 px-3 py-2.5 backdrop-blur sm:gap-3 sm:px-4 sm:py-4">
           <div class="flex min-w-0 flex-1 items-center gap-2 sm:block">
-            <Button aria-label="Open navigation" class="md:hidden" size="sm" variant="secondary" onclick={openMobileNav}>
-              <Menu class="h-4 w-4" />
+            <Button aria-label="Open navigation" class="lg:hidden" size="icon-mobile" variant="secondary" onclick={openMobileNav}>
+              <Menu class="h-5 w-5" />
             </Button>
             <div class="min-w-0">
               <p class="hidden text-sm font-medium uppercase tracking-[0.25em] text-slate-400 sm:block">Cognis</p>
@@ -332,8 +326,8 @@
             {#if $auth.user?.role === 'admin'}
               <Button class="hidden sm:inline-flex" size="sm" variant="secondary" onclick={() => goto('/getting-started')}>Getting started</Button>
             {/if}
-            <Button aria-label="Open keyboard shortcuts" size="sm" variant="secondary" onclick={openShortcutHelp}>
-              <CircleHelp class="h-4 w-4" />
+            <Button aria-label="Open keyboard shortcuts" size="icon-mobile" variant="secondary" onclick={openShortcutHelp}>
+              <CircleHelp class="h-5 w-5" />
             </Button>
             <Badge class={`hidden sm:inline-flex ${$wsState.status === 'connected' ? 'border-emerald-400/40 bg-emerald-500/10 text-emerald-200' : 'border-amber-400/40 bg-amber-500/10 text-amber-200'}`}>
               <span class="inline-flex items-center gap-2">
@@ -346,7 +340,7 @@
             </Badge>
             <span class={`inline-flex h-2.5 w-2.5 rounded-full sm:hidden ${$wsState.status === 'connected' ? 'bg-emerald-400' : 'bg-amber-400'}`} aria-label={`WebSocket ${$wsState.status}`}></span>
             {#if $wsState.status === 'stalled'}
-              <Button class="hidden sm:inline-flex" size="sm" variant="secondary" onclick={() => wsClient.connect()}>Reconnect</Button>
+              <Button size="sm" variant="secondary" onclick={() => wsClient.connect()}>Reconnect</Button>
             {/if}
           </div>
         </header>
@@ -398,40 +392,42 @@
     </div>
   </div>
 
-  {#if mobileNavOpen}
-    <div class="fixed inset-0 z-[70] isolate flex justify-end md:hidden" role="presentation">
-      <button class="absolute inset-0 z-0 bg-slate-950/75" onclick={closeMobileNav} type="button" aria-label="Close navigation" transition:fade={{ duration: 180 }}></button>
-      <aside class="relative z-10 flex h-full w-[min(22rem,100vw)] flex-col border-l border-slate-800 bg-slate-950 px-5 py-5 shadow-card" aria-label="Navigation menu">
-        <div class="flex items-center justify-between gap-3 border-b border-slate-800 pb-5">
-          <div>
-            <p class="text-sm uppercase tracking-[0.25em] text-sky-300">Cognis</p>
-            <p class="mt-1 text-sm text-slate-400">{$auth.user?.email}</p>
-          </div>
-          <Button aria-label="Close navigation" size="sm" variant="secondary" onclick={closeMobileNav}>
-            <X class="h-4 w-4" />
-          </Button>
+  <!-- Mobile navigation sheet (right-side drawer) -->
+  <Sheet open={mobileNavOpen} onClose={closeMobileNav} side="right" label="Navigation menu">
+    {#snippet header()}
+      <div class="flex items-center justify-between gap-3">
+        <div>
+          <p class="text-sm uppercase tracking-[0.25em] text-sky-300">Cognis</p>
+          <p class="mt-1 text-sm text-slate-400">{$auth.user?.email}</p>
         </div>
+        <Button aria-label="Close navigation" size="icon-mobile" variant="secondary" onclick={closeMobileNav}>
+          <X class="h-4 w-4" />
+        </Button>
+      </div>
+    {/snippet}
 
-        <nav class="mt-5 space-y-2">
-          {#each navigationItems as item}
-            <a
-              class={`flex items-center gap-3 rounded-2xl px-4 py-3 text-sm transition ${$page.url.pathname.startsWith(item.href) ? 'bg-sky-500/20 text-white' : 'text-slate-300 hover:bg-slate-900 hover:text-white'}`}
-              href={item.href}
-              onclick={closeMobileNav}
-            >
-              <svelte:component this={item.icon} class="h-4 w-4" />
-              <span>{item.label}</span>
-            </a>
-          {/each}
-        </nav>
+    <nav class="space-y-2">
+      {#each navigationItems as item}
+        <a
+          class={`flex min-h-[48px] items-center gap-3 rounded-2xl px-4 py-3 text-base transition ${$page.url.pathname.startsWith(item.href) ? 'bg-sky-500/20 text-white' : 'text-slate-300 hover:bg-slate-900 hover:text-white'}`}
+          href={item.href}
+          onclick={closeMobileNav}
+        >
+          <svelte:component this={item.icon} class="h-5 w-5" />
+          <span>{item.label}</span>
+        </a>
+      {/each}
+    </nav>
 
-        <div class="mt-auto space-y-3 border-t border-slate-800 pt-5">
-          {#if $auth.user?.role === 'admin'}
-            <Button class="w-full justify-center" variant="secondary" onclick={() => { closeMobileNav(); void goto('/getting-started'); }}>Getting started</Button>
-          {/if}
-          <Button class="w-full justify-center" variant="secondary" onclick={handleLogout}>Sign out</Button>
-        </div>
-      </aside>
+    <div class="mt-6 space-y-3 border-t border-slate-800 pt-5">
+      {#if $auth.user?.role === 'admin'}
+        <Button class="w-full justify-center" variant="secondary" onclick={() => { closeMobileNav(); void goto('/getting-started'); }}>Getting started</Button>
+      {/if}
+      <Button class="w-full justify-center" variant="secondary" onclick={handleLogout}>Sign out</Button>
     </div>
-  {/if}
+  </Sheet>
+
+  <!-- Mobile bottom tab bar: primary navigation on small screens. Hidden inside
+       chat detail views so the composer owns the bottom safe-area. -->
+  <BottomTabBar hidden={/^\/chat\/[^/]+/.test($page.url.pathname)} />
 {/if}

@@ -3,6 +3,12 @@
 
   import { cn } from '$lib/utils';
 
+  /**
+   * Input primitive. Mobile font-size is 16px to prevent iOS Safari from zooming
+   * the viewport on focus; desktop scales back down to 14px at md+. Minimum
+   * height is 44px mobile, 36px at md+.
+   */
+
   let {
     type = 'text',
     value = $bindable(''),
@@ -23,7 +29,7 @@
 
 <input
   class={cn(
-    'w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-500',
+    'w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 text-base text-slate-100 placeholder:text-slate-500 min-h-[44px] py-2.5 md:min-h-[36px] md:py-2 md:text-sm',
     className
   )}
   {type}

@@ -347,7 +347,7 @@
     <Card class="p-6">
       <h2 class="mb-4 text-lg font-semibold text-white">Configuration</h2>
       <div class="space-y-4">
-        <div class="grid grid-cols-2 gap-4">
+        <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
           <div class="space-y-1">
             <label for="edit-name" class="text-xs font-medium uppercase tracking-widest text-slate-400">Name</label>
             <Input id="edit-name" bind:value={form.name} />
@@ -372,7 +372,7 @@
         </div>
 
         {#if form.schedule_type === 'cron'}
-          <div class="grid grid-cols-2 gap-4">
+          <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <div class="space-y-1">
               <label for="edit-cron" class="text-xs font-medium uppercase tracking-widest text-slate-400">Cron expression</label>
               <Input id="edit-cron" bind:value={form.cron_expr} />
@@ -393,7 +393,7 @@
           </div>
         {/if}
 
-        <div class="grid grid-cols-2 gap-4">
+        <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
           <div class="space-y-1">
             <label for="edit-workflow" class="text-xs font-medium uppercase tracking-widest text-slate-400">Workflow</label>
             <select id="edit-workflow" bind:value={form.workflow_id} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
@@ -424,7 +424,7 @@
           ></textarea>
         </div>
 
-        <div class="grid grid-cols-2 gap-4">
+        <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
           <div class="space-y-1">
             <label for="edit-priority" class="text-xs font-medium uppercase tracking-widest text-slate-400">Priority</label>
             <Input id="edit-priority" bind:value={form.priority} type="number" />

@@ -30,6 +30,7 @@ Part of the Openclaw ecosystem: Cognis controller, [Intaris](https://github.com/
 - **Decision Engine** -- Deterministic rules + lightweight LLM classifier decide whether a request runs inline or gets delegated to a background sub-session.
 - **Context management** -- Parallel context assembly (Mnemory recall + Intaris events + intention read via `asyncio.gather`). LLM-based compaction with mechanical fallback for long conversations.
 - **Web UI** -- SvelteKit application served by Cognis on `:8080` by default, with setup flow, diagnostics, provider presets, and account management.
+- **Installable PWA** -- Cognis ships as a Progressive Web App. Install on desktop, iPhone, or Android for a dedicated window, offline app shell, safe-area-aware layout, and native-feel mobile navigation with a bottom tab bar and bottom-sheet drawers.
 - **Channel adapters** -- Connect agents to Signal, WhatsApp, Telegram, Discord, Slack, Matrix, IRC, Google Chat, and iMessage (via BlueBubbles) with DB-managed channel accounts and webhook/gateway integrations. Signal and BlueBubbles currently have the most complete setup documentation.
 - **Secure pairing flow** -- External senders can be required to redeem a short-lived verification code in the Cognis UI before the agent accepts their messages.
 - **Polished workspace UX** -- Global toasts, confirmation dialogs, keyboard shortcuts, mobile navigation, chat timestamps, and unsaved-change protection.

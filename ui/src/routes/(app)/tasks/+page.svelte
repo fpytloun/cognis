@@ -36,6 +36,10 @@
   let dragState = $state<{ taskId: string; column: TaskBoardColumnId } | null>(null);
   let dropTargetColumn = $state<TaskBoardColumnId | null>(null);
 
+  // Mobile column picker: on small screens we show one column at a time with
+  // a segmented-style selector instead of a horizontally scrollable kanban.
+  let mobileActiveColumn = $state<TaskBoardColumnId>('running');
+
   let pollTimer: number | null = null;
   let visibilityHandler: (() => void) | null = null;
 
@@ -431,63 +435,109 @@
       {/if}
     </Card>
 
-    <div class="overflow-x-auto">
-      <div class="grid min-w-[1200px] gap-4 xl:grid-cols-5">
-      {#each TASK_BOARD_COLUMNS as column}
-        <section
-          class="flex min-h-[600px] flex-col rounded-3xl border p-4 shadow-card transition-colors {dropTargetColumn === column.id && dragState && dragState.column !== column.id ? 'border-blue-500/50 bg-blue-950/20' : 'border-slate-800/80 bg-slate-900/70'}"
-          ondragover={(event: DragEvent) => {
-            if (dragState && isDragTransitionValid(dragState.column, column.id)) {
-              event.preventDefault();
-              dropTargetColumn = column.id;
-            }
-          }}
-          ondragleave={(event: DragEvent) => {
-            const target = event.currentTarget as HTMLElement;
-            if (!target.contains(event.relatedTarget as Node)) {
-              if (dropTargetColumn === column.id) dropTargetColumn = null;
-            }
-          }}
-          ondrop={() => handleColumnDrop(column.id)}
-          aria-label={column.label}
-        >
-          <div class="mb-3 flex items-center justify-between gap-2">
-            <div>
-              <p class="text-sm font-semibold text-white">{column.label}</p>
-              <p class="text-xs uppercase tracking-[0.2em] text-slate-500">{tasksForColumn(column.id).length} items</p>
-            </div>
-          </div>
+    <!-- Mobile column picker (below lg) -->
+    <div class="lg:hidden">
+      <div class="flex gap-2 overflow-x-auto pb-2" role="tablist" aria-label="Task columns">
+        {#each TASK_BOARD_COLUMNS as column}
+          {@const count = tasksForColumn(column.id).length}
+          <button
+            type="button"
+            role="tab"
+            aria-selected={mobileActiveColumn === column.id}
+            onclick={() => (mobileActiveColumn = column.id)}
+            class={`shrink-0 rounded-full border px-4 py-2 text-sm font-medium transition ${mobileActiveColumn === column.id ? 'border-sky-400 bg-sky-500/15 text-white' : 'border-slate-800 bg-slate-900/60 text-slate-300'}`}
+          >
+            {column.label}
+            <span class="ml-1.5 rounded-full bg-slate-950/60 px-2 py-0.5 text-xs text-slate-400">{count}</span>
+          </button>
+        {/each}
+      </div>
 
-          <div class="flex-1 space-y-2 overflow-y-auto">
-            {#each tasksForColumn(column.id) as task (task.task_id)}
-              <div
-                draggable={!filtersActive}
-                ondragstart={() => (dragState = { taskId: task.task_id, column: column.id })}
-                ondragend={() => { dragState = null; dropTargetColumn = null; }}
-                ondragover={(event: DragEvent) => event.preventDefault()}
-                ondrop={(event: DragEvent) => { event.stopPropagation(); handleColumnDrop(column.id, task.task_id); }}
-              >
+      {#each TASK_BOARD_COLUMNS as column}
+        {#if mobileActiveColumn === column.id}
+          <section class="mt-3 space-y-2 rounded-3xl border border-slate-800/80 bg-slate-900/70 p-3 shadow-card" aria-label={column.label}>
+            <div class="space-y-2">
+              {#each tasksForColumn(column.id) as task (task.task_id)}
                 <TaskCard
                   {task}
                   workflowName={workflowName(task.workflow_id)}
                   selected={selectedIds.has(task.task_id)}
                   onclick={(event) => handleCardClick(event, task.task_id, column.id)}
                 />
-              </div>
-            {/each}
-          </div>
-        </section>
+              {/each}
+              {#if tasksForColumn(column.id).length === 0}
+                <p class="py-8 text-center text-sm text-slate-500">No tasks.</p>
+              {/if}
+            </div>
+          </section>
+        {/if}
       {/each}
+    </div>
+
+    <!-- Desktop kanban board (lg+) -->
+    <div class="hidden lg:block">
+      <div class="overflow-x-auto">
+        <div class="grid min-w-[1200px] gap-4 lg:grid-cols-5">
+        {#each TASK_BOARD_COLUMNS as column}
+          <section
+            class="flex min-h-[600px] flex-col rounded-3xl border p-4 shadow-card transition-colors {dropTargetColumn === column.id && dragState && dragState.column !== column.id ? 'border-blue-500/50 bg-blue-950/20' : 'border-slate-800/80 bg-slate-900/70'}"
+            ondragover={(event: DragEvent) => {
+              if (dragState && isDragTransitionValid(dragState.column, column.id)) {
+                event.preventDefault();
+                dropTargetColumn = column.id;
+              }
+            }}
+            ondragleave={(event: DragEvent) => {
+              const target = event.currentTarget as HTMLElement;
+              if (!target.contains(event.relatedTarget as Node)) {
+                if (dropTargetColumn === column.id) dropTargetColumn = null;
+              }
+            }}
+            ondrop={() => handleColumnDrop(column.id)}
+            aria-label={column.label}
+          >
+            <div class="mb-3 flex items-center justify-between gap-2">
+              <div>
+                <p class="text-sm font-semibold text-white">{column.label}</p>
+                <p class="text-xs uppercase tracking-[0.2em] text-slate-500">{tasksForColumn(column.id).length} items</p>
+              </div>
+            </div>
+
+            <div class="flex-1 space-y-2 overflow-y-auto">
+              {#each tasksForColumn(column.id) as task (task.task_id)}
+                <div
+                  draggable={!filtersActive}
+                  ondragstart={() => (dragState = { taskId: task.task_id, column: column.id })}
+                  ondragend={() => { dragState = null; dropTargetColumn = null; }}
+                  ondragover={(event: DragEvent) => event.preventDefault()}
+                  ondrop={(event: DragEvent) => { event.stopPropagation(); handleColumnDrop(column.id, task.task_id); }}
+                >
+                  <TaskCard
+                    {task}
+                    workflowName={workflowName(task.workflow_id)}
+                    selected={selectedIds.has(task.task_id)}
+                    onclick={(event) => handleCardClick(event, task.task_id, column.id)}
+                  />
+                </div>
+              {/each}
+            </div>
+          </section>
+        {/each}
+        </div>
       </div>
     </div>
   </section>
 
-  <!-- Bulk action bar -->
+  <!-- Bulk action bar. Wraps on narrow viewports; sits above the bottom tab bar
+       on mobile via safe-area-aware offset. -->
   {#if selectedCount > 0}
-    <div class="fixed inset-x-0 bottom-6 z-40 flex justify-center">
-      <div class="flex items-center gap-3 rounded-2xl border border-slate-700 bg-slate-900/95 px-5 py-3 shadow-2xl backdrop-blur-sm">
+    <div
+      class="fixed inset-x-2 z-40 flex justify-center lg:inset-x-0 lg:bottom-6"
+      style="bottom: calc(env(safe-area-inset-bottom, 0px) + 64px);"
+    >
+      <div class="flex w-full max-w-2xl flex-wrap items-center justify-center gap-2 rounded-2xl border border-slate-700 bg-slate-900/95 px-3 py-2.5 shadow-2xl backdrop-blur-sm sm:gap-3 sm:px-5 sm:py-3">
         <span class="text-sm font-medium text-slate-200">{selectedCount} selected</span>
-        <div class="h-5 w-px bg-slate-700"></div>
+        <div class="hidden h-5 w-px bg-slate-700 sm:block"></div>
         {#if submitCount > 0}
           <Button size="sm" onclick={bulkSubmit}>Submit ({submitCount})</Button>
         {/if}

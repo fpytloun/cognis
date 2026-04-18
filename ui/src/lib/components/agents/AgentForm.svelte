@@ -516,7 +516,9 @@
               {/each}
             </div>
 
-            <div class="space-y-2 max-h-80 overflow-y-auto">
+            <!-- Scroll-within-scroll is painful on touch. On mobile let the
+                 whole page scroll through this list; on desktop cap it. -->
+            <div class="space-y-2 md:max-h-80 md:overflow-y-auto">
               {#each toolCategories as category}
                 {@const categoryTools = toolsForCategory(category)}
                 <details class="rounded-xl border border-slate-800 bg-slate-950/50 p-3">

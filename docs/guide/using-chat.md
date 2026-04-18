@@ -67,3 +67,24 @@ If something looks wrong, check the system section for:
 - database and key information
 
 If the WebSocket connection drops, the UI will attempt to reconnect and recover missed events.
+
+## Install as an app (PWA)
+
+Cognis ships as a Progressive Web App. On desktop browsers (Chrome/Edge/Safari) and Android, you can install it for a dedicated window, app-icon launch, and an offline shell:
+
+- **Chrome / Edge (any platform)**: a one-time install banner appears inside the app. You can also use the browser's address-bar install button, or menu -> "Install Cognis".
+- **iOS Safari**: tap the Share icon, then "Add to Home Screen". Cognis detects this environment and shows a one-time hint with the instructions.
+- **Android Chrome**: tap menu -> "Install app" or wait for the in-app install banner.
+
+When installed:
+
+- The app launches in a standalone window with no browser chrome, respecting the safe-area insets on iPhone notches.
+- The app shell (HTML, JS, CSS) is cached so the UI loads even when the network is unavailable. Conversations still require a live WebSocket connection.
+- Updates are applied automatically. When a new version is available, a small banner appears at the top of the screen with a "Reload" action.
+
+## Mobile-specific behavior
+
+- Primary navigation on mobile is a bottom tab bar (Chat / Tasks / Agents / Settings). Inside a chat conversation the bar hides so the composer owns the bottom safe-area.
+- Tapping the hamburger button in the header opens a right-side sheet drawer with the full navigation. The sheet supports swipe-down-to-dismiss.
+- The composer uses 16 px text on mobile so iOS Safari does not zoom the viewport when you focus it.
+- The bottom tab bar, composer, and floating action bars respect the `safe-area-inset-bottom` so they sit above the Home Indicator on iPhones.

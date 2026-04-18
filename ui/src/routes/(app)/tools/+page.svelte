@@ -678,7 +678,25 @@
     {#if tool.parameters?.properties && Object.keys(tool.parameters.properties).length > 0}
       <div>
         <span class="text-zinc-500 text-xs uppercase tracking-wider">Parameters</span>
-        <div class="mt-1.5 border border-zinc-700/50 rounded-lg overflow-hidden">
+        <!-- Mobile: stacked card per parameter. Desktop: 3-column table. -->
+        <div class="mt-1.5 md:hidden space-y-2">
+          {#each Object.entries(tool.parameters.properties) as [paramName, param]}
+            {@const isRequired = (tool.parameters.required || []).includes(paramName)}
+            <div class="rounded-lg border border-zinc-700/50 bg-zinc-900/60 p-3">
+              <div class="flex items-start justify-between gap-3">
+                <span class="font-mono text-sm text-zinc-100 break-all">{paramName}{#if isRequired}<span class="text-red-400 ml-0.5">*</span>{/if}</span>
+                <span class="shrink-0 font-mono text-xs text-zinc-400">{param.type || 'any'}</span>
+              </div>
+              {#if param.enum}
+                <p class="mt-1 text-xs text-zinc-500">({param.enum.join(' | ')})</p>
+              {/if}
+              {#if param.description}
+                <p class="mt-2 text-xs text-zinc-400">{param.description}</p>
+              {/if}
+            </div>
+          {/each}
+        </div>
+        <div class="mt-1.5 hidden rounded-lg border border-zinc-700/50 md:block overflow-x-auto">
           <table class="w-full text-sm">
             <thead><tr class="bg-zinc-800/50"><th class="text-left px-3 py-1.5 text-zinc-400 font-medium">Name</th><th class="text-left px-3 py-1.5 text-zinc-400 font-medium">Type</th><th class="text-left px-3 py-1.5 text-zinc-400 font-medium">Description</th></tr></thead>
             <tbody class="divide-y divide-zinc-700/30">

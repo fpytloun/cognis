@@ -1,5 +1,26 @@
-import { renderMarkdown } from '$lib/markdown';
+import { createMarkdownStreamer, renderMarkdown, type MarkdownStreamer } from '$lib/markdown';
 import type { AttachmentRef, CognisWebSocketEvent, MessageEvent } from '$lib/types/api';
+
+/**
+ * Per-message markdown streamers. Streaming assistant replies accumulate
+ * tokens chunk-by-chunk; rather than re-parse the whole content on every
+ * chunk we give each message its own streamer so only the tail block is
+ * re-parsed while earlier blocks stay memoized. See createMarkdownStreamer().
+ */
+const streamers = new Map<string, MarkdownStreamer>();
+
+function getStreamer(messageId: string): MarkdownStreamer {
+  let streamer = streamers.get(messageId);
+  if (!streamer) {
+    streamer = createMarkdownStreamer();
+    streamers.set(messageId, streamer);
+  }
+  return streamer;
+}
+
+export function releaseStreamer(messageId: string): void {
+  streamers.delete(messageId);
+}
 
 export type TimelineItem =
   | MessageTimelineItem
@@ -579,10 +600,13 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
     if (index >= 0) {
       const message = next[index] as MessageTimelineItem;
       const content = `${message.content}${event.content}`;
+      // Use the per-message streamer: finalized blocks are memoized, only the
+      // in-progress tail is re-parsed. See docstring on createMarkdownStreamer.
+      const streamer = getStreamer(event.message_id);
       next[index] = {
         ...message,
         content,
-        html: renderMarkdown(content),
+        html: streamer.render(content),
         streaming: true,
         timestamp: message.timestamp ?? new Date().toISOString()
       };
@@ -601,8 +625,13 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
     const attachments = Array.isArray(event.attachments) ? event.attachments : [];
     if (index >= 0) {
       const message = next[index] as MessageTimelineItem;
+      // Finalize and release the streamer for this message.
+      const streamer = getStreamer(event.message_id);
+      const finalHtml = streamer.finalize(message.content);
+      releaseStreamer(event.message_id);
       next[index] = {
         ...message,
+        html: finalHtml,
         seq: event.seq,
         streaming: false,
         attachments: attachments.length > 0 ? attachments : message.attachments

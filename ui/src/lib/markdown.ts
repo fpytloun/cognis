@@ -36,7 +36,135 @@ function createDocsRenderer(): Renderer {
 export function renderDocsMarkdown(markdown: string): string {
   const parsed = marked.parse(markdown, {
     async: false,
-    renderer: createDocsRenderer(),
+    renderer: createDocsRenderer()
   });
   return sanitizeHtml(typeof parsed === 'string' ? parsed : '');
+}
+
+/**
+ * Streaming markdown renderer.
+ *
+ * Splits incoming content at block boundaries (blank lines and fenced code
+ * blocks) and memoizes per-block HTML. Re-parsing during streaming only hits
+ * the tail block. For a 2000-token assistant reply this turns an O(n^2)
+ * parse+sanitize into O(n) at steady state.
+ *
+ * Usage:
+ *   const streamer = createMarkdownStreamer();
+ *   const html = streamer.render(content);
+ *   // On message_complete, finalize to force-flush the tail.
+ *   const finalHtml = streamer.finalize(content);
+ */
+export interface MarkdownStreamer {
+  render(content: string): string;
+  finalize(content: string): string;
+  reset(): void;
+}
+
+export function createMarkdownStreamer(): MarkdownStreamer {
+  // Map of block text -> rendered HTML fragment (stable blocks only).
+  const cache = new Map<string, string>();
+  let stableHtml = '';
+  let stableLen = 0;
+
+  function splitBlocks(text: string): { stable: string[]; tail: string } {
+    // Walk chars and keep track of fenced code state so we don't split mid-fence.
+    const blocks: string[] = [];
+    let start = 0;
+    let i = 0;
+    let inFence = false;
+    let fenceMarker = '';
+
+    const lines = text.split('\n');
+    let charIdx = 0;
+    let blockStart = 0;
+
+    for (let li = 0; li < lines.length; li++) {
+      const line = lines[li];
+      const fenceMatch = line.match(/^(```+|~~~+)/);
+      if (fenceMatch) {
+        if (!inFence) {
+          inFence = true;
+          fenceMarker = fenceMatch[1];
+        } else if (line.startsWith(fenceMarker)) {
+          inFence = false;
+          fenceMarker = '';
+        }
+      }
+      const isBlockBreak = !inFence && line.trim() === '';
+      if (isBlockBreak && blockStart < charIdx) {
+        const block = text.slice(blockStart, charIdx);
+        if (block.trim()) blocks.push(block);
+        blockStart = charIdx + line.length + 1;
+      }
+      charIdx += line.length + 1;
+      i = li;
+    }
+
+    // Anything after the last block break is the tail. If we're not in a
+    // fence and the last char was a blank line, tail is empty.
+    const tail = blockStart < text.length ? text.slice(blockStart) : '';
+
+    return { stable: blocks, tail };
+  }
+
+  function parseSanitize(chunk: string): string {
+    const parsed = marked.parse(chunk, { async: false });
+    return sanitizeHtml(typeof parsed === 'string' ? parsed : '');
+  }
+
+  function render(content: string): string {
+    if (!content) {
+      stableHtml = '';
+      stableLen = 0;
+      return '';
+    }
+
+    const { stable, tail } = splitBlocks(content);
+
+    // Cache hit: re-use memoized HTML for each stable block.
+    let pieces = '';
+    for (const block of stable) {
+      let html = cache.get(block);
+      if (html === undefined) {
+        html = parseSanitize(block);
+        cache.set(block, html);
+      }
+      pieces += html;
+    }
+    stableHtml = pieces;
+    stableLen = stable.reduce((acc, b) => acc + b.length, 0);
+
+    const tailHtml = tail.trim() ? parseSanitize(tail) : '';
+    return pieces + tailHtml;
+  }
+
+  function finalize(content: string): string {
+    // Force a full parse of the tail; cache stable blocks for future calls.
+    const { stable, tail } = splitBlocks(content);
+    let pieces = '';
+    for (const block of stable) {
+      let html = cache.get(block);
+      if (html === undefined) {
+        html = parseSanitize(block);
+        cache.set(block, html);
+      }
+      pieces += html;
+    }
+    if (tail.trim()) {
+      // Don't cache trailing fragment (may still grow with follow-up edits).
+      pieces += parseSanitize(tail);
+    }
+    stableHtml = pieces;
+    stableLen = content.length;
+    return pieces;
+  }
+
+  function reset(): void {
+    cache.clear();
+    stableHtml = '';
+    stableLen = 0;
+  }
+
+  return { render, finalize, reset };
 }

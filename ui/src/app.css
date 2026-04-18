@@ -3,7 +3,13 @@
 @tailwind utilities;
 
 :root {
-  color-scheme: light;
+  color-scheme: dark;
+  --kb-offset: 0px;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
 }
 
 html,
@@ -16,10 +22,13 @@ body,
 body {
   @apply bg-slate-950 text-slate-100 antialiased;
   min-height: 100dvh;
+  /* Simplified background: single subtle radial + gradient. Previous 3-layer
+     stack caused continuous GPU composition on low-end devices. */
   background-image:
-    radial-gradient(circle at top left, rgb(59 130 246 / 0.18), transparent 28%),
-    radial-gradient(circle at top right, rgb(14 165 233 / 0.12), transparent 24%),
+    radial-gradient(circle at top left, rgb(59 130 246 / 0.12), transparent 42%),
     linear-gradient(180deg, rgb(2 6 23) 0%, rgb(15 23 42) 100%);
+  background-attachment: fixed;
+  overscroll-behavior-y: none;
 }
 
 @supports (padding: max(0px)) {
@@ -103,12 +112,13 @@ textarea:focus-visible,
   border-radius: 9999px;
   background: rgb(15 23 42 / 0.92);
   color: rgb(148 163 184);
-  padding: 0.3rem 0.55rem;
-  font-size: 0.65rem;
+  padding: 0.5rem 0.8rem; /* larger tap target on mobile */
+  font-size: 0.7rem;
   font-weight: 600;
   letter-spacing: 0.08em;
   text-transform: uppercase;
   transition: color 120ms ease, border-color 120ms ease, background-color 120ms ease;
+  min-height: 36px;
 }
 
 .chat-code-copy-button:hover {
@@ -118,18 +128,42 @@ textarea:focus-visible,
 }
 
 .chat-code-copy-button svg {
-  width: 0.85rem;
-  height: 0.85rem;
+  width: 0.9rem;
+  height: 0.9rem;
 }
 
 @media (max-width: 640px) {
   .chat-markdown pre {
-    padding-top: 2.5rem;
+    padding-top: 2.75rem;
   }
 
   .chat-code-copy-button {
-    top: 0.55rem;
-    right: 0.55rem;
-    padding: 0.25rem 0.45rem;
+    top: 0.5rem;
+    right: 0.5rem;
   }
+}
+
+/* Respect reduced-motion. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Touch-scroll niceties. */
+.overflow-y-auto,
+.overflow-auto,
+.overflow-x-auto {
+  -webkit-overflow-scrolling: touch;
+}
+
+/* Utility: bottom-sheet-safe element that floats above the iOS keyboard. */
+.kb-offset {
+  transform: translateY(calc(var(--kb-offset) * -1));
+  transition: transform 180ms cubic-bezier(0.32, 0.72, 0, 1);
 }

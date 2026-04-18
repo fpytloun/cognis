@@ -1239,9 +1239,25 @@
   <LoadingState label="Loading settings" description="Fetching providers, routing, secrets, diagnostics, and account data." />
 {:else}
   <section class="space-y-5">
-    <div class="flex flex-wrap gap-2">
+    <!-- Mobile: horizontally scrollable pill strip. Desktop: flex-wrap.
+         Previously 9 buttons wrapped to 3 lines on phones. -->
+    <div class="sticky top-0 z-10 -mx-2 overflow-x-auto px-2 py-1 sm:mx-0 sm:px-0 md:hidden">
+      <div class="flex gap-2 pb-1" role="tablist" aria-label="Settings sections">
+        {#each tabs as tab}
+          <Button
+            class="shrink-0 snap-start"
+            variant={activeTab === tab ? 'primary' : 'secondary'}
+            size="sm"
+            onclick={() => setActiveTab(tab)}
+            aria-selected={activeTab === tab}
+            role="tab"
+          >{TAB_LABELS[tab]}</Button>
+        {/each}
+      </div>
+    </div>
+    <div class="hidden md:flex flex-wrap gap-2" role="tablist" aria-label="Settings sections">
       {#each tabs as tab}
-        <Button variant={activeTab === tab ? 'primary' : 'secondary'} onclick={() => setActiveTab(tab)}>{TAB_LABELS[tab]}</Button>
+        <Button variant={activeTab === tab ? 'primary' : 'secondary'} onclick={() => setActiveTab(tab)} role="tab" aria-selected={activeTab === tab}>{TAB_LABELS[tab]}</Button>
       {/each}
     </div>
 

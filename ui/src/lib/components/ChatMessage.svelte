@@ -4,11 +4,15 @@
   import type { MessageTimelineItem } from '$lib/chat';
   import LiveDots from '$lib/components/LiveDots.svelte';
   import { addToast } from '$lib/stores/toasts';
+  import { now as nowStore } from '$lib/stores/now';
   import { formatAbsoluteTime, formatCompactTime } from '$lib/time';
 
   let { item } = $props<{ item: MessageTimelineItem }>();
 
-  let now = $state(new Date());
+  // Subscribe to the single global "now" ticker instead of starting a per-message
+  // setInterval. On conversations with dozens of visible messages this avoids
+  // dozens of redundant timers and improves mobile battery life.
+  const nowDate = $derived(new Date($nowStore));
   let messageCopied = $state(false);
   let copiedCodeBlocks = $state<Set<string>>(new Set());
   let copyResetTimer: number | null = null;
@@ -21,9 +25,7 @@
   }
 
   onMount(() => {
-    const interval = setInterval(() => { now = new Date(); }, 30_000);
     return () => {
-      clearInterval(interval);
       if (copyResetTimer !== null) {
         window.clearTimeout(copyResetTimer);
       }
@@ -66,49 +68,83 @@
     }
   }
 
-  function addCodeCopyButtons(node: HTMLDivElement, _html: string): { update: (_html: string) => void; destroy: () => void } {
-    let cleanupCallbacks: Array<() => void> = [];
+  /**
+   * Idempotent code-copy button mounter.
+   *
+   * Previously, this directive's `update` path ran on every streaming chunk,
+   * tearing down and rebuilding every `<pre>`'s copy button. On a long
+   * assistant reply with several code blocks that was the single most
+   * expensive mobile work during streaming.
+   *
+   * Now:
+   *   - Only `<pre>` elements that don't already carry our data-attribute
+   *     receive a button. Existing mounts are left alone.
+   *   - On each sync() we also cancel any timers for `<pre>` elements that
+   *     vanished (e.g. streaming tail rebuilt by markdown streamer) so we
+   *     don't keep trying to restore the label on a detached node.
+   */
+  function addCodeCopyButtons(
+    node: HTMLDivElement,
+    _html: string
+  ): { update: (_html: string) => void; destroy: () => void } {
+    // Track which pre element a copyKey currently maps to, so we can clear
+    // timers for keys whose pre has been replaced.
+    const labelByKey = new Map<string, HTMLElement>();
 
-    const renderButtons = (): void => {
-      cleanupCallbacks.forEach((cleanup) => cleanup());
-      cleanupCallbacks = [];
+    const cancelTimer = (copyKey: string): void => {
+      const existing = codeCopyResetTimers.get(copyKey);
+      if (existing !== undefined) {
+        window.clearTimeout(existing);
+        codeCopyResetTimers.delete(copyKey);
+      }
+    };
 
-      const blocks = Array.from(node.querySelectorAll('pre'));
+    const markCopied = (copyKey: string, label: HTMLElement): void => {
+      copiedCodeBlocks = new Set([...copiedCodeBlocks, copyKey]);
+      label.textContent = 'Copied';
+      cancelTimer(copyKey);
+      const reset = window.setTimeout(() => {
+        const next = new Set(copiedCodeBlocks);
+        next.delete(copyKey);
+        copiedCodeBlocks = next;
+        codeCopyResetTimers.delete(copyKey);
+        // Only touch the label if it's still in the DOM — if the streaming
+        // rerender replaced the <pre>, we'd be writing to a detached node.
+        const current = labelByKey.get(copyKey);
+        if (current && current.isConnected) current.textContent = 'Copy';
+      }, 2000);
+      codeCopyResetTimers.set(copyKey, reset);
+    };
+
+    const sync = (): void => {
+      const blocks = Array.from(node.querySelectorAll<HTMLElement>('pre'));
+      const seenKeys = new Set<string>();
+
       for (const [index, block] of blocks.entries()) {
+        const copyKey = `${item.id}:${index}`;
+        seenKeys.add(copyKey);
+
+        if (block.dataset.copyMounted === '1') continue;
         const code = block.querySelector('code');
         if (!code) continue;
 
         block.classList.add('chat-code-block');
+        block.dataset.copyMounted = '1';
 
         const button = document.createElement('button');
         const label = document.createElement('span');
-        const copyKey = `${item.id}:${index}`;
         label.textContent = copiedCodeBlocks.has(copyKey) ? 'Copied' : 'Copy';
         button.type = 'button';
         button.className = 'chat-code-copy-button';
         button.setAttribute('aria-label', 'Copy code block');
-        button.innerHTML = copiedCodeBlocks.has(copyKey)
-          ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg>'
-          : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>';
+        button.innerHTML =
+          '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>';
         button.append(label);
 
         const onClick = async (): Promise<void> => {
           try {
             await navigator.clipboard.writeText(code.textContent ?? '');
-            copiedCodeBlocks = new Set([...copiedCodeBlocks, copyKey]);
-            const existingTimer = codeCopyResetTimers.get(copyKey);
-            if (existingTimer !== undefined) {
-              window.clearTimeout(existingTimer);
-            }
-            renderButtons();
-            const resetTimer = window.setTimeout(() => {
-              const next = new Set(copiedCodeBlocks);
-              next.delete(copyKey);
-              copiedCodeBlocks = next;
-              codeCopyResetTimers.delete(copyKey);
-              renderButtons();
-            }, 2000);
-            codeCopyResetTimers.set(copyKey, resetTimer);
+            markCopied(copyKey, label);
           } catch {
             addToast('Failed to copy code block', 'error');
           }
@@ -116,20 +152,31 @@
 
         button.addEventListener('click', onClick);
         block.append(button);
-        cleanupCallbacks.push(() => button.removeEventListener('click', onClick));
-        cleanupCallbacks.push(() => button.remove());
+        labelByKey.set(copyKey, label);
+      }
+
+      // Cancel timers for copyKeys whose <pre> has been removed by a
+      // streaming tail rebuild, so we don't attempt to restore text on a
+      // detached label.
+      for (const copyKey of labelByKey.keys()) {
+        if (!seenKeys.has(copyKey)) {
+          cancelTimer(copyKey);
+          labelByKey.delete(copyKey);
+        }
       }
     };
 
-    renderButtons();
+    sync();
 
     return {
       update(_nextHtml: string) {
-        renderButtons();
+        // New <pre> elements may have been appended by the streaming tail
+        // re-render. Existing ones are skipped.
+        sync();
       },
       destroy() {
-        cleanupCallbacks.forEach((cleanup) => cleanup());
-        cleanupCallbacks = [];
+        for (const copyKey of labelByKey.keys()) cancelTimer(copyKey);
+        labelByKey.clear();
       }
     };
   }
@@ -165,7 +212,7 @@
   <div class="mt-2.5 flex items-center justify-between gap-3 text-[10px] uppercase tracking-[0.18em] opacity-70 sm:mt-3 sm:text-[11px]">
     <div class="flex items-center gap-2 sm:gap-3">
       <span>{item.role}</span>
-      <span title={formatAbsoluteTime(item.timestamp)}>{formatCompactTime(item.timestamp, now)}</span>
+      <span title={formatAbsoluteTime(item.timestamp)}>{formatCompactTime(item.timestamp, nowDate)}</span>
     </div>
     <div class="flex items-center gap-2">
       {#if item.streaming}
@@ -173,16 +220,16 @@
       {/if}
       {#if item.role === 'assistant' && !item.streaming}
         <button
-          class="inline-flex h-7 w-7 items-center justify-center rounded-full text-slate-400 transition hover:bg-slate-800/80 hover:text-slate-100"
+          class="inline-flex h-10 w-10 items-center justify-center rounded-full text-slate-400 transition hover:bg-slate-800/80 hover:text-slate-100 md:h-8 md:w-8"
           onclick={copyMessage}
           type="button"
           title="Copy raw markdown"
           aria-label="Copy raw markdown"
         >
           {#if messageCopied}
-            <Check class="h-3.5 w-3.5" />
+            <Check class="h-4 w-4 md:h-3.5 md:w-3.5" />
           {:else}
-            <Copy class="h-3.5 w-3.5" />
+            <Copy class="h-4 w-4 md:h-3.5 md:w-3.5" />
           {/if}
         </button>
       {/if}

@@ -432,34 +432,39 @@
               </div>
             </button>
 
-            <!-- Quick actions (visible on hover) -->
-            <div class="absolute right-3 top-3 flex gap-1 opacity-0 transition-opacity group-hover:opacity-100">
+            <!-- Quick actions. Always visible on touch (previously used
+                 opacity-0 group-hover which is unreachable on touch devices);
+                 dimmed at rest on desktop and brightened on hover. -->
+            <div class="absolute right-2 top-2 flex gap-1 opacity-100 transition-opacity lg:opacity-60 lg:group-hover:opacity-100">
               <Tooltip text={schedule.enabled ? 'Disable' : 'Enable'}>
                 <button
-                  class="rounded-lg p-1.5 text-slate-400 hover:bg-slate-800 hover:text-white"
+                  class="inline-flex h-10 w-10 items-center justify-center rounded-xl text-slate-300 hover:bg-slate-800 hover:text-white md:h-8 md:w-8"
+                  aria-label={schedule.enabled ? 'Disable schedule' : 'Enable schedule'}
                   onclick={(e: MouseEvent) => { e.stopPropagation(); toggleEnabled(schedule); }}
                 >
                   {#if schedule.enabled}
-                    <Pause class="h-3.5 w-3.5" />
+                    <Pause class="h-4 w-4" />
                   {:else}
-                    <Play class="h-3.5 w-3.5" />
+                    <Play class="h-4 w-4" />
                   {/if}
                 </button>
               </Tooltip>
               <Tooltip text="Trigger now">
                 <button
-                  class="rounded-lg p-1.5 text-slate-400 hover:bg-slate-800 hover:text-white"
+                  class="inline-flex h-10 w-10 items-center justify-center rounded-xl text-slate-300 hover:bg-slate-800 hover:text-white md:h-8 md:w-8"
+                  aria-label="Trigger schedule now"
                   onclick={(e: MouseEvent) => { e.stopPropagation(); triggerNow(schedule); }}
                 >
-                  <Zap class="h-3.5 w-3.5" />
+                  <Zap class="h-4 w-4" />
                 </button>
               </Tooltip>
               <Tooltip text="Delete">
                 <button
-                  class="rounded-lg p-1.5 text-slate-400 hover:bg-red-900/50 hover:text-red-400"
+                  class="inline-flex h-10 w-10 items-center justify-center rounded-xl text-slate-300 hover:bg-red-900/50 hover:text-red-400 md:h-8 md:w-8"
+                  aria-label="Delete schedule"
                   onclick={(e: MouseEvent) => { e.stopPropagation(); deleteSchedule(schedule); }}
                 >
-                  <Trash2 class="h-3.5 w-3.5" />
+                  <Trash2 class="h-4 w-4" />
                 </button>
               </Tooltip>
             </div>
@@ -482,7 +487,12 @@
     <div class="max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-3xl border border-slate-700 bg-slate-900 p-6 shadow-2xl" role="dialog" aria-modal="true" aria-label="Create schedule">
       <div class="mb-5 flex items-center justify-between">
         <h2 class="text-lg font-semibold text-white">Create schedule</h2>
-        <button class="text-slate-400 hover:text-white" onclick={() => (showCreateModal = false)} aria-label="Close">&times;</button>
+        <button
+          class="inline-flex h-11 w-11 items-center justify-center rounded-xl text-slate-400 hover:bg-slate-800 hover:text-white"
+          onclick={() => (showCreateModal = false)}
+          aria-label="Close"
+          type="button"
+        >&times;</button>
       </div>
 
       <div class="space-y-4">
@@ -523,11 +533,12 @@
           <div class="space-y-1">
             <label for="sched-cron" class="text-xs font-medium uppercase tracking-widest text-slate-400">Cron expression</label>
             <Input id="sched-cron" bind:value={form.cron_expr} placeholder="0 9 * * *" />
-            <div class="flex flex-wrap gap-1.5 pt-1">
+            <div class="flex flex-wrap gap-2 pt-1">
               {#each cronPresets as preset}
                 <button
-                  class="rounded-lg border border-slate-700 px-2 py-0.5 text-xs text-slate-400 transition-colors hover:border-slate-500 hover:text-slate-200 {form.cron_expr === preset.value ? 'border-blue-500/50 bg-blue-500/10 text-blue-400' : ''}"
+                  class="rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-300 transition-colors hover:border-slate-500 hover:text-slate-200 md:py-1 md:text-xs {form.cron_expr === preset.value ? 'border-blue-500/50 bg-blue-500/10 text-blue-400' : ''}"
                   onclick={() => (form.cron_expr = preset.value)}
+                  type="button"
                 >
                   {preset.label}
                 </button>
@@ -545,11 +556,12 @@
         {:else if form.schedule_type === 'interval'}
           <div class="space-y-1">
             <label class="text-xs font-medium uppercase tracking-widest text-slate-400">Interval</label>
-            <div class="flex flex-wrap gap-1.5">
+            <div class="flex flex-wrap gap-2">
               {#each intervalPresets as preset}
                 <button
-                  class="rounded-lg border border-slate-700 px-2 py-1 text-xs text-slate-400 transition-colors hover:border-slate-500 hover:text-slate-200 {form.interval_seconds === preset.value ? 'border-blue-500/50 bg-blue-500/10 text-blue-400' : ''}"
+                  class="rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-300 transition-colors hover:border-slate-500 hover:text-slate-200 md:py-1 md:text-xs {form.interval_seconds === preset.value ? 'border-blue-500/50 bg-blue-500/10 text-blue-400' : ''}"
                   onclick={() => (form.interval_seconds = preset.value)}
+                  type="button"
                 >
                   {preset.label}
                 </button>
@@ -564,8 +576,8 @@
           </div>
         {/if}
 
-        <!-- Agent + Workflow -->
-        <div class="grid grid-cols-2 gap-4">
+        <!-- Agent + Workflow. Stacks on narrow phones; two columns at sm+. -->
+        <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
           <div class="space-y-1">
             <label for="sched-agent" class="text-xs font-medium uppercase tracking-widest text-slate-400">Agent</label>
             <select id="sched-agent" bind:value={form.agent_id} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
@@ -600,8 +612,8 @@
           ></textarea>
         </div>
 
-        <!-- Task options -->
-        <div class="grid grid-cols-2 gap-4">
+        <!-- Task options. Stacks on narrow phones. -->
+        <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
           <div class="space-y-1">
             <label for="sched-priority" class="text-xs font-medium uppercase tracking-widest text-slate-400">Priority</label>
             <Input id="sched-priority" bind:value={form.priority} type="number" />
