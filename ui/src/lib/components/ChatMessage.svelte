@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { Check, Copy } from 'lucide-svelte';
+  import Check from 'lucide-svelte/icons/check';
+import Copy from 'lucide-svelte/icons/copy';
   import { onMount } from 'svelte';
   import type { MessageTimelineItem } from '$lib/chat';
   import LiveDots from '$lib/components/LiveDots.svelte';

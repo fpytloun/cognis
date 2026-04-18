@@ -3,7 +3,20 @@
   import { page } from '$app/state';
   import { onMount, tick } from 'svelte';
   import { fade } from 'svelte/transition';
-  import { ArrowDown, ArrowLeft, Check, ChevronDown, ChevronUp, ChevronsLeft, ChevronsRight, Copy, Info, Maximize2, Minimize2, Paperclip, Search, X } from 'lucide-svelte';
+  import ArrowDown from 'lucide-svelte/icons/arrow-down';
+import ArrowLeft from 'lucide-svelte/icons/arrow-left';
+import Check from 'lucide-svelte/icons/check';
+import ChevronDown from 'lucide-svelte/icons/chevron-down';
+import ChevronUp from 'lucide-svelte/icons/chevron-up';
+import ChevronsLeft from 'lucide-svelte/icons/chevrons-left';
+import ChevronsRight from 'lucide-svelte/icons/chevrons-right';
+import Copy from 'lucide-svelte/icons/copy';
+import Info from 'lucide-svelte/icons/info';
+import Maximize2 from 'lucide-svelte/icons/maximize-2';
+import Minimize2 from 'lucide-svelte/icons/minimize-2';
+import Paperclip from 'lucide-svelte/icons/paperclip';
+import Search from 'lucide-svelte/icons/search';
+import X from 'lucide-svelte/icons/x';
 
   import AgentAvatar from '$lib/components/AgentAvatar.svelte';
   import AgentProfilePopover from '$lib/components/AgentProfilePopover.svelte';
@@ -2393,23 +2406,31 @@
               Send the first message to start this conversation.
             </p>
           {:else}
+            <!--
+              Timeline virtualization via CSS `content-visibility: auto`
+              (see `.chat-timeline-item` in app.css). Browsers skip paint
+              and layout of messages that are scrolled off-screen, giving
+              us most of the benefit of full virtualization without a new
+              runtime dep. `contain-intrinsic-size` supplies a placeholder
+              so the scrollbar doesn't jump while content pops in.
+            -->
             {#each displayedTimeline as item (item.id)}
               {#if item.kind === 'message'}
-                <div class={`flex min-w-0 ${item.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                <div class={`chat-timeline-item kind-message flex min-w-0 ${item.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                   <ChatMessage {item} />
                 </div>
               {:else if item.kind === 'tool_call'}
-                <ToolCallBlock {item} />
+                <div class="chat-timeline-item kind-tool_call"><ToolCallBlock {item} /></div>
               {:else if item.kind === 'reasoning'}
-                <ReasoningBlock {item} />
+                <div class="chat-timeline-item kind-reasoning"><ReasoningBlock {item} /></div>
               {:else if item.kind === 'delegation'}
-                <DelegationCard {item} onViewSession={handleViewSession} />
+                <div class="chat-timeline-item kind-delegation"><DelegationCard {item} onViewSession={handleViewSession} /></div>
               {:else if item.kind === 'compaction'}
-                <CompactionCard {item} onViewPreviousSession={handleViewSession} />
+                <div class="chat-timeline-item kind-compaction"><CompactionCard {item} onViewPreviousSession={handleViewSession} /></div>
               {:else if item.kind === 'system_message'}
-                <p class="py-1 text-center text-xs italic text-slate-500 whitespace-pre-line">{item.text}</p>
+                <p class="chat-timeline-item kind-system_message py-1 text-center text-xs italic text-slate-500 whitespace-pre-line">{item.text}</p>
               {:else}
-                <article class={`rounded-3xl border px-4 py-4 text-sm shadow-card ${item.tone === 'warning' ? 'border-amber-500/30 bg-amber-500/10 text-amber-100' : item.tone === 'error' ? 'border-rose-500/30 bg-rose-500/10 text-rose-100' : 'border-slate-700 bg-slate-900 text-slate-200'}`}>
+                <article class={`chat-timeline-item kind-notice rounded-3xl border px-4 py-4 text-sm shadow-card ${item.tone === 'warning' ? 'border-amber-500/30 bg-amber-500/10 text-amber-100' : item.tone === 'error' ? 'border-rose-500/30 bg-rose-500/10 text-rose-100' : 'border-slate-700 bg-slate-900 text-slate-200'}`}>
                   <h3 class="font-semibold">{item.title}</h3>
                   <p class="mt-2 leading-6">{item.description}</p>
                 </article>

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
-  import { ArrowDown } from 'lucide-svelte';
+  import ArrowDown from 'lucide-svelte/icons/arrow-down';
 
   import { api, asApiError } from '$lib/api/client';
   import {

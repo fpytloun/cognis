@@ -1,28 +1,26 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import {
-    BrainCircuit,
-    ChevronDown,
-    ChevronRight,
-    Download,
-    ExternalLink,
-    GitBranch,
-    Import,
-    ListChecks,
-    Plug,
-    Plus,
-    Search,
-    Settings,
-    ShieldCheck,
-    Trash2,
-    Pencil,
-    FileText,
-    Terminal,
-    Globe,
-    Wrench,
-    Server,
-    BookOpen
-  } from 'lucide-svelte';
+  import BrainCircuit from 'lucide-svelte/icons/brain-circuit';
+import ChevronDown from 'lucide-svelte/icons/chevron-down';
+import ChevronRight from 'lucide-svelte/icons/chevron-right';
+import Download from 'lucide-svelte/icons/download';
+import ExternalLink from 'lucide-svelte/icons/external-link';
+import GitBranch from 'lucide-svelte/icons/git-branch';
+import Import from 'lucide-svelte/icons/import';
+import ListChecks from 'lucide-svelte/icons/list-checks';
+import Plug from 'lucide-svelte/icons/plug';
+import Plus from 'lucide-svelte/icons/plus';
+import Search from 'lucide-svelte/icons/search';
+import Settings from 'lucide-svelte/icons/settings';
+import ShieldCheck from 'lucide-svelte/icons/shield-check';
+import Trash2 from 'lucide-svelte/icons/trash-2';
+import Pencil from 'lucide-svelte/icons/pencil';
+import FileText from 'lucide-svelte/icons/file-text';
+import Terminal from 'lucide-svelte/icons/terminal';
+import Globe from 'lucide-svelte/icons/globe';
+import Wrench from 'lucide-svelte/icons/wrench';
+import Server from 'lucide-svelte/icons/server';
+import BookOpen from 'lucide-svelte/icons/book-open';
 
   import { api } from '$lib/api/client';
   import Badge from '$lib/components/ui/Badge.svelte';

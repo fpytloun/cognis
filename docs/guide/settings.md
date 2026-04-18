@@ -16,6 +16,21 @@ Depending on your role, the settings workspace can include:
 - users
 - account settings and API keys
 
+Each section is also reachable by a clean URL so you can bookmark or link to
+a specific tab:
+
+- `/settings/providers`
+- `/settings/routing`
+- `/settings/secrets`
+- `/settings/web`
+- `/settings/tools`
+- `/settings/executors`
+- `/settings/users`
+- `/settings/system`
+- `/settings/account`
+
+These all land on the main settings page with the matching tab selected.
+
 ## Providers and routing
 
 Use the provider and routing tabs to decide:

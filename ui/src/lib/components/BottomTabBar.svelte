@@ -1,6 +1,9 @@
 <script lang="ts">
   import { page } from '$app/stores';
-  import { Bot, ListTodo, MessageSquareText, Settings } from 'lucide-svelte';
+  import Bot from 'lucide-svelte/icons/bot';
+import ListTodo from 'lucide-svelte/icons/list-todo';
+import MessageSquareText from 'lucide-svelte/icons/message-square-text';
+import Settings from 'lucide-svelte/icons/settings';
 
   /**
    * Mobile bottom tab bar. Shown only below `lg` breakpoint (matches `isMobile`

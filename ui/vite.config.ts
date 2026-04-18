@@ -16,6 +16,11 @@ export default defineConfig({
       }
     }
   },
+  build: {
+    // Warn when a chunk exceeds 250KB (uncompressed). Initial-load chunks
+    // should stay well below this to keep mobile time-to-interactive low.
+    chunkSizeWarningLimit: 250
+  },
   test: {
     environment: 'jsdom',
     include: ['src/**/*.{test,spec}.{ts,js}'],

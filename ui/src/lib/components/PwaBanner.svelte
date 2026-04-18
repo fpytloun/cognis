@@ -1,6 +1,9 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { Download, RefreshCw, Share, X } from 'lucide-svelte';
+  import Download from 'lucide-svelte/icons/download';
+import RefreshCw from 'lucide-svelte/icons/refresh-cw';
+import Share from 'lucide-svelte/icons/share';
+import X from 'lucide-svelte/icons/x';
 
   import Button from '$lib/components/ui/Button.svelte';
   import {

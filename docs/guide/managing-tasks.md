@@ -27,6 +27,11 @@ The task board gives you a kanban-style view of work by status. From there you c
 - open task details
 - understand which items are blocked, active, or completed
 
+On mobile the board shows a single column at a time and a segmented-control
+selector (Draft / Queued / Running / Paused / Done) so each column fills the
+viewport. Drag-and-drop is desktop only; on mobile, open the task detail and
+use the state buttons to move work.
+
 ## Task detail view
 
 The task detail page shows the full workflow run, including:

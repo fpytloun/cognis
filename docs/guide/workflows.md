@@ -41,6 +41,8 @@ Open `Workflows` and either:
 
 You can then define metadata, edit steps, preview the pipeline diagram, and save the workflow.
 
+On mobile, a sticky action bar at the bottom of the screen keeps `Save` one tap away even at the end of a long step editor. Other actions (New, Duplicate, Export YAML, Delete) are behind the `Actions` button on the same bar. Each step has up/down arrows for reorder, and every `?` help icon opens on tap.
+
 The main chat agent can also manage workflows directly when you want to stay in conversation instead of using the editor. In that case, the agent should inspect the existing workflow first, keep changes minimal, and avoid mutating workflows that are already referenced by active tasks.
 
 ## YAML import and export

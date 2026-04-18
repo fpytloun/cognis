@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { FileSearch, Logs } from 'lucide-svelte';
+  import FileSearch from 'lucide-svelte/icons/file-search';
+import Logs from 'lucide-svelte/icons/logs';
   import type { WorkflowStepFormState } from '$lib/workflows';
 
   let {

@@ -1,5 +1,8 @@
 <script lang="ts">
-  import { AlertCircle, CheckCircle2, Info, TriangleAlert } from 'lucide-svelte';
+  import AlertCircle from 'lucide-svelte/icons/alert-circle';
+import CheckCircle2 from 'lucide-svelte/icons/check-circle-2';
+import Info from 'lucide-svelte/icons/info';
+import TriangleAlert from 'lucide-svelte/icons/triangle-alert';
 
   import { removeToast, toastStore, type ToastItem } from '$lib/stores/toasts';
 

@@ -1,0 +1,25 @@
+<script lang="ts">
+  import { goto } from '$app/navigation';
+  import { onMount } from 'svelte';
+
+  // Clean-URL deep link for /settings/secrets. Redirects to the canonical
+  // /settings?tab=secrets. Three-layer redirect strategy:
+  //   1. `<meta http-equiv="refresh">` — fires before hydration in every
+  //      browser so direct visits / bookmarks never see a blank page for
+  //      more than a single paint frame (and no JS-disabled blank either).
+  //   2. A small interstitial body so even that single paint shows intent.
+  //   3. `goto(...)` in onMount — the fast path for the hydrated SPA case
+  //      (avoids a full reload when the user already has the app loaded).
+  onMount(() => {
+    void goto('/settings?tab=secrets', { replaceState: true });
+  });
+</script>
+
+<svelte:head>
+  <title>Settings · secrets · Cognis</title>
+  <meta http-equiv="refresh" content="0; url=/settings?tab=secrets" />
+</svelte:head>
+
+<div class="flex min-h-[40vh] items-center justify-center p-8 text-sm text-slate-400">
+  Opening settings…
+</div>

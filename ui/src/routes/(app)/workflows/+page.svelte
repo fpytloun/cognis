@@ -1,7 +1,9 @@
 <script lang="ts">
   import { beforeNavigate } from '$app/navigation';
   import { onMount } from 'svelte';
-  import { ArrowDown, ArrowUp, MoreVertical } from 'lucide-svelte';
+  import ArrowDown from 'lucide-svelte/icons/arrow-down';
+import ArrowUp from 'lucide-svelte/icons/arrow-up';
+import MoreVertical from 'lucide-svelte/icons/more-vertical';
 
   import { api, asApiError } from '$lib/api/client';
   import LoadingState from '$lib/components/LoadingState.svelte';

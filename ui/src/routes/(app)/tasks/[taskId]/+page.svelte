@@ -1,7 +1,19 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
   import { page } from '$app/stores';
-  import { ArrowLeft, ArrowRight, CheckCircle2, ChevronDown, ChevronUp, Clock3, GitBranch, LoaderCircle, PanelRightOpen, PlayCircle, Settings2, Sparkles, Target } from 'lucide-svelte';
+  import ArrowLeft from 'lucide-svelte/icons/arrow-left';
+import ArrowRight from 'lucide-svelte/icons/arrow-right';
+import CheckCircle2 from 'lucide-svelte/icons/check-circle-2';
+import ChevronDown from 'lucide-svelte/icons/chevron-down';
+import ChevronUp from 'lucide-svelte/icons/chevron-up';
+import Clock3 from 'lucide-svelte/icons/clock-3';
+import GitBranch from 'lucide-svelte/icons/git-branch';
+import LoaderCircle from 'lucide-svelte/icons/loader-circle';
+import PanelRightOpen from 'lucide-svelte/icons/panel-right-open';
+import PlayCircle from 'lucide-svelte/icons/play-circle';
+import Settings2 from 'lucide-svelte/icons/settings-2';
+import Sparkles from 'lucide-svelte/icons/sparkles';
+import Target from 'lucide-svelte/icons/target';
   import { onMount } from 'svelte';
 
   import { api, asApiError } from '$lib/api/client';

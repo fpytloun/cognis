@@ -12,18 +12,16 @@
   import { confirmAction } from '$lib/stores/confirm';
   import { addToast } from '$lib/stores/toasts';
   import type { Agent, Conversation, Schedule, Workflow } from '$lib/types/api';
-  import {
-    AlertTriangle,
-    Calendar,
-    Clock,
-    Pause,
-    Play,
-    Plus,
-    RefreshCw,
-    Timer,
-    Trash2,
-    Zap
-  } from 'lucide-svelte';
+  import AlertTriangle from 'lucide-svelte/icons/alert-triangle';
+import Calendar from 'lucide-svelte/icons/calendar';
+import Clock from 'lucide-svelte/icons/clock';
+import Pause from 'lucide-svelte/icons/pause';
+import Play from 'lucide-svelte/icons/play';
+import Plus from 'lucide-svelte/icons/plus';
+import RefreshCw from 'lucide-svelte/icons/refresh-cw';
+import Timer from 'lucide-svelte/icons/timer';
+import Trash2 from 'lucide-svelte/icons/trash-2';
+import Zap from 'lucide-svelte/icons/zap';
 
   let loading = $state(true);
   let error = $state('');

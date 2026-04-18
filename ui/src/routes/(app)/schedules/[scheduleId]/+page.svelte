@@ -22,20 +22,18 @@
   import { confirmAction } from '$lib/stores/confirm';
   import { addToast } from '$lib/stores/toasts';
   import type { Agent, Conversation, Schedule, ScheduleRun, Workflow } from '$lib/types/api';
-  import {
-    AlertTriangle,
-    ArrowLeft,
-    Calendar,
-    Check,
-    Clock,
-    Pause,
-    Play,
-    Save,
-    Timer,
-    Trash2,
-    X,
-    Zap
-  } from 'lucide-svelte';
+  import AlertTriangle from 'lucide-svelte/icons/alert-triangle';
+import ArrowLeft from 'lucide-svelte/icons/arrow-left';
+import Calendar from 'lucide-svelte/icons/calendar';
+import Check from 'lucide-svelte/icons/check';
+import Clock from 'lucide-svelte/icons/clock';
+import Pause from 'lucide-svelte/icons/pause';
+import Play from 'lucide-svelte/icons/play';
+import Save from 'lucide-svelte/icons/save';
+import Timer from 'lucide-svelte/icons/timer';
+import Trash2 from 'lucide-svelte/icons/trash-2';
+import X from 'lucide-svelte/icons/x';
+import Zap from 'lucide-svelte/icons/zap';
 
   let loading = $state(true);
   let saving = $state(false);

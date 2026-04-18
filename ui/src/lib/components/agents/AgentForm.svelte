@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { Sparkles, Loader2 } from 'lucide-svelte';
+  import Sparkles from 'lucide-svelte/icons/sparkles';
+import Loader2 from 'lucide-svelte/icons/loader-2';
   import Button from '$lib/components/ui/Button.svelte';
   import Card from '$lib/components/ui/Card.svelte';
   import Input from '$lib/components/ui/Input.svelte';

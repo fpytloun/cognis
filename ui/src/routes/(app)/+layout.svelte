@@ -2,27 +2,25 @@
   import { goto } from '$app/navigation';
   import { page } from '$app/stores';
   import { onMount } from 'svelte';
-  import {
-    Bot,
-    BookOpen,
-    BrainCircuit,
-    ChevronsLeft,
-    ChevronsRight,
-    CircleHelp,
-    Clock,
-    ListTodo,
-    Menu,
-    MessageSquareText,
-    Radio,
-    RefreshCw,
-    ServerCrash,
-    Settings,
-    ShieldAlert,
-    Wifi,
-    Workflow,
-    Wrench,
-    X
-  } from 'lucide-svelte';
+  import Bot from 'lucide-svelte/icons/bot';
+import BookOpen from 'lucide-svelte/icons/book-open';
+import BrainCircuit from 'lucide-svelte/icons/brain-circuit';
+import ChevronsLeft from 'lucide-svelte/icons/chevrons-left';
+import ChevronsRight from 'lucide-svelte/icons/chevrons-right';
+import CircleHelp from 'lucide-svelte/icons/circle-help';
+import Clock from 'lucide-svelte/icons/clock';
+import ListTodo from 'lucide-svelte/icons/list-todo';
+import Menu from 'lucide-svelte/icons/menu';
+import MessageSquareText from 'lucide-svelte/icons/message-square-text';
+import Radio from 'lucide-svelte/icons/radio';
+import RefreshCw from 'lucide-svelte/icons/refresh-cw';
+import ServerCrash from 'lucide-svelte/icons/server-crash';
+import Settings from 'lucide-svelte/icons/settings';
+import ShieldAlert from 'lucide-svelte/icons/shield-alert';
+import Wifi from 'lucide-svelte/icons/wifi';
+import Workflow from 'lucide-svelte/icons/workflow';
+import Wrench from 'lucide-svelte/icons/wrench';
+import X from 'lucide-svelte/icons/x';
 
   import { api } from '$lib/api/client';
   import { deriveGettingStartedSteps, isGettingStartedDismissed } from '$lib/getting-started';
