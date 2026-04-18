@@ -955,3 +955,134 @@ async def test_execute_workflow_fails_when_active_runtime_exceeds_budget(
     assert result.status == "failed"
     assert result.workflow_state is not None
     assert result.workflow_state.status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_execute_run_step_marks_step_run_failed_when_agent_loop_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _build_engine()
+    task = TaskModel(
+        task_id="task-1",
+        title="Task",
+        created_by="user@example.com",
+        agent_id="agent-1",
+        workflow_state=WorkflowState(),
+        workspace_root="/workspace",
+        working_directory="/workspace",
+    )
+    step_def = StepDefinition(name="execute", type="run", prompt="Do work")
+    workflow = Workflow(workflow_id="wf:test", name="Test", steps=[step_def])
+    conversation = SimpleNamespace(conversation_id="conv-1")
+    session = SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1")
+    updated_statuses: list[tuple[str, str]] = []
+
+    async def _resolve_step_agent(*args: object, **kwargs: object) -> SimpleNamespace:
+        del args, kwargs
+        return SimpleNamespace(agent_id="agent-1", agent_type="primary")
+
+    async def _reuse_or_create(*args: object, **kwargs: object):
+        del args, kwargs
+        return conversation, session, False
+
+    async def _create_step_session(*args: object, **kwargs: object):
+        del args, kwargs
+        return conversation, session
+
+    async def _resolve_runtime(*args: object, **kwargs: object) -> SimpleNamespace:
+        del args, kwargs
+        return SimpleNamespace(
+            tool_registry=None,
+            executor_connection=None,
+            executor_environment=None,
+            cleanup=lambda: asyncio.sleep(0),
+        )
+
+    async def _latest_step_run(*args: object, **kwargs: object):
+        del args, kwargs
+        return None
+
+    async def _create_step_run(*args: object, **kwargs: object):
+        del args, kwargs
+        return SimpleNamespace()
+
+    async def _update_step_run(_session: object, step_run_id: str, **kwargs: object) -> bool:
+        status = kwargs.get("status")
+        if isinstance(status, str):
+            updated_statuses.append((step_run_id, status))
+        return True
+
+    async def _run_step(*args: object, **kwargs: object):
+        del args, kwargs
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(engine, "_resolve_step_agent", _resolve_step_agent)
+    monkeypatch.setattr(engine, "_reuse_or_create_step_session", _reuse_or_create)
+    monkeypatch.setattr(engine, "_create_step_session", _create_step_session)
+    monkeypatch.setattr(engine, "_resolve_step_runtime", _resolve_runtime)
+    monkeypatch.setattr(engine._agent_loop, "run_step", _run_step, raising=False)
+    monkeypatch.setattr(
+        "cognis.core.workflow_engine.get_latest_step_run_for_task_step",
+        _latest_step_run,
+    )
+    monkeypatch.setattr("cognis.core.workflow_engine.create_step_run", _create_step_run)
+    monkeypatch.setattr("cognis.core.workflow_engine.update_step_run", _update_step_run)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await engine._execute_run_step(
+            task, step_def, task.workflow_state or WorkflowState(), workflow
+        )
+
+    assert ("sr_" in updated_statuses[0][0]) is True
+    assert updated_statuses[-1][1] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_execute_workflow_exception_cleans_running_step_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _build_engine()
+    task = TaskModel(
+        task_id="task-fail-cleanup",
+        title="Task",
+        created_by="user@example.com",
+        agent_id="agent-1",
+        workflow_id="wf:test",
+        workflow_state=WorkflowState(current_step_index=0),
+    )
+    workflow = Workflow(
+        workflow_id="wf:test",
+        name="Test Workflow",
+        steps=[StepDefinition(name="execute", type="run")],
+    )
+    fail_calls: list[str] = []
+
+    async def _execute_run_step(*args: object, **kwargs: object):
+        del args, kwargs
+        raise RuntimeError("step exploded")
+
+    async def _persist_task_final(*args: object, **kwargs: object) -> None:
+        return None
+
+    async def _noop(*args: object, **kwargs: object) -> None:
+        return None
+
+    async def _fail_running_step_runs_for_task(
+        _session: object, task_id: str, *args: object, **kwargs: object
+    ) -> None:
+        del args, kwargs
+        fail_calls.append(task_id)
+
+    monkeypatch.setattr(engine, "_execute_run_step", _execute_run_step)
+    monkeypatch.setattr(engine, "_persist_task_final", _persist_task_final)
+    monkeypatch.setattr(engine, "_cleanup_step_sessions", _noop)
+    monkeypatch.setattr(engine, "_deliver_task_result", _noop)
+    monkeypatch.setattr(
+        "cognis.core.workflow_engine.fail_running_step_runs_for_task",
+        _fail_running_step_runs_for_task,
+    )
+
+    result = await engine.execute_workflow(task, workflow)
+
+    assert result.status == "failed"
+    assert fail_calls == ["task-fail-cleanup"]

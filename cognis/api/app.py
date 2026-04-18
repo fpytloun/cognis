@@ -397,6 +397,7 @@ def create_app() -> FastAPI:
         recovered_sessions = await session_manager.recover_stale_sessions()
         recovered_tasks = await task_queue.recover_stale_tasks()
         recovered_paused_tasks = await task_queue.recover_paused_tasks()
+        recovered_orphaned_step_runs = await task_queue.recover_orphaned_running_step_runs()
         await task_queue.start()
 
         # Scheduler — evaluates cron/interval/one-shot schedules and
@@ -453,6 +454,7 @@ def create_app() -> FastAPI:
         app.state.recovered_session_ids = frozenset(recovered_sessions)
         app.state.recovered_task_ids = frozenset(recovered_tasks)
         app.state.recovered_paused_task_ids = frozenset(recovered_paused_tasks)
+        app.state.recovered_orphaned_step_runs = recovered_orphaned_step_runs
 
         app.state.notification_service = notification_service
         app.state.turn_scheduler = turn_scheduler

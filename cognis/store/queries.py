@@ -1812,6 +1812,34 @@ async def fail_running_step_runs_for_task(
     return int(getattr(result, "rowcount", 0) or 0)
 
 
+async def fail_orphaned_running_step_runs(
+    session: AsyncSession,
+    completed_at: datetime,
+    *,
+    final_status: str = "failed",
+) -> int:
+    """Finalize running step runs whose parent task is already terminal."""
+
+    terminal_statuses = ["failed", "completed", "cancelled"]
+    parent_status = select(Task.status).where(Task.task_id == StepRun.task_id).scalar_subquery()
+    stmt = (
+        update(StepRun)
+        .where(
+            StepRun.status == "running",
+            StepRun.task_id.in_(select(Task.task_id).where(Task.status.in_(terminal_statuses))),
+        )
+        .values(
+            status=sa.case(
+                (parent_status == "cancelled", "cancelled"),
+                else_=final_status,
+            ),
+            completed_at=completed_at,
+        )
+    )
+    result = await session.execute(stmt)
+    return int(getattr(result, "rowcount", 0) or 0)
+
+
 # ---------------------------------------------------------------------------
 # Workflows
 # ---------------------------------------------------------------------------

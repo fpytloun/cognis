@@ -623,6 +623,14 @@ class WorkflowEngine:
             state.status = "failed"
             task.status = TaskStatus.FAILED
             task.completed_at = datetime.now(UTC)
+            async with self._session_factory() as db_session:
+                await fail_running_step_runs_for_task(
+                    db_session,
+                    task.task_id,
+                    datetime.now(UTC),
+                    final_status="failed",
+                )
+                await db_session.commit()
             await self._persist_task_final(task)
             WORKFLOWS_TOTAL.labels(workflow_name=workflow.name, status="failed").inc()
 
@@ -822,6 +830,16 @@ class WorkflowEngine:
                     db_session,
                     step_run_id,
                     status="cancelled" if current_status == TaskStatus.CANCELLED else "paused",
+                    completed_at=datetime.now(UTC),
+                )
+                await db_session.commit()
+            raise
+        except Exception:
+            async with self._session_factory() as db_session:
+                await update_step_run(
+                    db_session,
+                    step_run_id,
+                    status="failed",
                     completed_at=datetime.now(UTC),
                 )
                 await db_session.commit()

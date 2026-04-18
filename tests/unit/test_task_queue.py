@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import pytest
 
 from cognis.store.database import create_engine, create_session_factory
+from cognis.core.task_queue import TaskQueue
 from cognis.store.models import Agent, Base, User
 from cognis.store.queries import (
     add_task_dependency,
     create_step_run,
     create_task,
+    fail_orphaned_running_step_runs,
     fail_running_step_runs_for_task,
     get_step_run,
     get_task,
@@ -66,6 +69,144 @@ async def test_create_and_get_task(tmp_path: object) -> None:
             assert task is not None
             assert task.title == "Test Task"
             assert task.status == "draft"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_recover_orphaned_running_step_runs_cleans_terminal_parent_leaks(
+    tmp_path: object,
+) -> None:
+    engine, factory = await _bootstrap_db(tmp_path)
+    try:
+        async with factory() as session:
+            await create_task(
+                session,
+                created_by="user@test.com",
+                agent_id="agent-1",
+                title="Failed task",
+                status="failed",
+                task_id="task_failed_recovery",
+            )
+            await create_step_run(
+                session,
+                task_id="task_failed_recovery",
+                step_name="execute",
+                step_type="run",
+                agent_id="agent-1",
+                step_run_id="sr_failed_recovery",
+            )
+            await update_step_run(session, "sr_failed_recovery", status="running")
+            await session.commit()
+
+        queue = TaskQueue(
+            session_factory=factory,
+            workflow_engine=SimpleNamespace(),
+            workflow_registry=SimpleNamespace(),
+            event_bus=SimpleNamespace(publish=lambda *_args, **_kwargs: None),
+        )
+
+        recovered = await queue.recover_orphaned_running_step_runs()
+
+        assert recovered == 1
+        async with factory() as session:
+            step_run = await get_step_run(session, "sr_failed_recovery")
+            assert step_run is not None and step_run.status == "failed"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_fail_orphaned_running_step_runs_only_touches_terminal_tasks(
+    tmp_path: object,
+) -> None:
+    engine, factory = await _bootstrap_db(tmp_path)
+    try:
+        async with factory() as session:
+            await create_task(
+                session,
+                created_by="user@test.com",
+                agent_id="agent-1",
+                title="Failed task",
+                status="failed",
+                task_id="task_failed",
+            )
+            await create_task(
+                session,
+                created_by="user@test.com",
+                agent_id="agent-1",
+                title="Running task",
+                status="running",
+                task_id="task_running",
+            )
+            await create_step_run(
+                session,
+                task_id="task_failed",
+                step_name="execute",
+                step_type="run",
+                agent_id="agent-1",
+                step_run_id="sr_orphaned",
+            )
+            await create_step_run(
+                session,
+                task_id="task_running",
+                step_name="execute",
+                step_type="run",
+                agent_id="agent-1",
+                step_run_id="sr_active",
+            )
+            await update_step_run(session, "sr_orphaned", status="running")
+            await update_step_run(session, "sr_active", status="running")
+            await session.commit()
+
+        async with factory() as session:
+            updated = await fail_orphaned_running_step_runs(session, datetime.now(UTC))
+            await session.commit()
+            assert updated == 1
+
+        async with factory() as session:
+            orphaned = await get_step_run(session, "sr_orphaned")
+            active = await get_step_run(session, "sr_active")
+            assert orphaned is not None and orphaned.status == "failed"
+            assert active is not None and active.status == "running"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_fail_orphaned_running_step_runs_preserves_cancelled_parent_semantics(
+    tmp_path: object,
+) -> None:
+    engine, factory = await _bootstrap_db(tmp_path)
+    try:
+        async with factory() as session:
+            await create_task(
+                session,
+                created_by="user@test.com",
+                agent_id="agent-1",
+                title="Cancelled task",
+                status="cancelled",
+                task_id="task_cancelled",
+            )
+            await create_step_run(
+                session,
+                task_id="task_cancelled",
+                step_name="execute",
+                step_type="run",
+                agent_id="agent-1",
+                step_run_id="sr_cancelled_orphan",
+            )
+            await update_step_run(session, "sr_cancelled_orphan", status="running")
+            await session.commit()
+
+        async with factory() as session:
+            updated = await fail_orphaned_running_step_runs(session, datetime.now(UTC))
+            await session.commit()
+            assert updated == 1
+
+        async with factory() as session:
+            step_run = await get_step_run(session, "sr_cancelled_orphan")
+            assert step_run is not None and step_run.status == "cancelled"
     finally:
         await engine.dispose()
 

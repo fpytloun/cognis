@@ -26,6 +26,7 @@ from cognis.runtime_context import scoped_runtime_context
 from cognis.store.queries import (
     count_active_steps,
     create_task,
+    fail_orphaned_running_step_runs,
     fail_running_step_runs_for_task,
     get_dependent_tasks,
     get_setting_value,
@@ -58,7 +59,7 @@ TASK_PICK_DURATION = Histogram(
 
 # Default capacity limits
 DEFAULT_MAX_ACTIVE_STEPS_GLOBAL = 10
-DEFAULT_MAX_ACTIVE_STEPS_PER_AGENT = 3
+DEFAULT_MAX_ACTIVE_STEPS_PER_AGENT = 5
 DEFAULT_POLL_INTERVAL_SECONDS = 1.0
 DEFAULT_STALE_AFTER_SECONDS = 300
 
@@ -617,6 +618,23 @@ class TaskQueue:
                     )
             recovered.append(task.task_id)
 
+        return recovered
+
+    async def recover_orphaned_running_step_runs(self) -> int:
+        """Finalize running step runs whose parent tasks are already terminal."""
+
+        async with self._session_factory() as db_session:
+            recovered = await fail_orphaned_running_step_runs(
+                db_session,
+                datetime.now(UTC),
+                final_status="failed",
+            )
+            await db_session.commit()
+        if recovered:
+            logger.info(
+                "Recovered orphaned running step runs",
+                extra={"extra_data": {"count": recovered}},
+            )
         return recovered
 
     async def _drain_loop(self) -> None:
