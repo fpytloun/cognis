@@ -459,3 +459,229 @@ async def test_finalize_active_step_runs_marks_paused_and_running_rows(tmp_path:
             assert paused is not None and paused.status == "cancelled"
     finally:
         await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# recover_paused_tasks — behavior for each pause type
+# ---------------------------------------------------------------------------
+
+
+class _FakePauseWaiter:
+    def __init__(self) -> None:
+        self.registered: dict[str, SimpleNamespace] = {}
+        self.resolved: list[tuple[str, SimpleNamespace]] = []
+
+    def register(self, pending: SimpleNamespace) -> None:
+        self.registered[pending.pause_id] = pending
+
+    def get(self, pause_id: str) -> SimpleNamespace | None:
+        return self.registered.get(pause_id)
+
+    def resolve(self, pause_id: str, resolution: SimpleNamespace) -> bool:
+        self.resolved.append((pause_id, resolution))
+        return True
+
+
+class _FakeNotificationService:
+    def __init__(self, rows: dict[str, SimpleNamespace]) -> None:
+        self._rows = rows
+
+    async def get(self, notification_id: str) -> SimpleNamespace | None:
+        return self._rows.get(notification_id)
+
+
+async def _build_queue_for_recovery(
+    tmp_path: object, notification_rows: dict[str, SimpleNamespace] | None = None
+) -> tuple[TaskQueue, _FakePauseWaiter, object]:
+    engine = create_engine(f"sqlite+aiosqlite:///{tmp_path}/cognis.db")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    factory = create_session_factory(engine)
+
+    fake_waiter = _FakePauseWaiter()
+    fake_engine = SimpleNamespace(
+        _pause_waiter=fake_waiter,
+        _notification_service=_FakeNotificationService(notification_rows or {}),
+    )
+    queue = TaskQueue(
+        session_factory=factory,
+        workflow_engine=fake_engine,
+        workflow_registry=SimpleNamespace(),
+        event_bus=SimpleNamespace(publish=lambda *_a, **_k: None),
+    )
+    queue.launch_calls = []  # type: ignore[attr-defined]
+
+    def _record_launch(task: object) -> None:
+        queue.launch_calls.append(task)  # type: ignore[attr-defined]
+
+    queue._launch_task_run = _record_launch  # type: ignore[method-assign]
+
+    return queue, fake_waiter, engine
+
+
+@pytest.mark.asyncio
+async def test_recover_paused_tasks_step_input_with_persisted_response(
+    tmp_path: object,
+) -> None:
+    queue, waiter, engine = await _build_queue_for_recovery(tmp_path)
+    try:
+        async with queue._session_factory() as session:  # noqa: SLF001
+            session.add(User(email="user@test.com", name="Test", role="admin"))
+            await session.flush()
+            session.add(Agent(agent_id="agent-1", owner_email="user@test.com", name="A"))
+            await create_task(
+                session,
+                created_by="user@test.com",
+                agent_id="agent-1",
+                title="Paused step input",
+                status="paused",
+                task_id="task_step_input",
+            )
+            state = {
+                "current_step_index": 0,
+                "pending_pause_type": "step_input",
+                "pending_pause_payload": {
+                    "pause_id": "input_1",
+                    "step_name": "step-a",
+                    "question": "Ready?",
+                    "response": "yes",
+                },
+            }
+            await update_task_workflow_state(session, "task_step_input", state)
+            await session.commit()
+
+        recovered = await queue.recover_paused_tasks()
+        assert recovered == ["task_step_input"]
+        # Persisted response → relaunch without registering a new waiter.
+        assert len(queue.launch_calls) == 1  # type: ignore[attr-defined]
+        assert waiter.registered == {}
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_recover_paused_tasks_step_input_awaiting_user(tmp_path: object) -> None:
+    queue, waiter, engine = await _build_queue_for_recovery(tmp_path)
+    try:
+        async with queue._session_factory() as session:  # noqa: SLF001
+            session.add(User(email="user@test.com", name="Test", role="admin"))
+            await session.flush()
+            session.add(Agent(agent_id="agent-1", owner_email="user@test.com", name="A"))
+            await create_task(
+                session,
+                created_by="user@test.com",
+                agent_id="agent-1",
+                title="Paused awaiting user",
+                status="paused",
+                task_id="task_awaiting",
+            )
+            state = {
+                "current_step_index": 0,
+                "pending_pause_type": "step_input",
+                "pending_pause_payload": {
+                    "pause_id": "input_2",
+                    "step_name": "step-a",
+                    "question": "Ready?",
+                },
+            }
+            await update_task_workflow_state(session, "task_awaiting", state)
+            await session.commit()
+
+        recovered = await queue.recover_paused_tasks()
+        assert recovered == ["task_awaiting"]
+        # No persisted response → task stays paused, waiter registered.
+        assert queue.launch_calls == []  # type: ignore[attr-defined]
+        assert "input_2" in waiter.registered
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_recover_paused_tasks_credential_replays_resolved_notification(
+    tmp_path: object,
+) -> None:
+    resolved_row = SimpleNamespace(
+        status="resolved",
+        resolution={
+            "decision": "continue",
+            "state": "resolved",
+            "credential_id": "cred-abc",
+            "credential_label": "My token",
+            "credential_kind": "api_key",
+        },
+    )
+    queue, waiter, engine = await _build_queue_for_recovery(
+        tmp_path, notification_rows={"cred_1": resolved_row}
+    )
+    try:
+        async with queue._session_factory() as session:  # noqa: SLF001
+            session.add(User(email="user@test.com", name="Test", role="admin"))
+            await session.flush()
+            session.add(Agent(agent_id="agent-1", owner_email="user@test.com", name="A"))
+            await create_task(
+                session,
+                created_by="user@test.com",
+                agent_id="agent-1",
+                title="Paused credential",
+                status="paused",
+                task_id="task_cred",
+            )
+            state = {
+                "current_step_index": 0,
+                "pending_pause_type": "credential_request",
+                "pending_pause_payload": {
+                    "pause_id": "cred_1",
+                    "step_name": "step-a",
+                    "message": "Need token",
+                },
+            }
+            await update_task_workflow_state(session, "task_cred", state)
+            await session.commit()
+
+        recovered = await queue.recover_paused_tasks()
+        assert recovered == ["task_cred"]
+        # Resolution replayed: waiter registered and resolved, task launched.
+        assert "cred_1" in waiter.registered
+        assert waiter.resolved and waiter.resolved[0][0] == "cred_1"
+        assert len(queue.launch_calls) == 1  # type: ignore[attr-defined]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_recover_paused_tasks_credential_pending_stays_paused(tmp_path: object) -> None:
+    queue, waiter, engine = await _build_queue_for_recovery(tmp_path, notification_rows={})
+    try:
+        async with queue._session_factory() as session:  # noqa: SLF001
+            session.add(User(email="user@test.com", name="Test", role="admin"))
+            await session.flush()
+            session.add(Agent(agent_id="agent-1", owner_email="user@test.com", name="A"))
+            await create_task(
+                session,
+                created_by="user@test.com",
+                agent_id="agent-1",
+                title="Paused credential pending",
+                status="paused",
+                task_id="task_cred_pending",
+            )
+            state = {
+                "current_step_index": 0,
+                "pending_pause_type": "credential_request",
+                "pending_pause_payload": {
+                    "pause_id": "cred_2",
+                    "step_name": "step-a",
+                    "message": "Need token",
+                },
+            }
+            await update_task_workflow_state(session, "task_cred_pending", state)
+            await session.commit()
+
+        recovered = await queue.recover_paused_tasks()
+        assert recovered == ["task_cred_pending"]
+        # Not resolved → waiter registered, task NOT launched.
+        assert "cred_2" in waiter.registered
+        assert waiter.resolved == []
+        assert queue.launch_calls == []  # type: ignore[attr-defined]
+    finally:
+        await engine.dispose()

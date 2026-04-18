@@ -38,11 +38,30 @@ router = APIRouter(tags=["schedules"])
 # ---------------------------------------------------------------------------
 
 
+_VALID_SCHEDULE_RUN_STATUSES = {"success", "failed", "skipped"}
+
+
+def _coerce_schedule_run_status(value: Any) -> str | None:
+    """Accept the three valid ScheduleRunStatus strings; drop unknown values.
+
+    Used only where the ScheduleRunStatus enum domain model constructor
+    refuses anything else. The API response surface intentionally
+    returns a free-form string so derived task statuses (``"running"``,
+    ``"completed"``, etc.) can be surfaced to the UI without enum drift
+    breaking the response validation.
+    """
+
+    if isinstance(value, str) and value in _VALID_SCHEDULE_RUN_STATUSES:
+        return value
+    return None
+
+
 def _effective_last_run_status(
     row: Any,
     latest_task_run: tuple[str, datetime | None] | None,
 ) -> str | None:
     """Return the user-visible latest run status for a schedule."""
+
     if latest_task_run is None:
         return row.last_run_status
 
@@ -75,11 +94,9 @@ def _row_to_response(
         enabled=row.enabled,
         max_concurrent_runs=row.max_concurrent_runs,
         delete_after_run=row.delete_after_run,
-        completion_mode_family=getattr(row, "completion_mode_family", "default"),
-        allow_silent_completion=bool(getattr(row, "allow_silent_completion", False)),
         last_fired_at=row.last_fired_at,
         next_fire_at=row.next_fire_at,
-        last_run_status=row.last_run_status,
+        last_run_status=_coerce_schedule_run_status(row.last_run_status),
         consecutive_errors=row.consecutive_errors,
         disabled_reason=row.disabled_reason,
         created_by=row.created_by,

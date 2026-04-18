@@ -39,6 +39,18 @@ from cognis.tools.skill_parser import (
 router = APIRouter(tags=["skills"])
 
 
+def _coerce_tools_list(value: Any) -> list[dict[str, Any]] | None:
+    """Normalize legacy dict-shaped skill tool persistence into list[dict]."""
+
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    if isinstance(value, dict):
+        return [value]
+    return None
+
+
 def _version_to_response(row: Any) -> SkillVersionResponse:
     return SkillVersionResponse(
         version_id=row.version_id,
@@ -47,7 +59,7 @@ def _version_to_response(row: Any) -> SkillVersionResponse:
         content_hash=row.content_hash,
         schema_version=row.schema_version,
         instructions=row.instructions,
-        tools=row.tools,
+        tools=_coerce_tools_list(row.tools),
         prompt_templates=row.prompt_templates,
         secret_placeholders=row.secret_placeholders,
         source_url=row.source_url,
@@ -68,7 +80,7 @@ def _skill_to_response(row: Any, version_row: Any | None = None) -> SkillRespons
         name=row.name,
         description=row.description,
         instructions=row.instructions,
-        tools=row.tools,
+        tools=_coerce_tools_list(row.tools),
         prompt_templates=row.prompt_templates,
         tags=row.tags,
         attach_to_all_agents=row.auto_load,

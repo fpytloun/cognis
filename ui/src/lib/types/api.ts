@@ -138,6 +138,7 @@ export interface Session {
   session_id: string;
   conversation_id: string;
   parent_session_id: string | null;
+  previous_session_id: string | null;
   user_email: string;
   agent_id: string;
   delegation_mode: string | null;
@@ -148,6 +149,7 @@ export interface Session {
   started_at: string | null;
   idle_since: string | null;
   completed_at: string | null;
+  completion_reason: string | null;
   result_summary: string | null;
   updated_at: string | null;
 }
@@ -696,12 +698,14 @@ export interface StepRun {
   status: string;
   attempt: number;
   agent_id: string;
+  workspace_root: string | null;
+  working_directory: string | null;
   conversation_id: string | null;
   session_id: string | null;
   intaris_session_id: string | null;
   output: Record<string, unknown> | null;
   evaluation: Record<string, unknown> | null;
-  todos: Record<string, unknown> | null;
+  todos: Array<Record<string, unknown>>;
   started_at: string | null;
   completed_at: string | null;
   updated_at: string | null;
@@ -730,6 +734,8 @@ export interface Task {
   completion_mode_family: 'default' | 'direct';
   allow_silent_completion: boolean;
   workflow_id: string | null;
+  workspace_root: string | null;
+  working_directory: string | null;
   workflow_state: WorkflowState | null;
   queue_name: string;
   scheduled_for: string | null;

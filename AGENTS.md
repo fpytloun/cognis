@@ -589,3 +589,35 @@ Full architecture and design specifications are in `docs/specs/`:
 - **Never push to main/master without explicit approval.**
 - **Always use `git add -u`** (tracked files only), never `git add -A`.
 - **Always follow Conventional Commits** for commit messages.
+
+## Contract and Invariant Hygiene
+
+Stage 20+ refactors exposed several patterns that cost us debugging
+cycles. When extending the controller, API, or workflow engine, follow
+these rules:
+
+- **One source of truth for controller tool schemas.** Controller-injected
+  tools (``step_todo_write``, ``step_complete``, ``step_request_input``,
+  etc.) must pull their JSON schema from
+  ``cognis/tools/builtin/workflow.py``. Never hand-roll a second schema
+  in the agent loop — the LLM-facing and validator-facing schemas must
+  be byte-identical.
+- **Validate controller tool arguments.** Every controller-intercepted
+  tool handler must call ``validate_tool_arguments`` from
+  ``cognis.core.tool_arguments`` before mutating state. On failure,
+  emit a synthetic ``is_error=True`` tool result so the LLM can
+  self-correct; never silently accept ``{"_raw": "..."}``.
+- **API response shapes must round-trip every producer.** Add a
+  coverage test in ``tests/unit/test_api_contracts.py`` for any new
+  response model. The UI TypeScript interface in
+  ``ui/src/lib/types/api.ts`` is enforced against the Pydantic model by
+  ``tests/unit/test_ui_contract_sync.py``.
+- **Lifecycle invariants belong in ``cognis.core.invariants``.** If a
+  transition can leak persistent state when a failure path skips it,
+  add a checker + reconciler there. The startup sequence and the
+  ``/api/v1/system/reconcile`` admin endpoint will pick it up
+  automatically.
+- **Never clean up step sessions on pause.** ``_cleanup_step_sessions``
+  must only run when ``task.status`` is terminal. Pausing the task
+  leaves the step session in place so it can resume with its pending
+  tool-call context.

@@ -573,7 +573,7 @@ class StepRunResponse(BaseModel):
     intaris_session_id: str | None = None
     output: dict[str, Any] | None = None
     evaluation: dict[str, Any] | None = None
-    todos: dict[str, Any] | None = None
+    todos: list[dict[str, Any]] = Field(default_factory=list)
     started_at: datetime | None = None
     completed_at: datetime | None = None
     updated_at: datetime | None = None

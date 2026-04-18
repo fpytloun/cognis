@@ -264,5 +264,32 @@ def list_api_keys_command(email: str) -> None:
     asyncio.run(_run())
 
 
+@admin_app.command("reconcile")
+def reconcile_command() -> None:
+    """Run invariant reconciliation on demand.
+
+    Repairs any persistent state drift (orphaned running step runs,
+    conversations pointing at terminal sessions, etc.). The same
+    reconciler runs automatically at controller startup; this command
+    exists for operational emergencies where a restart is not feasible.
+    """
+
+    import asyncio
+
+    async def _run() -> None:
+        from cognis.core.invariants import reconcile_invariants
+
+        _, _, session_factory = await _get_runtime()
+        async with session_factory() as session:
+            reports = await reconcile_invariants(session)
+        for report in reports:
+            typer.echo(
+                f"{report.category}: reconciled={report.reconciled_count} "
+                f"remaining={report.current_count}"
+            )
+
+    asyncio.run(_run())
+
+
 def print_env_template() -> None:
     typer.echo(ENV_TEMPLATE)

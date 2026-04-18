@@ -48,6 +48,7 @@ from cognis.core.prompts import PromptContext
 from cognis.core.pruning import prune_tool_outputs
 from cognis.core.runtime import ExecutorEnvironmentSnapshot, ResolvedStepRuntime
 from cognis.core.title_policy import sync_intaris_title
+from cognis.core.tool_arguments import ToolArgumentError, validate_tool_arguments
 from cognis.core.tool_exposure import prepare_tool_exposure
 from cognis.core.truncation import middle_truncate
 from cognis.logging import get_logger
@@ -2477,6 +2478,21 @@ class AgentLoop:
                         reason="tool_call:step_complete",
                         on_token=on_token,
                     )
+                    validation_error = self._validate_controller_tool_arguments(
+                        tc.name, tc.arguments
+                    )
+                    if validation_error is not None:
+                        await self._emit_tool_argument_error(
+                            ctx,
+                            tc=tc,
+                            tool_id=tool_id,
+                            events_to_record=events_to_record,
+                            messages=messages,
+                            error=validation_error,
+                            on_tool_result=on_tool_result,
+                            on_token=on_token,
+                        )
+                        continue
                     # Reject step_complete when it's not available (e.g. direct chat)
                     if not ctx.policy.step_complete_available:
                         err_content = json.dumps(
@@ -2703,7 +2719,25 @@ class AgentLoop:
 
                 elif tc.name == STEP_TODO_WRITE:
                     _append_tool_call_event(events_to_record, tc, tool_id)
-                    requested_todos = tc.arguments.get("todos", []) or []
+                    validation_error = self._validate_controller_tool_arguments(
+                        tc.name, tc.arguments
+                    )
+                    if validation_error is not None:
+                        await self._emit_tool_argument_error(
+                            ctx,
+                            tc=tc,
+                            tool_id=tool_id,
+                            events_to_record=events_to_record,
+                            messages=messages,
+                            error=validation_error,
+                            on_tool_result=on_tool_result,
+                            on_token=on_token,
+                        )
+                        continue
+                    raw_requested = tc.arguments.get("todos", [])
+                    if not isinstance(raw_requested, list):
+                        raw_requested = []
+                    requested_todos = [item for item in raw_requested if isinstance(item, dict)]
                     previous_normalized = _normalize_todos(ctx.todos or [])
                     new_normalized = _normalize_todos(requested_todos)
                     unchanged = previous_normalized == new_normalized
@@ -2769,6 +2803,21 @@ class AgentLoop:
 
                 elif tc.name == STEP_TODO_LIST:
                     _append_tool_call_event(events_to_record, tc, tool_id)
+                    validation_error = self._validate_controller_tool_arguments(
+                        tc.name, tc.arguments
+                    )
+                    if validation_error is not None:
+                        await self._emit_tool_argument_error(
+                            ctx,
+                            tc=tc,
+                            tool_id=tool_id,
+                            events_to_record=events_to_record,
+                            messages=messages,
+                            error=validation_error,
+                            on_tool_result=on_tool_result,
+                            on_token=on_token,
+                        )
+                        continue
                     list_normalized = _normalize_todos(ctx.todos or [])
                     list_non_terminal = sum(
                         1
@@ -2807,6 +2856,21 @@ class AgentLoop:
                         on_token=on_token,
                     )
                     _track_pending_tool_call(ctx, tc, tool_id=tool_id)
+                    validation_error = self._validate_controller_tool_arguments(
+                        tc.name, tc.arguments
+                    )
+                    if validation_error is not None:
+                        await self._emit_tool_argument_error(
+                            ctx,
+                            tc=tc,
+                            tool_id=tool_id,
+                            events_to_record=events_to_record,
+                            messages=messages,
+                            error=validation_error,
+                            on_tool_result=on_tool_result,
+                            on_token=on_token,
+                        )
+                        continue
                     if (
                         ctx.interaction_mode != "step_requests"
                         or not ctx.step_definition.allow_questions
@@ -2858,7 +2922,14 @@ class AgentLoop:
                     pause_id = f"input_{uuid.uuid4().hex[:12]}"
                     question = tc.arguments.get("question", "")
                     options = tc.arguments.get("options")
-                    pause_context = tc.arguments.get("context")
+                    raw_context = tc.arguments.get("context")
+                    pause_context: dict[str, Any] | None
+                    if isinstance(raw_context, dict):
+                        pause_context = raw_context
+                    elif isinstance(raw_context, str) and raw_context:
+                        pause_context = {"note": raw_context}
+                    else:
+                        pause_context = None
                     pause_options = (
                         [str(option) for option in options] if isinstance(options, list) else None
                     )
@@ -2896,7 +2967,9 @@ class AgentLoop:
                             "step_run_id": ctx.step_run_id,
                             "session_id": ctx.session.session_id,
                             "question": question,
-                            "options": pause_options,
+                            # Canonical dict-shape options to match live
+                            # pause state and the notification payload.
+                            "options": formatted_options,
                             "context": pause_context,
                         },
                     )
@@ -2961,6 +3034,21 @@ class AgentLoop:
                         on_token=on_token,
                     )
                     _track_pending_tool_call(ctx, tc, tool_id=tool_id)
+                    validation_error = self._validate_controller_tool_arguments(
+                        tc.name, tc.arguments
+                    )
+                    if validation_error is not None:
+                        await self._emit_tool_argument_error(
+                            ctx,
+                            tc=tc,
+                            tool_id=tool_id,
+                            events_to_record=events_to_record,
+                            messages=messages,
+                            error=validation_error,
+                            on_tool_result=on_tool_result,
+                            on_token=on_token,
+                        )
+                        continue
                     pause_id = f"auth_{uuid.uuid4().hex[:12]}"
                     timeout_seconds = int(tc.arguments.get("timeout_seconds", 600) or 600)
                     auth_payload: dict[str, Any] = {
@@ -3135,6 +3223,21 @@ class AgentLoop:
                         reason="tool_call:list_credentials",
                         on_token=on_token,
                     )
+                    validation_error = self._validate_controller_tool_arguments(
+                        tc.name, tc.arguments
+                    )
+                    if validation_error is not None:
+                        await self._emit_tool_argument_error(
+                            ctx,
+                            tc=tc,
+                            tool_id=tool_id,
+                            events_to_record=events_to_record,
+                            messages=messages,
+                            error=validation_error,
+                            on_tool_result=on_tool_result,
+                            on_token=on_token,
+                        )
+                        continue
                     rows = await self.providers.credentials.list_credentials(ctx.session.user_email)
                     allowed = set(
                         ctx.agent.permissions.allowed_credentials if ctx.agent.permissions else []
@@ -3201,6 +3304,21 @@ class AgentLoop:
                         reason="tool_call:search_tools",
                         on_token=on_token,
                     )
+                    validation_error = self._validate_controller_tool_arguments(
+                        tc.name, tc.arguments
+                    )
+                    if validation_error is not None:
+                        await self._emit_tool_argument_error(
+                            ctx,
+                            tc=tc,
+                            tool_id=tool_id,
+                            events_to_record=events_to_record,
+                            messages=messages,
+                            error=validation_error,
+                            on_tool_result=on_tool_result,
+                            on_token=on_token,
+                        )
+                        continue
                     matches = search_inventory(
                         inventory_tools,
                         str(tc.arguments.get("query", "")),
@@ -6258,221 +6376,140 @@ class AgentLoop:
         return "\n\n".join(sections)
 
     def _build_controller_tool_schemas(self, ctx: StepContext) -> list[dict[str, Any]]:
-        """Build JSON schemas for controller-injected tools."""
+        """Build JSON schemas for controller-injected tools.
+
+        Schemas are sourced from the central registry definitions in
+        ``cognis/tools/builtin/workflow.py`` so validators and LLM prompts
+        always see the same shape. Conditional availability (step_complete
+        only when the policy allows it, step_request_input only when the
+        step permits questions) is applied here.
+        """
+
         from cognis.tools.builtin.orchestration import orchestration_tools
+        from cognis.tools.builtin.workflow import (
+            LIST_CREDENTIALS_TOOL,
+            REQUEST_AUTH_CHALLENGE_TOOL,
+            REQUEST_CREDENTIAL_TOOL,
+            STEP_COMPLETE_TOOL,
+            STEP_REQUEST_INPUT_TOOL,
+            STEP_TODO_LIST_TOOL,
+            STEP_TODO_WRITE_TOOL,
+        )
+
+        def _to_schema(tool_def: Any) -> dict[str, Any]:
+            return {
+                "type": "function",
+                "function": {
+                    "name": tool_def.name,
+                    "description": tool_def.description,
+                    "parameters": tool_def.parameters,
+                },
+            }
 
         tools: list[dict[str, Any]] = []
 
-        # step_complete — available when policy allows it (workflow steps, sub-sessions)
+        # step_complete — only when the policy allows it.
         if ctx.policy.step_complete_available:
-            tools.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": STEP_COMPLETE,
-                        "description": (
-                            "Signal that this step is complete. Before calling this "
-                            "tool, you MUST write out your findings, deliverables, or "
-                            "results as a text message — the evaluator verifies your "
-                            "work against your written output. Then call this tool. "
-                            "All todos must be completed or cancelled before calling this."
-                        ),
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "summary": {
-                                    "type": "string",
-                                    "description": "Brief summary of accomplishments",
-                                },
-                                "outputs": {
-                                    "type": "object",
-                                    "description": (
-                                        "Key structured data produced by this step "
-                                        "(e.g., URLs found, metrics gathered, file paths "
-                                        "modified). Include data that downstream steps or "
-                                        "the evaluator need."
-                                    ),
-                                },
-                                "claims": {
-                                    "type": "array",
-                                    "items": {"type": "string"},
-                                    "description": (
-                                        "Specific, verifiable claims about what was "
-                                        "accomplished. Each claim should be independently "
-                                        "checkable against your written output above."
-                                    ),
-                                },
-                                "outcome": {
-                                    "type": "object",
-                                    "description": (
-                                        "Optional business outcome for this step. Use "
-                                        "'rejected' when the step completed properly but "
-                                        "the reviewed work should go back for revision, or "
-                                        "'failed' when the step itself could not complete "
-                                        "successfully."
-                                    ),
-                                    "properties": {
-                                        "status": {
-                                            "type": "string",
-                                            "enum": ["success", "rejected", "failed"],
-                                        },
-                                        "reason": {
-                                            "type": "string",
-                                            "description": "Required for rejected or failed outcomes.",
-                                        },
-                                    },
-                                    "required": ["status"],
-                                },
-                                "notification": {
-                                    "type": "object",
-                                    "description": (
-                                        "Optional completion delivery choice. Use "
-                                        "notification.mode='silent' only when silent "
-                                        "completion is allowed and nothing user-actionable "
-                                        "happened. Use notification.mode='direct' for "
-                                        "ready-to-read outputs like daily briefs or summaries "
-                                        "that should go straight to the resolved target channel."
-                                    ),
-                                    "properties": {
-                                        "mode": {
-                                            "type": "string",
-                                            "enum": ["silent", "direct"],
-                                        },
-                                        "reason": {
-                                            "type": "string",
-                                            "description": "Required for silent completion. Optional for direct.",
-                                        },
-                                    },
-                                    "required": ["mode"],
-                                },
-                            },
-                            "required": ["summary"],
-                        },
-                    },
-                }
-            )
+            tools.append(_to_schema(STEP_COMPLETE_TOOL))
 
-        # step_request_input — conditional
+        # step_request_input — only when the step permits interactive questions.
         if ctx.interaction_mode == "step_requests" and ctx.step_definition.allow_questions:
-            tools.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": STEP_REQUEST_INPUT,
-                        "description": (
-                            "Request input from the caller while staying in the same "
-                            "step or direct-chat turn. Use this when you are blocked on "
-                            "missing information and need the answer before continuing."
-                        ),
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "question": {
-                                    "type": "string",
-                                    "description": "What you need to know",
-                                },
-                                "options": {
-                                    "type": "array",
-                                    "items": {"type": "string"},
-                                    "description": "Optional structured options",
-                                },
-                                "context": {
-                                    "type": "string",
-                                    "description": "Why you need this input",
-                                },
-                            },
-                            "required": ["question"],
-                        },
-                    },
-                }
-            )
+            tools.append(_to_schema(STEP_REQUEST_INPUT_TOOL))
 
-        # step_todo tools — always available
-        tools.extend(
-            [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": STEP_TODO_WRITE,
-                        "description": (
-                            "Track progress within this execution context. Use todos for "
-                            "complex work with multiple concrete actions, not for trivial "
-                            "single-step work or high-level plans. Break substantial work "
-                            "into specific, actionable items instead of 2-3 broad buckets. "
-                            "Prefer a fuller checklist when the task spans inspection, "
-                            "implementation, tests, docs, and verification. Keep exactly "
-                            "one todo in status 'in_progress' at a time, mark items "
-                            "'completed' immediately after finishing them, and use "
-                            "'cancelled' only for work that no longer applies. In chat, "
-                            "todos should cover only concrete work you are actively "
-                            "continuing in the current turn. In workflow steps and "
-                            "delegated sub-sessions, create or update todos before "
-                            "substantial work and keep them accurate until the step is done."
-                        ),
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "todos": {
-                                    "type": "array",
-                                    "items": {
-                                        "type": "object",
-                                        "properties": {
-                                            "content": {"type": "string"},
-                                            "status": {
-                                                "type": "string",
-                                                "enum": [
-                                                    "pending",
-                                                    "in_progress",
-                                                    "completed",
-                                                    "cancelled",
-                                                ],
-                                            },
-                                        },
-                                    },
-                                    "description": "Updated todo list",
-                                },
-                            },
-                            "required": ["todos"],
-                        },
-                    },
-                },
-                {
-                    "type": "function",
-                    "function": {
-                        "name": STEP_TODO_LIST,
-                        "description": "Read current execution-context todos.",
-                        "parameters": {"type": "object", "properties": {}},
-                    },
-                },
-            ]
-        )
+        # step_todo tools — always available.
+        tools.append(_to_schema(STEP_TODO_WRITE_TOOL))
+        tools.append(_to_schema(STEP_TODO_LIST_TOOL))
+
+        # Credential / auth tools — gated by agent permissions.
+        if _controller_builtin_enabled(ctx.agent, REQUEST_CREDENTIAL_TOOL):
+            tools.append(_to_schema(REQUEST_CREDENTIAL_TOOL))
+        if _controller_builtin_enabled(ctx.agent, REQUEST_AUTH_CHALLENGE_TOOL):
+            tools.append(_to_schema(REQUEST_AUTH_CHALLENGE_TOOL))
+        if _controller_builtin_enabled(ctx.agent, LIST_CREDENTIALS_TOOL):
+            tools.append(_to_schema(LIST_CREDENTIALS_TOOL))
 
         if _controller_builtin_enabled(ctx.agent, SEARCH_TOOLS_TOOL):
-            tools.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": SEARCH_TOOLS_TOOL.name,
-                        "description": SEARCH_TOOLS_TOOL.description,
-                        "parameters": SEARCH_TOOLS_TOOL.parameters,
-                    },
-                }
-            )
+            tools.append(_to_schema(SEARCH_TOOLS_TOOL))
 
-        # Orchestration tools — based on orchestration_mode
+        # Orchestration tools — based on orchestration_mode.
         for tool_def in orchestration_tools(ctx.orchestration_mode):
-            tools.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": tool_def.name,
-                        "description": tool_def.description,
-                        "parameters": tool_def.parameters,
-                    },
-                }
-            )
+            tools.append(_to_schema(tool_def))
 
         return tools
+
+    def _get_controller_tool_parameters(self, tool_name: str) -> dict[str, Any] | None:
+        """Return the parameters schema for a controller tool, or None."""
+
+        from cognis.tools.builtin.workflow import (
+            LIST_CREDENTIALS_TOOL,
+            REQUEST_AUTH_CHALLENGE_TOOL,
+            REQUEST_CREDENTIAL_TOOL,
+            STEP_COMPLETE_TOOL,
+            STEP_REQUEST_INPUT_TOOL,
+            STEP_TODO_LIST_TOOL,
+            STEP_TODO_WRITE_TOOL,
+        )
+
+        registry = {
+            STEP_COMPLETE_TOOL.name: STEP_COMPLETE_TOOL,
+            STEP_REQUEST_INPUT_TOOL.name: STEP_REQUEST_INPUT_TOOL,
+            STEP_TODO_WRITE_TOOL.name: STEP_TODO_WRITE_TOOL,
+            STEP_TODO_LIST_TOOL.name: STEP_TODO_LIST_TOOL,
+            REQUEST_CREDENTIAL_TOOL.name: REQUEST_CREDENTIAL_TOOL,
+            REQUEST_AUTH_CHALLENGE_TOOL.name: REQUEST_AUTH_CHALLENGE_TOOL,
+            LIST_CREDENTIALS_TOOL.name: LIST_CREDENTIALS_TOOL,
+            SEARCH_TOOLS_TOOL.name: SEARCH_TOOLS_TOOL,
+        }
+        tool_def = registry.get(tool_name)
+        return tool_def.parameters if tool_def is not None else None
+
+    def _validate_controller_tool_arguments(
+        self,
+        tool_name: str,
+        raw_arguments: Any,
+    ) -> ToolArgumentError | None:
+        """Validate ``raw_arguments`` against the controller tool schema."""
+
+        schema = self._get_controller_tool_parameters(tool_name)
+        return validate_tool_arguments(tool_name, raw_arguments, schema=schema)
+
+    async def _emit_tool_argument_error(
+        self,
+        ctx: StepContext,
+        *,
+        tc: ToolCall,
+        tool_id: str,
+        events_to_record: list[SessionEvent],
+        messages: list[dict[str, Any]],
+        error: ToolArgumentError,
+        on_tool_result: ToolResultCallback | None,
+        on_token: TokenCallback | None,
+    ) -> None:
+        """Send a structured tool-error back to the LLM without mutating state."""
+
+        payload = error.as_tool_result()
+        content = json.dumps(payload)
+        messages.append({"role": "tool", "tool_call_id": tc.call_id, "content": content})
+        _append_tool_result_event(events_to_record, tc, content, True, tool_id=tool_id)
+        _resolve_pending_tool_call(ctx, tc.call_id)
+        await self._flush_events_incremental(
+            ctx,
+            events_to_record,
+            reason=f"tool_result:{tc.name}:invalid_args",
+            on_token=on_token,
+        )
+        if on_tool_result is not None:
+            await on_tool_result(tc.call_id, tc.name, content, True, None, None)
+        logger.warning(
+            "tool: rejected malformed arguments",
+            extra={
+                "extra_data": {
+                    "tool_name": tc.name,
+                    "reason": error.reason,
+                    "session_id": ctx.session.session_id,
+                }
+            },
+        )
 
     def _get_executor_tool_schemas(self, ctx: StepContext) -> list[dict[str, Any]]:
         """Get tool schemas from the executor's tool registry.

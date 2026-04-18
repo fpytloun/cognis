@@ -634,25 +634,30 @@ class WorkflowEngine:
             await self._persist_task_final(task)
             WORKFLOWS_TOTAL.labels(workflow_name=workflow.name, status="failed").inc()
 
-        # Clean up step sessions — mark all as completed/failed based on
-        # final task status.  This prevents session resource leaks where
-        # step sessions stay "idle" or "active" forever.
-        if self._notification_service is not None and task.status in {
+        # Clean up step sessions — only when the task has truly reached a
+        # terminal state. Pausing a task (StepInterrupted) leaves
+        # ``task.status == running`` and keeps the in-flight step session
+        # in place so it can resume. Running cleanup on pause would mark
+        # the session ``completed``, forcing a fresh session on resume
+        # and losing the pending tool call context.
+        is_terminal = task.status in {
             TaskStatus.COMPLETED,
             TaskStatus.FAILED,
             TaskStatus.CANCELLED,
-        }:
+        }
+        if self._notification_service is not None and is_terminal:
             await self._notification_service.mark_task_notifications_terminal(
                 task.task_id,
                 reason=f"task_{task.status}",
             )
-        await self._cleanup_step_sessions(task)
+        if is_terminal:
+            await self._cleanup_step_sessions(task)
 
         duration = (datetime.now(UTC) - start_time).total_seconds()
         WORKFLOW_DURATION.labels(workflow_name=workflow.name).observe(duration)
 
         # Deliver result
-        if task.status in {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}:
+        if is_terminal:
             await self._deliver_task_result(task)
 
         return task

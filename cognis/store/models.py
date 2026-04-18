@@ -587,7 +587,9 @@ class SkillRow(Base):
     name: Mapped[str] = mapped_column(String, nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     instructions: Mapped[str] = mapped_column(Text, nullable=False)
-    tools: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    # Historically persisted as dict, now canonical list[dict] matching
+    # SkillVersionRow. Read path must defensively coerce legacy dict rows.
+    tools: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
     prompt_templates: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     tags: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
     auto_load: Mapped[bool] = mapped_column(nullable=False, default=False, server_default="0")

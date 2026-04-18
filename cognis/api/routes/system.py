@@ -133,6 +133,42 @@ async def metrics() -> Response:
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
+@router.get("/api/v1/system/invariants")
+async def system_invariants(request: Request) -> dict[str, Any]:
+    """Admin-only read-only probe of cross-subsystem invariants.
+
+    Surfaces any persistent state drift that the runtime has not
+    reconciled automatically. Useful for dashboards and alerts; any
+    non-zero count should be investigated.
+    """
+
+    require_admin(request)
+    from cognis.core.invariants import check_invariants
+
+    async with request.app.state.session_factory() as session:
+        reports = await check_invariants(session)
+    return {
+        "invariants": [report.as_dict() for report in reports],
+        "startup_reports": getattr(request.app.state, "startup_invariant_reports", []),
+    }
+
+
+@router.post("/api/v1/system/reconcile")
+async def system_reconcile(request: Request) -> dict[str, Any]:
+    """Admin-only on-demand invariant reconciliation.
+
+    Runs the same reconciler as controller startup. Idempotent — if the
+    system is already consistent, repeat calls return zero counts.
+    """
+
+    require_admin(request)
+    from cognis.core.invariants import reconcile_invariants
+
+    async with request.app.state.session_factory() as session:
+        reports = await reconcile_invariants(session)
+    return {"invariants": [report.as_dict() for report in reports]}
+
+
 @router.get("/.well-known/jwks.json")
 async def jwks(request: Request) -> JSONResponse:
     return JSONResponse(content=request.app.state.auth_provider.jwks())

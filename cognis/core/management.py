@@ -38,10 +38,47 @@ def task_pending_pause_response(pause_waiter: Any, task: TaskModel) -> PendingPa
         step_run_id=payload.get("step_run_id"),
         session_id=payload.get("session_id"),
         question=payload.get("question") or payload.get("message") or payload.get("label"),
-        options=payload.get("options"),
-        context=payload.get("context"),
+        options=_normalize_pause_options(payload.get("options")),
+        context=_normalize_pause_context(payload.get("context")),
     )
     return pending_pause_to_response(recovered_pause)
+
+
+def _normalize_pause_options(value: Any) -> list[dict[str, Any]] | None:
+    """Coerce persisted pause options into the canonical list[dict] shape.
+
+    Historical writers persisted options as ``list[str]`` for step_input
+    pauses while the live path registers options as ``list[dict]``.
+    Normalize at the read edge so task detail endpoints do not 500 for
+    either shape after a restart.
+    """
+
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        return None
+    normalized: list[dict[str, Any]] = []
+    for option in value:
+        if isinstance(option, dict):
+            normalized.append(option)
+        elif isinstance(option, str):
+            normalized.append({"label": option, "action": option})
+    return normalized or None
+
+
+def _normalize_pause_context(value: Any) -> dict[str, Any] | None:
+    """Coerce persisted pause context into a dict or None.
+
+    Historically string values leaked into this field for
+    step_request_input. Drop anything that is not a dict so the response
+    model validates cleanly.
+    """
+
+    if isinstance(value, dict):
+        return value
+    if value is None or value == "":
+        return None
+    return {"note": str(value)}
 
 
 async def task_workflow_run_response(

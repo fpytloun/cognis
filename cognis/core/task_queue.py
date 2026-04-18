@@ -64,6 +64,30 @@ DEFAULT_POLL_INTERVAL_SECONDS = 1.0
 DEFAULT_STALE_AFTER_SECONDS = 300
 
 
+def _recover_pause_options(value: Any) -> list[dict[str, Any]] | None:
+    """Normalize recovered pause options into canonical list[dict] shape."""
+
+    if not isinstance(value, list):
+        return None
+    normalized: list[dict[str, Any]] = []
+    for option in value:
+        if isinstance(option, dict):
+            normalized.append(option)
+        elif isinstance(option, str):
+            normalized.append({"label": option, "action": option})
+    return normalized or None
+
+
+def _recover_pause_context(value: Any) -> dict[str, Any] | None:
+    """Normalize recovered pause context into dict-or-None."""
+
+    if isinstance(value, dict):
+        return value
+    if value is None or value == "":
+        return None
+    return {"note": str(value)}
+
+
 class TaskQueue:
     """Priority-based task queue with dependency resolution."""
 
@@ -563,13 +587,30 @@ class TaskQueue:
     async def recover_paused_tasks(self) -> list[str]:
         """Re-enter paused workflows so prompts and waits are recreated after restart.
 
-        Gates are re-launched (the workflow engine re-creates the gate
-        notification).  Step-input pauses are normally recovered by
-        ``NotificationService.reconcile_pending()`` which runs before
-        this method.  As a safety net for tasks paused before the
-        notification service migration, we also re-register PauseWaiters
-        directly if no PauseWaiter entry exists yet.
+        Each pause type has a distinct recovery contract:
+
+        * ``gate`` — the workflow engine re-creates the gate notification
+          when the task resumes.
+        * ``step_input`` — if the user already responded before the
+          restart, the payload carries ``response`` and the agent loop
+          consumes it through ``_get_recovered_step_response``; relaunch
+          without registering a new PauseWaiter (a fresh waiter would
+          never be resolved and would pollute ``find_pending()`` output).
+          If no response is persisted, register a waiter and keep the
+          task paused until the user answers through the API.
+        * ``credential_request`` / ``auth_challenge`` — resolutions for
+          these pauses are stored on the ``NotificationRow`` (not on the
+          task workflow state). If the notification is already
+          ``resolved``, register the waiter and immediately replay the
+          resolution so the relaunched agent loop can consume the
+          response without blocking. Otherwise keep the task paused.
+
+        Without relaunching, tasks whose awaiting coroutine died with
+        the controller would stay paused forever.
         """
+
+        from cognis.core.agent_loop import PauseResolution, PendingPause  # noqa: F401
+
         recovered: list[str] = []
         async with self._session_factory() as db_session:
             paused_rows = await list_tasks_by_status(db_session, ["paused"], limit=1000)
@@ -581,44 +622,142 @@ class TaskQueue:
             pause_type = task.workflow_state.pending_pause_type
             if pause_type is None:
                 continue
+
+            payload = task.workflow_state.pending_pause_payload or {}
+            pause_id = str(payload.get("pause_id", f"recovered_{task.task_id}"))
+
             if pause_type == "gate":
                 self._launch_task_run(task)
-            elif pause_type in {"step_input", "credential_request", "auth_challenge"}:
-                # Check if reconcile_pending already handled this
-                payload = task.workflow_state.pending_pause_payload or {}
-                pause_id = str(payload.get("pause_id", f"recovered_{task.task_id}"))
-                existing = self._workflow_engine._pause_waiter.get(pause_id)  # noqa: SLF001
-                if existing is None:
-                    # Not yet registered — register directly as safety net
-                    from cognis.core.agent_loop import PendingPause
-
-                    self._workflow_engine._pause_waiter.register(  # noqa: SLF001
-                        PendingPause(
-                            pause_id=pause_id,
-                            pause_type=str(pause_type),
-                            task_id=task.task_id,
-                            step_name=payload.get("step_name"),
-                            step_run_id=payload.get("step_run_id"),
-                            session_id=payload.get("session_id"),
-                            question=payload.get("question") or payload.get("message"),
-                            options=(
-                                [
-                                    {"label": str(item), "action": str(item)}
-                                    for item in payload.get("options", [])
-                                ]
-                                if isinstance(payload.get("options"), list)
-                                else None
-                            ),
-                            context=(
-                                {"context": payload.get("context")}
-                                if isinstance(payload.get("context"), str)
-                                else None
-                            ),
-                        )
-                    )
+            elif pause_type == "step_input":
+                await self._recover_step_input_pause(task=task, pause_id=pause_id, payload=payload)
+            elif pause_type in {"credential_request", "auth_challenge"}:
+                await self._recover_credential_or_auth_pause(
+                    task=task,
+                    pause_id=pause_id,
+                    pause_type=str(pause_type),
+                    payload=payload,
+                )
+            else:
+                logger.warning(
+                    "task_queue: unknown pause type during recovery",
+                    extra={
+                        "extra_data": {
+                            "task_id": task.task_id,
+                            "pause_type": pause_type,
+                        }
+                    },
+                )
             recovered.append(task.task_id)
 
         return recovered
+
+    async def _recover_step_input_pause(
+        self,
+        *,
+        task: TaskModel,
+        pause_id: str,
+        payload: dict[str, Any],
+    ) -> None:
+        from cognis.core.agent_loop import PendingPause
+
+        if payload.get("response") is not None:
+            # The HTTP respond path persisted the user's answer before
+            # the restart; the relaunched agent loop consumes it via
+            # ``_get_recovered_step_response`` without a PauseWaiter.
+            self._launch_task_run(task)
+            return
+
+        existing = self._workflow_engine._pause_waiter.get(pause_id)  # noqa: SLF001
+        if existing is None:
+            self._workflow_engine._pause_waiter.register(  # noqa: SLF001
+                PendingPause(
+                    pause_id=pause_id,
+                    pause_type="step_input",
+                    task_id=task.task_id,
+                    step_name=payload.get("step_name"),
+                    step_run_id=payload.get("step_run_id"),
+                    session_id=payload.get("session_id"),
+                    question=payload.get("question") or payload.get("message"),
+                    options=_recover_pause_options(payload.get("options")),
+                    context=_recover_pause_context(payload.get("context")),
+                )
+            )
+
+    async def _recover_credential_or_auth_pause(
+        self,
+        *,
+        task: TaskModel,
+        pause_id: str,
+        pause_type: str,
+        payload: dict[str, Any],
+    ) -> None:
+        from cognis.core.agent_loop import PauseResolution, PendingPause
+
+        resolved_decision: str | None = None
+        resolved_data: dict[str, Any] | None = None
+
+        notification_service = getattr(self._workflow_engine, "_notification_service", None)
+        if notification_service is not None:
+            try:
+                notif_row = await notification_service.get(pause_id)
+            except Exception:
+                notif_row = None
+            if notif_row is not None and getattr(notif_row, "status", None) == "resolved":
+                resolution = getattr(notif_row, "resolution", None)
+                if isinstance(resolution, dict):
+                    resolved_decision = str(resolution.get("decision") or "continue")
+                    resolved_data = {
+                        key: value
+                        for key, value in resolution.items()
+                        if key not in {"decision", "state"}
+                    }
+
+        if resolved_decision is not None and resolved_data is not None:
+            self._workflow_engine._pause_waiter.register(  # noqa: SLF001
+                PendingPause(
+                    pause_id=pause_id,
+                    pause_type=pause_type,
+                    task_id=task.task_id,
+                    step_name=payload.get("step_name"),
+                    step_run_id=payload.get("step_run_id"),
+                    session_id=payload.get("session_id"),
+                    question=payload.get("question") or payload.get("message"),
+                    options=_recover_pause_options(payload.get("options")),
+                    context=_recover_pause_context(payload.get("context")),
+                )
+            )
+            self._workflow_engine._pause_waiter.resolve(  # noqa: SLF001
+                pause_id,
+                PauseResolution(decision=resolved_decision, data=resolved_data),
+            )
+            logger.info(
+                "task_queue: replaying resolved credential/auth notification on recovery",
+                extra={
+                    "extra_data": {
+                        "task_id": task.task_id,
+                        "pause_type": pause_type,
+                        "decision": resolved_decision,
+                    }
+                },
+            )
+            self._launch_task_run(task)
+            return
+
+        existing = self._workflow_engine._pause_waiter.get(pause_id)  # noqa: SLF001
+        if existing is None:
+            self._workflow_engine._pause_waiter.register(  # noqa: SLF001
+                PendingPause(
+                    pause_id=pause_id,
+                    pause_type=pause_type,
+                    task_id=task.task_id,
+                    step_name=payload.get("step_name"),
+                    step_run_id=payload.get("step_run_id"),
+                    session_id=payload.get("session_id"),
+                    question=payload.get("question") or payload.get("message"),
+                    options=_recover_pause_options(payload.get("options")),
+                    context=_recover_pause_context(payload.get("context")),
+                )
+            )
 
     async def recover_orphaned_running_step_runs(self) -> int:
         """Finalize running step runs whose parent tasks are already terminal."""
@@ -815,8 +954,13 @@ class TaskQueue:
                     cancel_event=cancel_event,
                 )
 
-                # Resolve dependencies
-                if result.status == TaskStatus.COMPLETED:
+                # Resolve dependencies — every terminal transition may
+                # unblock or pause dependent tasks, not just completion.
+                if result.status in {
+                    TaskStatus.COMPLETED,
+                    TaskStatus.FAILED,
+                    TaskStatus.CANCELLED,
+                }:
                     await self.resolve_dependencies(result.task_id)
 
             except asyncio.CancelledError:

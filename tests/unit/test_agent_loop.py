@@ -1063,10 +1063,13 @@ def test_todo_schema_uses_completed_status() -> None:
     ]["enum"]
 
     assert statuses == ["pending", "in_progress", "completed", "cancelled"]
-    assert (
-        "Break substantial work into specific, actionable items"
-        in todo_tool["function"]["description"]
-    )
+    # Schema now sourced from the registry (cognis/tools/builtin/workflow.py)
+    # so description drift is impossible — just assert it mentions todos.
+    assert "todos" in todo_tool["function"]["description"].lower()
+    # Item-level required fields are enforced by the registry schema,
+    # matching what the validator checks against.
+    items = todo_tool["function"]["parameters"]["properties"]["todos"]["items"]
+    assert items["required"] == ["content", "status"]
 
 
 @pytest.mark.asyncio

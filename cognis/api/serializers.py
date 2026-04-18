@@ -237,13 +237,47 @@ def step_run_to_response(row: Any) -> StepRunResponse:
         conversation_id=getattr(row, "conversation_id", None),
         session_id=row.session_id,
         intaris_session_id=row.intaris_session_id,
-        output=row.output,
-        evaluation=row.evaluation,
-        todos=row.todos,
+        output=_coerce_dict_or_none(row.output),
+        evaluation=_coerce_dict_or_none(row.evaluation),
+        todos=_coerce_list_of_dicts(getattr(row, "todos", None)),
         started_at=row.started_at,
         completed_at=row.completed_at,
         updated_at=getattr(row, "updated_at", None),
     )
+
+
+def _coerce_dict_or_none(value: Any) -> dict[str, Any] | None:
+    """Accept dict or return None; log warning for unexpected shapes."""
+
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value
+    logger.warning(
+        "serializer: unexpected non-dict value coerced to None",
+        extra={"extra_data": {"actual_type": type(value).__name__}},
+    )
+    return None
+
+
+def _coerce_list_of_dicts(value: Any) -> list[dict[str, Any]]:
+    """Accept list[dict] canonical form; normalize legacy shapes.
+
+    Guards every API response against producer bugs that might persist
+    unexpected shapes (None, dict, stray primitives). Producers in the
+    codebase should always persist list[dict], but this helper keeps
+    API endpoints from returning 500 for historical or corrupt rows.
+    """
+
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    logger.warning(
+        "serializer: unexpected non-list value normalized to empty list",
+        extra={"extra_data": {"actual_type": type(value).__name__}},
+    )
+    return []
 
 
 def workflow_to_response(row: Any) -> WorkflowResponse:

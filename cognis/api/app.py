@@ -398,6 +398,40 @@ def create_app() -> FastAPI:
         recovered_tasks = await task_queue.recover_stale_tasks()
         recovered_paused_tasks = await task_queue.recover_paused_tasks()
         recovered_orphaned_step_runs = await task_queue.recover_orphaned_running_step_runs()
+
+        # System-wide invariant reconciliation. Runs after the focused
+        # recovery helpers above so any residual drift (e.g. conversations
+        # whose active_session_id still points at a terminal session) is
+        # cleaned before the drain loop starts picking tasks. The
+        # implementation is idempotent and covered by unit tests.
+        from cognis.core.invariants import reconcile_invariants
+
+        async with session_factory() as recon_session:
+            invariant_reports = await reconcile_invariants(recon_session)
+        reconciled_invariant_counts = {
+            report.category: report.reconciled_count
+            for report in invariant_reports
+            if report.reconciled_count
+        }
+        if reconciled_invariant_counts:
+            logger.warning(
+                "startup: reconciled invariant violations",
+                extra={"extra_data": {"counts": reconciled_invariant_counts}},
+            )
+
+        logger.info(
+            "startup: recovery summary",
+            extra={
+                "extra_data": {
+                    "recovered_sessions": len(recovered_sessions),
+                    "recovered_tasks": len(recovered_tasks),
+                    "recovered_paused_tasks": len(recovered_paused_tasks),
+                    "recovered_orphaned_step_runs": recovered_orphaned_step_runs,
+                    "invariant_reports": [report.as_dict() for report in invariant_reports],
+                }
+            },
+        )
+
         await task_queue.start()
 
         # Scheduler — evaluates cron/interval/one-shot schedules and
@@ -455,6 +489,7 @@ def create_app() -> FastAPI:
         app.state.recovered_task_ids = frozenset(recovered_tasks)
         app.state.recovered_paused_task_ids = frozenset(recovered_paused_tasks)
         app.state.recovered_orphaned_step_runs = recovered_orphaned_step_runs
+        app.state.startup_invariant_reports = [report.as_dict() for report in invariant_reports]
 
         app.state.notification_service = notification_service
         app.state.turn_scheduler = turn_scheduler

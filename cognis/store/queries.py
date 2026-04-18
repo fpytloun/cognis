@@ -1818,15 +1818,25 @@ async def fail_orphaned_running_step_runs(
     *,
     final_status: str = "failed",
 ) -> int:
-    """Finalize running step runs whose parent task is already terminal."""
+    """Finalize non-terminal step runs whose parent task is already terminal.
 
-    terminal_statuses = ["failed", "completed", "cancelled"]
+    Covers every non-terminal ``StepRun`` status (``running``, ``paused``,
+    ``evaluating``, ``pending``) so a terminal task can never leave active
+    step run rows behind to saturate queue capacity. Cancellation
+    semantics are preserved: step runs under a ``cancelled`` parent are
+    marked ``cancelled`` regardless of ``final_status``.
+    """
+
+    terminal_parent_statuses = ["failed", "completed", "cancelled"]
+    non_terminal_step_statuses = ["running", "paused", "evaluating", "pending"]
     parent_status = select(Task.status).where(Task.task_id == StepRun.task_id).scalar_subquery()
     stmt = (
         update(StepRun)
         .where(
-            StepRun.status == "running",
-            StepRun.task_id.in_(select(Task.task_id).where(Task.status.in_(terminal_statuses))),
+            StepRun.status.in_(non_terminal_step_statuses),
+            StepRun.task_id.in_(
+                select(Task.task_id).where(Task.status.in_(terminal_parent_statuses))
+            ),
         )
         .values(
             status=sa.case(

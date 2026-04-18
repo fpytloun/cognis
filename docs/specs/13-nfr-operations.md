@@ -200,6 +200,43 @@ cognis_task_lease_timeouts_total
 cognis_executor_heartbeat_age_seconds{executor_id}
 ```
 
+#### System Invariants and Recovery
+
+```
+cognis_invariant_current{category}
+    # Gauge of current invariant violations. Non-zero at steady state is a
+    # signal of drift; investigate via /api/v1/system/invariants.
+cognis_invariant_reconciled_total{category}
+    # Counter of reconciliations performed on startup or via
+    # /api/v1/system/reconcile. Sudden increases indicate a bug in the
+    # write path that is being papered over.
+cognis_tool_call_malformed_total{tool_name, reason}
+    # Controller tool calls rejected by the argument validator. Reason is
+    # one of unparseable_json, not_object, schema_violation.
+cognis_mnemory_session_forged_total
+    # Count of Mnemory recalls that returned a different session id than
+    # requested. Steady low values are acceptable (TTL expiry); spikes
+    # correlate with Mnemory-side instability or clock drift.
+cognis_mnemory_session_repaired_total{reason}
+    # Immutable-prefix repair actions.  Reasons:
+    # - existing_session_returned_no_core
+    # - mnemory_session_forged
+    # - intaris_snapshot_missing
+```
+
+Invariant categories:
+
+- `non_terminal_step_runs_under_terminal_task` — step_runs in
+  `running`/`paused`/`evaluating`/`pending` under a terminal parent.
+- `conversations_with_terminal_active_session` — conversations still
+  pointing at a terminal session after a crash/restart.
+
+Admin surfaces:
+
+- `GET /api/v1/system/invariants` — admin-only read-only probe.
+- `POST /api/v1/system/reconcile` — admin-only on-demand repair.
+- `cognis-controller admin reconcile` — CLI equivalent.
+
 #### Browser Recording and Takeover
 
 ```
