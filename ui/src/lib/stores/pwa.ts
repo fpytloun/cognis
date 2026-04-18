@@ -24,6 +24,20 @@ let deferredPrompt: BeforeInstallPromptEvent | null = null;
 export const installPromptAvailable = writable(false);
 export const updateAvailable = writable(false);
 
+function activateWaitingWorker(waiting: ServiceWorker): void {
+  updateAvailable.set(false);
+
+  navigator.serviceWorker.addEventListener(
+    'controllerchange',
+    () => {
+      window.location.reload();
+    },
+    { once: true }
+  );
+
+  waiting.postMessage({ type: 'SKIP_WAITING' });
+}
+
 if (typeof window !== 'undefined') {
   window.addEventListener('beforeinstallprompt', (event) => {
     event.preventDefault();
@@ -105,10 +119,12 @@ export async function registerServiceWorker(): Promise<void> {
       scope: '/'
     });
 
-    // If there's already a waiting SW at page load (user reloaded between
-    // install and activate), surface the update banner immediately.
+    // If there's already a waiting SW at page load, the user has already
+    // refreshed or reopened the app since the update banner first appeared.
+    // Finish applying the update instead of showing the same banner again.
     if (registration.waiting && navigator.serviceWorker.controller) {
-      updateAvailable.set(true);
+      activateWaitingWorker(registration.waiting);
+      return;
     }
 
     // When a new SW finishes installing AND an existing controller is in
@@ -137,13 +153,5 @@ export async function applyUpdate(): Promise<void> {
     window.location.reload();
     return;
   }
-  // Reload once the waiting SW takes control.
-  navigator.serviceWorker.addEventListener(
-    'controllerchange',
-    () => {
-      window.location.reload();
-    },
-    { once: true }
-  );
-  waiting.postMessage({ type: 'SKIP_WAITING' });
+  activateWaitingWorker(waiting);
 }
