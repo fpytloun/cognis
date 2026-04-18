@@ -9,7 +9,7 @@ from cognis.core.session import SessionManager, _map_cognis_to_intaris_status
 from cognis.models.session import ConversationContext
 from cognis.store.database import create_engine, create_session_factory
 from cognis.store.models import Agent, Conversation, Session, User
-from cognis.store.queries import get_session_row, list_conversation_sessions
+from cognis.store.queries import get_conversation, get_session_row, list_conversation_sessions
 
 
 class _Guardrails:
@@ -568,5 +568,91 @@ async def test_intaris_sync_failure_does_not_block_mark(tmp_path) -> None:
     manager_fail = SessionManager(session_factory, providers_fail, _Cache())
     updated = await manager_fail.mark_idle(root.session_id)
     assert updated  # DB update succeeded despite Intaris failure
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_archive_conversation_clears_active_session_and_marks_session_completed(
+    tmp_path,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    providers = _Providers()
+    manager = SessionManager(session_factory, providers, _Cache())
+
+    conversation = await manager.create_conversation(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context=ConversationContext(type="web"),
+        title="Archive test",
+    )
+    root = await manager.create_root_session(
+        conversation_id=conversation.conversation_id,
+        user_email="user@example.com",
+        agent_id="agent-1",
+        intention="test",
+    )
+
+    archived = await manager.archive_conversation(conversation.conversation_id)
+
+    assert archived is True
+    assert providers.guardrails.status_calls[-1] == (
+        root.session_id,
+        "completed",
+        "completion_reason=conversation_archived",
+    )
+
+    async with session_factory() as session:
+        stored_conversation = await get_conversation(session, conversation.conversation_id)
+        stored_session = await get_session_row(session, root.session_id)
+        assert stored_conversation is not None
+        assert stored_conversation.status == "archived"
+        assert stored_conversation.active_session_id is None
+        assert stored_session is not None
+        assert stored_session.status == "completed"
+        assert stored_session.completion_reason == "conversation_archived"
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_soft_delete_conversation_clears_active_session_and_marks_session_completed(
+    tmp_path,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    providers = _Providers()
+    manager = SessionManager(session_factory, providers, _Cache())
+
+    conversation = await manager.create_conversation(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context=ConversationContext(type="web"),
+        title="Delete test",
+    )
+    root = await manager.create_root_session(
+        conversation_id=conversation.conversation_id,
+        user_email="user@example.com",
+        agent_id="agent-1",
+        intention="test",
+    )
+
+    deleted = await manager.soft_delete_conversation(conversation.conversation_id)
+
+    assert deleted is True
+    assert providers.guardrails.status_calls[-1] == (
+        root.session_id,
+        "completed",
+        "completion_reason=conversation_deleted",
+    )
+
+    async with session_factory() as session:
+        stored_conversation = await get_conversation(session, conversation.conversation_id)
+        stored_session = await get_session_row(session, root.session_id)
+        assert stored_conversation is not None
+        assert stored_conversation.status == "deleted"
+        assert stored_conversation.active_session_id is None
+        assert stored_session is not None
+        assert stored_session.status == "completed"
+        assert stored_session.completion_reason == "conversation_deleted"
 
     await engine.dispose()

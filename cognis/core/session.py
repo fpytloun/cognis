@@ -899,9 +899,21 @@ class SessionManager:
                 if conversation is None:
                     return False
                 sessions = await queries.list_conversation_sessions(db_session, conversation_id)
+                sessions_to_sync = [
+                    session_row
+                    for session_row in sessions
+                    if session_row.status
+                    not in {
+                        SessionStatus.COMPLETED,
+                        SessionStatus.FAILED,
+                        SessionStatus.CANCELLED,
+                        SessionStatus.TERMINATED,
+                    }
+                ]
                 await queries.set_conversation_status(
                     db_session, conversation_id, conversation_status
                 )
+                await queries.update_conversation_active_session(db_session, conversation_id, None)
                 for session_row in sessions:
                     if session_row.status in {
                         SessionStatus.COMPLETED,
@@ -916,6 +928,7 @@ class SessionManager:
                         SessionStatus.COMPLETED,
                         completed_at=datetime.now(UTC),
                         result_summary=f"conversation {conversation_status}",
+                        completion_reason=f"conversation_{conversation_status}",
                     )
                 await db_session.commit()
             except Exception:
@@ -924,17 +937,12 @@ class SessionManager:
 
         for session_row in sessions:
             await self._evict_session_state(session_row.session_id)
-            if session_row.status not in {
-                SessionStatus.COMPLETED,
-                SessionStatus.FAILED,
-                SessionStatus.CANCELLED,
-                SessionStatus.TERMINATED,
-            }:
-                await self._sync_intaris_status(
-                    session_row.intaris_session_id or session_row.session_id,
-                    "completed",
-                    completion_reason=f"conversation_{conversation_status}",
-                )
+        for session_row in sessions_to_sync:
+            await self._sync_intaris_status(
+                session_row.intaris_session_id or session_row.session_id,
+                "completed",
+                completion_reason=f"conversation_{conversation_status}",
+            )
         return True
 
     async def _require_agent(self, db_session: AsyncSession, agent_id: str) -> AgentDefinition:

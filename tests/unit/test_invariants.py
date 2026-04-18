@@ -217,3 +217,45 @@ async def test_reconcile_invariants_clears_active_session_pointer_to_terminal_se
             assert row.active_session_id is None
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_invariants_clears_active_session_pointer_to_missing_session(
+    tmp_path: object,
+) -> None:
+    engine, factory = await _bootstrap_db(tmp_path)
+    try:
+        from cognis.store.models import Conversation
+
+        async with factory() as session:
+            conv = Conversation(
+                conversation_id="conv-missing",
+                user_email="user@test.com",
+                agent_id="agent-1",
+                title="Missing session",
+                active_session_id="sess-missing",
+                context_type="chat",
+                context_ref=None,
+                context_data={},
+            )
+            session.add(conv)
+            await session.commit()
+
+        async with factory() as session:
+            reports = await reconcile_invariants(session)
+        cleared = next(
+            r for r in reports if r.category == "conversations_with_missing_active_session"
+        )
+        assert cleared.reconciled_count == 1
+
+        async with factory() as session:
+            from sqlalchemy import select
+
+            row = (
+                await session.execute(
+                    select(Conversation).where(Conversation.conversation_id == "conv-missing")
+                )
+            ).scalar_one()
+            assert row.active_session_id is None
+    finally:
+        await engine.dispose()

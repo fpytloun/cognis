@@ -793,6 +793,7 @@ async def list_conversations(
     *,
     context_type: str | None = None,
     agent_id: str | None = None,
+    status: str = "active",
 ) -> list[Conversation]:
     """List conversations for a user, optionally filtered by context type and agent."""
     query = (
@@ -800,6 +801,12 @@ async def list_conversations(
         .where(Conversation.user_email == user_email)
         .order_by(Conversation.updated_at.desc(), Conversation.conversation_id.asc())
     )
+    if status == "active":
+        query = query.where(Conversation.status == "active")
+    elif status == "archived":
+        query = query.where(Conversation.status == "archived")
+    elif status != "all":
+        raise ValueError(f"Unsupported conversation status filter: {status}")
     if context_type is not None:
         query = query.where(Conversation.context_type == context_type)
     if agent_id is not None:
@@ -869,7 +876,7 @@ async def mark_conversation_read(session: AsyncSession, conversation_id: str) ->
 
 
 async def update_conversation_active_session(
-    session: AsyncSession, conversation_id: str, active_session_id: str
+    session: AsyncSession, conversation_id: str, active_session_id: str | None
 ) -> bool:
     """Set the active session ID for a conversation."""
 
@@ -880,6 +887,29 @@ async def update_conversation_active_session(
     conversation.updated_at = datetime.now(UTC)
     await session.flush()
     return True
+
+
+async def get_latest_root_session_for_conversation(
+    session: AsyncSession,
+    conversation_id: str,
+) -> Session | None:
+    """Return the newest root session for a conversation.
+
+    Used when an archived conversation no longer has an active session pointer but
+    still needs its readable history bootstrapped from the most recent root-session
+    lineage.
+    """
+
+    result = await session.execute(
+        select(Session)
+        .where(
+            Session.conversation_id == conversation_id,
+            Session.parent_session_id.is_(None),
+        )
+        .order_by(Session.started_at.desc(), Session.session_id.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
 
 
 async def update_conversation_active_session_if_unset(

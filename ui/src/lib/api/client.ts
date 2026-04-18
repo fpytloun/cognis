@@ -306,19 +306,22 @@ export const api = {
   conversations: {
     list(
       cursor: string | null = null,
-      filters: { contextType?: string | null; agentId?: string | null } = {}
+      filters: { contextType?: string | null; agentId?: string | null; status?: string | null } = {}
     ): Promise<CursorPage<Conversation>> {
       return request<CursorPage<Conversation>>(
         `/api/v1/conversations${encodeQuery({
           cursor,
           limit: 50,
           context_type: filters.contextType,
-          agent_id: filters.agentId
+          agent_id: filters.agentId,
+          status: filters.status
         })}`
       );
     },
 
-    async listAll(filters: { contextType?: string | null; agentId?: string | null } = {}): Promise<Conversation[]> {
+    async listAll(
+      filters: { contextType?: string | null; agentId?: string | null; status?: string | null } = {}
+    ): Promise<Conversation[]> {
       return collectCursorPages((cursor) => this.list(cursor, filters));
     },
 

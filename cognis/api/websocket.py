@@ -443,7 +443,11 @@ class WebSocketConnectionManager:
     ) -> None:
         """Replay missed events for a reconnecting client."""
         from cognis.core.session import _to_session_model
-        from cognis.store.queries import get_conversation, get_session_row
+        from cognis.store.queries import (
+            get_conversation,
+            get_session_row,
+            update_conversation_active_session,
+        )
 
         async with self.app.state.session_factory() as db_session:
             conversation_row = await get_conversation(db_session, conversation_id)
@@ -468,15 +472,16 @@ class WebSocketConnectionManager:
                 if conversation_row.active_session_id
                 else None
             )
+            if conversation_row.active_session_id and session_row is None:
+                await update_conversation_active_session(db_session, conversation_id, None)
+                await db_session.commit()
+
+        self.subscribe(connection, conversation_id)
 
         if session_row is None:
-            await self.send_error(
-                connection, code="not_found", message="Session not found", recoverable=False
-            )
             return
 
         session = _to_session_model(session_row)
-        self.subscribe(connection, conversation_id)
 
         result = await self.app.state.providers.guardrails.read_events(
             session_id=session.intaris_session_id or session.session_id,

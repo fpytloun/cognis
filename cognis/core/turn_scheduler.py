@@ -1694,7 +1694,12 @@ class TurnScheduler:
         """
         from cognis.api.serializers import agent_to_response
         from cognis.core.session import _to_conversation_model, _to_session_model
-        from cognis.store.queries import get_agent, get_conversation, get_session_row
+        from cognis.store.queries import (
+            get_agent,
+            get_conversation,
+            get_session_row,
+            update_conversation_active_session,
+        )
 
         async with self._session_factory() as session:
             conversation_row = await get_conversation(session, conversation_id)
@@ -1741,8 +1746,22 @@ class TurnScheduler:
                     return conversation_model, root_session, agent_model, True
 
             session_row = await get_session_row(session, conversation_row.active_session_id)
+            if session_row is None and conversation_row.status == "active":
+                await update_conversation_active_session(
+                    session, conversation_row.conversation_id, None
+                )
+                await session.commit()
+                conversation_model.active_session_id = None
 
         if session_row is None:
+            if (
+                conversation_model.status == "active"
+                and conversation_model.active_session_id is None
+            ):
+                return await self._load_conversation_runtime(
+                    conversation_id,
+                    user_message=user_message,
+                )
             return None
 
         session_model = _to_session_model(session_row)

@@ -72,6 +72,10 @@ INVARIANTS: tuple[tuple[str, str], ...] = (
         "conversations_with_terminal_active_session",
         "Conversations whose active_session_id points at a terminal session.",
     ),
+    (
+        "conversations_with_missing_active_session",
+        "Conversations whose active_session_id points at no session row.",
+    ),
 )
 
 
@@ -128,6 +132,8 @@ async def _count_violations(session: Any, category: str) -> int:
         return await _count_orphaned_step_runs(session)
     if category == "conversations_with_terminal_active_session":
         return await _count_conversations_with_terminal_active_session(session)
+    if category == "conversations_with_missing_active_session":
+        return await _count_conversations_with_missing_active_session(session)
     return 0
 
 
@@ -136,6 +142,8 @@ async def _reconcile_category(session: Any, category: str, *, now: datetime) -> 
         return await _reconcile_orphaned_step_runs(session, now=now)
     if category == "conversations_with_terminal_active_session":
         return await _reconcile_conversations_with_terminal_active_session(session)
+    if category == "conversations_with_missing_active_session":
+        return await _reconcile_conversations_with_missing_active_session(session)
     return 0
 
 
@@ -188,6 +196,33 @@ async def _reconcile_conversations_with_terminal_active_session(session: Any) ->
         .where(
             Conversation.active_session_id.is_not(None),
             Conversation.active_session_id.in_(terminal_session_ids),
+        )
+        .values(active_session_id=None)
+    )
+    result = await session.execute(stmt)
+    count = int(getattr(result, "rowcount", 0) or 0)
+    if count:
+        await session.commit()
+    return count
+
+
+async def _count_conversations_with_missing_active_session(session: Any) -> int:
+    existing_session_ids = select(SessionRow.session_id)
+    stmt = select(Conversation.conversation_id).where(
+        Conversation.active_session_id.is_not(None),
+        Conversation.active_session_id.not_in(existing_session_ids),
+    )
+    result = await session.execute(stmt)
+    return len(result.scalars().all())
+
+
+async def _reconcile_conversations_with_missing_active_session(session: Any) -> int:
+    existing_session_ids = select(SessionRow.session_id)
+    stmt = (
+        update(Conversation)
+        .where(
+            Conversation.active_session_id.is_not(None),
+            Conversation.active_session_id.not_in(existing_session_ids),
         )
         .values(active_session_id=None)
     )

@@ -16,9 +16,10 @@
         : 'border-sky-500/30 bg-sky-500/10 text-sky-100';
   }
 
-  // Task delegations have IDs starting with "task_" — link to task detail
-  // instead of trying to load session events.
+  // Task delegations have IDs starting with "task_". Sub-session cards should
+  // only offer "View session" for real session identifiers.
   let isTaskDelegation = $derived(item.taskId.startsWith('task_'));
+  let isSessionDelegation = $derived(item.taskId.startsWith('sess_'));
 </script>
 
 <article class={`rounded-3xl border px-4 py-4 shadow-card ${toneClass()}`}>
@@ -54,7 +55,7 @@
       >
         View task
       </a>
-    {:else if onViewSession}
+    {:else if onViewSession && isSessionDelegation}
       <Button
         size="sm"
         variant="ghost"

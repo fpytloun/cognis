@@ -70,6 +70,7 @@
   let showDropZone = $state(false);
   let dragCounter = 0;
   let selectedAgentId = $state('');
+  let selectedConversationStatus = $state<'active' | 'archived'>('active');
   let archivingConversation = $state(false);
   let deletingConversation = $state(false);
   let mobileListOpen = $state(false);
@@ -336,6 +337,22 @@
     }
   }
 
+  function clearLastOpenedConversation(conversationId: string | null | undefined = null): void {
+    if (typeof window === 'undefined') return;
+    if (!conversationId) {
+      window.localStorage.removeItem(CHAT_STORAGE_KEYS.lastOpenedConversation);
+      return;
+    }
+    const stored = window.localStorage.getItem(CHAT_STORAGE_KEYS.lastOpenedConversation);
+    if (stored === conversationId) {
+      window.localStorage.removeItem(CHAT_STORAGE_KEYS.lastOpenedConversation);
+    }
+  }
+
+  function nextVisibleConversationId(excludingConversationId: string): string | null {
+    return conversations.find((conversation) => conversation.conversation_id !== excludingConversationId)?.conversation_id ?? null;
+  }
+
   const terminalTodoStatuses = new Set(['completed', 'cancelled']);
 
   let chatTodos = $derived.by(() => {
@@ -395,6 +412,7 @@
     const response = await api.conversations.list(reset ? null : conversationCursor, {
       contextType: channelFilter,
       agentId: agentFilter,
+      status: selectedConversationStatus,
     });
     conversations = reset ? response.items : [...conversations, ...response.items];
     conversationCursor = response.cursor;
@@ -534,7 +552,11 @@
 
   async function refreshAvailableChannelTypes(): Promise<void> {
     const agentFilter = selectedAgentId !== 'all' ? selectedAgentId : null;
-    const allConversations = await api.conversations.listAll({ agentId: agentFilter, contextType: null });
+    const allConversations = await api.conversations.listAll({
+      agentId: agentFilter,
+      contextType: null,
+      status: selectedConversationStatus
+    });
     const types = new Set(
       allConversations.map((conversation) => conversation.context?.type?.toLowerCase() ?? 'unknown')
     );
@@ -890,6 +912,16 @@
         return;
       }
 
+      const desiredStatusFilter: 'active' | 'archived' = conversation.status === 'archived' ? 'archived' : 'active';
+      if (selectedConversationStatus !== desiredStatusFilter) {
+        selectedConversationStatus = desiredStatusFilter;
+        await refreshAvailableChannelTypes();
+        await loadConversationPage(true);
+        if (isStaleConversationLoad(requestId)) {
+          return;
+        }
+      }
+
       activeConversationId = conversationId;
       currentConversation = conversation;
       persistLastOpenedConversation(conversation);
@@ -927,6 +959,7 @@
         return;
       }
       error = asApiError(caughtError).message;
+      clearLastOpenedConversation(conversationId);
       currentConversation = null;
       sessions = [];
       timeline = [];
@@ -1042,9 +1075,13 @@
 
     archivingConversation = true;
     try {
-      currentConversation = await api.conversations.update(currentConversation.conversation_id, { archived: true });
+      const archivedConversation = await api.conversations.update(currentConversation.conversation_id, { archived: true });
+      clearLastOpenedConversation(archivedConversation.conversation_id);
+      selectedConversationStatus = 'active';
       await refreshSidebarData();
+      const nextConversationId = nextVisibleConversationId(archivedConversation.conversation_id);
       addToast('Conversation archived.', 'success');
+      await goto(nextConversationId ? `/chat/${nextConversationId}` : '/chat/new');
     } catch (caughtError) {
       error = asApiError(caughtError).message;
       addToast(error, 'error', 4_000, 'Unable to archive conversation');
@@ -1065,17 +1102,47 @@
 
     deletingConversation = true;
     try {
-      await api.conversations.remove(currentConversation.conversation_id);
+      const deletedConversationId = currentConversation.conversation_id;
+      await api.conversations.remove(deletedConversationId);
+      clearLastOpenedConversation(deletedConversationId);
+      selectedConversationStatus = 'active';
       await refreshSidebarData();
-      const nextConversation = conversations.find((c) => c.conversation_id !== currentConversation?.conversation_id);
+      const nextConversationId = nextVisibleConversationId(deletedConversationId);
       addToast('Conversation deleted.', 'success');
-      await goto(nextConversation ? `/chat/${nextConversation.conversation_id}` : '/chat/new');
+      await goto(nextConversationId ? `/chat/${nextConversationId}` : '/chat/new');
     } catch (caughtError) {
       error = asApiError(caughtError).message;
       addToast(error, 'error', 4_000, 'Unable to delete conversation');
     } finally {
       deletingConversation = false;
     }
+  }
+
+  async function restoreConversation(): Promise<void> {
+    if (!currentConversation || currentConversation.status !== 'archived') return;
+
+    archivingConversation = true;
+    try {
+      currentConversation = await api.conversations.update(currentConversation.conversation_id, { archived: false });
+      selectedConversationStatus = 'active';
+      await refreshSidebarData();
+      if (currentConversation) {
+        persistLastOpenedConversation(currentConversation);
+      }
+      addToast('Conversation restored.', 'success');
+    } catch (caughtError) {
+      error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to restore conversation');
+    } finally {
+      archivingConversation = false;
+    }
+  }
+
+  async function setConversationStatusFilter(status: 'active' | 'archived'): Promise<void> {
+    if (selectedConversationStatus === status) return;
+    selectedConversationStatus = status;
+    await refreshAvailableChannelTypes();
+    await loadConversationPage(true);
   }
 
   async function saveTitle(): Promise<void> {
@@ -1873,6 +1940,19 @@
           <Search class="pointer-events-none absolute left-3 top-2.5 h-4 w-4 text-slate-500" />
           <Input bind:value={conversationSearch} class="pl-9" placeholder="Filter by title" />
         </div>
+
+        <div class="grid grid-cols-2 gap-2">
+          <Button
+            size="sm"
+            variant={selectedConversationStatus === 'active' ? 'primary' : 'secondary'}
+            onclick={() => void setConversationStatusFilter('active')}
+          >Active</Button>
+          <Button
+            size="sm"
+            variant={selectedConversationStatus === 'archived' ? 'primary' : 'secondary'}
+            onclick={() => void setConversationStatusFilter('archived')}
+          >Archived</Button>
+        </div>
       </div>
 
       <!-- Scrollable middle: conversation list -->
@@ -2106,9 +2186,15 @@
               >
                 <Info class="h-3.5 w-3.5" />
               </button>
-              <Button size="sm" variant="secondary" disabled={!currentConversation || archivingConversation} onclick={archiveConversation}>
-                {archivingConversation ? 'Archiving...' : 'Archive'}
-              </Button>
+              {#if currentConversation?.status === 'archived'}
+                <Button size="sm" variant="secondary" disabled={archivingConversation} onclick={restoreConversation}>
+                  {archivingConversation ? 'Restoring...' : 'Restore'}
+                </Button>
+              {:else}
+                <Button size="sm" variant="secondary" disabled={!currentConversation || archivingConversation} onclick={archiveConversation}>
+                  {archivingConversation ? 'Archiving...' : 'Archive'}
+                </Button>
+              {/if}
               <Button size="sm" variant="danger" disabled={!currentConversation || deletingConversation} onclick={deleteConversation}>
                 {deletingConversation ? 'Deleting...' : 'Delete'}
               </Button>
@@ -2157,9 +2243,15 @@
               <Button size="sm" variant="secondary" onclick={() => { sessionInfoOpen = !sessionInfoOpen; if (sessionInfoOpen && !sessionInfo) void loadSessionInfo(); }}>
                 Session details
               </Button>
-              <Button size="sm" variant="secondary" disabled={!currentConversation || archivingConversation} onclick={archiveConversation}>
-                {archivingConversation ? 'Archiving...' : 'Archive'}
-              </Button>
+              {#if currentConversation.status === 'archived'}
+                <Button size="sm" variant="secondary" disabled={archivingConversation} onclick={restoreConversation}>
+                  {archivingConversation ? 'Restoring...' : 'Restore'}
+                </Button>
+              {:else}
+                <Button size="sm" variant="secondary" disabled={!currentConversation || archivingConversation} onclick={archiveConversation}>
+                  {archivingConversation ? 'Archiving...' : 'Archive'}
+                </Button>
+              {/if}
               <Button size="sm" variant="danger" disabled={!currentConversation || deletingConversation} onclick={deleteConversation}>
                 {deletingConversation ? 'Deleting...' : 'Delete'}
               </Button>
@@ -2310,9 +2402,13 @@
           <div class="rounded-2xl border border-slate-700/60 bg-slate-900/60 px-4 py-3 text-center text-sm text-slate-400">
             This conversation is from <span class="font-medium text-slate-300">{contextTypeBadge(currentConversation)}</span>. Read-only in web UI.
           </div>
-        {:else if currentConversation && currentConversation.status !== 'active'}
+        {:else if currentConversation && currentConversation.status === 'archived'}
           <div class="rounded-2xl border border-slate-700/60 bg-slate-900/60 px-4 py-3 text-center text-sm text-slate-400">
             This conversation is archived.
+          </div>
+        {:else if currentConversation && currentConversation.status === 'deleted'}
+          <div class="rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-center text-sm text-rose-100">
+            This conversation has been deleted.
           </div>
         {:else if isSessionBlocked()}
           <div class="rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-center text-sm text-amber-100">

@@ -38,6 +38,7 @@ from cognis.models.session import ConversationContext
 from cognis.store.queries import (
     get_agent,
     get_conversation,
+    get_latest_root_session_for_conversation,
     get_latest_active_conversation_for_agent,
     get_root_session_chain,
     get_session_row,
@@ -48,6 +49,13 @@ from cognis.store.queries import (
 )
 
 logger = get_logger(__name__)
+
+
+def _require_visible_conversation(request: Request, row: Any) -> Any:
+    if row is None or getattr(row, "status", None) == "deleted":
+        raise api_exception(404, "not_found", "Conversation not found")
+    require_owner_or_admin(request, row.user_email)
+    return row
 
 
 async def _hydrate_event_attachments(
@@ -85,12 +93,17 @@ async def conversation_list(
     limit: int = Query(default=20, ge=1, le=100),
     context_type: str | None = Query(default=None),
     agent_id: str | None = Query(default=None),
+    status: str = Query(default="active", pattern="^(active|archived|all)$"),
 ) -> CursorPage[ConversationResponse]:
     user = require_current_user(request)
     async with request.app.state.session_factory() as session:
-        rows = await list_conversations(session, user.email, context_type=context_type)
-    if agent_id is not None:
-        rows = [row for row in rows if row.agent_id == agent_id]
+        rows = await list_conversations(
+            session,
+            user.email,
+            context_type=context_type,
+            agent_id=agent_id,
+            status=status,
+        )
     items = [conversation_to_response(row) for row in rows]
     page_items, next_cursor, has_more = paginate_items(
         items,
@@ -172,9 +185,7 @@ async def create_conversation(
 async def conversation_detail(request: Request, conversation_id: str) -> ConversationResponse:
     async with request.app.state.session_factory() as session:
         row = await get_conversation(session, conversation_id)
-    if row is None:
-        raise api_exception(404, "not_found", "Conversation not found")
-    require_owner_or_admin(request, row.user_email)
+    row = _require_visible_conversation(request, row)
     return conversation_to_response(row)
 
 
@@ -191,6 +202,8 @@ async def update_conversation(
         if row is None:
             raise api_exception(404, "not_found", "Conversation not found")
         require_owner_or_admin(request, row.user_email)
+        if row.status == "deleted":
+            raise api_exception(404, "not_found", "Conversation not found")
         if payload.archived is True:
             await manager.archive_conversation(conversation_id)
         elif payload.archived is False and row.status == "archived":
@@ -209,9 +222,7 @@ async def mark_read(request: Request, conversation_id: str) -> dict[str, bool]:
     require_current_user(request)
     async with request.app.state.session_factory() as session:
         row = await get_conversation(session, conversation_id)
-        if row is None:
-            raise api_exception(404, "not_found", "Conversation not found")
-        require_owner_or_admin(request, row.user_email)
+        row = _require_visible_conversation(request, row)
         await mark_conversation_read(session, conversation_id)
         await session.commit()
     return {"ok": True}
@@ -273,10 +284,13 @@ async def conversation_messages(
 ) -> MessageHistoryResponse:
     async with request.app.state.session_factory() as session:
         row = await get_conversation(session, conversation_id)
-        if row is None:
-            raise api_exception(404, "not_found", "Conversation not found")
-        require_owner_or_admin(request, row.user_email)
-        if row.active_session_id is None:
+        row = _require_visible_conversation(request, row)
+
+        history_anchor_id = row.active_session_id
+        if history_anchor_id is None and after_seq == 0:
+            latest_root = await get_latest_root_session_for_conversation(session, conversation_id)
+            history_anchor_id = latest_root.session_id if latest_root is not None else None
+        if history_anchor_id is None:
             return MessageHistoryResponse(items=[], last_seq=0, has_more=False)
 
         # Incremental fetch (after_seq > 0): read only the active session.
@@ -284,11 +298,11 @@ async def conversation_messages(
         # merge events from all root sessions (oldest first).
         lineage_truncated = False
         if after_seq > 0:
-            session_row = await get_session_row(session, row.active_session_id)
+            session_row = await get_session_row(session, history_anchor_id)
             session_rows = [session_row] if session_row is not None else []
         else:
             session_rows, lineage_truncated = await get_root_session_chain(
-                session, conversation_id, row.active_session_id
+                session, conversation_id, history_anchor_id
             )
 
     if not session_rows:
@@ -472,6 +486,10 @@ async def send_message(
     if row is None:
         raise api_exception(404, "not_found", "Conversation not found")
     require_owner_or_admin(request, row.user_email)
+    if row.status == "deleted":
+        raise api_exception(404, "not_found", "Conversation not found")
+    if row.status == "archived":
+        raise api_exception(409, "conflict", "Conversation is not active")
 
     # --- Slash command dispatch ---
     command_result = await _try_command_dispatch(request, conversation_id, payload.content, user)
@@ -637,9 +655,7 @@ def _turn_error_to_http(error: TurnError) -> Exception:
 async def conversation_sessions(request: Request, conversation_id: str) -> list[SessionResponse]:
     async with request.app.state.session_factory() as session:
         row = await get_conversation(session, conversation_id)
-        if row is None:
-            raise api_exception(404, "not_found", "Conversation not found")
-        require_owner_or_admin(request, row.user_email)
+        row = _require_visible_conversation(request, row)
         sessions = await list_conversation_sessions(session, conversation_id)
     return [session_to_response(item) for item in sessions]
 
@@ -669,9 +685,7 @@ async def session_events(
     """
     async with request.app.state.session_factory() as session:
         row = await get_conversation(session, conversation_id)
-        if row is None:
-            raise api_exception(404, "not_found", "Conversation not found")
-        require_owner_or_admin(request, row.user_email)
+        row = _require_visible_conversation(request, row)
         session_row = await get_session_row(session, session_id)
     if session_row is None or session_row.conversation_id != conversation_id:
         raise api_exception(404, "not_found", "Session not found in this conversation")

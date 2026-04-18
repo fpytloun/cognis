@@ -7,7 +7,11 @@ from unittest.mock import AsyncMock
 from fastapi.testclient import TestClient
 
 from cognis.api.app import create_app
-from cognis.api.websocket import AuthenticatedWebSocket, _handle_step_response
+from cognis.api.websocket import (
+    AuthenticatedWebSocket,
+    WebSocketConnectionManager,
+    _handle_step_response,
+)
 from cognis.core.agent_loop import PendingPause
 from cognis.core.decision import DecisionResult
 from cognis.models.session import EventReadResult
@@ -961,6 +965,270 @@ def test_conversation_list_filters_by_agent(monkeypatch: object, tmp_path: Path)
         assert [item["conversation_id"] for item in body["items"]] == [second_id]
         assert body["items"][0]["agent_id"] == "agent-2"
         assert first_id != second_id
+
+
+def test_conversation_list_defaults_to_active_and_supports_archived_filter(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> tuple[str, str, str]:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                active = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                    title="Active",
+                )
+                archived = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                    title="Archived",
+                )
+                archived.status = "archived"
+                deleted = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                    title="Deleted",
+                )
+                deleted.status = "deleted"
+                await session.commit()
+                return (
+                    active.conversation_id,
+                    archived.conversation_id,
+                    deleted.conversation_id,
+                )
+
+        active_id, archived_id, deleted_id = asyncio.run(_seed())
+
+        active_response = client.get(
+            "/api/v1/conversations",
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+        assert active_response.status_code == 200
+        assert [item["conversation_id"] for item in active_response.json()["items"]] == [active_id]
+
+        archived_response = client.get(
+            "/api/v1/conversations?status=archived",
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+        assert archived_response.status_code == 200
+        assert [item["conversation_id"] for item in archived_response.json()["items"]] == [
+            archived_id
+        ]
+        assert deleted_id not in [
+            item["conversation_id"] for item in archived_response.json()["items"]
+        ]
+
+
+def test_deleted_conversation_is_hidden_from_detail_and_history(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> str:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                conversation = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                    title="Hidden",
+                )
+                conversation.status = "deleted"
+                await session.commit()
+                return conversation.conversation_id
+
+        conversation_id = asyncio.run(_seed())
+        headers = _auth_headers(app, email="user@example.com")
+
+        detail_response = client.get(f"/api/v1/conversations/{conversation_id}", headers=headers)
+        history_response = client.get(
+            f"/api/v1/conversations/{conversation_id}/messages",
+            headers=headers,
+        )
+
+        assert detail_response.status_code == 404
+        assert history_response.status_code == 404
+
+
+def test_archived_conversation_history_loads_without_active_session(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> tuple[str, str]:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                conversation = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                    title="Archived",
+                )
+                session_row = await create_session(
+                    session,
+                    conversation_id=conversation.conversation_id,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                )
+                await set_session_intaris_session_id(
+                    session, session_row.session_id, session_row.session_id
+                )
+                await update_conversation_active_session(
+                    session, conversation.conversation_id, session_row.session_id
+                )
+                conversation.status = "archived"
+                await update_conversation_active_session(
+                    session, conversation.conversation_id, None
+                )
+                await session.commit()
+                return conversation.conversation_id, session_row.session_id
+
+        conversation_id, expected_session_id = asyncio.run(_seed())
+
+        async def _fake_read_events(
+            session_id: str,
+            after_seq: int = 0,
+            limit: int = 0,
+            allow_missing_stream: bool = False,
+            **_: object,
+        ) -> EventReadResult:
+            assert session_id == expected_session_id
+            assert after_seq == 0
+            assert limit == 0
+            assert allow_missing_stream is True
+            return EventReadResult(
+                events=[
+                    {
+                        "seq": 1,
+                        "type": "assistant_message",
+                        "data": {"content": "archived history"},
+                        "ts": "2026-03-28T00:00:00Z",
+                    }
+                ],
+                last_seq=1,
+                has_more=False,
+                missing_stream_fallback_used=False,
+            )
+
+        app.state.providers.guardrails.read_events = _fake_read_events
+
+        response = client.get(
+            f"/api/v1/conversations/{conversation_id}/messages",
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["active_session_id"] == expected_session_id
+        assert body["items"][0]["type"] == "assistant_message"
+
+
+def test_websocket_replay_skips_missing_active_session_error(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> str:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                conversation = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                    title="Replay",
+                )
+                conversation.active_session_id = "sess-missing"
+                await session.commit()
+                return conversation.conversation_id
+
+        conversation_id = asyncio.run(_seed())
+
+        class _Socket:
+            def __init__(self) -> None:
+                self.sent: list[dict[str, object]] = []
+
+            async def send_json(self, payload: dict[str, object]) -> None:
+                self.sent.append(payload)
+
+        manager = WebSocketConnectionManager(app)
+        socket = _Socket()
+        connection = AuthenticatedWebSocket(
+            connection_id="conn-1",
+            websocket=socket,
+            user_email="user@example.com",
+            role="user",
+        )
+
+        asyncio.run(manager.replay(connection, conversation_id=conversation_id, last_seq=0))
+
+        assert socket.sent == []
+        assert conversation_id in connection.subscriptions
 
 
 def test_conversation_messages_returns_empty_when_stream_missing(
