@@ -72,6 +72,38 @@ def test_overlap_restart_appends_only_unseen_suffix() -> None:
     }
 
 
+def test_corrected_full_object_replaces_invalid_partial_payload() -> None:
+    acc = StreamAccumulator()
+    _feed_tool_delta(
+        acc,
+        '{"todos":[content":"Find the Lumilens Todoist project and appropriate section",'
+        '"status":"in_progress"}]}',
+        name="step_todo_write",
+    )
+    _feed_tool_delta(
+        acc,
+        '{"todos":[{"content":"Find the Lumilens Todoist project and appropriate section",'
+        '"status":"in_progress"},{"content":"Create the Todoist task for Monday in '
+        'the Lumilens project","status":"pending"}]}',
+        name="step_todo_write",
+    )
+    calls = acc.get_tool_calls()
+    assert len(calls) == 1
+    assert calls[0].name == "step_todo_write"
+    assert calls[0].arguments == {
+        "todos": [
+            {
+                "content": "Find the Lumilens Todoist project and appropriate section",
+                "status": "in_progress",
+            },
+            {
+                "content": "Create the Todoist task for Monday in the Lumilens project",
+                "status": "pending",
+            },
+        ]
+    }
+
+
 def test_two_concatenated_objects_split_into_separate_calls() -> None:
     acc = StreamAccumulator()
     _feed_tool_delta(acc, '{"query":"a"}')
@@ -90,3 +122,44 @@ def test_malformed_arguments_fall_through_to_raw() -> None:
     # _raw is the signal to validators / tool handlers; it must be
     # the only key so validate_tool_arguments can detect it.
     assert set(calls[0].arguments.keys()) == {"_raw"}
+
+
+def test_recover_trailing_valid_object_for_mcp_tool_arguments() -> None:
+    acc = StreamAccumulator()
+    _feed_tool_delta(
+        acc,
+        '{"tasks":[content":"Fixnout sizing RDS instance v Terraform",'
+        '"description":"","priority":"p4","dueString":"Monday",'
+        '"deadlineDate":"","duration":"","labels":[],"'
+        'projectId":"6fMRX3vr2McFxCr7","sectionId":"6fr2pjvJV2M5PFF7",'
+        '"parentId":"","order":0,"responsibleUser":"",'
+        '"isUncompletable":false}]}{"tasks":[{"content":"Fixnout sizing RDS '
+        'instance v Terraform","description":"","priority":"p4",'
+        '"dueString":"Monday","deadlineDate":"","duration":"",'
+        '"labels":[],"projectId":"6fMRX3vr2McFxCr7",'
+        '"sectionId":"6fr2pjvJV2M5PFF7","parentId":"","order":0,'
+        '"responsibleUser":"","isUncompletable":false}]}',
+        name="mcp__todoist_add_tasks",
+    )
+    calls = acc.get_tool_calls()
+    assert len(calls) == 1
+    assert calls[0].name == "mcp__todoist_add_tasks"
+    assert calls[0].arguments == {
+        "tasks": [
+            {
+                "content": "Fixnout sizing RDS instance v Terraform",
+                "description": "",
+                "priority": "p4",
+                "dueString": "Monday",
+                "deadlineDate": "",
+                "duration": "",
+                "labels": [],
+                "projectId": "6fMRX3vr2McFxCr7",
+                "sectionId": "6fr2pjvJV2M5PFF7",
+                "parentId": "",
+                "order": 0,
+                "responsibleUser": "",
+                "isUncompletable": False,
+            }
+        ]
+    }

@@ -51,7 +51,7 @@ from cognis.core.title_policy import sync_intaris_title
 from cognis.core.tool_arguments import ToolArgumentError, validate_tool_arguments
 from cognis.core.tool_exposure import prepare_tool_exposure
 from cognis.core.truncation import middle_truncate
-from cognis.json_stream import merge_incremental_json_fragment
+from cognis.json_stream import merge_incremental_json_fragment, recover_trailing_json_object
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.artifact import AttachmentRef
@@ -668,10 +668,11 @@ class StreamAccumulator:
                 if func.get("arguments"):
                     incoming_arguments = func["arguments"]
                     existing_arguments = entry["arguments"]
-                    entry["arguments"] = merge_incremental_json_fragment(
+                    merge_result = merge_incremental_json_fragment(
                         existing_arguments,
                         incoming_arguments,
                     )
+                    entry["arguments"] = merge_result.merged
                     if len(entry["arguments"]) > _MAX_TOOL_CALL_ARGUMENT_CHARS:
                         raise ValueError(
                             f"Tool call arguments exceeded {_MAX_TOOL_CALL_ARGUMENT_CHARS} characters"
@@ -702,6 +703,16 @@ class StreamAccumulator:
                                 arguments=parsed,
                             )
                         )
+                    continue
+                recovered_args = recover_trailing_json_object(tc["arguments"])
+                if recovered_args is not None:
+                    result.append(
+                        ToolCall(
+                            call_id=tc["id"] or f"call_{uuid.uuid4().hex[:12]}",
+                            name=tc["name"],
+                            arguments=recovered_args,
+                        )
+                    )
                     continue
                 logger.warning(
                     "Malformed tool call arguments; passing as _raw",

@@ -367,10 +367,13 @@ class _ResponsesStreamState:
                 existing["name"] = str(item.get("name") or existing["name"])
             initial_arguments = str(item.get("arguments") or "")
             if initial_arguments:
-                existing["arguments"] = merge_incremental_json_fragment(
+                merge_result = merge_incremental_json_fragment(
                     str(existing.get("arguments") or ""),
                     initial_arguments,
                 )
+                existing["arguments"] = merge_result.merged
+                if merge_result.replaced:
+                    existing["emitted"] = 0
             self._bind_item_aliases(existing["state_key"], aliases)
             return existing, False
         index = self._next_tool_index
@@ -507,12 +510,14 @@ class _ResponsesStreamState:
         if state is None or not isinstance(delta, str) or not delta:
             return None
         existing_arguments = str(state.get("arguments") or "")
-        merged_arguments = merge_incremental_json_fragment(existing_arguments, delta)
-        appended_delta = merged_arguments[len(existing_arguments) :]
-        state["arguments"] = merged_arguments
-        if not appended_delta:
+        merge_result = merge_incremental_json_fragment(existing_arguments, delta)
+        state["arguments"] = merge_result.merged
+        if not merge_result.emitted:
             return None
-        state["emitted"] += len(appended_delta)
+        if merge_result.replaced:
+            state["emitted"] = len(state["arguments"])
+        else:
+            state["emitted"] += len(merge_result.emitted)
         return {
             "choices": [
                 {
@@ -521,7 +526,7 @@ class _ResponsesStreamState:
                             {
                                 "index": state["index"],
                                 "id": state["call_id"],
-                                "function": {"arguments": appended_delta},
+                                "function": {"arguments": merge_result.emitted},
                             }
                         ]
                     }
@@ -537,16 +542,24 @@ class _ResponsesStreamState:
         if state is None:
             return None
         final_arguments = str(item.get("arguments") or "")
-        merged_arguments = merge_incremental_json_fragment(
+        merge_result = merge_incremental_json_fragment(
             str(state.get("arguments") or ""),
             final_arguments,
         )
+        merged_arguments = merge_result.merged
         emitted = int(state.get("emitted", 0))
-        if len(merged_arguments) <= emitted:
+        if merge_result.replaced:
+            delta = merge_result.emitted
+            state["arguments"] = merged_arguments
+            state["emitted"] = len(merged_arguments)
+        else:
+            if len(merged_arguments) <= emitted:
+                return None
+            delta = merged_arguments[emitted:]
+            state["arguments"] = merged_arguments
+            state["emitted"] = len(merged_arguments)
+        if not delta:
             return None
-        delta = merged_arguments[emitted:]
-        state["arguments"] = merged_arguments
-        state["emitted"] = len(merged_arguments)
         return {
             "choices": [
                 {

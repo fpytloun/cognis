@@ -453,3 +453,49 @@ async def test_responses_stream_to_chat_chunks_dedupes_replay_when_item_id_chang
     assert len(calls) == 1
     assert calls[0].call_id == "call_shared"
     assert calls[0].arguments == {"summary": "done"}
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_recovers_trailing_valid_object_suffix() -> None:
+    async def _stream():
+        yield {
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "id": "fc_suffix",
+                "call_id": "call_suffix",
+                "name": "step_todo_write",
+                "arguments": (
+                    '{"todos":[content":"Find the Lumilens Todoist project and '
+                    'appropriate section","status":"in_progress"}]}'
+                    '{"todos":[{"content":"Find the Lumilens Todoist project and '
+                    'appropriate section","status":"in_progress"},{"content":'
+                    '"Create the Todoist task for Monday in the Lumilens project",'
+                    '"status":"pending"}]}'
+                ),
+            },
+        }
+        yield {
+            "type": "response.completed",
+            "response": {"status": "completed", "usage": {"total_tokens": 7}},
+        }
+
+    acc = StreamAccumulator()
+    async for chunk in responses_stream_to_chat_chunks(_stream()):
+        acc.feed(chunk)
+
+    calls = acc.get_tool_calls()
+    assert len(calls) == 1
+    assert calls[0].name == "step_todo_write"
+    assert calls[0].arguments == {
+        "todos": [
+            {
+                "content": "Find the Lumilens Todoist project and appropriate section",
+                "status": "in_progress",
+            },
+            {
+                "content": "Create the Todoist task for Monday in the Lumilens project",
+                "status": "pending",
+            },
+        ]
+    }
