@@ -39,8 +39,10 @@ class _SessionCache:
         self.entry = None if cold else _CacheEntry()
         self.refresh_calls = 0
         self.prefix_entries: list[ImmutablePrefixEntry] = []
+        self.prefix_entries_after_refresh: list[ImmutablePrefixEntry] = []
         self.prefix_repair_needed = False
         self.last_repair_attempt_at: float | None = None
+        self.mark_prefix_repair_calls = 0
 
     async def refresh(self, session: SessionModel) -> object:
         del session
@@ -49,6 +51,8 @@ class _SessionCache:
         if self.fail_refresh:
             raise RuntimeError("event read failed")
         self.entry = self.entry or _CacheEntry()
+        if self.prefix_entries_after_refresh:
+            self.prefix_entries = list(self.prefix_entries_after_refresh)
         return self.entry
 
     def get_entry(self, session_id: str) -> object | None:
@@ -117,6 +121,7 @@ class _SessionCache:
     async def mark_prefix_repair_needed(self, session_id: str) -> None:
         del session_id
         self.prefix_repair_needed = True
+        self.mark_prefix_repair_calls += 1
 
     def get_compaction_summary(self, session_id: str) -> str | None:
         del session_id
@@ -401,6 +406,156 @@ async def test_context_assembler_uses_search_mode_for_follow_up_turns() -> None:
 
     assert memory.search_modes == ["search"]
     assert memory.identity_calls == []
+
+
+@pytest.mark.asyncio
+async def test_context_assembler_rebuilds_prefix_from_refresh_before_retry_bootstrap() -> None:
+    memory = _Memory()
+    cache = _SessionCache(cold=True)
+    cache.prefix_entries_after_refresh = [
+        ImmutablePrefixEntry(
+            role="system",
+            source="identity",
+            content="Recovered identity",
+            seq=2,
+        ),
+        ImmutablePrefixEntry(
+            role="developer",
+            source="core_memories",
+            content="Recovered core memories",
+            seq=3,
+        ),
+    ]
+    assembler = ContextAssembler(
+        memory=memory,
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=cache,
+        session_manager=_SessionManager(),
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+
+    result = await assembler.assemble(
+        session=_session(mnemory_session_id="mem-existing"),
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="retry this step",
+        tool_definitions=[],
+    )
+
+    assert cache.refresh_calls == 1
+    assert memory.identity_calls == []
+    assert memory.recall_calls[0]["session_id"] == "mem-existing"
+    assert "Recovered identity" in str(result.messages[0]["content"])
+
+
+@pytest.mark.asyncio
+async def test_context_assembler_repairs_existing_mnemory_session_with_fresh_session_when_core_missing() -> (
+    None
+):
+    class _RepairingMemory(_Memory):
+        async def load_session_identity(self, **kwargs: object) -> dict[str, object]:
+            self.call_order.append("identity")
+            self.identity_calls.append(dict(kwargs))
+            if kwargs.get("session_id") == "mem-existing":
+                return {
+                    "session_id": "mem-existing",
+                    "instructions": "Use memory tools carefully.",
+                    "core_memories": None,
+                }
+            return {
+                "session_id": "mem-repaired",
+                "instructions": "Use memory tools carefully.",
+                "core_memories": "restored core memories",
+            }
+
+        async def recall(self, **kwargs: object) -> dict[str, object]:
+            self.call_order.append("recall")
+            self.recall_calls.append(dict(kwargs))
+            self.search_modes.append(str(kwargs["search_mode"]))
+            return {
+                "session_id": str(kwargs.get("session_id") or "mem-repaired"),
+                "search_results": [{"memory": "Uses pytest", "score": 0.9}],
+            }
+
+    memory = _RepairingMemory()
+    cache = _SessionCache(cold=True)
+    session_manager = _SessionManager()
+    assembler = ContextAssembler(
+        memory=memory,
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=cache,
+        session_manager=session_manager,
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+    session = _session(mnemory_session_id="mem-existing")
+
+    result = await assembler.assemble(
+        session=session,
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="retry this step",
+        tool_definitions=[],
+    )
+
+    assert cache.refresh_calls == 1
+    assert memory.identity_calls == [
+        {
+            "session_id": "mem-existing",
+            "labels": {"project": "cognis"},
+            "context": "cached intention",
+        },
+        {"session_id": None, "labels": {"project": "cognis"}, "context": "cached intention"},
+    ]
+    assert session_manager.attached == [("session-1", "mem-repaired")]
+    assert session.mnemory_session_id == "mem-repaired"
+    assert "restored core memories" in str(result.messages[0]["content"])
+
+
+@pytest.mark.asyncio
+async def test_context_assembler_adopts_forged_per_turn_mnemory_session_and_marks_repair() -> None:
+    class _ForgedRecallMemory(_Memory):
+        async def recall(self, **kwargs: object) -> dict[str, object]:
+            self.call_order.append("recall")
+            self.recall_calls.append(dict(kwargs))
+            self.search_modes.append(str(kwargs["search_mode"]))
+            return {
+                "session_id": "mem-forged",
+                "search_results": [{"memory": "Uses pytest", "score": 0.9}],
+                "_session_forged": True,
+            }
+
+    memory = _ForgedRecallMemory()
+    cache = _SessionCache()
+    cache.prefix_entries = [
+        ImmutablePrefixEntry(role="system", source="identity", content="Agent identity", seq=1)
+    ]
+    session_manager = _SessionManager()
+    assembler = ContextAssembler(
+        memory=memory,
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=cache,
+        session_manager=session_manager,
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+    session = _session(mnemory_session_id="mem-existing")
+
+    await assembler.assemble(
+        session=session,
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="follow up",
+        tool_definitions=[],
+    )
+
+    assert session_manager.attached == [("session-1", "mem-forged")]
+    assert session.mnemory_session_id == "mem-forged"
+    assert cache.mark_prefix_repair_calls == 1
 
 
 @pytest.mark.asyncio

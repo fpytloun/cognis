@@ -1536,6 +1536,47 @@ def test_build_tool_attachment_context_uses_user_blocks_for_vision_models() -> N
     assert message["content"][1]["type"] == "image_url"
 
 
+def test_context_pressure_exceeded_counts_exposed_tool_schemas() -> None:
+    loop = AgentLoop.__new__(AgentLoop)
+    loop.providers = SimpleNamespace(
+        llm=SimpleNamespace(
+            count_messages_tokens=lambda messages, model: 900,
+            count_tokens=lambda text, model: len(text),
+        )
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="execute", type="run", prompt="Do work"),
+        session=SimpleNamespace(session_id="sess-1"),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(
+            agent_id="agent-1",
+            owner_email="user@example.com",
+            name="Agent",
+        ),
+        current_model="test-model",
+        current_model_info=SimpleNamespace(max_output_tokens=50),
+    )
+    tool_schemas = [
+        {
+            "type": "function",
+            "function": {
+                "name": "filesystem/read_file",
+                "description": "Read a file",
+                "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+            },
+        }
+    ]
+
+    exceeded = loop._context_pressure_exceeded(
+        ctx,
+        messages=[{"role": "system", "content": "hello"}],
+        tool_schemas=tool_schemas,
+        max_context_tokens=1000,
+    )
+
+    assert exceeded is True
+
+
 @pytest.mark.asyncio
 async def test_tool_call_ceiling_returns_partial_step_output_without_second_llm_turn() -> None:
     fake_llm = _ToolCallCeilingLLM()

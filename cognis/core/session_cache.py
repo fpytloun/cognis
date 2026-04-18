@@ -742,7 +742,11 @@ class SessionCache:
             entry.prefix_entries = []
             entry.context_snapshot_seq = 0
             entry.context_snapshot_source = None
-            entry.prefix_repair_needed = bool(raw_events)
+            entry.prefix_repair_needed = any(
+                str(raw_event.get("type") or "")
+                in {"system_message", "developer_message", "user_message", "assistant_message"}
+                for raw_event in raw_events
+            )
             return
 
         seq_to_message: dict[int, dict[str, Any]] = {}

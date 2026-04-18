@@ -3349,7 +3349,7 @@ class AgentLoop:
                 and self._context_pressure_exceeded(
                     ctx,
                     messages=messages,
-                    tool_definitions=exposure.tool_definitions,
+                    tool_schemas=exposure.tools,
                     max_context_tokens=context_result.max_context_tokens,
                 )
             ):
@@ -5635,7 +5635,7 @@ class AgentLoop:
         ctx: StepContext,
         *,
         messages: list[dict[str, Any]],
-        tool_definitions: list[ToolDefinition],
+        tool_schemas: list[dict[str, Any]],
         max_context_tokens: int,
     ) -> bool:
         if not ctx.current_model or max_context_tokens <= 0:
@@ -5647,11 +5647,9 @@ class AgentLoop:
         )
         try:
             prompt_tokens = self.providers.llm.count_messages_tokens(messages, ctx.current_model)
-            if tool_definitions:
+            if tool_schemas:
                 prompt_tokens += self.providers.llm.count_tokens(
-                    json.dumps(
-                        [tool.model_dump(mode="json") for tool in tool_definitions], sort_keys=True
-                    ),
+                    json.dumps(tool_schemas, sort_keys=True),
                     ctx.current_model,
                 )
         except Exception:

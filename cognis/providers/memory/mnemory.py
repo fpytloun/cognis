@@ -7,6 +7,7 @@ from time import perf_counter
 from typing import Any, TypeVar
 
 import httpx
+from prometheus_client import Counter
 
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
@@ -16,6 +17,11 @@ from cognis.providers.retry import with_retry
 from cognis.runtime_context import current_agent_id, current_user_email
 
 logger = get_logger(__name__)
+
+MNEMORY_SESSION_FORGED_TOTAL = Counter(
+    "cognis_mnemory_session_forged_total",
+    "Mnemory recalls that returned a different session id than requested.",
+)
 
 T = TypeVar("T")
 
@@ -188,6 +194,21 @@ class MnemoryProvider:
             max_retries=2,
             operation="mnemory recall",
         )
+        returned_session_id = str(result.get("session_id") or "").strip()
+        if session_id and returned_session_id and returned_session_id != session_id:
+            MNEMORY_SESSION_FORGED_TOTAL.inc()
+            logger.warning(
+                "mnemory: recall returned different session id than requested",
+                extra={
+                    "extra_data": {
+                        "requested_session_id": session_id,
+                        "returned_session_id": returned_session_id,
+                    }
+                },
+            )
+            result["_session_forged"] = True
+        else:
+            result["_session_forged"] = False
         stats = result.get("stats", {})
         logger.info(
             "mnemory: recall complete",

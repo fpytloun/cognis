@@ -16,6 +16,7 @@
   import WorkflowDiagram from '$lib/components/workflows/WorkflowDiagram.svelte';
   import { confirmAction } from '$lib/stores/confirm';
   import { addToast } from '$lib/stores/toasts';
+  import { loadTaskPageData, refreshTaskPageData, shouldClearTaskFromError } from '$lib/task-detail';
   import { renderMarkdown } from '$lib/markdown';
   import { formatAbsoluteTime, formatDuration, formatRelativeTime } from '$lib/time';
   import { workflowToFormState } from '$lib/workflows';
@@ -549,13 +550,13 @@
     loading = true;
     error = '';
     try {
-      [task, agents, workflows, conversations, allTasks] = await Promise.all([
-        api.tasks.detail(taskIdFromRoute()),
-        api.agents.listAll(),
-        api.workflows.listAll(),
-        api.conversations.listAll(),
-        api.tasks.listAll()
-      ]);
+      const data = await loadTaskPageData(api, taskIdFromRoute());
+      task = data.task;
+      agents = data.agents;
+      workflows = data.workflows;
+      conversations = data.conversations;
+      allTasks = data.allTasks;
+      error = data.auxiliaryError;
       editForm = {
         title: task.title,
         description: task.description,
@@ -570,6 +571,7 @@
       };
       selectedStepName = defaultStepSelection(task, selectedStepName);
     } catch (caughtError) {
+      task = null;
       error = asApiError(caughtError).message;
     } finally {
       loading = false;
@@ -579,12 +581,15 @@
   async function refreshTaskOnly(): Promise<void> {
     if (document.hidden) return;
     try {
-      [task, allTasks] = await Promise.all([
-        api.tasks.detail(taskIdFromRoute()),
-        api.tasks.listAll()
-      ]);
+      const data = await refreshTaskPageData(api, taskIdFromRoute(), allTasks);
+      task = data.task;
+      allTasks = data.allTasks;
+      error = data.auxiliaryError;
       selectedStepName = defaultStepSelection(task, selectedStepName);
     } catch (caughtError) {
+      if (shouldClearTaskFromError(caughtError)) {
+        task = null;
+      }
       error = asApiError(caughtError).message;
     }
   }
@@ -1572,5 +1577,5 @@
     />
   {/if}
 {:else}
-  <p class="rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-100">Task not found.</p>
+  <p class="rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-100">{error || 'Task not found.'}</p>
 {/if}

@@ -12,6 +12,7 @@ from pathlib import Path
 from time import monotonic
 from typing import Any
 
+from prometheus_client import Counter
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -41,6 +42,12 @@ from cognis.store.queries import get_setting_value
 
 logger = get_logger(__name__)
 
+MNEMORY_SESSION_REPAIRED_TOTAL = Counter(
+    "cognis_mnemory_session_repaired_total",
+    "Mnemory session repairs performed while rebuilding immutable prefixes.",
+    labelnames=("reason",),
+)
+
 EVENT_TYPES_FOR_CONTEXT = [
     "user_message",
     "assistant_message",
@@ -52,6 +59,12 @@ EVENT_TYPES_FOR_CONTEXT = [
 ]
 
 _MAX_PROJECT_INSTRUCTION_BYTES = 32000
+_VISIBLE_HISTORY_EVENT_TYPES = {
+    "system_message",
+    "developer_message",
+    "user_message",
+    "assistant_message",
+}
 
 
 def _is_newer_timestamp(candidate: str | None, current: str | None) -> bool:
@@ -405,6 +418,16 @@ class ContextAssembler:
             effective_working_directory=effective_working_directory,
             executor_environment=executor_environment,
         )
+        refreshed_cache_entry: Any | None = None
+        performed_refresh = False
+        if (
+            not self.session_cache.get_prefix_entries(session.session_id)
+            and session.mnemory_session_id is not None
+        ):
+            refreshed_cache_entry = await self.session_cache.refresh(session)
+            performed_refresh = True
+            if not self.session_cache.get_prefix_entries(session.session_id):
+                await self.session_cache.mark_prefix_repair_needed(session.session_id)
         prefix_entries = await self._ensure_immutable_prefix(
             session=session,
             agent=agent,
@@ -424,19 +447,27 @@ class ContextAssembler:
                 managed=True,
                 instruction_mode=None,
             )
-            refresh_task = self.session_cache.refresh(session)
             intention_task = self.guardrails.get_session(
                 session.intaris_session_id or session.session_id
             )
-            # Providers are mandatory — any failure propagates immediately.
-            # Intention is best-effort (non-critical for turn execution).
-            gathered_results: tuple[Any, Any, Any] = await asyncio.gather(
-                recall_task,
-                refresh_task,
-                intention_task,
-                return_exceptions=True,  # Intention may fail independently
-            )
-        recall_result, cache_result, intention_result = gathered_results
+            if performed_refresh:
+                recall_result, intention_result = await asyncio.gather(
+                    recall_task,
+                    intention_task,
+                    return_exceptions=True,
+                )
+                cache_result: Any = refreshed_cache_entry
+            else:
+                refresh_task = self.session_cache.refresh(session)
+                # Providers are mandatory — any failure propagates immediately.
+                # Intention is best-effort (non-critical for turn execution).
+                gathered_results: tuple[Any, Any, Any] = await asyncio.gather(
+                    recall_task,
+                    refresh_task,
+                    intention_task,
+                    return_exceptions=True,
+                )
+                recall_result, cache_result, intention_result = gathered_results
 
         degraded_sources: list[str] = []
 
@@ -522,9 +553,13 @@ class ContextAssembler:
                     "extra_data": {
                         "session_id": session.session_id,
                         "expected_mnemory_session_id": session.mnemory_session_id,
+                        "returned_mnemory_session_id": recall_session_id,
                     }
                 },
             )
+            adopted = await self._adopt_mnemory_session(session, recall_session_id)
+            if adopted:
+                await self.session_cache.mark_prefix_repair_needed(session.session_id)
 
         # Format mutable search results
         mutable_search_results = _format_search_results(recall_payload.get("search_results"))
@@ -1213,37 +1248,84 @@ class ContextAssembler:
         try:
             instructions: str | None = None
             core_memories: str | None = None
+            repair_reason: str | None = None
+            requested_session_id = session.mnemory_session_id
+            previous_mnemory_session_id = session.mnemory_session_id
             recall_session_id = session.mnemory_session_id
             if not allow_empty_memory:
-                with scoped_runtime_context(
-                    user_email=session.user_email, agent_id=session.agent_id
-                ):
-                    identity_payload = await self.memory.load_session_identity(
-                        session_id=session.mnemory_session_id,
-                        labels=memory_labels,
-                        context=context,
-                    )
+                identity_payload = await self._load_identity_payload(
+                    session_id=session.mnemory_session_id,
+                    session=session,
+                    memory_labels=memory_labels,
+                    context=context,
+                )
                 raw_instructions = identity_payload.get("instructions")
                 raw_core = identity_payload.get("core_memories")
                 recall_session_id = (
                     str(identity_payload.get("session_id") or "").strip() or recall_session_id
                 )
+                if (
+                    requested_session_id
+                    and recall_session_id
+                    and recall_session_id != requested_session_id
+                ):
+                    repair_reason = "mnemory_session_forged"
+                    logger.warning(
+                        "context: adopting forged Mnemory session while rebuilding immutable prefix",
+                        extra={
+                            "extra_data": {
+                                "session_id": session.session_id,
+                                "old_mnemory_session_id": requested_session_id,
+                                "new_mnemory_session_id": recall_session_id,
+                            }
+                        },
+                    )
+                    await self._adopt_mnemory_session(session, recall_session_id)
+                elif session.mnemory_session_id is None and recall_session_id:
+                    await self._adopt_mnemory_session(session, recall_session_id)
+
                 if isinstance(raw_instructions, str) and raw_instructions.strip():
                     instructions = _adapt_memory_instructions(raw_instructions.strip())
                 if isinstance(raw_core, str) and raw_core.strip():
                     core_memories = raw_core.strip()
+
+                if not core_memories and requested_session_id is not None:
+                    repair_reason = repair_reason or "existing_session_returned_no_core"
+                    logger.warning(
+                        "context: existing Mnemory session could not resume immutable prefix, creating fresh repair session",
+                        extra={
+                            "extra_data": {
+                                "session_id": session.session_id,
+                                "old_mnemory_session_id": requested_session_id,
+                                "reason": repair_reason,
+                            }
+                        },
+                    )
+                    identity_payload = await self._load_identity_payload(
+                        session_id=None,
+                        session=session,
+                        memory_labels=memory_labels,
+                        context=context,
+                    )
+                    raw_instructions = identity_payload.get("instructions")
+                    raw_core = identity_payload.get("core_memories")
+                    recall_session_id = str(identity_payload.get("session_id") or "").strip()
+                    if recall_session_id:
+                        await self._adopt_mnemory_session(session, recall_session_id)
+                    instructions = (
+                        _adapt_memory_instructions(raw_instructions.strip())
+                        if isinstance(raw_instructions, str) and raw_instructions.strip()
+                        else None
+                    )
+                    core_memories = (
+                        raw_core.strip() if isinstance(raw_core, str) and raw_core.strip() else None
+                    )
+
                 if not core_memories:
                     raise ImmutablePrefixUnavailable(
                         "Core memories are unavailable for this session.",
                         reason="missing_core",
                     )
-                if session.mnemory_session_id is None and recall_session_id:
-                    updated = await self.session_manager.attach_mnemory_session(
-                        session.session_id,
-                        recall_session_id,
-                    )
-                    if updated:
-                        session.mnemory_session_id = recall_session_id
 
             prefix_entries = self._compose_prefix_entries(
                 agent=agent,
@@ -1286,6 +1368,8 @@ class ContextAssembler:
                 extras={
                     "mnemory_session_id": recall_session_id,
                     "agent_id": agent.agent_id,
+                    "old_mnemory_session_id": previous_mnemory_session_id,
+                    "repair_reason": repair_reason,
                 },
             )
             with scoped_runtime_context(user_email=session.user_email, agent_id=session.agent_id):
@@ -1310,11 +1394,45 @@ class ContextAssembler:
                 snapshot_seq=snapshot_result.last_seq,
                 snapshot_source=snapshot_source,
             )
+            if snapshot_source == "repair":
+                MNEMORY_SESSION_REPAIRED_TOTAL.labels(
+                    reason=repair_reason or "intaris_snapshot_missing"
+                ).inc()
             return resolved_entries
         except Exception:
             if snapshot_source == "repair":
                 await self.session_cache.note_repair_attempt(session.session_id)
             raise
+
+    async def _load_identity_payload(
+        self,
+        *,
+        session_id: str | None,
+        session: SessionModel,
+        memory_labels: dict[str, str],
+        context: str | None,
+    ) -> dict[str, Any]:
+        with scoped_runtime_context(user_email=session.user_email, agent_id=session.agent_id):
+            return await self.memory.load_session_identity(
+                session_id=session_id,
+                labels=memory_labels,
+                context=context,
+            )
+
+    async def _adopt_mnemory_session(
+        self,
+        session: SessionModel,
+        mnemory_session_id: str,
+    ) -> bool:
+        if not mnemory_session_id or session.mnemory_session_id == mnemory_session_id:
+            return False
+        updated = await self.session_manager.attach_mnemory_session(
+            session.session_id,
+            mnemory_session_id,
+        )
+        if updated:
+            session.mnemory_session_id = mnemory_session_id
+        return updated
 
     def _compose_prefix_entries(
         self,
