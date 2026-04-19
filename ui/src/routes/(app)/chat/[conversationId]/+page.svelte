@@ -13,6 +13,7 @@ import ChevronsRight from 'lucide-svelte/icons/chevrons-right';
 import Copy from 'lucide-svelte/icons/copy';
 import Info from 'lucide-svelte/icons/info';
 import Maximize2 from 'lucide-svelte/icons/maximize-2';
+import Menu from 'lucide-svelte/icons/menu';
 import Minimize2 from 'lucide-svelte/icons/minimize-2';
 import Paperclip from 'lucide-svelte/icons/paperclip';
 import Search from 'lucide-svelte/icons/search';
@@ -49,6 +50,7 @@ import X from 'lucide-svelte/icons/x';
     SESSION_LOG_POLL_INTERVAL_MS
   } from '$lib/chat-page';
   import { confirmAction } from '$lib/stores/confirm';
+  import { requestOpenMobileNav } from '$lib/stores/mobileNav';
   import { addToast } from '$lib/stores/toasts';
   import { onCancelActiveTurnRequest, onChatComposerFocusRequest } from '$lib/shortcuts';
   import { isSupported as notificationsSupported, isGranted as notificationsGranted, requestPermission, notifyIfHidden, hasAskedPermission } from '$lib/notifications';
@@ -2247,7 +2249,10 @@ import X from 'lucide-svelte/icons/x';
                   <ChevronsRight class="h-4 w-4" />
                 </button>
               {/if}
-              <div class="lg:hidden">
+              <div class="flex items-center gap-1.5 lg:hidden">
+                <Button aria-label="Open navigation" size="sm" variant="secondary" onclick={requestOpenMobileNav}>
+                  <Menu class="h-4 w-4" />
+                </Button>
                 <Button aria-label="Open conversations" size="sm" variant="secondary" onclick={openMobileList}>
                   <ArrowLeft class="h-4 w-4" />
                 </Button>

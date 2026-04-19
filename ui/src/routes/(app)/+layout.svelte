@@ -32,6 +32,7 @@ import X from 'lucide-svelte/icons/x';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import { closeShortcutHelp, openShortcutHelp, requestCancelActiveTurn, requestChatComposerFocus, shortcutHelpOpen } from '$lib/shortcuts';
   import { auth } from '$lib/stores/auth';
+  import { mobileNavOpenSignal } from '$lib/stores/mobileNav';
   import { workspaceHealth } from '$lib/system';
   import type { SystemDiagnostics } from '$lib/types/api';
   import { wsClient, wsState } from '$lib/ws/client';
@@ -236,9 +237,21 @@ import X from 'lucide-svelte/icons/x';
 
     window.addEventListener('keydown', handleGlobalShortcuts);
 
+    // Pages that hide the global mobile header (chat detail) use this
+    // signal to open the main nav drawer from their own hamburger button.
+    let firstSignal = true;
+    const unsubscribeMobileNav = mobileNavOpenSignal.subscribe(() => {
+      if (firstSignal) {
+        firstSignal = false;
+        return;
+      }
+      openMobileNav();
+    });
+
     return () => {
       document.body.style.overflow = '';
       window.removeEventListener('keydown', handleGlobalShortcuts);
+      unsubscribeMobileNav();
       wsClient.disconnect();
       workspaceHealth.stop();
     };
