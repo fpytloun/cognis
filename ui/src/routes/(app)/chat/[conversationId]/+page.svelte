@@ -356,17 +356,24 @@ import X from 'lucide-svelte/icons/x';
     return [];
   }
 
-  function todoStatusClass(status: string): string {
-    if (status === 'completed') return 'border-emerald-500/30 bg-emerald-500/10 text-emerald-100';
-    if (status === 'cancelled') return 'border-slate-700 bg-slate-900 text-slate-400';
-    if (status === 'in_progress') return 'border-sky-500/30 bg-sky-500/10 text-sky-100';
-    return 'border-amber-500/30 bg-amber-500/10 text-amber-100';
+  /**
+   * Compact status indicator for a todo row. Returns the background
+   * colour for a tiny dot rendered next to the todo content — we drop
+   * the old bordered pill + coloured bubble in favour of a single
+   * line-of-text representation where the status reads at a glance
+   * from the colour of a 6px dot.
+   */
+  function todoStatusDot(status: string): string {
+    if (status === 'completed') return 'bg-emerald-400';
+    if (status === 'cancelled') return 'bg-slate-600';
+    if (status === 'in_progress') return 'bg-sky-400';
+    return 'bg-amber-400';
   }
 
   function todoPriorityClass(priority: string): string {
     if (priority === 'high') return 'text-rose-300';
-    if (priority === 'low') return 'text-slate-400';
-    return 'text-slate-300';
+    if (priority === 'low') return 'text-slate-500';
+    return 'text-slate-400';
   }
 
   function sortEscalations(items: Escalation[]): Escalation[] {
@@ -2741,41 +2748,46 @@ import X from 'lucide-svelte/icons/x';
                store using visualViewport; on iOS this pushes the composer
                above the on-screen keyboard so the input stays visible. -->
           <div class="shrink-0 space-y-3" style="padding-bottom: var(--kb-offset, 0px);">
+          <!--
+            Compact todo drawer. Single-line header ("Todos · N active
+            · X in progress"), and each todo renders as a single line:
+            a coloured status dot, the content, and a muted priority
+            label. No bordered cards, no coloured backgrounds — the
+            whole list stays visually quiet above the composer.
+          -->
           {#if shouldShowChatTodoDrawer}
-            <div class="overflow-hidden rounded-2xl border border-slate-800/80 bg-slate-900/90 sm:rounded-3xl">
-              <button class="flex w-full items-center justify-between gap-3 px-4 py-3 text-left transition hover:bg-slate-800/40" onclick={() => { chatTodoDrawerOpen = !chatTodoDrawerOpen; }} type="button">
-                <div>
-                  <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Current step todos</p>
-                  <p class="mt-1 text-sm text-slate-300">
-                    {activeChatTodos.length} active
-                    {#if chatTodoCounts.inProgress > 0}
-                      · {chatTodoCounts.inProgress} in progress
-                    {/if}
-                    {#if chatTodoCounts.pending > 0}
-                      · {chatTodoCounts.pending} pending
-                    {/if}
-                  </p>
-                </div>
+            <div class="rounded-xl border border-slate-800/60 bg-slate-900/40">
+              <button
+                class="flex w-full items-center justify-between gap-3 px-3 py-1.5 text-left text-sm transition hover:bg-slate-800/40"
+                onclick={() => { chatTodoDrawerOpen = !chatTodoDrawerOpen; }}
+                type="button"
+              >
+                <span class="truncate text-slate-300">
+                  <span class="font-medium text-slate-200">Todos</span>
+                  <span class="text-slate-500"> · {activeChatTodos.length} active{#if chatTodoCounts.inProgress > 0} · {chatTodoCounts.inProgress} in progress{/if}{#if chatTodoCounts.pending > 0} · {chatTodoCounts.pending} pending{/if}</span>
+                </span>
                 {#if chatTodoDrawerOpen}
-                  <ChevronUp class="h-4 w-4 text-slate-500" />
+                  <ChevronUp class="h-3.5 w-3.5 shrink-0 text-slate-500" />
                 {:else}
-                  <ChevronDown class="h-4 w-4 text-slate-500" />
+                  <ChevronDown class="h-3.5 w-3.5 shrink-0 text-slate-500" />
                 {/if}
               </button>
               {#if chatTodoDrawerOpen}
-                <div class="space-y-2 border-t border-slate-800/60 px-4 py-3">
+                <ul class="divide-y divide-slate-800/40 border-t border-slate-800/60">
                   {#each activeChatTodos as todo}
-                    <div class="rounded-2xl border px-3 py-3 text-sm {todoStatusClass(todo.status)}">
-                      <div class="flex flex-wrap items-center justify-between gap-2">
-                        <span class="font-medium">{todo.content}</span>
-                        <div class="flex items-center gap-2 text-[10px] uppercase tracking-[0.18em]">
-                          <span class="rounded-full border border-current/20 px-2 py-0.5">{todo.status.replace('_', ' ')}</span>
-                          <span class={todoPriorityClass(todo.priority)}>{todo.priority}</span>
-                        </div>
-                      </div>
-                    </div>
+                    <li class="flex items-center gap-2 px-3 py-1.5 text-sm text-slate-200">
+                      <span
+                        class={`inline-block h-2 w-2 shrink-0 rounded-full ${todoStatusDot(todo.status)}`}
+                        aria-label={todo.status.replace('_', ' ')}
+                        title={todo.status.replace('_', ' ')}
+                      ></span>
+                      <span class="min-w-0 flex-1 truncate">{todo.content}</span>
+                      {#if todo.priority !== 'medium'}
+                        <span class={`shrink-0 text-xs ${todoPriorityClass(todo.priority)}`}>{todo.priority}</span>
+                      {/if}
+                    </li>
                   {/each}
-                </div>
+                </ul>
               {/if}
             </div>
           {/if}

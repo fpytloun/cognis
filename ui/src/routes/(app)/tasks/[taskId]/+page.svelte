@@ -282,15 +282,22 @@ import Target from 'lucide-svelte/icons/target';
       .filter((todo: { content: string; status: string; priority: string }) => !['completed', 'cancelled'].includes(todo.status));
   }
 
-  function todoStatusClass(status: string): string {
-    if (status === 'in_progress') return 'border-sky-500/30 bg-sky-500/10 text-sky-100';
-    return 'border-amber-500/30 bg-amber-500/10 text-amber-100';
+  /**
+   * Tiny coloured dot that carries the todo's status on its own, so
+   * the row can collapse to a single line of text without a bordered
+   * pill. Matches the chat-side compact rendering.
+   */
+  function todoStatusDot(status: string): string {
+    if (status === 'in_progress') return 'bg-sky-400';
+    if (status === 'completed') return 'bg-emerald-400';
+    if (status === 'cancelled') return 'bg-slate-600';
+    return 'bg-amber-400';
   }
 
   function todoPriorityClass(priority: string): string {
     if (priority === 'high') return 'text-rose-300';
-    if (priority === 'low') return 'text-slate-400';
-    return 'text-slate-300';
+    if (priority === 'low') return 'text-slate-500';
+    return 'text-slate-400';
   }
 
   function openSessionLogs(stepRun: StepRun): void {
@@ -1127,21 +1134,26 @@ import Target from 'lucide-svelte/icons/target';
 
                     {#if activeStepTodos(latestAttempt).length > 0}
                       {@const todos = activeStepTodos(latestAttempt)}
-                      <div class="mt-4 rounded-2xl border border-slate-800 bg-slate-900/60 px-4 py-3">
-                        <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Open todos</p>
-                        <div class="mt-3 space-y-2">
-                          {#each todos as todo}
-                            <div class="rounded-2xl border px-3 py-3 text-sm {todoStatusClass(todo.status)}">
-                              <div class="flex flex-wrap items-center justify-between gap-2">
-                                <span class="font-medium">{todo.content}</span>
-                                <div class="flex items-center gap-2 text-[10px] uppercase tracking-[0.18em]">
-                                  <span class="rounded-full border border-current/20 px-2 py-0.5">{todo.status.replace('_', ' ')}</span>
-                                  <span class={todoPriorityClass(todo.priority)}>{todo.priority}</span>
-                                </div>
-                              </div>
-                            </div>
-                          {/each}
+                      <div class="mt-4 rounded-xl border border-slate-800/60 bg-slate-900/40">
+                        <div class="border-b border-slate-800/60 px-3 py-1.5 text-xs font-medium text-slate-400">
+                          Open todos
+                          <span class="text-slate-500"> · {todos.length}</span>
                         </div>
+                        <ul class="divide-y divide-slate-800/40">
+                          {#each todos as todo}
+                            <li class="flex items-center gap-2 px-3 py-1.5 text-sm text-slate-200">
+                              <span
+                                class={`inline-block h-2 w-2 shrink-0 rounded-full ${todoStatusDot(todo.status)}`}
+                                aria-label={todo.status.replace('_', ' ')}
+                                title={todo.status.replace('_', ' ')}
+                              ></span>
+                              <span class="min-w-0 flex-1 truncate">{todo.content}</span>
+                              {#if todo.priority !== 'medium'}
+                                <span class={`shrink-0 text-xs ${todoPriorityClass(todo.priority)}`}>{todo.priority}</span>
+                              {/if}
+                            </li>
+                          {/each}
+                        </ul>
                       </div>
                     {/if}
 
