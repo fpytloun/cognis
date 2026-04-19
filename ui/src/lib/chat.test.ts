@@ -1,6 +1,14 @@
 import { describe, expect, it } from 'vitest';
 
-import { appendOptimisticUserMessage, applyWebSocketEvent, normalizeHistory } from '$lib/chat';
+import {
+  annotateStepRequestInputWithNotification,
+  appendOptimisticUserMessage,
+  applyWebSocketEvent,
+  findPendingStepRequestInputCall,
+  normalizeHistory,
+  optimisticallyResolveStepRequestInput,
+  type ToolCallTimelineItem
+} from '$lib/chat';
 
 describe('chat timeline helpers', () => {
   it('normalizes history messages and updates streaming assistant content', () => {
@@ -413,5 +421,102 @@ describe('chat timeline helpers', () => {
 
     expect(systemTwice).toHaveLength(1);
     expect(noticeTwice).toHaveLength(2);
+  });
+
+  describe('step_request_input helpers', () => {
+    it('finds the most recent unresolved step_request_input tool call', () => {
+      const timeline = applyWebSocketEvent([], {
+        type: 'tool_call',
+        conversation_id: 'conv_1',
+        session_id: 'sess_1',
+        message_id: 'msg_1',
+        call_id: 'call_1',
+        tool_name: 'step_request_input',
+        status: 'started',
+        arguments: { question: 'Which name?' }
+      });
+
+      const pending = findPendingStepRequestInputCall(timeline);
+      expect(pending).not.toBeNull();
+      expect(pending?.callId).toBe('call_1');
+      expect(pending?.toolName).toBe('step_request_input');
+    });
+
+    it('ignores step_request_input calls that already have a tool_result', () => {
+      const started = applyWebSocketEvent([], {
+        type: 'tool_call',
+        conversation_id: 'conv_1',
+        session_id: 'sess_1',
+        message_id: 'msg_1',
+        call_id: 'call_1',
+        tool_name: 'step_request_input',
+        status: 'started',
+        arguments: { question: 'Which name?' }
+      });
+      const resolved = applyWebSocketEvent(started, {
+        type: 'tool_result',
+        conversation_id: 'conv_1',
+        session_id: 'sess_1',
+        message_id: 'msg_1',
+        call_id: 'call_1',
+        tool_name: 'step_request_input',
+        result: JSON.stringify({ response: 'First option' }),
+        is_error: false
+      });
+
+      expect(findPendingStepRequestInputCall(resolved)).toBeNull();
+    });
+
+    it('annotates the pending step_request_input tool call with a notification id', () => {
+      const timeline = applyWebSocketEvent([], {
+        type: 'tool_call',
+        conversation_id: 'conv_1',
+        session_id: 'sess_1',
+        message_id: 'msg_1',
+        call_id: 'call_1',
+        tool_name: 'step_request_input',
+        status: 'started',
+        arguments: { question: 'Which name?' }
+      });
+
+      const annotated = annotateStepRequestInputWithNotification(timeline, 'input_abc123');
+      const tool = annotated.find((item) => item.kind === 'tool_call') as ToolCallTimelineItem;
+      expect(tool.notificationId).toBe('input_abc123');
+    });
+
+    it('optimistically resolves a step_request_input tool call with the user answer', () => {
+      const timeline = applyWebSocketEvent([], {
+        type: 'tool_call',
+        conversation_id: 'conv_1',
+        session_id: 'sess_1',
+        message_id: 'msg_1',
+        call_id: 'call_1',
+        tool_name: 'step_request_input',
+        status: 'started',
+        arguments: { question: 'Which name?' }
+      });
+      const tool = timeline.find((item) => item.kind === 'tool_call') as ToolCallTimelineItem;
+      const resolved = optimisticallyResolveStepRequestInput(timeline, tool.id, 'Main option');
+      const updated = resolved.find((item) => item.kind === 'tool_call') as ToolCallTimelineItem;
+      expect(updated.status).toBe('completed');
+      expect(updated.isError).toBe(false);
+      expect(updated.result).toBe(JSON.stringify({ response: 'Main option' }));
+      // A subsequent authoritative tool_result from the backend must still
+      // take precedence so evaluation metadata / duration are populated.
+      const authoritative = applyWebSocketEvent(resolved, {
+        type: 'tool_result',
+        conversation_id: 'conv_1',
+        session_id: 'sess_1',
+        message_id: 'msg_1',
+        call_id: 'call_1',
+        tool_name: 'step_request_input',
+        result: JSON.stringify({ response: 'Main option' }),
+        is_error: false,
+        duration_ms: 1200
+      });
+      const final = authoritative.find((item) => item.kind === 'tool_call') as ToolCallTimelineItem;
+      expect(final.status).toBe('completed');
+      expect(final.durationMs).toBe(1200);
+    });
   });
 });

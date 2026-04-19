@@ -54,7 +54,10 @@ import X from 'lucide-svelte/icons/x';
   import { isSupported as notificationsSupported, isGranted as notificationsGranted, requestPermission, notifyIfHidden, hasAskedPermission } from '$lib/notifications';
   import { workspaceHealth } from '$lib/system';
   import {
+    annotateStepRequestInputWithNotification,
     appendOptimisticUserMessage,
+    findPendingStepRequestInputCall,
+    optimisticallyResolveStepRequestInput,
     applyWebSocketEvent,
     finalizeReasoningItems,
     normalizeHistory,
@@ -685,8 +688,20 @@ import X from 'lucide-svelte/icons/x';
   async function refreshPendingDirectQuestion(): Promise<void> {
     if (!currentConversation || document.hidden) return;
     try {
-      const directQuestion = (await api.notifications.list(currentConversation.conversation_id))
-        .filter((item) => item.notification_type === 'step_question' && item.status === 'pending' && item.task_id === null)
+      const notifications = await api.notifications.list(currentConversation.conversation_id);
+      const pendingStepNotifications = notifications.filter(
+        (item) => item.notification_type === 'step_question' && item.status === 'pending',
+      );
+      // Annotate any pending step_request_input tool call with a
+      // notification id so the send routing can resolve it without
+      // needing another round-trip. Task-scoped notifications count
+      // too — the UI uses the annotation purely for resolution, and
+      // the backend rejects unauthorized resolves.
+      for (const notif of pendingStepNotifications) {
+        timeline = annotateStepRequestInputWithNotification(timeline, notif.notification_id);
+      }
+      const directQuestion = pendingStepNotifications
+        .filter((item) => item.task_id === null)
         .map((item) => pendingDirectQuestionFromNotification(item))
         .find((item): item is PendingDirectQuestion => item !== null) ?? null;
       pendingDirectQuestion = directQuestion;
@@ -1357,13 +1372,28 @@ import X from 'lucide-svelte/icons/x';
 
     const isSlashCommand = SYSTEM_SLASH_COMMANDS.some((cmd) => content.startsWith(cmd));
 
-    if (pendingDirectQuestion && !isSlashCommand && composerAttachments.length > 0) {
+    // Detect a `step_request_input` tool call sitting in the timeline
+    // waiting for a reply. This is the source-of-truth signal that the
+    // agent loop is paused for user input. `pendingDirectQuestion` is a
+    // mirror of the same state but can drift (stale fetch, missed WS
+    // event, reload race) — the tool-call entry does not.
+    const pendingStepTool = findPendingStepRequestInputCall(timeline);
+    const isStepInputReply =
+      !isSlashCommand && (pendingDirectQuestion !== null || pendingStepTool !== null);
+
+    if (isStepInputReply && composerAttachments.length > 0) {
       addToast('Attachments are not supported for clarification responses.', 'error');
       return;
     }
 
-    if (!isSlashCommand) {
+    // Optimistic UI. When the message is a step_request_input reply we do
+    // not append a separate user bubble — the tool call block will show the
+    // user's answer inline as the resolution. Adding a bubble too would
+    // duplicate the content and leave the tool call block stuck as pending.
+    if (!isSlashCommand && !isStepInputReply) {
       timeline = appendOptimisticUserMessage(timeline, content, composerAttachments);
+    }
+    if (!isSlashCommand) {
       lastSubmittedMessage = content;
       lastRecoverableMessage = '';
       turnInProgress = true;
@@ -1380,18 +1410,53 @@ import X from 'lucide-svelte/icons/x';
     }
     const attachments = [...composerAttachments];
     composerAttachments = [];
+
+    if (isStepInputReply) {
+      // Resolve the notification ID. Order of preference:
+      //   1. The tool call's own annotation (authoritative if present).
+      //   2. `pendingDirectQuestion.notificationId` from the WS event.
+      //   3. A fresh fetch of pending step_question notifications.
+      let notificationId = pendingStepTool?.notificationId ?? pendingDirectQuestion?.notificationId ?? '';
+      if (!notificationId && currentConversation) {
+        try {
+          const list = await api.notifications.list(currentConversation.conversation_id);
+          const match = list.find(
+            (item) => item.notification_type === 'step_question' && item.status === 'pending',
+          );
+          if (match) notificationId = match.notification_id;
+        } catch {
+          // Fall through — we'll send as a regular message below if lookup fails.
+        }
+      }
+
+      if (notificationId) {
+        directQuestionSubmitting = true;
+        if (pendingStepTool) {
+          // Show the user's answer inside the tool call block immediately
+          // so the Resolution section stops saying "Waiting for user input"
+          // even before the backend tool_result arrives.
+          timeline = optimisticallyResolveStepRequestInput(timeline, pendingStepTool.id, content);
+        }
+        syncVisibleWindow();
+        userScrolledUp = false;
+        scrollToBottom();
+        const stepName =
+          typeof pendingStepTool?.arguments?.step_name === 'string'
+            ? (pendingStepTool.arguments.step_name as string)
+            : pendingDirectQuestion?.stepName;
+        wsClient.respondStepQuestion(notificationId, content, stepName);
+        return;
+      }
+
+      // Fall back to a regular message: we saw a pending step_request_input
+      // but could not resolve a notification_id. Replace the missing
+      // optimistic bubble so the user still sees their message.
+      timeline = appendOptimisticUserMessage(timeline, content, attachments);
+    }
+
     syncVisibleWindow();
     userScrolledUp = false;
     scrollToBottom();
-    if (pendingDirectQuestion && !isSlashCommand) {
-      directQuestionSubmitting = true;
-      wsClient.respondStepQuestion(
-        pendingDirectQuestion.notificationId,
-        content,
-        pendingDirectQuestion.stepName
-      );
-      return;
-    }
     wsClient.sendMessage(currentConversation.conversation_id, content, attachments);
   }
 
@@ -1745,17 +1810,24 @@ import X from 'lucide-svelte/icons/x';
       return;
     }
 
-    if (event.type === 'workflow_step_question' && !event.task_id && event.notification_id) {
-      pendingDirectQuestion = pendingDirectQuestionFromParts(
-        event.notification_id,
-        event.step_name,
-        event.question,
-        event.options,
-        event.context,
-      );
-      directQuestionSubmitting = false;
-      awaitingAssistantStart = false;
-      turnInProgress = false;
+    if (event.type === 'workflow_step_question' && event.notification_id) {
+      // Annotate the matching step_request_input tool call so the user's
+      // next reply can be routed to `respondStepQuestion` even if this
+      // banner-level pendingDirectQuestion state gets cleared (reload,
+      // compaction, or a message_complete arriving during submission).
+      timeline = annotateStepRequestInputWithNotification(timeline, event.notification_id);
+      if (!event.task_id) {
+        pendingDirectQuestion = pendingDirectQuestionFromParts(
+          event.notification_id,
+          event.step_name,
+          event.question,
+          event.options,
+          event.context,
+        );
+        directQuestionSubmitting = false;
+        awaitingAssistantStart = false;
+        turnInProgress = false;
+      }
     }
 
     if (event.type === 'workflow_step_question_resolved') {

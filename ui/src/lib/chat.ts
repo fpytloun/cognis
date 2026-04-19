@@ -66,6 +66,19 @@ export interface ToolCallTimelineItem {
   durationMs?: number;
   evaluation?: ToolCallEvaluation;
   reconstructed?: boolean;
+  /**
+   * Notification ID backing a pending `step_request_input` tool call.
+   *
+   * The backend creates a `step_question` notification whose
+   * `notification_id` is the `pause_id` the agent loop is waiting on, but
+   * the `tool_call` event itself does not carry that ID. The chat page
+   * annotates the matching `step_request_input` tool item when the
+   * corresponding `workflow_step_question` WebSocket event arrives so we
+   * can resolve the pause by typing a reply — even if
+   * `pendingDirectQuestion` state has been lost to a race, compaction, or
+   * conversation reload.
+   */
+  notificationId?: string;
 }
 
 export interface DelegationTimelineItem {
@@ -570,6 +583,80 @@ export function appendOptimisticUserMessage(items: TimelineItem[], content: stri
       true
     )
   ];
+}
+
+/** Tool status values we treat as "still running, waiting for resolution". */
+const PENDING_TOOL_STATUSES = new Set(['started', 'running', 'paused']);
+
+/**
+ * Canonical match for the `step_request_input` controller tool. The backend
+ * uses snake_case; this normalizer keeps the comparison resilient against
+ * casing/underscore noise from older history rows.
+ */
+function isStepRequestInputToolName(name: string): boolean {
+  return name.toLowerCase().replace(/_/g, '') === 'steprequestinput';
+}
+
+/**
+ * Return the most recent `step_request_input` tool call that has not yet
+ * resolved (status still pending, no tool_result recorded). Used by the chat
+ * page to route the user's next text reply into `respondStepQuestion` so the
+ * message becomes the resolution of the pause instead of a stray bubble.
+ */
+export function findPendingStepRequestInputCall(items: TimelineItem[]): ToolCallTimelineItem | null {
+  for (let i = items.length - 1; i >= 0; i--) {
+    const item = items[i];
+    if (item.kind !== 'tool_call') continue;
+    const toolItem = item as ToolCallTimelineItem;
+    if (!isStepRequestInputToolName(toolItem.toolName)) continue;
+    if (!PENDING_TOOL_STATUSES.has(toolItem.status)) continue;
+    if (toolItem.result !== undefined) continue;
+    return toolItem;
+  }
+  return null;
+}
+
+/**
+ * Attach a notification ID to the latest unresolved `step_request_input`
+ * tool call in the timeline. Called when a `workflow_step_question`
+ * WebSocket event arrives, so the tool call knows the `pause_id` it can be
+ * resolved against later even if `pendingDirectQuestion` state is lost.
+ */
+export function annotateStepRequestInputWithNotification(
+  items: TimelineItem[],
+  notificationId: string,
+): TimelineItem[] {
+  const pending = findPendingStepRequestInputCall(items);
+  if (!pending) return items;
+  if (pending.notificationId === notificationId) return items;
+  return items.map((item) =>
+    item.id === pending.id
+      ? ({ ...(item as ToolCallTimelineItem), notificationId } satisfies ToolCallTimelineItem)
+      : item,
+  );
+}
+
+/**
+ * Optimistically mark a `step_request_input` tool call as resolved with the
+ * user's response. The tool call block immediately shows the answer in its
+ * Resolution area while the backend's real `tool_result` is in flight.
+ */
+export function optimisticallyResolveStepRequestInput(
+  items: TimelineItem[],
+  toolId: string,
+  response: string,
+): TimelineItem[] {
+  return items.map((item) => {
+    if (item.id !== toolId || item.kind !== 'tool_call') return item;
+    const tool = item as ToolCallTimelineItem;
+    if (!isStepRequestInputToolName(tool.toolName)) return item;
+    return {
+      ...tool,
+      status: 'completed',
+      isError: false,
+      result: JSON.stringify({ response }),
+    } satisfies ToolCallTimelineItem;
+  });
 }
 
 export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocketEvent): TimelineItem[] {
