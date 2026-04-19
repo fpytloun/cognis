@@ -1,7 +1,7 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
   import { page } from '$app/state';
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import { fade } from 'svelte/transition';
   import ArrowDown from 'lucide-svelte/icons/arrow-down';
 import ArrowLeft from 'lucide-svelte/icons/arrow-left';
@@ -1439,6 +1439,13 @@ import X from 'lucide-svelte/icons/x';
     }
     error = '';
     composer = '';
+    // Clear the native value synchronously and let Svelte flush the
+    // reactive binding before measuring scrollHeight. Without the tick,
+    // `syncComposerHeight` runs while the textarea still holds the
+    // multi-line content, so it "resizes" back to the same height and
+    // the composer stays expanded until the user types again.
+    if (composerElement) composerElement.value = '';
+    await tick();
     syncComposerHeight();
     const attachments = [...composerAttachments];
     composerAttachments = [];
