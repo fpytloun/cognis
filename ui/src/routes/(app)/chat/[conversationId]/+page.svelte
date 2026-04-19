@@ -416,7 +416,14 @@ import X from 'lucide-svelte/icons/x';
     return [];
   });
   let activeChatTodos = $derived.by(() => chatTodos.filter((todo) => !terminalTodoStatuses.has(todo.status)));
-  let shouldShowChatTodoDrawer = $derived(activeChatTodos.length > 0 && (turnInProgress || pendingDirectQuestion !== null || directQuestionSubmitting));
+  // Show the drawer whenever the latest step still has open todos.
+  // Previously the drawer was gated on an active turn / pending
+  // question, which meant a page refresh hid the drawer even though
+  // the underlying todos hadn't changed. Active todos themselves are
+  // the right signal — if the agent left work pending, the user
+  // should see what's still open without having to wait for the next
+  // turn to start.
+  let shouldShowChatTodoDrawer = $derived(activeChatTodos.length > 0);
   let chatTodoCounts = $derived.by(() => ({
     inProgress: activeChatTodos.filter((todo) => todo.status === 'in_progress').length,
     pending: activeChatTodos.filter((todo) => todo.status === 'pending').length,
@@ -2025,6 +2032,19 @@ import X from 'lucide-svelte/icons/x';
     if (shouldShowChatTodoDrawer) {
       chatTodoDrawerOpen = true;
     }
+  });
+
+  // The todo drawer takes vertical space above the composer. When it
+  // appears, the chat timeline's client height shrinks by that amount
+  // and the bottom of the conversation slips out of view, which the
+  // user perceives as the page \"jumping\" and auto-scroll breaking.
+  // Re-anchor to the bottom whenever the drawer's visibility or
+  // expanded state changes; this is a no-op when the user has
+  // intentionally scrolled up.
+  $effect(() => {
+    void shouldShowChatTodoDrawer;
+    void chatTodoDrawerOpen;
+    requestAnimationFrame(() => scrollToBottom());
   });
 
   $effect(() => {
