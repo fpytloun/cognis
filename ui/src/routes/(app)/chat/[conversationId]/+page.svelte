@@ -97,7 +97,11 @@ import X from 'lucide-svelte/icons/x';
   let deletingConversation = $state(false);
   let mobileListOpen = $state(false);
   let mobileFilterOpen = $state(false);
-  let mobileHeaderDetailsOpen = $state(false);
+  // Unified flag for the expanded header info panel. Replaces the older
+  // pair of `sessionInfoOpen` (desktop popover) + `mobileHeaderDetailsOpen`
+  // (mobile-only panel) with one state so the Info button has a single,
+  // predictable effect regardless of viewport size.
+  let headerInfoOpen = $state(false);
   // Default to iMessage-style: Enter inserts a newline and the user taps
   // the send button (or presses Cmd/Ctrl+Enter) to submit. Users who
   // previously opted into Enter-to-send keep their choice via localStorage.
@@ -148,9 +152,19 @@ import X from 'lucide-svelte/icons/x';
     denied_count: number;
     escalated_count: number;
   }
-  let sessionInfoOpen = $state(false);
   let sessionInfo = $state<SessionInfoData | null>(null);
   let sessionInfoLoading = $state(false);
+
+  function toggleHeaderInfo(): void {
+    headerInfoOpen = !headerInfoOpen;
+    if (headerInfoOpen && !sessionInfo) {
+      void loadSessionInfo();
+    }
+  }
+
+  function closeHeaderInfo(): void {
+    headerInfoOpen = false;
+  }
   let contextUsage = $state<ContextUsage | null>(null);
   let subSessionInfoOpen = $state(false);
   let subSessionInfo = $state<SessionInfoData | null>(null);
@@ -1026,7 +1040,7 @@ import X from 'lucide-svelte/icons/x';
     sessionsError = '';
     escalationError = '';
     escalationResolutionPending = null;
-    mobileHeaderDetailsOpen = false;
+    headerInfoOpen = false;
     mobileListOpen = false;
     document.body.style.overflow = '';
 
@@ -2354,54 +2368,28 @@ import X from 'lucide-svelte/icons/x';
               {/if}
             </div>
 
-            <!-- Session info popover -->
-            {#if sessionInfoOpen}
-              <div class={`mt-2 rounded-xl border border-slate-700 bg-slate-900/95 px-4 py-3 text-sm ${mobileHeaderDetailsOpen ? '' : 'hidden sm:block'}`}>
-                {#if sessionInfoLoading}
-                  <p class="text-xs text-slate-500">Loading session details...</p>
-                {:else if sessionInfo}
-                  {#if sessionInfo.intention}
-                    <div class="mb-2">
-                      <p class="text-[10px] font-semibold uppercase tracking-widest text-slate-500">Intention</p>
-                      <p class="mt-0.5 text-sm text-slate-200">{sessionInfo.intention}</p>
-                    </div>
-                  {/if}
-                  <div class="flex flex-wrap gap-3 text-xs text-slate-400">
-                    <span>Status: <span class="text-slate-200">{sessionInfo.status}</span></span>
-                    <span>Calls: <span class="text-slate-200">{sessionInfo.total_calls}</span></span>
-                    <span class="text-emerald-400">{sessionInfo.approved_count} approved</span>
-                    <span class="text-rose-400">{sessionInfo.denied_count} denied</span>
-                    <span class="text-amber-400">{sessionInfo.escalated_count} escalated</span>
-                  </div>
-                {:else}
-                  <p class="text-xs text-slate-500">Unable to load session details.</p>
-                {/if}
-              </div>
-            {/if}
           </div>
 
+          <!--
+            Header action row. One Info button toggles a full-width
+            details panel that appears below the header (under the
+            session id on desktop and under the title on mobile). The
+            old chevron toggle and the separate desktop Info button
+            were merged into this single icon — the same button on
+            every viewport for a predictable affordance.
+          -->
           <div class="flex items-center gap-2">
             <button
-              class="inline-flex rounded-lg border border-slate-700 px-2 py-1.5 text-xs text-slate-300 transition hover:bg-slate-800 hover:text-white sm:hidden"
-              onclick={() => (mobileHeaderDetailsOpen = !mobileHeaderDetailsOpen)}
+              class="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-slate-700 text-slate-400 transition hover:bg-slate-800 hover:text-slate-100 sm:h-8 sm:w-8"
+              onclick={toggleHeaderInfo}
               type="button"
-              aria-label="Toggle conversation details"
+              title="Session details"
+              aria-label="Toggle session details"
+              aria-expanded={headerInfoOpen}
             >
-              {#if mobileHeaderDetailsOpen}
-                <ChevronUp class="h-4 w-4" />
-              {:else}
-                <ChevronDown class="h-4 w-4" />
-              {/if}
+              <Info class="h-4 w-4" />
             </button>
             <div class="hidden flex-wrap gap-2 sm:flex">
-              <button
-                class="flex items-center gap-1 text-xs text-slate-500 transition hover:text-sky-300"
-                onclick={() => { sessionInfoOpen = !sessionInfoOpen; if (sessionInfoOpen && !sessionInfo) void loadSessionInfo(); }}
-                type="button"
-                title="Session details"
-              >
-                <Info class="h-3.5 w-3.5" />
-              </button>
               {#if currentConversation?.status === 'archived'}
                 <Button size="sm" variant="secondary" disabled={archivingConversation} onclick={restoreConversation}>
                   {archivingConversation ? 'Restoring...' : 'Restore'}
@@ -2417,24 +2405,30 @@ import X from 'lucide-svelte/icons/x';
             </div>
           </div>
         </div>
+      </div>
 
-        {#if mobileHeaderDetailsOpen && currentConversation}
-          {@const agent = conversationAgent(currentConversation)}
-          <div class="mt-2 space-y-3 rounded-2xl border border-slate-800/80 bg-slate-950/50 px-3 py-3 sm:hidden">
-            <div class="flex flex-wrap items-center gap-2 text-sm text-slate-300">
-              {#if agent}
-                <div class="flex items-center gap-2 rounded-lg bg-slate-900/80 px-2 py-1">
-                  <AgentAvatar name={agent.display_name ?? agent.name} avatarUrl={agent.avatar_url ?? null} class="h-5 w-5" />
-                  <span>{agent.display_name ?? agent.name}</span>
-                </div>
-              {/if}
-              <span class="rounded-full border border-slate-700 bg-slate-800/60 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-widest text-slate-400">
-                {contextTypeBadge(currentConversation)}
-              </span>
-              {#if sessions.length > 1}
-                <span class="rounded-full border border-slate-700 bg-slate-800/60 px-2 py-0.5 text-[10px] font-medium text-slate-400">{sessions.length} sessions</span>
-              {/if}
-            </div>
+      <!--
+        Expanded session details panel. Sits directly below the header
+        so it extends the header's width, not the title column's. On
+        mobile, it also carries the agent / context / session-id
+        chips that are hidden in the sub-header row above.
+      -->
+      {#if headerInfoOpen && currentConversation}
+        {@const panelAgent = conversationAgent(currentConversation)}
+        <div class="border-b border-slate-800/80 bg-slate-900/40 px-3 py-3 sm:px-4 sm:py-4 lg:px-5">
+          <div class="mb-3 flex flex-wrap items-center gap-2 text-sm text-slate-300 sm:hidden">
+            {#if panelAgent}
+              <div class="flex items-center gap-2 rounded-lg bg-slate-900/80 px-2 py-1">
+                <AgentAvatar name={panelAgent.display_name ?? panelAgent.name} avatarUrl={panelAgent.avatar_url ?? null} class="h-5 w-5" />
+                <span>{panelAgent.display_name ?? panelAgent.name}</span>
+              </div>
+            {/if}
+            <span class="rounded-full border border-slate-700 bg-slate-800/60 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-widest text-slate-400">
+              {contextTypeBadge(currentConversation)}
+            </span>
+            {#if sessions.length > 1}
+              <span class="rounded-full border border-slate-700 bg-slate-800/60 px-2 py-0.5 text-[10px] font-medium text-slate-400">{sessions.length} sessions</span>
+            {/if}
             {#if currentConversation.active_session_id}
               <button
                 class="flex items-center gap-1 font-mono text-xs text-slate-500 transition hover:text-slate-300"
@@ -2450,31 +2444,42 @@ import X from 'lucide-svelte/icons/x';
                 {/if}
               </button>
             {/if}
-            {#if contextUsage}
-              <div class="text-[10px] text-slate-400">
-                Context {contextUsage.prompt_tokens.toLocaleString()} / {contextUsage.max_context_tokens.toLocaleString()} ({contextUsage.percentage}%)
+          </div>
+          {#if sessionInfoLoading}
+            <p class="text-xs text-slate-500">Loading session details…</p>
+          {:else if sessionInfo}
+            {#if sessionInfo.intention}
+              <div class="mb-3">
+                <p class="text-[10px] font-semibold uppercase tracking-widest text-slate-500">Intention</p>
+                <p class="mt-1 text-sm leading-6 text-slate-200">{sessionInfo.intention}</p>
               </div>
             {/if}
-            <div class="flex flex-wrap gap-2">
-              <Button size="sm" variant="secondary" onclick={() => { sessionInfoOpen = !sessionInfoOpen; if (sessionInfoOpen && !sessionInfo) void loadSessionInfo(); }}>
-                Session details
-              </Button>
-              {#if currentConversation.status === 'archived'}
-                <Button size="sm" variant="secondary" disabled={archivingConversation} onclick={restoreConversation}>
-                  {archivingConversation ? 'Restoring...' : 'Restore'}
-                </Button>
-              {:else}
-                <Button size="sm" variant="secondary" disabled={!currentConversation || archivingConversation} onclick={archiveConversation}>
-                  {archivingConversation ? 'Archiving...' : 'Archive'}
-                </Button>
-              {/if}
-              <Button size="sm" variant="danger" disabled={!currentConversation || deletingConversation} onclick={deleteConversation}>
-                {deletingConversation ? 'Deleting...' : 'Delete'}
-              </Button>
+            <div class="flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-400">
+              <span>Status: <span class="text-slate-200">{sessionInfo.status}</span></span>
+              <span>Calls: <span class="text-slate-200">{sessionInfo.total_calls}</span></span>
+              <span class="text-emerald-400">{sessionInfo.approved_count} approved</span>
+              <span class="text-rose-400">{sessionInfo.denied_count} denied</span>
+              <span class="text-amber-400">{sessionInfo.escalated_count} escalated</span>
             </div>
+          {:else}
+            <p class="text-xs text-slate-500">Unable to load session details.</p>
+          {/if}
+          <div class="mt-3 flex flex-wrap gap-2 sm:hidden">
+            {#if currentConversation.status === 'archived'}
+              <Button size="sm" variant="secondary" disabled={archivingConversation} onclick={restoreConversation}>
+                {archivingConversation ? 'Restoring…' : 'Restore'}
+              </Button>
+            {:else}
+              <Button size="sm" variant="secondary" disabled={!currentConversation || archivingConversation} onclick={archiveConversation}>
+                {archivingConversation ? 'Archiving…' : 'Archive'}
+              </Button>
+            {/if}
+            <Button size="sm" variant="danger" disabled={!currentConversation || deletingConversation} onclick={deleteConversation}>
+              {deletingConversation ? 'Deleting…' : 'Delete'}
+            </Button>
           </div>
-        {/if}
-      </div>
+        </div>
+      {/if}
 
       <!-- Message area + composer -->
       <div class="flex min-h-0 flex-1 flex-col gap-2 px-0 py-2 sm:gap-4 sm:px-4 sm:py-4">
@@ -2554,10 +2559,12 @@ import X from 'lucide-svelte/icons/x';
         {/if}
 
         <!-- Timeline -->
+        <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
         <div
           class="relative min-h-0 flex-1 space-y-3 overflow-y-auto px-2.5 py-1.5 sm:p-4"
           bind:this={timelineEl}
           onscroll={handleTimelineScroll}
+          onclick={closeHeaderInfo}
         >
           {#if visibleStartIndex > 0}
             <div class="flex justify-center">
