@@ -792,7 +792,17 @@ import Target from 'lucide-svelte/icons/target';
 {#if loading}
   <LoadingState label="Loading task" description="Fetching workflow state, step runs, and dependency information." />
 {:else if task}
-  <section class="space-y-5">
+  <!--
+    The app layout's <main> uses `overflow-hidden`, so each page is
+    responsible for its own scroll region. Task detail has a lot of
+    content (workflow diagram, step runs, feedback, metadata) that
+    easily exceeds the viewport — without a scroll container, the
+    bottom of the page was getting clipped on mobile. Make the root
+    section a proper flex child that fills and scrolls vertically,
+    and hide horizontal overflow so long agent IDs / conversation
+    titles can't push the layout wider than the viewport.
+  -->
+  <section class="min-h-0 min-w-0 flex-1 space-y-5 overflow-y-auto overflow-x-hidden px-3 py-4 sm:px-5 sm:py-6">
     <div class="flex flex-wrap items-start justify-between gap-4">
       <div class="min-w-0 space-y-3">
         <Button size="sm" variant="secondary" onclick={() => goto('/tasks')}>Back to task board</Button>
