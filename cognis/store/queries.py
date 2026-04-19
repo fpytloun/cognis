@@ -795,11 +795,22 @@ async def list_conversations(
     agent_id: str | None = None,
     status: str = "active",
 ) -> list[Conversation]:
-    """List conversations for a user, optionally filtered by context type and agent."""
+    """List conversations for a user, optionally filtered by context type and agent.
+
+    Ordered by the timestamp of the last message (``last_message_at``) so that
+    conversations with the most recent real activity surface first. Metadata
+    updates (title edits, session reactivation, archive/unarchive) bump
+    ``updated_at`` and are used as a stable secondary sort for conversations
+    that have never received a message.
+    """
     query = (
         select(Conversation)
         .where(Conversation.user_email == user_email)
-        .order_by(Conversation.updated_at.desc(), Conversation.conversation_id.asc())
+        .order_by(
+            Conversation.last_message_at.desc().nullslast(),
+            Conversation.updated_at.desc(),
+            Conversation.conversation_id.asc(),
+        )
     )
     if status == "active":
         query = query.where(Conversation.status == "active")
