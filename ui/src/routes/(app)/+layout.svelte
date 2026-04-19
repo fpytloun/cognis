@@ -415,7 +415,13 @@ import X from 'lucide-svelte/icons/x';
       -->
       <main class="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-transparent" id="main-content">
         {#if showMobileHeader}
-        <header class="sticky top-0 z-10 flex shrink-0 items-center justify-between gap-2 border-b border-slate-800/80 bg-slate-950/95 px-3 py-2.5 backdrop-blur sm:gap-3 sm:px-4 sm:py-2.5 lg:hidden">
+        <!--
+          Mobile top bar. On iOS PWAs with `black-translucent` status bar,
+          the system draws content under the status bar, so pad the header
+          top by `env(safe-area-inset-top)` so the hamburger + title sit
+          below the camera cutout instead of being obscured by it.
+        -->
+        <header class="sticky top-0 z-10 flex shrink-0 items-center justify-between gap-2 border-b border-slate-800/80 bg-slate-950/95 px-3 pt-[calc(0.625rem+env(safe-area-inset-top))] pb-2.5 backdrop-blur sm:gap-3 sm:px-4 sm:pt-[calc(0.625rem+env(safe-area-inset-top))] sm:pb-2.5 lg:hidden">
           <div class="flex min-w-0 flex-1 items-center gap-2 lg:hidden">
             <Button aria-label="Open navigation" class="h-11 w-11 lg:hidden md:h-9 md:w-9" size="icon" variant="secondary" onclick={openMobileNav}>
               <Menu class="h-5 w-5" />

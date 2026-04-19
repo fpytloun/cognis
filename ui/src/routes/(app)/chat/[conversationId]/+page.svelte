@@ -2091,7 +2091,7 @@ import X from 'lucide-svelte/icons/x';
     <aside
       aria-label="Conversation list"
       aria-modal={mobileListOpen ? 'true' : undefined}
-      class={`fixed inset-y-3 left-3 z-40 flex w-[min(22rem,calc(100vw-1.5rem))] min-h-0 flex-col rounded-[1.75rem] border border-slate-800/80 bg-slate-900/95 shadow-card backdrop-blur transition-transform duration-200 ease-out lg:static lg:z-auto lg:w-[18rem] lg:translate-x-0 lg:rounded-none lg:border-0 lg:border-r lg:border-slate-800/60 lg:bg-transparent lg:shadow-none lg:backdrop-blur-0 ${chatSidebarCollapsed ? 'lg:hidden' : 'lg:flex'} ${mobileListOpen || !currentConversation ? 'translate-x-0' : '-translate-x-[120%] pointer-events-none lg:pointer-events-auto'}`}
+      class={`fixed left-3 top-[calc(0.75rem+env(safe-area-inset-top))] bottom-[calc(0.75rem+env(safe-area-inset-bottom))] z-40 flex w-[min(22rem,calc(100vw-1.5rem))] min-h-0 flex-col rounded-[1.75rem] border border-slate-800/80 bg-slate-900/95 shadow-card backdrop-blur transition-transform duration-200 ease-out lg:static lg:z-auto lg:w-[18rem] lg:translate-x-0 lg:rounded-none lg:border-0 lg:border-r lg:border-slate-800/60 lg:bg-transparent lg:shadow-none lg:backdrop-blur-0 ${chatSidebarCollapsed ? 'lg:hidden' : 'lg:flex'} ${mobileListOpen || !currentConversation ? 'translate-x-0' : '-translate-x-[120%] pointer-events-none lg:pointer-events-auto'}`}
       role={mobileListOpen ? 'dialog' : undefined}
     >
       <!-- Static top: filters -->
@@ -2263,8 +2263,14 @@ import X from 'lucide-svelte/icons/x';
           </div>
         </div>
       {/if}
-      <!-- Header -->
-      <div class="border-b border-slate-800/80 px-2.5 py-2 sm:px-4 sm:py-3 lg:px-5 lg:py-4">
+      <!--
+        Chat header. On mobile the global top bar is hidden on chat detail
+        (to maximise conversation space), so this header is the one that
+        carries the status-bar clearance on iOS PWAs. Pad the top by
+        `env(safe-area-inset-top)` on mobile; on lg+ there's no status
+        bar to worry about so padding stays normal.
+      -->
+      <div class="border-b border-slate-800/80 px-2.5 pt-[calc(0.5rem+env(safe-area-inset-top))] pb-2 sm:px-4 sm:pt-[calc(0.75rem+env(safe-area-inset-top))] sm:pb-3 lg:px-5 lg:pt-4 lg:pb-4">
         <div class="flex flex-wrap items-start justify-between gap-3">
           <div class="min-w-0 flex-1">
             <div class="flex items-center gap-2">
