@@ -360,7 +360,7 @@
 {#if loading}
   <LoadingState label="Loading task board" description="Fetching draft, queued, running, paused, and completed work items." />
 {:else}
-  <section class="space-y-5">
+  <section class="min-w-0 space-y-5">
     {#if agents.length === 0}
       <Card class="p-5">
         <p class="text-sm font-medium text-white">Create an agent before using the task board.</p>
@@ -391,7 +391,7 @@
       <p class="rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-100">{error}</p>
     {/if}
 
-    <Card class="p-5">
+    <Card class="p-4 sm:p-5">
       <div class="grid gap-4 md:grid-cols-4">
         <label class="space-y-2 text-sm font-medium text-slate-200">
           <span>Search</span>
@@ -455,7 +455,7 @@
 
       {#each TASK_BOARD_COLUMNS as column}
         {#if mobileActiveColumn === column.id}
-          <section class="mt-3 space-y-2 rounded-3xl border border-slate-800/80 bg-slate-900/70 p-3 shadow-card" aria-label={column.label}>
+          <section class="mt-3 space-y-2" aria-label={column.label}>
             <div class="space-y-2">
               {#each tasksForColumn(column.id) as task (task.task_id)}
                 <TaskCard

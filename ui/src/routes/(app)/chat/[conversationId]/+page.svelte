@@ -2095,7 +2095,7 @@ import X from 'lucide-svelte/icons/x';
     <!-- Main chat area -->
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <section
-      class="relative flex min-h-0 flex-1 flex-col rounded-[1.75rem] border border-slate-800/80 bg-slate-900/70 shadow-card backdrop-blur lg:rounded-3xl"
+      class="relative flex min-h-0 flex-1 flex-col border-0 bg-transparent shadow-none backdrop-blur-0 lg:rounded-3xl lg:border lg:border-slate-800/80 lg:bg-slate-900/70 lg:shadow-card lg:backdrop-blur"
       ondragenter={handleDragEnter}
       ondragleave={handleDragLeave}
       ondragover={handleDragOver}
@@ -2113,7 +2113,7 @@ import X from 'lucide-svelte/icons/x';
         </div>
       {/if}
       <!-- Header -->
-      <div class="border-b border-slate-800/80 px-3 py-2.5 sm:px-5 sm:py-4">
+      <div class="border-b border-slate-800/80 px-2.5 py-2 sm:px-4 sm:py-3 lg:px-5 lg:py-4">
         <div class="flex flex-wrap items-start justify-between gap-3">
           <div class="min-w-0 flex-1">
             <div class="flex items-center gap-2">
@@ -2281,7 +2281,7 @@ import X from 'lucide-svelte/icons/x';
 
         {#if mobileHeaderDetailsOpen && currentConversation}
           {@const agent = conversationAgent(currentConversation)}
-          <div class="mt-3 space-y-3 rounded-2xl border border-slate-800/80 bg-slate-950/50 px-3 py-3 sm:hidden">
+          <div class="mt-2 space-y-3 rounded-2xl border border-slate-800/80 bg-slate-950/50 px-3 py-3 sm:hidden">
             <div class="flex flex-wrap items-center gap-2 text-sm text-slate-300">
               {#if agent}
                 <div class="flex items-center gap-2 rounded-lg bg-slate-900/80 px-2 py-1">
@@ -2338,7 +2338,7 @@ import X from 'lucide-svelte/icons/x';
       </div>
 
       <!-- Message area + composer -->
-      <div class="flex min-h-0 flex-1 flex-col gap-3 p-3 sm:gap-4 sm:p-4">
+      <div class="flex min-h-0 flex-1 flex-col gap-2 px-0 py-2 sm:gap-4 sm:px-4 sm:py-4">
         {#if isMemoryDegraded()}
           <div class="rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
             Memory is currently unavailable — this conversation won't have access to past context.
@@ -2391,7 +2391,7 @@ import X from 'lucide-svelte/icons/x';
 
         <!-- Timeline -->
         <div
-          class="relative min-h-0 flex-1 space-y-3 overflow-y-auto p-2 sm:p-4"
+          class="relative min-h-0 flex-1 space-y-3 overflow-y-auto px-2.5 py-1.5 sm:p-4"
           bind:this={timelineEl}
           onscroll={handleTimelineScroll}
         >
@@ -2511,7 +2511,7 @@ import X from 'lucide-svelte/icons/x';
                above the on-screen keyboard so the input stays visible. -->
           <div class="shrink-0 space-y-3" style="padding-bottom: var(--kb-offset, 0px);">
           {#if shouldShowChatTodoDrawer}
-            <div class="overflow-hidden rounded-[1.5rem] border border-slate-800/80 bg-slate-900/90 sm:rounded-3xl">
+            <div class="overflow-hidden rounded-2xl border border-slate-800/80 bg-slate-900/90 sm:rounded-3xl">
               <button class="flex w-full items-center justify-between gap-3 px-4 py-3 text-left transition hover:bg-slate-800/40" onclick={() => { chatTodoDrawerOpen = !chatTodoDrawerOpen; }} type="button">
                 <div>
                   <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Current step todos</p>
@@ -2549,7 +2549,7 @@ import X from 'lucide-svelte/icons/x';
             </div>
           {/if}
 
-          <form class="shrink-0 space-y-3 rounded-[1.5rem] border border-slate-800/80 bg-slate-900/90 p-3 sm:rounded-3xl sm:p-4" onsubmit={(event) => { event.preventDefault(); void handleSend(); }}>
+          <form class="shrink-0 space-y-2 border-t border-slate-800/80 bg-slate-950/95 px-2.5 pt-2 pb-[calc(0.5rem+env(safe-area-inset-bottom))] sm:space-y-3 sm:rounded-3xl sm:border sm:bg-slate-900/90 sm:p-4" onsubmit={(event) => { event.preventDefault(); void handleSend(); }}>
             <!-- Slash command suggestions dropdown -->
             {#if slashSuggestionsVisible}
               <div class="mb-1 rounded-xl border border-slate-700 bg-slate-900/95 py-1 text-sm shadow-lg">
@@ -2631,7 +2631,7 @@ import X from 'lucide-svelte/icons/x';
                 <Maximize2 class="h-4 w-4 md:h-3.5 md:w-3.5" />
               </button>
             </div>
-            <div class="flex flex-wrap items-center justify-between gap-3">
+            <div class="flex flex-wrap items-center justify-between gap-2">
               <label class="hidden items-center gap-2 text-xs text-slate-400 sm:flex">
                 <input bind:checked={enterToSend} class="h-4 w-4 rounded border-slate-700 bg-slate-950" onchange={persistEnterToSendPreference} type="checkbox" />
                 <span>Press Enter to send</span>

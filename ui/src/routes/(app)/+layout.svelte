@@ -204,6 +204,10 @@ import X from 'lucide-svelte/icons/x';
     return navigationItems.find((item) => pathname.startsWith(item.href))?.label ?? 'Workspace';
   }
 
+  let isChatRoute = $derived($page.url.pathname.startsWith('/chat'));
+  let isChatDetailRoute = $derived(/^\/chat\/[^/]+/.test($page.url.pathname));
+  let shouldReserveBottomTabSpace = $derived(!isChatDetailRoute);
+
   onMount(() => {
     restoreSidebarState();
     void auth.bootstrap().then(async () => {
@@ -248,7 +252,7 @@ import X from 'lucide-svelte/icons/x';
   <ConfirmDialog />
   <ShortcutHelp />
   <div class="h-[100dvh] overflow-hidden">
-    <div class="mx-auto flex h-[100dvh] max-w-[1600px] gap-3 overflow-hidden px-2 py-2 pb-[calc(56px+env(safe-area-inset-bottom))] sm:px-3 sm:py-3 lg:gap-6 lg:px-6 lg:py-4 lg:pb-4">
+    <div class={`mx-auto flex h-[100dvh] max-w-[1600px] overflow-hidden ${shouldReserveBottomTabSpace ? 'pb-[calc(56px+env(safe-area-inset-bottom))]' : 'pb-0'} lg:gap-6 lg:px-6 lg:py-4 lg:pb-4`}>
       <!-- svelte-ignore a11y_no_static_element_interactions -->
       <aside
         class={`hidden min-h-0 shrink-0 overflow-hidden whitespace-nowrap rounded-3xl border border-slate-800/80 bg-slate-900/80 shadow-card backdrop-blur transition-all duration-200 ease-in-out lg:flex lg:flex-col lg:justify-between ${sidebarExpanded ? 'w-72 p-5' : 'w-16 p-3'}`}
@@ -308,10 +312,10 @@ import X from 'lucide-svelte/icons/x';
         </div>
       </aside>
 
-      <main class="flex min-h-0 flex-1 flex-col gap-3 overflow-hidden rounded-[1.75rem] border border-slate-800/80 bg-slate-950/70 p-3 shadow-card backdrop-blur sm:rounded-3xl sm:p-4 lg:gap-4 lg:p-6" id="main-content">
-        <header class="sticky top-0 z-10 flex shrink-0 items-center justify-between gap-2 rounded-2xl border border-slate-800/80 bg-slate-900/95 px-3 py-2.5 backdrop-blur sm:gap-3 sm:px-4 sm:py-4">
+      <main class="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-transparent p-0 shadow-none lg:gap-4 lg:rounded-[1.75rem] lg:border lg:border-slate-800/80 lg:bg-slate-950/70 lg:p-6 lg:shadow-card lg:backdrop-blur" id="main-content">
+        <header class="sticky top-0 z-10 flex shrink-0 items-center justify-between gap-2 border-b border-slate-800/80 bg-slate-950/95 px-3 py-2.5 backdrop-blur sm:gap-3 sm:px-4 sm:py-3 lg:rounded-2xl lg:border lg:border-slate-800/80 lg:bg-slate-900/95 lg:py-4">
           <div class="flex min-w-0 flex-1 items-center gap-2 sm:block">
-            <Button aria-label="Open navigation" class="lg:hidden" size="icon-mobile" variant="secondary" onclick={openMobileNav}>
+            <Button aria-label="Open navigation" class="h-11 w-11 lg:hidden md:h-9 md:w-9" size="icon" variant="secondary" onclick={openMobileNav}>
               <Menu class="h-5 w-5" />
             </Button>
             <div class="min-w-0">
@@ -324,7 +328,7 @@ import X from 'lucide-svelte/icons/x';
             {#if $auth.user?.role === 'admin'}
               <Button class="hidden sm:inline-flex" size="sm" variant="secondary" onclick={() => goto('/getting-started')}>Getting started</Button>
             {/if}
-            <Button aria-label="Open keyboard shortcuts" size="icon-mobile" variant="secondary" onclick={openShortcutHelp}>
+            <Button aria-label="Open keyboard shortcuts" class="h-11 w-11 md:h-9 md:w-9" size="icon" variant="secondary" onclick={openShortcutHelp}>
               <CircleHelp class="h-5 w-5" />
             </Button>
             <Badge class={`hidden sm:inline-flex ${$wsState.status === 'connected' ? 'border-emerald-400/40 bg-emerald-500/10 text-emerald-200' : 'border-amber-400/40 bg-amber-500/10 text-amber-200'}`}>
@@ -383,7 +387,7 @@ import X from 'lucide-svelte/icons/x';
           </div>
         {/if}
 
-        <div class={`min-h-0 flex-1 ${$page.url.pathname.startsWith('/chat') ? 'overflow-hidden' : 'overflow-y-auto'}`}>
+        <div class={`min-h-0 min-w-0 flex-1 ${isChatRoute ? 'overflow-hidden' : 'overflow-y-auto overflow-x-hidden px-3 py-3 sm:px-4 sm:py-4 lg:px-0 lg:py-0'}`}>
             <slot />
         </div>
       </main>
@@ -398,7 +402,7 @@ import X from 'lucide-svelte/icons/x';
           <p class="text-sm uppercase tracking-[0.25em] text-sky-300">Cognis</p>
           <p class="mt-1 text-sm text-slate-400">{$auth.user?.email}</p>
         </div>
-        <Button aria-label="Close navigation" size="icon-mobile" variant="secondary" onclick={closeMobileNav}>
+        <Button aria-label="Close navigation" class="h-11 w-11 md:h-9 md:w-9" size="icon" variant="secondary" onclick={closeMobileNav}>
           <X class="h-4 w-4" />
         </Button>
       </div>
@@ -427,5 +431,5 @@ import X from 'lucide-svelte/icons/x';
 
   <!-- Mobile bottom tab bar: primary navigation on small screens. Hidden inside
        chat detail views so the composer owns the bottom safe-area. -->
-  <BottomTabBar hidden={/^\/chat\/[^/]+/.test($page.url.pathname)} />
+  <BottomTabBar hidden={isChatDetailRoute} />
 {/if}

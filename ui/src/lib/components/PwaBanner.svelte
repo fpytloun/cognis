@@ -110,7 +110,7 @@ import X from 'lucide-svelte/icons/x';
       <p class="font-medium">Add to Home Screen</p>
       <p class="text-xs text-slate-400">Tap the Share icon in Safari, then "Add to Home Screen" for a native-app feel.</p>
     </div>
-    <Button aria-label="Dismiss" size="icon-mobile" variant="ghost" onclick={dismissIos}>
+    <Button aria-label="Dismiss" class="h-11 w-11 md:h-9 md:w-9" size="icon" variant="ghost" onclick={dismissIos}>
       <X class="h-4 w-4" />
     </Button>
   </div>
