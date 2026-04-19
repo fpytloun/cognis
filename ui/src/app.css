@@ -25,6 +25,23 @@ html {
   font-size: 15px;
 }
 
+/*
+ * iOS Safari auto-zooms the viewport whenever a focused text input has
+ * a computed font-size below 16px. Our 15px root + frequent `text-sm`
+ * (14px) usage tripped that on iPhone PWAs — the whole page magnified
+ * and shifted sideways as soon as the keyboard opened. Force a 16px
+ * minimum on text-entry controls on touch pointers so the focus never
+ * triggers the zoom; desktop (fine pointer) keeps the designed sizes
+ * because auto-zoom is not a concern there.
+ */
+@media (pointer: coarse) {
+  input:not([type="range"]):not([type="checkbox"]):not([type="radio"]):not([type="color"]):not([type="file"]),
+  textarea,
+  [contenteditable="true"] {
+    font-size: 16px !important;
+  }
+}
+
 html,
 body,
 #svelte {
