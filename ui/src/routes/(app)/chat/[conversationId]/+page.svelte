@@ -2081,10 +2081,16 @@ import X from 'lucide-svelte/icons/x';
       Dropping the rounded card background on lg lets the conversation
       list feel like part of the page instead of a box inside a box.
     -->
+    <!--
+      Conversation list on mobile floats over the chat area as a card.
+      Its top is pushed below the Dynamic Island by a generous 16px
+      buffer on top of `env(safe-area-inset-top)` so notification
+      banners and the status bar always have room above the card.
+    -->
     <aside
       aria-label="Conversation list"
       aria-modal={mobileListOpen ? 'true' : undefined}
-      class={`fixed left-3 top-[calc(0.75rem+env(safe-area-inset-top))] bottom-[calc(0.75rem+env(safe-area-inset-bottom))] z-40 flex w-[min(22rem,calc(100vw-1.5rem))] min-h-0 flex-col rounded-[1.75rem] border border-slate-800/80 bg-slate-900/95 shadow-card backdrop-blur transition-transform duration-200 ease-out lg:static lg:z-auto lg:w-[18rem] lg:translate-x-0 lg:rounded-none lg:border-0 lg:border-r lg:border-slate-800/60 lg:bg-transparent lg:shadow-none lg:backdrop-blur-0 ${chatSidebarCollapsed ? 'lg:hidden' : 'lg:flex'} ${mobileListOpen || !currentConversation ? 'translate-x-0' : '-translate-x-[120%] pointer-events-none lg:pointer-events-auto'}`}
+      class={`fixed left-3 top-[calc(1rem+env(safe-area-inset-top))] bottom-[calc(0.75rem+env(safe-area-inset-bottom))] z-40 flex w-[min(22rem,calc(100vw-1.5rem))] min-h-0 flex-col rounded-[1.75rem] border border-slate-800/80 bg-slate-900/95 shadow-card backdrop-blur transition-transform duration-200 ease-out lg:static lg:z-auto lg:w-[18rem] lg:translate-x-0 lg:rounded-none lg:border-0 lg:border-r lg:border-slate-800/60 lg:bg-transparent lg:shadow-none lg:backdrop-blur-0 ${chatSidebarCollapsed ? 'lg:hidden' : 'lg:flex'} ${mobileListOpen || !currentConversation ? 'translate-x-0' : '-translate-x-[120%] pointer-events-none lg:pointer-events-auto'}`}
       role={mobileListOpen ? 'dialog' : undefined}
     >
       <!-- Static top: filters -->
