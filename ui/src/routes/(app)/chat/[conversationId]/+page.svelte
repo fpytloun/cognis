@@ -1,7 +1,7 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
   import { page } from '$app/state';
-  import { onMount, tick } from 'svelte';
+  import { onMount } from 'svelte';
   import { fade } from 'svelte/transition';
   import ArrowDown from 'lucide-svelte/icons/arrow-down';
 import ArrowLeft from 'lucide-svelte/icons/arrow-left';
@@ -12,9 +12,7 @@ import ChevronsLeft from 'lucide-svelte/icons/chevrons-left';
 import ChevronsRight from 'lucide-svelte/icons/chevrons-right';
 import Copy from 'lucide-svelte/icons/copy';
 import Info from 'lucide-svelte/icons/info';
-import Maximize2 from 'lucide-svelte/icons/maximize-2';
 import Menu from 'lucide-svelte/icons/menu';
-import Minimize2 from 'lucide-svelte/icons/minimize-2';
 import Search from 'lucide-svelte/icons/search';
 import X from 'lucide-svelte/icons/x';
 
@@ -88,9 +86,7 @@ import X from 'lucide-svelte/icons/x';
   let sessions = $state<Session[]>([]);
   let composer = $state('');
   let composerElement = $state<HTMLTextAreaElement | null>(null);
-  let expandedComposerElement = $state<HTMLTextAreaElement | null>(null);
   let composerAttachments = $state<AttachmentRef[]>([]);
-  let composerExpanded = $state(false);
   let showDropZone = $state(false);
   let dragCounter = 0;
   let selectedAgentId = $state('');
@@ -1372,10 +1368,6 @@ import X from 'lucide-svelte/icons/x';
   }
 
   function focusActiveComposer(): void {
-    if (composerExpanded) {
-      expandedComposerElement?.focus();
-      return;
-    }
     composerElement?.focus();
   }
 
@@ -1383,7 +1375,6 @@ import X from 'lucide-svelte/icons/x';
     const content = composer.trim();
     if ((!content && composerAttachments.length === 0) || !currentConversation || isReadOnly(currentConversation)) return;
     if (pendingDirectQuestion && directQuestionSubmitting) return;
-    const shouldRestoreInlineFocus = composerExpanded;
 
     const isSlashCommand = SYSTEM_SLASH_COMMANDS.some((cmd) => content.startsWith(cmd));
 
@@ -1415,14 +1406,8 @@ import X from 'lucide-svelte/icons/x';
       awaitingAssistantStart = true;
     }
     error = '';
-    composerExpanded = false;
     composer = '';
     syncComposerHeight();
-    if (shouldRestoreInlineFocus) {
-      await tick();
-      syncComposerHeight();
-      composerElement?.focus();
-    }
     const attachments = [...composerAttachments];
     composerAttachments = [];
 
@@ -1548,21 +1533,6 @@ import X from 'lucide-svelte/icons/x';
     composerElement.style.height = `${Math.min(composerElement.scrollHeight, 220)}px`;
   }
 
-  async function openExpandedComposer(): Promise<void> {
-    if (composerExpanded) return;
-    composerExpanded = true;
-    await tick();
-    expandedComposerElement?.focus();
-  }
-
-  async function closeExpandedComposer(): Promise<void> {
-    if (!composerExpanded) return;
-    composerExpanded = false;
-    await tick();
-    syncComposerHeight();
-    composerElement?.focus();
-  }
-
   function handleComposerKeydown(event: KeyboardEvent): void {
     // Slash suggestion navigation
     if (slashSuggestionsVisible) {
@@ -1589,27 +1559,6 @@ import X from 'lucide-svelte/icons/x';
     if (!enterToSend || event.key !== 'Enter' || event.shiftKey) return;
     event.preventDefault();
     void handleSend();
-  }
-
-  function handleExpandedComposerKeydown(event: KeyboardEvent): void {
-    if (event.key === 'Escape' && slashSuggestionsVisible) {
-      event.preventDefault();
-      slashSuggestionsVisible = false;
-      return;
-    }
-    if (event.key === 'Escape') {
-      event.preventDefault();
-      void closeExpandedComposer();
-      return;
-    }
-    handleComposerKeydown(event);
-  }
-
-  function handleExpandedComposerOverlayKeydown(event: KeyboardEvent): void {
-    if (event.key === 'Escape') {
-      event.preventDefault();
-      void closeExpandedComposer();
-    }
   }
 
   async function handleEscalationDecision(callId: string, decision: 'approve' | 'deny'): Promise<void> {
@@ -2790,31 +2739,19 @@ import X from 'lucide-svelte/icons/x';
               onremove={removeAttachment}
               disabled={directQuestionSubmitting}
             />
-            <div class="relative">
-              <textarea
-                bind:this={composerElement}
-                bind:value={composer}
-                class="min-h-[56px] w-full resize-none rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 pr-10 text-base text-slate-100 placeholder:text-slate-500 md:text-sm"
-                disabled={!currentConversation || isReadOnly(currentConversation) || isLlmUnavailableForSetup() || directQuestionSubmitting}
-                enterkeyhint={enterToSend ? 'send' : 'enter'}
-                autocapitalize="sentences"
-                spellcheck="true"
-                onkeydown={handleComposerKeydown}
-                oninput={() => { updateSlashSuggestions(); syncComposerHeight(); }}
-                onpaste={(event) => void handlePaste(event)}
-                placeholder={isLlmUnavailableForSetup() ? 'Configure an LLM provider to start chatting.' : pendingDirectQuestion ? 'Answer the pending clarification request...' : `Send a message to ${currentAgentDisplayName}...`}
-              ></textarea>
-              <button
-                type="button"
-                class="absolute bottom-2 right-2 inline-flex h-7 w-7 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-800/60 hover:text-slate-200 disabled:opacity-40"
-                title="Expand composer"
-                aria-label="Expand composer"
-                disabled={!currentConversation || isReadOnly(currentConversation) || isLlmUnavailableForSetup() || directQuestionSubmitting}
-                onclick={() => void openExpandedComposer()}
-              >
-                <Maximize2 class="h-3.5 w-3.5" />
-              </button>
-            </div>
+            <textarea
+              bind:this={composerElement}
+              bind:value={composer}
+              class="min-h-[56px] w-full resize-none rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-base text-slate-100 placeholder:text-slate-500 md:text-sm"
+              disabled={!currentConversation || isReadOnly(currentConversation) || isLlmUnavailableForSetup() || directQuestionSubmitting}
+              enterkeyhint={enterToSend ? 'send' : 'enter'}
+              autocapitalize="sentences"
+              spellcheck="true"
+              onkeydown={handleComposerKeydown}
+              oninput={() => { updateSlashSuggestions(); syncComposerHeight(); }}
+              onpaste={(event) => void handlePaste(event)}
+              placeholder={isLlmUnavailableForSetup() ? 'Configure an LLM provider to start chatting.' : pendingDirectQuestion ? 'Answer the pending clarification request...' : `Send a message to ${currentAgentDisplayName}...`}
+            ></textarea>
             <div class="flex flex-wrap items-center justify-between gap-2">
               <label class="flex items-center gap-2 text-xs text-slate-400">
                 <input bind:checked={enterToSend} class="h-4 w-4 rounded border-slate-700 bg-slate-950" onchange={persistEnterToSendPreference} type="checkbox" />
@@ -2841,83 +2778,6 @@ import X from 'lucide-svelte/icons/x';
           </div>
         {/if}
       </div>
-
-      {#if composerExpanded}
-        <!-- svelte-ignore a11y_click_events_have_key_events -->
-        <div class="fixed inset-0 z-[85] flex items-center justify-center bg-slate-950/80 px-4 py-6 backdrop-blur" role="presentation" tabindex="-1" onclick={() => void closeExpandedComposer()} onkeydown={handleExpandedComposerOverlayKeydown}>
-          <div
-            class="w-full max-w-5xl rounded-3xl border border-slate-800 bg-slate-950 shadow-card"
-            role="dialog"
-            aria-modal="true"
-            aria-label="Expanded chat composer"
-            tabindex="-1"
-            onclick={(event) => event.stopPropagation()}
-          >
-            <div class="flex items-center justify-between border-b border-slate-800 px-5 py-4">
-              <div>
-                <p class="text-sm font-semibold text-white">Expanded Composer</p>
-                <p class="mt-1 text-xs text-slate-400">Use this space for longer prompts and structured notes.</p>
-              </div>
-              <button
-                type="button"
-                class="inline-flex h-9 w-9 items-center justify-center rounded-full border border-slate-800 text-slate-400 transition hover:border-slate-700 hover:text-slate-100"
-                title="Collapse composer"
-                aria-label="Collapse composer"
-                onclick={() => void closeExpandedComposer()}
-              >
-                <Minimize2 class="h-4 w-4" />
-              </button>
-            </div>
-            <div class="space-y-4 px-5 py-5">
-              {#if slashSuggestionsVisible}
-                <div class="rounded-xl border border-slate-700 bg-slate-900/95 py-1 text-sm shadow-lg">
-                  {#each slashFilteredSuggestions as suggestion, i}
-                    <button
-                      class="flex w-full items-center gap-3 px-3 py-1.5 text-left text-xs transition {i === slashSelectedIndex ? 'bg-slate-700/60 text-slate-100' : 'text-slate-400 hover:bg-slate-800/60 hover:text-slate-200'}"
-                      onmousedown={(e: MouseEvent) => { e.preventDefault(); acceptSlashSuggestion(i); }}
-                      type="button"
-                    >
-                      <span class="font-mono font-medium text-sky-400">{suggestion.command}</span>
-                      <span class="opacity-70">{suggestion.description}</span>
-                    </button>
-                  {/each}
-                </div>
-              {/if}
-              <ComposerAttachments
-                attachments={composerAttachments}
-                onremove={removeAttachment}
-                disabled={directQuestionSubmitting}
-              />
-              <textarea
-                bind:this={expandedComposerElement}
-                bind:value={composer}
-                class="min-h-[55vh] w-full resize-none rounded-3xl border border-slate-800 bg-slate-900/60 px-5 py-4 text-base leading-6 text-slate-100 placeholder:text-slate-500 md:text-sm"
-                disabled={!currentConversation || isReadOnly(currentConversation) || isLlmUnavailableForSetup() || directQuestionSubmitting}
-                enterkeyhint={enterToSend ? 'send' : 'enter'}
-                onkeydown={handleExpandedComposerKeydown}
-                oninput={updateSlashSuggestions}
-                onpaste={(event) => void handlePaste(event)}
-                placeholder={isLlmUnavailableForSetup() ? 'Configure an LLM provider to start chatting.' : pendingDirectQuestion ? 'Answer the pending clarification request...' : `Send a longer message to ${currentAgentDisplayName}...`}
-              ></textarea>
-              <div class="flex flex-wrap items-center justify-between gap-3">
-                <label class="flex items-center gap-2 text-xs text-slate-400">
-                  <input bind:checked={enterToSend} class="h-4 w-4 rounded border-slate-700 bg-slate-950" onchange={persistEnterToSendPreference} type="checkbox" />
-                  <span>Press Enter to send</span>
-                </label>
-                <div class="flex flex-wrap justify-end gap-2">
-                  <AttachFileButton onchange={uploadFiles} disabled={directQuestionSubmitting} />
-                  <Button size="sm" variant="secondary" type="button" onclick={() => void closeExpandedComposer()}>
-                    Close
-                  </Button>
-                  <Button size="sm" type="button" disabled={(!composer.trim() && composerAttachments.length === 0) || !currentConversation || isReadOnly(currentConversation) || isLlmUnavailableForSetup() || directQuestionSubmitting} onclick={() => void handleSend()}>
-                    {directQuestionSubmitting ? 'Sending...' : pendingDirectQuestion ? 'Answer' : 'Send'}
-                  </Button>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-      {/if}
 
       {#if showNewChatModal}
         <NewChatModal
