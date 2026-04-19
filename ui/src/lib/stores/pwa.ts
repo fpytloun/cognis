@@ -21,10 +21,9 @@ interface BeforeInstallPromptEvent extends Event {
 
 let deferredPrompt: BeforeInstallPromptEvent | null = null;
 
-const AUTO_APPLY_WAITING_PREFIX = 'cognis-sw-auto-apply:';
-const AUTO_APPLY_TIMEOUT_MS = 5000;
 const INSTALL_DISMISS_KEY = 'cognis-pwa-install-dismissed-until';
 const INSTALL_DISMISS_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const UPDATE_DISMISSED_KEY = 'cognis-pwa-update-dismissed';
 
 export const installPromptAvailable = writable(false);
 export const updateAvailable = writable(false);
@@ -55,53 +54,30 @@ export function dismissInstallPromptForNow(): void {
   installPromptAvailable.set(false);
 }
 
-function waitingWorkerAttemptKey(waiting: ServiceWorker): string | null {
-  if (typeof window === 'undefined') return null;
+// --- update banner (session-scoped dismissal) ----------------------------
+
+function isUpdateDismissed(): boolean {
+  if (typeof window === 'undefined') return false;
   try {
-    return `${AUTO_APPLY_WAITING_PREFIX}${waiting.scriptURL}`;
+    return window.sessionStorage.getItem(UPDATE_DISMISSED_KEY) === '1';
   } catch {
-    return null;
-  }
-}
-
-function activateWaitingWorker(waiting: ServiceWorker, options: { auto?: boolean } = {}): void {
-  updateAvailable.set(false);
-
-  const attemptKey = options.auto ? waitingWorkerAttemptKey(waiting) : null;
-  let timeoutId: number | null = null;
-
-  const onControllerChange = () => {
-    if (timeoutId !== null) {
-      window.clearTimeout(timeoutId);
-    }
-    window.location.reload();
-  };
-
-  navigator.serviceWorker.addEventListener(
-    'controllerchange',
-    onControllerChange,
-    { once: true }
-  );
-
-  if (attemptKey) {
-    timeoutId = window.setTimeout(() => {
-      navigator.serviceWorker.removeEventListener('controllerchange', onControllerChange);
-      updateAvailable.set(true);
-    }, AUTO_APPLY_TIMEOUT_MS);
-  }
-
-  waiting.postMessage({ type: 'SKIP_WAITING' });
-}
-
-function tryAutoApplyWaitingWorker(waiting: ServiceWorker): boolean {
-  const attemptKey = waitingWorkerAttemptKey(waiting);
-  if (!attemptKey) return false;
-  if (window.sessionStorage.getItem(attemptKey) === '1') {
     return false;
   }
-  window.sessionStorage.setItem(attemptKey, '1');
-  activateWaitingWorker(waiting, { auto: true });
-  return true;
+}
+
+export function dismissUpdateBanner(): void {
+  if (typeof window === 'undefined') return;
+  try {
+    window.sessionStorage.setItem(UPDATE_DISMISSED_KEY, '1');
+  } catch {
+    // ignore storage errors (Safari private mode, disabled cookies, etc.)
+  }
+  updateAvailable.set(false);
+}
+
+function announceUpdateIfEligible(): void {
+  if (isUpdateDismissed()) return;
+  updateAvailable.set(true);
 }
 
 if (typeof window !== 'undefined') {
@@ -175,10 +151,11 @@ export function isIosSafari(): boolean {
 /**
  * Service worker registration + update lifecycle.
  *
- * The SW installs new versions to the `waiting` state — we never auto-apply
- * them. The user sees an "Update available" banner and taps Reload, which
- * posts `SKIP_WAITING` to the waiting SW; it activates and `controllerchange`
- * fires on the page, triggering a reload so the new assets take effect.
+ * The SW installs new versions to the `waiting` state. We never auto-apply
+ * them. The user sees an "Update available" banner with Reload and Dismiss
+ * buttons. Reload calls `applyUpdate()`, which performs a hard reset
+ * (unregister all SWs + delete Cognis caches + reload). Dismiss hides the
+ * banner for the rest of the session.
  *
  * First installs (no existing controller) do NOT raise the update banner so
  * we don't nag fresh visitors.
@@ -193,24 +170,24 @@ export async function registerServiceWorker(): Promise<void> {
       scope: '/'
     });
 
-    // If there's already a waiting SW at page load, the user has already
-    // refreshed or reopened the app since the update banner first appeared.
-    // Finish applying the update instead of showing the same banner again.
+    // Offer the update banner if a new service worker is already waiting
+    // at load time. We never auto-trigger SKIP_WAITING here: previous
+    // versions did, but that pathway could deadlock on some browsers
+    // (controllerchange never fired) and caused the banner to reappear
+    // forever. `applyUpdate()` below does a hard reset instead, which
+    // always succeeds.
     if (registration.waiting && navigator.serviceWorker.controller) {
-      if (!tryAutoApplyWaitingWorker(registration.waiting)) {
-        updateAvailable.set(true);
-      }
-      return;
+      announceUpdateIfEligible();
     }
 
     // When a new SW finishes installing AND an existing controller is in
-    // charge, a fresh version is ready to activate. Offer the update banner.
+    // charge, a fresh version is ready to activate. Offer the banner.
     registration.addEventListener('updatefound', () => {
       const installing = registration.installing;
       if (!installing) return;
       installing.addEventListener('statechange', () => {
         if (installing.state === 'installed' && navigator.serviceWorker.controller) {
-          updateAvailable.set(true);
+          announceUpdateIfEligible();
         }
       });
     });
@@ -221,17 +198,42 @@ export async function registerServiceWorker(): Promise<void> {
 }
 
 export async function applyUpdate(): Promise<void> {
-  if (typeof window === 'undefined' || !('serviceWorker' in navigator)) return;
-  const registration = await navigator.serviceWorker.getRegistration();
-  const waiting = registration?.waiting;
-  if (!waiting) {
-    // Nothing waiting — a reload is still the user's "apply" gesture.
-    window.location.reload();
-    return;
+  if (typeof window === 'undefined') return;
+
+  updateAvailable.set(false);
+  try {
+    window.sessionStorage.removeItem(UPDATE_DISMISSED_KEY);
+  } catch {
+    // ignore
   }
-  const attemptKey = waitingWorkerAttemptKey(waiting);
-  if (attemptKey) {
-    window.sessionStorage.setItem(attemptKey, '1');
+
+  // Hard reset: unregister every service worker and delete every Cognis
+  // cache, then force a reload. Previous approaches used SKIP_WAITING +
+  // controllerchange, which could deadlock on some browsers and cause
+  // the banner to reappear indefinitely. The hard reset guarantees the
+  // next load has no waiting worker and no stale cached shell, so the
+  // new version installs cleanly without a banner loop.
+  if ('serviceWorker' in navigator) {
+    try {
+      const registrations = await navigator.serviceWorker.getRegistrations();
+      await Promise.all(registrations.map((r) => r.unregister().catch(() => false)));
+    } catch {
+      // ignore
+    }
   }
-  activateWaitingWorker(waiting, { auto: true });
+
+  if (typeof caches !== 'undefined') {
+    try {
+      const names = await caches.keys();
+      await Promise.all(
+        names
+          .filter((n) => n.startsWith('cognis-'))
+          .map((n) => caches.delete(n).catch(() => false))
+      );
+    } catch {
+      // ignore
+    }
+  }
+
+  window.location.reload();
 }

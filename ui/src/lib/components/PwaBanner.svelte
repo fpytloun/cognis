@@ -11,6 +11,7 @@ import X from 'lucide-svelte/icons/x';
     applyUpdate,
     displayMode,
     dismissInstallPromptForNow,
+    dismissUpdateBanner,
     installPromptAvailable,
     isInstallPromptDismissed,
     isIosSafari,
@@ -90,6 +91,16 @@ import X from 'lucide-svelte/icons/x';
       <p class="text-xs text-slate-400">Reload to apply the latest Cognis version.</p>
     </div>
     <Button size="sm" onclick={() => void applyUpdate()}>Reload</Button>
+    <Button
+      aria-label="Dismiss update banner"
+      class="h-9 w-9"
+      size="icon"
+      variant="ghost"
+      onclick={dismissUpdateBanner}
+      title="Dismiss"
+    >
+      <X class="h-4 w-4" />
+    </Button>
   </div>
 {/if}
 
