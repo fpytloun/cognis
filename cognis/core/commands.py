@@ -332,18 +332,10 @@ class CommandDispatcher:
             )
 
         lines = [f"Model: {usage['model']}"]
-        try:
-            model_info = await self._providers.llm.get_model_info(usage["model"])
+        model_info = await self._get_context_usage_model_info(usage)
+        if model_info is not None:
             lines.append(f"Model context window: {model_info.context_window:,} tokens")
-        except Exception:
-            pass
-        lines.extend(
-            [
-                f"Session configured cap: {usage['max_context_tokens']:,} tokens",
-                f"Current usage: {usage['prompt_tokens']:,} tokens ({usage['percentage']}% of session cap)",
-                f"Compaction threshold: {int(self._compaction_strategy.compaction_threshold * 100)}%",
-            ]
-        )
+        self._append_context_usage_lines(lines, usage)
         return CommandResult(type="system_message", text="\n".join(lines))
 
     async def _handle_info(
@@ -376,15 +368,10 @@ class CommandDispatcher:
         usage = self._session_cache.get_context_usage(current_session.session_id)
         if usage:
             lines.append(f"Model: {usage['model']}")
-            try:
-                model_info = await self._providers.llm.get_model_info(usage["model"])
+            model_info = await self._get_context_usage_model_info(usage)
+            if model_info is not None:
                 lines.append(f"Model context window: {model_info.context_window:,} tokens")
-            except Exception:
-                pass
-            lines.append(f"Session configured cap: {usage['max_context_tokens']:,} tokens")
-            lines.append(
-                f"Current usage: {usage['prompt_tokens']:,} tokens ({usage['percentage']}% of session cap)"
-            )
+            self._append_context_usage_lines(lines, usage)
         reasoning = self._session_cache.get_reasoning_effort_override(current_session.session_id)
         if reasoning:
             lines.append(f"Reasoning effort: {reasoning}")
@@ -421,6 +408,61 @@ class CommandDispatcher:
             lines.append(f"Started: {current_session.started_at}")
 
         return CommandResult(type="system_message", text="\n".join(lines))
+
+    async def _get_context_usage_model_info(self, usage: dict[str, Any]) -> Any | None:
+        """Resolve model metadata for cached context usage."""
+
+        if self._providers is None or getattr(self._providers, "llm", None) is None:
+            return None
+        provider_id = usage.get("provider_id")
+        try:
+            if provider_id:
+                try:
+                    return await self._providers.llm.get_model_info(
+                        usage["model"], provider_id=provider_id
+                    )
+                except TypeError:
+                    pass
+            return await self._providers.llm.get_model_info(usage["model"])
+        except Exception:
+            return None
+
+    def _append_context_usage_lines(self, lines: list[str], usage: dict[str, Any]) -> None:
+        """Append cached context-usage diagnostics to a command response."""
+
+        lines.append(f"Session configured cap: {usage['max_context_tokens']:,} tokens")
+        lines.append(
+            f"Current usage: {usage['prompt_tokens']:,} tokens ({usage['percentage']}% of session cap)"
+        )
+
+        reserve_output_tokens = usage.get("reserve_output_tokens")
+        effective_reserve_output_tokens = usage.get(
+            "effective_reserve_output_tokens", reserve_output_tokens
+        )
+        if isinstance(reserve_output_tokens, int):
+            if (
+                isinstance(effective_reserve_output_tokens, int)
+                and effective_reserve_output_tokens != reserve_output_tokens
+            ):
+                lines.append(
+                    "Reserved output tokens: "
+                    f"{reserve_output_tokens:,} (clamped to "
+                    f"{effective_reserve_output_tokens:,} for loop pressure checks)"
+                )
+            else:
+                lines.append(f"Reserved output tokens: {reserve_output_tokens:,}")
+
+        effective_prompt_budget = usage.get("effective_prompt_budget")
+        if isinstance(effective_prompt_budget, int):
+            lines.append(f"Effective prompt budget: {effective_prompt_budget:,} tokens")
+
+        loop_pressure_threshold = usage.get("loop_pressure_threshold")
+        if isinstance(loop_pressure_threshold, int):
+            lines.append(f"Loop pressure threshold: {loop_pressure_threshold:,} tokens")
+
+        compaction_threshold = getattr(self._compaction_strategy, "compaction_threshold", None)
+        if isinstance(compaction_threshold, int | float):
+            lines.append(f"Compaction threshold: {int(compaction_threshold * 100)}%")
 
     def _append_session_metadata(
         self,

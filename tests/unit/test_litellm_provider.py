@@ -506,6 +506,38 @@ async def test_litellm_provider_infers_openai_responses_capabilities_for_proxy_m
 
 
 @pytest.mark.asyncio
+async def test_litellm_provider_applies_gpt5_metadata_floor_when_lookup_fails(
+    tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="openai",
+                display_name="OpenAI",
+                location="controller",
+                backend="litellm",
+                config={"preset": "openai", "default_model": "gpt-5.4"},
+                status="active",
+            )
+        )
+        await session.commit()
+
+    monkeypatch.setattr(
+        "cognis.providers.llm.litellm.litellm.get_model_info",
+        lambda **_: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    provider = LiteLLMProvider(session_factory)
+    model_info = await provider.get_model_info("gpt-5.4", provider_id="openai")
+
+    assert model_info.context_window == 1_048_576
+    assert model_info.max_output_tokens == 65_536
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_litellm_provider_returns_default_model_info_when_missing(tmp_path: object) -> None:
     engine, session_factory = await _session_factory(tmp_path)
     provider = LiteLLMProvider(session_factory)

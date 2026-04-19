@@ -76,6 +76,7 @@ _IMAGE_GEN_STRATEGY: dict[str, str] = {
 
 # Anthropic model name patterns for prompt caching support
 _ANTHROPIC_MODEL_PATTERNS = re.compile(r"(claude|anthropic)", re.IGNORECASE)
+_GPT5_MODEL_PATTERN = re.compile(r"(^|/)(gpt-5(?:[.-].*)?)$", re.IGNORECASE)
 
 LLM_REASONING_EFFORT_USED_TOTAL = Counter(
     "cognis_llm_reasoning_effort_used_total",
@@ -109,6 +110,15 @@ _GEMINI_MODEL_PATTERNS = re.compile(r"(gemini|vertex_ai|google)", re.IGNORECASE)
 def _supports_image_response_format(model: str) -> bool:
     normalized = model.rsplit("/", 1)[-1].lower()
     return normalized != "gpt-image-1"
+
+
+def _metadata_floor_for_model(model_id: str) -> dict[str, int] | None:
+    """Return conservative fallback metadata floors for known model families."""
+
+    normalized = normalize_openai_model_name(model_id)
+    if _GPT5_MODEL_PATTERN.search(normalized):
+        return {"context_window": 1_048_576, "max_output_tokens": 65_536}
+    return None
 
 
 def _apply_message_cache_hints(
@@ -737,6 +747,29 @@ class LiteLLMProvider:
                 proxy_info = proxy_info_map.get(model_id, {})
                 if proxy_info:
                     merged.update(proxy_info)
+
+        metadata_floor = _metadata_floor_for_model(model_id)
+        if metadata_floor is not None:
+            applied_floor: dict[str, int] = {}
+            context_window = int(merged.get("context_window") or 0)
+            if context_window <= DEFAULT_MODEL_INFO.context_window:
+                merged["context_window"] = metadata_floor["context_window"]
+                applied_floor["context_window"] = metadata_floor["context_window"]
+            max_output_tokens = int(merged.get("max_output_tokens") or 0)
+            if max_output_tokens <= DEFAULT_MODEL_INFO.max_output_tokens:
+                merged["max_output_tokens"] = metadata_floor["max_output_tokens"]
+                applied_floor["max_output_tokens"] = metadata_floor["max_output_tokens"]
+            if applied_floor:
+                logger.warning(
+                    "Applied conservative model metadata floor",
+                    extra={
+                        "extra_data": {
+                            "model_id": model_id,
+                            "provider_id": provider.provider_id if provider is not None else None,
+                            **applied_floor,
+                        }
+                    },
+                )
 
         merged.update(configured)
         merged["model_id"] = model_id

@@ -1112,6 +1112,21 @@ class StepContext:
     consume_boundary_batch: Callable[[str], Coroutine[Any, Any, list[dict[str, Any]]]] | None = None
 
 
+@dataclass(slots=True)
+class ContextPressureSnapshot:
+    """Token-budget snapshot used for tool-loop pressure checks."""
+
+    prompt_tokens: int
+    max_context_tokens: int
+    reserve_output_tokens: int
+    effective_reserve_output_tokens: int
+    available_prompt_tokens: int
+    threshold_prompt_tokens: int
+    exceeded: bool
+    reason: str
+    reserve_clamped: bool = False
+
+
 # ---------------------------------------------------------------------------
 # Agent loop
 # ---------------------------------------------------------------------------
@@ -1910,14 +1925,6 @@ class AgentLoop:
         # Capture cache breakpoint for prompt caching (Anthropic cache_control)
         cache_breakpoint = getattr(context_result, "cache_breakpoint_index", None)
 
-        # Store context usage in session cache for UI display and /context command
-        self.session_cache.update_context_usage(
-            ctx.session,
-            prompt_tokens=context_result.prompt_tokens,
-            max_context_tokens=context_result.max_context_tokens,
-            model=context_result.resolved_model,
-        )
-
         # Main agentic loop
         step_reprompt_count = 0
         mid_stream_retries = 0
@@ -2022,6 +2029,22 @@ class AgentLoop:
                         ),
                     }
                 },
+            )
+            pre_call_snapshot = self._context_pressure_snapshot(
+                ctx,
+                messages=messages,
+                tool_schemas=exposure.tools,
+                max_context_tokens=context_result.max_context_tokens,
+            )
+            self._store_context_usage_snapshot(
+                ctx,
+                snapshot=pre_call_snapshot,
+                provider_id=current_provider_id,
+            )
+            self._maybe_log_context_reserve_clamp(
+                ctx,
+                pre_call_snapshot,
+                provider_id=current_provider_id,
             )
             llm_kwargs.update(exposure.request_kwargs)
 
@@ -3509,6 +3532,23 @@ class AgentLoop:
             ):
                 continue
 
+            post_tool_snapshot = self._context_pressure_snapshot(
+                ctx,
+                messages=messages,
+                tool_schemas=exposure.tools,
+                max_context_tokens=context_result.max_context_tokens,
+            )
+            self._store_context_usage_snapshot(
+                ctx,
+                snapshot=post_tool_snapshot,
+                provider_id=current_provider_id,
+            )
+            self._maybe_log_context_reserve_clamp(
+                ctx,
+                post_tool_snapshot,
+                provider_id=current_provider_id,
+            )
+
             # Check if step_complete was called in this batch
             if step_output is not None:
                 break
@@ -3516,12 +3556,8 @@ class AgentLoop:
             if (
                 tool_call_count > 0
                 and tool_call_count % 10 == 0
-                and self._context_pressure_exceeded(
-                    ctx,
-                    messages=messages,
-                    tool_schemas=exposure.tools,
-                    max_context_tokens=context_result.max_context_tokens,
-                )
+                and post_tool_snapshot is not None
+                and post_tool_snapshot.exceeded
             ):
                 logger.warning(
                     "Context pressure ceiling reached during tool loop",
@@ -3530,6 +3566,17 @@ class AgentLoop:
                             "session_id": ctx.session.session_id,
                             "tool_call_count": tool_call_count,
                             "step_name": ctx.step_definition.name,
+                            "model": ctx.current_model,
+                            "provider_id": current_provider_id,
+                            "prompt_tokens": post_tool_snapshot.prompt_tokens,
+                            "max_context_tokens": post_tool_snapshot.max_context_tokens,
+                            "reserve_output_tokens": post_tool_snapshot.reserve_output_tokens,
+                            "effective_reserve_output_tokens": (
+                                post_tool_snapshot.effective_reserve_output_tokens
+                            ),
+                            "available_prompt_tokens": post_tool_snapshot.available_prompt_tokens,
+                            "threshold_prompt_tokens": post_tool_snapshot.threshold_prompt_tokens,
+                            "reason": post_tool_snapshot.reason,
                         }
                     },
                 )
@@ -6011,13 +6058,35 @@ class AgentLoop:
         tool_schemas: list[dict[str, Any]],
         max_context_tokens: int,
     ) -> bool:
+        snapshot = self._context_pressure_snapshot(
+            ctx,
+            messages=messages,
+            tool_schemas=tool_schemas,
+            max_context_tokens=max_context_tokens,
+        )
+        return bool(snapshot and snapshot.exceeded)
+
+    def _context_pressure_snapshot(
+        self,
+        ctx: StepContext,
+        *,
+        messages: list[dict[str, Any]],
+        tool_schemas: list[dict[str, Any]],
+        max_context_tokens: int,
+    ) -> ContextPressureSnapshot | None:
         if not ctx.current_model or max_context_tokens <= 0:
-            return False
+            return None
         reserve_output_tokens = (
             ctx.agent.llm_config.max_tokens
             if ctx.agent.llm_config and ctx.agent.llm_config.max_tokens is not None
             else getattr(ctx.current_model_info, "max_output_tokens", 0)
         )
+        reserve_output_tokens = max(0, int(reserve_output_tokens or 0))
+        effective_reserve_output_tokens = reserve_output_tokens
+        reserve_clamped = False
+        if reserve_output_tokens >= max_context_tokens:
+            effective_reserve_output_tokens = max(1, max_context_tokens // 4)
+            reserve_clamped = effective_reserve_output_tokens != reserve_output_tokens
         try:
             prompt_tokens = self.providers.llm.count_messages_tokens(messages, ctx.current_model)
             if tool_schemas:
@@ -6026,11 +6095,87 @@ class AgentLoop:
                     ctx.current_model,
                 )
         except Exception:
-            return False
-        available_prompt_tokens = max(0, max_context_tokens - reserve_output_tokens)
+            return None
+        available_prompt_tokens = max(0, max_context_tokens - effective_reserve_output_tokens)
         if available_prompt_tokens <= 0:
-            return True
-        return prompt_tokens >= int(available_prompt_tokens * 0.95)
+            return ContextPressureSnapshot(
+                prompt_tokens=prompt_tokens,
+                max_context_tokens=max_context_tokens,
+                reserve_output_tokens=reserve_output_tokens,
+                effective_reserve_output_tokens=effective_reserve_output_tokens,
+                available_prompt_tokens=available_prompt_tokens,
+                threshold_prompt_tokens=0,
+                exceeded=True,
+                reason="no_budget",
+                reserve_clamped=reserve_clamped,
+            )
+        threshold_prompt_tokens = int(available_prompt_tokens * 0.95)
+        return ContextPressureSnapshot(
+            prompt_tokens=prompt_tokens,
+            max_context_tokens=max_context_tokens,
+            reserve_output_tokens=reserve_output_tokens,
+            effective_reserve_output_tokens=effective_reserve_output_tokens,
+            available_prompt_tokens=available_prompt_tokens,
+            threshold_prompt_tokens=threshold_prompt_tokens,
+            exceeded=prompt_tokens >= threshold_prompt_tokens,
+            reason="over_threshold",
+            reserve_clamped=reserve_clamped,
+        )
+
+    def _store_context_usage_snapshot(
+        self,
+        ctx: StepContext,
+        *,
+        snapshot: ContextPressureSnapshot | None,
+        provider_id: str | None,
+    ) -> None:
+        if snapshot is None:
+            return
+        try:
+            self.session_cache.update_context_usage(
+                ctx.session,
+                prompt_tokens=snapshot.prompt_tokens,
+                max_context_tokens=snapshot.max_context_tokens,
+                model=ctx.current_model or "",
+                provider_id=provider_id,
+                reserve_output_tokens=snapshot.reserve_output_tokens,
+                effective_reserve_output_tokens=snapshot.effective_reserve_output_tokens,
+            )
+        except TypeError:
+            self.session_cache.update_context_usage(
+                ctx.session,
+                prompt_tokens=snapshot.prompt_tokens,
+                max_context_tokens=snapshot.max_context_tokens,
+                model=ctx.current_model or "",
+            )
+
+    def _maybe_log_context_reserve_clamp(
+        self,
+        ctx: StepContext,
+        snapshot: ContextPressureSnapshot | None,
+        *,
+        provider_id: str | None,
+    ) -> None:
+        if snapshot is None or not snapshot.reserve_clamped:
+            return
+        notifier = getattr(self.session_cache, "note_context_reserve_clamp", None)
+        should_log = bool(notifier(ctx.session.session_id)) if callable(notifier) else True
+        if not should_log:
+            return
+        logger.warning(
+            "Output reservation exceeds model context window; clamping loop budget",
+            extra={
+                "extra_data": {
+                    "session_id": ctx.session.session_id,
+                    "model": ctx.current_model,
+                    "provider_id": provider_id,
+                    "max_context_tokens": snapshot.max_context_tokens,
+                    "reserve_output_tokens": snapshot.reserve_output_tokens,
+                    "effective_reserve_output_tokens": (snapshot.effective_reserve_output_tokens),
+                    "available_prompt_tokens": snapshot.available_prompt_tokens,
+                }
+            },
+        )
 
     async def _execute_regular_tool_batch(
         self,

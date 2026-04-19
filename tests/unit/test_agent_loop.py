@@ -984,6 +984,9 @@ class _NoopSessionCache:
     def update_context_usage(self, *_: object, **__: object) -> None:
         return None
 
+    def note_context_reserve_clamp(self, _: str) -> bool:
+        return True
+
     async def append_recorded_events(self, *_: object, **__: object) -> None:
         return None
 
@@ -1761,6 +1764,43 @@ def test_context_pressure_exceeded_counts_exposed_tool_schemas() -> None:
     )
 
     assert exceeded is True
+
+
+def test_context_pressure_snapshot_clamps_oversized_output_reserve() -> None:
+    loop = AgentLoop.__new__(AgentLoop)
+    loop.providers = SimpleNamespace(
+        llm=SimpleNamespace(
+            count_messages_tokens=lambda messages, model: 29_000,
+            count_tokens=lambda text, model: 0,
+        )
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="execute", type="run", prompt="Do work"),
+        session=SimpleNamespace(session_id="sess-1"),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(
+            agent_id="agent-1",
+            owner_email="user@example.com",
+            name="Agent",
+        ),
+        current_model="gpt-5.4",
+        current_model_info=SimpleNamespace(max_output_tokens=500_000),
+    )
+
+    snapshot = loop._context_pressure_snapshot(
+        ctx,
+        messages=[{"role": "system", "content": "hello"}],
+        tool_schemas=[],
+        max_context_tokens=250_000,
+    )
+
+    assert snapshot is not None
+    assert snapshot.reserve_clamped is True
+    assert snapshot.reserve_output_tokens == 500_000
+    assert snapshot.effective_reserve_output_tokens == 62_500
+    assert snapshot.available_prompt_tokens == 187_500
+    assert snapshot.threshold_prompt_tokens == 178_125
+    assert snapshot.exceeded is False
 
 
 @pytest.mark.asyncio

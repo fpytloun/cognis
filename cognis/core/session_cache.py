@@ -75,6 +75,10 @@ class CachedSessionState:
     last_prompt_tokens: int = 0
     max_context_tokens: int = 0
     context_model: str = ""
+    context_provider_id: str | None = None
+    reserve_output_tokens: int = 0
+    effective_reserve_output_tokens: int = 0
+    context_reserve_clamp_warned: bool = False
     # Per-session overrides (ephemeral, set via /model and /thinking commands)
     model_override: str | None = None
     reasoning_effort_override: str | None = None
@@ -126,6 +130,10 @@ def _serialize_entry(entry: CachedSessionState) -> str:
             "last_prompt_tokens": entry.last_prompt_tokens,
             "max_context_tokens": entry.max_context_tokens,
             "context_model": entry.context_model,
+            "context_provider_id": entry.context_provider_id,
+            "reserve_output_tokens": entry.reserve_output_tokens,
+            "effective_reserve_output_tokens": entry.effective_reserve_output_tokens,
+            "context_reserve_clamp_warned": entry.context_reserve_clamp_warned,
             "model_override": entry.model_override,
             "reasoning_effort_override": entry.reasoning_effort_override,
         },
@@ -162,6 +170,10 @@ def _deserialize_entry(raw: str) -> CachedSessionState:
         last_prompt_tokens=data.get("last_prompt_tokens", 0),
         max_context_tokens=data.get("max_context_tokens", 0),
         context_model=data.get("context_model", ""),
+        context_provider_id=data.get("context_provider_id"),
+        reserve_output_tokens=data.get("reserve_output_tokens", 0),
+        effective_reserve_output_tokens=data.get("effective_reserve_output_tokens", 0),
+        context_reserve_clamp_warned=bool(data.get("context_reserve_clamp_warned", False)),
         model_override=data.get("model_override"),
         reasoning_effort_override=data.get("reasoning_effort_override"),
     )
@@ -456,32 +468,60 @@ class SessionCache:
         prompt_tokens: int,
         max_context_tokens: int,
         model: str,
+        provider_id: str | None = None,
+        reserve_output_tokens: int | None = None,
+        effective_reserve_output_tokens: int | None = None,
     ) -> None:
-        """Store latest context usage from context assembly."""
+        """Store the latest prompt-usage snapshot for a session."""
 
         entry = self._entries.get(session.session_id)
         if entry is not None:
             entry.last_prompt_tokens = prompt_tokens
             entry.max_context_tokens = max_context_tokens
             entry.context_model = model
+            entry.context_provider_id = provider_id
+            if reserve_output_tokens is not None:
+                entry.reserve_output_tokens = reserve_output_tokens
+            if effective_reserve_output_tokens is not None:
+                entry.effective_reserve_output_tokens = effective_reserve_output_tokens
 
     def get_context_usage(self, session_id: str) -> dict[str, Any] | None:
         """Get the cached context usage for a session.
 
-        Returns a dict with ``prompt_tokens``, ``max_context_tokens``,
-        ``percentage``, and ``model``, or ``None`` if no data is cached.
+        Returns a dict with prompt usage, effective reserve/budget values,
+        and model identity, or ``None`` if no data is cached.
         """
 
         entry = self.get_entry(session_id)
         if entry is None or entry.max_context_tokens <= 0:
             return None
+        effective_prompt_budget = max(
+            0, entry.max_context_tokens - entry.effective_reserve_output_tokens
+        )
         return {
             "prompt_tokens": entry.last_prompt_tokens,
             "max_context_tokens": entry.max_context_tokens,
             "percentage": round(entry.last_prompt_tokens / entry.max_context_tokens * 100, 1),
             "model": entry.context_model,
+            "provider_id": entry.context_provider_id,
             "reasoning_effort": entry.reasoning_effort_override,
+            "reserve_output_tokens": entry.reserve_output_tokens,
+            "effective_reserve_output_tokens": entry.effective_reserve_output_tokens,
+            "reserve_output_tokens_clamped": (
+                entry.reserve_output_tokens != entry.effective_reserve_output_tokens
+            ),
+            "effective_prompt_budget": effective_prompt_budget,
+            "loop_pressure_threshold": int(effective_prompt_budget * 0.95),
         }
+
+    def note_context_reserve_clamp(self, session_id: str) -> bool:
+        """Return ``True`` the first time a session clamps output reserve."""
+
+        entry = self.get_entry(session_id)
+        if entry is None or entry.context_reserve_clamp_warned:
+            return False
+        entry.context_reserve_clamp_warned = True
+        return True
 
     def set_model_override(self, session_id: str, model: str | None) -> None:
         """Set per-session model override (from /model command)."""

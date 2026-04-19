@@ -57,8 +57,11 @@ class _TurnScheduler:
 
 
 class _SessionCache:
-    def get_context_usage(self, _: str) -> None:
-        return None
+    def __init__(self, usage: dict[str, object] | None = None) -> None:
+        self.usage = usage
+
+    def get_context_usage(self, _: str) -> dict[str, object] | None:
+        return self.usage
 
     def get_reasoning_effort_override(self, _: str) -> None:
         return None
@@ -667,6 +670,54 @@ async def test_cancel_without_pending_gate_falls_back_to_stop() -> None:
     assert result.type == "system_message"
     assert "Stopped the current work" in (result.text or "")
     assert scheduler.calls == ["conv-1"]
+
+
+@pytest.mark.asyncio
+async def test_context_reports_effective_prompt_budget() -> None:
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=None,
+        session_cache=_SessionCache(
+            {
+                "prompt_tokens": 29_000,
+                "max_context_tokens": 250_000,
+                "percentage": 11.6,
+                "model": "gpt-5.4",
+                "provider_id": "proxy",
+                "reasoning_effort": None,
+                "reserve_output_tokens": 500_000,
+                "effective_reserve_output_tokens": 62_500,
+                "effective_prompt_budget": 187_500,
+                "loop_pressure_threshold": 178_125,
+            }
+        ),
+        compaction_strategy=SimpleNamespace(compaction_threshold=0.85),
+        providers=SimpleNamespace(
+            llm=SimpleNamespace(
+                get_model_info=AsyncMock(return_value=SimpleNamespace(context_window=1_048_576))
+            )
+        ),
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+    )
+
+    result = await dispatcher.dispatch(
+        "/context",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert result is not None
+    assert result.text is not None
+    assert "Model context window: 1,048,576 tokens" in result.text
+    assert (
+        "Reserved output tokens: 500,000 (clamped to 62,500 for loop pressure checks)"
+        in result.text
+    )
+    assert "Effective prompt budget: 187,500 tokens" in result.text
+    assert "Loop pressure threshold: 178,125 tokens" in result.text
 
 
 @pytest.mark.asyncio
