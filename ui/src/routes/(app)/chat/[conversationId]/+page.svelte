@@ -2684,12 +2684,14 @@ import X from 'lucide-svelte/icons/x';
           {/if}
 
           <!--
-            Composer: a flat region with a subtle top divider and a
-            slightly recessed translucent background that matches the
-            iOS/macOS Messages affordance. The textarea itself carries
-            its own border, so no outer card is needed.
+            Composer: sits flush at the bottom of the viewport and spans
+            the full width of the chat area. No outer card, no recessed
+            background — the textarea below carries its own border. Safe
+            area bottom padding ensures the composer reaches the edge of
+            the screen on iPhone PWAs without hiding behind the home
+            indicator.
           -->
-          <form class="shrink-0 space-y-2 border-t border-slate-800/60 bg-slate-950/80 px-3 pt-3 pb-[calc(0.75rem+env(safe-area-inset-bottom))] sm:space-y-3 sm:px-5 sm:py-4 backdrop-blur-sm" onsubmit={(event) => { event.preventDefault(); void handleSend(); }}>
+          <form class="shrink-0 space-y-2 border-t border-slate-800/60 bg-transparent px-3 pt-3 pb-[calc(0.75rem+env(safe-area-inset-bottom))] sm:space-y-3 sm:px-5 sm:py-4 sm:pb-[calc(1rem+env(safe-area-inset-bottom))]" onsubmit={(event) => { event.preventDefault(); void handleSend(); }}>
             <!-- Slash command suggestions dropdown -->
             {#if slashSuggestionsVisible}
               <div class="mb-1 rounded-xl border border-slate-700 bg-slate-900/95 py-1 text-sm shadow-lg">
