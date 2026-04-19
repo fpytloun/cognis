@@ -53,7 +53,6 @@ import X from 'lucide-svelte/icons/x';
   let diagnostics = $state<SystemDiagnostics | null>(null);
   let mobileNavOpen = $state(false);
   let sidebarCollapsed = $state(false);
-  let sidebarHovered = $state(false);
 
   function openMobileNav(): void {
     mobileNavOpen = true;
@@ -117,13 +116,18 @@ import X from 'lucide-svelte/icons/x';
 
   function toggleSidebar(): void {
     sidebarCollapsed = !sidebarCollapsed;
-    sidebarHovered = false;
     if (typeof window !== 'undefined') {
       window.localStorage.setItem('cognis-sidebar-collapsed', sidebarCollapsed ? '1' : '0');
     }
   }
 
-  let sidebarExpanded = $derived(!sidebarCollapsed || sidebarHovered);
+  // Sidebar state is fully controlled by the explicit collapse toggle.
+  // The previous design also expanded on hover, but that made the
+  // desktop layout shift every time the user moved their cursor across
+  // the left edge. Users can see icon labels via the native `title`
+  // tooltip when collapsed, and expand via the chevron button when
+  // they want the full labels.
+  let sidebarExpanded = $derived(!sidebarCollapsed);
 
   function isTextInputTarget(target: EventTarget | null): boolean {
     if (!(target instanceof HTMLElement)) {
@@ -319,11 +323,8 @@ import X from 'lucide-svelte/icons/x';
   <ShortcutHelp />
   <div class="h-[100dvh] overflow-hidden">
     <div class={`mx-auto flex h-[100dvh] max-w-[1600px] overflow-hidden ${shouldReserveBottomTabSpace ? 'pb-[calc(56px+env(safe-area-inset-bottom))]' : 'pb-0'} lg:gap-6 lg:px-6 lg:py-4 lg:pb-4`}>
-      <!-- svelte-ignore a11y_no_static_element_interactions -->
       <aside
         class={`hidden min-h-0 shrink-0 overflow-hidden whitespace-nowrap rounded-3xl border border-slate-800/80 bg-slate-900/80 shadow-card backdrop-blur transition-all duration-200 ease-in-out lg:flex lg:flex-col lg:justify-between ${sidebarExpanded ? 'w-72 p-5' : 'w-16 p-3'}`}
-        onmouseenter={() => { sidebarHovered = true; }}
-        onmouseleave={() => { sidebarHovered = false; }}
       >
         <div class="min-w-0 min-h-0 flex-1 overflow-y-auto">
           {#if sidebarExpanded}
