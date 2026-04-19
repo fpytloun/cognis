@@ -46,6 +46,16 @@ a {
   @apply text-sky-300 transition-colors hover:text-sky-200;
 }
 
+/* JSON syntax highlighting for tool-call input/output blocks. Colours
+   stay close to the assistant bubble palette so highlighted payloads
+   read as part of the conversation, not a separate dev tool. */
+.json-key { @apply text-sky-300; }
+.json-string { @apply text-emerald-300; }
+.json-number { @apply text-amber-200; }
+.json-boolean { @apply text-violet-300; }
+.json-null { @apply text-violet-300 italic; }
+.json-punct { @apply text-slate-500; }
+
 button:focus-visible,
 input:focus-visible,
 select:focus-visible,

@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { ToolCallTimelineItem } from '$lib/chat';
   import LiveDots from '$lib/components/LiveDots.svelte';
+  import { highlightJson, looksLikeJson, prettyPrintJson } from '$lib/syntax/json';
 
   let { item } = $props<{ item: ToolCallTimelineItem }>();
 
@@ -138,6 +139,31 @@
       totalLines,
       hiddenCount: totalLines - LINES_PER_PAGE
     };
+  }
+
+  /**
+   * Return pretty-printed + JSON-highlighted HTML when ``raw`` parses
+   * as JSON; otherwise return ``null`` so the caller falls back to
+   * rendering the raw text without syntax colouring.
+   */
+  function formatMaybeJson(raw: string, showAll: boolean): {
+    html: string | null;
+    text: string;
+    totalLines: number;
+    hiddenCount: number;
+  } {
+    if (looksLikeJson(raw)) {
+      const pretty = prettyPrintJson(raw);
+      const paginated = paginatedText(pretty, showAll);
+      return {
+        html: highlightJson(paginated.text),
+        text: paginated.text,
+        totalLines: paginated.totalLines,
+        hiddenCount: paginated.hiddenCount,
+      };
+    }
+    const paginated = paginatedText(raw, showAll);
+    return { html: null, ...paginated };
   }
 
   function borderColor(): string {
@@ -281,10 +307,10 @@
 
       {:else}
         {#if item.arguments && Object.keys(item.arguments).length > 0}
-          {@const inputData = paginatedText(formatArguments(), inputExpanded)}
+          {@const inputData = formatMaybeJson(formatArguments(), inputExpanded)}
           <div>
             <p class="mb-1 text-xs font-medium uppercase tracking-widest text-slate-500">Input</p>
-            <pre class="max-h-[40vh] overflow-auto rounded-lg border border-slate-800/60 bg-slate-950/60 p-3 text-xs leading-5 text-slate-300">{inputData.text}</pre>
+            <pre class="max-h-[40vh] overflow-auto rounded-lg border border-slate-800/60 bg-slate-950/60 p-3 text-xs leading-5 text-slate-300">{#if inputData.html}{@html inputData.html}{:else}{inputData.text}{/if}</pre>
             {#if inputData.hiddenCount > 0}
               <button
                 class="mt-1 text-xs text-sky-400 hover:text-sky-300"
@@ -299,10 +325,10 @@
 
         {#if item.result != null}
           {@const cleaned = cleanResult(item.result)}
-          {@const outputData = paginatedText(cleaned, outputExpanded)}
+          {@const outputData = formatMaybeJson(cleaned, outputExpanded)}
           <div>
             <p class="mb-1 text-xs font-medium uppercase tracking-widest text-slate-500">Output</p>
-            <pre class={`max-h-[40vh] overflow-auto rounded-lg border bg-slate-950/60 p-3 text-xs leading-5 ${item.isError ? 'border-rose-500/30 text-rose-300' : 'border-slate-800/60 text-slate-300'}`}>{outputData.text}</pre>
+            <pre class={`max-h-[40vh] overflow-auto rounded-lg border bg-slate-950/60 p-3 text-xs leading-5 ${item.isError ? 'border-rose-500/30 text-rose-300' : 'border-slate-800/60 text-slate-300'}`}>{#if outputData.html}{@html outputData.html}{:else}{outputData.text}{/if}</pre>
             {#if outputData.hiddenCount > 0}
               <button
                 class="mt-1 text-xs text-sky-400 hover:text-sky-300"
