@@ -2,33 +2,35 @@
   import { page } from '$app/state';
   import { onMount } from 'svelte';
   import Download from 'lucide-svelte/icons/download';
-import RefreshCw from 'lucide-svelte/icons/refresh-cw';
 import Share from 'lucide-svelte/icons/share';
 import X from 'lucide-svelte/icons/x';
 
   import Button from '$lib/components/ui/Button.svelte';
   import {
-    applyUpdate,
     displayMode,
     dismissInstallPromptForNow,
-    dismissUpdateBanner,
     installPromptAvailable,
     isInstallPromptDismissed,
     isIosSafari,
     promptInstall,
-    updateAvailable
   } from '$lib/stores/pwa';
 
   /**
-   * PWA-related banners: update-available and install hints.
+   * PWA install-related banners.
    *
    * Rules:
-   *   - `updateAvailable` triggers a reload-to-apply toast-like banner.
    *   - On Android/Chrome/Edge, show "Install Cognis" when `beforeinstallprompt`
    *     has fired (controlled by `installPromptAvailable`).
    *   - On iOS Safari (not standalone), show a one-time hint explaining how to
    *     Add to Home Screen — since iOS has no install prompt event.
    *   - All banners are dismissible and remember dismissal in localStorage.
+   *
+   * The former \"Update available\" banner was removed: we could not reliably
+   * distinguish between \"a genuinely newer SW is waiting\" and \"the browser
+   * just registered a fresh SW after a hard reset\", which meant the banner
+   * kept re-appearing on boot. Until we have a robust signal, the SW updates
+   * silently on the next navigation and users simply see the new UI on their
+   * next reload.
    */
 
   const DISMISS_KEY_IOS = 'cognis-pwa-ios-dismissed';
@@ -78,31 +80,6 @@ import X from 'lucide-svelte/icons/x';
     window.localStorage.setItem(DISMISS_KEY_IOS, '1');
   }
 </script>
-
-{#if $updateAvailable}
-  <div
-    class="fixed inset-x-0 top-2 z-[90] mx-auto flex max-w-xl items-center gap-3 rounded-2xl border border-sky-400/40 bg-slate-900/95 px-4 py-3 text-sm text-slate-100 shadow-card backdrop-blur"
-    style="margin-top: env(safe-area-inset-top);"
-    role="status"
-  >
-    <RefreshCw class="h-4 w-4 shrink-0 text-sky-300" />
-    <div class="min-w-0 flex-1">
-      <p class="font-medium">Update available</p>
-      <p class="text-xs text-slate-400">Reload to apply the latest Cognis version.</p>
-    </div>
-    <Button size="sm" onclick={() => void applyUpdate()}>Reload</Button>
-    <Button
-      aria-label="Dismiss update banner"
-      class="h-9 w-9"
-      size="icon"
-      variant="ghost"
-      onclick={dismissUpdateBanner}
-      title="Dismiss"
-    >
-      <X class="h-4 w-4" />
-    </Button>
-  </div>
-{/if}
 
 {#if shouldShowInstallUi && $installPromptAvailable && !installDismissed && $displayMode === 'browser'}
   <div

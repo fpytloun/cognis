@@ -23,9 +23,17 @@ let deferredPrompt: BeforeInstallPromptEvent | null = null;
 
 const INSTALL_DISMISS_KEY = 'cognis-pwa-install-dismissed-until';
 const INSTALL_DISMISS_TTL_MS = 30 * 24 * 60 * 60 * 1000;
-const UPDATE_DISMISSED_KEY = 'cognis-pwa-update-dismissed';
 
 export const installPromptAvailable = writable(false);
+
+/**
+ * Kept for API compatibility with modules that still read this store, but
+ * the update-available banner is disabled: we could not reliably
+ * distinguish between a genuine new waiting SW and a freshly-registered
+ * SW after a hard reset, so the banner kept re-appearing on boot.
+ * Service workers still update silently in the background; users see the
+ * new UI on their next navigation.
+ */
 export const updateAvailable = writable(false);
 
 function installPromptEligiblePath(pathname: string): boolean {
@@ -54,30 +62,13 @@ export function dismissInstallPromptForNow(): void {
   installPromptAvailable.set(false);
 }
 
-// --- update banner (session-scoped dismissal) ----------------------------
+// --- update banner ----------------------------
 
-function isUpdateDismissed(): boolean {
-  if (typeof window === 'undefined') return false;
-  try {
-    return window.sessionStorage.getItem(UPDATE_DISMISSED_KEY) === '1';
-  } catch {
-    return false;
-  }
-}
-
+/**
+ * No-op kept to preserve the exported API for existing imports.
+ */
 export function dismissUpdateBanner(): void {
-  if (typeof window === 'undefined') return;
-  try {
-    window.sessionStorage.setItem(UPDATE_DISMISSED_KEY, '1');
-  } catch {
-    // ignore storage errors (Safari private mode, disabled cookies, etc.)
-  }
   updateAvailable.set(false);
-}
-
-function announceUpdateIfEligible(): void {
-  if (isUpdateDismissed()) return;
-  updateAvailable.set(true);
 }
 
 if (typeof window !== 'undefined') {
@@ -149,47 +140,21 @@ export function isIosSafari(): boolean {
 // --- Service worker registration ------------------------------------------
 
 /**
- * Service worker registration + update lifecycle.
+ * Service worker registration.
  *
- * The SW installs new versions to the `waiting` state. We never auto-apply
- * them. The user sees an "Update available" banner with Reload and Dismiss
- * buttons. Reload calls `applyUpdate()`, which performs a hard reset
- * (unregister all SWs + delete Cognis caches + reload). Dismiss hides the
- * banner for the rest of the session.
- *
- * First installs (no existing controller) do NOT raise the update banner so
- * we don't nag fresh visitors.
+ * A waiting worker is left to activate on its own after all tabs close
+ * (the browser default). We no longer raise an "Update available" banner
+ * because it could not be distinguished reliably from the normal fresh
+ * registration after a hard reset and ended up nagging on every load.
  */
 export async function registerServiceWorker(): Promise<void> {
   if (typeof window === 'undefined') return;
   if (!('serviceWorker' in navigator)) return;
 
   try {
-    const registration = await navigator.serviceWorker.register('/service-worker.js', {
+    await navigator.serviceWorker.register('/service-worker.js', {
       type: 'module',
       scope: '/'
-    });
-
-    // Offer the update banner if a new service worker is already waiting
-    // at load time. We never auto-trigger SKIP_WAITING here: previous
-    // versions did, but that pathway could deadlock on some browsers
-    // (controllerchange never fired) and caused the banner to reappear
-    // forever. `applyUpdate()` below does a hard reset instead, which
-    // always succeeds.
-    if (registration.waiting && navigator.serviceWorker.controller) {
-      announceUpdateIfEligible();
-    }
-
-    // When a new SW finishes installing AND an existing controller is in
-    // charge, a fresh version is ready to activate. Offer the banner.
-    registration.addEventListener('updatefound', () => {
-      const installing = registration.installing;
-      if (!installing) return;
-      installing.addEventListener('statechange', () => {
-        if (installing.state === 'installed' && navigator.serviceWorker.controller) {
-          announceUpdateIfEligible();
-        }
-      });
     });
   } catch (error) {
     // Service worker registration failures are non-fatal.
@@ -201,11 +166,6 @@ export async function applyUpdate(): Promise<void> {
   if (typeof window === 'undefined') return;
 
   updateAvailable.set(false);
-  try {
-    window.sessionStorage.removeItem(UPDATE_DISMISSED_KEY);
-  } catch {
-    // ignore
-  }
 
   // Hard reset: unregister every service worker and delete every Cognis
   // cache, then force a reload. Previous approaches used SKIP_WAITING +
