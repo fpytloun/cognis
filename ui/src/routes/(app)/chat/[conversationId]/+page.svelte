@@ -1150,6 +1150,9 @@ import X from 'lucide-svelte/icons/x';
   function openNewConversationModal(): void {
     newChatError = '';
     newChatAgentId = preferredNewConversationAgentId();
+    // On mobile the conversation list is a sliding overlay. Hide it before
+    // showing the modal or the modal is obscured by the list drawer.
+    mobileListOpen = false;
     showNewChatModal = true;
   }
 
