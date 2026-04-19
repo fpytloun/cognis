@@ -24,7 +24,7 @@
    *   header      optional header snippet
    */
 
-  type Side = 'bottom' | 'right' | 'center';
+  type Side = 'bottom' | 'right' | 'left' | 'center';
 
   interface Props {
     open: boolean;
@@ -186,6 +186,8 @@
         return 'inset-x-0 bottom-0 rounded-t-[1.75rem]';
       case 'right':
         return 'inset-y-0 right-0 w-[min(22rem,100vw)] rounded-l-[1.75rem]';
+      case 'left':
+        return 'inset-y-0 left-0 w-[min(22rem,100vw)] rounded-r-[1.75rem]';
       case 'center':
         return 'left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-[min(32rem,calc(100vw-2rem))] rounded-3xl';
       default:
@@ -227,7 +229,9 @@
       style={side === 'bottom'
         ? `max-height: ${maxHeight}; transform: translateY(${dragOffsetY}px); transition: ${dragging ? 'none' : 'transform 180ms cubic-bezier(.32,.72,0,1)'}; padding-bottom: calc(env(safe-area-inset-bottom) + 0.75rem);`
         : side === 'right'
-        ? `padding-bottom: env(safe-area-inset-bottom); padding-right: env(safe-area-inset-right);`
+        ? `padding-top: env(safe-area-inset-top); padding-bottom: env(safe-area-inset-bottom); padding-right: env(safe-area-inset-right);`
+        : side === 'left'
+        ? `padding-top: env(safe-area-inset-top); padding-bottom: env(safe-area-inset-bottom); padding-left: env(safe-area-inset-left);`
         : undefined}
     >
       {#if side === 'bottom' && dismissible}
