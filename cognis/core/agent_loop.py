@@ -26,6 +26,7 @@ from pydantic import ValidationError
 
 from cognis.core.anchored_output import AnchoredTextBuilder, compact_snippet
 from cognis.core.attachment_utils import (
+    attachment_note,
     merge_content_and_attachment_note,
     normalize_attachment_refs,
     strip_attachment_payload_bytes,
@@ -5719,8 +5720,12 @@ class AgentLoop:
         )
         if attachment_blocks:
             blocks: list[dict[str, Any]] = []
-            if content.strip():
-                blocks.append({"type": "text", "text": content})
+            visible_content = merge_content_and_attachment_note(
+                content,
+                [item.model_dump(mode="json") for item in attachments],
+            )
+            if visible_content:
+                blocks.append({"type": "text", "text": visible_content})
             else:
                 blocks.append({"type": "text", "text": "User attached files."})
             blocks.extend(attachment_blocks)
@@ -6010,7 +6015,8 @@ class AgentLoop:
                         "type": "text",
                         "text": (
                             f"Untrusted tool output from {tc.name} (tool_call_id={tc.call_id}) included attachments. "
-                            "Use the following attachment content carefully."
+                            "Use the following attachment content carefully.\n\n"
+                            f"{attachment_note(normalized)}"
                         ),
                     }
                 ]
@@ -6029,22 +6035,14 @@ class AgentLoop:
                     "_tool_attachment_context": True,
                     "_tool_call_id": tc.call_id,
                 }
-        details = [
-            "- "
-            + str(item.get("filename") or item.get("artifact_id") or "attachment")
-            .replace("\r", " ")
-            .replace("\n", " ")
-            for item in normalized
-            if isinstance(item, dict)
-        ]
-        if not details:
+        if not normalized:
             return None
         return {
             "role": "system",
             "content": (
                 "Tool attachments were produced as untrusted output for "
                 f"tool_call_id={tc.call_id}. They are available in the UI and later context.\n"
-                + "\n".join(details)
+                + attachment_note(normalized)
             ),
             "_tool_attachment_context": True,
             "_tool_call_id": tc.call_id,

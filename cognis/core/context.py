@@ -16,7 +16,10 @@ from prometheus_client import Counter
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from cognis.core.attachment_utils import attachment_note as _attachment_note
+from cognis.core.attachment_utils import (
+    attachment_label as _attachment_label,
+    attachment_note as _attachment_note,
+)
 from cognis.core.errors import ImmutablePrefixUnavailable
 from cognis.core.followups import (
     FollowUpMetadata,
@@ -768,8 +771,12 @@ class ContextAssembler:
             )
             if attachment_blocks:
                 blocks: list[dict[str, Any]] = []
-                if user_message.strip():
-                    blocks.append({"type": "text", "text": user_message})
+                intro = user_message
+                if user_attachments:
+                    note = _attachment_note(user_attachments)
+                    intro = f"{user_message}\n\n{note}" if user_message.strip() else note
+                if intro:
+                    blocks.append({"type": "text", "text": intro})
                 elif attachment_blocks:
                     blocks.append({"type": "text", "text": "User attached files."})
                 blocks.extend(attachment_blocks)
@@ -1105,8 +1112,12 @@ class ContextAssembler:
             )
             if attachment_blocks:
                 blocks: list[dict[str, Any]] = []
-                if user_message.strip():
-                    blocks.append({"type": "text", "text": user_message})
+                intro = user_message
+                if user_attachments:
+                    note = _attachment_note(user_attachments)
+                    intro = f"{user_message}\n\n{note}" if user_message.strip() else note
+                if intro:
+                    blocks.append({"type": "text", "text": intro})
                 else:
                     blocks.append({"type": "text", "text": "User attached files."})
                 blocks.extend(attachment_blocks)
@@ -1746,17 +1757,8 @@ def events_to_messages(events: list[Any]) -> list[dict[str, Any]]:
     def _assistant_attachment_context(attachments: list[dict[str, Any]]) -> str:
         lines: list[str] = []
         for attachment in attachments:
-            filename = (
-                str(attachment.get("filename") or attachment.get("artifact_id") or "attachment")
-                .replace("\r", " ")
-                .replace("\n", " ")
-            )
-            kind = (
-                str(attachment.get("kind") or attachment.get("mime_type") or "file")
-                .replace("\r", " ")
-                .replace("\n", " ")
-            )
-            lines.append(f"- {html.escape(filename, quote=True)} ({html.escape(kind, quote=True)})")
+            label = _attachment_label(attachment).replace("\r", " ").replace("\n", " ")
+            lines.append(f"- {html.escape(label, quote=True)}")
         return "<assistant_attachments>\n" + "\n".join(lines) + "\n</assistant_attachments>"
 
     for event in events:
@@ -2012,7 +2014,7 @@ def _looks_like_attachment_note_suffix(text: str) -> bool:
     We only use this to decide whether a recorded user message is the same
     as the current one with an attachment note appended during history
     replay. The canonical format produced by ``attachment_note`` is
-    ``"Attachments: <name> (<kind>), ..."`` (see
+    ``"Attachments: <name> (<kind>, artifact_id=<id>), ..."`` (see
     ``cognis/core/attachment_utils.py``). A few legacy/synthetic variants
     are also accepted to keep the dedupe robust if the recording format
     changes slightly.

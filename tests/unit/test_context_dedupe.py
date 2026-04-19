@@ -110,14 +110,14 @@ def test_tool_result_follows_user_returns_false() -> None:
 
 def test_canonical_attachment_note_suffix_matches() -> None:
     # Recording appends an attachment note in the canonical
-    # ``Attachments: <name> (<kind>)`` form produced by
+    # ``Attachments: <name> (<kind>, artifact_id=<id>)`` form produced by
     # ``cognis.core.attachment_utils.attachment_note``. The dedupe helper
     # must tolerate this suffix so an attachment-bearing turn is still
     # correctly identified as already-recorded.
     history = [
         {
             "role": "user",
-            "content": "hello\n\nAttachments: foo.pdf (application/pdf)",
+            "content": "hello\n\nAttachments: foo.pdf (application/pdf, artifact_id=art_1)",
         }
     ]
     assert (

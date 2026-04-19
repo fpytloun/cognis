@@ -379,7 +379,7 @@ def test_events_to_messages_keeps_assistant_attachments_out_of_visible_text() ->
     assert messages == [
         {
             "role": "assistant",
-            "content": "Ano. Přikládám ho tady jako přílohu.\n\n<assistant_attachments>\n- banner.png (image)\n</assistant_attachments>",
+            "content": "Ano. Přikládám ho tady jako přílohu.\n\n<assistant_attachments>\n- banner.png (image, artifact_id=img_1)\n</assistant_attachments>",
         }
     ]
 
@@ -408,7 +408,7 @@ def test_events_to_messages_keeps_user_attachment_note_in_text() -> None:
     assert messages == [
         {
             "role": "user",
-            "content": "Tady je soubor.\n\nAttachments: report.pdf (pdf)",
+            "content": "Tady je soubor.\n\nAttachments: report.pdf (pdf, artifact_id=file_1)",
         }
     ]
 

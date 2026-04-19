@@ -1722,6 +1722,7 @@ def test_build_tool_attachment_context_uses_user_blocks_for_vision_models() -> N
     assert message["role"] == "user"
     assert isinstance(message["content"], list)
     assert message["content"][0]["type"] == "text"
+    assert "artifact_id=art-1" in message["content"][0]["text"]
     assert message["content"][1]["type"] == "image_url"
 
 

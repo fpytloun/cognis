@@ -22,6 +22,16 @@ _CANONICAL_ATTACHMENT_KEYS = {
 }
 
 
+def attachment_label(attachment: dict[str, Any]) -> str:
+    filename = str(attachment.get("filename") or attachment.get("artifact_id") or "attachment")
+    kind = str(attachment.get("kind") or "file")
+    artifact_id = attachment.get("artifact_id")
+    details = [kind]
+    if isinstance(artifact_id, str) and artifact_id:
+        details.append(f"artifact_id={artifact_id}")
+    return f"{filename} ({', '.join(details)})"
+
+
 def normalize_attachment_ref(attachment: dict[str, Any]) -> dict[str, Any] | None:
     artifact_id = attachment.get("artifact_id")
 
@@ -196,9 +206,7 @@ def _deleted_attachment_fallback(
 def attachment_note(attachments: list[dict[str, Any]]) -> str:
     parts: list[str] = []
     for attachment in attachments:
-        filename = str(attachment.get("filename") or attachment.get("artifact_id") or "attachment")
-        kind = str(attachment.get("kind") or "file")
-        parts.append(f"{filename} ({kind})")
+        parts.append(attachment_label(attachment))
     return "Attachments: " + ", ".join(parts)
 
 

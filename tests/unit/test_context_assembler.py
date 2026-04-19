@@ -213,6 +213,17 @@ class _LLM:
         return sum(max(1, len(str(message.get("content", ""))) // 4) for message in messages)
 
 
+class _VisionLLM(_LLM):
+    async def get_model_info(self, model_id: str) -> ModelInfo:
+        del model_id
+        return ModelInfo(
+            model_id="test-model",
+            context_window=20000,
+            max_output_tokens=256,
+            supports_vision=True,
+        )
+
+
 class _SessionManager:
     def __init__(self) -> None:
         self.attached: list[tuple[str, str]] = []
@@ -823,6 +834,44 @@ async def test_context_assembler_refreshes_environment_between_turns() -> None:
     ][0]
     assert "/home/a" in str(first_env["content"])
     assert "/home/b" in str(second_env["content"])
+
+
+@pytest.mark.asyncio
+async def test_context_assembler_includes_artifact_ids_with_native_image_blocks() -> None:
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=_VisionLLM(),
+        session_cache=_SessionCache(),
+        session_manager=_SessionManager(),
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+
+    result = await assembler.assemble(
+        session=_session(),
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="Please edit this image",
+        user_attachments=[
+            {
+                "artifact_id": "att_1",
+                "kind": "image",
+                "mime_type": "image/png",
+                "filename": "photo.png",
+                "size_bytes": 123,
+                "url": "https://example.test/photo.png",
+            }
+        ],
+        tool_definitions=[],
+    )
+
+    user_messages = [message for message in result.messages if message.get("role") == "user"]
+    current_turn = user_messages[-1]
+    assert isinstance(current_turn["content"], list)
+    assert current_turn["content"][0]["type"] == "text"
+    assert "artifact_id=att_1" in current_turn["content"][0]["text"]
+    assert current_turn["content"][1]["type"] == "image_url"
 
 
 @pytest.mark.asyncio
