@@ -5,6 +5,9 @@
   import { fade } from 'svelte/transition';
   import ArrowDown from 'lucide-svelte/icons/arrow-down';
 import ArrowLeft from 'lucide-svelte/icons/arrow-left';
+import ArrowUp from 'lucide-svelte/icons/arrow-up';
+import Paperclip from 'lucide-svelte/icons/paperclip';
+import Square from 'lucide-svelte/icons/square';
 import Check from 'lucide-svelte/icons/check';
 import ChevronDown from 'lucide-svelte/icons/chevron-down';
 import ChevronUp from 'lucide-svelte/icons/chevron-up';
@@ -19,7 +22,6 @@ import X from 'lucide-svelte/icons/x';
   import AgentAvatar from '$lib/components/AgentAvatar.svelte';
   import AgentProfilePopover from '$lib/components/AgentProfilePopover.svelte';
   import AgentSelect from '$lib/components/AgentSelect.svelte';
-  import AttachFileButton from '$lib/components/AttachFileButton.svelte';
   import ChatMessage from '$lib/components/ChatMessage.svelte';
   import CompactionCard from '$lib/components/CompactionCard.svelte';
   import ComposerAttachments from '$lib/components/ComposerAttachments.svelte';
@@ -96,7 +98,10 @@ import X from 'lucide-svelte/icons/x';
   let mobileListOpen = $state(false);
   let mobileFilterOpen = $state(false);
   let mobileHeaderDetailsOpen = $state(false);
-  let enterToSend = $state(true);
+  // Default to iMessage-style: Enter inserts a newline and the user taps
+  // the send button (or presses Cmd/Ctrl+Enter) to submit. Users who
+  // previously opted into Enter-to-send keep their choice via localStorage.
+  let enterToSend = $state(false);
   let queuedCount = $state(0);
   let timeline = $state<TimelineItem[]>([]);
 
@@ -465,7 +470,9 @@ import X from 'lucide-svelte/icons/x';
 
   function restoreEnterToSendPreference(): void {
     if (typeof window === 'undefined') return;
-    enterToSend = window.localStorage.getItem(CHAT_STORAGE_KEYS.enterToSend) !== '0';
+    // Only opt into Enter-to-send when the stored value is explicitly "1".
+    // Absence (new users) or "0" both default to Enter-as-newline.
+    enterToSend = window.localStorage.getItem(CHAT_STORAGE_KEYS.enterToSend) === '1';
   }
 
   function restoreSelectedAgent(): void {
@@ -536,6 +543,17 @@ import X from 'lucide-svelte/icons/x';
     const agent = conversationAgent(currentConversation);
     return agent?.display_name ?? agent?.name ?? 'Cognis';
   });
+
+  // Enable the composer's send button only when there is something to send
+  // and the conversation is usable. Computed once so the template doesn't
+  // duplicate the disabled checks that previously sat on the Send button.
+  const canSendNow = $derived(
+    (composer.trim().length > 0 || composerAttachments.length > 0) &&
+      currentConversation !== null &&
+      !isReadOnly(currentConversation) &&
+      !isLlmUnavailableForSetup() &&
+      !directQuestionSubmitting,
+  );
 
   async function loadHistory(conversationId: string): Promise<import('$lib/types/api').MessageHistoryResponse> {
     const events: MessageEvent[] = [];
@@ -1556,7 +1574,19 @@ import X from 'lucide-svelte/icons/x';
         return;
       }
     }
-    if (!enterToSend || event.key !== 'Enter' || event.shiftKey) return;
+    // Enter key behaviour:
+    //   - Cmd/Ctrl+Enter always sends, regardless of the toggle. Covers
+    //     desktop users who want the keyboard shortcut without enabling
+    //     Enter-to-send as the default.
+    //   - Enter alone only sends when the user has opted into it.
+    //   - Shift+Enter is always a newline (delegated to the textarea).
+    if (event.key !== 'Enter' || event.shiftKey) return;
+    if (event.metaKey || event.ctrlKey) {
+      event.preventDefault();
+      void handleSend();
+      return;
+    }
+    if (!enterToSend) return;
     event.preventDefault();
     void handleSend();
   }
@@ -2741,40 +2771,85 @@ import X from 'lucide-svelte/icons/x';
               onremove={removeAttachment}
               disabled={directQuestionSubmitting}
             />
-            <textarea
-              bind:this={composerElement}
-              bind:value={composer}
-              class="min-h-[56px] w-full resize-none rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-base text-slate-100 placeholder:text-slate-500 md:text-sm"
-              disabled={!currentConversation || isReadOnly(currentConversation) || isLlmUnavailableForSetup() || directQuestionSubmitting}
-              enterkeyhint={enterToSend ? 'send' : 'enter'}
-              autocapitalize="sentences"
-              spellcheck="true"
-              onkeydown={handleComposerKeydown}
-              oninput={() => { updateSlashSuggestions(); syncComposerHeight(); }}
-              onpaste={(event) => void handlePaste(event)}
-              placeholder={isLlmUnavailableForSetup() ? 'Configure an LLM provider to start chatting.' : pendingDirectQuestion ? 'Answer the pending clarification request...' : `Send a message to ${currentAgentDisplayName}...`}
-            ></textarea>
-            <div class="flex flex-wrap items-center justify-between gap-2">
-              <label class="flex items-center gap-2 text-xs text-slate-400">
-                <input bind:checked={enterToSend} class="h-4 w-4 rounded border-slate-700 bg-slate-950" onchange={persistEnterToSendPreference} type="checkbox" />
-                <span>Press Enter to send</span>
-              </label>
-              <div class="flex flex-wrap justify-end gap-2">
-                <AttachFileButton onchange={uploadFiles} disabled={directQuestionSubmitting} />
-                {#if turnInProgress}
-                  <Button size="sm" variant="secondary" type="button" onclick={() => currentConversation && wsClient.cancelTurn(currentConversation.conversation_id)}>
-                    Cancel turn
-                  </Button>
-                {/if}
-                {#if pendingDirectQuestion}
-                  <Button size="sm" variant="secondary" type="button" disabled={directQuestionSubmitting} onclick={() => { composer = '/stop'; void handleSend(); }}>
-                    Stop
-                  </Button>
-                {/if}
-                <Button size="sm" type="submit" disabled={(!composer.trim() && composerAttachments.length === 0) || !currentConversation || isReadOnly(currentConversation) || isLlmUnavailableForSetup() || directQuestionSubmitting}>
-                  {directQuestionSubmitting ? 'Sending...' : pendingDirectQuestion ? 'Answer' : 'Send'}
-                </Button>
-              </div>
+            <!--
+              iMessage-style single-line composer:
+              * A single pill containing everything the user needs inline.
+              * Paperclip on the leading edge opens the file picker. The
+                native ``<input type="file">`` is overlaid at opacity 0 on
+                top of the visual button so iOS Safari treats the tap as
+                a direct user activation (opening the picker reliably
+                fails via programmatic ``click()`` when the input is
+                ``display: none``).
+              * The textarea grows vertically with content up to a cap.
+              * The trailing icon is context-sensitive: a circular stop
+                while a turn is streaming, a circular send arrow when
+                there is content to submit, and nothing when the field
+                is empty — so the pill has no unused chrome at rest.
+              * Enter defaults to newline; the toggle that used to sit
+                under the composer is gone. Power users can still submit
+                with Cmd/Ctrl+Enter or enable Enter-to-send through the
+                stored preference.
+            -->
+            <div class="flex items-end gap-1 rounded-3xl border border-slate-700 bg-slate-900/70 px-2 py-1.5 transition focus-within:border-sky-400/50 focus-within:ring-2 focus-within:ring-sky-400/20">
+              <span class="relative inline-flex shrink-0">
+                <button
+                  type="button"
+                  tabindex={-1}
+                  aria-hidden="true"
+                  class="inline-flex h-9 w-9 items-center justify-center rounded-full text-slate-400 transition hover:bg-slate-800/60 hover:text-slate-200 disabled:opacity-40"
+                  disabled={directQuestionSubmitting}
+                >
+                  <Paperclip class="h-4 w-4" />
+                </button>
+                <input
+                  aria-label="Attach files"
+                  class="absolute inset-0 cursor-pointer opacity-0 disabled:cursor-not-allowed"
+                  type="file"
+                  multiple
+                  disabled={directQuestionSubmitting}
+                  onchange={(event) => {
+                    const files = (event.currentTarget as HTMLInputElement).files;
+                    if (!files || files.length === 0) return;
+                    void uploadFiles(Array.from(files));
+                    (event.currentTarget as HTMLInputElement).value = '';
+                  }}
+                />
+              </span>
+              <textarea
+                bind:this={composerElement}
+                bind:value={composer}
+                rows={1}
+                class="min-h-[36px] max-h-[200px] flex-1 resize-none bg-transparent px-1 py-1.5 text-[15px] leading-6 text-slate-100 placeholder:text-slate-500 focus:outline-none focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0 sm:text-sm"
+                disabled={!currentConversation || isReadOnly(currentConversation) || isLlmUnavailableForSetup() || directQuestionSubmitting}
+                enterkeyhint={enterToSend ? 'send' : 'enter'}
+                autocapitalize="sentences"
+                spellcheck="true"
+                onkeydown={handleComposerKeydown}
+                oninput={() => { updateSlashSuggestions(); syncComposerHeight(); }}
+                onpaste={(event) => void handlePaste(event)}
+                placeholder={isLlmUnavailableForSetup() ? 'Configure an LLM provider to start chatting.' : pendingDirectQuestion ? 'Answer the pending clarification request...' : `Message ${currentAgentDisplayName}`}
+              ></textarea>
+              {#if turnInProgress}
+                <button
+                  type="button"
+                  aria-label="Cancel turn"
+                  title="Cancel turn"
+                  class="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-slate-800 text-slate-200 transition hover:bg-slate-700"
+                  onclick={() => currentConversation && wsClient.cancelTurn(currentConversation.conversation_id)}
+                >
+                  <Square class="h-3 w-3 fill-current" />
+                </button>
+              {:else if canSendNow}
+                <button
+                  type="submit"
+                  aria-label={pendingDirectQuestion ? 'Answer' : 'Send'}
+                  title={pendingDirectQuestion ? 'Answer' : 'Send'}
+                  class="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-sky-500 text-slate-950 transition hover:bg-sky-400 disabled:opacity-50"
+                  disabled={directQuestionSubmitting}
+                >
+                  <ArrowUp class="h-4 w-4" stroke-width="2.5" />
+                </button>
+              {/if}
             </div>
           </form>
           </div>
