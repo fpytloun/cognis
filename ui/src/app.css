@@ -12,6 +12,23 @@ html {
   text-size-adjust: 100%;
 }
 
+/*
+ * The layout is designed at desktop density, but iPad landscape hits our
+ * `lg:` (>=1024px) breakpoints with a smaller effective viewport than a
+ * typical desktop. Without compensation the UI feels one "Cmd -" too
+ * large: users have to zoom out once to get comfortable reading density.
+ *
+ * Slightly shrink the root font size on lg+ so rem-based Tailwind sizes
+ * come out ~93% smaller. Tap targets stay at least 36-40px because we
+ * use explicit height/width utilities on buttons, and 15px body is still
+ * well above Apple's minimum readable threshold.
+ */
+@media (min-width: 1024px) {
+  html {
+    font-size: 15px;
+  }
+}
+
 html,
 body,
 #svelte {
