@@ -404,7 +404,16 @@ import X from 'lucide-svelte/icons/x';
         </div>
       </aside>
 
-      <main class="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-transparent p-0 shadow-none lg:gap-3 lg:rounded-[1.75rem] lg:border lg:border-slate-800/80 lg:bg-slate-950/70 lg:p-4 lg:shadow-card lg:backdrop-blur xl:p-6" id="main-content">
+      <!--
+        The main content container used to wrap everything in a rounded,
+        bordered, backdrop-blurred card on lg+. On iPad/desktop that created
+        a stack of three nested darker boxes (outer app frame, chat
+        sidebar card, chat main card) that looked heavy and wasted
+        horizontal breathing room. Follow the Apple "content first"
+        principle: content sits directly on the page background, and
+        sections rely on subtle dividers and typography for hierarchy.
+      -->
+      <main class="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-transparent" id="main-content">
         {#if showMobileHeader}
         <header class="sticky top-0 z-10 flex shrink-0 items-center justify-between gap-2 border-b border-slate-800/80 bg-slate-950/95 px-3 py-2.5 backdrop-blur sm:gap-3 sm:px-4 sm:py-2.5 lg:hidden">
           <div class="flex min-w-0 flex-1 items-center gap-2 lg:hidden">

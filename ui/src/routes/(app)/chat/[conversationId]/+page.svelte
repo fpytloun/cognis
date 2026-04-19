@@ -2082,11 +2082,16 @@ import X from 'lucide-svelte/icons/x';
       ></button>
     {/if}
 
-    <!-- Sidebar -->
+    <!--
+      Sidebar: overlay card on mobile (needs its own chrome so it floats
+      over the chat), flat column with a subtle right divider on lg+.
+      Dropping the rounded card background on lg lets the conversation
+      list feel like part of the page instead of a box inside a box.
+    -->
     <aside
       aria-label="Conversation list"
       aria-modal={mobileListOpen ? 'true' : undefined}
-      class={`fixed inset-y-3 left-3 z-40 flex w-[min(22rem,calc(100vw-1.5rem))] min-h-0 flex-col rounded-[1.75rem] border border-slate-800/80 bg-slate-900/95 shadow-card backdrop-blur transition-transform duration-200 ease-out lg:static lg:z-auto lg:w-auto lg:translate-x-0 lg:rounded-3xl lg:bg-slate-900/70 ${chatSidebarCollapsed ? 'lg:hidden' : 'lg:flex'} ${mobileListOpen || !currentConversation ? 'translate-x-0' : '-translate-x-[120%] pointer-events-none lg:pointer-events-auto'}`}
+      class={`fixed inset-y-3 left-3 z-40 flex w-[min(22rem,calc(100vw-1.5rem))] min-h-0 flex-col rounded-[1.75rem] border border-slate-800/80 bg-slate-900/95 shadow-card backdrop-blur transition-transform duration-200 ease-out lg:static lg:z-auto lg:w-[18rem] lg:translate-x-0 lg:rounded-none lg:border-0 lg:border-r lg:border-slate-800/60 lg:bg-transparent lg:shadow-none lg:backdrop-blur-0 ${chatSidebarCollapsed ? 'lg:hidden' : 'lg:flex'} ${mobileListOpen || !currentConversation ? 'translate-x-0' : '-translate-x-[120%] pointer-events-none lg:pointer-events-auto'}`}
       role={mobileListOpen ? 'dialog' : undefined}
     >
       <!-- Static top: filters -->
@@ -2232,10 +2237,16 @@ import X from 'lucide-svelte/icons/x';
       </div>
     </aside>
 
-    <!-- Main chat area -->
+    <!--
+      Main chat area: flat column directly on the page background. The
+      previous lg: card with border/backdrop-blur/shadow created a
+      redundant dark container inside the app frame. Content hierarchy
+      is established by the header border-b, the message list, and the
+      composer border-t — no extra wrapper needed.
+    -->
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <section
-      class="relative flex min-h-0 flex-1 flex-col border-0 bg-transparent shadow-none backdrop-blur-0 lg:rounded-3xl lg:border lg:border-slate-800/80 lg:bg-slate-900/70 lg:shadow-card lg:backdrop-blur"
+      class="relative flex min-h-0 flex-1 flex-col bg-transparent"
       ondragenter={handleDragEnter}
       ondragleave={handleDragLeave}
       ondragover={handleDragOver}
@@ -2717,7 +2728,13 @@ import X from 'lucide-svelte/icons/x';
             </div>
           {/if}
 
-          <form class="shrink-0 space-y-2 border-t border-slate-800/80 bg-slate-950/95 px-2.5 pt-2 pb-[calc(0.5rem+env(safe-area-inset-bottom))] sm:space-y-3 sm:rounded-3xl sm:border sm:bg-slate-900/90 sm:p-4" onsubmit={(event) => { event.preventDefault(); void handleSend(); }}>
+          <!--
+            Composer: a flat region with a subtle top divider and a
+            slightly recessed translucent background that matches the
+            iOS/macOS Messages affordance. The textarea itself carries
+            its own border, so no outer card is needed.
+          -->
+          <form class="shrink-0 space-y-2 border-t border-slate-800/60 bg-slate-950/80 px-3 pt-3 pb-[calc(0.75rem+env(safe-area-inset-bottom))] sm:space-y-3 sm:px-5 sm:py-4 backdrop-blur-sm" onsubmit={(event) => { event.preventDefault(); void handleSend(); }}>
             <!-- Slash command suggestions dropdown -->
             {#if slashSuggestionsVisible}
               <div class="mb-1 rounded-xl border border-slate-700 bg-slate-900/95 py-1 text-sm shadow-lg">
