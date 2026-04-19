@@ -28,6 +28,7 @@ import X from 'lucide-svelte/icons/x';
   import ConfirmDialog from '$lib/components/ui/ConfirmDialog.svelte';
   import Sheet from '$lib/components/ui/Sheet.svelte';
   import Button from '$lib/components/ui/Button.svelte';
+  import Tooltip from '$lib/components/ui/Tooltip.svelte';
   import BottomTabBar from '$lib/components/BottomTabBar.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import { closeShortcutHelp, openShortcutHelp, requestCancelActiveTurn, requestChatComposerFocus, shortcutHelpOpen } from '$lib/shortcuts';
@@ -338,19 +339,35 @@ import X from 'lucide-svelte/icons/x';
             </div>
           {/if}
 
+          <!--
+            Nav links. When the sidebar is collapsed, wrap each link in a
+            right-placed Tooltip so users see the destination label on
+            hover or focus instead of waiting for the slow native
+            \`title\` tooltip. When expanded, the label is rendered
+            inline and no tooltip is needed.
+          -->
           <nav class={`space-y-1 ${sidebarExpanded ? 'mt-6 space-y-2' : 'mt-4'}`}>
             {#each navigationItems as item}
-              <a
-                aria-label={`Open ${item.label}`}
-                class={`flex items-center rounded-2xl text-sm transition ${$page.url.pathname.startsWith(item.href) ? 'bg-sky-500/20 text-white' : 'text-slate-300 hover:bg-slate-800 hover:text-white'} ${sidebarExpanded ? 'gap-3 px-4 py-3' : 'justify-center px-2 py-3'}`}
-                href={item.href}
-                title={sidebarExpanded ? undefined : item.label}
-              >
-                <svelte:component this={item.icon} class="h-4 w-4 shrink-0" />
-                {#if sidebarExpanded}
+              {#if sidebarExpanded}
+                <a
+                  aria-label={`Open ${item.label}`}
+                  class={`flex items-center rounded-2xl text-sm transition ${$page.url.pathname.startsWith(item.href) ? 'bg-sky-500/20 text-white' : 'text-slate-300 hover:bg-slate-800 hover:text-white'} gap-3 px-4 py-3`}
+                  href={item.href}
+                >
+                  <svelte:component this={item.icon} class="h-4 w-4 shrink-0" />
                   <span>{item.label}</span>
-                {/if}
-              </a>
+                </a>
+              {:else}
+                <Tooltip text={item.label} placement="right" class="block">
+                  <a
+                    aria-label={`Open ${item.label}`}
+                    class={`flex w-full items-center justify-center rounded-2xl px-2 py-3 text-sm transition ${$page.url.pathname.startsWith(item.href) ? 'bg-sky-500/20 text-white' : 'text-slate-300 hover:bg-slate-800 hover:text-white'}`}
+                    href={item.href}
+                  >
+                    <svelte:component this={item.icon} class="h-4 w-4 shrink-0" />
+                  </a>
+                </Tooltip>
+              {/if}
             {/each}
           </nav>
         </div>
@@ -392,48 +409,39 @@ import X from 'lucide-svelte/icons/x';
             <Button class="w-full justify-center" variant="secondary" onclick={handleLogout}>Sign out</Button>
           {:else}
             <div class="flex flex-col items-center gap-2">
-              <span class={`inline-flex h-2.5 w-2.5 rounded-full ${websocketStatusTone()}`} aria-label={`WebSocket ${$wsState.status}`} title={websocketStatusLabel()}></span>
-              <Button
-                aria-label="Open keyboard shortcuts"
-                class="h-9 w-9"
-                size="icon"
-                variant="ghost"
-                onclick={openShortcutHelp}
-                title="Help"
-              >
-                <CircleHelp class="h-4 w-4" />
-              </Button>
-              {#if $auth.user?.role === 'admin'}
-                <Button
-                  aria-label="Open getting started guide"
-                  class="h-9 w-9"
-                  size="icon"
-                  variant="ghost"
-                  onclick={() => goto('/getting-started')}
-                  title="Getting started"
-                >
-                  <BookOpen class="h-4 w-4" />
+              <Tooltip text={`WebSocket ${websocketStatusLabel()}`} placement="right">
+                <span
+                  class={`inline-flex h-2.5 w-2.5 rounded-full ${websocketStatusTone()}`}
+                  aria-label={`WebSocket ${$wsState.status}`}
+                ></span>
+              </Tooltip>
+              <Tooltip text="Help" placement="right">
+                <Button aria-label="Open keyboard shortcuts" class="h-9 w-9" size="icon" variant="ghost" onclick={openShortcutHelp}>
+                  <CircleHelp class="h-4 w-4" />
                 </Button>
+              </Tooltip>
+              {#if $auth.user?.role === 'admin'}
+                <Tooltip text="Getting started" placement="right">
+                  <Button aria-label="Open getting started guide" class="h-9 w-9" size="icon" variant="ghost" onclick={() => goto('/getting-started')}>
+                    <BookOpen class="h-4 w-4" />
+                  </Button>
+                </Tooltip>
               {/if}
               {#if $wsState.status === 'stalled'}
-                <Button
-                  aria-label="Reconnect WebSocket"
-                  class="h-9 w-9"
-                  size="icon"
-                  variant="ghost"
-                  onclick={() => wsClient.connect()}
-                  title="Reconnect"
-                >
-                  <RefreshCw class="h-4 w-4" />
-                </Button>
+                <Tooltip text="Reconnect WebSocket" placement="right">
+                  <Button aria-label="Reconnect WebSocket" class="h-9 w-9" size="icon" variant="ghost" onclick={() => wsClient.connect()}>
+                    <RefreshCw class="h-4 w-4" />
+                  </Button>
+                </Tooltip>
               {/if}
             </div>
           {/if}
+          <Tooltip text={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'} placement="right" class={sidebarCollapsed ? 'block w-full' : 'block w-full'}>
           <button
             class={`flex items-center rounded-xl text-xs text-slate-400 transition hover:bg-slate-800 hover:text-white ${sidebarExpanded ? 'w-full justify-center gap-2 px-3 py-2' : 'w-full justify-center py-2'}`}
             onclick={toggleSidebar}
             type="button"
-            title={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+            aria-label={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
           >
             {#if sidebarCollapsed}
               <ChevronsRight class="h-4 w-4" />
@@ -442,6 +450,7 @@ import X from 'lucide-svelte/icons/x';
               <span>Collapse</span>
             {/if}
           </button>
+          </Tooltip>
         </div>
       </aside>
 
