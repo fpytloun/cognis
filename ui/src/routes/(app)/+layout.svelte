@@ -28,7 +28,6 @@ import X from 'lucide-svelte/icons/x';
   import ToastViewport from '$lib/components/ToastViewport.svelte';
   import ConfirmDialog from '$lib/components/ui/ConfirmDialog.svelte';
   import Sheet from '$lib/components/ui/Sheet.svelte';
-  import Badge from '$lib/components/ui/Badge.svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import BottomTabBar from '$lib/components/BottomTabBar.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
@@ -313,35 +312,55 @@ import X from 'lucide-svelte/icons/x';
       </aside>
 
       <main class="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-transparent p-0 shadow-none lg:gap-3 lg:rounded-[1.75rem] lg:border lg:border-slate-800/80 lg:bg-slate-950/70 lg:p-4 lg:shadow-card lg:backdrop-blur xl:p-6" id="main-content">
-        <header class="sticky top-0 z-10 flex shrink-0 items-center justify-between gap-2 border-b border-slate-800/80 bg-slate-950/95 px-3 py-2.5 backdrop-blur sm:gap-3 sm:px-4 sm:py-2.5 lg:rounded-2xl lg:border lg:border-slate-800/80 lg:bg-slate-900/95 lg:px-4 lg:py-2.5">
-          <div class="flex min-w-0 flex-1 items-center gap-2">
+        <header class="sticky top-0 z-10 flex shrink-0 items-center justify-between gap-2 border-b border-slate-800/80 bg-slate-950/95 px-3 py-2.5 backdrop-blur sm:gap-3 sm:px-4 sm:py-2.5 lg:border-0 lg:bg-transparent lg:px-0 lg:py-0 lg:backdrop-blur-0">
+          <div class="flex min-w-0 flex-1 items-center gap-2 lg:hidden">
             <Button aria-label="Open navigation" class="h-11 w-11 lg:hidden md:h-9 md:w-9" size="icon" variant="secondary" onclick={openMobileNav}>
               <Menu class="h-5 w-5" />
             </Button>
-            <div class="min-w-0 lg:hidden">
+            <div class="min-w-0">
               <h2 class="truncate text-base font-semibold text-white sm:text-lg">{currentTitle($page.url.pathname)}</h2>
             </div>
           </div>
 
-          <div class="flex shrink-0 items-center gap-2">
+          <div class="flex shrink-0 items-center gap-2 lg:rounded-full lg:border lg:border-slate-800/80 lg:bg-slate-900/80 lg:px-1.5 lg:py-1 lg:shadow-card">
             {#if $auth.user?.role === 'admin'}
-              <Button class="hidden sm:inline-flex" size="sm" variant="secondary" onclick={() => goto('/getting-started')}>Getting started</Button>
+              <Button
+                aria-label="Open getting started guide"
+                class="hidden h-9 w-9 lg:inline-flex"
+                size="icon"
+                variant="ghost"
+                onclick={() => goto('/getting-started')}
+                title="Getting started"
+              >
+                <BookOpen class="h-4 w-4" />
+              </Button>
             {/if}
-            <Button aria-label="Open keyboard shortcuts" class="h-11 w-11 md:h-9 md:w-9" size="icon" variant="secondary" onclick={openShortcutHelp}>
+            <Button
+              aria-label="Open keyboard shortcuts"
+              class="h-11 w-11 md:h-9 md:w-9"
+              size="icon"
+              variant="secondary"
+              onclick={openShortcutHelp}
+              title="Keyboard shortcuts"
+            >
               <CircleHelp class="h-5 w-5" />
             </Button>
-            <Badge class={`hidden sm:inline-flex ${$wsState.status === 'connected' ? 'border-emerald-400/40 bg-emerald-500/10 text-emerald-200' : 'border-amber-400/40 bg-amber-500/10 text-amber-200'}`}>
-              <span class="inline-flex items-center gap-2">
-                <Wifi class="h-3.5 w-3.5" />
-                <span>WebSocket: {$wsState.status}</span>
-                {#if $wsState.status === 'reconnecting' || $wsState.status === 'stalled'}
-                  <span class="text-[11px] uppercase tracking-[0.2em] opacity-80">attempt {$wsState.attempts}/10</span>
-                {/if}
-              </span>
-            </Badge>
-            <span class={`inline-flex h-2.5 w-2.5 rounded-full sm:hidden ${$wsState.status === 'connected' ? 'bg-emerald-400' : 'bg-amber-400'}`} aria-label={`WebSocket ${$wsState.status}`}></span>
+            <span
+              class={`inline-flex h-2.5 w-2.5 rounded-full ${$wsState.status === 'connected' ? 'bg-emerald-400' : $wsState.status === 'stalled' ? 'bg-rose-400' : 'bg-amber-400'}`}
+              aria-label={`WebSocket ${$wsState.status}`}
+              title={`WebSocket ${$wsState.status}${$wsState.status === 'reconnecting' || $wsState.status === 'stalled' ? ` (attempt ${$wsState.attempts}/10)` : ''}`}
+            ></span>
             {#if $wsState.status === 'stalled'}
-              <Button size="sm" variant="secondary" onclick={() => wsClient.connect()}>Reconnect</Button>
+              <Button
+                aria-label="Reconnect WebSocket"
+                class="h-11 w-11 md:h-9 md:w-9"
+                size="icon"
+                variant="secondary"
+                onclick={() => wsClient.connect()}
+                title="Reconnect"
+              >
+                <RefreshCw class="h-4 w-4" />
+              </Button>
             {/if}
           </div>
         </header>
