@@ -532,6 +532,15 @@ import X from 'lucide-svelte/icons/x';
     return agents.find((agent) => agent.agent_id === conversation.agent_id);
   }
 
+  // Display name of the current conversation's agent for composer placeholders
+  // and any other in-page prompts. Falls back to "Cognis" only while the
+  // conversation and agent list have not been resolved yet.
+  const currentAgentDisplayName = $derived.by(() => {
+    if (!currentConversation) return 'Cognis';
+    const agent = conversationAgent(currentConversation);
+    return agent?.display_name ?? agent?.name ?? 'Cognis';
+  });
+
   async function loadHistory(conversationId: string): Promise<import('$lib/types/api').MessageHistoryResponse> {
     const events: MessageEvent[] = [];
     let afterSeq = 0;
@@ -2767,7 +2776,7 @@ import X from 'lucide-svelte/icons/x';
                 onkeydown={handleComposerKeydown}
                 oninput={() => { updateSlashSuggestions(); syncComposerHeight(); }}
                 onpaste={(event) => void handlePaste(event)}
-                placeholder={isLlmUnavailableForSetup() ? 'Configure an LLM provider to start chatting.' : pendingDirectQuestion ? 'Answer the pending clarification request...' : 'Send a message to Cognis...'}
+                placeholder={isLlmUnavailableForSetup() ? 'Configure an LLM provider to start chatting.' : pendingDirectQuestion ? 'Answer the pending clarification request...' : `Send a message to ${currentAgentDisplayName}...`}
               ></textarea>
               <button
                 type="button"
@@ -2862,7 +2871,7 @@ import X from 'lucide-svelte/icons/x';
                 onkeydown={handleExpandedComposerKeydown}
                 oninput={updateSlashSuggestions}
                 onpaste={(event) => void handlePaste(event)}
-                placeholder={isLlmUnavailableForSetup() ? 'Configure an LLM provider to start chatting.' : pendingDirectQuestion ? 'Answer the pending clarification request...' : 'Send a longer message to Cognis...'}
+                placeholder={isLlmUnavailableForSetup() ? 'Configure an LLM provider to start chatting.' : pendingDirectQuestion ? 'Answer the pending clarification request...' : `Send a longer message to ${currentAgentDisplayName}...`}
               ></textarea>
               <div class="flex flex-wrap items-center justify-between gap-3">
                 <label class="flex items-center gap-2 text-xs text-slate-400">
