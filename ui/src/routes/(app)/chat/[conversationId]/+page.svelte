@@ -16,6 +16,7 @@ import Maximize2 from 'lucide-svelte/icons/maximize-2';
 import Menu from 'lucide-svelte/icons/menu';
 import Minimize2 from 'lucide-svelte/icons/minimize-2';
 import Search from 'lucide-svelte/icons/search';
+import X from 'lucide-svelte/icons/x';
 
   import AgentAvatar from '$lib/components/AgentAvatar.svelte';
   import AgentProfilePopover from '$lib/components/AgentProfilePopover.svelte';
@@ -1671,6 +1672,23 @@ import Search from 'lucide-svelte/icons/search';
         directQuestionSubmitting = false;
         return;
       }
+      // User-initiated cancellation is not really an error condition —
+      // show a transient toast and skip the persistent red banner so it
+      // can't get stuck on screen without any dismiss affordance.
+      if (event.code === 'turn_cancelled') {
+        addToast(nextError, 'info', 3_000);
+        error = '';
+        awaitingAssistantStart = false;
+        turnInProgress = false;
+        directQuestionSubmitting = false;
+        pendingDirectQuestion = null;
+        if (escalationBusyCallId) {
+          escalationBusyCallId = null;
+          escalationResolutionPending = null;
+          void refreshEscalations();
+        }
+        return;
+      }
       error = nextError;
       awaitingAssistantStart = false;
       turnInProgress = false;
@@ -1679,9 +1697,6 @@ import Search from 'lucide-svelte/icons/search';
         escalationBusyCallId = null;
         escalationResolutionPending = null;
         void refreshEscalations();
-      }
-      if (event.code === 'turn_cancelled') {
-        pendingDirectQuestion = null;
       }
       if (event.recoverable) {
         lastRecoverableMessage = lastSubmittedMessage;
@@ -2470,10 +2485,20 @@ import Search from 'lucide-svelte/icons/search';
         {#if error}
           <div class="rounded-2xl border border-rose-500/30 bg-rose-500/10 px-3 py-3 text-sm text-rose-100">
             <div class="flex flex-wrap items-center justify-between gap-3">
-              <p>{error}</p>
-              {#if lastRecoverableMessage}
-                <Button size="sm" variant="secondary" onclick={retryLastTurn}>Retry</Button>
-              {/if}
+              <p class="min-w-0 flex-1 break-words">{error}</p>
+              <div class="flex shrink-0 items-center gap-2">
+                {#if lastRecoverableMessage}
+                  <Button size="sm" variant="secondary" onclick={retryLastTurn}>Retry</Button>
+                {/if}
+                <button
+                  aria-label="Dismiss error"
+                  class="inline-flex h-8 w-8 items-center justify-center rounded-lg text-rose-100 transition hover:bg-rose-500/20"
+                  onclick={() => { error = ''; lastRecoverableMessage = ''; }}
+                  type="button"
+                >
+                  <X class="h-4 w-4" />
+                </button>
+              </div>
             </div>
           </div>
         {/if}
