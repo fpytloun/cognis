@@ -6,6 +6,7 @@ import Copy from 'lucide-svelte/icons/copy';
   import AgentAvatar from '$lib/components/AgentAvatar.svelte';
   import AgentProfilePopover from '$lib/components/AgentProfilePopover.svelte';
   import LiveDots from '$lib/components/LiveDots.svelte';
+  import MessageAttachments from '$lib/components/MessageAttachments.svelte';
   import { addToast } from '$lib/stores/toasts';
   import { now as nowStore } from '$lib/stores/now';
   import { formatAbsoluteTime, formatCompactTime } from '$lib/time';
@@ -64,10 +65,6 @@ import Copy from 'lucide-svelte/icons/copy';
     return item.role === 'user'
       ? 'prose-user prose-headings:text-slate-950 prose-p:text-slate-950 prose-strong:text-slate-950 prose-code:text-slate-800 prose-code:before:content-none prose-code:after:content-none prose-a:text-slate-900 prose-a:underline'
       : 'prose-invert prose-code:text-sky-200 prose-code:before:content-none prose-code:after:content-none';
-  }
-
-  function isImage(mimeType: string | undefined): boolean {
-    return typeof mimeType === 'string' && mimeType.startsWith('image/');
   }
 
   async function copyMessage(): Promise<void> {
@@ -238,23 +235,7 @@ import Copy from 'lucide-svelte/icons/copy';
       {/if}
 
       {#if item.attachments && item.attachments.length > 0}
-        <div class="mt-4 space-y-3">
-          {#each item.attachments as attachment}
-            {#if attachment.url && isImage(attachment.mime_type)}
-              <a href={attachment.url} target="_blank" rel="noreferrer" class="block overflow-hidden rounded-2xl border border-slate-800 bg-slate-950/60">
-                <img src={attachment.url} alt={attachment.filename} class="max-h-80 w-full object-cover" loading="lazy" />
-                <div class="px-3 py-2 text-xs text-slate-400">{attachment.filename}</div>
-              </a>
-            {:else if attachment.url}
-              <a href={attachment.url} target="_blank" rel="noreferrer" class="flex items-center justify-between rounded-2xl border border-slate-800 bg-slate-950/60 px-3 py-3 text-sm text-slate-200 hover:border-slate-600">
-                <span class="truncate">{attachment.filename}</span>
-                <span class="text-xs text-slate-500">{attachment.mime_type}</span>
-              </a>
-            {:else}
-              <div class="rounded-2xl border border-slate-800 bg-slate-950/60 px-3 py-3 text-sm text-slate-300">{attachment.filename}</div>
-            {/if}
-          {/each}
-        </div>
+        <MessageAttachments attachments={item.attachments} />
       {/if}
 
       <div class="mt-2.5 flex items-center justify-between gap-3 text-[11px] opacity-80 sm:mt-3">
@@ -299,23 +280,7 @@ import Copy from 'lucide-svelte/icons/copy';
     {/if}
 
     {#if item.attachments && item.attachments.length > 0}
-      <div class="mt-4 space-y-3">
-        {#each item.attachments as attachment}
-          {#if attachment.url && isImage(attachment.mime_type)}
-            <a href={attachment.url} target="_blank" rel="noreferrer" class="block overflow-hidden rounded-2xl border border-slate-800 bg-slate-950/60">
-              <img src={attachment.url} alt={attachment.filename} class="max-h-80 w-full object-cover" loading="lazy" />
-              <div class="px-3 py-2 text-xs text-slate-400">{attachment.filename}</div>
-            </a>
-          {:else if attachment.url}
-            <a href={attachment.url} target="_blank" rel="noreferrer" class="flex items-center justify-between rounded-2xl border border-slate-800 bg-slate-950/60 px-3 py-3 text-sm text-slate-200 hover:border-slate-600">
-              <span class="truncate">{attachment.filename}</span>
-              <span class="text-xs text-slate-500">{attachment.mime_type}</span>
-            </a>
-          {:else}
-            <div class="rounded-2xl border border-slate-800 bg-slate-950/60 px-3 py-3 text-sm text-slate-300">{attachment.filename}</div>
-          {/if}
-        {/each}
-      </div>
+      <MessageAttachments attachments={item.attachments} />
     {/if}
 
     <div class="mt-2 flex items-center justify-end gap-2 text-[11px] opacity-70 sm:mt-2.5">
