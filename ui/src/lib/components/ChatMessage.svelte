@@ -217,7 +217,10 @@ import Copy from 'lucide-svelte/icons/copy';
     </div>
     <div class="flex items-center gap-2">
       {#if item.streaming}
-        <LiveDots inline={true} label="Live" size="sm" tone={item.role === 'assistant' ? 'sky' : 'slate'} />
+        <!-- The animated dots alone convey streaming; the "Live" label was
+             visual noise. An sr-only span keeps an accessible name. -->
+        <LiveDots inline={true} size="sm" tone={item.role === 'assistant' ? 'sky' : 'slate'} />
+        <span class="sr-only">Streaming</span>
       {/if}
       {#if item.role === 'assistant' && !item.streaming}
         <button
