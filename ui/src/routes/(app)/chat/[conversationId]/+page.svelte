@@ -2734,7 +2734,7 @@ import Search from 'lucide-svelte/icons/search';
               <textarea
                 bind:this={composerElement}
                 bind:value={composer}
-                class="min-h-[56px] w-full resize-none rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 pr-14 text-base text-slate-100 placeholder:text-slate-500 md:text-sm"
+                class="min-h-[56px] w-full resize-none rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 pr-10 text-base text-slate-100 placeholder:text-slate-500 md:text-sm"
                 disabled={!currentConversation || isReadOnly(currentConversation) || isLlmUnavailableForSetup() || directQuestionSubmitting}
                 enterkeyhint="send"
                 autocapitalize="sentences"
@@ -2746,13 +2746,13 @@ import Search from 'lucide-svelte/icons/search';
               ></textarea>
               <button
                 type="button"
-                class="absolute bottom-2 right-2 inline-flex h-11 w-11 items-center justify-center rounded-full border border-slate-700 bg-slate-900/90 text-slate-300 transition hover:border-slate-600 hover:text-slate-100 disabled:opacity-50 md:h-8 md:w-8"
+                class="absolute bottom-2 right-2 inline-flex h-7 w-7 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-800/60 hover:text-slate-200 disabled:opacity-40"
                 title="Expand composer"
                 aria-label="Expand composer"
                 disabled={!currentConversation || isReadOnly(currentConversation) || isLlmUnavailableForSetup() || directQuestionSubmitting}
                 onclick={() => void openExpandedComposer()}
               >
-                <Maximize2 class="h-4 w-4 md:h-3.5 md:w-3.5" />
+                <Maximize2 class="h-3.5 w-3.5" />
               </button>
             </div>
             <div class="flex flex-wrap items-center justify-between gap-2">
