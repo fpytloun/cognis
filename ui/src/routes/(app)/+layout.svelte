@@ -59,6 +59,46 @@ import X from 'lucide-svelte/icons/x';
     mobileNavOpen = true;
   }
 
+  // Left-edge swipe gesture to open the mobile nav drawer on non-chat
+  // routes. Mirrors the iOS/Android convention where a horizontal drag
+  // from the left bezel reveals the navigation. We use pointer events
+  // so touch and pencil both trigger; mouse is ignored so desktop
+  // users don't accidentally open the drawer while selecting text.
+  const EDGE_WIDTH_PX = 24;
+  const SWIPE_THRESHOLD_PX = 60;
+  let swipeTracking = false;
+  let swipeStartX = 0;
+  let swipeStartY = 0;
+
+  function onLeftEdgePointerDown(event: PointerEvent): void {
+    if (event.pointerType === 'mouse') return;
+    if (mobileNavOpen) return;
+    if (event.clientX > EDGE_WIDTH_PX) return;
+    swipeTracking = true;
+    swipeStartX = event.clientX;
+    swipeStartY = event.clientY;
+  }
+
+  function onLeftEdgePointerMove(event: PointerEvent): void {
+    if (!swipeTracking) return;
+    const dx = event.clientX - swipeStartX;
+    const dy = event.clientY - swipeStartY;
+    // Mostly-vertical gestures belong to the page scroller, not to the
+    // drawer. Abort so the user can still scroll without us hijacking.
+    if (Math.abs(dy) > Math.abs(dx)) {
+      swipeTracking = false;
+      return;
+    }
+    if (dx >= SWIPE_THRESHOLD_PX) {
+      swipeTracking = false;
+      openMobileNav();
+    }
+  }
+
+  function onLeftEdgePointerReset(): void {
+    swipeTracking = false;
+  }
+
   function closeMobileNav(): void {
     mobileNavOpen = false;
   }
@@ -503,15 +543,35 @@ import X from 'lucide-svelte/icons/x';
           </div>
         {/if}
 
-        <div class={`min-h-0 min-w-0 flex-1 ${isChatRoute ? 'overflow-hidden' : 'overflow-y-auto overflow-x-hidden px-3 py-3 sm:px-4 sm:py-4 lg:px-0 lg:py-0'}`}>
+        <!--
+          Non-chat pages support a left-edge swipe gesture to open the
+          mobile nav drawer — the same affordance iOS and Android apps
+          use. Chat detail has its own edge gesture (back-to-list), so
+          the handler is only attached when the route is not a chat
+          detail. Pointer-based gesture; mouse input is ignored.
+        -->
+        <div
+          class={`min-h-0 min-w-0 flex-1 ${isChatRoute ? 'overflow-hidden' : 'overflow-y-auto overflow-x-hidden px-3 py-3 sm:px-4 sm:py-4 lg:px-0 lg:py-0'}`}
+          onpointerdown={isChatDetailRoute ? undefined : onLeftEdgePointerDown}
+          onpointermove={isChatDetailRoute ? undefined : onLeftEdgePointerMove}
+          onpointerup={isChatDetailRoute ? undefined : onLeftEdgePointerReset}
+          onpointercancel={isChatDetailRoute ? undefined : onLeftEdgePointerReset}
+        >
             <slot />
         </div>
       </main>
     </div>
   </div>
 
-  <!-- Mobile navigation sheet (right-side drawer) -->
-  <Sheet open={mobileNavOpen} onClose={closeMobileNav} side="right" label="Navigation menu">
+  <!--
+    Mobile navigation sheet: opens from the LEFT edge, aligned with the
+    hamburger button on the left of the mobile header. Matches the
+    iOS/Android convention where the side drawer slides out from under
+    the menu icon. The Sheet also pads its top/bottom/left by the safe
+    area so content does not render under the Dynamic Island or the
+    home indicator.
+  -->
+  <Sheet open={mobileNavOpen} onClose={closeMobileNav} side="left" label="Navigation menu">
     {#snippet header()}
       <div class="flex items-center justify-between gap-3">
         <div>
