@@ -429,7 +429,6 @@ describe('chat timeline helpers', () => {
         type: 'tool_call',
         conversation_id: 'conv_1',
         session_id: 'sess_1',
-        message_id: 'msg_1',
         call_id: 'call_1',
         tool_name: 'step_request_input',
         status: 'started',
@@ -447,7 +446,6 @@ describe('chat timeline helpers', () => {
         type: 'tool_call',
         conversation_id: 'conv_1',
         session_id: 'sess_1',
-        message_id: 'msg_1',
         call_id: 'call_1',
         tool_name: 'step_request_input',
         status: 'started',
@@ -457,11 +455,11 @@ describe('chat timeline helpers', () => {
         type: 'tool_result',
         conversation_id: 'conv_1',
         session_id: 'sess_1',
-        message_id: 'msg_1',
         call_id: 'call_1',
         tool_name: 'step_request_input',
         result: JSON.stringify({ response: 'First option' }),
-        is_error: false
+        is_error: false,
+        duration_ms: 0
       });
 
       expect(findPendingStepRequestInputCall(resolved)).toBeNull();
@@ -472,7 +470,6 @@ describe('chat timeline helpers', () => {
         type: 'tool_call',
         conversation_id: 'conv_1',
         session_id: 'sess_1',
-        message_id: 'msg_1',
         call_id: 'call_1',
         tool_name: 'step_request_input',
         status: 'started',
@@ -489,7 +486,6 @@ describe('chat timeline helpers', () => {
         type: 'tool_call',
         conversation_id: 'conv_1',
         session_id: 'sess_1',
-        message_id: 'msg_1',
         call_id: 'call_1',
         tool_name: 'step_request_input',
         status: 'started',
@@ -507,7 +503,6 @@ describe('chat timeline helpers', () => {
         type: 'tool_result',
         conversation_id: 'conv_1',
         session_id: 'sess_1',
-        message_id: 'msg_1',
         call_id: 'call_1',
         tool_name: 'step_request_input',
         result: JSON.stringify({ response: 'Main option' }),
