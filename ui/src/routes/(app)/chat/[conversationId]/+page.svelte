@@ -858,6 +858,47 @@ import X from 'lucide-svelte/icons/x';
     mobileDrawerPreviouslyFocused = null;
   }
 
+  /**
+   * Intaris stores session intention either as a plain string or as a
+   * JSON object with at least `{intention, title?}`. The backend ships
+   * it through to the UI verbatim, which showed up as raw JSON in the
+   * Info panel. Pick the most useful display form:
+   *   - string: use it directly
+   *   - object with `intention`: use that field (drop surrounding
+   *     structure)
+   *   - fallback: pretty-print the JSON so at least it's readable
+   */
+  function extractIntentionDisplay(raw: unknown): { title: string | null; intention: string | null } {
+    if (raw == null) return { title: null, intention: null };
+    if (typeof raw !== 'string') {
+      if (typeof raw === 'object') {
+        const obj = raw as Record<string, unknown>;
+        const intention = typeof obj.intention === 'string' ? obj.intention : null;
+        const title = typeof obj.title === 'string' ? obj.title : null;
+        return { title, intention };
+      }
+      return { title: null, intention: String(raw) };
+    }
+    const trimmed = raw.trim();
+    if (!trimmed) return { title: null, intention: null };
+    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          const intention = typeof parsed.intention === 'string' ? parsed.intention : null;
+          const title = typeof parsed.title === 'string' ? parsed.title : null;
+          if (intention || title) {
+            return { title, intention };
+          }
+          return { title: null, intention: JSON.stringify(parsed, null, 2) };
+        }
+      } catch {
+        // fall through to raw display
+      }
+    }
+    return { title: null, intention: trimmed };
+  }
+
   async function loadSessionInfo(): Promise<void> {
     const sid = currentConversation?.active_session_id;
     if (!sid) return;
@@ -2461,10 +2502,16 @@ import X from 'lucide-svelte/icons/x';
           {#if sessionInfoLoading}
             <p class="text-xs text-slate-500">Loading session details…</p>
           {:else if sessionInfo}
-            {#if sessionInfo.intention}
+            {@const intentionView = extractIntentionDisplay(sessionInfo.intention)}
+            {#if intentionView.title || intentionView.intention}
               <div class="mb-3">
                 <p class="text-[10px] font-semibold uppercase tracking-widest text-slate-500">Intention</p>
-                <p class="mt-1 text-sm leading-6 text-slate-200">{sessionInfo.intention}</p>
+                {#if intentionView.title}
+                  <p class="mt-1 text-sm font-medium text-white">{intentionView.title}</p>
+                {/if}
+                {#if intentionView.intention}
+                  <p class="mt-1 whitespace-pre-wrap text-sm leading-6 text-slate-200">{intentionView.intention}</p>
+                {/if}
               </div>
             {/if}
             <div class="flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-400">
@@ -2926,10 +2973,16 @@ import X from 'lucide-svelte/icons/x';
               {#if subSessionInfoLoading}
                 <p class="text-xs text-slate-500">Loading session details...</p>
               {:else if subSessionInfo}
-                {#if subSessionInfo.intention}
+                {@const subIntention = extractIntentionDisplay(subSessionInfo.intention)}
+                {#if subIntention.title || subIntention.intention}
                   <div class="mb-2">
                     <p class="text-[10px] font-semibold uppercase tracking-widest text-slate-500">Intention</p>
-                    <p class="mt-0.5 text-sm text-slate-200">{subSessionInfo.intention}</p>
+                    {#if subIntention.title}
+                      <p class="mt-0.5 text-sm font-medium text-white">{subIntention.title}</p>
+                    {/if}
+                    {#if subIntention.intention}
+                      <p class="mt-0.5 whitespace-pre-wrap text-sm text-slate-200">{subIntention.intention}</p>
+                    {/if}
                   </div>
                 {/if}
                 <div class="flex flex-wrap gap-3 text-xs text-slate-400">
