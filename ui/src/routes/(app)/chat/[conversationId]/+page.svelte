@@ -2190,7 +2190,7 @@ import X from 'lucide-svelte/icons/x';
               {@const isActive = conversation.conversation_id === currentConversation?.conversation_id}
               {@const unread = conversation.has_unread && !isActive}
               <a
-                class={`flex items-start gap-3 rounded-2xl border px-3 py-2.5 transition ${isActive ? 'border-sky-400/40 bg-sky-500/10' : 'border-transparent bg-slate-950/60 hover:border-slate-700 hover:bg-slate-900'}`}
+                class={`flex items-start gap-3 rounded-xl px-3 py-2.5 transition ${isActive ? 'bg-sky-500/15 text-white' : 'text-slate-200 hover:bg-slate-900/60'}`}
                 href={`/chat/${conversation.conversation_id}`}
                 onclick={closeMobileList}
               >
@@ -2589,7 +2589,7 @@ import X from 'lucide-svelte/icons/x';
               {/if}
             </div>
           {:else if displayedTimeline.length === 0}
-            <p class="rounded-2xl border border-dashed border-slate-700 px-4 py-10 text-center text-sm text-slate-400">
+            <p class="px-4 py-16 text-center text-sm text-slate-500">
               Send the first message to start this conversation.
             </p>
           {:else}
