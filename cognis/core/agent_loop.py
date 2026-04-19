@@ -35,7 +35,13 @@ from cognis.core.context import _native_attachment_blocks
 from cognis.core.decision import build_routing_reminder
 from cognis.core.errors import ImmutablePrefixUnavailable
 from cognis.core.events import Event, EventBus, EventType
-from cognis.core.followups import FollowUpMetadata, FollowUpMode, FollowUpPolicy
+from cognis.core.followups import (
+    FollowUpMetadata,
+    FollowUpMode,
+    FollowUpPolicy,
+    build_history_boundary_message,
+    render_follow_up_block,
+)
 from cognis.core.harness_guards import (
     LoopGuardState,
     argument_sanity_rejection_payload,
@@ -1103,6 +1109,7 @@ class StepContext:
     remember_user_event_seq: int | None = None
     remember_assistant_event_seq: int | None = None
     turn_id: str | None = None
+    consume_boundary_batch: Callable[[str], Coroutine[Any, Any, list[dict[str, Any]]]] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -1887,25 +1894,12 @@ class AgentLoop:
         pending_audit_messages = list(getattr(context_result, "audit_messages", []) or [])
 
         def _queue_audit_message(*, role: str, source: str, content: str) -> None:
-            pending_audit_messages.append(
-                {
-                    "position": len(messages) - 1,
-                    "role": role,
-                    "content": content,
-                    "source": source,
-                    "content_type": "text",
-                    "hash": hashlib.sha256(
-                        json.dumps(
-                            {
-                                "role": role,
-                                "content": content,
-                                "source": source,
-                            },
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        ).encode("utf-8")
-                    ).hexdigest(),
-                }
+            self._append_pending_audit_message(
+                messages,
+                pending_audit_messages,
+                role=role,
+                source=source,
+                content=content,
             )
 
         # Record user message event (unless already recorded early for
@@ -2131,7 +2125,7 @@ class AgentLoop:
                 if reminder.get("role") == "system":
                     messages.pop(continuation_reminder_index)
                 continuation_reminder_index = None
-            for tc_index, tc in enumerate(tool_calls):
+            for _tc_index, tc in enumerate(tool_calls):
                 mapped_name = exposure.alias_map.get(tc.name, tc.name)
                 if mapped_name != tc.name:
                     logger.debug(
@@ -2235,6 +2229,14 @@ class AgentLoop:
 
             # No tool calls — check if step is complete
             if not tool_calls:
+                if await self._consume_boundary_batch_if_available(
+                    ctx,
+                    messages=messages,
+                    pending_audit_messages=pending_audit_messages,
+                    reason="after_assistant_message",
+                    on_token=on_token,
+                ):
+                    continue
                 if not ctx.policy.require_step_complete:
                     # Direct workflow (main chat): check for incomplete todos
                     incomplete_todos = self._get_incomplete_todos(ctx)
@@ -3497,6 +3499,15 @@ class AgentLoop:
                     on_tool_result=on_tool_result,
                 )
                 prepared_regular_batch.clear()
+
+            if step_output is None and await self._consume_boundary_batch_if_available(
+                ctx,
+                messages=messages,
+                pending_audit_messages=pending_audit_messages,
+                reason="after_tool_cycle",
+                on_token=on_token,
+            ):
+                continue
 
             # Check if step_complete was called in this batch
             if step_output is not None:
@@ -5479,6 +5490,209 @@ class AgentLoop:
         for event_type, source in metric_labels:
             AUDIT_EVENTS_TOTAL.labels(type=event_type, source=source).inc()
         audit_messages.clear()
+
+    def _append_pending_audit_message(
+        self,
+        messages: list[dict[str, Any]],
+        pending_audit_messages: list[dict[str, Any]],
+        *,
+        role: str,
+        source: str,
+        content: str,
+    ) -> None:
+        pending_audit_messages.append(
+            {
+                "position": len(messages) - 1,
+                "role": role,
+                "content": content,
+                "source": source,
+                "content_type": "text",
+                "hash": hashlib.sha256(
+                    json.dumps(
+                        {
+                            "role": role,
+                            "content": content,
+                            "source": source,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest(),
+            }
+        )
+
+    async def _consume_boundary_batch_if_available(
+        self,
+        ctx: StepContext,
+        *,
+        messages: list[dict[str, Any]],
+        pending_audit_messages: list[dict[str, Any]],
+        reason: str,
+        on_token: TokenCallback | None,
+    ) -> bool:
+        """Drain queued same-conversation input into the active direct turn."""
+
+        if ctx.policy is not CHAT_POLICY or ctx.consume_boundary_batch is None:
+            return False
+        batch = await ctx.consume_boundary_batch(reason)
+        if not batch:
+            return False
+
+        logger.info(
+            "agent: absorbed queued batch",
+            extra={
+                "extra_data": {
+                    "session_id": ctx.session.session_id,
+                    "conversation_id": ctx.conversation.conversation_id,
+                    "reason": reason,
+                    "batch_size": len(batch),
+                }
+            },
+        )
+        for item in batch:
+            await self._append_boundary_batch_item(
+                ctx,
+                messages=messages,
+                pending_audit_messages=pending_audit_messages,
+                item=item,
+                on_token=on_token,
+            )
+        return True
+
+    async def _append_boundary_batch_item(
+        self,
+        ctx: StepContext,
+        *,
+        messages: list[dict[str, Any]],
+        pending_audit_messages: list[dict[str, Any]],
+        item: dict[str, Any],
+        on_token: TokenCallback | None,
+    ) -> None:
+        """Append one absorbed inbound item into the live prompt/history."""
+
+        raw_attachments = item.get("attachments")
+        attachments = (
+            normalize_attachment_refs(raw_attachments) if isinstance(raw_attachments, list) else []
+        )
+        content = str(item.get("content") or "")
+        attachment_notice = item.get("attachment_notice")
+        attachment_context = item.get("attachment_context")
+        follow_up = item.get("follow_up")
+        system_initiated = bool(item.get("system_initiated"))
+
+        if follow_up is not None:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": build_history_boundary_message(),
+                }
+            )
+            self._append_pending_audit_message(
+                messages,
+                pending_audit_messages,
+                role="developer",
+                source="follow_up_boundary",
+                content=str(messages[-1]["content"]),
+            )
+            messages.append(
+                {
+                    "role": "system",
+                    "content": render_follow_up_block(follow_up),
+                }
+            )
+            self._append_pending_audit_message(
+                messages,
+                pending_audit_messages,
+                role="developer",
+                source="follow_up_boundary",
+                content=str(messages[-1]["content"]),
+            )
+
+        if isinstance(attachment_notice, str) and attachment_notice:
+            messages.append({"role": "system", "content": attachment_notice})
+            self._append_pending_audit_message(
+                messages,
+                pending_audit_messages,
+                role="developer",
+                source="attachment_notice",
+                content=attachment_notice,
+            )
+        if isinstance(attachment_context, str) and attachment_context:
+            messages.append({"role": "user", "content": attachment_context})
+            self._append_pending_audit_message(
+                messages,
+                pending_audit_messages,
+                role="user",
+                source="attachment_notice",
+                content=attachment_context,
+            )
+
+        if system_initiated:
+            if content:
+                messages.append({"role": "system", "content": content})
+            return
+
+        recorded_user_message = _user_message_for_recording(content, attachments)
+        if recorded_user_message:
+            await self._record_events_strict(
+                ctx,
+                [
+                    SessionEvent(
+                        type="user_message",
+                        data={
+                            "role": "user",
+                            "content": recorded_user_message,
+                            "content_type": "text",
+                            "source": "user_input",
+                            "turn_id": ctx.turn_id,
+                            "hash": hashlib.sha256(
+                                json.dumps(
+                                    {
+                                        "role": "user",
+                                        "content": recorded_user_message,
+                                        "source": "user_input",
+                                    },
+                                    sort_keys=True,
+                                    separators=(",", ":"),
+                                ).encode("utf-8")
+                            ).hexdigest(),
+                            "attachments": [
+                                item.model_dump(mode="json", exclude={"url"})
+                                for item in attachments
+                            ],
+                        },
+                    )
+                ],
+                reason="user_message_boundary",
+                on_token=on_token,
+            )
+
+        attachment_blocks, unsupported = _native_attachment_blocks(
+            attachments, ctx.current_model_info
+        )
+        if attachment_blocks:
+            blocks: list[dict[str, Any]] = []
+            if content.strip():
+                blocks.append({"type": "text", "text": content})
+            else:
+                blocks.append({"type": "text", "text": "User attached files."})
+            blocks.extend(attachment_blocks)
+            if unsupported:
+                blocks.append(
+                    {
+                        "type": "text",
+                        "text": "Unsupported attachments were omitted: " + ", ".join(unsupported),
+                    }
+                )
+            messages.append({"role": "user", "content": blocks})
+            return
+
+        visible_content = merge_content_and_attachment_note(
+            content,
+            [item.model_dump(mode="json") for item in attachments],
+        )
+        if visible_content:
+            messages.append({"role": "user", "content": visible_content})
 
     async def _record_system_notice_audit(
         self,

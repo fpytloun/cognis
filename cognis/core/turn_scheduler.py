@@ -25,7 +25,7 @@ import contextlib
 import html
 import uuid
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from time import monotonic
@@ -163,6 +163,7 @@ class _QueuedMessage:
     content: str
     user_email: str
     attachments: list[dict[str, Any]] | None = None
+    attachment_notice: str | None = None
     attachment_context: str | None = None
     system_initiated: bool = False
     channel_deliverable: bool = False
@@ -171,6 +172,19 @@ class _QueuedMessage:
     follow_up: FollowUpMetadata | None = None
     outbound_attachments: list[dict[str, Any]] | None = None
     turn_observers: tuple[TurnObserver, ...] = ()
+
+
+@dataclass(slots=True)
+class _TurnControl:
+    """Mutable state for one active conversation turn."""
+
+    cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
+    turn_observers: list[TurnObserver] = field(default_factory=list)
+    absorbed_follow_up_ids: set[str] = field(default_factory=set)
+    absorbed_outbound_attachments: list[dict[str, Any]] = field(default_factory=list)
+    absorbed_channel_deliverable: bool = False
+    absorbed_delivery_id: str | None = None
+    absorbed_delivery_fallback_text: str | None = None
 
 
 class SessionCreationFailedError(Exception):
@@ -281,7 +295,7 @@ class TurnScheduler:
 
         # Per-conversation turn serialization
         self._active_turns: dict[str, asyncio.Task[None]] = {}
-        self._turn_controls: dict[str, asyncio.Event] = {}
+        self._turn_controls: dict[str, _TurnControl] = {}
         self._turn_sessions: dict[str, str] = {}
         self._queued_messages: dict[str, deque[_QueuedMessage]] = defaultdict(deque)
         self._escalation_notice_pause_ids: dict[str, str] = {}
@@ -446,6 +460,7 @@ class TurnScheduler:
                         attachments=[
                             item.model_dump(mode="json") for item in normalized_attachments
                         ],
+                        attachment_notice=attachment_notice,
                         attachment_context=attachment_context,
                         outbound_attachments=outbound_attachments,
                         follow_up=follow_up,
@@ -502,6 +517,7 @@ class TurnScheduler:
                     content=effective_content,
                     user_email=user_email,
                     attachments=[item.model_dump(mode="json") for item in normalized_attachments],
+                    attachment_notice=attachment_notice,
                     attachment_context=attachment_context,
                     outbound_attachments=outbound_attachments,
                     system_initiated=system_initiated,
@@ -572,7 +588,10 @@ class TurnScheduler:
             queue.clear()
         if control is None:
             return cleared_queue
-        control.set()
+        if isinstance(control, asyncio.Event):
+            control.set()
+        else:
+            control.cancel_event.set()
         active_task = self._active_turns.get(conversation_id)
         if active_task is not None and not active_task.done():
             active_task.cancel()
@@ -595,6 +614,120 @@ class TurnScheduler:
     def queued_count(self, conversation_id: str) -> int:
         """Return the number of queued messages for a conversation."""
         return len(self._queued_messages.get(conversation_id, []))
+
+    async def _consume_queued_batch_for_active_turn(
+        self,
+        conversation_id: str,
+        *,
+        reason: str,
+    ) -> list[dict[str, Any]]:
+        """Drain the currently queued inbox batch for an active direct turn."""
+
+        queue = self._queued_messages.get(conversation_id)
+        if not queue:
+            return []
+        control = self._turn_controls.get(conversation_id)
+        if control is None:
+            return []
+
+        batch: list[_QueuedMessage] = []
+        while queue and self._queued_message_is_absorbable(queue[0]):
+            batch.append(queue.popleft())
+        if not batch:
+            return []
+
+        self._merge_active_turn_observers(control.turn_observers, batch)
+
+        payloads: list[dict[str, Any]] = []
+        for queued in batch:
+            if queued.follow_up is not None:
+                control.absorbed_follow_up_ids.add(queued.follow_up.follow_up_id)
+            if queued.outbound_attachments:
+                control.absorbed_outbound_attachments.extend(queued.outbound_attachments)
+            if queued.channel_deliverable:
+                control.absorbed_channel_deliverable = True
+            if queued.delivery_id:
+                control.absorbed_delivery_id = queued.delivery_id
+            if queued.delivery_fallback_text:
+                control.absorbed_delivery_fallback_text = queued.delivery_fallback_text
+            payloads.append(
+                {
+                    "content": queued.content,
+                    "attachments": list(queued.attachments or []),
+                    "attachment_notice": queued.attachment_notice,
+                    "attachment_context": queued.attachment_context,
+                    "system_initiated": queued.system_initiated,
+                    "follow_up": queued.follow_up,
+                }
+            )
+            if queued.attachment_notice:
+                await self._notify_observers_system_message(
+                    conversation_id,
+                    queued.attachment_notice,
+                    turn_observers=control.turn_observers,
+                )
+            if not queued.system_initiated:
+                await self._event_bus.publish(
+                    Event(
+                        type=EventType.USER_MESSAGE,
+                        data={
+                            "conversation_id": conversation_id,
+                            "session_id": self._turn_sessions.get(conversation_id),
+                            "content": queued.content,
+                            "attachments": strip_attachment_payload_bytes(queued.attachments or []),
+                        },
+                    )
+                )
+
+        logger.info(
+            "turn_scheduler: absorbed queued batch into active turn",
+            extra={
+                "extra_data": {
+                    "conversation_id": conversation_id,
+                    "reason": reason,
+                    "batch_size": len(payloads),
+                    "remaining_queue": self.queued_count(conversation_id),
+                }
+            },
+        )
+        await self._notify_observers(
+            conversation_id,
+            "on_queued",
+            conversation_id,
+            self.queued_count(conversation_id),
+            turn_observers=control.turn_observers,
+        )
+        return payloads
+
+    def _queued_message_is_absorbable(self, queued: _QueuedMessage) -> bool:
+        """Return whether a queued message can be merged mid-turn."""
+
+        return all(
+            getattr(observer, "supports_mid_turn_absorb", False)
+            for observer in queued.turn_observers
+        )
+
+    def _merge_active_turn_observers(
+        self,
+        active_observers: list[TurnObserver],
+        batch: list[_QueuedMessage],
+    ) -> None:
+        """Merge queued per-submit observers into the active turn."""
+
+        for queued in batch:
+            for observer in queued.turn_observers:
+                absorbed = False
+                for active_observer in active_observers:
+                    absorb = getattr(active_observer, "absorb_queued_observer", None)
+                    if callable(absorb) and absorb(observer):
+                        absorbed = True
+                        break
+                if absorbed:
+                    continue
+                if not getattr(observer, "supports_mid_turn_absorb", False):
+                    continue
+                if observer not in active_observers:
+                    active_observers.append(observer)
 
     async def _purge_expired_follow_ups(self) -> None:
         now = monotonic()
@@ -1019,7 +1152,7 @@ class TurnScheduler:
     ) -> None:
         """Launch a turn as a background asyncio.Task."""
         conversation_id = conversation.conversation_id
-        control = asyncio.Event()
+        control = _TurnControl(turn_observers=list(turn_observers))
         self._turn_controls[conversation_id] = control
         self._turn_sessions[conversation_id] = session.session_id
         if not system_initiated:
@@ -1041,8 +1174,8 @@ class TurnScheduler:
                 delivery_id=delivery_id,
                 delivery_fallback_text=delivery_fallback_text,
                 bootstrap_wait_for_intention=bootstrap_wait_for_intention,
-                cancel_event=control,
-                turn_observers=turn_observers,
+                cancel_event=control.cancel_event,
+                turn_control=control,
             )
         )
 
@@ -1065,7 +1198,8 @@ class TurnScheduler:
         delivery_fallback_text: str | None,
         bootstrap_wait_for_intention: bool,
         cancel_event: asyncio.Event,
-        turn_observers: tuple[TurnObserver, ...],
+        turn_control: _TurnControl | None = None,
+        turn_observers: tuple[TurnObserver, ...] = (),
     ) -> None:
         """Execute a single chat turn."""
         conversation_id = conversation.conversation_id
@@ -1074,6 +1208,9 @@ class TurnScheduler:
         start_time = asyncio.get_running_loop().time()
         turn_type = "system" if system_initiated else "user"
         turn_succeeded = False
+        if turn_control is None:
+            turn_control = _TurnControl(turn_observers=list(turn_observers))
+        turn_observers = turn_control.turn_observers
 
         try:
             current_user_email.set(user_email)
@@ -1201,6 +1338,10 @@ class TurnScheduler:
                 on_tool_result=on_tool_result,
                 cancel_event=cancel_event,
                 bootstrap_wait_for_intention=bootstrap_wait_for_intention,
+                consume_boundary_batch=lambda reason: self._consume_queued_batch_for_active_turn(
+                    conversation_id,
+                    reason=reason,
+                ),
             )
 
             # Post-turn housekeeping
@@ -1243,14 +1384,19 @@ class TurnScheduler:
                     else None
                 ),
                 system_initiated=system_initiated,
-                channel_deliverable=channel_deliverable,
-                delivery_id=delivery_id,
-                delivery_fallback_text=delivery_fallback_text,
+                channel_deliverable=(
+                    channel_deliverable or turn_control.absorbed_channel_deliverable
+                ),
+                delivery_id=turn_control.absorbed_delivery_id or delivery_id,
+                delivery_fallback_text=(
+                    turn_control.absorbed_delivery_fallback_text or delivery_fallback_text
+                ),
                 attachments=(
                     normalize_attachment_refs(
                         [
                             *(step_output.attachments if step_output else []),
                             *(outbound_attachments or []),
+                            *turn_control.absorbed_outbound_attachments,
                         ]
                     )
                     or None
@@ -1282,9 +1428,13 @@ class TurnScheduler:
                 session.session_id,
                 error,
                 system_initiated=system_initiated,
-                channel_deliverable=channel_deliverable,
-                delivery_id=delivery_id,
-                delivery_fallback_text=delivery_fallback_text,
+                channel_deliverable=(
+                    channel_deliverable or turn_control.absorbed_channel_deliverable
+                ),
+                delivery_id=turn_control.absorbed_delivery_id or delivery_id,
+                delivery_fallback_text=(
+                    turn_control.absorbed_delivery_fallback_text or delivery_fallback_text
+                ),
                 turn_observers=turn_observers,
             )
             TURNS_TOTAL.labels(outcome="cancelled").inc()
@@ -1300,9 +1450,13 @@ class TurnScheduler:
                 session.session_id,
                 error,
                 system_initiated=system_initiated,
-                channel_deliverable=channel_deliverable,
-                delivery_id=delivery_id,
-                delivery_fallback_text=delivery_fallback_text,
+                channel_deliverable=(
+                    channel_deliverable or turn_control.absorbed_channel_deliverable
+                ),
+                delivery_id=turn_control.absorbed_delivery_id or delivery_id,
+                delivery_fallback_text=(
+                    turn_control.absorbed_delivery_fallback_text or delivery_fallback_text
+                ),
                 turn_observers=turn_observers,
             )
             TURNS_TOTAL.labels(outcome="error").inc()
@@ -1316,6 +1470,13 @@ class TurnScheduler:
                     await self._mark_follow_up_handled(conversation_id, follow_up.follow_up_id)
                 else:
                     await self._clear_follow_up_pending(conversation_id, follow_up.follow_up_id)
+
+            absorbed_follow_up_ids = set(turn_control.absorbed_follow_up_ids)
+            for follow_up_id in absorbed_follow_up_ids:
+                if turn_succeeded:
+                    await self._mark_follow_up_handled(conversation_id, follow_up_id)
+                else:
+                    await self._clear_follow_up_pending(conversation_id, follow_up_id)
 
             self._active_turns.pop(conversation_id, None)
             self._turn_controls.pop(conversation_id, None)

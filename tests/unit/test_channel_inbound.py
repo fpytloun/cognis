@@ -465,6 +465,36 @@ async def test_channel_turn_observer_final_mode_never_flushes_mid_turn() -> None
     assert turn_scheduler.remove_observer.called
 
 
+def test_channel_turn_observer_absorbs_latest_reply_anchor() -> None:
+    adapter = _FakeAdapter()
+    manager = _FakeManager(adapter)
+    turn_scheduler = MagicMock()
+
+    active = ChannelTurnObserver(
+        channel_type="signal",
+        account_id="acct-1",
+        chat_id="chat-1",
+        conversation_id="conv-1",
+        turn_scheduler=turn_scheduler,
+        reply_to_id="msg-1",
+        channel_manager_ref=lambda: manager,
+        assistant_delivery_mode="final",
+    )
+    queued = ChannelTurnObserver(
+        channel_type="signal",
+        account_id="acct-1",
+        chat_id="chat-1",
+        conversation_id="conv-1",
+        turn_scheduler=turn_scheduler,
+        reply_to_id="msg-3",
+        channel_manager_ref=lambda: manager,
+        assistant_delivery_mode="final",
+    )
+
+    assert active.absorb_queued_observer(queued) is True
+    assert active._reply_to_id == "msg-3"
+
+
 @pytest.mark.asyncio
 async def test_channel_turn_observer_sends_text_and_media_together() -> None:
     adapter = _FakeAdapter()

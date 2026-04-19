@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any, cast
@@ -163,6 +164,7 @@ class WorkflowEngine:
         on_tool_result: ToolResultCallback | None = None,
         cancel_event: asyncio.Event | None = None,
         bootstrap_wait_for_intention: bool = False,
+        consume_boundary_batch: Callable[[str], Any] | None = None,
     ) -> StepOutput | None:
         """Run the hot-path direct workflow through a workflow-engine entrypoint.
 
@@ -202,6 +204,7 @@ class WorkflowEngine:
             cancel_event=cancel_event,
             bootstrap_wait_for_intention=bootstrap_wait_for_intention,
             orchestration_mode=OrchestrationMode.FULL,
+            consume_boundary_batch=consume_boundary_batch,
         )
 
         try:

@@ -1063,6 +1063,73 @@ async def test_direct_todo_reprompt_is_system_message() -> None:
 
 
 @pytest.mark.asyncio
+async def test_direct_turn_absorbs_queued_batch_before_todo_reprompt() -> None:
+    fake_llm = _FakeReminderLLM()
+    consumed_reasons: list[str] = []
+
+    async def _consume_boundary_batch(reason: str) -> list[dict[str, object]]:
+        consumed_reasons.append(reason)
+        if len(consumed_reasons) > 1:
+            return []
+        return [
+            {
+                "content": "Also include the deployment notes.",
+                "attachments": [],
+                "system_initiated": False,
+                "follow_up": None,
+            }
+        ]
+
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-1",
+            intaris_session_id="sess-1",
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        todos=[{"content": "keep working", "status": "pending"}],
+        policy=CHAT_POLICY,
+        user_message="",
+        user_attachments=[],
+        attachment_notice=None,
+        prior_context=None,
+        system_initiated=True,
+        is_retry=False,
+        workflow_state=None,
+        executor_environment=None,
+        cancel_event=None,
+        bootstrap_wait_for_intention=False,
+        tool_registry=None,
+        executor_connection=None,
+        consume_boundary_batch=_consume_boundary_batch,
+    )
+
+    output = await agent_loop.run_step(ctx)
+
+    assert output is not None
+    assert isinstance(output.error, str)
+    assert consumed_reasons == ["after_assistant_message"]
+    assert len(fake_llm.calls) >= 2
+    assert fake_llm.calls[1][-1]["role"] == "user"
+    assert fake_llm.calls[1][-1]["content"] == "Also include the deployment notes."
+
+
+@pytest.mark.asyncio
 async def test_step_complete_reprompt_is_system_message() -> None:
     ctx = StepContext(
         step_definition=StepDefinition(name="step-a", type="run", prompt="", allow_questions=False),

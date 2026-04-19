@@ -17,7 +17,12 @@ from cognis.core.followups import (
     FollowUpStatus,
     TaskResultFollowUp,
 )
-from cognis.core.turn_scheduler import TurnScheduler, _effective_user_content
+from cognis.core.turn_scheduler import (
+    TurnScheduler,
+    _effective_user_content,
+    _QueuedMessage,
+    _TurnControl,
+)
 from cognis.models.agent import AgentDefinition
 from cognis.models.artifact import ArtifactKind, AttachmentRef
 from cognis.models.session import SessionStatus
@@ -490,6 +495,144 @@ async def test_queued_turn_observer_only_receives_its_own_turn() -> None:
     assert second_observer.tokens == ["token:second"]
     assert len(first_observer.completed) == 1
     assert len(second_observer.completed) == 1
+
+
+@pytest.mark.asyncio
+async def test_consume_queued_batch_for_active_turn_publishes_user_messages() -> None:
+    event_bus = EventBus()
+    seen_user_messages: list[str] = []
+
+    async def _capture_user_message(event: object) -> None:
+        seen_user_messages.append(str(event.data.get("content") or ""))
+
+    event_bus.subscribe(EventType.USER_MESSAGE, _capture_user_message)
+
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=event_bus,
+    )
+    observer = _RecordingObserver()
+    control = _TurnControl(turn_observers=[observer])
+    scheduler._turn_controls["conv-1"] = control
+    scheduler._turn_sessions["conv-1"] = "sess-1"
+    scheduler._queued_messages["conv-1"].extend(
+        [
+            _QueuedMessage(
+                content="first queued",
+                user_email="user@example.com",
+                attachment_notice="Attachment warning",
+                outbound_attachments=[{"artifact_id": "art-1", "filename": "report.txt"}],
+                channel_deliverable=True,
+                delivery_id="reply-latest",
+                delivery_fallback_text="fallback",
+            ),
+            _QueuedMessage(content="second queued", user_email="user@example.com"),
+        ]
+    )
+
+    batch = await scheduler._consume_queued_batch_for_active_turn(
+        "conv-1",
+        reason="after_tool_cycle",
+    )
+
+    assert [item["content"] for item in batch] == ["first queued", "second queued"]
+    assert seen_user_messages == ["first queued", "second queued"]
+    assert scheduler.queued_count("conv-1") == 0
+    assert observer.queued == [0]
+    assert observer.system_messages == ["Attachment warning"]
+    assert control.absorbed_outbound_attachments == [
+        {"artifact_id": "art-1", "filename": "report.txt"}
+    ]
+    assert control.absorbed_channel_deliverable is True
+    assert control.absorbed_delivery_id == "reply-latest"
+    assert control.absorbed_delivery_fallback_text == "fallback"
+
+
+def test_merge_active_turn_observers_skips_non_absorbable_observers() -> None:
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+    active_observer = _RecordingObserver()
+    active_observers = [active_observer]
+    queued_observer = _RecordingObserver()
+
+    scheduler._merge_active_turn_observers(
+        active_observers,
+        [
+            _QueuedMessage(
+                content="queued", user_email="user@example.com", turn_observers=(queued_observer,)
+            )
+        ],
+    )
+
+    assert active_observers == [active_observer]
+
+
+@pytest.mark.asyncio
+async def test_consume_queued_batch_preserves_non_absorbable_tail() -> None:
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+    scheduler._turn_controls["conv-1"] = _TurnControl()
+    scheduler._turn_sessions["conv-1"] = "sess-1"
+    blocking_observer = _RecordingObserver()
+    scheduler._queued_messages["conv-1"].extend(
+        [
+            _QueuedMessage(content="first queued", user_email="user@example.com"),
+            _QueuedMessage(
+                content="second queued",
+                user_email="user@example.com",
+                turn_observers=(blocking_observer,),
+            ),
+        ]
+    )
+
+    batch = await scheduler._consume_queued_batch_for_active_turn(
+        "conv-1",
+        reason="after_tool_cycle",
+    )
+
+    assert [item["content"] for item in batch] == ["first queued"]
+    assert scheduler.queued_count("conv-1") == 1
+    assert scheduler._queued_messages["conv-1"][0].content == "second queued"
 
 
 @pytest.mark.asyncio
@@ -986,6 +1129,180 @@ async def test_run_turn_publishes_effective_user_message_content() -> None:
     ]
     assert len(user_events) == 1
     assert user_events[0].data["content"] == "User attached an audio file."
+
+
+@pytest.mark.asyncio
+async def test_run_turn_merges_absorbed_delivery_metadata() -> None:
+    async def _run_direct_turn(**kwargs: object) -> object:
+        consume_boundary_batch = kwargs["consume_boundary_batch"]
+        assert callable(consume_boundary_batch)
+        await consume_boundary_batch("after_tool_cycle")
+        return SimpleNamespace(content="reply", attachments=[])
+
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(run_direct_turn=_run_direct_turn),
+        decision_engine=SimpleNamespace(
+            decide=AsyncMock(return_value=SimpleNamespace(decision="inline"))
+        ),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(
+            refresh=AsyncMock(return_value=SimpleNamespace(last_event_seq=0)),
+            get_context_usage=MagicMock(return_value=None),
+            get_entry=MagicMock(return_value=None),
+        ),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+    scheduler._touch_conversation = AsyncMock()  # type: ignore[method-assign]
+    published: list[object] = []
+
+    async def _capture_publish(result: object, **_: object) -> None:
+        published.append(result)
+
+    scheduler._publish_turn_completed = _capture_publish  # type: ignore[method-assign]
+    control = _TurnControl()
+    scheduler._turn_controls["conv-1"] = control
+    scheduler._turn_sessions["conv-1"] = "sess-1"
+    scheduler._queued_messages["conv-1"].append(
+        _QueuedMessage(
+            content="queued follow-up",
+            user_email="user@example.com",
+            system_initiated=True,
+            outbound_attachments=[{"artifact_id": "art-2", "filename": "image.png"}],
+            channel_deliverable=True,
+            delivery_id="reply-2",
+            delivery_fallback_text="fallback text",
+        )
+    )
+
+    await scheduler._run_turn(
+        conversation=SimpleNamespace(
+            conversation_id="conv-1", title="", user_email="user@example.com"
+        ),
+        session=SimpleNamespace(session_id="sess-1"),
+        agent=SimpleNamespace(agent_id="agent-1"),
+        content="hello",
+        user_email="user@example.com",
+        attachments=[],
+        outbound_attachments=None,
+        attachment_notice=None,
+        attachment_context=None,
+        system_initiated=False,
+        channel_deliverable=False,
+        delivery_id=None,
+        delivery_fallback_text=None,
+        bootstrap_wait_for_intention=False,
+        cancel_event=AsyncMock(),
+        turn_control=control,
+        turn_observers=(),
+    )
+
+    assert len(published) == 1
+    result = published[0]
+    assert result.channel_deliverable is True
+    assert result.delivery_id == "reply-2"
+    assert result.delivery_fallback_text == "fallback text"
+    assert result.attachments == [{"artifact_id": "art-2", "filename": "image.png"}]
+
+
+@pytest.mark.asyncio
+async def test_run_turn_error_merges_absorbed_delivery_metadata() -> None:
+    async def _run_direct_turn(**kwargs: object) -> object:
+        consume_boundary_batch = kwargs["consume_boundary_batch"]
+        assert callable(consume_boundary_batch)
+        await consume_boundary_batch("after_tool_cycle")
+        raise RuntimeError("boom")
+
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(run_direct_turn=_run_direct_turn),
+        decision_engine=SimpleNamespace(
+            decide=AsyncMock(return_value=SimpleNamespace(decision="inline"))
+        ),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(
+            refresh=AsyncMock(return_value=SimpleNamespace(last_event_seq=0)),
+            get_context_usage=MagicMock(return_value=None),
+            get_entry=MagicMock(return_value=None),
+        ),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+    scheduler._touch_conversation = AsyncMock()  # type: ignore[method-assign]
+    captured_errors: list[dict[str, object]] = []
+
+    async def _capture_error(
+        conversation_id: str,
+        session_id: str,
+        error: object,
+        **kwargs: object,
+    ) -> None:
+        captured_errors.append(
+            {
+                "conversation_id": conversation_id,
+                "session_id": session_id,
+                "error": error,
+                **kwargs,
+            }
+        )
+
+    scheduler._publish_turn_error = _capture_error  # type: ignore[method-assign]
+    control = _TurnControl()
+    scheduler._turn_controls["conv-1"] = control
+    scheduler._turn_sessions["conv-1"] = "sess-1"
+    scheduler._queued_messages["conv-1"].append(
+        _QueuedMessage(
+            content="queued follow-up",
+            user_email="user@example.com",
+            system_initiated=True,
+            outbound_attachments=[{"artifact_id": "art-3", "filename": "report.pdf"}],
+            channel_deliverable=True,
+            delivery_id="reply-3",
+            delivery_fallback_text="fallback error",
+        )
+    )
+
+    await scheduler._run_turn(
+        conversation=SimpleNamespace(
+            conversation_id="conv-1", title="", user_email="user@example.com"
+        ),
+        session=SimpleNamespace(session_id="sess-1"),
+        agent=SimpleNamespace(agent_id="agent-1"),
+        content="hello",
+        user_email="user@example.com",
+        attachments=[],
+        outbound_attachments=None,
+        attachment_notice=None,
+        attachment_context=None,
+        system_initiated=False,
+        channel_deliverable=False,
+        delivery_id=None,
+        delivery_fallback_text=None,
+        bootstrap_wait_for_intention=False,
+        cancel_event=AsyncMock(),
+        turn_control=control,
+        turn_observers=(),
+    )
+
+    assert len(captured_errors) == 1
+    assert captured_errors[0]["channel_deliverable"] is True
+    assert captured_errors[0]["delivery_id"] == "reply-3"
+    assert captured_errors[0]["delivery_fallback_text"] == "fallback error"
 
 
 @pytest.mark.asyncio

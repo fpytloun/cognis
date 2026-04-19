@@ -788,6 +788,8 @@ class ChannelTurnObserver:
     the turn finishes.  Also sends typing indicators during processing.
     """
 
+    supports_mid_turn_absorb = True
+
     def __init__(
         self,
         *,
@@ -1071,6 +1073,25 @@ class ChannelTurnObserver:
 
     async def on_queued(self, conversation_id: str, queued_count: int) -> None:
         """No-op for queue notifications."""
+
+    def absorb_queued_observer(self, observer: Any) -> bool:
+        """Adopt the latest reply anchor from a queued sibling observer."""
+
+        if not isinstance(observer, ChannelTurnObserver):
+            return False
+        if observer is self:
+            return True
+        if (
+            observer._conversation_id != self._conversation_id  # noqa: SLF001
+            or observer._channel_type != self._channel_type  # noqa: SLF001
+            or observer._account_id != self._account_id  # noqa: SLF001
+            or observer._chat_id != self._chat_id  # noqa: SLF001
+            or observer._thread_id != self._thread_id  # noqa: SLF001
+        ):
+            return False
+        if observer._reply_to_id:  # noqa: SLF001
+            self._reply_to_id = observer._reply_to_id  # noqa: SLF001
+        return True
 
     # ------------------------------------------------------------------
     # Helpers
