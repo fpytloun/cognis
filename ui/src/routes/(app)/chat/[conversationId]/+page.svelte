@@ -2786,37 +2786,32 @@ import X from 'lucide-svelte/icons/x';
             />
             <!--
               iMessage-style single-line composer:
-              * A single pill containing everything the user needs inline.
-              * Paperclip on the leading edge opens the file picker. The
-                native ``<input type="file">`` is overlaid at opacity 0 on
-                top of the visual button so iOS Safari treats the tap as
-                a direct user activation (opening the picker reliably
-                fails via programmatic ``click()`` when the input is
-                ``display: none``).
-              * The textarea grows vertically with content up to a cap.
-              * The trailing icon is context-sensitive: a circular stop
-                while a turn is streaming, a circular send arrow when
-                there is content to submit, and nothing when the field
-                is empty — so the pill has no unused chrome at rest.
-              * Enter defaults to newline; the toggle that used to sit
-                under the composer is gone. Power users can still submit
-                with Cmd/Ctrl+Enter or enable Enter-to-send through the
-                stored preference.
+              * Paperclip on the leading edge is a <label> wrapping an
+                sr-only file input. Native label→input activation opens
+                the iOS file picker reliably without the previous
+                opacity-0 overlay, which on iOS used to show its tap
+                highlight across the textarea width when the invisible
+                <input>'s intrinsic box spilled past the 36px icon.
+              * The textarea grows vertically up to a cap. Using
+                `items-center` on the pill keeps the paperclip, the
+                text baseline, and the trailing button visually on one
+                line when the composer is a single row.
+              * The trailing icon is context-sensitive: a stop square
+                while a turn is streaming, a send arrow when there is
+                content to submit, and nothing when the field is
+                empty.
+              * Enter defaults to newline; Cmd/Ctrl+Enter always
+                submits, and the stored Enter-to-send preference still
+                applies for users who opted in.
             -->
-            <div class="flex items-end gap-1 rounded-3xl border border-slate-700 bg-slate-900/70 px-2 py-1.5 transition focus-within:border-sky-400/50 focus-within:ring-2 focus-within:ring-sky-400/20">
-              <span class="relative inline-flex shrink-0">
-                <button
-                  type="button"
-                  tabindex={-1}
-                  aria-hidden="true"
-                  class="inline-flex h-9 w-9 items-center justify-center rounded-full text-slate-400 transition hover:bg-slate-800/60 hover:text-slate-200 disabled:opacity-40"
-                  disabled={directQuestionSubmitting}
-                >
-                  <Paperclip class="h-4 w-4" />
-                </button>
+            <div class="flex items-center gap-1 rounded-3xl border border-slate-700 bg-slate-900/70 px-2 py-1 transition focus-within:border-sky-400/50 focus-within:ring-2 focus-within:ring-sky-400/20">
+              <label
+                aria-label="Attach files"
+                class={`inline-flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center rounded-full text-slate-400 transition hover:bg-slate-800/60 hover:text-slate-200 focus-within:bg-slate-800/60 focus-within:text-slate-200 ${directQuestionSubmitting ? 'pointer-events-none opacity-40' : ''}`}
+              >
+                <Paperclip class="h-4 w-4 pointer-events-none" />
                 <input
-                  aria-label="Attach files"
-                  class="absolute inset-0 cursor-pointer opacity-0 disabled:cursor-not-allowed"
+                  class="sr-only"
                   type="file"
                   multiple
                   disabled={directQuestionSubmitting}
@@ -2827,12 +2822,12 @@ import X from 'lucide-svelte/icons/x';
                     (event.currentTarget as HTMLInputElement).value = '';
                   }}
                 />
-              </span>
+              </label>
               <textarea
                 bind:this={composerElement}
                 bind:value={composer}
                 rows={1}
-                class="min-h-[36px] max-h-[200px] flex-1 resize-none bg-transparent px-1 py-1.5 text-[15px] leading-6 text-slate-100 placeholder:text-slate-500 focus:outline-none focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0 sm:text-sm"
+                class="min-h-[36px] max-h-[200px] flex-1 resize-none self-center bg-transparent px-1 py-[0.4rem] text-[15px] leading-5 text-slate-100 placeholder:text-slate-500 focus:outline-none focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0 sm:text-sm"
                 disabled={!currentConversation || isReadOnly(currentConversation) || isLlmUnavailableForSetup() || directQuestionSubmitting}
                 enterkeyhint={enterToSend ? 'send' : 'enter'}
                 autocapitalize="sentences"
