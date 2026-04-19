@@ -2,6 +2,7 @@
   import ArrowLeft from 'lucide-svelte/icons/arrow-left';
 
   import { policyOptions, type ChannelEditorDraft, type ChannelEditorMode, type SetupGuide } from '$lib/channels';
+  import AgentSelect from '$lib/components/AgentSelect.svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import Card from '$lib/components/ui/Card.svelte';
   import Input from '$lib/components/ui/Input.svelte';
@@ -81,16 +82,17 @@
           <Input bind:value={draft.display_name} placeholder={`${selectedType.label} Account`} />
         </label>
 
-        <label class="grid gap-2 text-sm text-slate-300">
-          Agent
-          <select bind:value={draft.agent_id} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
-            <option value="">Select an agent</option>
-            {#each primaryAgents() as agent}
-              <option value={agent.agent_id}>{agent.display_name ?? agent.name}</option>
-            {/each}
-          </select>
+        <div class="grid gap-2 text-sm text-slate-300">
+          <span>Agent</span>
+          <AgentSelect
+            agents={primaryAgents()}
+            value={draft.agent_id}
+            onchange={(next) => { draft.agent_id = next; }}
+            placeholder="Select an agent"
+            emptyLabel="No primary agents"
+          />
           <span class="text-xs text-slate-500">Only primary agents can own channel accounts.</span>
-        </label>
+        </div>
 
         <label class="grid gap-2 text-sm text-slate-300">
           Adapter location

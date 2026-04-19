@@ -3,6 +3,7 @@
   import { onMount } from 'svelte';
 
   import { api, asApiError } from '$lib/api/client';
+  import AgentSelect from '$lib/components/AgentSelect.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import TaskCard from '$lib/components/tasks/TaskCard.svelte';
   import CreateTaskModal from '$lib/components/tasks/CreateTaskModal.svelte';
@@ -443,15 +444,17 @@
           <span>Search</span>
           <Input bind:value={filters.search} placeholder="title or description" />
         </label>
-        <label class="space-y-2 text-sm font-medium text-slate-200">
+        <div class="space-y-2 text-sm font-medium text-slate-200">
           <span>Agent</span>
-          <select bind:value={filters.agentId} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
-            <option value="">All</option>
-            {#each agents as agent}
-              <option value={agent.agent_id}>{agent.display_name ?? agent.name}</option>
-            {/each}
-          </select>
-        </label>
+          <AgentSelect
+            agents={agents}
+            value={filters.agentId || ''}
+            onchange={(next) => { filters.agentId = next; }}
+            allowAll
+            allValue=""
+            allLabel="All"
+          />
+        </div>
         <label class="space-y-2 text-sm font-medium text-slate-200">
           <span>Workflow</span>
           <select bind:value={filters.workflowId} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">

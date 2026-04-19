@@ -18,6 +18,7 @@ import Target from 'lucide-svelte/icons/target';
 
   import { api, asApiError } from '$lib/api/client';
   import AgentAvatar from '$lib/components/AgentAvatar.svelte';
+  import AgentSelect from '$lib/components/AgentSelect.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import SessionLogsDrawer from '$lib/components/tasks/SessionLogsDrawer.svelte';
   import StepOutputModal from '$lib/components/tasks/StepOutputModal.svelte';
@@ -1511,14 +1512,15 @@ import Target from 'lucide-svelte/icons/target';
             <span>Priority</span>
             <Input bind:value={editForm.priority} type="number" disabled={!isEditable} />
           </label>
-          <label class="space-y-2 text-sm font-medium text-slate-200">
+          <div class="space-y-2 text-sm font-medium text-slate-200">
             <span>Agent</span>
-            <select bind:value={editForm.agent_id} disabled={!isEditable} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100 disabled:opacity-50">
-              {#each agents.filter((a) => a.agent_type === 'primary') as agent}
-                <option value={agent.agent_id}>{agent.display_name ?? agent.name}</option>
-              {/each}
-            </select>
-          </label>
+            <AgentSelect
+              agents={agents.filter((a) => a.agent_type === 'primary')}
+              value={editForm.agent_id}
+              onchange={(next) => { editForm.agent_id = next; }}
+              disabled={!isEditable}
+            />
+          </div>
           <label class="space-y-2 text-sm font-medium text-slate-200">
             <span>Workflow</span>
             <select bind:value={editForm.workflow_id} disabled={!isEditable} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100 disabled:opacity-50">

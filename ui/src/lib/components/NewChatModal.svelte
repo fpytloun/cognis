@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
 
   import type { Agent } from '$lib/types/api';
+  import AgentSelect from '$lib/components/AgentSelect.svelte';
   import Button from '$lib/components/ui/Button.svelte';
 
   let {
@@ -83,21 +84,17 @@
       <p class="mt-4 rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-100">{error}</p>
     {/if}
 
-    <label class="mt-5 block space-y-2">
-      <span class="text-xs font-medium uppercase tracking-widest text-slate-500">Primary agent</span>
-      <select
-        bind:value={selectedAgentId}
-        class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+    <div class="mt-5">
+      <AgentSelect
+        label="Primary agent"
+        agents={primaryAgents}
+        value={selectedAgentId}
+        onchange={(next) => { selectedAgentId = next; }}
         disabled={busy || primaryAgents.length === 0}
-      >
-        {#if primaryAgents.length === 0}
-          <option value="">No active primary agents</option>
-        {/if}
-        {#each primaryAgents as agent}
-          <option value={agent.agent_id}>{agent.display_name ?? agent.name}</option>
-        {/each}
-      </select>
-    </label>
+        emptyLabel="No active primary agents"
+        placeholder="Select an agent"
+      />
+    </div>
 
     <div class="mt-6 flex flex-wrap justify-end gap-3">
       <Button variant="secondary" disabled={busy} onclick={oncancel}>Cancel</Button>

@@ -4,6 +4,7 @@
   import { onMount } from 'svelte';
 
   import { api, asApiError } from '$lib/api/client';
+  import AgentSelect from '$lib/components/AgentSelect.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import Badge from '$lib/components/ui/Badge.svelte';
   import Button from '$lib/components/ui/Button.svelte';
@@ -351,12 +352,13 @@ import Zap from 'lucide-svelte/icons/zap';
             <Input id="edit-name" bind:value={form.name} />
           </div>
           <div class="space-y-1">
-            <label for="edit-agent" class="text-xs font-medium uppercase tracking-widest text-slate-400">Agent</label>
-            <select id="edit-agent" bind:value={form.agent_id} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
-              {#each agents as agent}
-                <option value={agent.agent_id}>{agent.display_name ?? agent.name}</option>
-              {/each}
-            </select>
+            <span class="block text-xs font-medium uppercase tracking-widest text-slate-400">Agent</span>
+            <AgentSelect
+              id="edit-agent"
+              agents={agents}
+              value={form.agent_id}
+              onchange={(next) => { form.agent_id = next; }}
+            />
           </div>
         </div>
 

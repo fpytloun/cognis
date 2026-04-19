@@ -3,6 +3,7 @@
   import { onMount } from 'svelte';
 
   import { api, asApiError } from '$lib/api/client';
+  import AgentSelect from '$lib/components/AgentSelect.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import Badge from '$lib/components/ui/Badge.svelte';
   import Button from '$lib/components/ui/Button.svelte';
@@ -577,12 +578,13 @@ import Zap from 'lucide-svelte/icons/zap';
         <!-- Agent + Workflow. Stacks on narrow phones; two columns at sm+. -->
         <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
           <div class="space-y-1">
-            <label for="sched-agent" class="text-xs font-medium uppercase tracking-widest text-slate-400">Agent</label>
-            <select id="sched-agent" bind:value={form.agent_id} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
-              {#each agents as agent}
-                <option value={agent.agent_id}>{agent.display_name ?? agent.name}</option>
-              {/each}
-            </select>
+            <span class="block text-xs font-medium uppercase tracking-widest text-slate-400">Agent</span>
+            <AgentSelect
+              id="sched-agent"
+              agents={agents}
+              value={form.agent_id}
+              onchange={(next) => { form.agent_id = next; }}
+            />
           </div>
           <div class="space-y-1">
             <label for="sched-workflow" class="text-xs font-medium uppercase tracking-widest text-slate-400">Workflow</label>

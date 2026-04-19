@@ -21,6 +21,7 @@ import X from 'lucide-svelte/icons/x';
 
   import AgentAvatar from '$lib/components/AgentAvatar.svelte';
   import AgentProfilePopover from '$lib/components/AgentProfilePopover.svelte';
+  import AgentSelect from '$lib/components/AgentSelect.svelte';
   import ChatMessage from '$lib/components/ChatMessage.svelte';
   import CompactionCard from '$lib/components/CompactionCard.svelte';
   import DelegationCard from '$lib/components/DelegationCard.svelte';
@@ -1852,7 +1853,10 @@ import X from 'lucide-svelte/icons/x';
     // No longer polling for escalations — they arrive via push events
   }
 
-  async function handleAgentFilterChange(): Promise<void> {
+  async function handleAgentFilterChange(next?: string): Promise<void> {
+    if (typeof next === 'string') {
+      selectedAgentId = next;
+    }
     persistSelectedAgent();
     await refreshAvailableChannelTypes();
     await loadConversationPage(true);
@@ -2096,19 +2100,14 @@ import X from 'lucide-svelte/icons/x';
           </div>
         {:else}
           <div class={`space-y-3 ${mobileFilterOpen ? 'block' : 'hidden lg:block'}`}>
-          <label class="block space-y-1">
-            <span class="text-xs font-medium uppercase tracking-widest text-slate-500">Agent</span>
-            <select
-              bind:value={selectedAgentId}
-              onchange={handleAgentFilterChange}
-              class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
-            >
-              <option value="all">All agents</option>
-              {#each agents.filter((a) => a.status === 'active' && a.agent_type === 'primary') as agent}
-                <option value={agent.agent_id}>{agent.display_name ?? agent.name}</option>
-              {/each}
-            </select>
-          </label>
+          <AgentSelect
+            label="Agent"
+            agents={agents.filter((a) => a.status === 'active' && a.agent_type === 'primary')}
+            value={selectedAgentId}
+            onchange={(next) => void handleAgentFilterChange(next)}
+            allowAll
+            allLabel="All agents"
+          />
 
           <label class="block space-y-1">
             <span class="text-xs font-medium uppercase tracking-widest text-slate-500">Channel</span>
