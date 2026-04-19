@@ -2761,7 +2761,7 @@ import X from 'lucide-svelte/icons/x';
                 bind:value={composer}
                 class="min-h-[56px] w-full resize-none rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 pr-10 text-base text-slate-100 placeholder:text-slate-500 md:text-sm"
                 disabled={!currentConversation || isReadOnly(currentConversation) || isLlmUnavailableForSetup() || directQuestionSubmitting}
-                enterkeyhint="send"
+                enterkeyhint={enterToSend ? 'send' : 'enter'}
                 autocapitalize="sentences"
                 spellcheck="true"
                 onkeydown={handleComposerKeydown}
@@ -2781,7 +2781,7 @@ import X from 'lucide-svelte/icons/x';
               </button>
             </div>
             <div class="flex flex-wrap items-center justify-between gap-2">
-              <label class="hidden items-center gap-2 text-xs text-slate-400 sm:flex">
+              <label class="flex items-center gap-2 text-xs text-slate-400">
                 <input bind:checked={enterToSend} class="h-4 w-4 rounded border-slate-700 bg-slate-950" onchange={persistEnterToSendPreference} type="checkbox" />
                 <span>Press Enter to send</span>
               </label>
@@ -2858,13 +2858,14 @@ import X from 'lucide-svelte/icons/x';
                 bind:value={composer}
                 class="min-h-[55vh] w-full resize-none rounded-3xl border border-slate-800 bg-slate-900/60 px-5 py-4 text-base leading-6 text-slate-100 placeholder:text-slate-500 md:text-sm"
                 disabled={!currentConversation || isReadOnly(currentConversation) || isLlmUnavailableForSetup() || directQuestionSubmitting}
+                enterkeyhint={enterToSend ? 'send' : 'enter'}
                 onkeydown={handleExpandedComposerKeydown}
                 oninput={updateSlashSuggestions}
                 onpaste={(event) => void handlePaste(event)}
                 placeholder={isLlmUnavailableForSetup() ? 'Configure an LLM provider to start chatting.' : pendingDirectQuestion ? 'Answer the pending clarification request...' : 'Send a longer message to Cognis...'}
               ></textarea>
               <div class="flex flex-wrap items-center justify-between gap-3">
-                <label class="hidden items-center gap-2 text-xs text-slate-400 sm:flex">
+                <label class="flex items-center gap-2 text-xs text-slate-400">
                   <input bind:checked={enterToSend} class="h-4 w-4 rounded border-slate-700 bg-slate-950" onchange={persistEnterToSendPreference} type="checkbox" />
                   <span>Press Enter to send</span>
                 </label>
