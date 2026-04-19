@@ -20,6 +20,7 @@
   // ---------------------------------------------------------------------------
 
   let loading = $state(true);
+  let loadingTimedOut = $state(false);
   let creating = $state(false);
   let error = $state('');
   let tasks = $state<Task[]>([]);
@@ -42,6 +43,10 @@
 
   let pollTimer: number | null = null;
   let visibilityHandler: (() => void) | null = null;
+  let loadTimeoutTimer: number | null = null;
+  let boardLoadRequestId = 0;
+
+  const TASK_BOARD_LOAD_TIMEOUT_MS = 10000;
 
   let filters = $state<TaskFilterState>({
     search: '',
@@ -108,19 +113,41 @@
   // ---------------------------------------------------------------------------
 
   async function loadBoardData(): Promise<void> {
+    const requestId = ++boardLoadRequestId;
     loading = true;
+    loadingTimedOut = false;
     error = '';
+    if (loadTimeoutTimer !== null) {
+      window.clearTimeout(loadTimeoutTimer);
+    }
+    loadTimeoutTimer = window.setTimeout(() => {
+      if (requestId === boardLoadRequestId && loading) {
+        loadingTimedOut = true;
+      }
+    }, TASK_BOARD_LOAD_TIMEOUT_MS);
     try {
-      [tasks, agents, workflows, conversations] = await Promise.all([
+      const [nextTasks, nextAgents, nextWorkflows, nextConversations] = await Promise.all([
         api.tasks.listAll(),
         api.agents.listAll(),
         api.workflows.listAll(),
         api.conversations.listAll()
       ]);
+      if (requestId !== boardLoadRequestId) return;
+      tasks = nextTasks;
+      agents = nextAgents;
+      workflows = nextWorkflows;
+      conversations = nextConversations;
     } catch (caughtError) {
+      if (requestId !== boardLoadRequestId) return;
       error = asApiError(caughtError).message;
     } finally {
-      loading = false;
+      if (requestId === boardLoadRequestId) {
+        if (loadTimeoutTimer !== null) {
+          window.clearTimeout(loadTimeoutTimer);
+          loadTimeoutTimer = null;
+        }
+        loading = false;
+      }
     }
   }
 
@@ -348,6 +375,9 @@
     void loadBoardData().then(() => startPolling());
     return () => {
       stopPolling();
+      if (loadTimeoutTimer !== null) {
+        window.clearTimeout(loadTimeoutTimer);
+      }
       if (visibilityHandler) document.removeEventListener('visibilitychange', visibilityHandler);
     };
   });
@@ -358,7 +388,23 @@
 </svelte:head>
 
 {#if loading}
-  <LoadingState label="Loading task board" description="Fetching draft, queued, running, paused, and completed work items." />
+  {#if loadingTimedOut}
+    <Card class="mx-auto max-w-3xl p-6 sm:p-8">
+      <div class="space-y-4 text-center">
+        <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Task board</p>
+        <h1 class="text-xl font-semibold text-white">Still loading task board</h1>
+        <p class="text-sm leading-6 text-slate-400">
+          Fetching tasks is taking longer than expected. You can retry now or open diagnostics to check provider health.
+        </p>
+        <div class="flex flex-wrap justify-center gap-3">
+          <Button onclick={() => void loadBoardData()}>Retry</Button>
+          <Button variant="secondary" onclick={() => goto('/settings/system')}>Open diagnostics</Button>
+        </div>
+      </div>
+    </Card>
+  {:else}
+    <LoadingState label="Loading task board" description="Fetching draft, queued, running, paused, and completed work items." />
+  {/if}
 {:else}
   <section class="min-w-0 space-y-5">
     {#if agents.length === 0}

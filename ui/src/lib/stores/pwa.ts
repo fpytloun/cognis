@@ -23,9 +23,37 @@ let deferredPrompt: BeforeInstallPromptEvent | null = null;
 
 const AUTO_APPLY_WAITING_PREFIX = 'cognis-sw-auto-apply:';
 const AUTO_APPLY_TIMEOUT_MS = 5000;
+const INSTALL_DISMISS_KEY = 'cognis-pwa-install-dismissed-until';
+const INSTALL_DISMISS_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
 export const installPromptAvailable = writable(false);
 export const updateAvailable = writable(false);
+
+function installPromptEligiblePath(pathname: string): boolean {
+  return pathname === '/getting-started' || pathname === '/login' || pathname === '/setup';
+}
+
+export function isInstallPromptDismissed(): boolean {
+  if (typeof window === 'undefined') return false;
+  const raw = window.localStorage.getItem(INSTALL_DISMISS_KEY);
+  if (!raw) return false;
+  const until = Number(raw);
+  if (!Number.isFinite(until)) {
+    window.localStorage.removeItem(INSTALL_DISMISS_KEY);
+    return false;
+  }
+  if (until <= Date.now()) {
+    window.localStorage.removeItem(INSTALL_DISMISS_KEY);
+    return false;
+  }
+  return true;
+}
+
+export function dismissInstallPromptForNow(): void {
+  if (typeof window === 'undefined') return;
+  window.localStorage.setItem(INSTALL_DISMISS_KEY, String(Date.now() + INSTALL_DISMISS_TTL_MS));
+  installPromptAvailable.set(false);
+}
 
 function waitingWorkerAttemptKey(waiting: ServiceWorker): string | null {
   if (typeof window === 'undefined') return null;
@@ -45,9 +73,6 @@ function activateWaitingWorker(waiting: ServiceWorker, options: { auto?: boolean
   const onControllerChange = () => {
     if (timeoutId !== null) {
       window.clearTimeout(timeoutId);
-    }
-    if (attemptKey) {
-      window.sessionStorage.removeItem(attemptKey);
     }
     window.location.reload();
   };
@@ -81,6 +106,11 @@ function tryAutoApplyWaitingWorker(waiting: ServiceWorker): boolean {
 
 if (typeof window !== 'undefined') {
   window.addEventListener('beforeinstallprompt', (event) => {
+    if (!installPromptEligiblePath(window.location.pathname) || isInstallPromptDismissed()) {
+      deferredPrompt = null;
+      installPromptAvailable.set(false);
+      return;
+    }
     event.preventDefault();
     deferredPrompt = event as BeforeInstallPromptEvent;
     installPromptAvailable.set(true);
@@ -102,6 +132,9 @@ export async function promptInstall(): Promise<'accepted' | 'dismissed' | null> 
     const choice = await deferredPrompt.userChoice;
     deferredPrompt = null;
     installPromptAvailable.set(false);
+    if (choice.outcome === 'dismissed') {
+      dismissInstallPromptForNow();
+    }
     return choice.outcome;
   } catch {
     return null;
@@ -196,5 +229,9 @@ export async function applyUpdate(): Promise<void> {
     window.location.reload();
     return;
   }
-  activateWaitingWorker(waiting);
+  const attemptKey = waitingWorkerAttemptKey(waiting);
+  if (attemptKey) {
+    window.sessionStorage.setItem(attemptKey, '1');
+  }
+  activateWaitingWorker(waiting, { auto: true });
 }

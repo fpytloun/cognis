@@ -65,6 +65,7 @@ import X from 'lucide-svelte/icons/x';
   import { wsClient } from '$lib/ws/client';
 
   let initializing = $state(true);
+  let initialLoadTimedOut = $state(false);
   let switchingConversation = $state(false);
   let initialConversationResolved = $state(false);
   let error = $state('');
@@ -174,6 +175,9 @@ import X from 'lucide-svelte/icons/x';
   let visibilityHandler: (() => void) | null = null;
   let conversationLoadRequestId = 0;
   let mobileDrawerPreviouslyFocused: HTMLElement | null = null;
+  let initialLoadTimeoutTimer: number | null = null;
+
+  const CHAT_INITIAL_LOAD_TIMEOUT_MS = 10000;
 
   function isLlmUnavailableForSetup(): boolean {
     const llmDetails = JSON.stringify($workspaceHealth.health?.providers?.llm ?? {}).toLowerCase();
@@ -483,6 +487,26 @@ import X from 'lucide-svelte/icons/x';
 
   function conversationIdFromRoute(): string {
     return page.params.conversationId ?? '';
+  }
+
+  function beginInitialLoadTimeout(): void {
+    if (initialLoadTimeoutTimer !== null) {
+      window.clearTimeout(initialLoadTimeoutTimer);
+    }
+    initialLoadTimedOut = false;
+    initialLoadTimeoutTimer = window.setTimeout(() => {
+      if (initializing || (conversationIdFromRoute() && !currentConversation && !error)) {
+        initialLoadTimedOut = true;
+      }
+    }, CHAT_INITIAL_LOAD_TIMEOUT_MS);
+  }
+
+  function stopInitialLoadTimeout(): void {
+    if (initialLoadTimeoutTimer !== null) {
+      window.clearTimeout(initialLoadTimeoutTimer);
+      initialLoadTimeoutTimer = null;
+    }
+    initialLoadTimedOut = false;
   }
 
   function conversationTitle(conversation: Conversation): string {
@@ -987,6 +1011,7 @@ import X from 'lucide-svelte/icons/x';
 
       activeConversationId = conversationId;
       currentConversation = conversation;
+      initialLoadTimedOut = false;
       persistLastOpenedConversation(conversation);
       if (!conversations.some((item) => item.conversation_id === conversation.conversation_id)) {
         conversations = [conversation, ...conversations];
@@ -1039,6 +1064,9 @@ import X from 'lucide-svelte/icons/x';
         initializing = false;
         switchingConversation = false;
         initialConversationResolved = true;
+        if (currentConversation || error) {
+          stopInitialLoadTimeout();
+        }
       }
     }
   }
@@ -1046,17 +1074,27 @@ import X from 'lucide-svelte/icons/x';
   async function initialize(): Promise<void> {
     initializing = true;
     error = '';
+    beginInitialLoadTimeout();
+    const hasConversationRoute = Boolean(conversationIdFromRoute());
+
+    // Render the chat shell immediately for deep links so mobile users don't
+    // stare at a full-screen blocking card while the sidebar and history load.
+    if (hasConversationRoute) {
+      initializing = false;
+    }
 
     try {
       await refreshSidebarData();
-      if (!conversationIdFromRoute()) {
+      if (!hasConversationRoute) {
         initializing = false;
         initialConversationResolved = true;
+        stopInitialLoadTimeout();
       }
     } catch (caughtError) {
       error = asApiError(caughtError).message;
       initializing = false;
       initialConversationResolved = true;
+      stopInitialLoadTimeout();
     }
 
     if (notificationsSupported() && !notificationsGranted() && !hasAskedPermission()) {
@@ -1913,6 +1951,7 @@ import X from 'lucide-svelte/icons/x';
 
     return () => {
       document.body.style.overflow = '';
+      stopInitialLoadTimeout();
       unsubscribeWs?.();
       unsubscribeComposerFocus?.();
       unsubscribeCancelTurn?.();
@@ -1932,7 +1971,7 @@ import X from 'lucide-svelte/icons/x';
   <title>{currentConversation ? `${conversationTitle(currentConversation)} · Chat · Cognis` : 'Chat · Cognis'}</title>
 </svelte:head>
 
-{#if initializing}
+{#if initializing && !conversationIdFromRoute()}
   <LoadingState label="Loading conversation" description="Fetching history, restoring workflow prompts, and preparing the live stream." />
 {:else}
   <div class={`relative flex h-full min-h-0 flex-col gap-3 overflow-hidden ${chatSidebarCollapsed ? '' : 'lg:grid lg:grid-cols-[320px_minmax(0,1fr)] lg:gap-4'}`}>
@@ -2371,6 +2410,21 @@ import X from 'lucide-svelte/icons/x';
           </div>
         {/if}
 
+        {#if initialLoadTimedOut && !currentConversation && !error}
+          <div class="rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-4 text-sm text-amber-100">
+            <div class="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <p class="font-medium">Still loading conversation</p>
+                <p class="mt-1 text-amber-100/80">History or live session setup is taking longer than expected.</p>
+              </div>
+              <div class="flex gap-2">
+                <Button size="sm" variant="secondary" onclick={() => void openConversation(conversationIdFromRoute())}>Retry</Button>
+                <Button size="sm" variant="secondary" onclick={() => goto('/settings/system')}>Diagnostics</Button>
+              </div>
+            </div>
+          </div>
+        {/if}
+
         {#if sessionsError && !isPreSessionConversation}
           <div class="rounded-2xl border border-amber-500/30 bg-amber-500/10 px-3 py-3 text-sm text-amber-100">
             <div class="flex flex-wrap items-center justify-between gap-3">
@@ -2410,7 +2464,15 @@ import X from 'lucide-svelte/icons/x';
             </div>
           {/if}
 
-          {#if displayedTimeline.length === 0}
+          {#if !currentConversation && !error}
+            <div class="rounded-2xl border border-dashed border-slate-700 px-4 py-10 text-center text-sm text-slate-400">
+              {#if initialLoadTimedOut}
+                Conversation data is still loading. Use Retry above if it stays stuck.
+              {:else}
+                Loading conversation history and preparing the live stream.
+              {/if}
+            </div>
+          {:else if displayedTimeline.length === 0}
             <p class="rounded-2xl border border-dashed border-slate-700 px-4 py-10 text-center text-sm text-slate-400">
               Send the first message to start this conversation.
             </p>

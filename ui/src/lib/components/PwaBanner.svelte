@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { page } from '$app/state';
   import { onMount } from 'svelte';
   import Download from 'lucide-svelte/icons/download';
 import RefreshCw from 'lucide-svelte/icons/refresh-cw';
@@ -9,7 +10,9 @@ import X from 'lucide-svelte/icons/x';
   import {
     applyUpdate,
     displayMode,
+    dismissInstallPromptForNow,
     installPromptAvailable,
+    isInstallPromptDismissed,
     isIosSafari,
     promptInstall,
     updateAvailable
@@ -27,34 +30,45 @@ import X from 'lucide-svelte/icons/x';
    *   - All banners are dismissible and remember dismissal in localStorage.
    */
 
-  const DISMISS_KEY_INSTALL = 'cognis-pwa-install-dismissed';
   const DISMISS_KEY_IOS = 'cognis-pwa-ios-dismissed';
 
   let installDismissed = $state(false);
   let iosDismissed = $state(false);
   let showIosHint = $state(false);
+  let shouldShowInstallUi = $derived(
+    page.url.pathname === '/getting-started' || page.url.pathname === '/login' || page.url.pathname === '/setup'
+  );
 
   onMount(() => {
     if (typeof window === 'undefined') return;
-    installDismissed = window.localStorage.getItem(DISMISS_KEY_INSTALL) === '1';
+    installDismissed = isInstallPromptDismissed();
     iosDismissed = window.localStorage.getItem(DISMISS_KEY_IOS) === '1';
     // Show iOS hint only if on iOS Safari, not installed, and not previously dismissed.
-    if (isIosSafari() && !iosDismissed) {
+    if (isIosSafari() && !iosDismissed && shouldShowInstallUi) {
       showIosHint = true;
     }
+  });
+
+  $effect(() => {
+    if (!shouldShowInstallUi) {
+      installDismissed = true;
+      showIosHint = false;
+      return;
+    }
+    installDismissed = isInstallPromptDismissed();
+    showIosHint = isIosSafari() && !iosDismissed;
   });
 
   async function handleInstall(): Promise<void> {
     const outcome = await promptInstall();
     if (outcome === 'accepted') {
       installDismissed = true;
-      window.localStorage.setItem(DISMISS_KEY_INSTALL, '1');
     }
   }
 
   function dismissInstall(): void {
     installDismissed = true;
-    window.localStorage.setItem(DISMISS_KEY_INSTALL, '1');
+    dismissInstallPromptForNow();
   }
 
   function dismissIos(): void {
@@ -79,7 +93,7 @@ import X from 'lucide-svelte/icons/x';
   </div>
 {/if}
 
-{#if $installPromptAvailable && !installDismissed && $displayMode === 'browser'}
+{#if shouldShowInstallUi && $installPromptAvailable && !installDismissed && $displayMode === 'browser'}
   <div
     class="fixed inset-x-2 bottom-2 z-[70] mx-auto flex max-w-xl items-start gap-3 rounded-2xl border border-sky-400/40 bg-slate-900/95 px-4 py-3 text-sm text-slate-100 shadow-card backdrop-blur lg:bottom-4"
     style="margin-bottom: max(env(safe-area-inset-bottom), 0.5rem);"
@@ -98,7 +112,7 @@ import X from 'lucide-svelte/icons/x';
   </div>
 {/if}
 
-{#if showIosHint && $displayMode === 'browser'}
+{#if shouldShowInstallUi && showIosHint && $displayMode === 'browser'}
   <div
     class="fixed inset-x-2 bottom-2 z-[70] mx-auto flex max-w-xl items-start gap-3 rounded-2xl border border-sky-400/40 bg-slate-900/95 px-4 py-3 text-sm text-slate-100 shadow-card backdrop-blur lg:bottom-4"
     style="margin-bottom: max(env(safe-area-inset-bottom), 0.5rem);"

@@ -68,9 +68,9 @@ import X from 'lucide-svelte/icons/x';
     if (stored !== null) {
       sidebarCollapsed = stored === '1';
     } else {
-      // Default: collapsed below lg (1024px), expanded at lg+. Lower pivot than
-      // the old xl (1280px) so 1024–1279 px laptops get the side-by-side layout.
-      sidebarCollapsed = window.innerWidth < 1024;
+      // Default: collapsed below lg (1024px). On desktop chat routes, also
+      // start collapsed so the conversation view gets more width by default.
+      sidebarCollapsed = window.innerWidth < 1024 || $page.url.pathname.startsWith('/chat/');
     }
   }
 
@@ -336,6 +336,44 @@ import X from 'lucide-svelte/icons/x';
               {/if}
             </div>
             <Button class="w-full justify-center" variant="secondary" onclick={handleLogout}>Sign out</Button>
+          {:else}
+            <div class="flex flex-col items-center gap-2">
+              <span class={`inline-flex h-2.5 w-2.5 rounded-full ${websocketStatusTone()}`} aria-label={`WebSocket ${$wsState.status}`} title={websocketStatusLabel()}></span>
+              <Button
+                aria-label="Open keyboard shortcuts"
+                class="h-9 w-9"
+                size="icon"
+                variant="ghost"
+                onclick={openShortcutHelp}
+                title="Help"
+              >
+                <CircleHelp class="h-4 w-4" />
+              </Button>
+              {#if $auth.user?.role === 'admin'}
+                <Button
+                  aria-label="Open getting started guide"
+                  class="h-9 w-9"
+                  size="icon"
+                  variant="ghost"
+                  onclick={() => goto('/getting-started')}
+                  title="Getting started"
+                >
+                  <BookOpen class="h-4 w-4" />
+                </Button>
+              {/if}
+              {#if $wsState.status === 'stalled'}
+                <Button
+                  aria-label="Reconnect WebSocket"
+                  class="h-9 w-9"
+                  size="icon"
+                  variant="ghost"
+                  onclick={() => wsClient.connect()}
+                  title="Reconnect"
+                >
+                  <RefreshCw class="h-4 w-4" />
+                </Button>
+              {/if}
+            </div>
           {/if}
           <button
             class={`flex items-center rounded-xl text-xs text-slate-400 transition hover:bg-slate-800 hover:text-white ${sidebarExpanded ? 'w-full justify-center gap-2 px-3 py-2' : 'w-full justify-center py-2'}`}
