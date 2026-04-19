@@ -4,6 +4,7 @@ import Copy from 'lucide-svelte/icons/copy';
   import { onMount } from 'svelte';
   import type { MessageTimelineItem } from '$lib/chat';
   import AgentAvatar from '$lib/components/AgentAvatar.svelte';
+  import AgentProfilePopover from '$lib/components/AgentProfilePopover.svelte';
   import LiveDots from '$lib/components/LiveDots.svelte';
   import { addToast } from '$lib/stores/toasts';
   import { now as nowStore } from '$lib/stores/now';
@@ -19,6 +20,12 @@ import Copy from 'lucide-svelte/icons/copy';
     agent ? (agent.display_name ?? agent.name) : 'Assistant'
   );
   const agentAvatarUrl = $derived(agent?.avatar_url ?? null);
+
+  // Per-message agent profile popover state. Clicking the leading avatar
+  // opens a popover with the agent's name, type, and description — the
+  // same popover shown from the chat header — so the identity is always
+  // reachable from within a conversation without scrolling to the top.
+  let showAgentProfile = $state(false);
 
   // Subscribe to the single global "now" ticker instead of starting a per-message
   // setInterval. On conversations with dozens of visible messages this avoids
@@ -206,7 +213,23 @@ import Copy from 'lucide-svelte/icons/copy';
 -->
 {#if item.role === 'assistant'}
   <div class="flex w-full min-w-0 items-start gap-2 sm:gap-3">
-    <AgentAvatar name={agentName} avatarUrl={agentAvatarUrl} class="mt-0.5 h-8 w-8 shrink-0 text-xs" />
+    <div class="relative mt-0.5 shrink-0">
+      {#if agent}
+        <button
+          type="button"
+          class="block rounded-2xl transition hover:ring-2 hover:ring-sky-400/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400"
+          aria-label={`View ${agentName} profile`}
+          onclick={() => { showAgentProfile = !showAgentProfile; }}
+        >
+          <AgentAvatar name={agentName} avatarUrl={agentAvatarUrl} class="h-8 w-8 text-xs" />
+        </button>
+        {#if showAgentProfile}
+          <AgentProfilePopover {agent} onClose={() => { showAgentProfile = false; }} />
+        {/if}
+      {:else}
+        <AgentAvatar name={agentName} avatarUrl={agentAvatarUrl} class="h-8 w-8 text-xs" />
+      {/if}
+    </div>
     <article class={`overflow-hidden rounded-[1.4rem] px-3 py-2.5 shadow-card sm:rounded-3xl sm:px-4 sm:py-3 ${sizeClass()} ${bubbleClass()}`}>
       {#if item.html}
         <div use:addCodeCopyButtons={item.html} class={`chat-markdown prose max-w-none overflow-x-auto break-words prose-pre:overflow-x-auto ${proseClass()}`}>{@html item.html}</div>
