@@ -71,48 +71,6 @@ textarea:focus-visible,
   overflow-wrap: anywhere;
 }
 
-/* Zero-dep timeline virtualization: browsers skip paint/layout for messages
-   that are scrolled off-screen. `contain-intrinsic-size` gives a placeholder
-   height so the scrollbar doesn't jump when content pops in.
-
-   The `auto` keyword in `contain-intrinsic-size: auto <value>` tells the
-   browser to remember the last measured size for each element, so after a
-   one-time render the actual height is used and scroll thumb stays stable.
-   The fallback value is a per-kind estimate; we differentiate because tool
-   calls, delegation cards, and compaction cards are typically much taller
-   than a single chat bubble. */
-.chat-timeline-item {
-  content-visibility: auto;
-}
-
-.chat-timeline-item.kind-message {
-  contain-intrinsic-size: auto 140px;
-}
-
-.chat-timeline-item.kind-tool_call {
-  contain-intrinsic-size: auto 220px;
-}
-
-.chat-timeline-item.kind-reasoning {
-  contain-intrinsic-size: auto 160px;
-}
-
-.chat-timeline-item.kind-delegation {
-  contain-intrinsic-size: auto 260px;
-}
-
-.chat-timeline-item.kind-compaction {
-  contain-intrinsic-size: auto 200px;
-}
-
-.chat-timeline-item.kind-system_message {
-  contain-intrinsic-size: auto 40px;
-}
-
-.chat-timeline-item.kind-notice {
-  contain-intrinsic-size: auto 120px;
-}
-
 .chat-markdown table {
   display: block;
   width: max-content;

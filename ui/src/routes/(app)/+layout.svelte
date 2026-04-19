@@ -312,15 +312,14 @@ import X from 'lucide-svelte/icons/x';
         </div>
       </aside>
 
-      <main class="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-transparent p-0 shadow-none lg:gap-4 lg:rounded-[1.75rem] lg:border lg:border-slate-800/80 lg:bg-slate-950/70 lg:p-6 lg:shadow-card lg:backdrop-blur" id="main-content">
-        <header class="sticky top-0 z-10 flex shrink-0 items-center justify-between gap-2 border-b border-slate-800/80 bg-slate-950/95 px-3 py-2.5 backdrop-blur sm:gap-3 sm:px-4 sm:py-3 lg:rounded-2xl lg:border lg:border-slate-800/80 lg:bg-slate-900/95 lg:py-4">
-          <div class="flex min-w-0 flex-1 items-center gap-2 sm:block">
+      <main class="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-transparent p-0 shadow-none lg:gap-3 lg:rounded-[1.75rem] lg:border lg:border-slate-800/80 lg:bg-slate-950/70 lg:p-4 lg:shadow-card lg:backdrop-blur xl:p-6" id="main-content">
+        <header class="sticky top-0 z-10 flex shrink-0 items-center justify-between gap-2 border-b border-slate-800/80 bg-slate-950/95 px-3 py-2.5 backdrop-blur sm:gap-3 sm:px-4 sm:py-2.5 lg:rounded-2xl lg:border lg:border-slate-800/80 lg:bg-slate-900/95 lg:px-4 lg:py-2.5">
+          <div class="flex min-w-0 flex-1 items-center gap-2">
             <Button aria-label="Open navigation" class="h-11 w-11 lg:hidden md:h-9 md:w-9" size="icon" variant="secondary" onclick={openMobileNav}>
               <Menu class="h-5 w-5" />
             </Button>
-            <div class="min-w-0">
-              <p class="hidden text-sm font-medium uppercase tracking-[0.25em] text-slate-400 sm:block">Cognis</p>
-              <h2 class="truncate text-base font-semibold text-white sm:mt-1 sm:text-xl">{currentTitle($page.url.pathname)}</h2>
+            <div class="min-w-0 lg:hidden">
+              <h2 class="truncate text-base font-semibold text-white sm:text-lg">{currentTitle($page.url.pathname)}</h2>
             </div>
           </div>
 

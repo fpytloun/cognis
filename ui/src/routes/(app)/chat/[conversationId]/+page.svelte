@@ -129,6 +129,7 @@ import X from 'lucide-svelte/icons/x';
   let timelineEl = $state<HTMLDivElement | null>(null);
   let userScrolledUp = $state(false);
   let programmaticScroll = false;
+  let lastTimelineScrollTop = $state(0);
   let selectedChannel = $state('all');
   let chatSidebarCollapsed = $state(false);
   interface SessionInfoData {
@@ -701,12 +702,13 @@ import X from 'lucide-svelte/icons/x';
     visibleStartIndex = Math.max(0, timeline.length - 100);
   }
 
-  function scrollToBottom(): void {
-    if (!timelineEl || userScrolledUp) return;
+  function scrollToBottom(force = false): void {
+    if (!timelineEl || (!force && userScrolledUp)) return;
     programmaticScroll = true;
     requestAnimationFrame(() => {
       if (timelineEl) {
         timelineEl.scrollTop = timelineEl.scrollHeight;
+        lastTimelineScrollTop = timelineEl.scrollTop;
       }
       programmaticScroll = false;
     });
@@ -714,17 +716,26 @@ import X from 'lucide-svelte/icons/x';
 
   function handleTimelineScroll(): void {
     if (!timelineEl || programmaticScroll) return;
+    const currentScrollTop = timelineEl.scrollTop;
     const distanceFromBottom = timelineEl.scrollHeight - timelineEl.scrollTop - timelineEl.clientHeight;
-    userScrolledUp = distanceFromBottom > 80;
+
+    // Pause live-follow as soon as the user actively scrolls upward, instead
+    // of waiting until they are far away from the tail. This makes it much
+    // easier to escape a fast-moving stream on touch devices.
+    if (currentScrollTop < lastTimelineScrollTop - 2 && distanceFromBottom > 0) {
+      userScrolledUp = true;
+    } else if (distanceFromBottom <= 24) {
+      userScrolledUp = false;
+    } else if (distanceFromBottom > 80) {
+      userScrolledUp = true;
+    }
+
+    lastTimelineScrollTop = currentScrollTop;
   }
 
   function jumpToBottom(): void {
     userScrolledUp = false;
-    programmaticScroll = true;
-    if (timelineEl) {
-      timelineEl.scrollTop = timelineEl.scrollHeight;
-    }
-    programmaticScroll = false;
+    scrollToBottom(true);
   }
 
   function channelTypes(): string[] {
@@ -904,9 +915,7 @@ import X from 'lucide-svelte/icons/x';
 
     requestAnimationFrame(() => {
       requestAnimationFrame(() => {
-        if (timelineEl && !userScrolledUp) {
-          timelineEl.scrollTop = timelineEl.scrollHeight;
-        }
+        scrollToBottom(true);
       });
     });
   }
@@ -2406,31 +2415,23 @@ import X from 'lucide-svelte/icons/x';
               Send the first message to start this conversation.
             </p>
           {:else}
-            <!--
-              Timeline virtualization via CSS `content-visibility: auto`
-              (see `.chat-timeline-item` in app.css). Browsers skip paint
-              and layout of messages that are scrolled off-screen, giving
-              us most of the benefit of full virtualization without a new
-              runtime dep. `contain-intrinsic-size` supplies a placeholder
-              so the scrollbar doesn't jump while content pops in.
-            -->
             {#each displayedTimeline as item (item.id)}
               {#if item.kind === 'message'}
-                <div class={`chat-timeline-item kind-message flex min-w-0 ${item.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                <div class={`flex min-w-0 ${item.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                   <ChatMessage {item} />
                 </div>
               {:else if item.kind === 'tool_call'}
-                <div class="chat-timeline-item kind-tool_call"><ToolCallBlock {item} /></div>
+                <div><ToolCallBlock {item} /></div>
               {:else if item.kind === 'reasoning'}
-                <div class="chat-timeline-item kind-reasoning"><ReasoningBlock {item} /></div>
+                <div><ReasoningBlock {item} /></div>
               {:else if item.kind === 'delegation'}
-                <div class="chat-timeline-item kind-delegation"><DelegationCard {item} onViewSession={handleViewSession} /></div>
+                <div><DelegationCard {item} onViewSession={handleViewSession} /></div>
               {:else if item.kind === 'compaction'}
-                <div class="chat-timeline-item kind-compaction"><CompactionCard {item} onViewPreviousSession={handleViewSession} /></div>
+                <div><CompactionCard {item} onViewPreviousSession={handleViewSession} /></div>
               {:else if item.kind === 'system_message'}
-                <p class="chat-timeline-item kind-system_message py-1 text-center text-xs italic text-slate-500 whitespace-pre-line">{item.text}</p>
+                <p class="py-1 text-center text-xs italic text-slate-500 whitespace-pre-line">{item.text}</p>
               {:else}
-                <article class={`chat-timeline-item kind-notice rounded-3xl border px-4 py-4 text-sm shadow-card ${item.tone === 'warning' ? 'border-amber-500/30 bg-amber-500/10 text-amber-100' : item.tone === 'error' ? 'border-rose-500/30 bg-rose-500/10 text-rose-100' : 'border-slate-700 bg-slate-900 text-slate-200'}`}>
+                <article class={`rounded-3xl border px-4 py-4 text-sm shadow-card ${item.tone === 'warning' ? 'border-amber-500/30 bg-amber-500/10 text-amber-100' : item.tone === 'error' ? 'border-rose-500/30 bg-rose-500/10 text-rose-100' : 'border-slate-700 bg-slate-900 text-slate-200'}`}>
                   <h3 class="font-semibold">{item.title}</h3>
                   <p class="mt-2 leading-6">{item.description}</p>
                 </article>

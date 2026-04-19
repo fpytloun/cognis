@@ -21,21 +21,62 @@ interface BeforeInstallPromptEvent extends Event {
 
 let deferredPrompt: BeforeInstallPromptEvent | null = null;
 
+const AUTO_APPLY_WAITING_PREFIX = 'cognis-sw-auto-apply:';
+const AUTO_APPLY_TIMEOUT_MS = 5000;
+
 export const installPromptAvailable = writable(false);
 export const updateAvailable = writable(false);
 
-function activateWaitingWorker(waiting: ServiceWorker): void {
+function waitingWorkerAttemptKey(waiting: ServiceWorker): string | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    return `${AUTO_APPLY_WAITING_PREFIX}${waiting.scriptURL}`;
+  } catch {
+    return null;
+  }
+}
+
+function activateWaitingWorker(waiting: ServiceWorker, options: { auto?: boolean } = {}): void {
   updateAvailable.set(false);
+
+  const attemptKey = options.auto ? waitingWorkerAttemptKey(waiting) : null;
+  let timeoutId: number | null = null;
+
+  const onControllerChange = () => {
+    if (timeoutId !== null) {
+      window.clearTimeout(timeoutId);
+    }
+    if (attemptKey) {
+      window.sessionStorage.removeItem(attemptKey);
+    }
+    window.location.reload();
+  };
 
   navigator.serviceWorker.addEventListener(
     'controllerchange',
-    () => {
-      window.location.reload();
-    },
+    onControllerChange,
     { once: true }
   );
 
+  if (attemptKey) {
+    timeoutId = window.setTimeout(() => {
+      navigator.serviceWorker.removeEventListener('controllerchange', onControllerChange);
+      updateAvailable.set(true);
+    }, AUTO_APPLY_TIMEOUT_MS);
+  }
+
   waiting.postMessage({ type: 'SKIP_WAITING' });
+}
+
+function tryAutoApplyWaitingWorker(waiting: ServiceWorker): boolean {
+  const attemptKey = waitingWorkerAttemptKey(waiting);
+  if (!attemptKey) return false;
+  if (window.sessionStorage.getItem(attemptKey) === '1') {
+    return false;
+  }
+  window.sessionStorage.setItem(attemptKey, '1');
+  activateWaitingWorker(waiting, { auto: true });
+  return true;
 }
 
 if (typeof window !== 'undefined') {
@@ -123,7 +164,9 @@ export async function registerServiceWorker(): Promise<void> {
     // refreshed or reopened the app since the update banner first appeared.
     // Finish applying the update instead of showing the same banner again.
     if (registration.waiting && navigator.serviceWorker.controller) {
-      activateWaitingWorker(registration.waiting);
+      if (!tryAutoApplyWaitingWorker(registration.waiting)) {
+        updateAvailable.set(true);
+      }
       return;
     }
 
