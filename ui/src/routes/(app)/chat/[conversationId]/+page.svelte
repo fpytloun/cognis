@@ -15,15 +15,15 @@ import Info from 'lucide-svelte/icons/info';
 import Maximize2 from 'lucide-svelte/icons/maximize-2';
 import Menu from 'lucide-svelte/icons/menu';
 import Minimize2 from 'lucide-svelte/icons/minimize-2';
-import Paperclip from 'lucide-svelte/icons/paperclip';
 import Search from 'lucide-svelte/icons/search';
-import X from 'lucide-svelte/icons/x';
 
   import AgentAvatar from '$lib/components/AgentAvatar.svelte';
   import AgentProfilePopover from '$lib/components/AgentProfilePopover.svelte';
   import AgentSelect from '$lib/components/AgentSelect.svelte';
+  import AttachFileButton from '$lib/components/AttachFileButton.svelte';
   import ChatMessage from '$lib/components/ChatMessage.svelte';
   import CompactionCard from '$lib/components/CompactionCard.svelte';
+  import ComposerAttachments from '$lib/components/ComposerAttachments.svelte';
   import DelegationCard from '$lib/components/DelegationCard.svelte';
   import EscalationPrompt from '$lib/components/EscalationPrompt.svelte';
   import LiveDots from '$lib/components/LiveDots.svelte';
@@ -88,7 +88,6 @@ import X from 'lucide-svelte/icons/x';
   let composer = $state('');
   let composerElement = $state<HTMLTextAreaElement | null>(null);
   let expandedComposerElement = $state<HTMLTextAreaElement | null>(null);
-  let attachmentInput = $state<HTMLInputElement | null>(null);
   let composerAttachments = $state<AttachmentRef[]>([]);
   let composerExpanded = $state(false);
   let showDropZone = $state(false);
@@ -1474,13 +1473,6 @@ import X from 'lucide-svelte/icons/x';
     }
   }
 
-  async function handleAttachmentSelect(event: Event): Promise<void> {
-    const files = (event.currentTarget as HTMLInputElement).files;
-    if (!files || files.length === 0) return;
-    await uploadFiles(Array.from(files));
-    if (attachmentInput) attachmentInput.value = '';
-  }
-
   function removeAttachment(artifactId: string): void {
     composerAttachments = composerAttachments.filter((item) => item.artifact_id !== artifactId);
   }
@@ -2733,18 +2725,11 @@ import X from 'lucide-svelte/icons/x';
                 {/if}
               </div>
             {/if}
-            {#if composerAttachments.length > 0}
-              <div class="flex flex-wrap gap-2">
-                {#each composerAttachments as attachment}
-                  <div class="flex items-center gap-2 rounded-full border border-slate-700 bg-slate-950/70 px-3 py-2 text-xs text-slate-200">
-                    <span class="truncate max-w-[220px]">{attachment.filename}</span>
-                    <button type="button" class="text-slate-400 hover:text-white" onclick={() => removeAttachment(attachment.artifact_id)} aria-label="Remove attachment">
-                      <X class="h-3.5 w-3.5" />
-                    </button>
-                  </div>
-                {/each}
-              </div>
-            {/if}
+            <ComposerAttachments
+              attachments={composerAttachments}
+              onremove={removeAttachment}
+              disabled={directQuestionSubmitting}
+            />
             <div class="relative">
               <textarea
                 bind:this={composerElement}
@@ -2776,10 +2761,7 @@ import X from 'lucide-svelte/icons/x';
                 <span>Press Enter to send</span>
               </label>
               <div class="flex flex-wrap justify-end gap-2">
-                <input bind:this={attachmentInput} class="hidden" type="file" multiple onchange={(event) => void handleAttachmentSelect(event)} />
-                <Button size="sm" variant="secondary" type="button" disabled={directQuestionSubmitting} onclick={() => attachmentInput?.click()}>
-                  <Paperclip class="h-4 w-4 sm:mr-2" /> <span class="hidden sm:inline">Attach</span>
-                </Button>
+                <AttachFileButton onchange={uploadFiles} disabled={directQuestionSubmitting} />
                 {#if turnInProgress}
                   <Button size="sm" variant="secondary" type="button" onclick={() => currentConversation && wsClient.cancelTurn(currentConversation.conversation_id)}>
                     Cancel turn
@@ -2841,18 +2823,11 @@ import X from 'lucide-svelte/icons/x';
                   {/each}
                 </div>
               {/if}
-              {#if composerAttachments.length > 0}
-                <div class="flex flex-wrap gap-2">
-                  {#each composerAttachments as attachment}
-                    <div class="flex items-center gap-2 rounded-full border border-slate-700 bg-slate-900/80 px-3 py-2 text-xs text-slate-200">
-                      <span class="max-w-[320px] truncate">{attachment.filename}</span>
-                      <button type="button" class="text-slate-400 hover:text-white" onclick={() => removeAttachment(attachment.artifact_id)} aria-label="Remove attachment">
-                        <X class="h-3.5 w-3.5" />
-                      </button>
-                    </div>
-                  {/each}
-                </div>
-              {/if}
+              <ComposerAttachments
+                attachments={composerAttachments}
+                onremove={removeAttachment}
+                disabled={directQuestionSubmitting}
+              />
               <textarea
                 bind:this={expandedComposerElement}
                 bind:value={composer}
@@ -2869,9 +2844,7 @@ import X from 'lucide-svelte/icons/x';
                   <span>Press Enter to send</span>
                 </label>
                 <div class="flex flex-wrap justify-end gap-2">
-                  <Button size="sm" variant="secondary" type="button" disabled={directQuestionSubmitting} onclick={() => attachmentInput?.click()}>
-                    <Paperclip class="h-4 w-4 sm:mr-2" /> <span class="hidden sm:inline">Attach</span>
-                  </Button>
+                  <AttachFileButton onchange={uploadFiles} disabled={directQuestionSubmitting} />
                   <Button size="sm" variant="secondary" type="button" onclick={() => void closeExpandedComposer()}>
                     Close
                   </Button>
