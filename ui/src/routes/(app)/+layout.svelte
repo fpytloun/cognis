@@ -204,7 +204,22 @@ import X from 'lucide-svelte/icons/x';
 
   let isChatRoute = $derived($page.url.pathname.startsWith('/chat'));
   let isChatDetailRoute = $derived(/^\/chat\/[^/]+/.test($page.url.pathname));
+  let showMobileHeader = $derived(!isChatDetailRoute);
   let shouldReserveBottomTabSpace = $derived(!isChatDetailRoute);
+
+  function websocketStatusLabel(): string {
+    if ($wsState.status === 'connected') return 'Connected';
+    if ($wsState.status === 'stalled') return 'Disconnected';
+    if ($wsState.status === 'reconnecting') return `Reconnecting (${$wsState.attempts}/10)`;
+    if ($wsState.status === 'connecting') return 'Connecting';
+    return 'Idle';
+  }
+
+  function websocketStatusTone(): string {
+    if ($wsState.status === 'connected') return 'bg-emerald-400';
+    if ($wsState.status === 'stalled') return 'bg-rose-400';
+    return 'bg-amber-400';
+  }
 
   onMount(() => {
     restoreSidebarState();
@@ -292,6 +307,34 @@ import X from 'lucide-svelte/icons/x';
               <p class="text-sm font-medium text-white">{$auth.user?.name ?? $auth.user?.email}</p>
               <p class="text-xs text-slate-400">{$auth.user?.email}</p>
             </div>
+            <div class="space-y-2 rounded-2xl border border-slate-800/80 bg-slate-950/60 px-3 py-3 text-sm text-slate-300">
+              <div class="flex items-center justify-between gap-3">
+                <span class="text-xs font-medium uppercase tracking-[0.2em] text-slate-400">Workspace</span>
+                <span class={`inline-flex h-2.5 w-2.5 rounded-full ${websocketStatusTone()}`} aria-label={`WebSocket ${$wsState.status}`}></span>
+              </div>
+              <div class="flex items-center justify-between gap-3 text-xs text-slate-400">
+                <span>WebSocket</span>
+                <span class="text-right">{websocketStatusLabel()}</span>
+              </div>
+              <div class="flex gap-2">
+                <Button class="flex-1 justify-center" size="sm" variant="secondary" onclick={openShortcutHelp}>
+                  <CircleHelp class="mr-1.5 h-3.5 w-3.5" />
+                  Help
+                </Button>
+                {#if $wsState.status === 'stalled'}
+                  <Button class="flex-1 justify-center" size="sm" variant="secondary" onclick={() => wsClient.connect()}>
+                    <RefreshCw class="mr-1.5 h-3.5 w-3.5" />
+                    Reconnect
+                  </Button>
+                {/if}
+              </div>
+              {#if $auth.user?.role === 'admin'}
+                <Button class="w-full justify-center" size="sm" variant="secondary" onclick={() => goto('/getting-started')}>
+                  <BookOpen class="mr-1.5 h-3.5 w-3.5" />
+                  Getting started
+                </Button>
+              {/if}
+            </div>
             <Button class="w-full justify-center" variant="secondary" onclick={handleLogout}>Sign out</Button>
           {/if}
           <button
@@ -311,6 +354,7 @@ import X from 'lucide-svelte/icons/x';
       </aside>
 
       <main class="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-transparent p-0 shadow-none lg:gap-3 lg:rounded-[1.75rem] lg:border lg:border-slate-800/80 lg:bg-slate-950/70 lg:p-4 lg:shadow-card lg:backdrop-blur xl:p-6" id="main-content">
+        {#if showMobileHeader}
         <header class="sticky top-0 z-10 flex shrink-0 items-center justify-between gap-2 border-b border-slate-800/80 bg-slate-950/95 px-3 py-2.5 backdrop-blur sm:gap-3 sm:px-4 sm:py-2.5 lg:hidden">
           <div class="flex min-w-0 flex-1 items-center gap-2 lg:hidden">
             <Button aria-label="Open navigation" class="h-11 w-11 lg:hidden md:h-9 md:w-9" size="icon" variant="secondary" onclick={openMobileNav}>
@@ -351,6 +395,7 @@ import X from 'lucide-svelte/icons/x';
             {/if}
           </div>
         </header>
+        {/if}
 
         {#if outageBanners().length > 0}
           <div class="space-y-3">
@@ -427,9 +472,34 @@ import X from 'lucide-svelte/icons/x';
     </nav>
 
     <div class="mt-6 space-y-3 border-t border-slate-800 pt-5">
-      {#if $auth.user?.role === 'admin'}
-        <Button class="w-full justify-center" variant="secondary" onclick={() => { closeMobileNav(); void goto('/getting-started'); }}>Getting started</Button>
-      {/if}
+      <div class="space-y-2 rounded-2xl border border-slate-800/80 bg-slate-950/60 px-3 py-3 text-sm text-slate-300">
+        <div class="flex items-center justify-between gap-3">
+          <span class="text-xs font-medium uppercase tracking-[0.2em] text-slate-400">Workspace</span>
+          <span class={`inline-flex h-2.5 w-2.5 rounded-full ${websocketStatusTone()}`} aria-label={`WebSocket ${$wsState.status}`}></span>
+        </div>
+        <div class="flex items-center justify-between gap-3 text-xs text-slate-400">
+          <span>WebSocket</span>
+          <span class="text-right">{websocketStatusLabel()}</span>
+        </div>
+        <div class="flex gap-2">
+          <Button class="flex-1 justify-center" variant="secondary" onclick={() => { closeMobileNav(); openShortcutHelp(); }}>
+            <CircleHelp class="mr-1.5 h-3.5 w-3.5" />
+            Help
+          </Button>
+          {#if $wsState.status === 'stalled'}
+            <Button class="flex-1 justify-center" variant="secondary" onclick={() => { closeMobileNav(); wsClient.connect(); }}>
+              <RefreshCw class="mr-1.5 h-3.5 w-3.5" />
+              Reconnect
+            </Button>
+          {/if}
+        </div>
+        {#if $auth.user?.role === 'admin'}
+          <Button class="w-full justify-center" variant="secondary" onclick={() => { closeMobileNav(); void goto('/getting-started'); }}>
+            <BookOpen class="mr-1.5 h-3.5 w-3.5" />
+            Getting started
+          </Button>
+        {/if}
+      </div>
       <Button class="w-full justify-center" variant="secondary" onclick={handleLogout}>Sign out</Button>
     </div>
   </Sheet>
