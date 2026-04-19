@@ -68,13 +68,49 @@
     }
   }
 
+  /**
+   * iOS Safari (including PWAs) does not reliably honour
+   * ``document.body.style.overflow = 'hidden'`` — rubber-band scroll
+   * still bubbles to the page behind the sheet, making the background
+   * feel like it takes precedence when the user scrolls inside the
+   * sheet. The proven workaround is to pin the body at the current
+   * scroll offset with ``position: fixed`` and restore the offset on
+   * close.
+   */
+  let savedScrollY = 0;
+
+  function lockBodyScroll(): void {
+    if (typeof document === 'undefined') return;
+    savedScrollY = window.scrollY || document.documentElement.scrollTop || 0;
+    document.body.style.position = 'fixed';
+    document.body.style.top = `-${savedScrollY}px`;
+    document.body.style.left = '0';
+    document.body.style.right = '0';
+    document.body.style.width = '100%';
+    document.body.style.overflow = 'hidden';
+  }
+
+  function unlockBodyScroll(): void {
+    if (typeof document === 'undefined') return;
+    document.body.style.position = '';
+    document.body.style.top = '';
+    document.body.style.left = '';
+    document.body.style.right = '';
+    document.body.style.width = '';
+    document.body.style.overflow = '';
+    if (savedScrollY > 0) {
+      window.scrollTo(0, savedScrollY);
+      savedScrollY = 0;
+    }
+  }
+
   $effect(() => {
     if (open) {
       previouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-      document.body.style.overflow = 'hidden';
+      lockBodyScroll();
       requestAnimationFrame(() => focusPanel());
     } else {
-      document.body.style.overflow = '';
+      unlockBodyScroll();
       previouslyFocused?.focus();
       previouslyFocused = null;
       dragOffsetY = 0;
@@ -84,7 +120,7 @@
 
   onMount(() => {
     return () => {
-      document.body.style.overflow = '';
+      unlockBodyScroll();
     };
   });
 
@@ -167,9 +203,11 @@
     aria-modal="true"
     aria-label={label}
   >
-    <!-- Backdrop -->
+    <!-- Backdrop. `touch-action: none` stops iOS Safari from
+         rubber-band-scrolling the page behind when the user drags
+         across the dimmed area. -->
     <button
-      class="absolute inset-0 bg-slate-950/75 backdrop-blur-sm"
+      class="absolute inset-0 touch-none bg-slate-950/75 backdrop-blur-sm"
       onclick={dismissible ? onClose : undefined}
       type="button"
       aria-label="Dismiss"
@@ -187,7 +225,7 @@
         className
       )}
       style={side === 'bottom'
-        ? `max-height: ${maxHeight}; transform: translateY(${dragOffsetY}px); transition: ${dragging ? 'none' : 'transform 180ms cubic-bezier(.32,.72,0,1)'}; padding-bottom: env(safe-area-inset-bottom);`
+        ? `max-height: ${maxHeight}; transform: translateY(${dragOffsetY}px); transition: ${dragging ? 'none' : 'transform 180ms cubic-bezier(.32,.72,0,1)'}; padding-bottom: calc(env(safe-area-inset-bottom) + 0.75rem);`
         : side === 'right'
         ? `padding-bottom: env(safe-area-inset-bottom); padding-right: env(safe-area-inset-right);`
         : undefined}
