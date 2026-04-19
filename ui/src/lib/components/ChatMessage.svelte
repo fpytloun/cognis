@@ -3,12 +3,22 @@
 import Copy from 'lucide-svelte/icons/copy';
   import { onMount } from 'svelte';
   import type { MessageTimelineItem } from '$lib/chat';
+  import AgentAvatar from '$lib/components/AgentAvatar.svelte';
   import LiveDots from '$lib/components/LiveDots.svelte';
   import { addToast } from '$lib/stores/toasts';
   import { now as nowStore } from '$lib/stores/now';
   import { formatAbsoluteTime, formatCompactTime } from '$lib/time';
+  import type { Agent } from '$lib/types/api';
 
-  let { item } = $props<{ item: MessageTimelineItem }>();
+  let { item, agent = null } = $props<{
+    item: MessageTimelineItem;
+    agent?: Agent | null;
+  }>();
+
+  const agentName = $derived(
+    agent ? (agent.display_name ?? agent.name) : 'Assistant'
+  );
+  const agentAvatarUrl = $derived(agent?.avatar_url ?? null);
 
   // Subscribe to the single global "now" ticker instead of starting a per-message
   // setInterval. On conversations with dozens of visible messages this avoids
@@ -21,7 +31,7 @@ import Copy from 'lucide-svelte/icons/copy';
 
   function sizeClass(): string {
     return item.role === 'assistant'
-      ? 'w-full min-w-0 xl:max-w-3xl'
+      ? 'min-w-0 flex-1 xl:max-w-3xl'
       : 'w-full min-w-0 sm:max-w-[88%] xl:max-w-2xl';
   }
 
@@ -183,60 +193,114 @@ import Copy from 'lucide-svelte/icons/copy';
   }
 </script>
 
-<article class={`overflow-hidden rounded-[1.4rem] px-3 py-2.5 shadow-card sm:rounded-3xl sm:px-4 sm:py-3 ${sizeClass()} ${bubbleClass()}`}>
-  {#if item.html}
-    <div use:addCodeCopyButtons={item.html} class={`chat-markdown prose max-w-none overflow-x-auto break-words prose-pre:overflow-x-auto ${proseClass()}`}>{@html item.html}</div>
-  {:else}
-    <p class="whitespace-pre-wrap break-words text-sm leading-6 [overflow-wrap:anywhere]">{item.content}</p>
-  {/if}
+<!--
+  Assistant messages are wrapped in a row: a 32px agent avatar on the
+  leading edge and the bubble filling the remaining width. The footer
+  inside the bubble repeats the agent name next to a small avatar so the
+  identity stays visible at the end of long responses, where a reader
+  has usually scrolled past the top-of-message avatar.
 
-  {#if item.attachments && item.attachments.length > 0}
-    <div class="mt-4 space-y-3">
-      {#each item.attachments as attachment}
-        {#if attachment.url && isImage(attachment.mime_type)}
-          <a href={attachment.url} target="_blank" rel="noreferrer" class="block overflow-hidden rounded-2xl border border-slate-800 bg-slate-950/60">
-            <img src={attachment.url} alt={attachment.filename} class="max-h-80 w-full object-cover" loading="lazy" />
-            <div class="px-3 py-2 text-xs text-slate-400">{attachment.filename}</div>
-          </a>
-        {:else if attachment.url}
-          <a href={attachment.url} target="_blank" rel="noreferrer" class="flex items-center justify-between rounded-2xl border border-slate-800 bg-slate-950/60 px-3 py-3 text-sm text-slate-200 hover:border-slate-600">
-            <span class="truncate">{attachment.filename}</span>
-            <span class="text-xs text-slate-500">{attachment.mime_type}</span>
-          </a>
-        {:else}
-          <div class="rounded-2xl border border-slate-800 bg-slate-950/60 px-3 py-3 text-sm text-slate-300">{attachment.filename}</div>
-        {/if}
-      {/each}
-    </div>
-  {/if}
+  User messages stay right-aligned without a leading avatar — the
+  right-edge alignment already communicates "from me" and matches
+  standard messaging-app conventions on mobile.
+-->
+{#if item.role === 'assistant'}
+  <div class="flex w-full min-w-0 items-start gap-2 sm:gap-3">
+    <AgentAvatar name={agentName} avatarUrl={agentAvatarUrl} class="mt-0.5 h-8 w-8 shrink-0 text-xs" />
+    <article class={`overflow-hidden rounded-[1.4rem] px-3 py-2.5 shadow-card sm:rounded-3xl sm:px-4 sm:py-3 ${sizeClass()} ${bubbleClass()}`}>
+      {#if item.html}
+        <div use:addCodeCopyButtons={item.html} class={`chat-markdown prose max-w-none overflow-x-auto break-words prose-pre:overflow-x-auto ${proseClass()}`}>{@html item.html}</div>
+      {:else}
+        <p class="whitespace-pre-wrap break-words text-sm leading-6 [overflow-wrap:anywhere]">{item.content}</p>
+      {/if}
 
-  <div class="mt-2.5 flex items-center justify-between gap-3 text-[10px] uppercase tracking-[0.18em] opacity-70 sm:mt-3 sm:text-[11px]">
-    <div class="flex items-center gap-2 sm:gap-3">
-      <span>{item.role}</span>
+      {#if item.attachments && item.attachments.length > 0}
+        <div class="mt-4 space-y-3">
+          {#each item.attachments as attachment}
+            {#if attachment.url && isImage(attachment.mime_type)}
+              <a href={attachment.url} target="_blank" rel="noreferrer" class="block overflow-hidden rounded-2xl border border-slate-800 bg-slate-950/60">
+                <img src={attachment.url} alt={attachment.filename} class="max-h-80 w-full object-cover" loading="lazy" />
+                <div class="px-3 py-2 text-xs text-slate-400">{attachment.filename}</div>
+              </a>
+            {:else if attachment.url}
+              <a href={attachment.url} target="_blank" rel="noreferrer" class="flex items-center justify-between rounded-2xl border border-slate-800 bg-slate-950/60 px-3 py-3 text-sm text-slate-200 hover:border-slate-600">
+                <span class="truncate">{attachment.filename}</span>
+                <span class="text-xs text-slate-500">{attachment.mime_type}</span>
+              </a>
+            {:else}
+              <div class="rounded-2xl border border-slate-800 bg-slate-950/60 px-3 py-3 text-sm text-slate-300">{attachment.filename}</div>
+            {/if}
+          {/each}
+        </div>
+      {/if}
+
+      <div class="mt-2.5 flex items-center justify-between gap-3 text-[11px] opacity-80 sm:mt-3">
+        <div class="flex min-w-0 items-center gap-1.5">
+          <AgentAvatar name={agentName} avatarUrl={agentAvatarUrl} class="h-4 w-4 rounded-md text-[9px]" />
+          <span class="truncate font-medium text-slate-200">{agentName}</span>
+          <span class="text-slate-500">·</span>
+          <span class="text-slate-400" title={formatAbsoluteTime(item.timestamp)}>{formatCompactTime(item.timestamp, nowDate)}</span>
+        </div>
+        <div class="flex shrink-0 items-center gap-2">
+          {#if item.streaming}
+            <!-- The animated dots alone convey streaming; the "Live" label was
+                 visual noise. An sr-only span keeps an accessible name. -->
+            <LiveDots inline={true} size="sm" tone="sky" />
+            <span class="sr-only">Streaming</span>
+          {/if}
+          {#if !item.streaming}
+            <button
+              class="inline-flex h-10 w-10 items-center justify-center rounded-full text-slate-400 transition hover:bg-slate-800/80 hover:text-slate-100 md:h-8 md:w-8"
+              onclick={copyMessage}
+              type="button"
+              title="Copy raw markdown"
+              aria-label="Copy raw markdown"
+            >
+              {#if messageCopied}
+                <Check class="h-4 w-4 md:h-3.5 md:w-3.5" />
+              {:else}
+                <Copy class="h-4 w-4 md:h-3.5 md:w-3.5" />
+              {/if}
+            </button>
+          {/if}
+        </div>
+      </div>
+    </article>
+  </div>
+{:else}
+  <article class={`overflow-hidden rounded-[1.4rem] px-3 py-2.5 shadow-card sm:rounded-3xl sm:px-4 sm:py-3 ${sizeClass()} ${bubbleClass()}`}>
+    {#if item.html}
+      <div use:addCodeCopyButtons={item.html} class={`chat-markdown prose max-w-none overflow-x-auto break-words prose-pre:overflow-x-auto ${proseClass()}`}>{@html item.html}</div>
+    {:else}
+      <p class="whitespace-pre-wrap break-words text-sm leading-6 [overflow-wrap:anywhere]">{item.content}</p>
+    {/if}
+
+    {#if item.attachments && item.attachments.length > 0}
+      <div class="mt-4 space-y-3">
+        {#each item.attachments as attachment}
+          {#if attachment.url && isImage(attachment.mime_type)}
+            <a href={attachment.url} target="_blank" rel="noreferrer" class="block overflow-hidden rounded-2xl border border-slate-800 bg-slate-950/60">
+              <img src={attachment.url} alt={attachment.filename} class="max-h-80 w-full object-cover" loading="lazy" />
+              <div class="px-3 py-2 text-xs text-slate-400">{attachment.filename}</div>
+            </a>
+          {:else if attachment.url}
+            <a href={attachment.url} target="_blank" rel="noreferrer" class="flex items-center justify-between rounded-2xl border border-slate-800 bg-slate-950/60 px-3 py-3 text-sm text-slate-200 hover:border-slate-600">
+              <span class="truncate">{attachment.filename}</span>
+              <span class="text-xs text-slate-500">{attachment.mime_type}</span>
+            </a>
+          {:else}
+            <div class="rounded-2xl border border-slate-800 bg-slate-950/60 px-3 py-3 text-sm text-slate-300">{attachment.filename}</div>
+          {/if}
+        {/each}
+      </div>
+    {/if}
+
+    <div class="mt-2 flex items-center justify-end gap-2 text-[11px] opacity-70 sm:mt-2.5">
       <span title={formatAbsoluteTime(item.timestamp)}>{formatCompactTime(item.timestamp, nowDate)}</span>
-    </div>
-    <div class="flex items-center gap-2">
       {#if item.streaming}
-        <!-- The animated dots alone convey streaming; the "Live" label was
-             visual noise. An sr-only span keeps an accessible name. -->
-        <LiveDots inline={true} size="sm" tone={item.role === 'assistant' ? 'sky' : 'slate'} />
+        <LiveDots inline={true} size="sm" tone="slate" />
         <span class="sr-only">Streaming</span>
       {/if}
-      {#if item.role === 'assistant' && !item.streaming}
-        <button
-          class="inline-flex h-10 w-10 items-center justify-center rounded-full text-slate-400 transition hover:bg-slate-800/80 hover:text-slate-100 md:h-8 md:w-8"
-          onclick={copyMessage}
-          type="button"
-          title="Copy raw markdown"
-          aria-label="Copy raw markdown"
-        >
-          {#if messageCopied}
-            <Check class="h-4 w-4 md:h-3.5 md:w-3.5" />
-          {:else}
-            <Copy class="h-4 w-4 md:h-3.5 md:w-3.5" />
-          {/if}
-        </button>
-      {/if}
     </div>
-  </div>
-</article>
+  </article>
+{/if}

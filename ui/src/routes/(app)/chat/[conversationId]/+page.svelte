@@ -2573,7 +2573,7 @@ import X from 'lucide-svelte/icons/x';
             {#each displayedTimeline as item (item.id)}
               {#if item.kind === 'message'}
                 <div class={`flex min-w-0 ${item.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                  <ChatMessage {item} />
+                  <ChatMessage {item} agent={currentConversation ? conversationAgent(currentConversation) ?? null : null} />
                 </div>
               {:else if item.kind === 'tool_call'}
                 <div><ToolCallBlock {item} /></div>
@@ -2969,7 +2969,7 @@ import X from 'lucide-svelte/icons/x';
               {#each subSessionTimeline as item (item.id)}
                 {#if item.kind === 'message'}
                   <div class={`flex min-w-0 ${item.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                    <ChatMessage {item} />
+                    <ChatMessage {item} agent={currentConversation ? conversationAgent(currentConversation) ?? null : null} />
                   </div>
                 {:else if item.kind === 'tool_call'}
                   <ToolCallBlock {item} />
