@@ -13,6 +13,7 @@
   let { children }: { children: Snippet } = $props();
 
   onMount(() => {
+    (window as Window & { __cognisStartupRecoverySuccess?: () => void }).__cognisStartupRecoverySuccess?.();
     void registerServiceWorker();
     // Keep subscription alive.
     const unsub = keyboardOffset.subscribe(() => {});

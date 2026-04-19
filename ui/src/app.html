@@ -38,6 +38,115 @@
     <link rel="apple-touch-startup-image" href="/pwa/apple-splash-750-1334.png"
           media="(device-width: 375px) and (device-height: 667px) and (-webkit-device-pixel-ratio: 2)" />
 
+    <script>
+      (() => {
+        const RECOVERY_KEY = 'cognis-startup-recovery-attempted';
+        const RECOVERY_PARAM = '__cognis_recover';
+        const CHUNK_ERROR_RE = /Failed to fetch dynamically imported module|Importing a module script failed|ChunkLoadError|error loading dynamically imported module/i;
+
+        function extractMessage(value) {
+          if (!value) return '';
+          if (typeof value === 'string') return value;
+          if (typeof value.message === 'string') return value.message;
+          try {
+            return String(value);
+          } catch {
+            return '';
+          }
+        }
+
+        async function clearCognisCaches() {
+          if ('serviceWorker' in navigator) {
+            const registrations = await navigator.serviceWorker.getRegistrations();
+            await Promise.all(registrations.map((registration) => registration.unregister().catch(() => false)));
+          }
+
+          if ('caches' in window) {
+            const names = await caches.keys();
+            await Promise.all(
+              names.filter((name) => name.startsWith('cognis-')).map((name) => caches.delete(name).catch(() => false))
+            );
+          }
+        }
+
+        function renderRecoveryScreen(message) {
+          const mount = () => {
+            if (document.getElementById('cognis-startup-recovery')) return;
+
+            const wrapper = document.createElement('div');
+            wrapper.id = 'cognis-startup-recovery';
+            wrapper.style.cssText = 'position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;padding:24px;background:#020617;color:#e2e8f0;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;';
+            wrapper.innerHTML = [
+              '<div style="max-width:420px;width:100%;border:1px solid rgba(51,65,85,.8);border-radius:24px;background:rgba(15,23,42,.96);padding:24px;box-shadow:0 24px 64px rgba(0,0,0,.45);">',
+              '<h1 style="margin:0 0 12px;font-size:20px;font-weight:700;color:#fff;">Reload Cognis</h1>',
+              '<p style="margin:0 0 12px;line-height:1.6;color:#cbd5e1;">The app code on this device is out of date and Safari could not load the latest version.</p>',
+              message ? `<p style="margin:0 0 16px;font-size:12px;line-height:1.5;color:#94a3b8;word-break:break-word;">${message.replace(/[<>&]/g, '')}</p>` : '',
+              '<button id="cognis-recovery-reload" type="button" style="width:100%;min-height:44px;border:0;border-radius:14px;background:#0ea5e9;color:#082f49;font-size:15px;font-weight:700;cursor:pointer;">Reload app</button>',
+              '</div>'
+            ].join('');
+            document.body.appendChild(wrapper);
+            wrapper.querySelector('#cognis-recovery-reload')?.addEventListener('click', async () => {
+              await clearCognisCaches().catch(() => {});
+              const url = new URL(window.location.href);
+              url.searchParams.delete(RECOVERY_PARAM);
+              window.location.replace(url.toString());
+            });
+          };
+
+          if (document.body) {
+            mount();
+          } else {
+            document.addEventListener('DOMContentLoaded', mount, { once: true });
+          }
+        }
+
+        async function recoverFromChunkFailure(message) {
+          if (sessionStorage.getItem(RECOVERY_KEY) === '1') {
+            renderRecoveryScreen(message);
+            return;
+          }
+
+          sessionStorage.setItem(RECOVERY_KEY, '1');
+          await clearCognisCaches().catch(() => {});
+
+          const url = new URL(window.location.href);
+          url.searchParams.set(RECOVERY_PARAM, '1');
+          window.location.replace(url.toString());
+        }
+
+        window.__cognisStartupRecoverySuccess = () => {
+          sessionStorage.removeItem(RECOVERY_KEY);
+          const url = new URL(window.location.href);
+          if (url.searchParams.has(RECOVERY_PARAM)) {
+            url.searchParams.delete(RECOVERY_PARAM);
+            window.history.replaceState(window.history.state, '', url.toString());
+          }
+        };
+
+        window.addEventListener('vite:preloadError', (event) => {
+          event.preventDefault?.();
+          void recoverFromChunkFailure('A cached app chunk could not be loaded.');
+        });
+
+        window.addEventListener('unhandledrejection', (event) => {
+          const message = extractMessage(event.reason);
+          if (!CHUNK_ERROR_RE.test(message)) return;
+          event.preventDefault?.();
+          void recoverFromChunkFailure(message);
+        });
+
+        window.addEventListener('error', (event) => {
+          const message = extractMessage(event.error || event.message);
+          const target = event.target;
+          const isScriptResourceFailure =
+            target instanceof HTMLScriptElement ||
+            (target instanceof HTMLLinkElement && target.rel === 'modulepreload');
+          if (!isScriptResourceFailure && !CHUNK_ERROR_RE.test(message)) return;
+          void recoverFromChunkFailure(message || 'The latest app code failed to load.');
+        }, true);
+      })();
+    </script>
+
     <title>Cognis</title>
     %sveltekit.head%
   </head>

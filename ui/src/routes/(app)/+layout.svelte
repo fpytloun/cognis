@@ -17,7 +17,6 @@ import RefreshCw from 'lucide-svelte/icons/refresh-cw';
 import ServerCrash from 'lucide-svelte/icons/server-crash';
 import Settings from 'lucide-svelte/icons/settings';
 import ShieldAlert from 'lucide-svelte/icons/shield-alert';
-import Wifi from 'lucide-svelte/icons/wifi';
 import Workflow from 'lucide-svelte/icons/workflow';
 import Wrench from 'lucide-svelte/icons/wrench';
 import X from 'lucide-svelte/icons/x';
@@ -312,7 +311,7 @@ import X from 'lucide-svelte/icons/x';
       </aside>
 
       <main class="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-transparent p-0 shadow-none lg:gap-3 lg:rounded-[1.75rem] lg:border lg:border-slate-800/80 lg:bg-slate-950/70 lg:p-4 lg:shadow-card lg:backdrop-blur xl:p-6" id="main-content">
-        <header class="sticky top-0 z-10 flex shrink-0 items-center justify-between gap-2 border-b border-slate-800/80 bg-slate-950/95 px-3 py-2.5 backdrop-blur sm:gap-3 sm:px-4 sm:py-2.5 lg:border-0 lg:bg-transparent lg:px-0 lg:py-0 lg:backdrop-blur-0">
+        <header class="sticky top-0 z-10 flex shrink-0 items-center justify-between gap-2 border-b border-slate-800/80 bg-slate-950/95 px-3 py-2.5 backdrop-blur sm:gap-3 sm:px-4 sm:py-2.5 lg:hidden">
           <div class="flex min-w-0 flex-1 items-center gap-2 lg:hidden">
             <Button aria-label="Open navigation" class="h-11 w-11 lg:hidden md:h-9 md:w-9" size="icon" variant="secondary" onclick={openMobileNav}>
               <Menu class="h-5 w-5" />
@@ -322,19 +321,7 @@ import X from 'lucide-svelte/icons/x';
             </div>
           </div>
 
-          <div class="flex shrink-0 items-center gap-2 lg:rounded-full lg:border lg:border-slate-800/80 lg:bg-slate-900/80 lg:px-1.5 lg:py-1 lg:shadow-card">
-            {#if $auth.user?.role === 'admin'}
-              <Button
-                aria-label="Open getting started guide"
-                class="hidden h-9 w-9 lg:inline-flex"
-                size="icon"
-                variant="ghost"
-                onclick={() => goto('/getting-started')}
-                title="Getting started"
-              >
-                <BookOpen class="h-4 w-4" />
-              </Button>
-            {/if}
+          <div class="flex shrink-0 items-center gap-2">
             <Button
               aria-label="Open keyboard shortcuts"
               class="h-11 w-11 md:h-9 md:w-9"
