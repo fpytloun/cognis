@@ -2297,18 +2297,6 @@ import X from 'lucide-svelte/icons/x';
         </div>
       </div>
 
-      <!-- Static bottom: collapse button -->
-      <div class="hidden shrink-0 border-t border-slate-800/60 p-3 lg:block">
-        <button
-          class="flex w-full items-center justify-center gap-2 rounded-xl py-1.5 text-xs text-slate-400 transition hover:bg-slate-800 hover:text-white"
-          onclick={toggleChatSidebar}
-          type="button"
-          title="Hide conversations"
-        >
-          <ChevronsLeft class="h-3.5 w-3.5" />
-          <span>Collapse</span>
-        </button>
-      </div>
     </aside>
 
     <!--
@@ -2348,16 +2336,27 @@ import X from 'lucide-svelte/icons/x';
         <div class="flex flex-wrap items-start justify-between gap-3">
           <div class="min-w-0 flex-1">
             <div class="flex items-center gap-2">
-              {#if chatSidebarCollapsed}
-                <button
-                  class="hidden rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-800 hover:text-white lg:inline-flex"
-                  onclick={toggleChatSidebar}
-                  type="button"
-                  title="Show conversations"
-                >
+              <!--
+                Desktop-only toggle for the conversation sidebar. Sits in
+                the top-left corner of the chat header, next to the
+                title, so both states (expand / collapse) appear in the
+                same place instead of the expand button living in the
+                header while the collapse button hid in the sidebar
+                footer.
+              -->
+              <button
+                class="hidden rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-800 hover:text-white lg:inline-flex"
+                onclick={toggleChatSidebar}
+                type="button"
+                title={chatSidebarCollapsed ? 'Show conversations' : 'Hide conversations'}
+                aria-label={chatSidebarCollapsed ? 'Show conversations' : 'Hide conversations'}
+              >
+                {#if chatSidebarCollapsed}
                   <ChevronsRight class="h-4 w-4" />
-                </button>
-              {/if}
+                {:else}
+                  <ChevronsLeft class="h-4 w-4" />
+                {/if}
+              </button>
               <div class="flex items-center gap-1.5 lg:hidden">
                 <Button aria-label="Open navigation" size="sm" variant="secondary" onclick={requestOpenMobileNav}>
                   <Menu class="h-4 w-4" />
