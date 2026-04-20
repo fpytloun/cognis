@@ -390,7 +390,17 @@
   }
 
   function effectiveRouteModelId(routeKey: RoutingKey): string {
-    return routingForm[routeKey].model.trim() || defaultProviderModelId();
+    const explicitModel = routingForm[routeKey].model.trim();
+    if (explicitModel) {
+      return explicitModel;
+    }
+    if (routeKey !== 'default') {
+      const inheritedDefaultRouteModel = routingForm.default.model.trim();
+      if (inheritedDefaultRouteModel) {
+        return inheritedDefaultRouteModel;
+      }
+    }
+    return defaultProviderModelId();
   }
 
   function routeThinkingEffortOptions(routeKey: RoutingKey): string[] {

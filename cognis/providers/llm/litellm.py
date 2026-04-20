@@ -203,6 +203,19 @@ def _model_dump(value: Any) -> dict[str, Any]:
     return {}
 
 
+def _looks_like_image_generation_model(model_name: str) -> bool:
+    normalized = model_name.strip().lower().replace("_", "-")
+    return any(
+        token in normalized
+        for token in (
+            "gpt-image",
+            "dall-e",
+            "image-generation",
+            "imagen",
+        )
+    )
+
+
 def _normalize_proxy_model_info(info: dict[str, Any]) -> dict[str, Any]:
     """Convert litellm proxy ``model_info`` fields to Cognis ``ModelInfo`` fields.
 
@@ -225,6 +238,8 @@ def _normalize_proxy_model_info(info: dict[str, Any]) -> dict[str, Any]:
         normalized["supports_vision"] = bool(info["supports_vision"])
     if "supports_audio_input" in info:
         normalized["supports_audio_input"] = bool(info["supports_audio_input"])
+    if "supports_image_generation" in info:
+        normalized["supports_image_generation"] = bool(info["supports_image_generation"])
     if "supports_pdf_input" in info:
         normalized["supports_pdf_input"] = bool(info["supports_pdf_input"])
     if "supports_reasoning" in info:
@@ -693,6 +708,11 @@ class LiteLLMProvider:
                             merged,
                             "supports_audio_input",
                         ),
+                        "supports_image_generation": _merge_live_bool(
+                            live,
+                            merged,
+                            "supports_image_generation",
+                        ),
                         "supports_pdf_input": _merge_live_bool(live, merged, "supports_pdf_input"),
                         "supports_file_input": _merge_live_bool(
                             live, merged, "supports_file_input"
@@ -814,6 +834,7 @@ class LiteLLMProvider:
                 or model_name.startswith("openai/gpt-4o")
             )
         )
+        supports_image_generation = _looks_like_image_generation_model(model_name)
         return {
             "supports_defer_loading": is_anthropic,
             "supports_prompt_caching": is_anthropic,
@@ -821,6 +842,7 @@ class LiteLLMProvider:
             "supports_responses_api": supports_responses_api,
             "supports_extended_thinking": False,
             "supports_openai_namespace_tools": False,
+            "supports_image_generation": supports_image_generation,
             "max_tools": 128 if is_openai_like else None,
         }
 

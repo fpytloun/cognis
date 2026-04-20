@@ -249,6 +249,38 @@ async def test_litellm_provider_does_not_inject_hidden_route_reasoning_default(
 
 
 @pytest.mark.asyncio
+async def test_litellm_provider_infers_image_generation_capability_from_model_name(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="openai",
+                display_name="OpenAI",
+                location="controller",
+                backend="litellm",
+                is_default=True,
+                config={
+                    "preset": "openai",
+                    "default_model": "gpt-image-1",
+                    "models": [{"model_id": "gpt-image-1"}],
+                },
+                status="active",
+            )
+        )
+        await session.commit()
+
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.get_model_info", lambda **_: {})
+    provider = LiteLLMProvider(session_factory)
+
+    model_info = await provider.get_model_info("gpt-image-1", provider_id="openai")
+
+    assert model_info.supports_image_generation is True
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_litellm_provider_falls_back_to_default_provider_model(tmp_path: object) -> None:
     engine, session_factory = await _session_factory(tmp_path)
     async with session_factory() as session:
@@ -1870,6 +1902,7 @@ def test_normalize_proxy_model_info_maps_fields() -> None:
         "supports_function_calling": True,
         "supports_vision": True,
         "supports_audio_input": False,
+        "supports_image_generation": True,
         "supports_pdf_input": True,
         "supports_reasoning": False,
         "supports_extended_thinking": True,
@@ -1884,6 +1917,7 @@ def test_normalize_proxy_model_info_maps_fields() -> None:
     assert result["supports_tools"] is True
     assert result["supports_vision"] is True
     assert result["supports_audio_input"] is False
+    assert result["supports_image_generation"] is True
     assert result["supports_pdf_input"] is True
     assert result["supports_reasoning"] is False
     assert result["supports_extended_thinking"] is True
