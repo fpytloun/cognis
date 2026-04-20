@@ -16,6 +16,7 @@ import pytest
 from pydantic import ValidationError
 
 from cognis.api.models import (
+    DeliverableResponse,
     ModelRoutingEntry,
     ModelRoutingResponse,
     PendingPauseResponse,
@@ -97,6 +98,23 @@ class TestStepRunTodosContract:
                 agent_id="agent",
                 todos={"wrong": "shape"},  # type: ignore[arg-type]
             )
+
+
+def test_deliverable_response_round_trip() -> None:
+    response = DeliverableResponse(
+        deliverable_id="dlv-1",
+        step_run_id="sr-1",
+        version=2,
+        content="# Result",
+        format="markdown",
+        title="Implementation summary",
+        target="channel",
+        outputs={"tests": "passed"},
+        status="approved",
+    )
+
+    assert response.outputs == {"tests": "passed"}
+    assert response.status == "approved"
 
 
 class TestPendingPauseShapeContract:

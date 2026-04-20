@@ -8,6 +8,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from cognis.models.deliverable import Deliverable
 from cognis.models.workflow import (
     CompletionDeliveryPolicy,
     StepEvaluation,
@@ -82,7 +83,7 @@ class TaskModel(BaseModel):
 
 
 class StepRunModel(BaseModel):
-    """A single step execution within a workflow run."""
+    """Current execution state for one workflow step within a workflow run."""
 
     step_run_id: str
     task_id: str
@@ -95,8 +96,11 @@ class StepRunModel(BaseModel):
     working_directory: str | None = None
     session_id: str | None = None
     intaris_session_id: str | None = None
+    deliverable_id: str | None = None
+    require_deliverable: bool | None = None
     output: StepOutput | None = None
     evaluation: StepEvaluation | None = None
+    deliverables: list[Deliverable] = Field(default_factory=list)
     todos: list[dict[str, Any]] = []
     started_at: datetime | None = None
     completed_at: datetime | None = None

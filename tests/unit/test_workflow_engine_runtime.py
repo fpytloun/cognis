@@ -256,6 +256,60 @@ async def test_handle_step_outcome_defaults_failed_without_route() -> None:
 
 
 @pytest.mark.asyncio
+async def test_build_result_data_uses_final_deliverable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _build_engine()
+    task = TaskModel(
+        task_id="task-1",
+        title="Task",
+        created_by="user@example.com",
+        agent_id="agent-1",
+        status="completed",
+    )
+    workflow = Workflow(
+        workflow_id="wf:test",
+        name="Deliverable Workflow",
+        steps=[
+            StepDefinition(name="plan", type="run", require_deliverable=True),
+            StepDefinition(name="final_summary", type="run", require_deliverable=True),
+        ],
+    )
+    state = WorkflowState(
+        step_outputs={
+            "plan": {"summary": "planned", "deliverable_id": "dlv-plan"},
+            "final_summary": {"summary": "done", "deliverable_id": "dlv-final"},
+        }
+    )
+
+    async def _get_deliverable(_session: object, deliverable_id: str) -> SimpleNamespace | None:
+        if deliverable_id != "dlv-final":
+            return None
+        return SimpleNamespace(
+            deliverable_id="dlv-final",
+            step_run_id="sr-final",
+            version=2,
+            content="# Final result",
+            format="markdown",
+            title="Final summary",
+            target="channel",
+            outputs={"tests": "passed"},
+            status="approved",
+            evaluator_feedback=None,
+            created_at=None,
+            updated_at=None,
+        )
+
+    monkeypatch.setattr("cognis.core.workflow_engine.get_deliverable", _get_deliverable)
+
+    result = await engine._build_result_data(task, state, workflow)
+
+    assert result is not None
+    assert result["final_deliverable_id"] == "dlv-final"
+    assert result["final_content"] == "# Final result"
+
+
+@pytest.mark.asyncio
 async def test_handle_gate_step_reuses_existing_pause_id(monkeypatch: pytest.MonkeyPatch) -> None:
     engine = _build_engine()
     notifications = _NotificationService()
@@ -772,6 +826,7 @@ async def test_execute_workflow_preserves_cancelled_status_from_outcome_gate(
     monkeypatch.setattr(engine._session_manager, "mark_completed", _mark_completed, raising=False)
     monkeypatch.setattr(engine, "_persist_workflow_state", _persist_state)
     monkeypatch.setattr(engine, "_persist_task_final", _persist_final)
+    monkeypatch.setattr(engine, "_build_result_data", _persist_final)
     monkeypatch.setattr(engine, "_cleanup_step_sessions", _cleanup)
     monkeypatch.setattr(engine, "_deliver_task_result", _deliver)
     monkeypatch.setattr(engine, "_evaluate_step", _evaluate_step)
@@ -858,6 +913,68 @@ async def test_handle_exhausted_gate_continue_does_not_mark_step_skipped(
 
 
 @pytest.mark.asyncio
+async def test_handle_exhausted_continue_promotes_rejected_deliverable_into_step_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _build_engine()
+    task = TaskModel(
+        task_id="task-1", title="Task", created_by="user@example.com", agent_id="agent-1"
+    )
+    workflow = Workflow(
+        workflow_id="wf:test", name="Test", steps=[StepDefinition(name="plan", type="run")]
+    )
+    state = WorkflowState(current_step_index=0)
+
+    async def _latest_step_run(*args: object, **kwargs: object) -> SimpleNamespace:
+        del args, kwargs
+        return SimpleNamespace(step_run_id="sr-1", output={"summary": "Old summary"})
+
+    async def _latest_rejected(*args: object, **kwargs: object) -> SimpleNamespace:
+        del args, kwargs
+        return SimpleNamespace(
+            deliverable_id="dlv-1",
+            version=3,
+            format="markdown",
+            title="Recovered summary",
+            content="Recovered deliverable body",
+            evaluator_feedback="Needs work",
+        )
+
+    async def _update_deliverable_status(*args: object, **kwargs: object) -> bool:
+        del args, kwargs
+        return True
+
+    async def _update_step_run(*args: object, **kwargs: object) -> bool:
+        del args, kwargs
+        return True
+
+    async def _persist(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        return None
+
+    monkeypatch.setattr(
+        "cognis.core.workflow_engine.get_latest_step_run_for_task_step",
+        _latest_step_run,
+    )
+    monkeypatch.setattr(
+        "cognis.core.workflow_engine.get_latest_rejected_deliverable_for_step_run",
+        _latest_rejected,
+    )
+    monkeypatch.setattr(
+        "cognis.core.workflow_engine.update_deliverable_status",
+        _update_deliverable_status,
+    )
+    monkeypatch.setattr("cognis.core.workflow_engine.update_step_run", _update_step_run)
+    monkeypatch.setattr(engine, "_persist_workflow_state", _persist)
+
+    handled = await engine._handle_exhausted(task, workflow.steps[0], state, workflow, "continue")
+
+    assert handled is True
+    assert state.step_outputs["plan"]["deliverable_id"] == "dlv-1"
+    assert state.step_outputs["plan"]["content"] == "Recovered deliverable body"
+
+
+@pytest.mark.asyncio
 async def test_execute_workflow_updates_current_step_run_id_after_retry_reset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -899,6 +1016,7 @@ async def test_execute_workflow_updates_current_step_run_id_after_retry_reset(
     monkeypatch.setattr(engine, "_evaluate_step", _evaluate_step)
     monkeypatch.setattr(engine, "_persist_workflow_state", _noop)
     monkeypatch.setattr(engine, "_persist_task_final", _noop)
+    monkeypatch.setattr(engine, "_build_result_data", _noop)
     monkeypatch.setattr(engine, "_cleanup_step_sessions", _noop)
     monkeypatch.setattr(engine, "_deliver_task_result", _noop)
     monkeypatch.setattr("cognis.core.workflow_engine.update_step_run", _update_step_run)

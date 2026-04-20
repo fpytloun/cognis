@@ -85,6 +85,51 @@ STEP_COMPLETE_TOOL = ToolDefinition(
     read_only=False,
 )
 
+WRITE_DELIVERABLE_TOOL = ToolDefinition(
+    name="write_deliverable",
+    description=(
+        "Write the user-facing deliverable for this workflow step. Call this before "
+        "step_complete when the step requires a deliverable. The content you pass is "
+        "the canonical workflow artifact and replaces any free-text response as the "
+        "step's user-facing output."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "content": {
+                "type": "string",
+                "description": "The final deliverable content for this step.",
+            },
+            "format": {
+                "type": "string",
+                "enum": ["markdown", "plain", "html"],
+                "description": "How the deliverable should be rendered.",
+                "default": "markdown",
+            },
+            "title": {
+                "type": "string",
+                "description": "Optional title for the deliverable.",
+            },
+            "target": {
+                "type": "string",
+                "enum": ["channel", "none"],
+                "description": (
+                    "Optional delivery hint. Final workflow policy decides what actually "
+                    "gets delivered."
+                ),
+            },
+            "outputs": {
+                "type": "object",
+                "description": "Optional structured sidecar data for evaluators or later steps.",
+            },
+        },
+        "required": ["content"],
+    },
+    source=_SOURCE,
+    category="deliverable",
+    read_only=False,
+)
+
 STEP_REQUEST_INPUT_TOOL = ToolDefinition(
     name="step_request_input",
     description=(
@@ -257,6 +302,7 @@ def workflow_tools() -> list[ToolDefinition]:
     Actual handling is done by the agent loop, not the tool router.
     """
     return [
+        WRITE_DELIVERABLE_TOOL,
         STEP_COMPLETE_TOOL,
         STEP_REQUEST_INPUT_TOOL,
         REQUEST_CREDENTIAL_TOOL,

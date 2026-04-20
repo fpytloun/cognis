@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import base64
 from contextlib import asynccontextmanager
-from unittest.mock import AsyncMock
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -130,6 +129,7 @@ async def test_turn_completed_event_uses_delivery_outbox() -> None:
         final_content="Done.",
         fallback_text="fallback",
         attachments=None,
+        deliverable_id=None,
         ignore_next_attempt=True,
     )
 

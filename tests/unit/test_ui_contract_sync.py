@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 
 from cognis.api.models import (
+    DeliverableResponse,
     PendingPauseResponse,
     SessionResponse,
     SkillResponse,
@@ -38,6 +39,7 @@ def _load_ui_types() -> str:
 
 _MODELS_TO_CHECK = (
     ("Task", TaskResponse),
+    ("Deliverable", DeliverableResponse),
     ("StepRun", StepRunResponse),
     ("PendingPause", PendingPauseResponse),
     ("Session", SessionResponse),
@@ -106,6 +108,7 @@ def test_ui_interface_covers_api_model_fields(interface_name: str, model_cls: ty
     # the UI explicitly ignores a server field.
     allowed_missing = {
         "Task": set(),
+        "Deliverable": set(),
         "StepRun": set(),
         "PendingPause": set(),
         "Session": set(),

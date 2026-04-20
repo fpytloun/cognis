@@ -436,7 +436,7 @@ class SystemWorkflowOverride(Base):
 
 
 class StepRun(Base):
-    """Individual step execution attempts within a workflow run."""
+    """Current execution state for one workflow step within a task run."""
 
     __tablename__ = "step_runs"
 
@@ -452,11 +452,45 @@ class StepRun(Base):
     conversation_id: Mapped[str | None] = mapped_column(String, nullable=True)
     session_id: Mapped[str | None] = mapped_column(String, nullable=True)
     intaris_session_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    deliverable_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    require_deliverable: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     output: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     evaluation: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     todos: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+
+class DeliverableRow(Base):
+    """Typed user-facing artifact written by a workflow step."""
+
+    __tablename__ = "deliverables"
+    __table_args__ = (
+        UniqueConstraint("step_run_id", "version", name="uq_deliverables_step_run_version"),
+        Index("ix_deliverables_step_run", "step_run_id"),
+        Index("ix_deliverables_status", "status"),
+    )
+
+    deliverable_id: Mapped[str] = mapped_column(String, primary_key=True)
+    step_run_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("step_runs.step_run_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    format: Mapped[str] = mapped_column(String, nullable=False, default="markdown")
+    title: Mapped[str | None] = mapped_column(String, nullable=True)
+    target: Mapped[str | None] = mapped_column(String, nullable=True)
+    outputs: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    status: Mapped[str] = mapped_column(String, nullable=False, default="buffered")
+    evaluator_feedback: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
     updated_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
     )

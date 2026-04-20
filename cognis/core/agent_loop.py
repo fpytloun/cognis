@@ -62,6 +62,7 @@ from cognis.json_stream import merge_incremental_json_fragment, recover_trailing
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.artifact import AttachmentRef
+from cognis.models.deliverable import Deliverable
 from cognis.models.session import ConversationModel, SessionEvent, SessionModel
 from cognis.models.tool import (
     Permission,
@@ -85,7 +86,14 @@ from cognis.runtime_context import (  # noqa: F401 — used in delegation
     current_workspace_root,
     scoped_runtime_context,
 )
-from cognis.store.queries import get_setting_value
+from cognis.store.queries import (
+    create_deliverable,
+    get_deliverable,
+    get_setting_value,
+    get_step_run,
+    list_deliverables_for_step_run,
+    update_step_run,
+)
 from cognis.tools.builtin.orchestration import (
     OrchestrationMode,
     handle_delegate_tool_call,
@@ -209,6 +217,7 @@ AUTO_COMPACTION_TIMEOUT_SECONDS = 15
 
 # Controller-injected tool names
 STEP_COMPLETE = "step_complete"
+WRITE_DELIVERABLE = "write_deliverable"
 STEP_REQUEST_INPUT = "step_request_input"
 REQUEST_CREDENTIAL = "request_credential"
 REQUEST_AUTH_CHALLENGE = "request_auth_challenge"
@@ -216,6 +225,7 @@ LIST_CREDENTIALS = "list_credentials"
 STEP_TODO_WRITE = "step_todo_write"
 STEP_TODO_LIST = "step_todo_list"
 CONTROLLER_TOOLS = {
+    WRITE_DELIVERABLE,
     STEP_COMPLETE,
     STEP_REQUEST_INPUT,
     REQUEST_CREDENTIAL,
@@ -248,6 +258,7 @@ _MAX_INTARIS_TOOL_RESULT = 50_000  # Intaris gets the middle-truncated preview
 _MAX_TODO_REPROMPTS = 3  # Max re-prompts for incomplete todos before force-completing
 _MAX_STEP_COMPLETE_REPROMPTS = 3
 _MAX_TOOL_CALL_ARGUMENT_CHARS = 256_000
+_DELIVERABLE_PREVIEW_CHARS = 240
 
 
 def _normalize_todo_status(status: Any) -> str:
@@ -395,7 +406,12 @@ def _build_step_complete_validation_error(arguments: dict[str, Any], exc: Valida
     )
 
 
-def _validate_step_completion_notification(ctx: StepContext, step_output: StepOutput) -> None:
+def _validate_step_completion_notification(
+    ctx: StepContext,
+    step_output: StepOutput,
+    *,
+    deliverable_content: str | None = None,
+) -> None:
     """Validate the requested completion notification against the step policy."""
 
     notification = step_output.notification
@@ -410,9 +426,10 @@ def _validate_step_completion_notification(ctx: StepContext, step_output: StepOu
         if notification.mode == "direct":
             raise ValueError("notification.mode='direct' is only valid for successful completion")
         raise ValueError("notification.mode='silent' is only valid for successful completion")
-    if notification.mode == "direct" and not step_output.content.strip():
+    effective_content = deliverable_content if deliverable_content is not None else step_output.content
+    if notification.mode == "direct" and not effective_content.strip():
         raise ValueError(
-            "notification.mode='direct' requires a non-empty final assistant message to deliver"
+            "notification.mode='direct' requires a non-empty deliverable to deliver"
         )
 
 
@@ -1157,6 +1174,13 @@ class StepContext:
     current_model: str | None = None
     current_model_info: Any = None
     remember_user_event_seq: int | None = None
+    current_deliverable_id: str | None = None
+    current_deliverable_version: int | None = None
+    current_deliverable_content: str | None = None
+    current_deliverable_format: str | None = None
+    current_deliverable_title: str | None = None
+    current_deliverable_outputs: dict[str, Any] = field(default_factory=dict)
+    current_deliverable_status: str | None = None
     remember_assistant_event_seq: int | None = None
     turn_id: str | None = None
     consume_boundary_batch: Callable[[str], Coroutine[Any, Any, list[dict[str, Any]]]] | None = None
@@ -1785,8 +1809,8 @@ class AgentLoop:
                         "requested revisions:\n\n"
                         f"{ctx.workflow_state.last_evaluation_feedback}\n\n"
                         "Please revise your work based on this feedback. "
-                        "When done, write out your updated findings and call "
-                        "step_complete."
+                        "When done, write_deliverable with the updated artifact "
+                        "and then call step_complete."
                     )
                     ctx.workflow_state.last_evaluation_feedback = None
                 else:
@@ -1796,7 +1820,8 @@ class AgentLoop:
                         "The evaluator has reviewed your previous attempt and "
                         "requested revisions. Review the evaluation feedback "
                         "above and revise your work accordingly. When done, "
-                        "write out your updated findings and call step_complete."
+                        "write_deliverable with the updated artifact and then call "
+                        "step_complete."
                     )
             else:
                 # First attempt — build the full rich prompt with task context
@@ -2378,7 +2403,8 @@ class AgentLoop:
                             "content": (
                                 "Internal controller reminder — this is not a new user message. "
                                 "Do not write a filler acknowledgment just for this reminder. "
-                                "If the step is finished, call step_complete now with your summary. "
+                                "If the step is finished, ensure you have called write_deliverable "
+                                "for the final artifact and then call step_complete with your summary. "
                                 "Otherwise continue the work until it is actually complete. Do not "
                                 "repeat prior text unnecessarily."
                             ),
@@ -2557,6 +2583,147 @@ class AgentLoop:
                     prepared_regular_batch.clear()
 
                 # Controller tool interception
+                if tc.name == WRITE_DELIVERABLE:
+                    _append_tool_call_event(events_to_record, tc, tool_id)
+                    await self._flush_events_incremental(
+                        ctx,
+                        events_to_record,
+                        reason="tool_call:write_deliverable",
+                        on_token=on_token,
+                    )
+                    validation_error = self._validate_controller_tool_arguments(
+                        tc.name, tc.arguments
+                    )
+                    if validation_error is not None:
+                        await self._emit_tool_argument_error(
+                            ctx,
+                            tc=tc,
+                            tool_id=tool_id,
+                            events_to_record=events_to_record,
+                            messages=messages,
+                            error=validation_error,
+                            on_tool_result=on_tool_result,
+                            on_token=on_token,
+                        )
+                        continue
+
+                    content = str(tc.arguments.get("content", ""))
+                    format_name = str(tc.arguments.get("format") or "markdown")
+                    title = tc.arguments.get("title")
+                    target = tc.arguments.get("target")
+                    outputs = tc.arguments.get("outputs")
+
+                    if ctx.step_run_id is None:
+                        err_content = json.dumps(
+                            {
+                                "status": "rejected",
+                                "reason": "not_in_workflow",
+                                "message": "write_deliverable is only available inside workflow steps.",
+                            }
+                        )
+                        messages.append(
+                            {"role": "tool", "tool_call_id": tc.call_id, "content": err_content}
+                        )
+                        _append_tool_result_event(
+                            events_to_record, tc, err_content, True, tool_id=tool_id
+                        )
+                        await self._flush_events_incremental(
+                            ctx,
+                            events_to_record,
+                            reason="tool_result:write_deliverable",
+                            on_token=on_token,
+                        )
+                        if on_tool_result:
+                            await on_tool_result(tc.call_id, tc.name, err_content, True, None, None)
+                        continue
+
+                    if not content.strip():
+                        err_content = json.dumps(
+                            {
+                                "status": "rejected",
+                                "reason": "empty_content",
+                                "message": "write_deliverable requires non-empty content.",
+                            }
+                        )
+                        messages.append(
+                            {"role": "tool", "tool_call_id": tc.call_id, "content": err_content}
+                        )
+                        _append_tool_result_event(
+                            events_to_record, tc, err_content, True, tool_id=tool_id
+                        )
+                        await self._flush_events_incremental(
+                            ctx,
+                            events_to_record,
+                            reason="tool_result:write_deliverable",
+                            on_token=on_token,
+                        )
+                        if on_tool_result:
+                            await on_tool_result(tc.call_id, tc.name, err_content, True, None, None)
+                        continue
+
+                    if format_name not in {"markdown", "plain", "html"}:
+                        err_content = json.dumps(
+                            {
+                                "status": "rejected",
+                                "reason": "invalid_format",
+                                "message": "write_deliverable format must be one of: markdown, plain, html.",
+                            }
+                        )
+                        messages.append(
+                            {"role": "tool", "tool_call_id": tc.call_id, "content": err_content}
+                        )
+                        _append_tool_result_event(
+                            events_to_record, tc, err_content, True, tool_id=tool_id
+                        )
+                        await self._flush_events_incremental(
+                            ctx,
+                            events_to_record,
+                            reason="tool_result:write_deliverable",
+                            on_token=on_token,
+                        )
+                        if on_tool_result:
+                            await on_tool_result(tc.call_id, tc.name, err_content, True, None, None)
+                        continue
+
+                    deliverable = await self._write_step_deliverable(
+                        ctx,
+                        content=content,
+                        format=format_name,
+                        title=str(title).strip() if isinstance(title, str) and title.strip() else None,
+                        target=(
+                            str(target)
+                            if isinstance(target, str) and target in {"channel", "none"}
+                            else None
+                        ),
+                        outputs=outputs if isinstance(outputs, dict) else {},
+                    )
+                    preview = compact_snippet(content, max_chars=_DELIVERABLE_PREVIEW_CHARS)
+                    result_content = json.dumps(
+                        {
+                            "status": "buffered",
+                            "deliverable_id": deliverable.deliverable_id,
+                            "version": deliverable.version,
+                            "length": len(content),
+                            "format": deliverable.format,
+                            "preview": preview,
+                        }
+                    )
+                    messages.append(
+                        {"role": "tool", "tool_call_id": tc.call_id, "content": result_content}
+                    )
+                    _append_tool_result_event(
+                        events_to_record, tc, result_content, False, tool_id=tool_id
+                    )
+                    await self._flush_events_incremental(
+                        ctx,
+                        events_to_record,
+                        reason="tool_result:write_deliverable",
+                        on_token=on_token,
+                    )
+                    if on_tool_result:
+                        await on_tool_result(tc.call_id, tc.name, result_content, False, None, None)
+                    continue
+
                 if tc.name == STEP_COMPLETE:
                     _append_tool_call_event(events_to_record, tc, tool_id)
                     await self._flush_events_incremental(
@@ -2704,6 +2871,55 @@ class AgentLoop:
                             await on_tool_result(tc.call_id, tc.name, err_content, True, None, None)
                         continue
 
+                    current_deliverable = await self._get_current_deliverable(ctx)
+                    if ctx.step_definition.require_deliverable and current_deliverable is None:
+                        STEP_COMPLETE_REJECTIONS.labels(reason="deliverable_missing").inc()
+                        err_content = json.dumps(
+                            {
+                                "status": "rejected",
+                                "reason": "deliverable_missing",
+                                "message": (
+                                    "This step requires a deliverable. Call write_deliverable with "
+                                    "your final user-facing output, then call step_complete. Do not "
+                                    "restate the deliverable as free text; write_deliverable is the "
+                                    "canonical workflow artifact."
+                                ),
+                                "required_action": "write_deliverable_then_retry_step_complete",
+                            }
+                        )
+                        messages.append(
+                            {"role": "tool", "tool_call_id": tc.call_id, "content": err_content}
+                        )
+                        _append_tool_result_event(
+                            events_to_record, tc, err_content, True, tool_id=tool_id
+                        )
+                        messages.append(
+                            {
+                                "role": "system",
+                                "content": (
+                                    "Internal controller reminder — this is not a new user message. "
+                                    "Do not write a filler acknowledgment. step_complete was rejected "
+                                    "because this step requires a deliverable. Your next action MUST be "
+                                    "write_deliverable with the final user-facing artifact. After that, "
+                                    "call step_complete again. Do NOT repeat the deliverable as free text."
+                                ),
+                            }
+                        )
+                        _queue_audit_message(
+                            role="developer",
+                            source="tool_reminder",
+                            content=str(messages[-1]["content"]),
+                        )
+                        await self._flush_events_incremental(
+                            ctx,
+                            events_to_record,
+                            reason="tool_result:step_complete",
+                            on_token=on_token,
+                        )
+                        if on_tool_result:
+                            await on_tool_result(tc.call_id, tc.name, err_content, True, None, None)
+                        continue
+
                     trailing_tool_calls = tool_calls[tc_index + 1 :]
                     if trailing_tool_calls:
                         STEP_COMPLETE_REJECTIONS.labels(
@@ -2739,13 +2955,41 @@ class AgentLoop:
                         continue
 
                     try:
+                        deliverable_outputs = (
+                            dict(current_deliverable.outputs)
+                            if current_deliverable is not None and isinstance(current_deliverable.outputs, dict)
+                            else {}
+                        )
+                        step_complete_outputs = (
+                            tc.arguments.get("outputs", {})
+                            if isinstance(tc.arguments.get("outputs"), dict)
+                            else {}
+                        )
                         step_output = StepOutput(
                             summary=tc.arguments.get("summary", ""),
-                            content=last_assistant_content,
-                            outputs=tc.arguments.get("outputs", {}),
+                            content=(
+                                current_deliverable.content
+                                if current_deliverable is not None
+                                else last_assistant_content
+                            ),
+                            outputs={**deliverable_outputs, **step_complete_outputs},
                             claims=tc.arguments.get("claims", []),
                             outcome=tc.arguments.get("outcome"),
                             notification=tc.arguments.get("notification"),
+                            deliverable_id=(
+                                current_deliverable.deliverable_id
+                                if current_deliverable is not None
+                                else None
+                            ),
+                            deliverable_version=(
+                                current_deliverable.version if current_deliverable is not None else None
+                            ),
+                            deliverable_format=(
+                                current_deliverable.format if current_deliverable is not None else None
+                            ),
+                            deliverable_title=(
+                                current_deliverable.title if current_deliverable is not None else None
+                            ),
                             execution_evidence=dict(ctx.execution_evidence),
                             attachments=list(collected_attachments),
                             session_id=ctx.session.session_id,
@@ -2753,7 +2997,13 @@ class AgentLoop:
                             or ctx.session.session_id,
                             completed_at=datetime.now(UTC),
                         )
-                        _validate_step_completion_notification(ctx, step_output)
+                        _validate_step_completion_notification(
+                            ctx,
+                            step_output,
+                            deliverable_content=(
+                                current_deliverable.content if current_deliverable is not None else None
+                            ),
+                        )
                     except ValidationError as exc:
                         STEP_COMPLETE_REJECTIONS.labels(
                             reason="invalid_step_complete_arguments"
@@ -6626,6 +6876,129 @@ class AgentLoop:
             )
             await db_session.commit()
 
+    def _clear_cached_deliverable(self, ctx: StepContext) -> None:
+        """Drop any cached step deliverable metadata from the runtime context."""
+
+        ctx.current_deliverable_id = None
+        ctx.current_deliverable_version = None
+        ctx.current_deliverable_content = None
+        ctx.current_deliverable_format = None
+        ctx.current_deliverable_title = None
+        ctx.current_deliverable_outputs = {}
+        ctx.current_deliverable_status = None
+
+    def _cache_deliverable(self, ctx: StepContext, row: Any) -> Deliverable:
+        """Cache a deliverable row on the step context and return the model."""
+
+        deliverable = Deliverable.model_validate(
+            {
+                "deliverable_id": row.deliverable_id,
+                "step_run_id": row.step_run_id,
+                "version": row.version,
+                "content": row.content,
+                "format": row.format,
+                "title": row.title,
+                "target": row.target,
+                "outputs": row.outputs or {},
+                "status": row.status,
+                "evaluator_feedback": row.evaluator_feedback,
+                "created_at": row.created_at,
+                "updated_at": row.updated_at,
+            }
+        )
+        ctx.current_deliverable_id = deliverable.deliverable_id
+        ctx.current_deliverable_version = deliverable.version
+        ctx.current_deliverable_content = deliverable.content
+        ctx.current_deliverable_format = deliverable.format
+        ctx.current_deliverable_title = deliverable.title
+        ctx.current_deliverable_outputs = dict(deliverable.outputs or {})
+        ctx.current_deliverable_status = str(deliverable.status)
+        return deliverable
+
+    async def _get_current_deliverable(self, ctx: StepContext) -> Deliverable | None:
+        """Return the active deliverable for the current step run, if any."""
+
+        if ctx.step_run_id is None:
+            return None
+        if ctx.current_deliverable_id and ctx.current_deliverable_content is not None:
+            return Deliverable.model_validate(
+                {
+                    "deliverable_id": ctx.current_deliverable_id,
+                    "step_run_id": ctx.step_run_id,
+                    "version": ctx.current_deliverable_version or 1,
+                    "content": ctx.current_deliverable_content,
+                    "format": ctx.current_deliverable_format or "markdown",
+                    "title": ctx.current_deliverable_title,
+                    "outputs": dict(ctx.current_deliverable_outputs),
+                    "status": ctx.current_deliverable_status or "buffered",
+                }
+            )
+
+        async with self.session_manager.session_factory() as db_session:
+            step_run = await get_step_run(db_session, ctx.step_run_id)
+            row = (
+                await get_deliverable(db_session, step_run.deliverable_id)
+                if step_run is not None and isinstance(step_run.deliverable_id, str)
+                else None
+            )
+        if row is None:
+            self._clear_cached_deliverable(ctx)
+            return None
+        return self._cache_deliverable(ctx, row)
+
+    async def _write_step_deliverable(
+        self,
+        ctx: StepContext,
+        *,
+        content: str,
+        format: str,
+        title: str | None,
+        target: str | None,
+        outputs: dict[str, Any] | None,
+    ) -> Deliverable:
+        """Persist a new deliverable version for the current step run."""
+
+        if ctx.step_run_id is None:
+            raise ValueError("not_in_workflow")
+
+        async with self.session_manager.session_factory() as db_session:
+            row = await create_deliverable(
+                db_session,
+                step_run_id=ctx.step_run_id,
+                content=content,
+                format=format,
+                title=title,
+                target=target,
+                outputs=outputs,
+            )
+            await update_step_run(db_session, ctx.step_run_id, deliverable_id=row.deliverable_id)
+            await db_session.commit()
+        return self._cache_deliverable(ctx, row)
+
+    async def _list_step_deliverables(self, ctx: StepContext) -> list[Deliverable]:
+        """Return all deliverable versions for the current step run."""
+
+        if ctx.step_run_id is None:
+            return []
+        async with self.session_manager.session_factory() as db_session:
+            rows = await list_deliverables_for_step_run(db_session, ctx.step_run_id)
+        return [self._cache_deliverable(ctx, row) if index == 0 else Deliverable.model_validate(
+            {
+                "deliverable_id": row.deliverable_id,
+                "step_run_id": row.step_run_id,
+                "version": row.version,
+                "content": row.content,
+                "format": row.format,
+                "title": row.title,
+                "target": row.target,
+                "outputs": row.outputs or {},
+                "status": row.status,
+                "evaluator_feedback": row.evaluator_feedback,
+                "created_at": row.created_at,
+                "updated_at": row.updated_at,
+            }
+        ) for index, row in enumerate(rows)]
+
     def _get_recovered_step_response(self, ctx: StepContext) -> str | None:
         """Return a persisted step-input response recovered after restart."""
         if ctx.workflow_state is None or ctx.workflow_state.pending_pause_type != "step_input":
@@ -6744,16 +7117,16 @@ class AgentLoop:
 
         parts.append(
             "\n\n---\n"
-            "When you have completed the objective, write out your findings and "
-            "deliverables as a detailed text response. Respect Expected output "
+            "When you have completed the objective, call write_deliverable with the "
+            "canonical user-facing artifact for this step. Respect Expected output "
             "closely for structure, tone, format, and level of detail. If "
             "Expected output conflicts with the step completion contract, still "
-            "provide the minimum assistant deliverable needed to complete the "
-            "step correctly. Do not interpret Expected output alone as permission "
-            "to omit the assistant deliverable entirely. Then call step_complete "
-            "with a summary, structured outputs, verifiable claims, and an "
-            "outcome when the completed step should explicitly report rejection "
-            "or failure. Use notification.mode='silent' only when the work "
+            "produce the minimum correct deliverable and write it via "
+            "write_deliverable. Free-text assistant messages during workflow steps are "
+            "reasoning and progress, not the final artifact. After writing the "
+            "deliverable, call step_complete with a summary, structured outputs, "
+            "verifiable claims, and an outcome when the completed step should "
+            "explicitly report rejection or failure. Use notification.mode='silent' only when the work "
             "completed successfully, silent completion is allowed, and there is "
             "nothing user-actionable to notify. Use notification.mode='direct' "
             "for ready-to-read outputs like daily briefs, evening summaries, or "
@@ -6792,6 +7165,7 @@ class AgentLoop:
             if raw is None:
                 continue
             output = StepOutput.model_validate(raw)
+            has_deliverable = bool(output.deliverable_id)
             section_parts = [f'<step_output source="{source_name}">']
             if effective_input.type == "full":
                 if output.summary:
@@ -6800,7 +7174,8 @@ class AgentLoop:
                     claims_str = "\n".join(f"  - {c}" for c in output.claims)
                     section_parts.append(f"Claims:\n{claims_str}")
                 if output.content:
-                    section_parts.append(f"Content:\n{output.content}")
+                    label = "Deliverable" if has_deliverable else "Assistant output"
+                    section_parts.append(f"{label}:\n{output.content}")
                 if output.outputs:
                     section_parts.append(
                         f"Structured outputs:\n{json.dumps(output.outputs, indent=2, default=str)}"
@@ -6808,6 +7183,8 @@ class AgentLoop:
             elif effective_input.type == "summary":
                 if output.summary:
                     section_parts.append(f"Summary: {output.summary}")
+                if has_deliverable and output.content:
+                    section_parts.append(f"Deliverable:\n{output.content}")
                 if output.outputs:
                     section_parts.append(
                         f"Structured outputs:\n{json.dumps(output.outputs, indent=2, default=str)}"
@@ -6818,6 +7195,8 @@ class AgentLoop:
                 if output.claims:
                     claims_str = "\n".join(f"  - {c}" for c in output.claims)
                     section_parts.append(f"Claims:\n{claims_str}")
+                if has_deliverable and output.content:
+                    section_parts.append(f"Deliverable:\n{output.content}")
                 if output.outputs:
                     section_parts.append(
                         f"Structured outputs:\n{json.dumps(output.outputs, indent=2, default=str)}"
@@ -6846,6 +7225,7 @@ class AgentLoop:
             STEP_REQUEST_INPUT_TOOL,
             STEP_TODO_LIST_TOOL,
             STEP_TODO_WRITE_TOOL,
+            WRITE_DELIVERABLE_TOOL,
         )
 
         def _to_schema(tool_def: Any) -> dict[str, Any]:
@@ -6859,6 +7239,9 @@ class AgentLoop:
             }
 
         tools: list[dict[str, Any]] = []
+
+        if ctx.policy.step_complete_available and ctx.step_run_id is not None:
+            tools.append(_to_schema(WRITE_DELIVERABLE_TOOL))
 
         # step_complete — only when the policy allows it.
         if ctx.policy.step_complete_available:
@@ -6900,9 +7283,11 @@ class AgentLoop:
             STEP_REQUEST_INPUT_TOOL,
             STEP_TODO_LIST_TOOL,
             STEP_TODO_WRITE_TOOL,
+            WRITE_DELIVERABLE_TOOL,
         )
 
         registry = {
+            WRITE_DELIVERABLE_TOOL.name: WRITE_DELIVERABLE_TOOL,
             STEP_COMPLETE_TOOL.name: STEP_COMPLETE_TOOL,
             STEP_REQUEST_INPUT_TOOL.name: STEP_REQUEST_INPUT_TOOL,
             STEP_TODO_WRITE_TOOL.name: STEP_TODO_WRITE_TOOL,

@@ -18,6 +18,7 @@ Each workflow defines:
 - workflow identity and description
 - ordered steps
 - step type and prompts
+- step deliverables authored via `write_deliverable`
 - optional evaluation or revision behavior
 - loop and gate behavior
 - optional agent overrides per step
@@ -58,12 +59,25 @@ The workflow editor supports YAML import and export so you can:
 When a task runs with a workflow, Cognis records:
 
 - the active step
-- step attempts
+- step attempts and deliverable versions
 - evaluator decisions
 - pauses for gates or questions
 - final completion or failure state
 
-Task results are delivered back into the conversation flow rather than sent directly to external channels.
+### Deliverables by default
+
+Workflow steps use deliverables by default.
+
+- A **deliverable** is the typed artifact a step writes with `write_deliverable`.
+- Deliverables are used for evaluator review, downstream step context, task detail UI, and final workflow output.
+- A workflow can produce many step deliverables, but only one final deliverable is externally delivered for the run.
+- Free-text assistant messages during workflow execution are reasoning or progress, not the canonical artifact.
+
+This makes deliverables useful for more than just the final user-facing message. They are the stable artifacts that let multi-step workflows stay inspectable and evaluable.
+
+Exception: `system:direct` keeps the normal chat behavior, so direct chat replies still come from the assistant message instead of `write_deliverable`.
+
+Task results are delivered back into the conversation flow, with the chosen final deliverable treated as the canonical workflow result.
 
 ## Tips
 

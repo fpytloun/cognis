@@ -440,7 +440,8 @@ uv run alembic -c cognis/store/migrations/alembic.ini downgrade -1
 | `sessions` | `session_id` | Session metadata (NO event seq/compaction fields) |
 | `tasks` | `task_id` | Durable work items (kanban cards, queue items) |
 | `task_dependencies` | `(task_id, depends_on)` | DAG edges between tasks |
-| `step_runs` | `step_run_id` | Workflow step execution attempts |
+| `step_runs` | `step_run_id` | Current workflow step execution state + attempt counter |
+| `deliverables` | `deliverable_id` | Typed step artifacts and final workflow outputs |
 | `workflows` | `workflow_id` | Portable workflow templates |
 | `schedules` | `schedule_id` | Cron-like task factory |
 | `settings` | `key` | System settings (replaces config file) |
@@ -585,6 +586,7 @@ Full architecture and design specifications are in `docs/specs/`:
 
 - **Never execute tool calls in the controller.** All tool execution goes through an executor, even in-process.
 - **Never store Intaris-derived state in Cognis DB.** Use the session cache.
+- **Workflow deliverables are the canonical step artifacts.** In workflow steps, `write_deliverable` is the authoritative user-facing artifact for evaluation, UI, and final workflow output. Free-text assistant messages in workflow steps are reasoning/progress only. Exception: `system:direct` keeps normal chat-message replies.
 - **Never log message content, tool args, memory content, or secrets.**
 - **Never use sync I/O in the controller.** Everything is async.
 - **Never bypass Intaris for non-bypassable tools.** Even `"*": "allow"` permissions don't skip guardrails for these.
