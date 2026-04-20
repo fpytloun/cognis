@@ -123,6 +123,31 @@ async def test_session_cache_cold_and_warm_paths() -> None:
 
 
 @pytest.mark.asyncio
+async def test_session_cache_warm_refresh_rebuilds_prefix_when_initialized_entry_is_missing_it() -> (
+    None
+):
+    guardrails = _Guardrails()
+    cache = SessionCache(guardrails, max_entries=10)
+    session = _session()
+
+    entry = await cache.refresh(session)
+    guardrails.calls.clear()
+
+    entry.prefix_entries = []
+    entry.context_snapshot_seq = 0
+    entry.context_snapshot_source = None
+
+    warm_entry = await cache.refresh(session)
+
+    assert warm_entry is entry
+    assert guardrails.calls == [12, 0]
+    assert [item.source for item in cache.get_prefix_entries(session.session_id)] == [
+        "memory_instructions",
+        "core_memories",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_session_cache_appends_recorded_events_and_applies_compaction() -> None:
     cache = SessionCache(_Guardrails(), max_entries=10)
     session = _session()

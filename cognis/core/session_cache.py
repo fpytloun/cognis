@@ -13,6 +13,7 @@ Intaris load.
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import json
 from dataclasses import dataclass, field
@@ -310,6 +311,9 @@ class SessionCache:
                             "session_id": entry.session_id,
                             "event_count": len(entry.events),
                             "last_seq": entry.last_event_seq,
+                            "prefix_entry_count": len(entry.prefix_entries),
+                            "context_snapshot_seq": entry.context_snapshot_seq,
+                            "context_snapshot_source": entry.context_snapshot_source,
                         }
                     },
                 )
@@ -319,8 +323,32 @@ class SessionCache:
                     after_seq=entry.last_event_seq,
                     allow_missing_stream=True,
                 )
+                if getattr(event_read, "missing_stream_fallback_used", False):
+                    logger.warning(
+                        "cache: warm refresh fell back to missing Intaris stream",
+                        extra={
+                            "extra_data": {
+                                "session_id": entry.session_id,
+                                "intaris_session_id": entry.intaris_session_id,
+                                "after_seq": entry.last_event_seq,
+                            }
+                        },
+                    )
                 self._apply_intaris_events(entry, event_read.events)
-                if any(
+                force_prefix_rebuild = not entry.prefix_entries
+                if force_prefix_rebuild:
+                    logger.info(
+                        "cache: warm refresh forcing full Intaris read to rebuild immutable prefix",
+                        extra={
+                            "extra_data": {
+                                "session_id": entry.session_id,
+                                "intaris_session_id": entry.intaris_session_id,
+                                "after_seq": entry.last_event_seq,
+                                "reason": "missing_prefix_entries",
+                            }
+                        },
+                    )
+                if force_prefix_rebuild or any(
                     str(raw_event.get("type") or "") == "context_snapshot"
                     for raw_event in event_read.events
                 ):
@@ -329,6 +357,21 @@ class SessionCache:
                         after_seq=0,
                         allow_missing_stream=True,
                     )
+                    if getattr(full_read, "missing_stream_fallback_used", False):
+                        logger.warning(
+                            "cache: full prefix rebuild fell back to missing Intaris stream",
+                            extra={
+                                "extra_data": {
+                                    "session_id": entry.session_id,
+                                    "intaris_session_id": entry.intaris_session_id,
+                                    "rebuild_reason": (
+                                        "missing_prefix_entries"
+                                        if force_prefix_rebuild
+                                        else "incremental_context_snapshot"
+                                    ),
+                                }
+                            },
+                        )
                     self._rebuild_prefix_from_raw_events(entry, full_read.events)
                     entry.last_event_seq = max(entry.last_event_seq, full_read.last_seq)
                 entry.last_event_seq = max(entry.last_event_seq, event_read.last_seq)
@@ -339,6 +382,9 @@ class SessionCache:
                             "session_id": entry.session_id,
                             "new_events": len(event_read.events),
                             "last_seq": entry.last_event_seq,
+                            "prefix_entry_count": len(entry.prefix_entries),
+                            "context_snapshot_seq": entry.context_snapshot_seq,
+                            "context_snapshot_source": entry.context_snapshot_source,
                         }
                     },
                 )
@@ -672,6 +718,9 @@ class SessionCache:
                             "extra_data": {
                                 "session_id": session.session_id,
                                 "event_count": len(entry.events),
+                                "initialized": entry.initialized,
+                                "prefix_entry_count": len(entry.prefix_entries),
+                                "context_snapshot_seq": entry.context_snapshot_seq,
                             }
                         },
                     )
@@ -709,6 +758,16 @@ class SessionCache:
             after_seq=0,
             allow_missing_stream=True,
         )
+        if getattr(event_read, "missing_stream_fallback_used", False):
+            logger.warning(
+                "cache: cold load fell back to missing Intaris stream",
+                extra={
+                    "extra_data": {
+                        "session_id": session.session_id,
+                        "intaris_session_id": entry.intaris_session_id,
+                    }
+                },
+            )
         self._apply_intaris_events(entry, event_read.events)
         self._rebuild_prefix_from_raw_events(entry, event_read.events)
         entry.last_event_seq = event_read.last_seq
@@ -785,6 +844,9 @@ class SessionCache:
         entry: CachedSessionState,
         raw_events: list[dict[str, Any]],
     ) -> None:
+        raw_event_type_counts = collections.Counter(
+            str(raw_event.get("type") or "") for raw_event in raw_events
+        )
         latest_snapshot: dict[str, Any] | None = None
         for raw_event in raw_events:
             if raw_event.get("type") != "context_snapshot":
@@ -803,6 +865,18 @@ class SessionCache:
                 in {"system_message", "developer_message", "user_message", "assistant_message"}
                 for raw_event in raw_events
             )
+            if entry.prefix_repair_needed:
+                logger.warning(
+                    "cache: no Intaris context snapshot found while rebuilding immutable prefix",
+                    extra={
+                        "extra_data": {
+                            "session_id": entry.session_id,
+                            "intaris_session_id": entry.intaris_session_id,
+                            "raw_event_count": len(raw_events),
+                            "event_type_counts": dict(raw_event_type_counts),
+                        }
+                    },
+                )
             return
 
         seq_to_message: dict[int, dict[str, Any]] = {}
@@ -813,12 +887,14 @@ class SessionCache:
 
         snapshot_data = latest_snapshot.get("data", {})
         rebuilt_entries: list[ImmutablePrefixEntry] = []
+        missing_refs: list[int] = []
         for item in snapshot_data.get("entries", []):
             if not isinstance(item, dict):
                 continue
             seq = int(item.get("seq", 0))
             message = seq_to_message.get(seq)
             if message is None:
+                missing_refs.append(seq)
                 continue
             data = message.get("data", {})
             content = data.get("content")
@@ -847,6 +923,41 @@ class SessionCache:
                 compaction_summary = prefix_entry.content
                 break
         entry.last_compaction_summary = compaction_summary
+        if missing_refs:
+            logger.warning(
+                "cache: Intaris context snapshot references missing prefix messages",
+                extra={
+                    "extra_data": {
+                        "session_id": entry.session_id,
+                        "intaris_session_id": entry.intaris_session_id,
+                        "context_snapshot_seq": entry.context_snapshot_seq,
+                        "context_snapshot_source": entry.context_snapshot_source,
+                        "snapshot_entry_count": len(snapshot_data.get("entries", [])),
+                        "rebuilt_entry_count": len(entry.prefix_entries),
+                        "missing_ref_count": len(missing_refs),
+                        "missing_ref_sample": missing_refs[:10],
+                        "available_prefix_message_count": len(seq_to_message),
+                        "raw_event_count": len(raw_events),
+                        "event_type_counts": dict(raw_event_type_counts),
+                    }
+                },
+            )
+        elif not entry.prefix_entries:
+            logger.warning(
+                "cache: Intaris context snapshot rebuilt zero immutable prefix entries",
+                extra={
+                    "extra_data": {
+                        "session_id": entry.session_id,
+                        "intaris_session_id": entry.intaris_session_id,
+                        "context_snapshot_seq": entry.context_snapshot_seq,
+                        "context_snapshot_source": entry.context_snapshot_source,
+                        "snapshot_entry_count": len(snapshot_data.get("entries", [])),
+                        "available_prefix_message_count": len(seq_to_message),
+                        "raw_event_count": len(raw_events),
+                        "event_type_counts": dict(raw_event_type_counts),
+                    }
+                },
+            )
 
     def _apply_cached_event(self, entry: CachedSessionState, event: CachedEvent) -> None:
         if event.type in PREFIX_EVENT_TYPES:
