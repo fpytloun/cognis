@@ -405,7 +405,6 @@ import X from 'lucide-svelte/icons/x';
                 <a
                   use:sidebarTooltip={item.label}
                   aria-label={`Open ${item.label}`}
-                  title={item.label}
                   class={`flex items-center justify-center rounded-2xl px-2 py-3 text-sm transition ${$page.url.pathname.startsWith(item.href) ? 'bg-sky-500/20 text-white' : 'text-slate-300 hover:bg-slate-800 hover:text-white'}`}
                   href={item.href}
                 >
