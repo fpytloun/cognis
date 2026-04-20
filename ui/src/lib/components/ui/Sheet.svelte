@@ -200,7 +200,7 @@
 
 {#if open}
   <div
-    class="fixed inset-0 z-[80] isolate"
+    class="app-viewport-overlay z-[80] isolate"
     role="dialog"
     aria-modal="true"
     aria-label={label}
@@ -229,9 +229,9 @@
       style={side === 'bottom'
         ? `max-height: ${maxHeight}; transform: translateY(${dragOffsetY}px); transition: ${dragging ? 'none' : 'transform 180ms cubic-bezier(.32,.72,0,1)'}; padding-bottom: calc(env(safe-area-inset-bottom) + 0.75rem);`
         : side === 'right'
-        ? `padding-top: env(safe-area-inset-top); padding-bottom: env(safe-area-inset-bottom); padding-right: env(safe-area-inset-right);`
+        ? `padding-top: 0.75rem; padding-bottom: max(0.75rem, env(safe-area-inset-bottom)); padding-right: env(safe-area-inset-right);`
         : side === 'left'
-        ? `padding-top: env(safe-area-inset-top); padding-bottom: env(safe-area-inset-bottom); padding-left: env(safe-area-inset-left);`
+        ? `padding-top: 0.75rem; padding-bottom: max(0.75rem, env(safe-area-inset-bottom)); padding-left: env(safe-area-inset-left);`
         : undefined}
     >
       {#if side === 'bottom' && dismissible}

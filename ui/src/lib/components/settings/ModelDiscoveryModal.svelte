@@ -71,11 +71,12 @@
 
 <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
 <div
-  class="fixed inset-0 z-[80] flex items-center justify-center bg-slate-950/80 backdrop-blur"
+  class="app-viewport-overlay z-[80] flex items-center justify-center overflow-y-auto overscroll-contain bg-slate-950/80 px-4 py-4 backdrop-blur"
   onclick={handleBackdropClick}
+  role="presentation"
 >
   <div
-    class="w-full max-w-2xl rounded-3xl border border-slate-700 bg-slate-900 p-6 shadow-2xl"
+    class="max-h-full w-full max-w-2xl overflow-y-auto rounded-3xl border border-slate-700 bg-slate-900 p-6 shadow-2xl overscroll-contain"
     role="dialog"
     aria-modal="true"
     aria-label="Add discovered models"

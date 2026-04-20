@@ -800,19 +800,12 @@ import Target from 'lucide-svelte/icons/target';
   <LoadingState label="Loading task" description="Fetching workflow state, step runs, and dependency information." />
 {:else if task}
   <!--
-    The app layout's <main> uses \`overflow-hidden\`, so each page is
-    responsible for its own scroll region. Task detail has a lot of
-    content (workflow diagram, step runs, feedback, metadata) that
-    easily exceeds the viewport.
-    * Vertical: the root section fills the flex parent and scrolls.
-    * Horizontal: \`overflow-x-auto\` is a safety net so any child
-      that refuses to shrink (long agent IDs, wide generated tables,
-      code blocks that escape the prose wrap) can at least be
-      reached by scrolling instead of being silently clipped.
-      Specific wide blocks (the workflow diagram, step chips)
-      already have their own \`overflow-x-auto\` wrappers.
+    Task detail should behave like a normal full-width page, not a
+    horizontally pannable canvas. Keep the root locked to the viewport
+    width and let only explicitly wide children (workflow diagram,
+    chip rows, code/table blocks) own horizontal scrolling.
   -->
-  <section class="min-h-0 min-w-0 flex-1 space-y-5 overflow-y-auto overflow-x-auto px-3 py-4 sm:px-5 sm:py-6">
+  <section class="min-h-0 min-w-0 w-full max-w-full flex-1 space-y-5 overflow-y-auto overflow-x-hidden overscroll-contain px-3 py-4 sm:px-5 sm:py-6">
     <div class="flex flex-wrap items-start justify-between gap-4">
       <div class="min-w-0 space-y-3">
         <Button size="sm" variant="secondary" onclick={() => goto('/tasks')}>Back to task board</Button>
@@ -856,8 +849,8 @@ import Target from 'lucide-svelte/icons/target';
       <p class="rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-100">{error}</p>
     {/if}
 
-    <div class="grid gap-5 lg:grid-cols-[minmax(0,1fr)_380px]">
-      <div class="space-y-5">
+    <div class="grid min-w-0 gap-5 lg:grid-cols-[minmax(0,1fr)_380px]">
+      <div class="min-w-0 space-y-5">
         <!-- Pipeline diagram -->
         {#if diagramSteps.length > 0}
           <Card class="overflow-hidden p-0">
@@ -1037,8 +1030,8 @@ import Target from 'lucide-svelte/icons/target';
             </div>
           </div>
 
-          <div class="grid gap-4 px-4 py-4 sm:px-5 sm:py-5 lg:grid-cols-[260px_minmax(0,1fr)]">
-            <div class="space-y-2">
+          <div class="grid min-w-0 gap-4 px-4 py-4 sm:px-5 sm:py-5 lg:grid-cols-[260px_minmax(0,1fr)]">
+            <div class="min-w-0 space-y-2">
               {#each stepGroups as group}
                 {@const latestStatus = group.latest ? displayStepStatus(group.latest) : (task.pending_pause?.step_name === group.stepName ? 'paused' : 'pending')}
                 {@const groupAgent = agentFor(group.latest?.agent_id ?? null)}
@@ -1063,7 +1056,7 @@ import Target from 'lucide-svelte/icons/target';
               {/each}
             </div>
 
-            <div class="space-y-4">
+            <div class="min-w-0 space-y-4">
               {#if selectedStepGroup}
                 {#if selectedStepGroup.latest}
                   {@const latestAttempt = selectedStepGroup.latest}
@@ -1310,7 +1303,7 @@ import Target from 'lucide-svelte/icons/target';
       </div>
 
       <!-- Sidebar -->
-      <div class="hidden space-y-5 lg:block">
+      <div class="min-w-0 hidden space-y-5 lg:block">
         <!-- Origin -->
         <Card class="p-5">
           <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Origin</p>
@@ -1462,9 +1455,9 @@ import Target from 'lucide-svelte/icons/target';
   </section>
 
   {#if mobileStepDetailOpen && selectedStepGroup}
-    <div class="fixed inset-0 z-40 lg:hidden" role="presentation">
+    <div class="app-viewport-overlay z-40 lg:hidden" role="presentation">
       <button class="absolute inset-0 bg-slate-950/80" onclick={closeMobileStepDetail} type="button" aria-label="Close step detail"></button>
-      <div class="absolute inset-x-0 bottom-0 max-h-[82vh] overflow-y-auto rounded-t-[2rem] border-t border-slate-700 bg-slate-950 p-5 shadow-2xl">
+      <div class="absolute inset-x-0 bottom-0 max-h-full overflow-y-auto rounded-t-[2rem] border-t border-slate-700 bg-slate-950 p-5 shadow-2xl overscroll-contain">
         <div class="flex items-start justify-between gap-3">
           <div>
             <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Step detail</p>
@@ -1516,9 +1509,9 @@ import Target from 'lucide-svelte/icons/target';
   {/if}
 
   {#if configModalOpen}
-    <div class="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/85 p-4" role="presentation">
+    <div class="app-viewport-overlay z-50 flex items-center justify-center overflow-y-auto overscroll-contain bg-slate-950/85 p-4" role="presentation">
       <button class="absolute inset-0" onclick={closeConfigModal} type="button" aria-label="Close configuration"></button>
-      <div class="relative z-10 max-h-[90vh] w-full max-w-4xl overflow-y-auto rounded-[2rem] border border-slate-700 bg-slate-900 p-6 shadow-2xl">
+      <div class="relative z-10 max-h-full w-full max-w-4xl overflow-y-auto rounded-[2rem] border border-slate-700 bg-slate-900 p-6 shadow-2xl overscroll-contain">
         <div class="flex items-start justify-between gap-4 border-b border-slate-800 pb-4">
           <div>
             <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Task configuration</p>

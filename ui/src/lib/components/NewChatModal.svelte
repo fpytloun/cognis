@@ -73,9 +73,9 @@
   });
 </script>
 
-<div class="fixed inset-0 z-[90] flex items-center justify-center bg-slate-950/80 px-4 py-6 backdrop-blur" role="presentation">
+<div class="app-viewport-overlay z-[90] flex items-center justify-center overflow-y-auto overscroll-contain bg-slate-950/80 px-4 py-6 backdrop-blur" role="presentation">
   <button class="absolute inset-0" onclick={() => !busy && oncancel()} type="button" aria-label="Close new chat dialog"></button>
-  <div bind:this={container} class="relative z-10 w-full max-w-lg rounded-3xl border border-slate-800 bg-slate-950 p-6 shadow-card" role="dialog" aria-modal="true" aria-labelledby="new-chat-title">
+  <div bind:this={container} class="relative z-10 max-h-full w-full max-w-lg overflow-y-auto rounded-3xl border border-slate-800 bg-slate-950 p-6 shadow-card overscroll-contain" role="dialog" aria-modal="true" aria-labelledby="new-chat-title">
     <p class="text-sm uppercase tracking-[0.25em] text-slate-400">Conversation setup</p>
     <h2 class="mt-3 text-xl font-semibold text-white" id="new-chat-title">{title}</h2>
     <p class="mt-3 text-sm leading-6 text-slate-300">{description}</p>

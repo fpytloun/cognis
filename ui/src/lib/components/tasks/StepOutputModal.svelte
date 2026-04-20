@@ -114,14 +114,12 @@
 </script>
 
 <!--
-  Full step output modal. Raised above the mobile bottom tab bar and
-  safe-area-padded so the modal edges never tuck under iPhone's
-  Dynamic Island or home indicator. The panel uses
-  \`max-w-3xl max-h-full\` so its content scrolls internally without
-  pushing the page wider than the viewport.
+  Full step output modal. Bounded by the shared app-shell offsets so
+  it stays above the mobile header and bottom tab bar while still
+  scrolling internally.
 -->
 <div
-  class="fixed inset-0 z-[95] flex items-stretch justify-center bg-slate-950/85 px-3 pt-[calc(0.75rem+env(safe-area-inset-top))] pb-[calc(0.75rem+env(safe-area-inset-bottom))] backdrop-blur sm:items-center sm:px-4 sm:py-6"
+  class="app-viewport-overlay z-[95] flex items-stretch justify-center overflow-y-auto overscroll-contain bg-slate-950/85 px-3 py-3 backdrop-blur sm:items-center sm:px-4 sm:py-6"
   role="presentation"
 >
   <button class="absolute inset-0" onclick={onclose} type="button" aria-label="Close full output"></button>
@@ -150,7 +148,7 @@
       </div>
     </div>
 
-    <div class="min-h-0 flex-1 space-y-5 overflow-y-auto overflow-x-hidden px-5 py-5 sm:px-6">
+    <div class="min-h-0 flex-1 space-y-5 overflow-y-auto overflow-x-hidden overscroll-contain px-5 py-5 sm:px-6">
       {#if summary}
         <section>
           <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Summary</p>

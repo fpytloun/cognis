@@ -480,10 +480,11 @@ import Zap from 'lucide-svelte/icons/zap';
 {#if showCreateModal}
   <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
   <div
-    class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+    class="app-viewport-overlay z-50 flex items-center justify-center overflow-y-auto overscroll-contain bg-black/60 px-4 py-4 backdrop-blur-sm"
     onclick={handleBackdropClick}
+    role="presentation"
   >
-    <div class="max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-3xl border border-slate-700 bg-slate-900 p-6 shadow-2xl" role="dialog" aria-modal="true" aria-label="Create schedule">
+    <div class="max-h-full w-full max-w-lg overflow-y-auto rounded-3xl border border-slate-700 bg-slate-900 p-6 shadow-2xl overscroll-contain" role="dialog" aria-modal="true" aria-label="Create schedule">
       <div class="mb-5 flex items-center justify-between">
         <h2 class="text-lg font-semibold text-white">Create schedule</h2>
         <button

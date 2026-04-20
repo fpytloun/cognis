@@ -5,6 +5,8 @@
 :root {
   color-scheme: dark;
   --kb-offset: 0px;
+  --app-shell-top-offset: 0px;
+  --app-shell-bottom-offset: 0px;
 }
 
 html {
@@ -230,4 +232,17 @@ textarea:focus-visible,
 .kb-offset {
   transform: translateY(calc(var(--kb-offset) * -1));
   transition: transform 180ms cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+/*
+ * App overlays live inside the same viewport shell as the mobile header
+ * and bottom tab bar. Reserve that chrome via shared CSS variables so
+ * dialogs, drawers, and sheets size against the actually visible area
+ * instead of blindly using the full viewport.
+ */
+.app-viewport-overlay {
+  position: fixed;
+  inset-inline: 0;
+  top: var(--app-shell-top-offset, 0px);
+  bottom: var(--app-shell-bottom-offset, 0px);
 }

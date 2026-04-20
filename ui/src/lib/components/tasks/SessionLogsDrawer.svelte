@@ -165,16 +165,14 @@
 <svelte:window onkeydown={handleKeydown} />
 
 <!--
-  Session logs drawer. Raised above the bottom tab bar (z-60) and the
-  mobile app header (z-10) so the panel fills the viewport without
-  getting clipped. Top header and scroll area pad by the matching
-  safe-area insets so iPhone PWAs don't lose the close button under
-  the Dynamic Island or the last log line behind the home indicator.
+  Session logs drawer. The overlay is bounded by the shared app-shell
+  header/tab offsets so the panel lives entirely inside the visible
+  viewport instead of tucking under the mobile chrome.
 -->
 <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-<div class="fixed inset-0 z-[90] flex justify-end bg-black/60" onclick={handleBackdropClick} role="presentation">
-  <aside class="flex h-full min-h-0 w-full max-w-2xl flex-col overflow-hidden border-l border-slate-700 bg-slate-900 shadow-2xl animate-slide-in-right">
-    <div class="flex items-center justify-between border-b border-slate-800 px-4 pt-[calc(0.75rem+env(safe-area-inset-top))] pb-3">
+<div class="app-viewport-overlay z-[90] flex justify-end overflow-hidden bg-black/60" onclick={handleBackdropClick} role="presentation">
+  <aside class="ml-auto flex h-full min-h-0 w-full max-w-2xl flex-col overflow-hidden border-l border-slate-700 bg-slate-900 shadow-2xl animate-slide-in-right">
+    <div class="flex items-center justify-between border-b border-slate-800 px-4 py-3">
       <div class="min-w-0">
         <p class="text-xs uppercase tracking-widest text-slate-500">Session logs</p>
         <h3 class="truncate text-sm font-semibold text-white">{stepName || sessionId}</h3>
@@ -196,7 +194,7 @@
     </div>
 
     <div
-      class="relative min-h-0 flex-1 space-y-4 overflow-y-auto overflow-x-hidden px-4 py-4 pb-[calc(1rem+env(safe-area-inset-bottom))]"
+      class="relative min-h-0 flex-1 space-y-4 overflow-y-auto overflow-x-hidden overscroll-contain px-4 py-4 pb-4"
       bind:this={timelineEl}
       onscroll={handleTimelineScroll}
     >

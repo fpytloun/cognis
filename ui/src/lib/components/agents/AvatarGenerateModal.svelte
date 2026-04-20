@@ -79,11 +79,11 @@
 <!-- Overlay -->
 <!-- svelte-ignore a11y_click_events_have_key_events -->
 <!-- svelte-ignore a11y_no_static_element_interactions -->
-<div class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onclick={onClose}>
+<div class="app-viewport-overlay z-50 flex items-center justify-center overflow-y-auto overscroll-contain bg-black/60 px-4 py-4 backdrop-blur-sm" onclick={onClose}>
   <!-- Dialog -->
   <!-- svelte-ignore a11y_click_events_have_key_events -->
   <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div class="w-full max-w-lg rounded-3xl border border-slate-700 bg-slate-900 p-6 shadow-2xl" onclick={(e) => e.stopPropagation()}>
+  <div class="max-h-full w-full max-w-lg overflow-y-auto rounded-3xl border border-slate-700 bg-slate-900 p-6 shadow-2xl overscroll-contain" onclick={(e) => e.stopPropagation()}>
     <!-- Header -->
     <div class="mb-4 flex items-center justify-between">
       <h3 class="text-lg font-semibold text-slate-100">Generate Avatar</h3>

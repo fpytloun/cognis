@@ -3119,8 +3119,8 @@
 
 <!-- Secret creation modal -->
 {#if showSecretModal}
-  <div class="fixed inset-0 z-[80] flex items-center justify-center bg-slate-950/80 backdrop-blur" role="dialog" aria-modal="true">
-    <div class="w-full max-w-md rounded-3xl border border-slate-800 bg-slate-950 p-6 shadow-card">
+  <div class="app-viewport-overlay z-[80] flex items-center justify-center overflow-y-auto overscroll-contain bg-slate-950/80 px-4 py-4 backdrop-blur" role="dialog" aria-modal="true">
+    <div class="max-h-full w-full max-w-md overflow-y-auto rounded-3xl border border-slate-800 bg-slate-950 p-6 shadow-card overscroll-contain">
       <p class="text-xs uppercase tracking-[0.25em] text-slate-400">New credential</p>
       <h3 class="mt-1 text-lg font-semibold text-white">{secretModalTarget === 'provider' ? 'Create API key secret' : 'Create environment secret'}</h3>
       <div class="mt-4 space-y-4">
@@ -3143,8 +3143,8 @@
 
 <!-- User create modal -->
 {#if showUserCreateModal}
-  <div class="fixed inset-0 z-[80] flex items-center justify-center bg-slate-950/80 backdrop-blur" role="dialog" aria-modal="true">
-    <div class="w-full max-w-md rounded-3xl border border-slate-800 bg-slate-950 p-6 shadow-card">
+  <div class="app-viewport-overlay z-[80] flex items-center justify-center overflow-y-auto overscroll-contain bg-slate-950/80 px-4 py-4 backdrop-blur" role="dialog" aria-modal="true">
+    <div class="max-h-full w-full max-w-md overflow-y-auto rounded-3xl border border-slate-800 bg-slate-950 p-6 shadow-card overscroll-contain">
       <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Administration</p>
       <h3 class="mt-1 text-lg font-semibold text-white">Create user</h3>
       <div class="mt-4 space-y-4">
@@ -3184,8 +3184,8 @@
 
 <!-- User edit modal -->
 {#if showUserEditModal && editingUser}
-  <div class="fixed inset-0 z-[80] flex items-center justify-center bg-slate-950/80 backdrop-blur" role="dialog" aria-modal="true">
-    <div class="w-full max-w-md rounded-3xl border border-slate-800 bg-slate-950 p-6 shadow-card">
+  <div class="app-viewport-overlay z-[80] flex items-center justify-center overflow-y-auto overscroll-contain bg-slate-950/80 px-4 py-4 backdrop-blur" role="dialog" aria-modal="true">
+    <div class="max-h-full w-full max-w-md overflow-y-auto rounded-3xl border border-slate-800 bg-slate-950 p-6 shadow-card overscroll-contain">
       <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Administration</p>
       <h3 class="mt-1 text-lg font-semibold text-white">Edit user</h3>
       <p class="mt-1 text-sm text-slate-400">{editingUser.email}</p>

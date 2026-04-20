@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import { page } from '$app/stores';
   import Bot from 'lucide-svelte/icons/bot';
 import ListTodo from 'lucide-svelte/icons/list-todo';
@@ -17,6 +18,7 @@ import Settings from 'lucide-svelte/icons/settings';
   }
 
   let { hidden = false }: Props = $props();
+  let navEl = $state<HTMLElement | null>(null);
 
   const tabs = [
     { href: '/chat', label: 'Chat', icon: MessageSquareText },
@@ -29,10 +31,51 @@ import Settings from 'lucide-svelte/icons/settings';
     if (href === '/chat' && pathname.startsWith('/chat')) return true;
     return pathname.startsWith(href);
   }
+
+  function setBottomOffset(value: number): void {
+    if (typeof document === 'undefined') return;
+    document.documentElement.style.setProperty('--app-shell-bottom-offset', `${Math.max(0, Math.round(value))}px`);
+  }
+
+  function syncBottomOffset(): void {
+    if (typeof window === 'undefined') return;
+    const shouldReserve = !hidden && window.innerWidth < 1024;
+    setBottomOffset(shouldReserve ? navEl?.offsetHeight ?? 0 : 0);
+  }
+
+  $effect(() => {
+    if (typeof window === 'undefined') return;
+    void hidden;
+    void navEl;
+    const rafId = window.requestAnimationFrame(syncBottomOffset);
+    return () => window.cancelAnimationFrame(rafId);
+  });
+
+  $effect(() => {
+    if (typeof ResizeObserver === 'undefined') return;
+    const element = navEl;
+    if (!element) {
+      syncBottomOffset();
+      return;
+    }
+    const observer = new ResizeObserver(syncBottomOffset);
+    observer.observe(element);
+    return () => observer.disconnect();
+  });
+
+  onMount(() => {
+    syncBottomOffset();
+    window.addEventListener('resize', syncBottomOffset);
+    return () => {
+      window.removeEventListener('resize', syncBottomOffset);
+      setBottomOffset(0);
+    };
+  });
 </script>
 
 {#if !hidden}
   <nav
+    bind:this={navEl}
     class="fixed inset-x-0 bottom-0 z-[60] border-t border-slate-800/80 bg-slate-950/95 backdrop-blur lg:hidden"
     style="padding-bottom: env(safe-area-inset-bottom, 0);"
     aria-label="Primary"

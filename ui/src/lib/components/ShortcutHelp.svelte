@@ -11,8 +11,8 @@
 </script>
 
 {#if $shortcutHelpOpen}
-  <div class="fixed inset-0 z-[85] flex items-center justify-center bg-slate-950/80 px-4 py-6 backdrop-blur" role="presentation">
-    <div aria-modal="true" aria-labelledby="shortcut-help-title" class="w-full max-w-xl rounded-3xl border border-slate-800 bg-slate-950 p-6 shadow-card" role="dialog">
+  <div class="app-viewport-overlay z-[85] flex items-center justify-center overflow-y-auto overscroll-contain bg-slate-950/80 px-4 py-6 backdrop-blur" role="presentation">
+    <div aria-modal="true" aria-labelledby="shortcut-help-title" class="max-h-full w-full max-w-xl overflow-y-auto rounded-3xl border border-slate-800 bg-slate-950 p-6 shadow-card overscroll-contain" role="dialog">
       <div class="flex items-center justify-between gap-3">
         <div>
           <p class="text-sm uppercase tracking-[0.25em] text-slate-400">Keyboard shortcuts</p>

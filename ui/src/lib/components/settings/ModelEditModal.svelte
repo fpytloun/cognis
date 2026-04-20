@@ -68,11 +68,12 @@
 
 <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
 <div
-  class="fixed inset-0 z-[80] flex items-center justify-center bg-slate-950/80 backdrop-blur"
+  class="app-viewport-overlay z-[80] flex items-center justify-center overflow-y-auto overscroll-contain bg-slate-950/80 px-4 py-4 backdrop-blur"
   onclick={handleBackdropClick}
+  role="presentation"
 >
   <div
-    class="w-full max-w-lg rounded-3xl border border-slate-700 bg-slate-900 p-6 shadow-2xl"
+    class="max-h-full w-full max-w-lg overflow-y-auto rounded-3xl border border-slate-700 bg-slate-900 p-6 shadow-2xl overscroll-contain"
     role="dialog"
     aria-modal="true"
     aria-label="Edit model"
@@ -83,7 +84,7 @@
       <button class="text-slate-400 hover:text-white" onclick={onclose} aria-label="Close">&times;</button>
     </div>
 
-    <div class="max-h-[70vh] space-y-5 overflow-y-auto pr-1">
+    <div class="space-y-5 pr-1">
       <!-- Display name -->
       <div class="space-y-1">
         <label for="model-display-name" class="text-sm font-medium text-slate-200">Display name</label>

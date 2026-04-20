@@ -64,8 +64,8 @@
 </script>
 
 {#if $confirmStore}
-  <div class="fixed inset-0 z-[90] flex items-center justify-center bg-slate-950/80 px-4 py-6 backdrop-blur" role="presentation">
-    <div bind:this={container} aria-modal="true" class="w-full max-w-lg rounded-3xl border border-slate-800 bg-slate-950 p-6 shadow-card" role="dialog" aria-labelledby="confirm-title">
+  <div class="app-viewport-overlay z-[90] flex items-center justify-center overflow-y-auto overscroll-contain bg-slate-950/80 px-4 py-6 backdrop-blur" role="presentation">
+    <div bind:this={container} aria-modal="true" class="max-h-full w-full max-w-lg overflow-y-auto rounded-3xl border border-slate-800 bg-slate-950 p-6 shadow-card overscroll-contain" role="dialog" aria-labelledby="confirm-title">
       <p class="text-sm uppercase tracking-[0.25em] text-slate-400">Confirmation required</p>
       <h2 class="mt-3 text-xl font-semibold text-white" id="confirm-title">{$confirmStore.title}</h2>
       <p class="mt-3 text-sm leading-6 text-slate-300">{$confirmStore.message}</p>

@@ -54,6 +54,7 @@ import X from 'lucide-svelte/icons/x';
   let diagnostics = $state<SystemDiagnostics | null>(null);
   let mobileNavOpen = $state(false);
   let sidebarCollapsed = $state(false);
+  let mobileHeaderEl = $state<HTMLElement | null>(null);
 
   function openMobileNav(): void {
     mobileNavOpen = true;
@@ -248,10 +249,27 @@ import X from 'lucide-svelte/icons/x';
     return navigationItems.find((item) => pathname.startsWith(item.href))?.label ?? 'Workspace';
   }
 
+  function setShellOffsetVariable(name: string, value: number): void {
+    if (typeof document === 'undefined') return;
+    document.documentElement.style.setProperty(name, `${Math.max(0, Math.round(value))}px`);
+  }
+
+  function syncMobileHeaderOffset(): void {
+    if (typeof window === 'undefined') return;
+    const shouldReserve = showMobileHeader && window.innerWidth < 1024;
+    setShellOffsetVariable('--app-shell-top-offset', shouldReserve ? mobileHeaderEl?.offsetHeight ?? 0 : 0);
+  }
+
   let isChatRoute = $derived($page.url.pathname.startsWith('/chat'));
   let isChatDetailRoute = $derived(/^\/chat\/[^/]+/.test($page.url.pathname));
   let showMobileHeader = $derived(!isChatDetailRoute);
   let shouldReserveBottomTabSpace = $derived(!isChatDetailRoute);
+  let contentShellClass = $derived.by(() => {
+    if (isChatRoute) {
+      return `min-h-0 min-w-0 flex-1 overflow-hidden ${showMobileHeader ? 'pt-[var(--app-shell-top-offset,0px)] lg:pt-0' : ''}`;
+    }
+    return 'min-h-0 min-w-0 flex-1 overflow-y-auto overflow-x-hidden overscroll-contain px-3 pb-3 pt-[calc(var(--app-shell-top-offset,0px)+0.75rem)] sm:px-4 sm:pb-4 lg:px-0 lg:pb-0 lg:pt-0';
+  });
 
   // Route changes can leave `--kb-offset` non-zero if the iOS keyboard
   // was still dismissing when the user tapped a nav link. Elements on
@@ -264,6 +282,14 @@ import X from 'lucide-svelte/icons/x';
     void $page.url.pathname;
     if (typeof document === 'undefined') return;
     document.documentElement.style.setProperty('--kb-offset', '0px');
+  });
+
+  $effect(() => {
+    if (typeof window === 'undefined') return;
+    void showMobileHeader;
+    void mobileHeaderEl;
+    const rafId = window.requestAnimationFrame(syncMobileHeaderOffset);
+    return () => window.cancelAnimationFrame(rafId);
   });
 
   function websocketStatusLabel(): string {
@@ -294,6 +320,7 @@ import X from 'lucide-svelte/icons/x';
     });
 
     window.addEventListener('keydown', handleGlobalShortcuts);
+    window.addEventListener('resize', syncMobileHeaderOffset);
 
     // Pages that hide the global mobile header (chat detail) use this
     // signal to open the main nav drawer from their own hamburger button.
@@ -309,6 +336,8 @@ import X from 'lucide-svelte/icons/x';
     return () => {
       document.body.style.overflow = '';
       window.removeEventListener('keydown', handleGlobalShortcuts);
+      window.removeEventListener('resize', syncMobileHeaderOffset);
+      setShellOffsetVariable('--app-shell-top-offset', 0);
       unsubscribeMobileNav();
       wsClient.disconnect();
       workspaceHealth.stop();
@@ -335,8 +364,8 @@ import X from 'lucide-svelte/icons/x';
   <ToastViewport />
   <ConfirmDialog />
   <ShortcutHelp />
-  <div class="h-[100dvh] overflow-hidden">
-    <div class={`mx-auto flex h-[100dvh] max-w-[1600px] overflow-hidden ${shouldReserveBottomTabSpace ? 'pb-[calc(56px+env(safe-area-inset-bottom))]' : 'pb-0'} lg:gap-6 lg:px-6 lg:py-4 lg:pb-4`}>
+  <div class="h-[100dvh] overflow-hidden overscroll-none">
+    <div class={`mx-auto flex h-[100dvh] max-w-[1600px] overflow-hidden ${shouldReserveBottomTabSpace ? 'pb-[var(--app-shell-bottom-offset,0px)]' : 'pb-0'} lg:gap-6 lg:px-6 lg:py-4 lg:pb-4`}>
       <aside
         class={`hidden min-h-0 shrink-0 overflow-hidden whitespace-nowrap rounded-3xl border border-slate-800/80 bg-slate-900/80 shadow-card backdrop-blur transition-all duration-200 ease-in-out lg:flex lg:flex-col lg:justify-between ${sidebarExpanded ? 'w-72 p-5' : 'w-16 p-3'}`}
       >
@@ -497,7 +526,7 @@ import X from 'lucide-svelte/icons/x';
           top by `env(safe-area-inset-top)` so the hamburger + title sit
           below the camera cutout instead of being obscured by it.
         -->
-        <header class="sticky top-0 z-10 flex shrink-0 items-center justify-between gap-2 border-b border-slate-800/80 bg-slate-950/95 px-3 pt-[calc(0.625rem+env(safe-area-inset-top))] pb-2.5 backdrop-blur sm:gap-3 sm:px-4 sm:pt-[calc(0.625rem+env(safe-area-inset-top))] sm:pb-2.5 lg:hidden">
+        <header bind:this={mobileHeaderEl} class="fixed inset-x-0 top-0 z-[70] flex shrink-0 items-center justify-between gap-2 border-b border-slate-800/80 bg-slate-950/95 px-3 pt-[calc(0.625rem+env(safe-area-inset-top))] pb-2.5 backdrop-blur sm:gap-3 sm:px-4 sm:pt-[calc(0.625rem+env(safe-area-inset-top))] sm:pb-2.5 lg:hidden">
           <div class="flex min-w-0 flex-1 items-center gap-2 lg:hidden">
             <Button aria-label="Open navigation" class="h-11 w-11 lg:hidden md:h-9 md:w-9" size="icon" variant="secondary" onclick={openMobileNav}>
               <Menu class="h-5 w-5" />
@@ -587,7 +616,7 @@ import X from 'lucide-svelte/icons/x';
           detail. Pointer-based gesture; mouse input is ignored.
         -->
         <div
-          class={`min-h-0 min-w-0 flex-1 ${isChatRoute ? 'overflow-hidden' : 'overflow-y-auto overflow-x-hidden px-3 py-3 sm:px-4 sm:py-4 lg:px-0 lg:py-0'}`}
+          class={contentShellClass}
           onpointerdown={isChatDetailRoute ? undefined : onLeftEdgePointerDown}
           onpointermove={isChatDetailRoute ? undefined : onLeftEdgePointerMove}
           onpointerup={isChatDetailRoute ? undefined : onLeftEdgePointerReset}
