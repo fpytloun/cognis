@@ -131,6 +131,29 @@ textarea:focus-visible,
   overflow-wrap: anywhere;
 }
 
+/*
+ * Generic prose blocks (Tailwind typography) don't wrap long tokens by
+ * default, which breaks the layout of the task detail page when a step
+ * summary includes a long URL or hash. Force overflow-wrap on inline
+ * content and make `<pre>`/`<table>` inside the block self-scrollable
+ * so they stay visible without pushing the page wider than the
+ * viewport.
+ */
+.prose :is(p, li, a, code, strong, em) {
+  overflow-wrap: anywhere;
+}
+
+.prose pre {
+  overflow-x: auto;
+  max-width: 100%;
+}
+
+.prose table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+}
+
 .docs-markdown .markdown-code-wrap,
 .docs-markdown .markdown-table-wrap {
   max-width: 100%;
