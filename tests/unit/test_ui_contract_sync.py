@@ -26,6 +26,7 @@ from cognis.api.models import (
     SkillVersionResponse,
     StepRunResponse,
     TaskResponse,
+    WorkflowResponse,
 )
 
 UI_API_TYPES = Path(__file__).resolve().parents[2] / "ui" / "src" / "lib" / "types" / "api.ts"
@@ -45,6 +46,7 @@ _MODELS_TO_CHECK = (
     ("Session", SessionResponse),
     ("Skill", SkillResponse),
     ("SkillVersion", SkillVersionResponse),
+    ("Workflow", WorkflowResponse),
 )
 
 
@@ -114,6 +116,7 @@ def test_ui_interface_covers_api_model_fields(interface_name: str, model_cls: ty
         "Session": set(),
         "Skill": set(),
         "SkillVersion": set(),
+        "Workflow": set(),
     }.get(interface_name, set())
     missing -= allowed_missing
 

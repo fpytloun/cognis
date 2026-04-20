@@ -55,7 +55,10 @@ WORKFLOW_TOOL_NAMES = {
     "delete_workflow",
     "duplicate_workflow",
 }
-ORCHESTRATION_TOOL_NAMES = SUBSESSION_TOOL_NAMES | TASK_TOOL_NAMES | WORKFLOW_TOOL_NAMES
+COMPOSITION_TOOL_NAMES = {"compose_and_run_workflow"}
+ORCHESTRATION_TOOL_NAMES = (
+    SUBSESSION_TOOL_NAMES | TASK_TOOL_NAMES | WORKFLOW_TOOL_NAMES | COMPOSITION_TOOL_NAMES
+)
 
 # ---------------------------------------------------------------------------
 # Sub-session tool definitions
@@ -658,6 +661,66 @@ _ALL_WORKFLOW_TOOLS = [
     DUPLICATE_WORKFLOW_TOOL,
 ]
 
+COMPOSE_AND_RUN_WORKFLOW_TOOL = ToolDefinition(
+    name="compose_and_run_workflow",
+    description=(
+        "Compose a proportional workflow from the current request, optionally reusing or "
+        "adapting an existing workflow, and immediately create a task or schedule from it. "
+        "Use this when the work is multi-step, recurring, deliverable-sensitive, or should "
+        "be scheduled instead of handled inline."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "intent": {"type": "string", "description": "Distilled statement of the user's goal."},
+            "context": {"type": "string", "description": "Relevant conversation and memory context."},
+            "title": {"type": "string", "description": "Optional task or schedule title override."},
+            "expected_output": {"type": "string", "description": "Expected final result shape."},
+            "skill_hints": {"type": "array", "items": {"type": "string"}},
+            "template_hints": {"type": "array", "items": {"type": "string"}},
+            "base_workflow_id": {"type": "string", "description": "Explicit base workflow to reuse or adapt."},
+            "decompose_skills": {
+                "type": "string",
+                "enum": ["auto", "always", "never"],
+                "default": "auto",
+            },
+            "schedule": {
+                "type": "object",
+                "description": "Optional schedule definition. When present, the composed workflow becomes persistent.",
+                "properties": {
+                    "name": {"type": "string"},
+                    "description": {"type": "string"},
+                    "schedule_type": {"type": "string", "enum": ["cron", "interval", "one_shot"]},
+                    "cron_expr": {"type": "string"},
+                    "interval_seconds": {"type": "integer"},
+                    "one_shot_at": {"type": "string"},
+                    "timezone": {"type": "string"},
+                    "enabled": {"type": "boolean"},
+                    "max_concurrent_runs": {"type": "integer"},
+                    "delete_after_run": {"type": "boolean"},
+                },
+                "required": ["schedule_type"],
+            },
+            "delivery": {
+                "type": "object",
+                "properties": {
+                    "mode": {"type": "string"},
+                    "target": {"type": "string"},
+                    "completion_mode_family": {"type": "string", "enum": ["default", "direct"]},
+                    "allow_silent_completion": {"type": "boolean"},
+                },
+            },
+            "persist": {"type": "boolean", "default": False},
+            "agent_id": {"type": "string", "description": "Optional agent override. Omit to use the current agent."},
+            "priority": {"type": "integer", "default": 0},
+        },
+        "required": ["intent"],
+    },
+    source=ToolSource(type="builtin"),
+    category="orchestration",
+    read_only=False,
+)
+
 # Sync-only delegate for task steps (no wait parameter exposed — always sync)
 _DELEGATE_SYNC_TOOL = DELEGATE_TOOL.model_copy(
     update={
@@ -710,7 +773,7 @@ def orchestration_tools(mode: OrchestrationMode = OrchestrationMode.FULL) -> lis
     if mode == OrchestrationMode.DELEGATE_SYNC_ONLY:
         return [_DELEGATE_SYNC_TOOL]
     # FULL mode
-    return _ALL_SUBSESSION_TOOLS + _ALL_TASK_TOOLS + _ALL_WORKFLOW_TOOLS
+    return _ALL_SUBSESSION_TOOLS + _ALL_TASK_TOOLS + _ALL_WORKFLOW_TOOLS + [COMPOSE_AND_RUN_WORKFLOW_TOOL]
 
 
 def is_orchestration_tool(tool_name: str) -> bool:
@@ -731,6 +794,12 @@ def is_task_tool(tool_name: str) -> bool:
 def is_workflow_tool(tool_name: str) -> bool:
     """Return True for workflow management tools."""
     return tool_name in WORKFLOW_TOOL_NAMES
+
+
+def is_composition_tool(tool_name: str) -> bool:
+    """Return True for workflow composition tools."""
+
+    return tool_name in COMPOSITION_TOOL_NAMES
 
 
 # ---------------------------------------------------------------------------

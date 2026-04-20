@@ -46,7 +46,8 @@ function buildApi(overrides: Partial<Record<string, unknown>> = {}) {
       listAll: vi.fn().mockResolvedValue([{ agent_id: 'agent-1', name: 'Agent' }])
     },
     workflows: {
-      listAll: vi.fn().mockResolvedValue([{ workflow_id: 'wf-1', name: 'Workflow' }])
+      listAll: vi.fn().mockResolvedValue([{ workflow_id: 'wf-1', name: 'Workflow' }]),
+      detail: vi.fn().mockResolvedValue({ workflow_id: 'wf-1', name: 'Workflow' })
     },
     conversations: {
       listAll: vi.fn().mockResolvedValue([{ conversation_id: 'conv-1', agent_id: 'agent-1' }])
@@ -59,14 +60,15 @@ describe('task detail helpers', () => {
   it('keeps task detail when auxiliary loads fail', async () => {
     const api = buildApi({
       workflows: {
-        listAll: vi.fn().mockRejectedValue(new ApiError('Workflow registry unavailable', { status: 503 }))
+        listAll: vi.fn().mockRejectedValue(new ApiError('Workflow registry unavailable', { status: 503 })),
+        detail: vi.fn().mockResolvedValue({ workflow_id: 'wf-1', name: 'Workflow' })
       }
     });
 
     const data = await loadTaskPageData(api as never, 'task-1');
 
     expect(data.task.task_id).toBe('task-1');
-    expect(data.workflows).toEqual([]);
+    expect(data.workflows).toEqual([{ workflow_id: 'wf-1', name: 'Workflow' }]);
     expect(data.auxiliaryError).toBe('Workflow registry unavailable');
   });
 

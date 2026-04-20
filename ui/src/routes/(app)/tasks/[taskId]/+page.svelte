@@ -114,6 +114,17 @@ import type { Agent, Conversation, Deliverable, StepRun, Task, TaskDetail, Workf
     return workflows.find((w) => w.workflow_id === workflowId)?.name ?? workflowId;
   }
 
+  function currentWorkflow(): Workflow | null {
+    if (!task?.workflow_id) return null;
+    const workflowId = task.workflow_id;
+    return workflows.find((workflow) => workflow.workflow_id === workflowId) ?? null;
+  }
+
+  async function promoteWorkflowFromTask(): Promise<void> {
+    if (!task?.workflow_id) return;
+    await goto(`/workflows?draftFrom=${encodeURIComponent(task.workflow_id)}`);
+  }
+
   function agentFor(agentId: string | null): Agent | null {
     if (!agentId) return null;
     return agents.find((a) => a.agent_id === agentId) ?? null;
@@ -1367,6 +1378,9 @@ import type { Agent, Conversation, Deliverable, StepRun, Task, TaskDetail, Workf
                   {@html finalTaskDeliverableHtml(task)}
                 </div>
               {/if}
+              {#if currentWorkflow()?.lifecycle === 'ephemeral'}
+                <Button class="mt-4" size="sm" variant="secondary" onclick={() => void promoteWorkflowFromTask()}>Promote workflow</Button>
+              {/if}
             </div>
           </div>
         </details>
@@ -1523,6 +1537,9 @@ import type { Agent, Conversation, Deliverable, StepRun, Task, TaskDetail, Workf
             <div class="prose prose-sm prose-invert mt-4 max-w-none text-slate-300">
               {@html finalTaskDeliverableHtml(task)}
             </div>
+          {/if}
+          {#if currentWorkflow()?.lifecycle === 'ephemeral'}
+            <Button class="mt-4" size="sm" variant="secondary" onclick={() => void promoteWorkflowFromTask()}>Promote workflow</Button>
           {/if}
         </Card>
       </div>

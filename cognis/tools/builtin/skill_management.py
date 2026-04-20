@@ -15,6 +15,7 @@ from cognis.models.skill import ImportProvenance, ResolvedSkill, ResolvedSkillSe
 from cognis.models.tool import ToolDefinition, ToolResult, ToolSource, stable_tool_id
 from cognis.tools.skill_service import (
     asset_refs_to_inputs,
+    compute_decomposition_source_hash,
     create_skill_version_with_assets,
     export_cognis_package,
     load_export_assets,
@@ -782,6 +783,7 @@ async def _handle_skill_write(
                 tools=tools,
                 prompt_templates=templates,
                 secret_placeholders=secret_placeholders,
+                steps=getattr(current_version, "steps", None) if current_version is not None else None,
                 assets=assets,
                 allow_binary_assets=False,
                 source_url=current_version.source_url if current_version is not None else None,
@@ -790,6 +792,11 @@ async def _handle_skill_write(
                 import_checksum=current_version.import_checksum if current_version is not None else None,
                 imported_at=current_version.imported_at if current_version is not None else None,
                 import_format=current_version.import_format if current_version is not None else None,
+                decomposition_source_hash=(
+                    getattr(current_version, "decomposition_source_hash", None)
+                    if current_version is not None
+                    else None
+                ),
             )
         except ValueError as exc:
             return ToolResult(output=str(exc), is_error=True)
@@ -880,6 +887,7 @@ async def _handle_skill_asset_write(
                 tools=tools,
                 prompt_templates=templates,
                 secret_placeholders=placeholders,
+                steps=getattr(current_version, "steps", None) if current_version is not None else None,
                 assets=asset_inputs,
                 allow_binary_assets=False,
                 source_url=current_version.source_url if current_version is not None else None,
@@ -888,6 +896,11 @@ async def _handle_skill_asset_write(
                 import_checksum=current_version.import_checksum if current_version is not None else None,
                 imported_at=current_version.imported_at if current_version is not None else None,
                 import_format=current_version.import_format if current_version is not None else None,
+                decomposition_source_hash=(
+                    getattr(current_version, "decomposition_source_hash", None)
+                    if current_version is not None
+                    else None
+                ),
             )
         except ValueError as exc:
             return ToolResult(output=str(exc), is_error=True)
@@ -967,6 +980,7 @@ async def _handle_skill_asset_delete(
             tools=tools,
             prompt_templates=templates,
             secret_placeholders=placeholders,
+            steps=getattr(current_version, "steps", None) if current_version is not None else None,
             assets=asset_refs_to_inputs(retained_assets),
             allow_binary_assets=False,
             source_url=current_version.source_url if current_version is not None else None,
@@ -975,6 +989,11 @@ async def _handle_skill_asset_delete(
             import_checksum=current_version.import_checksum if current_version is not None else None,
             imported_at=current_version.imported_at if current_version is not None else None,
             import_format=current_version.import_format if current_version is not None else None,
+            decomposition_source_hash=(
+                getattr(current_version, "decomposition_source_hash", None)
+                if current_version is not None
+                else None
+            ),
         )
         await update_skill(
             session,
@@ -1075,6 +1094,7 @@ async def _handle_skill_import_url(
         tools = normalize_skill_tools(skill_data.get("tools"))
         templates = normalize_prompt_templates(skill_data.get("prompt_templates"))
         placeholders = normalize_secret_placeholders(skill_data.get("secret_placeholders"))
+        steps = skill_data.get("steps") if isinstance(skill_data.get("steps"), list) else None
         tags = arguments.get("tags") or skill_data.get("tags") or []
         attach_to_all_agents = _resolve_attach_to_all_agents(arguments)
     except ValueError as exc:
@@ -1104,6 +1124,7 @@ async def _handle_skill_import_url(
                 tools=tools,
                 prompt_templates=templates,
                 secret_placeholders=placeholders,
+                steps=steps,
                 assets=skill_data.get("assets") if isinstance(skill_data.get("assets"), list) else None,
                 allow_binary_assets=False,
                 source_url=provenance.source_url,
@@ -1112,6 +1133,9 @@ async def _handle_skill_import_url(
                 import_checksum=provenance.import_checksum,
                 imported_at=provenance.imported_at,
                 import_format=provenance.import_format,
+                decomposition_source_hash=(
+                    compute_decomposition_source_hash(instructions) if steps else None
+                ),
             )
         except ValueError as exc:
             return ToolResult(output=str(exc), is_error=True)

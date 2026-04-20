@@ -184,6 +184,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_avatar_image_id_column)
         await conn.run_sync(_ensure_executor_runtime_state_columns)
         await conn.run_sync(_ensure_skill_versioning_columns)
+        await conn.run_sync(_ensure_skill_decomposition_columns)
         await conn.run_sync(_ensure_skill_system_column)
         await conn.run_sync(_ensure_schedule_extended_columns)
         await conn.run_sync(_ensure_conversation_title_source_column)
@@ -194,6 +195,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_step_run_execution_paths)
         await conn.run_sync(_ensure_deliverables_table)
         await conn.run_sync(_ensure_step_run_deliverable_columns)
+        await conn.run_sync(_ensure_workflow_lifecycle_columns)
         await conn.run_sync(_ensure_system_agent_override_skill_columns)
         await conn.run_sync(_ensure_harness_recovery_tables)
 
@@ -451,6 +453,22 @@ def _ensure_skill_system_column(sync_conn: object) -> None:
         execute(text("ALTER TABLE skills ADD COLUMN is_system BOOLEAN NOT NULL DEFAULT FALSE"))
 
 
+def _ensure_skill_decomposition_columns(sync_conn: object) -> None:
+    """Add skill decomposition columns to skill_versions when missing."""
+
+    inspector = cast(Any, inspect(sync_conn))
+    try:
+        columns = {column["name"] for column in inspector.get_columns("skill_versions")}
+    except Exception:
+        return
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+
+    if "steps" not in columns:
+        execute(text("ALTER TABLE skill_versions ADD COLUMN steps JSON"))
+    if "decomposition_source_hash" not in columns:
+        execute(text("ALTER TABLE skill_versions ADD COLUMN decomposition_source_hash VARCHAR"))
+
+
 def _ensure_schedule_extended_columns(sync_conn: object) -> None:
     """Add schedule type, error tracking, and completion delivery columns."""
     inspector = cast(Any, inspect(sync_conn))
@@ -619,6 +637,24 @@ def _ensure_step_run_deliverable_columns(sync_conn: object) -> None:
         execute(text("ALTER TABLE step_runs ADD COLUMN require_deliverable BOOLEAN"))
 
 
+def _ensure_workflow_lifecycle_columns(sync_conn: object) -> None:
+    """Add lifecycle fields to workflows when missing."""
+
+    inspector = cast(Any, inspect(sync_conn))
+    try:
+        columns = {column["name"] for column in inspector.get_columns("workflows")}
+    except Exception:
+        return
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+
+    if "lifecycle" not in columns:
+        execute(
+            text("ALTER TABLE workflows ADD COLUMN lifecycle VARCHAR NOT NULL DEFAULT 'persistent'")
+        )
+    if "archived_at" not in columns:
+        execute(text("ALTER TABLE workflows ADD COLUMN archived_at TIMESTAMP WITH TIME ZONE"))
+
+
 def _ensure_system_agent_override_skill_columns(sync_conn: object) -> None:
     """Add missing skill override columns to system agent overrides."""
 
@@ -723,7 +759,10 @@ async def seed_builtin_management_skills(session: AsyncSession) -> None:
         assert defaults is not None
         existing = await get_skill(session, str(skill["skill_id"]))
         if existing is not None:
-            updates: dict[str, object] = {"is_system": True}
+            updates: dict[str, object] = {
+                "is_system": True,
+                "auto_load": bool(defaults.get("auto_load", False)),
+            }
             if existing.owner_email is None and existing.current_version_id is None:
                 updates.update(
                     {
@@ -733,7 +772,6 @@ async def seed_builtin_management_skills(session: AsyncSession) -> None:
                         "tools": defaults["tools"],
                         "prompt_templates": defaults["prompt_templates"],
                         "tags": defaults["tags"],
-                        "auto_load": False,
                     }
                 )
             for key, value in updates.items():
@@ -743,6 +781,7 @@ async def seed_builtin_management_skills(session: AsyncSession) -> None:
                     existing.instructions,
                     existing.tools,
                     existing.prompt_templates,
+                    steps=defaults.get("steps") if isinstance(defaults.get("steps"), list) else None,
                 )
                 version_row = await create_skill_version(
                     session,
@@ -753,6 +792,8 @@ async def seed_builtin_management_skills(session: AsyncSession) -> None:
                     tools=existing.tools,
                     prompt_templates=existing.prompt_templates,
                     secret_placeholders=None,
+                    steps=defaults.get("steps") if isinstance(defaults.get("steps"), list) else None,
+                    decomposition_source_hash=None,
                 )
                 await set_current_version(session, existing.skill_id, version_row.version_id)
                 existing.current_version_id = version_row.version_id
@@ -768,7 +809,7 @@ async def seed_builtin_management_skills(session: AsyncSession) -> None:
             tools=defaults.get("tools"),
             prompt_templates=defaults.get("prompt_templates"),
             tags=list(defaults["tags"]),
-            auto_load=False,
+            auto_load=bool(defaults.get("auto_load", False)),
             is_system=True,
             source="db",
             owner_email=None,
@@ -781,11 +822,14 @@ async def seed_builtin_management_skills(session: AsyncSession) -> None:
                 row.instructions,
                 row.tools,
                 row.prompt_templates,
+                steps=defaults.get("steps") if isinstance(defaults.get("steps"), list) else None,
             ),
             instructions=row.instructions,
             tools=row.tools,
             prompt_templates=row.prompt_templates,
             secret_placeholders=None,
+            steps=defaults.get("steps") if isinstance(defaults.get("steps"), list) else None,
+            decomposition_source_hash=None,
         )
         await set_current_version(session, row.skill_id, version_row.version_id)
         row.current_version_id = version_row.version_id

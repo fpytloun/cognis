@@ -26,6 +26,7 @@ export type TimelineItem =
   | MessageTimelineItem
   | ToolCallTimelineItem
   | DelegationTimelineItem
+  | WorkflowComposedTimelineItem
   | ReasoningTimelineItem
   | NoticeTimelineItem
   | SystemMessageTimelineItem
@@ -88,6 +89,18 @@ export interface DelegationTimelineItem {
   taskLabel: string;
   status: 'started' | 'running' | 'paused' | 'completed' | 'failed' | 'cancelled';
   result: string | null;
+  timestamp: string | null;
+}
+
+export interface WorkflowComposedTimelineItem {
+  id: string;
+  kind: 'workflow_composed';
+  workflowId: string;
+  workflowName: string;
+  lifecycle: string;
+  taskId: string | null;
+  scheduleId: string | null;
+  steps: string[];
   timestamp: string | null;
 }
 
@@ -252,6 +265,23 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
           createMessageItem(`event:${eid}:assistant`, 'assistant', content, event.timestamp, event.seq, undefined, false, attachments)
         );
       }
+      continue;
+    }
+
+    if (event.type === 'workflow_composed') {
+      items.push({
+        id: `workflow-composed:${eid}`,
+        kind: 'workflow_composed',
+        workflowId: String(event.data.workflow_id ?? ''),
+        workflowName: String(event.data.workflow_name ?? event.data.workflow_id ?? 'Workflow'),
+        lifecycle: String(event.data.lifecycle ?? 'ephemeral'),
+        taskId: typeof event.data.task_id === 'string' ? event.data.task_id : null,
+        scheduleId: typeof event.data.schedule_id === 'string' ? event.data.schedule_id : null,
+        steps: Array.isArray(event.data.steps)
+          ? event.data.steps.filter((item): item is string => typeof item === 'string')
+          : [],
+        timestamp: event.timestamp
+      });
       continue;
     }
 
@@ -795,6 +825,21 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
       isError: event.is_error,
       durationMs: event.duration_ms ?? undefined,
       evaluation
+    });
+    return next;
+  }
+
+  if (event.type === 'workflow_composed') {
+    next.push({
+      id: `workflow-composed:${event.workflow_id}:${event.task_id ?? event.schedule_id ?? next.length}`,
+      kind: 'workflow_composed',
+      workflowId: event.workflow_id,
+      workflowName: event.workflow_name,
+      lifecycle: event.lifecycle,
+      taskId: event.task_id ?? null,
+      scheduleId: event.schedule_id ?? null,
+      steps: Array.isArray(event.steps) ? event.steps : [],
+      timestamp: new Date().toISOString()
     });
     return next;
   }

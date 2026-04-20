@@ -401,6 +401,10 @@ class WorkflowRow(Base):
     owner_email: Mapped[str | None] = mapped_column(
         String, ForeignKey("users.email"), nullable=True
     )
+    lifecycle: Mapped[str] = mapped_column(
+        String, nullable=False, default="persistent", server_default="persistent"
+    )
+    archived_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, default=_utcnow
     )
@@ -663,6 +667,8 @@ class SkillVersionRow(Base):
     tools: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
     prompt_templates: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     secret_placeholders: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    steps: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
+    decomposition_source_hash: Mapped[str | None] = mapped_column(String, nullable=True)
     # Import provenance
     source_url: Mapped[str | None] = mapped_column(String, nullable=True)
     resolved_url: Mapped[str | None] = mapped_column(String, nullable=True)

@@ -5,6 +5,49 @@ from __future__ import annotations
 from typing import Final
 
 SYSTEM_SKILL_DEFAULTS: Final[dict[str, dict[str, object]]] = {
+    "cognis-orchestrator": {
+        "skill_id": "cognis-orchestrator",
+        "auto_load": True,
+        "content": """---
+name: Cognis Orchestrator
+description: Guidance for deciding when to answer inline, when to use general-task, and when to compose a workflow.
+tags:
+  - cognis
+  - orchestration
+  - workflows
+---
+
+# Purpose
+
+Use this skill when deciding how to execute non-trivial work in Cognis.
+
+# Routing Rules
+
+- Keep clearly trivial work inline.
+- Use `create_task` with `system:general-task` when the work is substantial but does not justify explicit step structure.
+- Use `compose_and_run_workflow` when the work is multi-step, recurring, deliverable-sensitive, or should be scheduled.
+
+# Workflow Composition Rules
+
+- Prefer reusing an existing workflow unchanged when it already fits.
+- If an existing workflow is close but not exact, adapt it by deriving a new workflow instead of mutating the original.
+- Treat skills as capability bundles first. If a skill has saved decomposition, it can also provide workflow structure.
+- If a skill is useful but does not declare steps, composition may decompose it first.
+- Schedules force persistent workflows. One-shot compositions should normally stay ephemeral.
+
+# Deliverables
+
+- Deliverables are the canonical workflow artifacts.
+- Synthesis, summary, reporting, and final-output steps should usually require deliverables.
+- Gather, inspect, and fetch steps may omit required deliverables when a lightweight step output is enough.
+
+# Do Not Do
+
+- Do not mutate system workflows in place.
+- Do not create a custom workflow when an existing one already fits unchanged.
+- Do not schedule ephemeral workflows.
+""",
+    },
     "cognis-coding": {
         "skill_id": "cognis-coding",
         "content": """---
@@ -208,4 +251,6 @@ def get_system_skill_default(skill_id: str) -> dict[str, object] | None:
         "tags": list(parsed["tags"]),
         "tools": parsed["tools"],
         "prompt_templates": parsed["prompt_templates"],
+        "steps": parsed.get("steps") or [],
+        "auto_load": bool(default.get("auto_load", False)),
     }

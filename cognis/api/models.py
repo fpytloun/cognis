@@ -712,6 +712,8 @@ class WorkflowRequest(BaseModel):
     interaction: dict[str, Any] = Field(default_factory=dict)
     defaults: dict[str, Any] = Field(default_factory=dict)
     steps: list[dict[str, Any]] = Field(default_factory=list)
+    lifecycle: str = "persistent"
+    lineage: dict[str, Any] | None = None
 
 
 class WorkflowUpdateRequest(BaseModel):
@@ -723,6 +725,8 @@ class WorkflowUpdateRequest(BaseModel):
     interaction: dict[str, Any] | None = None
     defaults: dict[str, Any] | None = None
     steps: list[dict[str, Any]] | None = None
+    lifecycle: str | None = None
+    lineage: dict[str, Any] | None = None
 
 
 class WorkflowResponse(BaseModel):
@@ -737,6 +741,9 @@ class WorkflowResponse(BaseModel):
     steps: list[dict[str, Any]] = Field(default_factory=list)
     is_system: bool = False
     owner_email: str | None = None
+    lifecycle: str = "persistent"
+    archived_at: datetime | None = None
+    lineage: dict[str, Any] | None = None
     editable_fields: list[str] = Field(default_factory=list)
     has_overrides: bool = False
     disabled: bool = False
@@ -892,6 +899,9 @@ class SkillVersionResponse(BaseModel):
     tools: list[dict[str, Any]] | None = None
     prompt_templates: dict[str, Any] | None = None
     secret_placeholders: list[str] | None = None
+    steps: list[dict[str, Any]] | None = None
+    decomposition_source_hash: str | None = None
+    decomposition_stale: bool = False
     source_url: str | None = None
     resolved_url: str | None = None
     commit_sha: str | None = None
@@ -909,6 +919,7 @@ class SkillResponse(BaseModel):
     instructions: str
     tools: list[dict[str, Any]] | None = None
     prompt_templates: dict[str, Any] | None = None
+    steps: list[dict[str, Any]] | None = None
     tags: list[str] | None = None
     attach_to_all_agents: bool = False
     auto_load: bool = False  # Deprecated alias
@@ -927,6 +938,8 @@ class SkillCreateRequest(BaseModel):
     instructions: str
     tools: list[dict[str, Any]] | None = None
     prompt_templates: dict[str, Any] | None = None
+    steps: list[dict[str, Any]] | None = None
+    decomposition_source_hash: str | None = None
     tags: list[str] | None = None
     attach_to_all_agents: bool | None = None
     auto_load: bool | None = None
@@ -940,6 +953,8 @@ class SkillUpdateRequest(BaseModel):
     instructions: str | None = None
     tools: list[dict[str, Any]] | None = None
     prompt_templates: dict[str, Any] | None = None
+    steps: list[dict[str, Any]] | None = None
+    decomposition_source_hash: str | None = None
     tags: list[str] | None = None
     attach_to_all_agents: bool | None = None
     auto_load: bool | None = None
@@ -957,6 +972,13 @@ class SkillImportRequest(BaseModel):
     tags: list[str] | None = None
     attach_to_all_agents: bool | None = None
     auto_load: bool | None = None
+
+
+class SkillDecompositionPreviewResponse(BaseModel):
+    skill_id: str
+    source_hash: str
+    rationale: str = ""
+    steps: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class SkillExportResponse(BaseModel):

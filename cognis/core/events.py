@@ -69,6 +69,7 @@ class EventType(StrEnum):
     # Workflow
     WORKFLOW_GATE = "workflow_gate"
     WORKFLOW_PROGRESS = "workflow_progress"
+    WORKFLOW_COMPOSED = "workflow_composed"
 
     # Escalation
     ESCALATION_CREATED = "escalation_created"

@@ -437,7 +437,11 @@ class WorkflowRegistry:
         return _row_to_workflow(row)
 
     async def list_all(
-        self, *, owner_email: str | None = None, include_disabled: bool = False
+        self,
+        *,
+        owner_email: str | None = None,
+        include_disabled: bool = False,
+        include_ephemeral: bool = False,
     ) -> list[Workflow]:
         """List all available workflows (system + user)."""
         result: list[Workflow] = []
@@ -448,7 +452,12 @@ class WorkflowRegistry:
             if effective is not None:
                 result.append(effective)
         async with self._session_factory() as db_session:
-            rows = await list_workflows(db_session, owner_email=owner_email, include_system=False)
+            rows = await list_workflows(
+                db_session,
+                owner_email=owner_email,
+                include_system=False,
+                include_ephemeral=include_ephemeral,
+            )
         result.extend(_row_to_workflow(r) for r in rows)
         return result
 
@@ -469,6 +478,8 @@ class WorkflowRegistry:
                 version=workflow.version,
                 is_system=False,
                 owner_email=workflow.owner_email,
+                lifecycle=str(workflow.lifecycle),
+                archived_at=workflow.archived_at,
             )
             await db_session.commit()
         return workflow

@@ -29,10 +29,18 @@
   let versions = $state<SkillVersion[]>([]);
   let loadingVersions = $state(false);
   let restoringVersionId = $state<string | null>(null);
+  let decompositionPreview = $state<Record<string, unknown>[] | null>(null);
+  let decompositionRationale = $state('');
+  let decompositionSourceHash = $state<string | null>(null);
+  let decompositionLoading = $state(false);
+  let decompositionSaving = $state(false);
 
   $effect(() => {
     if (!open || !skill) {
       versions = [];
+      decompositionPreview = null;
+      decompositionRationale = '';
+      decompositionSourceHash = null;
       return;
     }
     loadingVersions = true;
@@ -91,6 +99,39 @@
       restoringVersionId = null;
     }
   }
+
+  async function previewDecomposition() {
+    if (!skill) return;
+    decompositionLoading = true;
+    try {
+      const preview = await api.skills.decomposePreview(skill.skill_id);
+      decompositionPreview = preview.steps;
+      decompositionRationale = preview.rationale;
+      decompositionSourceHash = preview.source_hash;
+      addToast('Skill decomposition preview generated.', 'success');
+    } catch (error) {
+      addToast(error instanceof Error ? error.message : 'Failed to decompose skill', 'error');
+    } finally {
+      decompositionLoading = false;
+    }
+  }
+
+  async function saveDecomposition() {
+    if (!skill || !decompositionPreview) return;
+    decompositionSaving = true;
+    try {
+      await api.skills.update(skill.skill_id, {
+        steps: decompositionPreview,
+        decomposition_source_hash: decompositionSourceHash ?? undefined
+      });
+      await onRestored();
+      addToast('Skill decomposition saved.', 'success');
+    } catch (error) {
+      addToast(error instanceof Error ? error.message : 'Failed to save decomposition', 'error');
+    } finally {
+      decompositionSaving = false;
+    }
+  }
 </script>
 
 <Sheet {open} {onClose} side="right" label={skill ? `${skill.name} details` : 'Skill details'} class="w-full md:w-[min(46rem,100vw)]">
@@ -118,11 +159,16 @@
 
   {#if skill}
     {@const current = skill.current_version}
+    {@const savedSteps = current?.steps ?? skill.steps ?? []}
     <div class="space-y-5 text-sm">
       <div class="flex flex-wrap gap-2">
         <Button size="sm" variant="secondary" onclick={() => downloadExport('skill_md')}><Download class="mr-1 h-4 w-4" /> SKILL.md</Button>
         <Button size="sm" variant="secondary" onclick={() => downloadExport('cognis_yaml')}><Download class="mr-1 h-4 w-4" /> YAML</Button>
         <Button size="sm" variant="secondary" onclick={() => downloadExport('cognis_package')}><Download class="mr-1 h-4 w-4" /> Package</Button>
+        <Button size="sm" variant="secondary" onclick={previewDecomposition} disabled={decompositionLoading}>{decompositionLoading ? 'Generating…' : 'Suggest decomposition'}</Button>
+        {#if decompositionPreview && decompositionPreview.length > 0}
+          <Button size="sm" variant="secondary" onclick={saveDecomposition} disabled={decompositionSaving || !!skill.is_system}>{decompositionSaving ? 'Saving…' : 'Save decomposition'}</Button>
+        {/if}
       </div>
 
       <section class="space-y-2 rounded-2xl border border-slate-800 bg-slate-950/70 p-4">
@@ -168,6 +214,44 @@
             <p class="text-xs text-slate-500">No prompt templates.</p>
           {/if}
         </div>
+      </section>
+
+      <section class="space-y-3 rounded-2xl border border-slate-800 bg-slate-950/70 p-4">
+        <div class="flex items-center gap-2 text-slate-200">
+          <GitBranch class="h-4 w-4 text-slate-400" />
+          <h3 class="font-medium">Workflow decomposition</h3>
+          {#if current?.decomposition_stale}
+            <Badge class="border-amber-500/30 bg-amber-500/10 text-amber-300">stale</Badge>
+          {/if}
+        </div>
+        {#if savedSteps.length > 0}
+          <div class="space-y-2">
+            {#each savedSteps as step, index}
+              <div class="rounded-xl border border-slate-800 bg-slate-900/80 px-3 py-2 text-xs text-slate-200">
+                <p class="font-medium text-slate-100">{index + 1}. {String(step.name ?? `step_${index + 1}`)}</p>
+                <p class="mt-1 text-slate-500">{String(step.type ?? 'run')}</p>
+              </div>
+            {/each}
+          </div>
+        {:else}
+          <p class="text-xs text-slate-500">No saved decomposition yet.</p>
+        {/if}
+        {#if decompositionPreview && decompositionPreview.length > 0}
+          <div class="rounded-xl border border-sky-500/20 bg-sky-500/5 p-3 text-xs text-slate-200">
+            <p class="font-medium text-sky-200">Preview</p>
+            {#if decompositionRationale}
+              <p class="mt-1 text-slate-400">{decompositionRationale}</p>
+            {/if}
+            <div class="mt-3 space-y-2">
+              {#each decompositionPreview as step, index}
+                <div class="rounded-xl border border-slate-800 bg-slate-900/80 px-3 py-2">
+                  <p class="font-medium text-slate-100">{index + 1}. {String(step.name ?? `step_${index + 1}`)}</p>
+                  <p class="mt-1 text-slate-500">{String(step.type ?? 'run')}</p>
+                </div>
+              {/each}
+            </div>
+          </div>
+        {/if}
       </section>
 
       <section class="space-y-3 rounded-2xl border border-slate-800 bg-slate-950/70 p-4">

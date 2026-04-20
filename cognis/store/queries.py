@@ -2068,6 +2068,8 @@ async def create_workflow(
     version: int = 1,
     is_system: bool = False,
     owner_email: str | None = None,
+    lifecycle: str = "persistent",
+    archived_at: datetime | None = None,
 ) -> WorkflowRow:
     """Create a workflow record."""
     row = WorkflowRow(
@@ -2078,6 +2080,8 @@ async def create_workflow(
         definition=definition,
         is_system=is_system,
         owner_email=owner_email,
+        lifecycle=lifecycle,
+        archived_at=archived_at,
     )
     session.add(row)
     await session.flush()
@@ -2097,6 +2101,7 @@ async def list_workflows(
     *,
     owner_email: str | None = None,
     include_system: bool = True,
+    include_ephemeral: bool = False,
 ) -> list[WorkflowRow]:
     """List workflows, optionally filtered by owner."""
     query = select(WorkflowRow).order_by(WorkflowRow.name.asc())
@@ -2107,6 +2112,8 @@ async def list_workflows(
         conditions.append(WorkflowRow.owner_email == owner_email)
     if conditions:
         query = query.where(sa.or_(*conditions))
+    if not include_ephemeral:
+        query = query.where(WorkflowRow.lifecycle == "persistent", WorkflowRow.archived_at.is_(None))
     result = await session.execute(query)
     return list(result.scalars().all())
 
@@ -2645,6 +2652,8 @@ async def create_skill_version(
     tools: list[dict[str, Any]] | None = None,
     prompt_templates: dict[str, Any] | None = None,
     secret_placeholders: list[str] | None = None,
+    steps: list[dict[str, Any]] | None = None,
+    decomposition_source_hash: str | None = None,
     source_url: str | None = None,
     resolved_url: str | None = None,
     commit_sha: str | None = None,
@@ -2665,6 +2674,8 @@ async def create_skill_version(
         tools=tools,
         prompt_templates=prompt_templates,
         secret_placeholders=secret_placeholders,
+        steps=steps,
+        decomposition_source_hash=decomposition_source_hash,
         source_url=source_url,
         resolved_url=resolved_url,
         commit_sha=commit_sha,

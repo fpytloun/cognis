@@ -43,6 +43,12 @@ describe('importWorkflowYaml', () => {
       'Each step must provide string name and type fields.'
     );
   });
+
+  it('normalizes imported workflows back to persistent lifecycle', () => {
+    const form = importWorkflowYaml(`workflow_id: wf_imported\nname: imported\nversion: 1\ncriteria: ''\ntags: []\nlifecycle: ephemeral\ninteraction:\n  mode: explicit_gates\ndefaults:\n  evaluate: true\n  max_attempts: 3\n  on_exhausted: gate\n  delivery:\n    completion_mode_family: default\n    allow_silent_completion: false\nsteps:\n  - name: gather\n    type: run\n`);
+
+    expect(form.lifecycle).toBe('persistent');
+  });
 });
 
 describe('workflowToFormState', () => {
@@ -71,6 +77,9 @@ describe('workflowToFormState', () => {
       ],
       is_system: false,
       owner_email: null,
+      lifecycle: 'persistent',
+      archived_at: null,
+      lineage: null,
       editable_fields: [],
       has_overrides: false,
       disabled: false,
@@ -109,6 +118,9 @@ describe('workflowToFormState', () => {
       ],
       is_system: false,
       owner_email: null,
+      lifecycle: 'persistent',
+      archived_at: null,
+      lineage: null,
       editable_fields: [],
       has_overrides: false,
       disabled: false,
@@ -146,6 +158,9 @@ describe('workflowToFormState', () => {
       ],
       is_system: false,
       owner_email: null,
+      lifecycle: 'persistent',
+      archived_at: null,
+      lineage: null,
       editable_fields: [],
       has_overrides: false,
       disabled: false,

@@ -48,6 +48,7 @@ import type {
   SettingsCategory,
   Skill,
   SkillCreate,
+  SkillDecompositionPreview,
   SkillExportResponse,
   SkillImportRequest,
   SkillUpdate,
@@ -737,6 +738,12 @@ export const api = {
       });
     },
 
+    decomposePreview(skillId: string): Promise<SkillDecompositionPreview> {
+      return request<SkillDecompositionPreview>(`/api/v1/skills/${skillId}/decompose-preview`, {
+        method: 'POST'
+      });
+    },
+
     import(data: SkillImportRequest): Promise<Skill> {
       return request<Skill>('/api/v1/skills/import', { method: 'POST', body: JSON.stringify(data) });
     },
@@ -835,11 +842,11 @@ export const api = {
   },
 
   workflows: {
-    list(cursor: string | null = null, params?: { include_disabled?: boolean }): Promise<CursorPage<Workflow>> {
+    list(cursor: string | null = null, params?: { include_disabled?: boolean; include_ephemeral?: boolean }): Promise<CursorPage<Workflow>> {
       return request<CursorPage<Workflow>>(`/api/v1/workflows${encodeQuery({ cursor, limit: 100, ...params })}`);
     },
 
-    async listAll(params?: { include_disabled?: boolean }): Promise<Workflow[]> {
+    async listAll(params?: { include_disabled?: boolean; include_ephemeral?: boolean }): Promise<Workflow[]> {
       return collectCursorPages((cursor) => this.list(cursor, params));
     },
 

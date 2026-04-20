@@ -45,6 +45,8 @@ export interface WorkflowFormState {
   version: number;
   criteria: string;
   tagsText: string;
+  lifecycle: 'persistent' | 'ephemeral';
+  lineage: Record<string, unknown> | null;
   interactionMode: string;
   defaultEvaluate: boolean;
   defaultMaxAttempts: number;
@@ -96,6 +98,8 @@ export function createEmptyWorkflowForm(): WorkflowFormState {
     version: 1,
     criteria: '',
     tagsText: '',
+    lifecycle: 'persistent',
+    lineage: null,
     interactionMode: 'explicit_gates',
     defaultEvaluate: true,
     defaultMaxAttempts: 3,
@@ -235,6 +239,8 @@ export function workflowToFormState(workflow: Workflow): WorkflowFormState {
     version: workflow.version,
     criteria: workflow.criteria,
     tagsText: workflow.tags.join(', '),
+    lifecycle: workflow.lifecycle === 'ephemeral' ? 'ephemeral' : 'persistent',
+    lineage: workflow.lineage ?? null,
     interactionMode: typeof workflow.interaction.mode === 'string' ? workflow.interaction.mode : 'explicit_gates',
     defaultEvaluate: workflow.defaults.evaluate !== false,
     defaultMaxAttempts: typeof workflow.defaults.max_attempts === 'number' ? workflow.defaults.max_attempts : 3,
@@ -289,6 +295,8 @@ export function formStateToWorkflowPayload(form: WorkflowFormState): Record<stri
     version: Number(form.version),
     criteria: form.criteria,
     tags: parseList(form.tagsText),
+    lifecycle: form.lifecycle,
+    lineage: form.lineage,
     interaction: { mode: form.interactionMode },
     defaults: {
       evaluate: form.defaultEvaluate,
@@ -471,5 +479,7 @@ export function importWorkflowYaml(raw: string): WorkflowFormState {
   if (parsed.steps.some((step) => !isRecord(step) || typeof step.name !== 'string' || typeof step.type !== 'string')) {
     throw new Error('Invalid workflow YAML format. Each step must provide string name and type fields.');
   }
-  return workflowToFormState(parsed as unknown as Workflow);
+  const form = workflowToFormState(parsed as unknown as Workflow);
+  form.lifecycle = 'persistent';
+  return form;
 }

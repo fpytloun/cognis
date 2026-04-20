@@ -24,6 +24,22 @@ class CompletionModeFamily(StrEnum):
     DIRECT = "direct"
 
 
+class WorkflowLifecycle(StrEnum):
+    """Storage lifecycle for a workflow definition."""
+
+    PERSISTENT = "persistent"
+    EPHEMERAL = "ephemeral"
+
+
+class WorkflowLineage(BaseModel):
+    """Origin metadata for derived or agent-composed workflows."""
+
+    base_workflow_id: str | None = None
+    source_skill_ids: list[str] = Field(default_factory=list)
+    composition_source: Literal["manual", "agent_composed", "promoted"] | None = None
+    composition_intent: str | None = None
+
+
 class CompletionDeliveryPolicy(BaseModel):
     """Resolved policy for workflow/task completion notifications."""
 
@@ -259,6 +275,9 @@ class Workflow(BaseModel):
     steps: list[StepDefinition]
     is_system: bool = False
     owner_email: str | None = None
+    lifecycle: WorkflowLifecycle = WorkflowLifecycle.PERSISTENT
+    archived_at: datetime | None = None
+    lineage: WorkflowLineage | None = None
     allow_user_override: bool = Field(default=False, exclude=True)
     allow_user_disable: bool = Field(default=False, exclude=True)
     editable_fields: list[str] = Field(default_factory=list, exclude=True)
