@@ -1,7 +1,7 @@
 <script lang="ts">
-  import { goto } from '$app/navigation';
-  import { page } from '$app/stores';
-  import ArrowLeft from 'lucide-svelte/icons/arrow-left';
+import { goto } from '$app/navigation';
+import { page } from '$app/stores';
+import ArrowLeft from 'lucide-svelte/icons/arrow-left';
 import ArrowRight from 'lucide-svelte/icons/arrow-right';
 import CheckCircle2 from 'lucide-svelte/icons/check-circle-2';
 import ChevronDown from 'lucide-svelte/icons/chevron-down';
@@ -30,10 +30,10 @@ import Target from 'lucide-svelte/icons/target';
   import { confirmAction } from '$lib/stores/confirm';
   import { addToast } from '$lib/stores/toasts';
   import { loadTaskPageData, refreshTaskPageData, shouldClearTaskFromError } from '$lib/task-detail';
-  import { renderMarkdown } from '$lib/markdown';
+  import { renderMarkdown, sanitizeHtml } from '$lib/markdown';
   import { formatAbsoluteTime, formatDuration, formatRelativeTime } from '$lib/time';
   import { workflowToFormState } from '$lib/workflows';
-  import type { Agent, Conversation, StepRun, Task, TaskDetail, Workflow } from '$lib/types/api';
+import type { Agent, Conversation, Deliverable, StepRun, Task, TaskDetail, Workflow } from '$lib/types/api';
 
   let loading = $state(true);
   let saving = $state(false);
@@ -196,6 +196,34 @@ import Target from 'lucide-svelte/icons/target';
   function stepOutputContent(stepRun: StepRun): string {
     const val = stepRun.output?.content;
     return typeof val === 'string' ? val : '';
+  }
+
+  function latestDeliverable(stepRun: StepRun): Deliverable | null {
+    return stepRun.deliverables[0] ?? null;
+  }
+
+  function latestDeliverableContent(stepRun: StepRun): string {
+    return latestDeliverable(stepRun)?.content ?? '';
+  }
+
+  function latestDeliverableHtml(stepRun: StepRun): string {
+    const deliverable = latestDeliverable(stepRun);
+    if (!deliverable?.content) return '';
+    return deliverable.format === 'html'
+      ? sanitizeHtml(deliverable.content)
+      : renderMarkdown(deliverable.content);
+  }
+
+  function finalTaskDeliverableHtml(detail: TaskDetail | null): string {
+    const content = detail?.result_data?.final_content;
+    const format = detail?.result_data?.final_format;
+    if (typeof content !== 'string' || !content.trim()) return '';
+    return format === 'html' ? sanitizeHtml(content) : renderMarkdown(content);
+  }
+
+  function attemptCountForGroup(group: StepGroup | null): number {
+    if (!group) return 0;
+    return group.latest?.attempt ?? group.attempts.length;
   }
 
   function hasRecordedStepOutput(stepRun: StepRun | null): boolean {
@@ -454,7 +482,7 @@ import Target from 'lucide-svelte/icons/target';
     return selected ?? stepGroups[0] ?? null;
   });
 
-  let stepAttemptCounts = $derived.by(() => Object.fromEntries(stepGroups.map((group) => [group.stepName, group.attempts.length])));
+  let stepAttemptCounts = $derived.by(() => Object.fromEntries(stepGroups.map((group) => [group.stepName, attemptCountForGroup(group)])));
 
   let stepStateLabels = $derived.by(() => {
     const labels: Record<string, string> = {};
@@ -500,16 +528,24 @@ import Target from 'lucide-svelte/icons/target';
   let stats = $derived.by(() => {
     if (!task) return null;
     const runs = task.step_runs;
-    const totalAttempts = runs.length;
+    const latestByStep = new Map<string, StepRun>();
+    for (const run of runs) {
+      const existing = latestByStep.get(run.step_name);
+      if (!existing || run.attempt >= existing.attempt) {
+        latestByStep.set(run.step_name, run);
+      }
+    }
+    const latestRuns = [...latestByStep.values()];
+    const totalAttempts = latestRuns.reduce((sum, run) => sum + Math.max(run.attempt, 1), 0);
     const completedSteps = new Set(
       runs
         .filter((r) => ['approved', 'completed'].includes(r.status) && stepOutcomeStatus(r) === 'success')
         .map((r) => r.step_name)
     ).size;
-    const evalRevisions = runs.filter((r) => r.evaluation && String(r.evaluation.decision) === 'revise').length;
+    const evalRevisions = latestRuns.reduce((sum, run) => sum + Math.max(run.attempt - 1, 0), 0);
     const evalFailures = runs.filter((r) => r.evaluation && String(r.evaluation.decision) === 'failed').length;
     const multiAttemptSteps = new Set(
-      runs.filter((r) => r.attempt > 1).map((r) => r.step_name)
+      latestRuns.filter((r) => r.attempt > 1).map((r) => r.step_name)
     ).size;
     const skipped = diagramSkippedSteps.length;
 
@@ -1024,7 +1060,7 @@ import Target from 'lucide-svelte/icons/target';
               </div>
               {#if selectedStepGroup}
                 <span class="rounded-full border border-slate-700 bg-slate-950/80 px-3 py-1 text-xs text-slate-300">
-                  {selectedStepGroup.attempts.length} attempt{selectedStepGroup.attempts.length === 1 ? '' : 's'}
+                  {attemptCountForGroup(selectedStepGroup)} attempt{attemptCountForGroup(selectedStepGroup) === 1 ? '' : 's'}
                 </span>
               {/if}
             </div>
@@ -1048,7 +1084,11 @@ import Target from 'lucide-svelte/icons/target';
                         {/if}
                         <p class="truncate font-medium text-white">{group.stepName}</p>
                       </div>
-                      <p class="mt-1 text-xs text-slate-500">{group.stepType === 'gate' ? 'Gate' : 'Execution'} {#if group.attempts.length > 1}<span class="ml-1 text-slate-400">x{group.attempts.length}</span>{/if}</p>
+                      {#if attemptCountForGroup(group) > 1}
+                        <p class="mt-1 text-xs text-slate-500">{group.stepType === 'gate' ? 'Gate' : 'Execution'} <span class="ml-1 text-slate-400">x{attemptCountForGroup(group)}</span></p>
+                      {:else}
+                        <p class="mt-1 text-xs text-slate-500">{group.stepType === 'gate' ? 'Gate' : 'Execution'}</p>
+                      {/if}
                     </div>
                     <span class="rounded-full border px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wider {statusColors[latestStatus] ?? 'border-slate-600 text-slate-400'}">{latestStatus}</span>
                   </div>
@@ -1128,6 +1168,31 @@ import Target from 'lucide-svelte/icons/target';
                       </div>
                     {/if}
 
+                    {#if latestAttempt.deliverables.length > 0}
+                      {@const deliverable = latestDeliverable(latestAttempt)}
+                      {@const deliverableHtml = latestDeliverableHtml(latestAttempt)}
+                      <div class="mt-4 rounded-2xl border border-sky-500/20 bg-sky-500/5 px-4 py-4">
+                        <div class="flex flex-wrap items-center justify-between gap-3">
+                          <div>
+                            <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Deliverable</p>
+                            {#if deliverable?.title}
+                              <p class="mt-1 text-sm font-medium text-white">{deliverable.title}</p>
+                            {/if}
+                          </div>
+                          <div class="flex flex-wrap gap-2 text-[11px] uppercase tracking-wide text-slate-300">
+                            {#each latestAttempt.deliverables as item}
+                              <span class={`rounded-full border px-2.5 py-1 ${item.status === 'delivered' ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-200' : item.status === 'approved' ? 'border-sky-500/30 bg-sky-500/10 text-sky-200' : item.status === 'rejected' ? 'border-amber-500/30 bg-amber-500/10 text-amber-200' : 'border-slate-700 bg-slate-900/80 text-slate-300'}`}>
+                                v{item.version} {item.status}
+                              </span>
+                            {/each}
+                          </div>
+                        </div>
+                        {#if deliverableHtml}
+                          <div class="prose prose-sm prose-invert mt-4 max-w-none text-slate-300">{@html deliverableHtml}</div>
+                        {/if}
+                      </div>
+                    {/if}
+
                     {#if activeStepTodos(latestAttempt).length > 0}
                       {@const todos = activeStepTodos(latestAttempt)}
                       <div class="mt-4 rounded-xl border border-slate-800/60 bg-slate-900/40">
@@ -1171,7 +1236,7 @@ import Target from 'lucide-svelte/icons/target';
                       {#if hasRecordedStepOutput(latestAttempt)}
                         <div class="mt-4 flex flex-wrap items-center gap-2 border-t border-slate-800 pt-3">
                           <Button size="sm" variant="secondary" onclick={() => openOutputModal(latestAttempt)}>Show full output</Button>
-                          <span class="text-xs text-slate-500">Includes completion metadata and the finalized assistant output.</span>
+                          <span class="text-xs text-slate-500">Includes deliverable versions, completion metadata, and any recorded reasoning.</span>
                         </div>
                       {/if}
                     </div>
@@ -1297,6 +1362,11 @@ import Target from 'lucide-svelte/icons/target';
             <div class="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
               <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Result</p>
               <p class="mt-3 leading-6 text-slate-300">{task.result_summary ?? 'This task has not produced a final result yet.'}</p>
+              {#if finalTaskDeliverableHtml(task)}
+                <div class="prose prose-sm prose-invert mt-4 max-w-none text-slate-300">
+                  {@html finalTaskDeliverableHtml(task)}
+                </div>
+              {/if}
             </div>
           </div>
         </details>
@@ -1449,6 +1519,11 @@ import Target from 'lucide-svelte/icons/target';
             <p class="mt-3 text-xs leading-5 text-slate-500">{task.applied_completion_reason}</p>
           {/if}
           <p class="mt-3 text-sm leading-6 text-slate-300">{task.result_summary ?? 'This task has not produced a final result yet.'}</p>
+          {#if finalTaskDeliverableHtml(task)}
+            <div class="prose prose-sm prose-invert mt-4 max-w-none text-slate-300">
+              {@html finalTaskDeliverableHtml(task)}
+            </div>
+          {/if}
         </Card>
       </div>
     </div>
@@ -1462,7 +1537,7 @@ import Target from 'lucide-svelte/icons/target';
           <div>
             <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Step detail</p>
             <h2 class="mt-1 text-lg font-semibold text-white">{selectedStepGroup.stepName}</h2>
-            <p class="mt-1 text-sm text-slate-400">{selectedStepGroup.stepType === 'gate' ? 'Gate step' : 'Execution step'} with {selectedStepGroup.attempts.length} attempt{selectedStepGroup.attempts.length === 1 ? '' : 's'}.</p>
+            <p class="mt-1 text-sm text-slate-400">{selectedStepGroup.stepType === 'gate' ? 'Gate step' : 'Execution step'} with {attemptCountForGroup(selectedStepGroup)} attempt{attemptCountForGroup(selectedStepGroup) === 1 ? '' : 's'}.</p>
           </div>
           <Button size="sm" variant="secondary" onclick={closeMobileStepDetail}>Close</Button>
         </div>

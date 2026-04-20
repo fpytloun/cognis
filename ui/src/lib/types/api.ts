@@ -717,6 +717,21 @@ export interface PendingPause {
   context: Record<string, unknown> | null;
 }
 
+export interface Deliverable {
+  deliverable_id: string;
+  step_run_id: string;
+  version: number;
+  content: string;
+  format: 'markdown' | 'plain' | 'html' | string;
+  title: string | null;
+  target: 'channel' | 'none' | string | null;
+  outputs: Record<string, unknown>;
+  status: string;
+  evaluator_feedback: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
 export interface StepRun {
   step_run_id: string;
   task_id: string;
@@ -730,8 +745,11 @@ export interface StepRun {
   conversation_id: string | null;
   session_id: string | null;
   intaris_session_id: string | null;
+  deliverable_id: string | null;
+  require_deliverable: boolean | null;
   output: Record<string, unknown> | null;
   evaluation: Record<string, unknown> | null;
+  deliverables: Deliverable[];
   todos: Array<Record<string, unknown>>;
   started_at: string | null;
   completed_at: string | null;
@@ -798,6 +816,7 @@ export interface WorkflowStep {
   gate?: Record<string, unknown> | null;
   on_reject?: Record<string, unknown> | null;
   outcome_routes?: Array<Record<string, unknown>> | null;
+  require_deliverable?: boolean;
 }
 
 export interface Workflow {

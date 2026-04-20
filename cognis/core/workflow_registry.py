@@ -63,6 +63,7 @@ DIRECT_WORKFLOW = Workflow(
             reasoning_effort="default",
             input=StepInputConfig(type="null"),
             completion=CompletionConfig(evaluate=False),
+            require_deliverable=False,
         ),
     ],
     is_system=True,
@@ -88,12 +89,14 @@ GENERAL_TASK_WORKFLOW = Workflow(
                 "first, keep the work focused, and verify the result before "
                 "completing the step. For coding work, prefer the smallest correct "
                 "change, preserve existing patterns, and update directly affected "
-                "docs only when needed."
+                "docs only when needed. Write a deliverable that captures the final "
+                "result, not just the work you attempted."
             ),
             reasoning_effort="low",
             input=StepInputConfig(type="null"),
             completion=CompletionConfig(evaluate=True, max_attempts=3),
             outcome_routes=[OutcomeRoute(status="failed", action="gate")],
+            require_deliverable=True,
         ),
     ],
     is_system=True,
@@ -118,7 +121,8 @@ RESEARCH_WORKFLOW = Workflow(
                 "Create a research plan for this task. Identify:\n"
                 "- Key questions to answer\n"
                 "- Sources and methodology (web search, codebase, documentation)\n"
-                "- Expected deliverables and format"
+                "- Expected deliverables and format\n\n"
+                "Write the plan itself as the step deliverable."
             ),
             input=StepInputConfig(type="null"),
             completion=CompletionConfig(
@@ -127,6 +131,7 @@ RESEARCH_WORKFLOW = Workflow(
                 evaluator_prompt=_PLAN_EVALUATOR_PROMPT,
             ),
             outcome_routes=[OutcomeRoute(status="failed", action="gate")],
+            require_deliverable=True,
         ),
         StepDefinition(
             name="research",
@@ -136,11 +141,13 @@ RESEARCH_WORKFLOW = Workflow(
             prompt=(
                 "Execute the research plan. Gather information from available "
                 "sources. Cross-reference findings for accuracy. Note any gaps "
-                "or conflicting information."
+                "or conflicting information. Write a deliverable that preserves "
+                "the gathered evidence and conclusions."
             ),
             input=StepInputConfig(type="last", source="plan"),
             completion=CompletionConfig(evaluate=True, max_attempts=5),
             outcome_routes=[OutcomeRoute(status="failed", action="gate")],
+            require_deliverable=True,
         ),
         StepDefinition(
             name="synthesize",
@@ -156,6 +163,7 @@ RESEARCH_WORKFLOW = Workflow(
             input=StepInputConfig(type="last", source=["plan", "research"]),
             completion=CompletionConfig(evaluate=True),
             outcome_routes=[OutcomeRoute(status="failed", action="gate")],
+            require_deliverable=True,
         ),
     ],
     is_system=True,
@@ -164,7 +172,7 @@ RESEARCH_WORKFLOW = Workflow(
 SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
     workflow_id="system:software-development",
     name="Software Development",
-    description="Full development pipeline: plan, architect review, implement, docs, code review, commit, remember.",
+    description="Full development pipeline: plan, architect review, implement, docs, code review, commit, remember, final summary.",
     criteria="Implementation tasks, feature development, bug fixes requiring structured quality pipeline.",
     tags=["code", "development"],
     interaction=InteractionMode(mode="explicit_gates"),
@@ -185,7 +193,8 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
                 "- Specific changes per file\n"
                 "- Edge cases and error handling\n"
                 "- Testing strategy\n"
-                "- Migration or compatibility concerns"
+                "- Migration or compatibility concerns\n\n"
+                "Write the plan itself as the step deliverable."
             ),
             input=StepInputConfig(type="null"),
             completion=CompletionConfig(
@@ -194,6 +203,7 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
                 evaluator_prompt=_PLAN_EVALUATOR_PROMPT,
             ),
             outcome_routes=[OutcomeRoute(status="failed", action="gate")],
+            require_deliverable=True,
             # Primary agent runs this — has memory, personality, project context
         ),
         StepDefinition(
@@ -211,7 +221,7 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
                 "step_complete.outcome.status='rejected' with a concise reason. If the "
                 "review itself could not be completed, use outcome.status='failed'. Put "
                 "the outcome only in step_complete, not as a trailing JSON object in the "
-                "written review."
+                "written review. The deliverable should be the actual review output."
             ),
             input=StepInputConfig(type="full", source="plan"),
             completion=CompletionConfig(evaluate=True, max_attempts=3),
@@ -224,6 +234,7 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
                 ),
                 OutcomeRoute(status="failed", action="gate"),
             ],
+            require_deliverable=True,
         ),
         StepDefinition(
             name="implement",
@@ -233,11 +244,13 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
             prompt=(
                 "Implement the approved plan. Follow the plan step by step. "
                 "After implementation, run relevant tests and linters to "
-                "verify correctness."
+                "verify correctness. The deliverable should summarize the concrete "
+                "changes made and the validation that was run."
             ),
             input=StepInputConfig(type="summary", source=["plan", "architect_review"]),
             completion=CompletionConfig(evaluate=True, max_attempts=3),
             outcome_routes=[OutcomeRoute(status="failed", action="gate")],
+            require_deliverable=True,
         ),
         StepDefinition(
             name="update_docs",
@@ -248,11 +261,13 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
                 "Update only the documentation directly affected by the changes, "
                 "such as README sections, guides, specs, API docs, configuration "
                 "examples, migration notes, or inline comments. If no documentation "
-                "updates are needed, explicitly say so instead of forcing changes."
+                "updates are needed, explicitly say so instead of forcing changes. "
+                "The deliverable should state what documentation changed or why none was needed."
             ),
             input=StepInputConfig(type="summary", source="implement"),
             completion=CompletionConfig(evaluate=False),
             outcome_routes=[OutcomeRoute(status="failed", action="gate")],
+            require_deliverable=True,
         ),
         StepDefinition(
             name="code_review",
@@ -266,7 +281,7 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
                 "step_complete.outcome.status='rejected' with a concise reason. If the "
                 "review itself could not be completed, use outcome.status='failed'. Put "
                 "the outcome only in step_complete, not as a trailing JSON object in the "
-                "written review."
+                "written review. The deliverable should contain the actual review findings."
             ),
             input=StepInputConfig(
                 type="summary",
@@ -282,6 +297,7 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
                 ),
                 OutcomeRoute(status="failed", action="gate"),
             ],
+            require_deliverable=True,
         ),
         StepDefinition(
             name="commit",
@@ -292,10 +308,12 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
                 "Create a conventional commit for all changes. If the commit cannot be "
                 "created due to an operational problem such as missing git identity or a "
                 "hook failure, report that via step_complete.outcome.status='failed' with "
-                "a concise reason instead of pretending success."
+                "a concise reason instead of pretending success. Write a short deliverable "
+                "summarizing the commit result and commit message."
             ),
             completion=CompletionConfig(evaluate=False),
             outcome_routes=[OutcomeRoute(status="failed", action="gate")],
+            require_deliverable=True,
         ),
         StepDefinition(
             name="remember",
@@ -304,7 +322,7 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
             prompt=(
                 "Store key findings, decisions, and implementation details "
                 "as memories for future reference. Attach a detailed summary "
-                "as an artifact."
+                "as an artifact. Write a deliverable summarizing what was remembered."
             ),
             input=StepInputConfig(
                 type="last",
@@ -312,7 +330,35 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
             ),
             completion=CompletionConfig(evaluate=False),
             outcome_routes=[OutcomeRoute(status="failed", action="gate")],
+            require_deliverable=True,
             # Primary agent — has memory tools
+        ),
+        StepDefinition(
+            name="final_summary",
+            type="run",
+            reasoning_effort="medium",
+            prompt=(
+                "Produce the final user-facing implementation report for this workflow. "
+                "Synthesize the approved plan, implementation summary, documentation status, "
+                "code review findings, commit result, and memory summary into one polished "
+                "deliverable. Focus on: what changed, what was verified, any remaining risks, "
+                "and any important follow-up notes."
+            ),
+            input=StepInputConfig(
+                type="summary",
+                source=[
+                    "plan",
+                    "architect_review",
+                    "implement",
+                    "update_docs",
+                    "code_review",
+                    "commit",
+                    "remember",
+                ],
+            ),
+            completion=CompletionConfig(evaluate=True, max_attempts=3),
+            outcome_routes=[OutcomeRoute(status="failed", action="gate")],
+            require_deliverable=True,
         ),
     ],
     is_system=True,
@@ -333,10 +379,14 @@ CREATIVE_WORKFLOW = Workflow(
             name="generate",
             type="run",
             reasoning_effort="low",
-            prompt="Create the requested content. Focus on quality, originality, and meeting the stated requirements.",
+            prompt=(
+                "Create the requested content. Focus on quality, originality, and meeting the stated requirements. "
+                "Write the content itself as the deliverable for this step."
+            ),
             input=StepInputConfig(type="null"),
             completion=CompletionConfig(evaluate=True, max_attempts=5, on_exhausted="continue"),
             outcome_routes=[OutcomeRoute(status="failed", action="gate")],
+            require_deliverable=True,
         ),
     ],
     is_system=True,

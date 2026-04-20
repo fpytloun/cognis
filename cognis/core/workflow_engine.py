@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import html
+import re
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -45,6 +47,7 @@ from cognis.core.workflow_registry import WorkflowRegistry
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.artifact import AttachmentRef
+from cognis.models.deliverable import Deliverable, DeliverableStatus
 from cognis.models.session import SessionEvent
 from cognis.models.task import TaskModel, TaskStatus
 from cognis.models.workflow import (
@@ -66,8 +69,13 @@ from cognis.runtime_context import (
 from cognis.store.queries import (
     create_step_run,
     fail_running_step_runs_for_task,
+    get_deliverable,
     get_latest_active_conversation_for_agent,
+    get_latest_approved_deliverable_for_step_run,
+    get_latest_rejected_deliverable_for_step_run,
     get_latest_step_run_for_task_step,
+    list_step_runs_for_task,
+    update_deliverable_status,
     update_step_run,
     update_task_status,
     update_task_workflow_state,
@@ -415,7 +423,25 @@ class WorkflowEngine:
                             step_run_id,
                             evaluation=evaluation.model_dump(mode="json"),
                             status=eval_status,
+                            deliverable_id=(
+                                None if evaluation.decision == "revise" else step_result.deliverable_id
+                            ),
                         )
+                        if step_result.deliverable_id is not None:
+                            if evaluation.decision == "approved":
+                                await update_deliverable_status(
+                                    db_session,
+                                    step_result.deliverable_id,
+                                    status=DeliverableStatus.APPROVED,
+                                    evaluator_feedback=None,
+                                )
+                            elif evaluation.decision == "revise":
+                                await update_deliverable_status(
+                                    db_session,
+                                    step_result.deliverable_id,
+                                    status=DeliverableStatus.REJECTED,
+                                    evaluator_feedback=evaluation.feedback or evaluation.reasoning,
+                                )
                         await db_session.commit()
 
                     logger.info(
@@ -474,6 +500,21 @@ class WorkflowEngine:
                         continue
 
                 # Step approved or no evaluation — commit the output and advance.
+                if step_result.deliverable_id is not None and not (completion and completion.evaluate):
+                    async with self._session_factory() as db_session:
+                        await update_deliverable_status(
+                            db_session,
+                            step_result.deliverable_id,
+                            status=DeliverableStatus.APPROVED,
+                            evaluator_feedback=None,
+                        )
+                        await update_step_run(
+                            db_session,
+                            step_run_id,
+                            deliverable_id=step_result.deliverable_id,
+                        )
+                        await db_session.commit()
+
                 state.step_outputs[step_def.name] = pending_output
 
                 # Mark the step session as completed now that it's approved.
@@ -566,7 +607,7 @@ class WorkflowEngine:
                 task.result_summary = self._build_result_summary(state, workflow)
                 task.completed_at = datetime.now(UTC)
 
-            task.result_data = self._build_result_data(state)
+            task.result_data = await self._build_result_data(task, state, workflow)
             task.applied_completion_mode, task.applied_completion_reason = (
                 self._resolve_applied_completion(task, state)
             )
@@ -721,6 +762,7 @@ class WorkflowEngine:
                 )
 
         persisted_todos: list[dict[str, Any]] = []
+        latest_step_run = None
         async with self._session_factory() as db_session:
             latest_step_run = await get_latest_step_run_for_task_step(
                 db_session, task.task_id, step_def.name
@@ -729,30 +771,41 @@ class WorkflowEngine:
             if isinstance(raw_todos, list):
                 persisted_todos = [item for item in raw_todos if isinstance(item, dict)]
 
-        # Create StepRun record
-        step_run_id = f"sr_{uuid.uuid4().hex}"
-        async with self._session_factory() as db_session:
-            await create_step_run(
-                db_session,
-                task_id=task.task_id,
-                step_name=step_def.name,
-                step_type=step_def.type,
-                agent_id=agent.agent_id,
-                attempt=attempt,
-                step_run_id=step_run_id,
-                conversation_id=conversation.conversation_id,
-                workspace_root=task.workspace_root,
-                working_directory=task.working_directory,
-            )
-            await update_step_run(
-                db_session,
-                step_run_id,
-                status="running",
-                session_id=session.session_id,
-                intaris_session_id=session.intaris_session_id,
-                todos=persisted_todos,
-                started_at=datetime.now(UTC),
-            )
+            if latest_step_run is None:
+                step_run_id = f"sr_{uuid.uuid4().hex}"
+                await create_step_run(
+                    db_session,
+                    task_id=task.task_id,
+                    step_name=step_def.name,
+                    step_type=step_def.type,
+                    agent_id=agent.agent_id,
+                    attempt=attempt,
+                    step_run_id=step_run_id,
+                    conversation_id=conversation.conversation_id,
+                    workspace_root=task.workspace_root,
+                    working_directory=task.working_directory,
+                    require_deliverable=step_def.require_deliverable,
+                )
+            else:
+                step_run_id = latest_step_run.step_run_id
+            update_kwargs: dict[str, Any] = {
+                "status": "running",
+                "attempt": attempt,
+                "conversation_id": conversation.conversation_id,
+                "session_id": session.session_id,
+                "intaris_session_id": session.intaris_session_id,
+                "workspace_root": task.workspace_root,
+                "working_directory": task.working_directory,
+                "require_deliverable": step_def.require_deliverable,
+                "output": None,
+                "evaluation": None,
+                "todos": persisted_todos,
+                "started_at": datetime.now(UTC),
+                "completed_at": None,
+            }
+            if latest_step_run is not None:
+                update_kwargs["deliverable_id"] = None
+            await update_step_run(db_session, step_run_id, **update_kwargs)
             await db_session.commit()
 
         await self._event_bus.publish(
@@ -880,6 +933,7 @@ class WorkflowEngine:
                 db_session,
                 step_run_id,
                 status=initial_status,
+                deliverable_id=(output.deliverable_id if output and output.deliverable_id else None),
                 output=output.model_dump(mode="json") if output else None,
                 completed_at=datetime.now(UTC),
             )
@@ -1600,6 +1654,43 @@ class WorkflowEngine:
         )
 
         if action == "continue":
+            async with self._session_factory() as db_session:
+                prior_run = await get_latest_step_run_for_task_step(
+                    db_session, task.task_id, step_def.name
+                )
+                if prior_run is not None:
+                    rejected_deliverable = await get_latest_rejected_deliverable_for_step_run(
+                        db_session, prior_run.step_run_id
+                    )
+                    if rejected_deliverable is not None:
+                        await update_deliverable_status(
+                            db_session,
+                            rejected_deliverable.deliverable_id,
+                            status=DeliverableStatus.APPROVED,
+                            evaluator_feedback=rejected_deliverable.evaluator_feedback,
+                        )
+                        await update_step_run(
+                            db_session,
+                            prior_run.step_run_id,
+                            deliverable_id=rejected_deliverable.deliverable_id,
+                        )
+                        await db_session.commit()
+                        latest_output = (
+                            dict(prior_run.output)
+                            if isinstance(getattr(prior_run, "output", None), dict)
+                            else {}
+                        )
+                        latest_output["deliverable_id"] = rejected_deliverable.deliverable_id
+                        latest_output["deliverable_version"] = rejected_deliverable.version
+                        latest_output["deliverable_format"] = rejected_deliverable.format
+                        latest_output["deliverable_title"] = rejected_deliverable.title
+                        latest_output["content"] = rejected_deliverable.content
+                        latest_output.setdefault(
+                            "summary",
+                            rejected_deliverable.title or rejected_deliverable.content[:200],
+                        )
+                        state.step_outputs[step_def.name] = latest_output
+
             # Skip and advance — record the skipped step so the final
             # task status reflects that not all steps succeeded.
             state.skipped_steps.append(step_def.name)
@@ -1757,13 +1848,35 @@ class WorkflowEngine:
     async def _deliver_task_result_direct(
         self, task: TaskModel, target_conversation_id: str
     ) -> None:
-        """Deliver the final assistant message directly to the resolved channel."""
+        """Deliver the final workflow deliverable directly to the resolved channel."""
 
         final_content = ""
         attachments: list[dict[str, Any]] = []
+        final_deliverable_id: str | None = None
+        deliverable_already_delivered = False
         if isinstance(task.result_data, dict):
-            raw_content = task.result_data.get("final_content")
-            if isinstance(raw_content, str):
+            raw_format = task.result_data.get("final_format")
+            final_format = raw_format if isinstance(raw_format, str) else None
+            raw_deliverable_id = task.result_data.get("final_deliverable_id")
+            if isinstance(raw_deliverable_id, str) and raw_deliverable_id:
+                async with self._session_factory() as db_session:
+                    deliverable_row = await get_deliverable(db_session, raw_deliverable_id)
+                if deliverable_row is not None and deliverable_row.content.strip():
+                    final_deliverable_id = deliverable_row.deliverable_id
+                    deliverable_already_delivered = (
+                        deliverable_row.status == DeliverableStatus.DELIVERED
+                    )
+                    safe_content = task.result_data.get("final_channel_content")
+                    if not isinstance(safe_content, str) or not safe_content.strip():
+                        safe_content = self._channel_safe_deliverable_content(
+                            deliverable_row.content,
+                            deliverable_row.format,
+                        )
+                    final_content = safe_content.strip()
+            raw_content = task.result_data.get("final_channel_content")
+            if not raw_content and final_format != "html":
+                raw_content = task.result_data.get("final_content")
+            if not final_content and isinstance(raw_content, str):
                 final_content = raw_content.strip()
             raw_attachments = task.result_data.get("attachments")
             if isinstance(raw_attachments, list):
@@ -1817,6 +1930,13 @@ class WorkflowEngine:
             await self._deliver_task_result_default(task, target_conversation_id)
             return
 
+        if deliverable_already_delivered and final_deliverable_id is not None:
+            logger.warning(
+                "task_delivery: deliverable already marked delivered, skipping duplicate direct send",
+                extra={"extra_data": {"task_id": task.task_id, "deliverable_id": final_deliverable_id}},
+            )
+            return
+
         sent = await self._channel_delivery.send_to_conversation(
             target_conversation_id,
             final_content,
@@ -1844,6 +1964,15 @@ class WorkflowEngine:
                 }
             },
         )
+
+        if final_deliverable_id is not None:
+            async with self._session_factory() as db_session:
+                await update_deliverable_status(
+                    db_session,
+                    final_deliverable_id,
+                    status=DeliverableStatus.DELIVERED,
+                )
+                await db_session.commit()
 
         event_type = EventType.TASK_FAILED
         if task.status == TaskStatus.COMPLETED:
@@ -1881,6 +2010,17 @@ class WorkflowEngine:
         self, task: TaskModel, target_conversation_id: str
     ) -> None:
         """Deliver task results through the normal follow-up flow."""
+
+        result_data = task.result_data if isinstance(task.result_data, dict) else {}
+        final_content = result_data.get("final_channel_content")
+        if not final_content and result_data.get("final_format") != "html":
+            final_content = result_data.get("final_content")
+        if not isinstance(final_content, str):
+            final_content = None
+        final_content = final_content.strip() or None
+        final_deliverable_id = result_data.get("final_deliverable_id")
+        if not isinstance(final_deliverable_id, str):
+            final_deliverable_id = None
 
         task_event = {
             TaskStatus.COMPLETED: "task_result",
@@ -1974,7 +2114,7 @@ class WorkflowEngine:
                 if route is not None:
                     channel_type, account_id, chat_id, thread_id, user_email = route
                     delivery_id = f"cdel_{uuid.uuid4().hex[:12]}"
-                    delivery_fallback_text = {
+                    delivery_fallback_text = final_content or {
                         TaskStatus.COMPLETED: "Background work completed. I could not deliver the detailed reply, so please open the conversation for the full result.",
                         TaskStatus.FAILED: "Background work failed. I could not deliver the detailed reply, so please open the conversation for details.",
                         TaskStatus.CANCELLED: "Background work was cancelled. I could not deliver the detailed reply, so please open the conversation for details.",
@@ -2026,6 +2166,24 @@ class WorkflowEngine:
             )
         )
 
+        if channel_deliverable and delivery_id is not None and final_content:
+            await self._event_bus.publish(
+                Event(
+                    type=EventType.TURN_COMPLETED,
+                    data={
+                        "conversation_id": target_conversation_id,
+                        "session_id": delivery_session_id,
+                        "message_id": f"task_delivery_{task.task_id}",
+                        "channel_deliverable": True,
+                        "delivery_id": delivery_id,
+                        "delivery_fallback_text": delivery_fallback_text,
+                        "final_content": final_content,
+                        "final_deliverable_id": final_deliverable_id,
+                        "attachments": (task.result_data or {}).get("attachments", []),
+                    },
+                )
+            )
+
         # Always request a follow-up turn so the agent can process the
         # result even if Intaris recording failed (degraded mode).
         follow_up = await self._follow_up_policy.build_task_result_follow_up(
@@ -2046,9 +2204,9 @@ class WorkflowEngine:
                 data={
                     "conversation_id": target_conversation_id,
                     "follow_up": follow_up.model_dump(mode="json"),
-                    "delivery_id": delivery_id,
-                    "channel_deliverable": channel_deliverable,
-                    "delivery_fallback_text": delivery_fallback_text,
+                    "delivery_id": None if final_content else delivery_id,
+                    "channel_deliverable": False if final_content else channel_deliverable,
+                    "delivery_fallback_text": None if final_content else delivery_fallback_text,
                 },
             )
         )
@@ -2132,7 +2290,6 @@ class WorkflowEngine:
         Called at the end of ``execute_workflow`` to prevent session
         resource leaks.  Sessions that are already completed are skipped.
         """
-        from cognis.store.queries import list_step_runs_for_task
 
         completion_reason = (
             "step_approved" if task.status == TaskStatus.COMPLETED else f"task_{task.status}"
@@ -2548,11 +2705,44 @@ class WorkflowEngine:
             return str(raw_output.get("summary", ""))
         return ""
 
-    def _build_result_data(self, state: WorkflowState) -> dict[str, Any] | None:
+    def _channel_safe_deliverable_content(self, content: str, format_name: str) -> str:
+        """Render deliverable content into a channel-safe text form."""
+
+        if format_name != "html":
+            return content
+        stripped = re.sub(r"<[^>]+>", " ", content)
+        normalized = re.sub(r"\n{3,}", "\n\n", stripped)
+        normalized = re.sub(r"[ \t]{2,}", " ", normalized)
+        return html.unescape(normalized).strip()
+
+    async def _build_result_data(
+        self,
+        task: TaskModel,
+        state: WorkflowState,
+        workflow: Workflow,
+    ) -> dict[str, Any] | None:
         result: dict[str, Any] = {}
-        last_output = self._last_step_output(state)
-        if last_output is not None and last_output.content.strip():
-            result["final_content"] = last_output.content
+        if task.status == TaskStatus.COMPLETED:
+            final_deliverable = await self._resolve_final_deliverable(task, state, workflow)
+            if final_deliverable is not None and final_deliverable.content.strip():
+                result["final_deliverable_id"] = final_deliverable.deliverable_id
+                result["final_content"] = final_deliverable.content
+                result["final_format"] = final_deliverable.format
+                result["final_channel_content"] = self._channel_safe_deliverable_content(
+                    final_deliverable.content,
+                    str(final_deliverable.format),
+                )
+                if final_deliverable.title:
+                    result["final_title"] = final_deliverable.title
+            else:
+                last_output = self._last_step_output(state)
+                if last_output is not None and last_output.content.strip():
+                    result["final_content"] = last_output.content
+                    result["final_format"] = "markdown"
+                    result["final_channel_content"] = self._channel_safe_deliverable_content(
+                        last_output.content,
+                        "markdown",
+                    )
 
         attachments: list[dict[str, Any]] = []
         for raw in state.step_outputs.values():
@@ -2578,6 +2768,70 @@ class WorkflowEngine:
         if deduped:
             result["attachments"] = deduped
         return result or None
+
+    async def _resolve_final_deliverable(
+        self,
+        task: TaskModel,
+        state: WorkflowState,
+        workflow: Workflow,
+    ) -> Deliverable | None:
+        """Return the final approved deliverable for a workflow, if any."""
+
+        for step in reversed(workflow.steps):
+            if step.type != "run" or not step.require_deliverable:
+                continue
+
+            raw_output = state.step_outputs.get(step.name)
+            deliverable_id = raw_output.get("deliverable_id") if isinstance(raw_output, dict) else None
+            if isinstance(deliverable_id, str) and deliverable_id:
+                async with self._session_factory() as db_session:
+                    row = await get_deliverable(db_session, deliverable_id)
+                if row is not None and row.status in {
+                    DeliverableStatus.APPROVED,
+                    DeliverableStatus.DELIVERED,
+                }:
+                    return Deliverable.model_validate(
+                        {
+                            "deliverable_id": row.deliverable_id,
+                            "step_run_id": row.step_run_id,
+                            "version": row.version,
+                            "content": row.content,
+                            "format": row.format,
+                            "title": row.title,
+                            "target": row.target,
+                            "outputs": row.outputs or {},
+                            "status": row.status,
+                            "evaluator_feedback": row.evaluator_feedback,
+                            "created_at": row.created_at,
+                            "updated_at": row.updated_at,
+                        }
+                    )
+
+            async with self._session_factory() as db_session:
+                prior_run = await get_latest_step_run_for_task_step(db_session, task.task_id, step.name)
+                if prior_run is None:
+                    continue
+                row = await get_latest_approved_deliverable_for_step_run(
+                    db_session, prior_run.step_run_id
+                )
+            if row is not None:
+                return Deliverable.model_validate(
+                    {
+                        "deliverable_id": row.deliverable_id,
+                        "step_run_id": row.step_run_id,
+                        "version": row.version,
+                        "content": row.content,
+                        "format": row.format,
+                        "title": row.title,
+                        "target": row.target,
+                        "outputs": row.outputs or {},
+                        "status": row.status,
+                        "evaluator_feedback": row.evaluator_feedback,
+                        "created_at": row.created_at,
+                        "updated_at": row.updated_at,
+                    }
+                )
+        return None
 
     def _last_step_output(self, state: WorkflowState) -> StepOutput | None:
         for raw in reversed(list(state.step_outputs.values())):

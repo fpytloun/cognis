@@ -539,6 +539,21 @@ class WorkflowRunResponse(BaseModel):
     pending_pause: PendingPauseResponse | None = None
 
 
+class DeliverableResponse(BaseModel):
+    deliverable_id: str
+    step_run_id: str
+    version: int
+    content: str
+    format: str = "markdown"
+    title: str | None = None
+    target: str | None = None
+    outputs: dict[str, Any] = Field(default_factory=dict)
+    status: str
+    evaluator_feedback: str | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
 class ChannelPairingRequestResponse(BaseModel):
     request_id: str
     owner_email: str
@@ -572,8 +587,11 @@ class StepRunResponse(BaseModel):
     conversation_id: str | None = None
     session_id: str | None = None
     intaris_session_id: str | None = None
+    deliverable_id: str | None = None
+    require_deliverable: bool | None = None
     output: dict[str, Any] | None = None
     evaluation: dict[str, Any] | None = None
+    deliverables: list[DeliverableResponse] = Field(default_factory=list)
     todos: list[dict[str, Any]] = Field(default_factory=list)
     started_at: datetime | None = None
     completed_at: datetime | None = None

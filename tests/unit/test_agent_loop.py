@@ -891,6 +891,14 @@ class _FinalAssistantContentLLM:
                         "tool_calls": [
                             {
                                 "index": 0,
+                                "id": "call_write",
+                                "function": {
+                                    "name": "write_deliverable",
+                                    "arguments": '{"content":"Final clean briefing text."}',
+                                },
+                            },
+                            {
+                                "index": 1,
                                 "id": "call_done",
                                 "function": {
                                     "name": "step_complete",
@@ -1060,6 +1068,7 @@ async def test_direct_todo_reprompt_is_system_message() -> None:
         system_initiated=True,
         is_retry=False,
         workflow_state=None,
+        step_run_id="sr-1",
         executor_environment=None,
         cancel_event=None,
         bootstrap_wait_for_intention=False,
@@ -1126,6 +1135,7 @@ async def test_direct_turn_absorbs_queued_batch_before_todo_reprompt() -> None:
         system_initiated=True,
         is_retry=False,
         workflow_state=None,
+        step_run_id="sr-1",
         executor_environment=None,
         cancel_event=None,
         bootstrap_wait_for_intention=False,
@@ -1168,7 +1178,7 @@ async def test_step_complete_reprompt_is_system_message() -> None:
     )
     calls = await _run_reminder_capture(ctx)
     assert calls[1][-1]["role"] == "system"
-    assert "call step_complete now" in str(calls[1][-1]["content"])
+    assert "ensure you have called write_deliverable" in str(calls[1][-1]["content"])
 
 
 def test_get_incomplete_todos_treats_done_as_completed() -> None:
@@ -1201,6 +1211,7 @@ def test_todo_schema_uses_completed_status() -> None:
         system_initiated=True,
         is_retry=False,
         workflow_state=None,
+        step_run_id="sr-1",
         executor_environment=None,
         cancel_event=None,
         bootstrap_wait_for_intention=False,
@@ -1209,6 +1220,9 @@ def test_todo_schema_uses_completed_status() -> None:
     )
 
     tools = loop._build_controller_tool_schemas(ctx)
+    write_deliverable_tool = next(
+        tool for tool in tools if tool["function"]["name"] == "write_deliverable"
+    )
     todo_tool = next(tool for tool in tools if tool["function"]["name"] == "step_todo_write")
     statuses = todo_tool["function"]["parameters"]["properties"]["todos"]["items"]["properties"][
         "status"
@@ -1222,6 +1236,7 @@ def test_todo_schema_uses_completed_status() -> None:
     # matching what the validator checks against.
     items = todo_tool["function"]["parameters"]["properties"]["todos"]["items"]
     assert items["required"] == ["content", "status"]
+    assert "canonical workflow artifact" in write_deliverable_tool["function"]["description"]
 
 
 @pytest.mark.asyncio
@@ -1274,7 +1289,9 @@ async def test_agent_loop_skips_routing_reminder_for_system_initiated_and_workfl
 
     workflow_assembler = _FakeContextAssembler()
     workflow_ctx = StepContext(
-        step_definition=StepDefinition(name="implement", type="run", prompt=""),
+        step_definition=StepDefinition(
+            name="implement", type="run", prompt="", require_deliverable=False
+        ),
         session=SimpleNamespace(
             session_id="sess-1",
             intaris_session_id="sess-1",
@@ -1297,7 +1314,9 @@ async def test_agent_loop_skips_routing_reminder_for_system_initiated_and_workfl
 async def test_agent_loop_skips_routing_reminder_for_secondary_policy_turns() -> None:
     assembler = _FakeContextAssembler()
     ctx = StepContext(
-        step_definition=StepDefinition(name="secondary", type="run", prompt=""),
+        step_definition=StepDefinition(
+            name="secondary", type="run", prompt="", require_deliverable=False
+        ),
         session=SimpleNamespace(
             session_id="sess-1",
             intaris_session_id="sess-1",
@@ -1453,7 +1472,9 @@ async def test_step_complete_validation_reprompts_and_accepts_corrected_payload(
         pause_waiter=PauseWaiter(),
     )
     ctx = StepContext(
-        step_definition=StepDefinition(name="commit", type="run", prompt=""),
+        step_definition=StepDefinition(
+            name="commit", type="run", prompt="", require_deliverable=False
+        ),
         session=SimpleNamespace(
             session_id="sess-1",
             intaris_session_id="sess-1",
@@ -1501,7 +1522,9 @@ async def test_step_complete_must_be_last_tool_call_in_response() -> None:
         pause_waiter=PauseWaiter(),
     )
     ctx = StepContext(
-        step_definition=StepDefinition(name="commit", type="run", prompt=""),
+        step_definition=StepDefinition(
+            name="commit", type="run", prompt="", require_deliverable=False
+        ),
         session=SimpleNamespace(
             session_id="sess-1",
             intaris_session_id="sess-1",
@@ -1664,7 +1687,7 @@ def test_step_complete_rejects_direct_notification_without_written_deliverable()
         notification={"mode": "direct"},
     )
 
-    with pytest.raises(ValueError, match="requires a non-empty final assistant message"):
+    with pytest.raises(ValueError, match="requires a non-empty deliverable"):
         _validate_step_completion_notification(ctx, step_output)
 
 
@@ -1979,6 +2002,7 @@ def test_format_prior_step_outputs_full_includes_full_content() -> None:
                 summary="Plan ready",
                 claims=["Covered edge cases"],
                 content="Detailed plan body",
+                deliverable_id="dlv-plan",
                 outputs={"files": ["a.py"]},
             ).model_dump(mode="json")
         }
@@ -2009,11 +2033,11 @@ def test_format_prior_step_outputs_full_includes_full_content() -> None:
 
     assert "Summary: Plan ready" in text
     assert "Claims:" in text
-    assert "Content:\nDetailed plan body" in text
+    assert "Deliverable:\nDetailed plan body" in text
     assert "Structured outputs:" in text
 
 
-def test_format_prior_step_outputs_summary_excludes_claims_and_content() -> None:
+def test_format_prior_step_outputs_summary_includes_deliverable_content() -> None:
     agent_loop = object.__new__(AgentLoop)
     workflow_state = WorkflowState(
         step_outputs={
@@ -2021,6 +2045,7 @@ def test_format_prior_step_outputs_summary_excludes_claims_and_content() -> None
                 summary="Implemented change",
                 claims=["Ran tests"],
                 content="Long implementation details",
+                deliverable_id="dlv-implement",
                 outputs={"tests": ["pytest tests/unit"]},
             ).model_dump(mode="json")
         }
@@ -2050,12 +2075,12 @@ def test_format_prior_step_outputs_summary_excludes_claims_and_content() -> None
     text = agent_loop._format_prior_step_outputs(ctx)
 
     assert "Summary: Implemented change" in text
+    assert "Deliverable:\nLong implementation details" in text
     assert "Structured outputs:" in text
     assert "Claims:" not in text
-    assert "Long implementation details" not in text
 
 
-def test_format_prior_step_outputs_last_excludes_full_content() -> None:
+def test_format_prior_step_outputs_last_includes_deliverable_content() -> None:
     agent_loop = object.__new__(AgentLoop)
     workflow_state = WorkflowState(
         step_outputs={
@@ -2063,6 +2088,7 @@ def test_format_prior_step_outputs_last_excludes_full_content() -> None:
                 summary="Plan ready",
                 claims=["Reviewed dependencies"],
                 content="Verbose plan details",
+                deliverable_id="dlv-plan",
                 outputs={"files": ["a.py", "b.py"]},
             ).model_dump(mode="json")
         }
@@ -2093,8 +2119,8 @@ def test_format_prior_step_outputs_last_excludes_full_content() -> None:
 
     assert "Summary: Plan ready" in text
     assert "Claims:" in text
+    assert "Deliverable:\nVerbose plan details" in text
     assert "Structured outputs:" in text
-    assert "Verbose plan details" not in text
 
 
 @pytest.mark.asyncio
@@ -3145,7 +3171,10 @@ async def test_step_complete_uses_only_final_assistant_message_for_content() -> 
     )
     ctx = StepContext(
         step_definition=StepDefinition(
-            name="briefing", type="run", prompt="Produce the final briefing."
+            name="briefing",
+            type="run",
+            prompt="Produce the final briefing.",
+            require_deliverable=False,
         ),
         session=SimpleNamespace(
             session_id="sess-1",
@@ -3195,6 +3224,6 @@ def test_step_prompt_respects_expected_output_without_allowing_silent_completion
 
     assert "Respect Expected output closely" in prompt
     assert (
-        "Do not interpret Expected output alone as permission to omit the assistant deliverable entirely"
+        "write_deliverable with the canonical user-facing artifact"
         in prompt
     )

@@ -409,12 +409,16 @@ class ChannelDeliveryService:
         attachments = event.data.get("attachments")
         if not isinstance(attachments, list):
             attachments = None
+        deliverable_id = event.data.get("final_deliverable_id")
+        if not isinstance(deliverable_id, str):
+            deliverable_id = None
 
         await self._deliver_outbox(
             delivery_id=delivery_id,
             final_content=final_content.strip() or None,
             fallback_text=fallback_text,
             attachments=attachments,
+            deliverable_id=deliverable_id,
             ignore_next_attempt=True,
         )
 
@@ -570,6 +574,7 @@ class ChannelDeliveryService:
         """Best-effort startup recovery for pending channel deliveries."""
 
         from cognis.store.queries import (
+            get_task,
             list_channel_delivery_outbox_due,
             list_channel_delivery_outbox_stale_sending,
             mark_channel_delivery_failed,
@@ -612,10 +617,30 @@ class ChannelDeliveryService:
             due = await list_channel_delivery_outbox_due(session, now=now)
 
         for row in due:
+            final_content: str | None = None
+            attachments: list[dict[str, Any]] | None = None
+            deliverable_id: str | None = None
+            if row.source_type == "task" and isinstance(row.source_id, str) and row.source_id:
+                async with self._session_factory() as session:
+                    task_row = await get_task(session, row.source_id)
+                result_data = task_row.result_data if task_row is not None and isinstance(task_row.result_data, dict) else {}
+                raw_final_content = result_data.get("final_channel_content") or result_data.get(
+                    "final_content"
+                )
+                if isinstance(raw_final_content, str) and raw_final_content.strip():
+                    final_content = raw_final_content.strip()
+                raw_attachments = result_data.get("attachments")
+                if isinstance(raw_attachments, list):
+                    attachments = [item for item in raw_attachments if isinstance(item, dict)]
+                raw_deliverable_id = result_data.get("final_deliverable_id")
+                if isinstance(raw_deliverable_id, str) and raw_deliverable_id:
+                    deliverable_id = raw_deliverable_id
             await self._deliver_outbox(
                 delivery_id=row.delivery_id,
-                final_content=None,
+                final_content=final_content,
                 fallback_text=row.fallback_text,
+                attachments=attachments,
+                deliverable_id=deliverable_id,
             )
 
     async def _retry_loop(self) -> None:
@@ -644,6 +669,7 @@ class ChannelDeliveryService:
         final_content: str | None,
         fallback_text: str | None,
         attachments: list[dict[str, Any]] | None = None,
+        deliverable_id: str | None = None,
         ignore_next_attempt: bool = False,
     ) -> None:
         from cognis.store.queries import (
@@ -651,6 +677,7 @@ class ChannelDeliveryService:
             mark_channel_delivery_failed,
             mark_channel_delivery_sent,
             mark_channel_delivery_uncertain,
+            update_deliverable_status,
         )
 
         lease_token = f"lease_{uuid.uuid4().hex[:12]}"
@@ -712,6 +739,12 @@ class ChannelDeliveryService:
                 if not ok:
                     await session.rollback()
                     return
+                if deliverable_id is not None:
+                    await update_deliverable_status(
+                        session,
+                        deliverable_id,
+                        status="delivered",
+                    )
             elif delivery_status == "partial":
                 await mark_channel_delivery_uncertain(
                     session,

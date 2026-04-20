@@ -195,6 +195,7 @@ class StepDefinition(BaseModel):
     gate: GateConfig | None = None
     on_reject: OnRejectConfig | None = None
     outcome_routes: list[OutcomeRoute] = Field(default_factory=list)
+    require_deliverable: bool = True
 
     @field_validator("reasoning_effort")
     @classmethod
@@ -270,11 +271,15 @@ class StepOutput(BaseModel):
     """What a step produces on completion (via step_complete) or failure (error is set)."""
 
     summary: str
-    content: str = ""  # Full assistant output (for delegation result delivery)
+    content: str = ""  # Approved deliverable text mirror for downstream context.
     outputs: dict[str, Any] = {}
     claims: list[str] = []
     outcome: StepOutcome | None = None
     notification: StepCompletionNotification | None = None
+    deliverable_id: str | None = None
+    deliverable_version: int | None = None
+    deliverable_format: Literal["markdown", "plain", "html"] | None = None
+    deliverable_title: str | None = None
     execution_evidence: dict[str, Any] | None = None
     error: str | None = None  # Set when the step failed with an exception
     completed_at: datetime | None = None

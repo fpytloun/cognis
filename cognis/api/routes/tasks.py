@@ -21,6 +21,7 @@ from cognis.api.models import (
     BatchSubmitRequest,
     BatchSubmitResponse,
     CursorPage,
+    DeliverableResponse,
     DependencyRequest,
     DependencyResponse,
     GateResponseRequest,
@@ -34,6 +35,7 @@ from cognis.api.models import (
     WorkflowRunResponse,
 )
 from cognis.api.serializers import (
+    deliverable_to_response,
     dependency_to_response,
     step_run_to_response,
     task_detail_to_response,
@@ -46,8 +48,7 @@ from cognis.core.management import (
     task_workflow_run_response,
 )
 from cognis.models.task import TaskDelivery, TaskModel
-from cognis.models.workflow import CompletionDeliveryPolicy
-from cognis.models.workflow import WorkflowState
+from cognis.models.workflow import CompletionDeliveryPolicy, WorkflowState
 from cognis.store.models import Task
 from cognis.store.queries import (
     add_task_dependency,
@@ -56,6 +57,7 @@ from cognis.store.queries import (
     get_step_run,
     get_task,
     get_task_dependencies,
+    list_deliverables_for_step_run,
     list_step_runs_for_task,
     remove_task_dependency,
 )
@@ -210,12 +212,22 @@ async def task_detail(request: Request, task_id: str) -> TaskDetailResponse:
     async with request.app.state.session_factory() as session:
         dep_rows = await get_task_dependencies(session, task_id)
         step_rows = await list_step_runs_for_task(session, task_id)
+        deliverables_by_step_run = {
+            row.step_run_id: [deliverable_to_response(item) for item in await list_deliverables_for_step_run(session, row.step_run_id)]
+            for row in step_rows
+        }
     pending_pause = _task_pending_pause(request, task)
     workflow_run = await _build_workflow_run_response(request, task, pending_pause)
     return task_detail_to_response(
         task,
         dependencies=[dependency_to_response(row) for row in dep_rows],
-        step_runs=[step_run_to_response(row) for row in step_rows],
+        step_runs=[
+            step_run_to_response(
+                row,
+                deliverables=deliverables_by_step_run.get(row.step_run_id, []),
+            )
+            for row in step_rows
+        ],
         pending_pause=pending_pause,
         workflow_run=workflow_run,
     )
@@ -429,7 +441,14 @@ async def task_steps(request: Request, task_id: str) -> list[StepRunResponse]:
     await _require_task(request, task_id)
     async with request.app.state.session_factory() as session:
         rows = await list_step_runs_for_task(session, task_id)
-    return [step_run_to_response(row) for row in rows]
+        deliverables_by_step_run = {
+            row.step_run_id: [deliverable_to_response(item) for item in await list_deliverables_for_step_run(session, row.step_run_id)]
+            for row in rows
+        }
+    return [
+        step_run_to_response(row, deliverables=deliverables_by_step_run.get(row.step_run_id, []))
+        for row in rows
+    ]
 
 
 @router.get("/api/v1/step-runs/{step_run_id}", response_model=StepRunResponse)
@@ -440,9 +459,30 @@ async def step_run_detail(request: Request, step_run_id: str) -> StepRunResponse
         if row is None:
             raise api_exception(404, "not_found", "Step run not found")
         task_row = await get_task(session, row.task_id)
-    if task_row is None or (task_row.created_by != user.email and user.role != "admin"):
+        deliverables = [
+            deliverable_to_response(item)
+            for item in await list_deliverables_for_step_run(session, row.step_run_id)
+        ]
+    if task_row is None or task_row.created_by != user.email:
         raise api_exception(404, "not_found", "Step run not found")
-    return step_run_to_response(row)
+    return step_run_to_response(row, deliverables=deliverables)
+
+
+@router.get(
+    "/api/v1/step-runs/{step_run_id}/deliverables",
+    response_model=list[DeliverableResponse],
+)
+async def step_run_deliverables(request: Request, step_run_id: str) -> list[DeliverableResponse]:
+    user = require_current_user(request)
+    async with request.app.state.session_factory() as session:
+        row = await get_step_run(session, step_run_id)
+        if row is None:
+            raise api_exception(404, "not_found", "Step run not found")
+        task_row = await get_task(session, row.task_id)
+        if task_row is None or task_row.created_by != user.email:
+            raise api_exception(404, "not_found", "Step run not found")
+        rows = await list_deliverables_for_step_run(session, step_run_id)
+    return [deliverable_to_response(row) for row in rows]
 
 
 @router.get("/api/v1/tasks/{task_id}/workflow-run", response_model=WorkflowRunResponse)
@@ -491,12 +531,13 @@ async def task_remove_dependency(
 
 
 async def _require_task(request: Request, task_id: str) -> TaskModel:
-    require_current_user(request)
+    user = require_current_user(request)
     async with request.app.state.session_factory() as session:
         row = await get_task(session, task_id)
     if row is None:
         raise api_exception(404, "not_found", "Task not found")
-    require_owner_or_admin(request, row.created_by)
+    if row.created_by != user.email:
+        raise api_exception(404, "not_found", "Task not found")
     return _row_to_task(row)
 
 

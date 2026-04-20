@@ -23,6 +23,7 @@ from cognis.store.models import (
     ChannelPairingRequest,
     Conversation,
     CredentialRow,
+    DeliverableRow,
     ExecutorRow,
     LLMProvider,
     MCPServerRow,
@@ -46,6 +47,9 @@ from cognis.store.models import (
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+_UNSET = object()
 
 
 # --- Users ---
@@ -1675,6 +1679,151 @@ async def get_dependent_tasks(
 
 
 # ---------------------------------------------------------------------------
+# Deliverables
+# ---------------------------------------------------------------------------
+
+
+async def create_deliverable(
+    session: AsyncSession,
+    *,
+    step_run_id: str,
+    content: str,
+    format: str = "markdown",
+    title: str | None = None,
+    target: str | None = None,
+    outputs: dict[str, Any] | None = None,
+    deliverable_id: str | None = None,
+) -> DeliverableRow:
+    """Create a new versioned deliverable for a step run."""
+
+    version_result = await session.execute(
+        select(sa.func.max(DeliverableRow.version)).where(DeliverableRow.step_run_id == step_run_id)
+    )
+    next_version = int(version_result.scalar_one_or_none() or 0) + 1
+
+    await session.execute(
+        update(DeliverableRow)
+        .where(
+            DeliverableRow.step_run_id == step_run_id,
+            DeliverableRow.status.in_(["buffered", "approved"]),
+        )
+        .values(status="superseded", updated_at=_utcnow())
+    )
+
+    row = DeliverableRow(
+        deliverable_id=deliverable_id or f"dlv_{uuid.uuid4().hex}",
+        step_run_id=step_run_id,
+        version=next_version,
+        content=content,
+        format=format,
+        title=title,
+        target=target,
+        outputs=outputs,
+        status="buffered",
+    )
+    session.add(row)
+    await session.flush()
+    return row
+
+
+async def get_deliverable(session: AsyncSession, deliverable_id: str) -> DeliverableRow | None:
+    """Get a deliverable by ID."""
+
+    result = await session.execute(
+        select(DeliverableRow).where(DeliverableRow.deliverable_id == deliverable_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def list_deliverables_for_step_run(
+    session: AsyncSession,
+    step_run_id: str,
+) -> list[DeliverableRow]:
+    """List deliverable versions for a step run, newest first."""
+
+    result = await session.execute(
+        select(DeliverableRow)
+        .where(DeliverableRow.step_run_id == step_run_id)
+        .order_by(DeliverableRow.version.desc(), DeliverableRow.created_at.desc())
+    )
+    return list(result.scalars().all())
+
+
+async def get_latest_active_deliverable_for_step_run(
+    session: AsyncSession,
+    step_run_id: str,
+) -> DeliverableRow | None:
+    """Return the latest non-rejected, non-superseded deliverable for a step run."""
+
+    result = await session.execute(
+        select(DeliverableRow)
+        .where(
+            DeliverableRow.step_run_id == step_run_id,
+            DeliverableRow.status.in_(["buffered", "approved", "delivered"]),
+        )
+        .order_by(DeliverableRow.version.desc(), DeliverableRow.created_at.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def update_deliverable_status(
+    session: AsyncSession,
+    deliverable_id: str,
+    *,
+    status: str,
+    evaluator_feedback: str | None | object = _UNSET,
+) -> bool:
+    """Update a deliverable lifecycle state."""
+
+    values: dict[str, object] = {"status": status, "updated_at": _utcnow()}
+    if evaluator_feedback is not _UNSET:
+        values["evaluator_feedback"] = evaluator_feedback
+    result = await session.execute(
+        update(DeliverableRow)
+        .where(DeliverableRow.deliverable_id == deliverable_id)
+        .values(**values)
+    )
+    return int(getattr(result, "rowcount", 0) or 0) > 0
+
+
+async def get_latest_approved_deliverable_for_step_run(
+    session: AsyncSession,
+    step_run_id: str,
+) -> DeliverableRow | None:
+    """Return the latest approved deliverable for a step run."""
+
+    result = await session.execute(
+        select(DeliverableRow)
+        .where(
+            DeliverableRow.step_run_id == step_run_id,
+            DeliverableRow.status == "approved",
+        )
+        .order_by(DeliverableRow.version.desc(), DeliverableRow.created_at.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_latest_rejected_deliverable_for_step_run(
+    session: AsyncSession,
+    step_run_id: str,
+) -> DeliverableRow | None:
+    """Return the latest rejected deliverable for a step run."""
+
+    result = await session.execute(
+        select(DeliverableRow)
+        .where(
+            DeliverableRow.step_run_id == step_run_id,
+            DeliverableRow.status == "rejected",
+        )
+        .order_by(DeliverableRow.version.desc(), DeliverableRow.created_at.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+# ---------------------------------------------------------------------------
 # Step Runs
 # ---------------------------------------------------------------------------
 
@@ -1691,6 +1840,8 @@ async def create_step_run(
     conversation_id: str | None = None,
     workspace_root: str | None = None,
     working_directory: str | None = None,
+    deliverable_id: str | None = None,
+    require_deliverable: bool | None = None,
 ) -> StepRun:
     """Create a new step run record."""
     row = StepRun(
@@ -1703,6 +1854,8 @@ async def create_step_run(
         workspace_root=workspace_root,
         working_directory=working_directory,
         conversation_id=conversation_id,
+        deliverable_id=deliverable_id,
+        require_deliverable=require_deliverable,
     )
     session.add(row)
     await session.flush()
@@ -1713,7 +1866,7 @@ _VALID_STEP_RUN_TRANSITIONS: dict[str, set[str]] = {
     "pending": {"running", "cancelled"},
     "running": {"evaluating", "approved", "rejected", "failed", "paused", "cancelled"},
     "evaluating": {"approved", "rejected", "failed"},
-    "approved": set(),  # terminal
+    "approved": {"running"},
     "rejected": {"running"},  # retry
     "paused": {"running", "cancelled"},
     "failed": {"running"},  # retry
@@ -1726,16 +1879,19 @@ async def update_step_run(
     step_run_id: str,
     *,
     status: str | None = None,
-    conversation_id: str | None = None,
-    session_id: str | None = None,
-    intaris_session_id: str | None = None,
-    workspace_root: str | None = None,
-    working_directory: str | None = None,
-    output: dict[str, object] | None = None,
-    evaluation: dict[str, object] | None = None,
-    todos: list[dict[str, object]] | None = None,
-    started_at: datetime | None = None,
-    completed_at: datetime | None = None,
+    attempt: int | object = _UNSET,
+    conversation_id: str | None | object = _UNSET,
+    session_id: str | None | object = _UNSET,
+    intaris_session_id: str | None | object = _UNSET,
+    workspace_root: str | None | object = _UNSET,
+    working_directory: str | None | object = _UNSET,
+    deliverable_id: str | None | object = _UNSET,
+    require_deliverable: bool | None | object = _UNSET,
+    output: dict[str, object] | None | object = _UNSET,
+    evaluation: dict[str, object] | None | object = _UNSET,
+    todos: list[dict[str, object]] | None | object = _UNSET,
+    started_at: datetime | None | object = _UNSET,
+    completed_at: datetime | None | object = _UNSET,
 ) -> bool:
     """Update step run fields.
 
@@ -1746,25 +1902,31 @@ async def update_step_run(
     values: dict[str, object] = {}
     if status is not None:
         values["status"] = status
-    if conversation_id is not None:
+    if attempt is not _UNSET:
+        values["attempt"] = attempt
+    if conversation_id is not _UNSET:
         values["conversation_id"] = conversation_id
-    if session_id is not None:
+    if session_id is not _UNSET:
         values["session_id"] = session_id
-    if intaris_session_id is not None:
+    if intaris_session_id is not _UNSET:
         values["intaris_session_id"] = intaris_session_id
-    if workspace_root is not None:
+    if workspace_root is not _UNSET:
         values["workspace_root"] = workspace_root
-    if working_directory is not None:
+    if working_directory is not _UNSET:
         values["working_directory"] = working_directory
-    if output is not None:
+    if deliverable_id is not _UNSET:
+        values["deliverable_id"] = deliverable_id
+    if require_deliverable is not _UNSET:
+        values["require_deliverable"] = require_deliverable
+    if output is not _UNSET:
         values["output"] = output
-    if evaluation is not None:
+    if evaluation is not _UNSET:
         values["evaluation"] = evaluation
-    if todos is not None:
+    if todos is not _UNSET:
         values["todos"] = todos
-    if started_at is not None:
+    if started_at is not _UNSET:
         values["started_at"] = started_at
-    if completed_at is not None:
+    if completed_at is not _UNSET:
         values["completed_at"] = completed_at
     if not values:
         return False

@@ -12,6 +12,7 @@ export interface WorkflowStepFormState {
   prompt: string;
   agentOverride: string;
   reasoningEffort: string;
+  requireDeliverable: boolean;
   inputMode: 'auto' | 'null' | 'last' | 'full' | 'summary';
   inputText: string;
   allowQuestions: boolean;
@@ -60,6 +61,7 @@ export function createEmptyStep(): WorkflowStepFormState {
     prompt: '',
     agentOverride: '',
     reasoningEffort: '',
+    requireDeliverable: true,
     inputMode: 'null',
     inputText: '',
     allowQuestions: false,
@@ -250,6 +252,7 @@ export function workflowToFormState(workflow: Workflow): WorkflowFormState {
         prompt: step.prompt ?? '',
         agentOverride: step.agent_override ?? '',
         reasoningEffort: typeof step.reasoning_effort === 'string' ? step.reasoning_effort : '',
+        requireDeliverable: step.require_deliverable !== false,
         inputMode: workflowInputMode(step.input),
         inputText: workflowInputSourceNames(step.input).join(', '),
         allowQuestions: step.allow_questions ?? false,
@@ -327,6 +330,7 @@ export function formStateToWorkflowPayload(form: WorkflowFormState): Record<stri
         prompt: step.prompt,
         agent_override: step.agentOverride || null,
         reasoning_effort: step.reasoningEffort || undefined,
+        require_deliverable: step.requireDeliverable,
         ...(inputPayload ? { input: inputPayload } : {}),
         allow_questions: step.allowQuestions,
         completion:

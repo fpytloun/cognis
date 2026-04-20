@@ -643,6 +643,15 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
                         </Tooltip>
                       </span>
                     </label>
+                    <label class="flex items-center gap-3 text-sm text-slate-200">
+                      <input bind:checked={step.requireDeliverable} class="h-4 w-4 rounded border-slate-600 bg-slate-950" disabled={!!selectedWorkflow?.is_system} type="checkbox" />
+                      <span class="inline-flex items-center gap-2">
+                        Require deliverable
+                        <Tooltip text="When enabled, the agent must call write_deliverable before step_complete. Deliverables become the canonical artifact for evaluation, UI, and final workflow output.">
+                          <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-700 text-xs text-slate-400 hover:text-slate-200 focus-visible:border-slate-400 md:h-5 md:w-5">?</button>
+                        </Tooltip>
+                      </span>
+                    </label>
                     {#if form.interactionMode === 'step_requests'}
                       <label class="flex items-center gap-3 text-sm text-slate-200">
                         <input bind:checked={step.allowQuestions} class="h-4 w-4 rounded border-slate-600 bg-slate-950" disabled={!!selectedWorkflow?.is_system} type="checkbox" />

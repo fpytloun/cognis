@@ -12,6 +12,7 @@ from cognis.api.models import (
     ConversationContextModel,
     ConversationResponse,
     CredentialResponse,
+    DeliverableResponse,
     DependencyResponse,
     EscalationResponse,
     LLMProviderResponse,
@@ -223,7 +224,28 @@ def dependency_to_response(row: Any) -> DependencyResponse:
     return DependencyResponse(task_id=row.task_id, depends_on=row.depends_on, required=row.required)
 
 
-def step_run_to_response(row: Any) -> StepRunResponse:
+def deliverable_to_response(row: Any) -> DeliverableResponse:
+    return DeliverableResponse(
+        deliverable_id=row.deliverable_id,
+        step_run_id=row.step_run_id,
+        version=row.version,
+        content=row.content,
+        format=row.format,
+        title=row.title,
+        target=row.target,
+        outputs=_coerce_dict_or_none(getattr(row, "outputs", None)) or {},
+        status=row.status,
+        evaluator_feedback=getattr(row, "evaluator_feedback", None),
+        created_at=getattr(row, "created_at", None),
+        updated_at=getattr(row, "updated_at", None),
+    )
+
+
+def step_run_to_response(
+    row: Any,
+    *,
+    deliverables: list[DeliverableResponse] | None = None,
+) -> StepRunResponse:
     return StepRunResponse(
         step_run_id=row.step_run_id,
         task_id=row.task_id,
@@ -237,8 +259,11 @@ def step_run_to_response(row: Any) -> StepRunResponse:
         conversation_id=getattr(row, "conversation_id", None),
         session_id=row.session_id,
         intaris_session_id=row.intaris_session_id,
+        deliverable_id=getattr(row, "deliverable_id", None),
+        require_deliverable=getattr(row, "require_deliverable", None),
         output=_coerce_dict_or_none(row.output),
         evaluation=_coerce_dict_or_none(row.evaluation),
+        deliverables=deliverables or [],
         todos=_coerce_list_of_dicts(getattr(row, "todos", None)),
         started_at=row.started_at,
         completed_at=row.completed_at,
