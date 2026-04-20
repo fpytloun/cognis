@@ -16,6 +16,8 @@ import pytest
 from pydantic import ValidationError
 
 from cognis.api.models import (
+    ModelRoutingEntry,
+    ModelRoutingResponse,
     PendingPauseResponse,
     SkillResponse,
     SkillVersionResponse,
@@ -197,3 +199,23 @@ class TestTaskResponseRoundTrip:
         assert response.description == ""
         assert response.workflow_state is None
         assert response.completion_mode_family == "default"
+
+
+class TestModelRoutingContracts:
+    def test_model_routing_defaults_to_empty_route_entries(self) -> None:
+        response = ModelRoutingResponse()
+
+        assert response.default == ModelRoutingEntry(model=None, reasoning_effort=None)
+        assert response.image_generation == ModelRoutingEntry(
+            model=None, reasoning_effort=None
+        )
+
+    def test_model_routing_preserves_nested_entry_shape(self) -> None:
+        response = ModelRoutingResponse(
+            default={"model": "gpt-5.4", "reasoning_effort": "xhigh"},
+            speech_to_text={"model": "gpt-4o-transcribe", "reasoning_effort": None},
+        )
+
+        assert response.default.model == "gpt-5.4"
+        assert response.default.reasoning_effort == "xhigh"
+        assert response.speech_to_text.model == "gpt-4o-transcribe"

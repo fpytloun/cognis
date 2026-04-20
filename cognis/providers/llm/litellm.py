@@ -28,6 +28,7 @@ from cognis.models.config import (
     ProviderHealth,
     SpeechToTextResult,
     TokenUsage,
+    normalize_reasoning_level,
 )
 from cognis.providers.llm.reasoning import (
     PreparedReasoningConfig,
@@ -53,6 +54,11 @@ PROXY_MODEL_INFO_CACHE_TTL = 300.0  # 5 minutes for successful proxy /model/info
 PROXY_MODEL_INFO_NEGATIVE_TTL = 30.0  # 30 seconds negative cache for failures
 SAFE_PROVIDER_KWARGS = {"api_base", "api_version", "base_url", "timeout"}
 _CACHE_MISS = object()
+_DEFAULT_TASK_TYPE_REASONING_EFFORTS: dict[str, str] = {
+    "classifier": "low",
+    "compaction": "low",
+    "evaluator": "low",
+}
 
 # Preset-to-litellm model prefix mapping.  LiteLLM uses the prefix to
 # determine which provider API to use.  Standard presets (openai, anthropic)
@@ -622,6 +628,18 @@ class LiteLLMProvider:
             rows = (await session.execute(select(LLMProviderRow))).scalars().all()
         return self._select_provider_id_for_model(rows, model_id)
 
+    async def _get_route_reasoning_effort(self, task_type: str) -> str | None:
+        async with self.session_factory() as session:
+            route = await session.get(ModelRouting, task_type)
+        if route is None:
+            return _DEFAULT_TASK_TYPE_REASONING_EFFORTS.get(task_type)
+        if not isinstance(route.config, dict):
+            return _DEFAULT_TASK_TYPE_REASONING_EFFORTS.get(task_type)
+        normalized = normalize_reasoning_level(route.config.get("reasoning_effort"))
+        if normalized == "default":
+            return _DEFAULT_TASK_TYPE_REASONING_EFFORTS.get(task_type)
+        return normalized or _DEFAULT_TASK_TYPE_REASONING_EFFORTS.get(task_type)
+
     async def _merge_litellm_model_info(
         self,
         model_id: str,
@@ -892,6 +910,19 @@ class LiteLLMProvider:
         request_kwargs = _merge_request_kwargs(
             await self._resolve_provider_kwargs(provider), kwargs
         )
+        existing_reasoning = normalize_reasoning_level(
+            request_kwargs.get("reasoning_effort")
+            if isinstance(request_kwargs.get("reasoning_effort"), str)
+            else None
+        )
+        if (
+            model is None
+            and explicit_provider_id is None
+            and existing_reasoning in {None, "default"}
+        ):
+            routed_reasoning = await self._get_route_reasoning_effort(task_type)
+            if routed_reasoning is not None:
+                request_kwargs["reasoning_effort"] = routed_reasoning
         retry_count = request_kwargs.pop("max_retries", None)
         if retry_count is None:
             retry_count = request_kwargs.pop("num_retries", None)
@@ -1004,6 +1035,19 @@ class LiteLLMProvider:
         request_kwargs = _merge_request_kwargs(
             await self._resolve_provider_kwargs(provider), kwargs
         )
+        existing_reasoning = normalize_reasoning_level(
+            request_kwargs.get("reasoning_effort")
+            if isinstance(request_kwargs.get("reasoning_effort"), str)
+            else None
+        )
+        if (
+            model is None
+            and explicit_provider_id is None
+            and existing_reasoning in {None, "default"}
+        ):
+            routed_reasoning = await self._get_route_reasoning_effort(task_type)
+            if routed_reasoning is not None:
+                request_kwargs["reasoning_effort"] = routed_reasoning
         retry_count = request_kwargs.pop("max_retries", None)
         if retry_count is None:
             retry_count = request_kwargs.pop("num_retries", None)

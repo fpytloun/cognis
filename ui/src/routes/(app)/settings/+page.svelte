@@ -21,6 +21,7 @@
   import { confirmAction } from '$lib/stores/confirm';
   import { addToast } from '$lib/stores/toasts';
   import { blockNavigationIfDirty, installBeforeUnloadGuard } from '$lib/navigation/unsaved';
+  import { thinkingEffortLabel } from '$lib/thinking';
   import { auth } from '$lib/stores/auth';
   import {
     executorMcpFailureDetails,
@@ -85,6 +86,50 @@
     system: 'system',
     account: 'account'
   };
+  const ROUTING_KEYS = ['default', 'classifier', 'compaction', 'evaluator', 'speech_to_text', 'image_generation'] as const;
+  const TEXT_ROUTING_KEYS = ['default', 'classifier', 'compaction', 'evaluator'] as const;
+  type RoutingKey = (typeof ROUTING_KEYS)[number];
+  type RoutingFormEntry = { model: string; reasoningEffort: string };
+  const ROUTING_METADATA: Array<{
+    key: RoutingKey;
+    label: string;
+    description: string;
+    supportsThinking: boolean;
+  }> = [
+    { key: 'default', label: 'default', description: 'Main chat and task execution.', supportsThinking: true },
+    { key: 'classifier', label: 'classifier', description: 'Decision engine / fast model.', supportsThinking: true },
+    { key: 'compaction', label: 'compaction', description: 'Context compaction summaries.', supportsThinking: true },
+    { key: 'evaluator', label: 'evaluator', description: 'Workflow step evaluation. Falls back to default if not set.', supportsThinking: true },
+    { key: 'speech_to_text', label: 'speech_to_text', description: 'Voice-note transcription. Use models like gpt-4o-transcribe, gpt-4o-mini-transcribe, or whisper.', supportsThinking: false },
+    { key: 'image_generation', label: 'image_generation', description: 'Image-capable model for avatars and tools. Must support image generation.', supportsThinking: false }
+  ];
+
+  function emptyRoutingEntry(): RoutingFormEntry {
+    return { model: '', reasoningEffort: '' };
+  }
+
+  function emptyModelRouting(): ModelRouting {
+    return {
+      default: { model: null, reasoning_effort: null },
+      classifier: { model: null, reasoning_effort: null },
+      compaction: { model: null, reasoning_effort: null },
+      evaluator: { model: null, reasoning_effort: null },
+      speech_to_text: { model: null, reasoning_effort: null },
+      image_generation: { model: null, reasoning_effort: null }
+    };
+  }
+
+  function emptyRoutingForm(): Record<RoutingKey, RoutingFormEntry> {
+    return {
+      default: emptyRoutingEntry(),
+      classifier: emptyRoutingEntry(),
+      compaction: emptyRoutingEntry(),
+      evaluator: emptyRoutingEntry(),
+      speech_to_text: emptyRoutingEntry(),
+      image_generation: emptyRoutingEntry()
+    };
+  }
+
   let activeTab = $state<SettingsTab>('providers');
   let loading = $state(true);
   let busy = $state(false);
@@ -93,7 +138,7 @@
   let notice = $state('');
   let settings = $state<SettingsCategory[]>([]);
   let providers = $state<LLMProvider[]>([]);
-  let modelRouting = $state<ModelRouting>({ default: null, classifier: null, compaction: null, evaluator: null, simple_inline: null, speech_to_text: null, image_generation: null, items: {} });
+  let modelRouting = $state<ModelRouting>(emptyModelRouting());
   let secrets = $state<SecretMetadata[]>([]);
   let credentials = $state<CredentialMetadata[]>([]);
   let health = $state<HealthResponse | null>(null);
@@ -187,16 +232,7 @@
   let accountNameDirty = $state(false);
   let executorPollTimer: ReturnType<typeof setInterval> | null = null;
 
-  let routingForm = $state({
-    default: '',
-    classifier: '',
-    compaction: '',
-    evaluator: '',
-    simple_inline: '',
-    speech_to_text: '',
-    image_generation: '',
-    extraJson: '{}'
-  });
+  let routingForm = $state<Record<RoutingKey, RoutingFormEntry>>(emptyRoutingForm());
 
   let secretForm = $state({
     name: '',
@@ -323,13 +359,43 @@
     return collectModelOptions(providers);
   }
 
+  function findModelEntry(modelId: string): ModelEntry | null {
+    const normalized = modelId.trim();
+    if (!normalized) {
+      return null;
+    }
+    for (const provider of providers) {
+      const match = provider.models.find((model) => model.model_id === normalized);
+      if (match) {
+        return match;
+      }
+    }
+    return null;
+  }
+
+  function routeThinkingEffortOptions(routeKey: RoutingKey): string[] {
+    if (!TEXT_ROUTING_KEYS.includes(routeKey as (typeof TEXT_ROUTING_KEYS)[number])) {
+      return [];
+    }
+    const modelEntry = findModelEntry(routingForm[routeKey].model);
+    return (modelEntry?.reasoning_efforts ?? []).filter((value) => value !== 'default');
+  }
+
+  function syncRouteThinkingEffort(routeKey: RoutingKey): void {
+    const entry = routingForm[routeKey];
+    const available = routeThinkingEffortOptions(routeKey);
+    if (!available.includes(entry.reasoningEffort)) {
+      routingForm[routeKey].reasoningEffort = '';
+    }
+  }
+
   function executorSelectorFor(labels: Record<string, string> | null | undefined): string {
     return Object.entries(labels || {}).map(([k, v]) => `${k}=${v}`).join(', ');
   }
 
   function routingWarnings(): string[] {
     const knownModels = new Set(modelOptions().map((item) => item.value));
-    return [routingForm.default, routingForm.classifier, routingForm.compaction, routingForm.evaluator, routingForm.simple_inline, routingForm.speech_to_text, routingForm.image_generation]
+    return ROUTING_KEYS.map((key) => routingForm[key].model)
       .filter(Boolean)
       .filter((model) => !knownModels.has(model))
       .map((model) => `Model '${model}' is not present in configured providers.`);
@@ -603,14 +669,30 @@
     ]);
 
     routingForm = {
-      default: modelRouting.default ?? '',
-      classifier: modelRouting.classifier ?? '',
-      compaction: modelRouting.compaction ?? '',
-      evaluator: modelRouting.evaluator ?? '',
-      simple_inline: modelRouting.simple_inline ?? '',
-      speech_to_text: modelRouting.speech_to_text ?? '',
-      image_generation: modelRouting.image_generation ?? '',
-      extraJson: JSON.stringify(modelRouting.items, null, 2)
+      default: {
+        model: modelRouting.default.model ?? '',
+        reasoningEffort: modelRouting.default.reasoning_effort ?? ''
+      },
+      classifier: {
+        model: modelRouting.classifier.model ?? '',
+        reasoningEffort: modelRouting.classifier.reasoning_effort ?? ''
+      },
+      compaction: {
+        model: modelRouting.compaction.model ?? '',
+        reasoningEffort: modelRouting.compaction.reasoning_effort ?? ''
+      },
+      evaluator: {
+        model: modelRouting.evaluator.model ?? '',
+        reasoningEffort: modelRouting.evaluator.reasoning_effort ?? ''
+      },
+      speech_to_text: {
+        model: modelRouting.speech_to_text.model ?? '',
+        reasoningEffort: ''
+      },
+      image_generation: {
+        model: modelRouting.image_generation.model ?? '',
+        reasoningEffort: ''
+      }
     };
 
     webConfig = await api.webConfig.status().catch(() => webConfig);
@@ -750,24 +832,34 @@
   }
 
   async function saveRouting(): Promise<void> {
-    try {
-      JSON.parse(routingForm.extraJson || '{}');
-    } catch {
-      error = 'Additional task routes must be valid JSON.';
-      return;
-    }
     busy = true;
     error = '';
     try {
       modelRouting = await api.modelRouting.update({
-        default: routingForm.default || null,
-        classifier: routingForm.classifier || null,
-        compaction: routingForm.compaction || null,
-        evaluator: routingForm.evaluator || null,
-        simple_inline: routingForm.simple_inline || null,
-        speech_to_text: routingForm.speech_to_text || null,
-        image_generation: routingForm.image_generation || null,
-        items: JSON.parse(routingForm.extraJson || '{}')
+        default: {
+          model: routingForm.default.model || null,
+          reasoning_effort: routingForm.default.model ? routingForm.default.reasoningEffort || null : null
+        },
+        classifier: {
+          model: routingForm.classifier.model || null,
+          reasoning_effort: routingForm.classifier.model ? routingForm.classifier.reasoningEffort || null : null
+        },
+        compaction: {
+          model: routingForm.compaction.model || null,
+          reasoning_effort: routingForm.compaction.model ? routingForm.compaction.reasoningEffort || null : null
+        },
+        evaluator: {
+          model: routingForm.evaluator.model || null,
+          reasoning_effort: routingForm.evaluator.model ? routingForm.evaluator.reasoningEffort || null : null
+        },
+        speech_to_text: {
+          model: routingForm.speech_to_text.model || null,
+          reasoning_effort: null
+        },
+        image_generation: {
+          model: routingForm.image_generation.model || null,
+          reasoning_effort: null
+        }
       });
       notice = 'Model routing updated.';
       addToast('Model routing updated.', 'success');
@@ -781,16 +873,14 @@
   }
 
   function copyDefaultModelToAll(): void {
-    if (!routingForm.default) {
+    if (!routingForm.default.model) {
       return;
     }
     routingForm = {
       ...routingForm,
-      classifier: routingForm.default,
-      compaction: routingForm.default,
-      evaluator: routingForm.default,
-      simple_inline: routingForm.default,
-      speech_to_text: routingForm.default
+      classifier: { ...routingForm.default },
+      compaction: { ...routingForm.default },
+      evaluator: { ...routingForm.default }
     };
   }
 
@@ -1571,80 +1661,42 @@
             <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Model routing</p>
             <h2 class="mt-1 text-lg font-semibold text-white">Task-type routing</h2>
           </div>
-          <Button variant="secondary" onclick={copyDefaultModelToAll}>Use default for all</Button>
+          <Button variant="secondary" onclick={copyDefaultModelToAll}>Copy default route to text routes</Button>
         </div>
 
         <div class="mt-4 grid gap-4 md:grid-cols-2">
-          <label class="space-y-2 text-sm font-medium text-slate-200">
-            <span>default</span>
-            <select bind:value={routingForm.default} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
-              <option value="">Use provider default</option>
-              {#each modelOptions() as option}
-                <option value={option.value}>{option.label}</option>
-              {/each}
-            </select>
-            <span class="block text-xs text-slate-400">Main chat and task execution.</span>
-          </label>
-          <label class="space-y-2 text-sm font-medium text-slate-200">
-            <span>classifier</span>
-            <select bind:value={routingForm.classifier} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
-              <option value="">Use provider default</option>
-              {#each modelOptions() as option}
-                <option value={option.value}>{option.label}</option>
-              {/each}
-            </select>
-            <span class="block text-xs text-slate-400">Decision engine / fast model.</span>
-          </label>
-          <label class="space-y-2 text-sm font-medium text-slate-200">
-            <span>compaction</span>
-            <select bind:value={routingForm.compaction} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
-              <option value="">Use provider default</option>
-              {#each modelOptions() as option}
-                <option value={option.value}>{option.label}</option>
-              {/each}
-            </select>
-            <span class="block text-xs text-slate-400">Context compaction summaries.</span>
-          </label>
-          <label class="space-y-2 text-sm font-medium text-slate-200">
-            <span>evaluator</span>
-            <select bind:value={routingForm.evaluator} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
-              <option value="">Use provider default</option>
-              {#each modelOptions() as option}
-                <option value={option.value}>{option.label}</option>
-              {/each}
-            </select>
-            <span class="block text-xs text-slate-400">Workflow step evaluation. Falls back to default if not set.</span>
-          </label>
-          <label class="space-y-2 text-sm font-medium text-slate-200">
-            <span>simple_inline</span>
-            <select bind:value={routingForm.simple_inline} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
-              <option value="">Use provider default</option>
-              {#each modelOptions() as option}
-                <option value={option.value}>{option.label}</option>
-              {/each}
-            </select>
-            <span class="block text-xs text-slate-400">Short inline responses / fast model.</span>
-          </label>
-          <label class="space-y-2 text-sm font-medium text-slate-200">
-            <span>speech_to_text</span>
-            <select bind:value={routingForm.speech_to_text} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
-              <option value="">Use provider default</option>
-              {#each modelOptions() as option}
-                <option value={option.value}>{option.label}</option>
-              {/each}
-            </select>
-            <span class="block text-xs text-slate-400">Voice-note transcription. Use models like gpt-4o-transcribe, gpt-4o-mini-transcribe, or whisper.</span>
-          </label>
-          <label class="space-y-2 text-sm font-medium text-slate-200">
-            <span>image_generation</span>
-            <select bind:value={routingForm.image_generation} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
-              <option value="">Use provider default</option>
-              {#each modelOptions() as option}
-                <option value={option.value}>{option.label}</option>
-              {/each}
-            </select>
-            <span class="block text-xs text-slate-400">Image-capable model for avatars and tools. Must support image generation.</span>
-          </label>
+          {#each ROUTING_METADATA as route}
+            <div class="space-y-3 rounded-2xl border border-slate-800 bg-slate-950/50 p-4 text-sm font-medium text-slate-200">
+              <div class="space-y-2">
+                <span>{route.label}</span>
+                <select bind:value={routingForm[route.key].model} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" onchange={() => syncRouteThinkingEffort(route.key)}>
+                  <option value="">Use provider default</option>
+                  {#each modelOptions() as option}
+                    <option value={option.value}>{option.label}</option>
+                  {/each}
+                </select>
+              </div>
+              {#if route.supportsThinking}
+                <div class="space-y-2">
+                  <span>Thinking effort</span>
+                  <select bind:value={routingForm[route.key].reasoningEffort} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={routeThinkingEffortOptions(route.key).length === 0}>
+                    <option value="">Default</option>
+                    {#each routeThinkingEffortOptions(route.key) as value}
+                      <option value={value}>{thinkingEffortLabel(value)}</option>
+                    {/each}
+                  </select>
+                  {#if routeThinkingEffortOptions(route.key).length === 0}
+                    <span class="block text-xs text-slate-500">
+                      {route.key === 'classifier' || route.key === 'compaction' || route.key === 'evaluator'
+                        ? 'Defaults to Low unless you choose an explicit route model.'
+                        : 'Select a known route model to choose a Thinking effort.'}
+                    </span>
+                  {/if}
+                </div>
+              {/if}
+              <span class="block text-xs text-slate-400">{route.description}</span>
+            </div>
+          {/each}
         </div>
 
         {#if routingWarnings().length > 0}
@@ -1655,10 +1707,6 @@
           </div>
         {/if}
 
-        <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
-          <span>Additional task routes (JSON)</span>
-          <textarea bind:value={routingForm.extraJson} class="min-h-[180px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 font-mono text-sm text-slate-100"></textarea>
-        </label>
         <div class="mt-5 flex justify-end">
           <Button onclick={saveRouting} disabled={!isAdmin || busy}>Save routing</Button>
         </div>

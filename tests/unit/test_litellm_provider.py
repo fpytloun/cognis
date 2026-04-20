@@ -48,6 +48,145 @@ async def test_litellm_provider_uses_model_routing_entry(tmp_path: object) -> No
 
 
 @pytest.mark.asyncio
+async def test_litellm_provider_applies_route_reasoning_effort_when_not_explicit(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="openai",
+                display_name="OpenAI",
+                location="controller",
+                backend="litellm",
+                config={
+                    "preset": "openai",
+                    "default_model": "gpt-5.4",
+                    "models": [
+                        {
+                            "model_id": "gpt-5.4",
+                            "supports_reasoning": True,
+                            "reasoning_efforts": [
+                                "default",
+                                "none",
+                                "low",
+                                "medium",
+                                "high",
+                                "xhigh",
+                            ],
+                        }
+                    ],
+                },
+                status="active",
+            )
+        )
+        session.add(
+            ModelRouting(
+                task_type="classifier",
+                provider_id="openai",
+                model="gpt-5.4",
+                config={"reasoning_effort": "xhigh"},
+            )
+        )
+        await session.commit()
+
+    provider = LiteLLMProvider(session_factory)
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(provider, "_should_route_to_executor", lambda *_args: True)
+
+    async def _fake_executor_generate(
+        model: str,
+        messages: list[dict[str, object]],
+        provider_row: LLMProvider,
+        *,
+        request_kwargs: dict[str, object],
+    ) -> dict[str, object]:
+        del model, messages, provider_row
+        captured.update(request_kwargs)
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+    monkeypatch.setattr(provider, "_executor_generate", _fake_executor_generate)
+
+    response = await provider.generate([{"role": "user", "content": "hi"}], task_type="classifier")
+
+    assert response["choices"][0]["message"]["content"] == "ok"
+    assert captured["reasoning_effort"] == "xhigh"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_litellm_provider_explicit_reasoning_effort_overrides_route_default(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="openai",
+                display_name="OpenAI",
+                location="controller",
+                backend="litellm",
+                config={
+                    "preset": "openai",
+                    "default_model": "gpt-5.4",
+                    "models": [
+                        {
+                            "model_id": "gpt-5.4",
+                            "supports_reasoning": True,
+                            "reasoning_efforts": [
+                                "default",
+                                "none",
+                                "low",
+                                "medium",
+                                "high",
+                                "xhigh",
+                            ],
+                        }
+                    ],
+                },
+                status="active",
+            )
+        )
+        session.add(
+            ModelRouting(
+                task_type="classifier",
+                provider_id="openai",
+                model="gpt-5.4",
+                config={"reasoning_effort": "xhigh"},
+            )
+        )
+        await session.commit()
+
+    provider = LiteLLMProvider(session_factory)
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(provider, "_should_route_to_executor", lambda *_args: True)
+
+    async def _fake_executor_generate(
+        model: str,
+        messages: list[dict[str, object]],
+        provider_row: LLMProvider,
+        *,
+        request_kwargs: dict[str, object],
+    ) -> dict[str, object]:
+        del model, messages, provider_row
+        captured.update(request_kwargs)
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+    monkeypatch.setattr(provider, "_executor_generate", _fake_executor_generate)
+
+    await provider.generate(
+        [{"role": "user", "content": "hi"}],
+        task_type="classifier",
+        reasoning_effort="medium",
+    )
+
+    assert captured["reasoning_effort"] == "medium"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_litellm_provider_falls_back_to_default_provider_model(tmp_path: object) -> None:
     engine, session_factory = await _session_factory(tmp_path)
     async with session_factory() as session:

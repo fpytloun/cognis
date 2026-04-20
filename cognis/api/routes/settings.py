@@ -26,6 +26,7 @@ from cognis.api.models import (
 )
 from cognis.api.serializers import llm_provider_to_response, setting_to_response
 from cognis.core.executor_policy import load_executor_policy
+from cognis.models.config import normalize_reasoning_level
 from cognis.settings_schema import setting_category, validate_setting_value
 from cognis.store.queries import (
     create_llm_provider,
@@ -43,6 +44,36 @@ from cognis.store.queries import (
 
 router = APIRouter(tags=["settings"])
 PROVIDER_TEST_COOLDOWN_SECONDS = 10.0
+_ROUTING_TASK_TYPES: tuple[str, ...] = (
+    "default",
+    "classifier",
+    "compaction",
+    "evaluator",
+    "speech_to_text",
+    "image_generation",
+)
+_TEXT_ROUTING_TASK_TYPES = frozenset({"default", "classifier", "compaction", "evaluator"})
+_ROUTING_REASONING_DEFAULTS: dict[str, str] = {
+    "classifier": "low",
+    "compaction": "low",
+    "evaluator": "low",
+}
+
+
+def _routing_entry_from_row(task_type: str, row: Any | None) -> dict[str, str | None]:
+    if row is None:
+        return {
+            "model": None,
+            "reasoning_effort": _ROUTING_REASONING_DEFAULTS.get(task_type),
+        }
+    reasoning_effort: str | None = None
+    if task_type in _TEXT_ROUTING_TASK_TYPES and isinstance(getattr(row, "config", None), dict):
+        reasoning_effort = normalize_reasoning_level(row.config.get("reasoning_effort"))
+        if reasoning_effort == "default":
+            reasoning_effort = None
+    if reasoning_effort is None:
+        reasoning_effort = _ROUTING_REASONING_DEFAULTS.get(task_type)
+    return {"model": getattr(row, "model", None), "reasoning_effort": reasoning_effort}
 
 
 def _apply_last_test_metadata(
@@ -391,16 +422,18 @@ async def model_routing_get(request: Request) -> ModelRoutingResponse:
     require_current_user(request)
     async with request.app.state.session_factory() as session:
         rows = await list_model_routing(session)
-    items = {row.task_type: row.model for row in rows}
+    route_by_task = {row.task_type: row for row in rows}
     return ModelRoutingResponse(
-        default=items.get("default"),
-        classifier=items.get("classifier"),
-        compaction=items.get("compaction"),
-        evaluator=items.get("evaluator"),
-        simple_inline=items.get("simple_inline"),
-        speech_to_text=items.get("speech_to_text"),
-        image_generation=items.get("image_generation"),
-        items=items,
+        default=_routing_entry_from_row("default", route_by_task.get("default")),
+        classifier=_routing_entry_from_row("classifier", route_by_task.get("classifier")),
+        compaction=_routing_entry_from_row("compaction", route_by_task.get("compaction")),
+        evaluator=_routing_entry_from_row("evaluator", route_by_task.get("evaluator")),
+        speech_to_text=_routing_entry_from_row(
+            "speech_to_text", route_by_task.get("speech_to_text")
+        ),
+        image_generation=_routing_entry_from_row(
+            "image_generation", route_by_task.get("image_generation")
+        ),
     )
 
 
@@ -410,29 +443,67 @@ async def model_routing_put(
     payload: ModelRoutingUpdateRequest,
 ) -> ModelRoutingResponse:
     require_admin(request)
-    updates = {
-        "default": payload.default,
-        "classifier": payload.classifier,
-        "compaction": payload.compaction,
-        "evaluator": payload.evaluator,
-        "simple_inline": payload.simple_inline,
-        "speech_to_text": payload.speech_to_text,
-        "image_generation": payload.image_generation,
-        **payload.items,
-    }
+    updates = {task_type: getattr(payload, task_type) for task_type in _ROUTING_TASK_TYPES}
     llm = request.app.state.providers.llm
+    prepared_updates: dict[str, tuple[str | None, str | None, dict[str, str] | None]] = {}
+    for task_type, entry in updates.items():
+        if entry.model is None or not entry.model.strip():
+            if entry.reasoning_effort not in {None, "", "default"}:
+                raise api_exception(
+                    422,
+                    "validation_error",
+                    f"{task_type} reasoning_effort requires an explicit model",
+                )
+            prepared_updates[task_type] = (None, None, None)
+            continue
+
+        normalized_model = entry.model.strip()
+        resolved_provider_id = await llm.find_provider_for_model(normalized_model)
+        config: dict[str, str] | None = None
+        if isinstance(entry.reasoning_effort, str) and entry.reasoning_effort.strip():
+            normalized_effort = normalize_reasoning_level(entry.reasoning_effort)
+            if normalized_effort is None:
+                raise api_exception(
+                    422,
+                    "validation_error",
+                    f"{task_type} reasoning_effort {entry.reasoning_effort!r} is invalid",
+                )
+        else:
+            normalized_effort = None
+        if normalized_effort == "default":
+            normalized_effort = None
+        if normalized_effort is not None:
+            if task_type not in _TEXT_ROUTING_TASK_TYPES:
+                raise api_exception(
+                    422,
+                    "validation_error",
+                    f"{task_type} does not support reasoning_effort",
+                )
+            model_info = await llm.get_model_info(normalized_model, provider_id=resolved_provider_id)
+            if normalized_effort not in model_info.reasoning_efforts:
+                raise api_exception(
+                    422,
+                    "validation_error",
+                    f"{task_type} reasoning_effort {normalized_effort!r} is not supported by model {normalized_model!r}",
+                )
+            config = {"reasoning_effort": normalized_effort}
+        prepared_updates[task_type] = (normalized_model, resolved_provider_id, config)
+
     async with request.app.state.session_factory() as session:
-        for task_type, model in updates.items():
-            if model is None:
+        existing_rows = await list_model_routing(session)
+        for row in existing_rows:
+            if row.task_type not in _ROUTING_TASK_TYPES:
+                await delete_model_routing(session, row.task_type)
+        for task_type, (normalized_model, resolved_provider_id, config) in prepared_updates.items():
+            if normalized_model is None:
                 await delete_model_routing(session, task_type)
                 continue
-            # Auto-resolve provider_id from the model when possible
-            resolved_provider_id = await llm.find_provider_for_model(model)
             await upsert_model_routing(
                 session,
                 task_type=task_type,
                 provider_id=resolved_provider_id,
-                model=model,
+                model=normalized_model,
+                config=config,
             )
         await session.commit()
     return await model_routing_get(request)

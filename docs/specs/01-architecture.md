@@ -264,9 +264,12 @@ environments.
 
 ```yaml
 model_routing:
-  classifier: "gpt-4.1-nano"        # Decision Engine (fast, cheap)
-  compaction: "gpt-4.1-mini"        # Context compaction
-  simple_inline: null                # Use agent's default
+  classifier:
+    model: "gpt-4.1-nano"           # Decision Engine (fast, cheap)
+    reasoning_effort: "low"
+  compaction:
+    model: "gpt-4.1-mini"           # Context compaction
+    reasoning_effort: "low"
 ```
 
 Internal system tasks (compaction, classification) can use any configured

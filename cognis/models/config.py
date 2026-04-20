@@ -104,11 +104,12 @@ DEFAULT_MODEL_INFO = ModelInfo(
 class ModelRoutingPolicy(BaseModel):
     """Which models for which task types."""
 
-    default: str | None = None
-    classifier: str | None = None
-    compaction: str | None = None
-    simple_inline: str | None = None
-    image_generation: str | None = None
+    default: dict[str, str | None] = Field(default_factory=dict)
+    classifier: dict[str, str | None] = Field(default_factory=dict)
+    compaction: dict[str, str | None] = Field(default_factory=dict)
+    evaluator: dict[str, str | None] = Field(default_factory=dict)
+    speech_to_text: dict[str, str | None] = Field(default_factory=dict)
+    image_generation: dict[str, str | None] = Field(default_factory=dict)
 
 
 class ProviderHealth(BaseModel):

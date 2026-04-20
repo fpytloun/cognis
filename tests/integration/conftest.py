@@ -330,7 +330,7 @@ def integration_stack(
     routing_response = client.put(
         "/api/v1/model-routing",
         headers=auth_headers,
-        json={"default": llm_model},
+        json={"default": {"model": llm_model, "reasoning_effort": None}},
     )
     assert routing_response.status_code == 200, (
         f"Model routing update failed: {routing_response.text}"
@@ -542,7 +542,7 @@ def live_stack(
     routing_response = http_client.put(
         f"{cognis_url}/api/v1/model-routing",
         headers=auth_headers,
-        json={"default": llm_model},
+        json={"default": {"model": llm_model, "reasoning_effort": None}},
     )
     assert routing_response.status_code == 200, (
         f"Model routing update failed: {routing_response.text}"

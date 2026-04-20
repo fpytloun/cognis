@@ -92,9 +92,11 @@ Use model routing to choose which provider/model should handle different kinds o
 - default chat
 - lightweight classification
 - context compaction
-- simple inline turns
+- workflow evaluation
+- speech to text
+- image generation
 
-Routing lets you use a cheaper or faster model for simple tasks and keep a stronger model for heavier work.
+Routing lets you use a cheaper or faster model for simple tasks and keep a stronger model for heavier work. Text routes can also define a default Thinking effort for the selected model.
 
 ## Credentials and secrets
 

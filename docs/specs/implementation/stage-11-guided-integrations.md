@@ -99,7 +99,6 @@ Make model routing understandable and easy to configure.
   - `default` — main chat and task execution
   - `classifier` — decision engine (fast model recommended)
   - `compaction` — context compaction summaries
-  - `simple_inline` — short inline responses (fast model recommended)
 - **Validation**: warn if a routing slot references a model not found in
   any configured provider.
 

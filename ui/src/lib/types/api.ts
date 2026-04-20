@@ -934,15 +934,18 @@ export interface LLMProvider {
   last_test: ProviderTestResult | null;
 }
 
+export interface ModelRoutingEntry {
+  model: string | null;
+  reasoning_effort: string | null;
+}
+
 export interface ModelRouting {
-  default: string | null;
-  classifier: string | null;
-  compaction: string | null;
-  evaluator: string | null;
-  simple_inline: string | null;
-  speech_to_text: string | null;
-  image_generation: string | null;
-  items: Record<string, string>;
+  default: ModelRoutingEntry;
+  classifier: ModelRoutingEntry;
+  compaction: ModelRoutingEntry;
+  evaluator: ModelRoutingEntry;
+  speech_to_text: ModelRoutingEntry;
+  image_generation: ModelRoutingEntry;
 }
 
 export interface SecretMetadata {

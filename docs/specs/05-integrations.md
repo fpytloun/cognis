@@ -910,12 +910,19 @@ class LiteLLMProvider:
 System-wide dynamic model selection for different task types:
 
 ```python
+class ModelRoutingEntry(BaseModel):
+    model: str | None = None
+    reasoning_effort: str | None = None
+
+
 class ModelRoutingPolicy(BaseModel):
     """Which models for which task types."""
-    default: str | None = None       # General agent work
-    classifier: str | None = None    # Decision Engine (fast, cheap)
-    compaction: str | None = None    # Context compaction
-    simple_inline: str | None = None # Short inline responses
+    default: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
+    classifier: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
+    compaction: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
+    evaluator: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
+    speech_to_text: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
+    image_generation: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
 ```
 
 Agents can override this per-agent in their `AgentLLMConfig.model_routing`.
@@ -1073,9 +1080,12 @@ llm_providers:
   # Cognis still orchestrates workflows, notifications, Intaris, and Mnemory.
 
 model_routing:
-  classifier: "gpt-4.1-nano"
-  compaction: "gpt-4.1-mini"
-  simple_inline: null                  # Use agent's default
+  classifier:
+    model: "gpt-4.1-nano"
+    reasoning_effort: "low"
+  compaction:
+    model: "gpt-4.1-mini"
+    reasoning_effort: "low"
 ```
 
 ## Secrets Provider

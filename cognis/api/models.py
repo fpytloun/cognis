@@ -384,26 +384,27 @@ class LLMProviderResponse(BaseModel):
     last_test: ProviderTestResultResponse | None = None
 
 
+class ModelRoutingEntry(BaseModel):
+    model: str | None = None
+    reasoning_effort: str | None = None
+
+
 class ModelRoutingResponse(BaseModel):
-    default: str | None = None
-    classifier: str | None = None
-    compaction: str | None = None
-    evaluator: str | None = None
-    simple_inline: str | None = None
-    speech_to_text: str | None = None
-    image_generation: str | None = None
-    items: dict[str, str] = Field(default_factory=dict)
+    default: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
+    classifier: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
+    compaction: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
+    evaluator: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
+    speech_to_text: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
+    image_generation: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
 
 
 class ModelRoutingUpdateRequest(BaseModel):
-    default: str | None = None
-    classifier: str | None = None
-    compaction: str | None = None
-    evaluator: str | None = None
-    simple_inline: str | None = None
-    speech_to_text: str | None = None
-    image_generation: str | None = None
-    items: dict[str, str] = Field(default_factory=dict)
+    default: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
+    classifier: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
+    compaction: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
+    evaluator: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
+    speech_to_text: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
+    image_generation: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
 
 
 class EnrichModelsRequest(BaseModel):

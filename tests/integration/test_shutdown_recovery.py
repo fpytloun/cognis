@@ -206,7 +206,7 @@ def test_stale_session_recovery_on_restart(
         http.put(
             f"{cognis_url}/api/v1/model-routing",
             headers=headers,
-            json={"default": llm_model},
+            json={"default": {"model": llm_model, "reasoning_effort": None}},
         )
 
         # Lower stale threshold so recovery triggers faster

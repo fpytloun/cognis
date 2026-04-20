@@ -440,7 +440,6 @@ class FollowUpPolicy:
                         prompt,
                         task_type="classifier",
                         temperature=0,
-                        reasoning_effort="low",
                         **generate_kwargs,
                     ),
                     timeout=self._classifier_timeout_seconds,

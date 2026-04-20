@@ -126,7 +126,6 @@ class CompactionStrategy:
             response = await self.llm.generate(
                 prompt_messages,
                 task_type="compaction",
-                reasoning_effort="low",
             )
             summary = extract_text_from_response(response).strip()
             if not summary:

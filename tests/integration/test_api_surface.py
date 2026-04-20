@@ -132,7 +132,7 @@ def test_model_routing_returns_seeded_default(
     assert response.status_code == 200
     data = response.json()
     # The seeded default model should be present
-    assert data.get("default") is not None or len(data.get("items", {})) > 0
+    assert data.get("default", {}).get("model") is not None
 
 
 @pytest.mark.integration
