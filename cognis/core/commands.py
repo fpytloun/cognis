@@ -21,7 +21,11 @@ from cognis.core.notifications import NotificationType
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.session import ConversationModel, SessionModel
-from cognis.providers.llm.reasoning import normalize_reasoning_effort
+from cognis.providers.llm.reasoning import (
+    normalize_reasoning_effort,
+    reasoning_efforts_for_model,
+    remap_reasoning_effort_to_available,
+)
 
 logger = get_logger(__name__)
 
@@ -364,7 +368,7 @@ class CommandDispatcher:
         lines.append(f"Session lifecycle: {current_session.status}")
         self._append_session_metadata(lines, current_session)
 
-        # Context usage + model + reasoning effort
+        # Context usage + model + thinking effort
         usage = self._session_cache.get_context_usage(current_session.session_id)
         if usage:
             lines.append(f"Model: {usage['model']}")
@@ -374,7 +378,7 @@ class CommandDispatcher:
             self._append_context_usage_lines(lines, usage)
         reasoning = self._session_cache.get_reasoning_effort_override(current_session.session_id)
         if reasoning:
-            lines.append(f"Reasoning effort: {reasoning}")
+            lines.append(f"Thinking effort: {reasoning}")
 
         # Intaris session stats
         intaris_sid = current_session.intaris_session_id or current_session.session_id
@@ -600,13 +604,13 @@ class CommandDispatcher:
         if not arg:
             lines = []
             if current_effort:
-                lines.append(f"Current reasoning effort: {current_effort}")
+                lines.append(f"Current thinking effort: {current_effort}")
             else:
-                lines.append("Reasoning effort: default (not set)")
+                lines.append("Thinking effort: default (not set)")
             if available:
                 lines.append(f"Available levels: {', '.join(available)}")
             else:
-                lines.append("No reasoning effort levels available for current model.")
+                lines.append("No thinking effort levels available for current model.")
             lines.append("Usage: /thinking <level>  (use 'off' to reset to default)")
             return CommandResult(type="system_message", text="\n".join(lines))
 
@@ -617,7 +621,7 @@ class CommandDispatcher:
                 text=(
                     f"Unsupported level: {arg}\nAvailable: {', '.join(available)}"
                     if available
-                    else "Unsupported reasoning level."
+                    else "Unsupported thinking effort."
                 ),
             )
 
@@ -626,20 +630,36 @@ class CommandDispatcher:
             self._session_cache.set_reasoning_effort_override(session_id, None)
             return CommandResult(
                 type="system_message",
-                text="Reasoning effort reset to default.",
+                text="Thinking effort reset to default.",
+            )
+
+        resolved_arg = (
+            remap_reasoning_effort_to_available(normalized_arg, available_efforts=available)
+            if available
+            else normalized_arg
+        )
+        if resolved_arg is None:
+            return CommandResult(
+                type="system_message",
+                text=(
+                    f"Unsupported level: {normalized_arg}\nAvailable: {', '.join(available)}"
+                    if available
+                    else "Unsupported thinking effort."
+                ),
             )
 
         # Validate
-        if available and normalized_arg not in available:
+        if available and resolved_arg not in available:
             return CommandResult(
                 type="system_message",
                 text=f"Unsupported level: {normalized_arg}\nAvailable: {', '.join(available)}",
             )
 
-        self._session_cache.set_reasoning_effort_override(session_id, normalized_arg)
+        self._session_cache.set_reasoning_effort_override(session_id, resolved_arg)
+        mapped_note = f" (mapped from {normalized_arg})" if resolved_arg != normalized_arg else ""
         return CommandResult(
             type="system_message",
-            text=f"Reasoning effort set to: {normalized_arg}\nTakes effect on next message.",
+            text=f"Thinking effort set to: {resolved_arg}{mapped_note}\nTakes effect on next message.",
         )
 
     async def _handle_lsp(self, *, user_email: str | None = None) -> CommandResult:
@@ -988,15 +1008,6 @@ Available commands:
   /cancel [note]     Cancel paused workflow gate, or stop active work"""
 
 
-_DEFAULT_REASONING_EFFORTS: dict[str, list[str]] = {
-    "anthropic": ["low", "medium", "high"],
-    "openai": ["low", "medium", "high"],
-}
-
-
 def _infer_reasoning_efforts(model: str) -> list[str]:
     """Best-effort reasoning effort levels for a model."""
-    m = model.lower()
-    if any(p in m for p in ("claude", "anthropic", "opus", "gpt-5", "o1", "o3", "o4", "gemini")):
-        return ["default", "none", "minimal", "low", "medium", "high", "max"]
-    return []
+    return reasoning_efforts_for_model(model, supports_reasoning=True)

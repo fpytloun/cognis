@@ -10,12 +10,32 @@ from pydantic import BaseModel, Field
 NORMALIZED_REASONING_LEVELS: tuple[str, ...] = (
     "default",
     "none",
-    "minimal",
     "low",
     "medium",
     "high",
+    "xhigh",
     "max",
 )
+
+LEGACY_REASONING_LEVEL_ALIASES: dict[str, str] = {
+    "minimal": "low",
+}
+
+
+def normalize_reasoning_level(value: str | None) -> str | None:
+    """Return the canonical Cognis thinking-effort level or ``None``."""
+
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if not normalized:
+        return None
+    if normalized in {"off", "reset"}:
+        return "default"
+    normalized = LEGACY_REASONING_LEVEL_ALIASES.get(normalized, normalized)
+    if normalized in NORMALIZED_REASONING_LEVELS:
+        return normalized
+    return None
 
 
 class UserRole(StrEnum):

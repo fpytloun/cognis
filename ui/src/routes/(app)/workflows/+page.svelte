@@ -23,6 +23,7 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
     formStateToSystemWorkflowOverridePayload,
     formStateToWorkflowPayload,
     importWorkflowYaml,
+    workflowThinkingEfforts,
     validateWorkflowForm,
     workflowToFormState,
     type WorkflowFormState
@@ -562,15 +563,12 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
                     </select>
                   </label>
                   <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
-                    <span>Reasoning effort</span>
+                    <span>Thinking effort</span>
                     <select bind:value={step.reasoningEffort} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!canEditSystemWorkflowField('stepReasoning')}>
                       <option value="">Default</option>
-                      <option value="none">None</option>
-                      <option value="minimal">Minimal</option>
-                      <option value="low">Low</option>
-                      <option value="medium">Medium</option>
-                      <option value="high">High</option>
-                      <option value="max">Max</option>
+                      {#each workflowThinkingEfforts() as value}
+                        <option value={value}>{value === 'xhigh' ? 'XHigh' : value.charAt(0).toUpperCase() + value.slice(1)}</option>
+                      {/each}
                     </select>
                   </label>
                 {/if}

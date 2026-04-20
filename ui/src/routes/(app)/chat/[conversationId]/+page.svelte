@@ -2435,7 +2435,7 @@ import X from 'lucide-svelte/icons/x';
 
                 <!-- Context usage badge (right-aligned) -->
                 {#if contextUsage}
-                  <span class="ml-auto flex items-center gap-1.5 text-[10px] font-medium {contextUsage.percentage > 85 ? 'text-rose-400' : contextUsage.percentage > 60 ? 'text-amber-400' : 'text-slate-400'}" title="Context: {contextUsage.prompt_tokens.toLocaleString()} / {contextUsage.max_context_tokens.toLocaleString()} tokens ({contextUsage.model}){contextUsage.reasoning_effort ? ` | reasoning: ${contextUsage.reasoning_effort}` : ''}">
+                  <span class="ml-auto flex items-center gap-1.5 text-[10px] font-medium {contextUsage.percentage > 85 ? 'text-rose-400' : contextUsage.percentage > 60 ? 'text-amber-400' : 'text-slate-400'}" title="Context: {contextUsage.prompt_tokens.toLocaleString()} / {contextUsage.max_context_tokens.toLocaleString()} tokens ({contextUsage.model}){contextUsage.reasoning_effort ? ` | thinking: ${contextUsage.reasoning_effort}` : ''}">
                     <span class="font-mono">{contextUsage.prompt_tokens.toLocaleString()}</span>
                     <span class="opacity-50">({contextUsage.percentage}%)</span>
                     {#if contextUsage.reasoning_effort}

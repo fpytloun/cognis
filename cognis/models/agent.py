@@ -9,7 +9,7 @@ from typing import Any
 from pydantic import BaseModel, Field, field_validator
 
 from cognis.logging import get_logger
-from cognis.models.config import NORMALIZED_REASONING_LEVELS
+from cognis.models.config import NORMALIZED_REASONING_LEVELS, normalize_reasoning_level
 from cognis.models.tool import Permission
 
 logger = get_logger(__name__)
@@ -129,10 +129,10 @@ class AgentLLMConfig(BaseModel):
             return None
         if not isinstance(value, str):
             raise ValueError("reasoning_effort must be a string or null")
-        normalized = value.strip().lower()
-        if not normalized:
-            return None
-        if normalized not in NORMALIZED_REASONING_LEVELS:
+        normalized = normalize_reasoning_level(value)
+        if normalized is None:
+            if not value.strip():
+                return None
             allowed = ", ".join(NORMALIZED_REASONING_LEVELS)
             raise ValueError(f"reasoning_effort must be one of {allowed}; got {value!r}")
         return normalized

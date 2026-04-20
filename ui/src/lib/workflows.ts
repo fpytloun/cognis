@@ -1,5 +1,6 @@
 import YAML from 'yaml';
 
+import { GENERIC_THINKING_EFFORTS } from '$lib/thinking';
 import type { Workflow } from '$lib/types/api';
 import { isRecord } from '$lib/utils';
 
@@ -101,6 +102,10 @@ export function createEmptyWorkflowForm(): WorkflowFormState {
     defaultAllowSilentCompletion: false,
     steps: [createEmptyStep()]
   };
+}
+
+export function workflowThinkingEfforts(): string[] {
+  return [...GENERIC_THINKING_EFFORTS].filter((value) => value !== 'default');
 }
 
 function joinOptions(options: Array<Record<string, unknown>>): string {

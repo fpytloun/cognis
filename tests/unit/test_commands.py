@@ -59,12 +59,19 @@ class _TurnScheduler:
 class _SessionCache:
     def __init__(self, usage: dict[str, object] | None = None) -> None:
         self.usage = usage
+        self.reasoning_effort_override: str | None = None
 
     def get_context_usage(self, _: str) -> dict[str, object] | None:
         return self.usage
 
-    def get_reasoning_effort_override(self, _: str) -> None:
+    def get_model_override(self, _: str) -> None:
         return None
+
+    def get_reasoning_effort_override(self, _: str) -> str | None:
+        return self.reasoning_effort_override
+
+    def set_reasoning_effort_override(self, _: str, effort: str | None) -> None:
+        self.reasoning_effort_override = effort
 
 
 class _GuardrailsProvider:
@@ -728,6 +735,75 @@ async def test_context_reports_effective_prompt_budget() -> None:
     assert "Last LLM call tokens: 12,345 prompt, 678 completion, 13,023 total" in result.text
     assert "Last LLM call cache read tokens: 7,277" in result.text
     assert "Last LLM call cache write tokens: 248" in result.text
+
+
+@pytest.mark.asyncio
+async def test_thinking_command_uses_model_specific_levels() -> None:
+    cache = _SessionCache({"model": "gpt-5.4"})
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=None,
+        session_cache=cache,
+        compaction_strategy=None,
+        providers=SimpleNamespace(
+            llm=SimpleNamespace(
+                get_model_info=AsyncMock(
+                    return_value=SimpleNamespace(
+                        reasoning_efforts=["default", "none", "low", "medium", "high", "xhigh"]
+                    )
+                )
+            )
+        ),
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+    )
+
+    result = await dispatcher.dispatch(
+        "/thinking",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert result is not None
+    assert result.text is not None
+    assert "Thinking effort: default (not set)" in result.text
+    assert "Available levels: default, none, low, medium, high, xhigh" in result.text
+
+
+@pytest.mark.asyncio
+async def test_thinking_command_remaps_generic_level_to_current_model() -> None:
+    cache = _SessionCache({"model": "gpt-5.4"})
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=None,
+        session_cache=cache,
+        compaction_strategy=None,
+        providers=SimpleNamespace(
+            llm=SimpleNamespace(
+                get_model_info=AsyncMock(
+                    return_value=SimpleNamespace(
+                        reasoning_efforts=["default", "none", "low", "medium", "high", "xhigh"]
+                    )
+                )
+            )
+        ),
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+    )
+
+    result = await dispatcher.dispatch(
+        "/thinking max",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert result is not None
+    assert result.text == "Thinking effort set to: xhigh (mapped from max)\nTakes effect on next message."
+    assert cache.reasoning_effort_override == "xhigh"
 
 
 @pytest.mark.asyncio

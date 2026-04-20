@@ -180,7 +180,7 @@ class StepEvaluator:
                 ]
                 generate_kwargs = {
                     "temperature": 0,
-                    "reasoning_effort": "minimal",
+                    "reasoning_effort": "low",
                     "response_format": {"type": "json_object"},
                 }
                 response = await self._generate_evaluator_response(messages, generate_kwargs)

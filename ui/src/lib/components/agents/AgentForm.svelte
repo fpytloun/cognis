@@ -10,13 +10,14 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
   import { api } from '$lib/api/client';
   import {
     buildSystemPromptPreview,
+  import { GENERIC_THINKING_EFFORTS, thinkingEffortLabel } from '$lib/thinking';
     defaultSystemPrompt,
     formStateToPayload,
     formStateToSystemOverridePayload,
     slugify,
     type AgentFormState
   } from '$lib/agents';
-  import type { Agent, CredentialMetadata, EffectiveToolItem, ExecutorConfig, IntarisMCPServer, LLMProvider, SecretMetadata, Skill, ToolDefinitionSummary, Workflow } from '$lib/types/api';
+  import type { Agent, CredentialMetadata, EffectiveToolItem, ExecutorConfig, IntarisMCPServer, LLMProvider, ModelEntry, SecretMetadata, Skill, ToolDefinitionSummary, Workflow } from '$lib/types/api';
 
   type AgentToolOption = (ToolDefinitionSummary & { tool_id?: string; permission?: string }) | EffectiveToolItem;
 
@@ -290,6 +291,31 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
 
 <form class="space-y-5" onsubmit={handleSubmit}>
   <div class="grid gap-5 lg:grid-cols-[minmax(0,1fr)_360px]">
+
+  function selectedProviderModelInfo(): ModelEntry | null {
+    if (!form.providerId) {
+      return null;
+    }
+    const provider = providers.find((p: LLMProvider) => p.provider_id === form.providerId);
+    if (!provider) {
+      return null;
+    }
+    const explicitModel = form.model.trim();
+    const defaultModel = typeof provider.config?.default_model === 'string' ? provider.config.default_model : '';
+    const resolvedModel = explicitModel || defaultModel;
+    if (!resolvedModel) {
+      return null;
+    }
+    return provider.models.find((model: ModelEntry) => model.model_id === resolvedModel) ?? null;
+  }
+
+  function availableThinkingEfforts(): string[] {
+    const modelInfo = selectedProviderModelInfo();
+    if (modelInfo) {
+      return modelInfo.reasoning_efforts.length > 0 ? modelInfo.reasoning_efforts : ['default'];
+    }
+    return [...GENERIC_THINKING_EFFORTS];
+  }
     <div class="space-y-5">
       <!-- Identity -->
       <Card class="p-5">
@@ -703,15 +729,12 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
             <Input bind:value={form.maxTokens} type="number" placeholder="default" disabled={!canEditField('llm_config.max_tokens')} />
           </label>
           <label class="space-y-2 text-sm font-medium text-slate-200">
-            <span>Reasoning effort</span>
+            <span>Thinking effort</span>
             <select bind:value={form.reasoningEffort} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!canEditField('llm_config.reasoning_effort')}>
               <option value="">Default</option>
-              <option value="none">None</option>
-              <option value="minimal">Minimal</option>
-              <option value="low">Low</option>
-              <option value="medium">Medium</option>
-              <option value="high">High</option>
-              <option value="max">Max</option>
+              {#each availableThinkingEfforts().filter((value: string) => value !== 'default') as value}
+                <option value={value}>{thinkingEffortLabel(value)}</option>
+              {/each}
             </select>
           </label>
         </div>

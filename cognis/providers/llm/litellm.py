@@ -32,8 +32,7 @@ from cognis.models.config import (
 from cognis.providers.llm.reasoning import (
     PreparedReasoningConfig,
     apply_reasoning_config,
-    auxiliary_reasoning_effort_for_family,
-    detect_reasoning_family,
+    auxiliary_reasoning_effort_for_model,
     reasoning_efforts_for_model,
 )
 from cognis.providers.llm.responses_bridge import (
@@ -770,12 +769,13 @@ class LiteLLMProvider:
                         }
                     },
                 )
-
         merged.update(configured)
         merged["model_id"] = model_id
+        profile_preview = ModelInfo.model_validate(merged)
         merged["reasoning_efforts"] = reasoning_efforts_for_model(
             model_id,
             provider_preset=preset,
+            model_info=profile_preview,
             supports_reasoning=bool(merged.get("supports_reasoning")),
         )
         return ModelInfo.model_validate(merged)
@@ -1321,12 +1321,14 @@ class LiteLLMProvider:
             base_max_tokens, int(request_kwargs.get("max_tokens", 0) or 0)
         )
         if model_info.supports_reasoning:
-            request_kwargs["reasoning_effort"] = auxiliary_reasoning_effort_for_family(
-                detect_reasoning_family(
-                    default_model,
-                    provider_preset=str(config.get("preset", "")).lower(),
-                )
+            auxiliary_effort = auxiliary_reasoning_effort_for_model(
+                default_model,
+                provider_preset=str(config.get("preset", "")).lower(),
+                model_info=model_info,
+                supports_reasoning=model_info.supports_reasoning,
             )
+            if auxiliary_effort is not None:
+                request_kwargs["reasoning_effort"] = auxiliary_effort
         request_kwargs = self._prepare_generation_request_kwargs(
             request_kwargs,
             model_id=default_model,

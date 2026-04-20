@@ -18,7 +18,7 @@ from cognis.core.workflow_management import (
     duplicate_visible_workflow,
     update_user_workflow,
 )
-from cognis.models.config import NORMALIZED_REASONING_LEVELS
+from cognis.models.config import NORMALIZED_REASONING_LEVELS, normalize_reasoning_level
 from cognis.store.queries import (
     delete_system_workflow_override,
     get_system_workflow_override,
@@ -162,8 +162,8 @@ async def _update_system_workflow_route(
         override: dict[str, object] = {}
         reasoning_effort = step_payload.get("reasoning_effort")
         if isinstance(reasoning_effort, str) and reasoning_effort:
-            normalized_effort = reasoning_effort.strip().lower()
-            if normalized_effort and normalized_effort not in NORMALIZED_REASONING_LEVELS:
+            normalized_effort = normalize_reasoning_level(reasoning_effort)
+            if normalized_effort is None:
                 allowed = ", ".join(NORMALIZED_REASONING_LEVELS)
                 raise api_exception(
                     status_code=422,

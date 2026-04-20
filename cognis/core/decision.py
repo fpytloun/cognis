@@ -403,7 +403,7 @@ async def select_workflow(
                     prompt,
                     task_type="classifier",
                     temperature=0,
-                    reasoning_effort="minimal",
+                    reasoning_effort="low",
                     **generate_kwargs,
                 ),
                 timeout=classifier_timeout_seconds,

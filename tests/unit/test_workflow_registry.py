@@ -212,6 +212,12 @@ def test_step_definition_rejects_invalid_reasoning_effort() -> None:
         StepDefinition(name="plan", type="run", reasoning_effort="medimum")
 
 
+def test_step_definition_normalizes_legacy_minimal_reasoning_effort() -> None:
+    step = StepDefinition(name="plan", type="run", reasoning_effort="minimal")
+
+    assert step.reasoning_effort == "low"
+
+
 def test_validate_workflow_rejects_unknown_outcome_route_target() -> None:
     workflow = Workflow(
         workflow_id="test:bad-outcome-route",

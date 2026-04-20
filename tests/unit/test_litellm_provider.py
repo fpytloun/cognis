@@ -6,7 +6,11 @@ import pytest
 
 from cognis.models.config import DEFAULT_MODEL_INFO
 from cognis.providers.llm.litellm import LiteLLMProvider, _normalize_proxy_model_info
-from cognis.providers.llm.reasoning import apply_reasoning_config, reasoning_efforts_for_model
+from cognis.providers.llm.reasoning import (
+    apply_reasoning_config,
+    reasoning_efforts_for_model,
+    remap_reasoning_effort_to_available,
+)
 from cognis.providers.llm.responses_bridge import responses_request_kwargs
 from cognis.store.database import create_engine, create_session_factory
 from cognis.store.models import Base, LLMProvider, ModelRouting
@@ -320,7 +324,7 @@ def test_reasoning_translation_drops_default_for_openai_models() -> None:
     assert "temperature" not in prepared.request_kwargs
 
 
-def test_reasoning_translation_maps_none_to_minimal_for_openai() -> None:
+def test_reasoning_translation_keeps_none_for_gpt5_models() -> None:
     prepared = apply_reasoning_config(
         {"reasoning_effort": "none"},
         model_id="gpt-5.4",
@@ -328,8 +332,8 @@ def test_reasoning_translation_maps_none_to_minimal_for_openai() -> None:
         model_info=DEFAULT_MODEL_INFO.model_copy(update={"supports_reasoning": True}),
     )
 
-    assert prepared.request_kwargs["reasoning_effort"] == "minimal"
-    assert prepared.effective_effort == "minimal"
+    assert prepared.request_kwargs["reasoning_effort"] == "none"
+    assert prepared.effective_effort == "none"
 
 
 def test_reasoning_translation_maps_none_to_google_thinking_budget_zero() -> None:
@@ -375,6 +379,26 @@ def test_reasoning_translation_enforces_anthropic_budget_floor() -> None:
 
     assert prepared.request_kwargs["thinking"] == {"type": "enabled", "budget_tokens": 8192}
     assert prepared.request_kwargs["max_tokens"] == 9216
+
+
+def test_reasoning_translation_uses_output_config_for_claude_47() -> None:
+    prepared = apply_reasoning_config(
+        {"reasoning_effort": "xhigh"},
+        model_id="claude-opus-4-7",
+        provider_preset="anthropic",
+        model_info=DEFAULT_MODEL_INFO.model_copy(
+            update={
+                "supports_reasoning": True,
+                "supports_extended_thinking": True,
+                "display_name": "Claude Opus 4.7",
+            }
+        ),
+    )
+
+    assert prepared.family == "anthropic_adaptive"
+    assert prepared.request_kwargs["thinking"] == {"type": "adaptive"}
+    assert prepared.request_kwargs["output_config"] == {"effort": "xhigh"}
+    assert prepared.effective_effort == "xhigh"
 
 
 def test_reasoning_translation_uses_provider_preset_for_aliased_openai_reasoning_models() -> None:
@@ -440,7 +464,37 @@ def test_reasoning_translation_respects_explicit_false_for_matching_model_ids() 
 def test_reasoning_efforts_for_reasoning_model_return_normalized_levels() -> None:
     assert reasoning_efforts_for_model(
         "gpt-5.4", provider_preset="openai", supports_reasoning=True
-    ) == ["default", "none", "minimal", "low", "medium", "high", "max"]
+    ) == ["default", "none", "low", "medium", "high", "xhigh"]
+
+
+def test_reasoning_efforts_for_claude_46_exclude_xhigh() -> None:
+    assert reasoning_efforts_for_model(
+        "claude-opus-4-6", provider_preset="anthropic", supports_reasoning=True
+    ) == ["default", "none", "low", "medium", "high", "max"]
+
+
+def test_reasoning_efforts_for_claude_47_include_xhigh() -> None:
+    assert reasoning_efforts_for_model(
+        "claude-opus-4-7", provider_preset="anthropic", supports_reasoning=True
+    ) == ["default", "none", "low", "medium", "high", "xhigh", "max"]
+
+
+def test_reasoning_efforts_for_openai_alias_use_display_name_when_available() -> None:
+    assert reasoning_efforts_for_model(
+        "internal-reasoner",
+        provider_preset="openai",
+        model_info=DEFAULT_MODEL_INFO.model_copy(
+            update={"supports_reasoning": True, "display_name": "GPT 5.4 Alias"}
+        ),
+        supports_reasoning=True,
+    ) == ["default", "none", "low", "medium", "high", "xhigh"]
+
+
+def test_remap_reasoning_effort_to_available_prefers_closest_supported_level() -> None:
+    assert remap_reasoning_effort_to_available(
+        "max",
+        available_efforts=["default", "none", "low", "medium", "high", "xhigh"],
+    ) == "xhigh"
 
 
 def test_reasoning_efforts_respect_explicit_false() -> None:
