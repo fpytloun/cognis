@@ -2764,10 +2764,19 @@ import X from 'lucide-svelte/icons/x';
             {/if}
           </div>
         {:else}
-          <!-- Composer container. `--kb-offset` is published by the viewport
-               store using visualViewport; on iOS this pushes the composer
-               above the on-screen keyboard so the input stays visible. -->
-          <div class="shrink-0 space-y-3" style="padding-bottom: var(--kb-offset, 0px);">
+          <!--
+            Composer container. \`--kb-offset\` is published by the
+            viewport store using \`visualViewport\`; on iOS this pushes
+            the composer above the on-screen keyboard so the input
+            stays visible. The wrapper uses the page background colour
+            (\`bg-slate-950\`) so the area filled by the kb-offset
+            padding does not briefly expose the keyboard surface when
+            iOS animates the viewport resize — on focus-out in
+            particular there is a short gap where the visualViewport
+            has not yet grown back, and a transparent wrapper would
+            show the darker keyboard background through the page.
+          -->
+          <div class="shrink-0 space-y-3 bg-slate-950" style="padding-bottom: var(--kb-offset, 0px);">
           <!--
             Compact todo drawer. Single-line header ("Todos · N active
             · X in progress"), and each todo renders as a single line:

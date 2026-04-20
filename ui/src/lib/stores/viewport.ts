@@ -45,12 +45,31 @@ export const keyboardOffset = readable(0, (set) => {
     // can offset themselves without JS.
     document.documentElement.style.setProperty('--kb-offset', `${offset}px`);
   };
+  const reset = () => {
+    set(0);
+    document.documentElement.style.setProperty('--kb-offset', '0px');
+  };
+  // iOS Safari sometimes does not fire `visualViewport.resize` immediately
+  // when the on-screen keyboard dismisses — the viewport stays the
+  // keyboard-shrunk size until the user scrolls. That leaves a dark gap
+  // below the composer equal to the keyboard height. Force a reset when
+  // any text input loses focus so the composer snaps back to the bottom.
+  const handleFocusOut = (event: FocusEvent): void => {
+    const target = event.target;
+    if (!(target instanceof HTMLElement)) return;
+    const tag = target.tagName.toLowerCase();
+    if (tag !== 'input' && tag !== 'textarea' && !target.isContentEditable) return;
+    // Defer past iOS's own viewport animation so our reset wins.
+    window.setTimeout(reset, 50);
+  };
   update();
   vv.addEventListener('resize', update);
   vv.addEventListener('scroll', update);
+  window.addEventListener('focusout', handleFocusOut, true);
   return () => {
     vv.removeEventListener('resize', update);
     vv.removeEventListener('scroll', update);
+    window.removeEventListener('focusout', handleFocusOut, true);
     document.documentElement.style.setProperty('--kb-offset', '0px');
   };
 });
