@@ -78,6 +78,7 @@ class CachedSessionState:
     context_provider_id: str | None = None
     reserve_output_tokens: int = 0
     effective_reserve_output_tokens: int = 0
+    last_llm_usage: dict[str, int] = field(default_factory=dict)
     context_reserve_clamp_warned: bool = False
     # Per-session overrides (ephemeral, set via /model and /thinking commands)
     model_override: str | None = None
@@ -133,6 +134,7 @@ def _serialize_entry(entry: CachedSessionState) -> str:
             "context_provider_id": entry.context_provider_id,
             "reserve_output_tokens": entry.reserve_output_tokens,
             "effective_reserve_output_tokens": entry.effective_reserve_output_tokens,
+            "last_llm_usage": entry.last_llm_usage,
             "context_reserve_clamp_warned": entry.context_reserve_clamp_warned,
             "model_override": entry.model_override,
             "reasoning_effort_override": entry.reasoning_effort_override,
@@ -173,6 +175,11 @@ def _deserialize_entry(raw: str) -> CachedSessionState:
         context_provider_id=data.get("context_provider_id"),
         reserve_output_tokens=data.get("reserve_output_tokens", 0),
         effective_reserve_output_tokens=data.get("effective_reserve_output_tokens", 0),
+        last_llm_usage={
+            str(key): int(value)
+            for key, value in data.get("last_llm_usage", {}).items()
+            if isinstance(key, str) and isinstance(value, int | float)
+        },
         context_reserve_clamp_warned=bool(data.get("context_reserve_clamp_warned", False)),
         model_override=data.get("model_override"),
         reasoning_effort_override=data.get("reasoning_effort_override"),
@@ -512,7 +519,16 @@ class SessionCache:
             ),
             "effective_prompt_budget": effective_prompt_budget,
             "loop_pressure_threshold": int(effective_prompt_budget * 0.95),
+            "last_llm_usage": dict(entry.last_llm_usage),
         }
+
+    def update_last_llm_usage(self, session_id: str, usage: dict[str, int] | None) -> None:
+        """Store provider-reported token usage for the latest LLM call."""
+
+        entry = self._entries.get(session_id)
+        if entry is None:
+            return
+        entry.last_llm_usage = dict(usage or {})
 
     def note_context_reserve_clamp(self, session_id: str) -> bool:
         """Return ``True`` the first time a session clamps output reserve."""

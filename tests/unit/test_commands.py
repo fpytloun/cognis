@@ -689,6 +689,13 @@ async def test_context_reports_effective_prompt_budget() -> None:
                 "effective_reserve_output_tokens": 62_500,
                 "effective_prompt_budget": 187_500,
                 "loop_pressure_threshold": 178_125,
+                "last_llm_usage": {
+                    "prompt_tokens": 12_345,
+                    "completion_tokens": 678,
+                    "total_tokens": 13_023,
+                    "cache_read_input_tokens": 7_277,
+                    "cache_creation_input_tokens": 248,
+                },
             }
         ),
         compaction_strategy=SimpleNamespace(compaction_threshold=0.85),
@@ -718,6 +725,9 @@ async def test_context_reports_effective_prompt_budget() -> None:
     )
     assert "Effective prompt budget: 187,500 tokens" in result.text
     assert "Loop pressure threshold: 178,125 tokens" in result.text
+    assert "Last LLM call tokens: 12,345 prompt, 678 completion, 13,023 total" in result.text
+    assert "Last LLM call cache read tokens: 7,277" in result.text
+    assert "Last LLM call cache write tokens: 248" in result.text
 
 
 @pytest.mark.asyncio

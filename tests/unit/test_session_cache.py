@@ -197,3 +197,44 @@ async def test_session_cache_evicts_oldest_unlocked_entry_when_full() -> None:
 
     assert cache.get_entry("session-1") is None
     assert cache.get_entry("session-2") is not None
+
+
+@pytest.mark.asyncio
+async def test_session_cache_exposes_last_llm_usage_in_context_snapshot() -> None:
+    cache = SessionCache(_Guardrails(), max_entries=10)
+    session = _session()
+    await cache.refresh(session)
+
+    cache.update_context_usage(
+        session,
+        prompt_tokens=2_000,
+        max_context_tokens=8_000,
+        model="gpt-5.4",
+        provider_id="proxy",
+        reserve_output_tokens=1_000,
+        effective_reserve_output_tokens=1_000,
+    )
+    cache.update_last_llm_usage(
+        session.session_id,
+        {
+            "prompt_tokens": 1_500,
+            "completion_tokens": 200,
+            "total_tokens": 1_700,
+            "cached_tokens": 1_024,
+            "cache_read_input_tokens": 900,
+            "cache_creation_input_tokens": 124,
+        },
+    )
+
+    usage = cache.get_context_usage(session.session_id)
+
+    assert usage is not None
+    assert usage["provider_id"] == "proxy"
+    assert usage["last_llm_usage"] == {
+        "prompt_tokens": 1_500,
+        "completion_tokens": 200,
+        "total_tokens": 1_700,
+        "cached_tokens": 1_024,
+        "cache_read_input_tokens": 900,
+        "cache_creation_input_tokens": 124,
+    }

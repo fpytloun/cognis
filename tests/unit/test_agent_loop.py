@@ -208,9 +208,21 @@ def test_stream_accumulator_reset() -> None:
 
 def test_stream_accumulator_collects_usage() -> None:
     acc = StreamAccumulator()
-    acc.feed({"usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}})
+    acc.feed(
+        {
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 20,
+                "total_tokens": 30,
+                "prompt_tokens_details": {"cached_tokens": 7},
+                "completion_tokens_details": {"reasoning_tokens": 2},
+            }
+        }
+    )
     assert acc.usage is not None
     assert acc.usage["total_tokens"] == 30
+    assert acc.usage["cached_tokens"] == 7
+    assert acc.usage["reasoning_tokens"] == 2
 
 
 # ---------------------------------------------------------------------------

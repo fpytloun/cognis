@@ -638,11 +638,7 @@ class StreamAccumulator:
             # Check for usage in final chunk
             usage = chunk.get("usage")
             if usage:
-                self.usage = {
-                    "prompt_tokens": usage.get("prompt_tokens", 0),
-                    "completion_tokens": usage.get("completion_tokens", 0),
-                    "total_tokens": usage.get("total_tokens", 0),
-                }
+                self.usage = _normalize_token_usage(usage)
             return None
 
         delta = choices[0].get("delta", {})
@@ -748,6 +744,59 @@ class StreamAccumulator:
         """Reset for the next LLM turn."""
         self.content_parts.clear()
         self.tool_calls.clear()
+        self.usage = None
+
+
+def _normalize_token_usage(usage: Any) -> dict[str, int]:
+    """Flatten provider usage payloads into integer token counters."""
+
+    if not isinstance(usage, dict):
+        return {}
+
+    def _read_int(*candidates: Any) -> int | None:
+        for candidate in candidates:
+            if isinstance(candidate, int | float):
+                return int(candidate)
+        return None
+
+    prompt_token_details = usage.get("prompt_tokens_details")
+    input_token_details = usage.get("input_tokens_details")
+    completion_token_details = usage.get("completion_tokens_details")
+    output_token_details = usage.get("output_tokens_details")
+
+    normalized: dict[str, int] = {}
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        value = _read_int(usage.get(key))
+        if value is not None:
+            normalized[key] = value
+
+    cached_tokens = _read_int(
+        usage.get("cached_tokens"),
+        prompt_token_details.get("cached_tokens") if isinstance(prompt_token_details, dict) else None,
+        input_token_details.get("cached_tokens") if isinstance(input_token_details, dict) else None,
+    )
+    if cached_tokens is not None:
+        normalized["cached_tokens"] = cached_tokens
+
+    cache_read_tokens = _read_int(usage.get("cache_read_input_tokens"))
+    if cache_read_tokens is not None:
+        normalized["cache_read_input_tokens"] = cache_read_tokens
+
+    cache_creation_tokens = _read_int(usage.get("cache_creation_input_tokens"))
+    if cache_creation_tokens is not None:
+        normalized["cache_creation_input_tokens"] = cache_creation_tokens
+
+    reasoning_tokens = _read_int(
+        usage.get("reasoning_tokens"),
+        completion_token_details.get("reasoning_tokens")
+        if isinstance(completion_token_details, dict)
+        else None,
+        output_token_details.get("reasoning_tokens") if isinstance(output_token_details, dict) else None,
+    )
+    if reasoning_tokens is not None:
+        normalized["reasoning_tokens"] = reasoning_tokens
+
+    return normalized
 
 
 def _try_split_concatenated_json(raw: str) -> list[dict[str, Any]] | None:
@@ -2140,6 +2189,11 @@ class AgentLoop:
 
             finish_reason = accumulator.finish_reason
             saved_partial_tool_calls = None
+            if hasattr(self.session_cache, "update_last_llm_usage"):
+                self.session_cache.update_last_llm_usage(
+                    ctx.session.session_id,
+                    accumulator.usage,
+                )
             content = continued_assistant_content + accumulator.get_content()
             tool_calls = accumulator.get_tool_calls()
             if continuation_reminder_index is not None and continuation_reminder_index < len(

@@ -682,11 +682,25 @@ def _extract_usage(payload: dict[str, Any]) -> dict[str, Any]:
     usage = payload.get("usage")
     if not isinstance(usage, dict):
         return {}
-    return {
+    normalized = dict(usage)
+    normalized.update(
+        {
         "prompt_tokens": usage.get("input_tokens", usage.get("prompt_tokens", 0)),
         "completion_tokens": usage.get("output_tokens", usage.get("completion_tokens", 0)),
         "total_tokens": usage.get("total_tokens", 0),
-    }
+        }
+    )
+    input_details = usage.get("input_tokens_details")
+    if isinstance(input_details, dict) and isinstance(
+        input_details.get("cached_tokens"), int | float
+    ):
+        normalized["cached_tokens"] = int(input_details["cached_tokens"])
+    output_details = usage.get("output_tokens_details")
+    if isinstance(output_details, dict) and isinstance(
+        output_details.get("reasoning_tokens"), int | float
+    ):
+        normalized["reasoning_tokens"] = int(output_details["reasoning_tokens"])
+    return normalized
 
 
 def _normalize_response_format(response_format: Any) -> dict[str, Any] | None:

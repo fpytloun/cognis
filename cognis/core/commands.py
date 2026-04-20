@@ -464,6 +464,44 @@ class CommandDispatcher:
         if isinstance(compaction_threshold, int | float):
             lines.append(f"Compaction threshold: {int(compaction_threshold * 100)}%")
 
+        self._append_last_llm_usage_lines(lines, usage.get("last_llm_usage"))
+
+    def _append_last_llm_usage_lines(
+        self, lines: list[str], usage: dict[str, Any] | None
+    ) -> None:
+        """Append provider-reported last-call token usage when available."""
+
+        if not isinstance(usage, dict) or not usage:
+            return
+
+        prompt_tokens = usage.get("prompt_tokens")
+        completion_tokens = usage.get("completion_tokens")
+        total_tokens = usage.get("total_tokens")
+        if all(isinstance(value, int) for value in (prompt_tokens, completion_tokens, total_tokens)):
+            lines.append(
+                "Last LLM call tokens: "
+                f"{prompt_tokens:,} prompt, {completion_tokens:,} completion, {total_tokens:,} total"
+            )
+
+        cache_lines_added = False
+        cached_tokens = usage.get("cached_tokens")
+        if isinstance(cached_tokens, int):
+            lines.append(f"Last LLM call cached tokens: {cached_tokens:,}")
+            cache_lines_added = True
+
+        cache_read_tokens = usage.get("cache_read_input_tokens")
+        if isinstance(cache_read_tokens, int):
+            lines.append(f"Last LLM call cache read tokens: {cache_read_tokens:,}")
+            cache_lines_added = True
+
+        cache_creation_tokens = usage.get("cache_creation_input_tokens")
+        if isinstance(cache_creation_tokens, int):
+            lines.append(f"Last LLM call cache write tokens: {cache_creation_tokens:,}")
+            cache_lines_added = True
+
+        if not cache_lines_added:
+            lines.append("Last LLM call cache details: not reported by provider")
+
     def _append_session_metadata(
         self,
         lines: list[str],

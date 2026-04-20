@@ -155,12 +155,24 @@ def test_responses_to_chat_response_prefers_input_output_usage_fields() -> None:
             "input_tokens": 7,
             "output_tokens": 8,
             "total_tokens": 15,
+            "input_tokens_details": {"cached_tokens": 5},
+            "output_tokens_details": {"reasoning_tokens": 3},
         },
     }
 
     result = responses_to_chat_response(payload)
 
-    assert result["usage"] == {"prompt_tokens": 7, "completion_tokens": 8, "total_tokens": 15}
+    assert result["usage"] == {
+        "prompt_tokens": 7,
+        "completion_tokens": 8,
+        "total_tokens": 15,
+        "input_tokens": 7,
+        "output_tokens": 8,
+        "input_tokens_details": {"cached_tokens": 5},
+        "output_tokens_details": {"reasoning_tokens": 3},
+        "cached_tokens": 5,
+        "reasoning_tokens": 3,
+    }
 
 
 @pytest.mark.asyncio
