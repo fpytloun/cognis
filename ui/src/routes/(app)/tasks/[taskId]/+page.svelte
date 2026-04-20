@@ -18,6 +18,7 @@ import Target from 'lucide-svelte/icons/target';
 
   import { api, asApiError } from '$lib/api/client';
   import AgentAvatar from '$lib/components/AgentAvatar.svelte';
+  import EscalationPrompt from '$lib/components/EscalationPrompt.svelte';
   import AgentSelect from '$lib/components/AgentSelect.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import SessionLogsDrawer from '$lib/components/tasks/SessionLogsDrawer.svelte';
@@ -30,10 +31,10 @@ import Target from 'lucide-svelte/icons/target';
   import { confirmAction } from '$lib/stores/confirm';
   import { addToast } from '$lib/stores/toasts';
   import { loadTaskPageData, refreshTaskPageData, shouldClearTaskFromError } from '$lib/task-detail';
-  import { renderMarkdown, sanitizeHtml } from '$lib/markdown';
+  import { renderMarkdown } from '$lib/markdown';
   import { formatAbsoluteTime, formatDuration, formatRelativeTime } from '$lib/time';
   import { workflowToFormState } from '$lib/workflows';
-import type { Agent, Conversation, Deliverable, StepRun, Task, TaskDetail, Workflow } from '$lib/types/api';
+import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRun, Task, TaskDetail, Workflow } from '$lib/types/api';
 
   let loading = $state(true);
   let saving = $state(false);
@@ -51,6 +52,8 @@ import type { Agent, Conversation, Deliverable, StepRun, Task, TaskDetail, Workf
   let mobileStepDetailOpen = $state(false);
   let configModalOpen = $state(false);
   let outputModalStepRun = $state<StepRun | null>(null);
+  let taskEscalations = $state<Escalation[]>([]);
+  let taskEscalationBusyCallId = $state<string | null>(null);
   let pollTimer: number | null = null;
   let tickNow = $state(Date.now());
   let durationTimer: ReturnType<typeof setInterval> | null = null;
@@ -202,23 +205,62 @@ import type { Agent, Conversation, Deliverable, StepRun, Task, TaskDetail, Workf
     return stepRun.deliverables[0] ?? null;
   }
 
-  function latestDeliverableContent(stepRun: StepRun): string {
-    return latestDeliverable(stepRun)?.content ?? '';
+  function finalTaskResultTitle(detail: TaskDetail | null): string {
+    const title = detail?.result_data?.final_title;
+    return typeof title === 'string' ? title : '';
   }
 
-  function latestDeliverableHtml(stepRun: StepRun): string {
-    const deliverable = latestDeliverable(stepRun);
-    if (!deliverable?.content) return '';
-    return deliverable.format === 'html'
-      ? sanitizeHtml(deliverable.content)
-      : renderMarkdown(deliverable.content);
-  }
-
-  function finalTaskDeliverableHtml(detail: TaskDetail | null): string {
-    const content = detail?.result_data?.final_content;
+  function finalTaskResultFormat(detail: TaskDetail | null): string {
     const format = detail?.result_data?.final_format;
-    if (typeof content !== 'string' || !content.trim()) return '';
-    return format === 'html' ? sanitizeHtml(content) : renderMarkdown(content);
+    return typeof format === 'string' ? format : '';
+  }
+
+  function hasFinalTaskOutput(detail: TaskDetail | null): boolean {
+    const content = detail?.result_data?.final_content;
+    return typeof content === 'string' && content.trim().length > 0;
+  }
+
+  function taskPauseLabel(pauseType: string | null | undefined): string {
+    if (pauseType === 'escalation') return 'awaiting approval';
+    if (pauseType === 'gate') return 'awaiting gate';
+    return 'awaiting reply';
+  }
+
+  function taskPauseSummaryLabel(pauseType: string | null | undefined): string {
+    if (pauseType === 'escalation') return 'Waiting for escalation approval';
+    if (pauseType === 'gate') return 'Waiting for gate review';
+    return 'Waiting for input';
+  }
+
+  function sortEscalations(items: Escalation[]): Escalation[] {
+    return [...items].sort((left, right) => (left.received_at ?? 0) - (right.received_at ?? 0));
+  }
+
+  function taskEscalationFromNotification(notification: Notification): Escalation | null {
+    if (notification.notification_type !== 'escalation' || notification.task_id !== task?.task_id) {
+      return null;
+    }
+    return {
+      call_id: notification.notification_id,
+      session_id: notification.session_id,
+      tool_name: typeof notification.payload.tool_name === 'string' ? notification.payload.tool_name : null,
+      decision: 'escalate',
+      resolved: false,
+      reasoning: typeof notification.payload.reasoning === 'string' ? notification.payload.reasoning : null,
+      risk: typeof notification.payload.risk === 'string' ? notification.payload.risk : null,
+      timeout_seconds:
+        typeof notification.payload.timeout_seconds === 'number'
+          ? notification.payload.timeout_seconds
+          : 300,
+      received_at: notification.created_at ? Date.parse(notification.created_at) : Date.now()
+    } satisfies Escalation;
+  }
+
+  function escalationSecondsRemaining(item: Escalation): number {
+    const receivedAt = item.received_at ?? tickNow;
+    const timeoutSeconds = item.timeout_seconds ?? 300;
+    const elapsedSeconds = (tickNow - receivedAt) / 1000;
+    return Math.max(Math.ceil(timeoutSeconds - elapsedSeconds), 0);
   }
 
   function attemptCountForGroup(group: StepGroup | null): number {
@@ -227,7 +269,9 @@ import type { Agent, Conversation, Deliverable, StepRun, Task, TaskDetail, Workf
   }
 
   function hasRecordedStepOutput(stepRun: StepRun | null): boolean {
-    if (!stepRun?.output) return false;
+    if (!stepRun) return false;
+    if (stepRun.deliverables.length > 0) return true;
+    if (!stepRun.output) return false;
     const output = stepRun.output;
     const summary = output.summary;
     const content = output.content;
@@ -488,7 +532,7 @@ import type { Agent, Conversation, Deliverable, StepRun, Task, TaskDetail, Workf
     const labels: Record<string, string> = {};
     for (const group of stepGroups) {
       if (task?.pending_pause?.step_name === group.stepName) {
-        labels[group.stepName] = task.pending_pause.pause_type === 'gate' ? 'awaiting gate' : 'awaiting reply';
+        labels[group.stepName] = taskPauseLabel(task.pending_pause.pause_type);
         continue;
       }
       const status = group.latest ? displayStepStatus(group.latest) : '';
@@ -508,9 +552,7 @@ import type { Agent, Conversation, Deliverable, StepRun, Task, TaskDetail, Workf
     return {
       activeStepName: task.pending_pause?.step_name ?? diagramActiveStep ?? activeGroup?.stepName ?? '',
       activeLabel: task.pending_pause
-        ? task.pending_pause.pause_type === 'gate'
-          ? 'Waiting for approval'
-          : 'Waiting for input'
+        ? taskPauseSummaryLabel(task.pending_pause.pause_type)
         : task.status === 'running'
           ? diagramActiveStep
             ? 'Agent is executing'
@@ -595,6 +637,7 @@ import type { Agent, Conversation, Deliverable, StepRun, Task, TaskDetail, Workf
   let activePause = $derived.by(() => {
     if (!task?.pending_pause || task.status !== 'paused') return null;
     const pause = task.pending_pause;
+    if (pause.pause_type === 'escalation') return null;
     const currentStepName = task.workflow_run?.current_step_name;
     if (pause.step_name && currentStepName && pause.step_name !== currentStepName) {
       return {
@@ -627,6 +670,19 @@ import type { Agent, Conversation, Deliverable, StepRun, Task, TaskDetail, Workf
     return Object.fromEntries(entries);
   });
 
+  async function refreshTaskEscalations(): Promise<void> {
+    if (!task) {
+      taskEscalations = [];
+      return;
+    }
+    const notifications = await api.notifications.list();
+    taskEscalations = sortEscalations(
+      notifications
+        .map((notification) => taskEscalationFromNotification(notification))
+        .filter((notification): notification is Escalation => notification !== null)
+    );
+  }
+
   // ---------------------------------------------------------------------------
   // Data loading
   // ---------------------------------------------------------------------------
@@ -655,8 +711,14 @@ import type { Agent, Conversation, Deliverable, StepRun, Task, TaskDetail, Workf
         allow_silent_completion: task.allow_silent_completion
       };
       selectedStepName = defaultStepSelection(task, selectedStepName);
+      try {
+        await refreshTaskEscalations();
+      } catch {
+        taskEscalations = [];
+      }
     } catch (caughtError) {
       task = null;
+      taskEscalations = [];
       error = asApiError(caughtError).message;
     } finally {
       loading = false;
@@ -671,9 +733,15 @@ import type { Agent, Conversation, Deliverable, StepRun, Task, TaskDetail, Workf
       allTasks = data.allTasks;
       error = data.auxiliaryError;
       selectedStepName = defaultStepSelection(task, selectedStepName);
+      try {
+        await refreshTaskEscalations();
+      } catch {
+        taskEscalations = [];
+      }
     } catch (caughtError) {
       if (shouldClearTaskFromError(caughtError)) {
         task = null;
+        taskEscalations = [];
       }
       error = asApiError(caughtError).message;
     }
@@ -779,6 +847,20 @@ import type { Agent, Conversation, Deliverable, StepRun, Task, TaskDetail, Workf
       task = await api.tasks.detail(task.task_id);
     } catch (caughtError) {
       error = asApiError(caughtError).message;
+    }
+  }
+
+  async function respondToEscalation(notificationId: string, decision: 'approve' | 'deny'): Promise<void> {
+    taskEscalationBusyCallId = notificationId;
+    try {
+      await api.notifications.resolve(notificationId, { decision });
+      await refreshTaskOnly();
+    } catch (caughtError) {
+      error = asApiError(caughtError).message;
+    } finally {
+      if (taskEscalationBusyCallId === notificationId) {
+        taskEscalationBusyCallId = null;
+      }
     }
   }
 
@@ -986,6 +1068,18 @@ import type { Agent, Conversation, Deliverable, StepRun, Task, TaskDetail, Workf
           </Card>
         {/if}
 
+        {#if taskEscalations.length > 0}
+          {@const activeEscalation = taskEscalations[0]}
+          <EscalationPrompt
+            item={activeEscalation}
+            secondsRemaining={escalationSecondsRemaining(activeEscalation)}
+            pending={taskEscalationBusyCallId === activeEscalation.call_id}
+            queuedCount={taskEscalations.length - 1}
+            onApprove={() => respondToEscalation(activeEscalation.call_id, 'approve')}
+            onDeny={() => respondToEscalation(activeEscalation.call_id, 'deny')}
+          />
+        {/if}
+
         <!-- Pending pause -->
         {#if activePause}
           <Card class="overflow-hidden p-0">
@@ -1170,7 +1264,6 @@ import type { Agent, Conversation, Deliverable, StepRun, Task, TaskDetail, Workf
 
                     {#if latestAttempt.deliverables.length > 0}
                       {@const deliverable = latestDeliverable(latestAttempt)}
-                      {@const deliverableHtml = latestDeliverableHtml(latestAttempt)}
                       <div class="mt-4 rounded-2xl border border-sky-500/20 bg-sky-500/5 px-4 py-4">
                         <div class="flex flex-wrap items-center justify-between gap-3">
                           <div>
@@ -1187,9 +1280,15 @@ import type { Agent, Conversation, Deliverable, StepRun, Task, TaskDetail, Workf
                             {/each}
                           </div>
                         </div>
-                        {#if deliverableHtml}
-                          <div class="prose prose-sm prose-invert mt-4 max-w-none text-slate-300">{@html deliverableHtml}</div>
-                        {/if}
+                        <div class="mt-4 flex flex-wrap gap-2 text-xs text-slate-400">
+                          {#if deliverable?.format}
+                            <span class="rounded-full border border-slate-700 bg-slate-950/80 px-2.5 py-1">Format {deliverable.format}</span>
+                          {/if}
+                          {#if deliverable?.content}
+                            <span class="rounded-full border border-slate-700 bg-slate-950/80 px-2.5 py-1">{deliverable.content.length.toLocaleString()} chars</span>
+                          {/if}
+                        </div>
+                        <p class="mt-4 text-sm text-slate-400">Deliverable content is hidden here so large outputs do not overwhelm the task view. Open the full output below to inspect it.</p>
                       </div>
                     {/if}
 
@@ -1362,10 +1461,18 @@ import type { Agent, Conversation, Deliverable, StepRun, Task, TaskDetail, Workf
             <div class="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
               <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Result</p>
               <p class="mt-3 leading-6 text-slate-300">{task.result_summary ?? 'This task has not produced a final result yet.'}</p>
-              {#if finalTaskDeliverableHtml(task)}
-                <div class="prose prose-sm prose-invert mt-4 max-w-none text-slate-300">
-                  {@html finalTaskDeliverableHtml(task)}
+              {#if finalTaskResultTitle(task) || finalTaskResultFormat(task)}
+                <div class="mt-4 flex flex-wrap gap-2 text-xs text-slate-400">
+                  {#if finalTaskResultTitle(task)}
+                    <span class="rounded-full border border-slate-700 bg-slate-950/80 px-2.5 py-1">{finalTaskResultTitle(task)}</span>
+                  {/if}
+                  {#if finalTaskResultFormat(task)}
+                    <span class="rounded-full border border-slate-700 bg-slate-950/80 px-2.5 py-1">Format {finalTaskResultFormat(task)}</span>
+                  {/if}
                 </div>
+              {/if}
+              {#if hasFinalTaskOutput(task)}
+                <p class="mt-4 text-xs text-slate-500">The finalized deliverable stays in the full step output modal to keep this summary lightweight.</p>
               {/if}
             </div>
           </div>
@@ -1519,10 +1626,18 @@ import type { Agent, Conversation, Deliverable, StepRun, Task, TaskDetail, Workf
             <p class="mt-3 text-xs leading-5 text-slate-500">{task.applied_completion_reason}</p>
           {/if}
           <p class="mt-3 text-sm leading-6 text-slate-300">{task.result_summary ?? 'This task has not produced a final result yet.'}</p>
-          {#if finalTaskDeliverableHtml(task)}
-            <div class="prose prose-sm prose-invert mt-4 max-w-none text-slate-300">
-              {@html finalTaskDeliverableHtml(task)}
+          {#if finalTaskResultTitle(task) || finalTaskResultFormat(task)}
+            <div class="mt-4 flex flex-wrap gap-2 text-xs text-slate-400">
+              {#if finalTaskResultTitle(task)}
+                <span class="rounded-full border border-slate-700 bg-slate-950/80 px-2.5 py-1">{finalTaskResultTitle(task)}</span>
+              {/if}
+              {#if finalTaskResultFormat(task)}
+                <span class="rounded-full border border-slate-700 bg-slate-950/80 px-2.5 py-1">Format {finalTaskResultFormat(task)}</span>
+              {/if}
             </div>
+          {/if}
+          {#if hasFinalTaskOutput(task)}
+            <p class="mt-4 text-xs text-slate-500">The finalized deliverable stays in the full step output modal to keep this summary lightweight.</p>
           {/if}
         </Card>
       </div>
