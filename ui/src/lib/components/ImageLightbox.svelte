@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
+
   import Download from 'lucide-svelte/icons/download';
   import X from 'lucide-svelte/icons/x';
 
@@ -7,11 +9,16 @@
    *
    * - Click the backdrop or the close button to dismiss.
    * - Press Escape to dismiss.
-   * - The download button triggers a real save (uses an `<a download>`
+   * - The download button triggers a real save (uses an ``<a download>``
    *   so the user gets the actual filename, not a hashed artifact id).
-   * - The image fills as much of the viewport as it can while
-   *   respecting safe-area insets, so on iPhone PWAs the controls
-   *   land below the Dynamic Island and above the home indicator.
+   * - Locks the body scroll while open so touchmove on the backdrop on
+   *   iOS Safari doesn't rubber-band the page behind the lightbox.
+   *   Without the lock the user can drag the page underneath, and the
+   *   backdrop-blur layer appears to shift / lose its fixed position,
+   *   and the toolbar scrolls out of the visible area.
+   * - Toolbar is absolutely positioned inside the fixed viewport with
+   *   safe-area padding so it always lands below the Dynamic Island
+   *   and stays visible regardless of the image's aspect ratio.
    */
 
   let { src, alt = 'Image', filename = null, onClose } = $props<{
@@ -21,34 +28,81 @@
     onClose: () => void;
   }>();
 
+  let savedScrollY = 0;
+
+  function lockBodyScroll(): void {
+    if (typeof document === 'undefined') return;
+    savedScrollY = window.scrollY || document.documentElement.scrollTop || 0;
+    document.body.style.position = 'fixed';
+    document.body.style.top = `-${savedScrollY}px`;
+    document.body.style.left = '0';
+    document.body.style.right = '0';
+    document.body.style.width = '100%';
+    document.body.style.overflow = 'hidden';
+  }
+
+  function unlockBodyScroll(): void {
+    if (typeof document === 'undefined') return;
+    document.body.style.position = '';
+    document.body.style.top = '';
+    document.body.style.left = '';
+    document.body.style.right = '';
+    document.body.style.width = '';
+    document.body.style.overflow = '';
+    if (savedScrollY > 0) {
+      window.scrollTo(0, savedScrollY);
+      savedScrollY = 0;
+    }
+  }
+
+  onMount(() => {
+    lockBodyScroll();
+    return () => unlockBodyScroll();
+  });
+
   function handleKeydown(event: KeyboardEvent): void {
     if (event.key === 'Escape') {
       event.preventDefault();
       onClose();
     }
   }
-
-  function handleBackdropClick(): void {
-    onClose();
-  }
 </script>
 
 <svelte:window onkeydown={handleKeydown} />
 
-<!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions a11y_no_noninteractive_element_interactions a11y_interactive_supports_focus -->
+<!-- svelte-ignore a11y_click_events_have_key_events -->
+<!-- svelte-ignore a11y_no_static_element_interactions -->
+<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+<!-- svelte-ignore a11y_interactive_supports_focus -->
 <div
   role="dialog"
   aria-modal="true"
   aria-label={filename ?? alt}
   tabindex="-1"
-  class="fixed inset-0 z-[80] flex flex-col items-stretch justify-stretch bg-black/85 backdrop-blur-sm"
-  onclick={handleBackdropClick}
+  class="fixed inset-0 z-[80] touch-none bg-slate-950/95"
+  onclick={onClose}
 >
-  <!-- Top toolbar -->
+  <!-- Image area. Centered, fills the viewport. Tapping the image
+       does not close the lightbox; tapping the surrounding backdrop
+       does. -->
   <!-- svelte-ignore a11y_click_events_have_key_events -->
-  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+  <img
+    {src}
+    {alt}
+    class="absolute inset-0 m-auto max-h-[calc(100dvh-8rem)] max-w-[calc(100vw-2rem)] rounded-2xl object-contain shadow-2xl"
+    onclick={(event) => event.stopPropagation()}
+  />
+
+  <!--
+    Toolbar. Absolutely positioned inside the fixed lightbox so the
+    surrounding image flex layout can never push it out of view, and
+    it carries its own solid background so it's always readable
+    against any image colour. `safe-area-inset-top` shifts it below
+    the Dynamic Island on iPhone PWAs.
+  -->
   <div
-    class="flex shrink-0 items-center justify-between gap-2 px-4 pt-[calc(0.75rem+env(safe-area-inset-top))] pb-3"
+    class="absolute inset-x-0 top-0 flex items-center justify-between gap-2 bg-slate-950/85 px-4 pt-[calc(0.75rem+env(safe-area-inset-top))] pb-3 shadow-lg backdrop-blur"
     onclick={(event) => event.stopPropagation()}
   >
     <p class="min-w-0 flex-1 truncate text-sm text-slate-200">{filename ?? alt}</p>
@@ -60,7 +114,7 @@
         download={filename ?? ''}
         target="_blank"
         rel="noreferrer"
-        class="inline-flex h-10 w-10 items-center justify-center rounded-full bg-slate-900/70 text-slate-100 transition hover:bg-slate-800"
+        class="inline-flex h-10 w-10 items-center justify-center rounded-full bg-slate-800/80 text-slate-100 transition hover:bg-slate-700"
       >
         <Download class="h-5 w-5" />
       </a>
@@ -69,22 +123,10 @@
         title="Close"
         type="button"
         onclick={onClose}
-        class="inline-flex h-10 w-10 items-center justify-center rounded-full bg-slate-900/70 text-slate-100 transition hover:bg-slate-800"
+        class="inline-flex h-10 w-10 items-center justify-center rounded-full bg-slate-800/80 text-slate-100 transition hover:bg-slate-700"
       >
         <X class="h-5 w-5" />
       </button>
     </div>
-  </div>
-
-  <!-- Image area -->
-  <div class="flex min-h-0 flex-1 items-center justify-center p-4">
-    <!-- svelte-ignore a11y_click_events_have_key_events -->
-    <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-    <img
-      {src}
-      {alt}
-      class="max-h-full max-w-full rounded-2xl object-contain shadow-2xl"
-      onclick={(event) => event.stopPropagation()}
-    />
   </div>
 </div>
