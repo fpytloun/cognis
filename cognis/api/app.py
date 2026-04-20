@@ -304,6 +304,7 @@ def create_app() -> FastAPI:
             shared_registry=shared_runtime.tool_registry,
             shared_connection=shared_runtime.executor_connection,
             session_factory=session_factory,
+            artifact_store=artifact_store,
         )
         agent_loop = AgentLoop(
             providers=providers,

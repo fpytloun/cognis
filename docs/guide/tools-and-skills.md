@@ -83,10 +83,14 @@ Agents can manage skills through built-in tools:
 - `skill_list` -- list available skills
 - `skill_load` -- load a skill's full instructions and related metadata
 - `skill_get` -- get skill details for inspection or debugging
+- `skill_versions` -- inspect version history
 - `skill_write` -- create or update a skill (creates a new version)
+- `skill_asset_write` -- add or replace a text/script asset on a skill
+- `skill_asset_delete` -- remove an asset from a skill
 - `skill_delete` -- delete a skill
 - `skill_import_url` -- import a skill from a URL
-- `skill_export` -- export a skill as SKILL.md or YAML
+- `skill_restore_version` -- restore a previous immutable version
+- `skill_export` -- export a skill as SKILL.md, YAML, or a full Cognis package
 
 All mutation tools are non-bypassable and evaluated by Intaris guardrails. When an agent creates or imports a skill, Cognis automatically attaches it to that agent for future runs.
 
@@ -102,6 +106,7 @@ Skills can be imported from:
 - **GitHub blob URLs** -- automatically resolved to raw content
 - **GitHub folder URLs** -- `SKILL.md` is inferred inside the folder
 - **Cognis YAML** -- the native portable format
+- **Cognis package** -- the full-fidelity portable format for skills with attached assets
 
 Import security:
 
@@ -114,6 +119,8 @@ Import security:
 ### Executable skill tools
 
 Skills can define tools with execution recipes. These tools appear as first-class tools in the agent's effective tool set. When called, the executor stages required assets into a temporary workspace, executes the recipe, and cleans up afterward.
+
+Skill assets are stored in Cognis itself (database metadata plus artifact storage) and are never managed as editable controller filesystem state. Executors only receive temporary staged copies for execution.
 
 Supported recipe modes:
 

@@ -1,16 +1,18 @@
 <script lang="ts">
   import Sparkles from 'lucide-svelte/icons/sparkles';
 import Loader2 from 'lucide-svelte/icons/loader-2';
+  import Eye from 'lucide-svelte/icons/eye';
   import Button from '$lib/components/ui/Button.svelte';
   import Card from '$lib/components/ui/Card.svelte';
   import Input from '$lib/components/ui/Input.svelte';
   import AgentAvatar from '$lib/components/AgentAvatar.svelte';
   import AvatarGenerateModal from '$lib/components/agents/AvatarGenerateModal.svelte';
+  import SkillDetailSheet from '$lib/components/skills/SkillDetailSheet.svelte';
   import ImageLightbox from '$lib/components/ImageLightbox.svelte';
   import { api } from '$lib/api/client';
+  import { GENERIC_THINKING_EFFORTS, thinkingEffortLabel } from '$lib/thinking';
   import {
     buildSystemPromptPreview,
-  import { GENERIC_THINKING_EFFORTS, thinkingEffortLabel } from '$lib/thinking';
     defaultSystemPrompt,
     formStateToPayload,
     formStateToSystemOverridePayload,
@@ -66,9 +68,11 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
   let localBindings = $state<string[]>([...secondaryBindings]);
   let showAvatarModal = $state(false);
   let showAvatarLightbox = $state(false);
+  let skillDetailId = $state<string | null>(null);
   let uploadingAvatar = $state(false);
   let fileInput: HTMLInputElement | undefined = $state();
   const editableFieldSet = $derived(new Set(editableFields));
+  const selectedSkillDetail = $derived(skills.find((skill: Skill) => skill.skill_id === skillDetailId) ?? null);
 
   function canEditField(field: string): boolean {
     if (!isSystemAsset) return !readonly;
@@ -287,10 +291,6 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
     }
     return models;
   }
-</script>
-
-<form class="space-y-5" onsubmit={handleSubmit}>
-  <div class="grid gap-5 lg:grid-cols-[minmax(0,1fr)_360px]">
 
   function selectedProviderModelInfo(): ModelEntry | null {
     if (!form.providerId) {
@@ -316,6 +316,10 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
     }
     return [...GENERIC_THINKING_EFFORTS];
   }
+</script>
+
+<form class="space-y-5" onsubmit={handleSubmit}>
+  <div class="grid gap-5 lg:grid-cols-[minmax(0,1fr)_360px]">
     <div class="space-y-5">
       <!-- Identity -->
       <Card class="p-5">
@@ -625,19 +629,27 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
             {#if selectableSkills.length > 0}
               <div class="grid gap-2 md:grid-cols-2">
                 {#each selectableSkills as skill}
-                  <label class="flex items-center gap-2 text-sm text-slate-200">
-                    <input
-                      checked={form.selectedSkillIds.includes(skill.skill_id)}
-                      class="h-4 w-4 rounded border-slate-600 bg-slate-950"
-                      type="checkbox"
-                      onchange={() => toggleSkill(skill.skill_id)}
-                      disabled={!canEditField('skills')}
-                    />
-                    <span>{skill.name}</span>
-                    {#if skill.current_version?.tools && skill.current_version.tools.length > 0}
-                      <span class="text-xs text-slate-500">({skill.current_version.tools.length} tools)</span>
-                    {/if}
-                  </label>
+                  <div class="flex items-center justify-between gap-3 rounded-lg border border-slate-800 bg-slate-950/70 px-3 py-2 text-sm text-slate-200">
+                    <label class="flex min-w-0 items-center gap-2">
+                      <input
+                        checked={form.selectedSkillIds.includes(skill.skill_id)}
+                        class="h-4 w-4 rounded border-slate-600 bg-slate-950"
+                        type="checkbox"
+                        onchange={() => toggleSkill(skill.skill_id)}
+                        disabled={!canEditField('skills')}
+                      />
+                      <span class="truncate">{skill.name}</span>
+                      {#if skill.current_version?.tools && skill.current_version.tools.length > 0}
+                        <span class="text-xs text-slate-500">({skill.current_version.tools.length} tools)</span>
+                      {/if}
+                      {#if skill.current_version?.asset_manifest && skill.current_version.asset_manifest.length > 0}
+                        <span class="text-xs text-slate-500">({skill.current_version.asset_manifest.length} assets)</span>
+                      {/if}
+                    </label>
+                    <button type="button" class="inline-flex items-center gap-1 text-xs text-slate-400 hover:text-slate-200" onclick={() => { skillDetailId = skill.skill_id; }}>
+                      <Eye class="h-3.5 w-3.5" /> View
+                    </button>
+                  </div>
                 {/each}
               </div>
             {/if}
@@ -653,6 +665,12 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
             {/if}
           </div>
         {/if}
+
+        <SkillDetailSheet
+          open={skillDetailId !== null}
+          skill={selectedSkillDetail}
+          onClose={() => { skillDetailId = null; }}
+        />
 
         <!-- Intaris MCP Servers -->
         {#if intarisMcpServers.length > 0}

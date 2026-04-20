@@ -26,6 +26,7 @@ from cognis.models.skill import (
 )
 from cognis.models.tool import ToolDefinition, ToolSource, stable_tool_id
 from cognis.store.models import SkillRow, SkillVersionRow
+from cognis.store.queries import list_skill_assets
 
 logger = get_logger(__name__)
 
@@ -192,7 +193,23 @@ async def resolve_skills_for_agent(
             version_row = ver_result.scalar_one_or_none()
             if version_row:
                 tools = _parse_tool_specs_from_version(version_row.tools)
-                asset_manifest = _parse_asset_manifest(version_row.asset_manifest)
+                asset_rows = await list_skill_assets(session, version_row.version_id)
+                asset_manifest = (
+                    [
+                        SkillAssetRef(
+                            filename=asset.filename,
+                            asset_id=asset.asset_id,
+                            artifact_namespace=asset.artifact_namespace,
+                            artifact_object_id=asset.artifact_object_id,
+                            content_hash=asset.content_hash,
+                            size_bytes=asset.size_bytes,
+                            content_type=asset.content_type,
+                        )
+                        for asset in asset_rows
+                    ]
+                    if asset_rows
+                    else _parse_asset_manifest(version_row.asset_manifest)
+                )
                 resolved.append(
                     ResolvedSkill(
                         skill_id=skill_id,

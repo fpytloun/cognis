@@ -390,6 +390,8 @@ def _build_runtime_handler(
 
 def _build_skill_handler(
     tool: Any,
+    *,
+    artifact_store: Any | None = None,
 ) -> Callable[[dict[str, Any], ToolExecutionContext], Awaitable[Any]] | None:
     """Build an executor handler for an executable skill tool.
 
@@ -415,90 +417,97 @@ def _build_skill_handler(
     recipe_timeout = recipe.get("timeout_seconds", 60)
     working_dir = recipe.get("working_dir")
 
+    def resolve_staged_path(base_dir: Path, relative_path: str) -> Path:
+        target = (base_dir / relative_path).resolve()
+        if not target.is_relative_to(base_dir.resolve()):
+            raise ValueError(f"Unsafe recipe path rejected: {relative_path}")
+        return target
+
     async def skill_handler(arguments: dict[str, Any], context: ToolExecutionContext) -> str:
         staging_dir = Path(tempfile.mkdtemp(prefix="cognis_skill_"))
         try:
-            # Stage assets if available
-            asset_manifest = exec_meta.get("asset_manifest", [])
-            for asset in asset_manifest:
-                filename = asset.get("filename", "")
-                if filename:
-                    # Path traversal protection: ensure resolved path stays under staging_dir
-                    asset_path = (staging_dir / filename).resolve()
-                    if not str(asset_path).startswith(str(staging_dir.resolve())):
-                        return f"Unsafe asset path rejected: {filename}"
-                    asset_path.parent.mkdir(parents=True, exist_ok=True)
-                    # For in-process, try to read from artifact store directly
-                    artifact_ns = asset.get("artifact_namespace", "skills")
-                    artifact_oid = asset.get("artifact_object_id", "")
-                    if artifact_oid:
-                        try:
-                            from cognis.artifacts.store import get_artifact_store
-
-                            store = get_artifact_store()
-                            content, _ct = await store.async_load(
-                                artifact_ns, artifact_oid, filename
-                            )
-                            asset_path.write_bytes(content)
-                            # Verify hash if available
-                            expected_hash = asset.get("content_hash", "")
-                            if expected_hash:
-                                actual_hash = hashlib.sha256(content).hexdigest()
-                                if actual_hash != expected_hash:
-                                    return f"Asset hash mismatch for {filename}"
-                        except Exception as exc:
-                            return f"Failed to stage asset {filename}: {exc}"
-
-            # Build execution environment
-            env = dict(context.runtime_metadata.get("env", {}))
-            env.update(recipe_env)
-            # Resolve secret placeholders
-            secret_placeholders = exec_meta.get("secret_placeholders", [])
-            secrets = context.runtime_metadata.get("secrets", {})
-            for placeholder in secret_placeholders:
-                if placeholder in secrets:
-                    env[placeholder] = secrets[placeholder]
-            env["SKILL_STAGING_DIR"] = str(staging_dir)
-
-            # Determine working directory
-            cwd = staging_dir / working_dir if working_dir else staging_dir
-
-            # Build command
-            if mode == "script":
-                script_path = staging_dir / entry
-                if not script_path.exists():
-                    return f"Script not found: {entry}"
-                script_path.chmod(0o755)
-                cmd = [str(script_path), *recipe_args]
-            elif mode == "command":
-                cmd = [entry, *recipe_args]
-            else:
-                return f"Unsupported recipe mode: {mode}"
-
-            # Template arguments into command
-            for key, value in arguments.items():
-                cmd = [c.replace(f"{{{key}}}", str(value)) for c in cmd]
-                env[f"SKILL_ARG_{key.upper()}"] = str(value)
-
-            # Execute
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                cwd=str(cwd),
-                env=env,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
             try:
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=recipe_timeout)
-            except TimeoutError:
-                proc.kill()
-                return f"Skill tool execution timed out after {recipe_timeout}s"
+                async def _run() -> str:
+                    proc: asyncio.subprocess.Process | None = None
+                    runtime_artifact_store = artifact_store
+                    if runtime_artifact_store is None and context.shared_runtime_metadata is not None:
+                        runtime_artifact_store = context.shared_runtime_metadata.get(
+                            "artifact_store"
+                        )
+                    asset_manifest = exec_meta.get("asset_manifest", [])
+                    for asset in asset_manifest:
+                        filename = asset.get("filename", "")
+                        if not filename:
+                            continue
+                        asset_path = resolve_staged_path(staging_dir, filename)
+                        asset_path.parent.mkdir(parents=True, exist_ok=True)
+                        artifact_ns = asset.get("artifact_namespace", "skills")
+                        artifact_oid = asset.get("artifact_object_id", "")
+                        if artifact_oid:
+                            try:
+                                if runtime_artifact_store is None:
+                                    return "Artifact store is not available for skill asset staging"
+                                content, _ct = await runtime_artifact_store.async_load(
+                                    artifact_ns, artifact_oid, filename
+                                )
+                                asset_path.write_bytes(content)
+                                expected_hash = asset.get("content_hash", "")
+                                if expected_hash:
+                                    actual_hash = hashlib.sha256(content).hexdigest()
+                                    if actual_hash != expected_hash:
+                                        return f"Asset hash mismatch for {filename}"
+                            except Exception as exc:
+                                return f"Failed to stage asset {filename}: {exc}"
 
-            output = stdout.decode(errors="replace")
-            if proc.returncode != 0:
-                err = stderr.decode(errors="replace")
-                return f"Exit code {proc.returncode}\n{output}\n{err}".strip()
-            return output
+                    env = dict(context.runtime_metadata.get("env", {}))
+                    env.update(recipe_env)
+                    secret_placeholders = exec_meta.get("secret_placeholders", [])
+                    secrets = context.runtime_metadata.get("secrets", {})
+                    for placeholder in secret_placeholders:
+                        if placeholder in secrets:
+                            env[placeholder] = secrets[placeholder]
+                    env["SKILL_STAGING_DIR"] = str(staging_dir)
+
+                    cwd = resolve_staged_path(staging_dir, working_dir) if working_dir else staging_dir
+
+                    if mode == "script":
+                        script_path = resolve_staged_path(staging_dir, entry)
+                        if not script_path.exists():
+                            return f"Script not found: {entry}"
+                        script_path.chmod(0o755)
+                        cmd = [str(script_path), *recipe_args]
+                    elif mode == "command":
+                        cmd = [entry, *recipe_args]
+                    else:
+                        return f"Unsupported recipe mode: {mode}"
+
+                    for key, value in arguments.items():
+                        cmd = [c.replace(f"{{{key}}}", str(value)) for c in cmd]
+                        env[f"SKILL_ARG_{key.upper()}"] = str(value)
+
+                    proc = await asyncio.create_subprocess_exec(
+                        *cmd,
+                        cwd=str(cwd),
+                        env=env,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    try:
+                        stdout, stderr = await proc.communicate()
+                    except asyncio.CancelledError:
+                        if proc.returncode is None:
+                            proc.kill()
+                            await proc.wait()
+                        raise
+                    output = stdout.decode(errors="replace")
+                    if proc.returncode != 0:
+                        err = stderr.decode(errors="replace")
+                        return f"Exit code {proc.returncode}\n{output}\n{err}".strip()
+                    return output
+
+                return await asyncio.wait_for(_run(), timeout=recipe_timeout)
+            except TimeoutError:
+                return f"Skill tool execution timed out after {recipe_timeout}s"
 
         finally:
             shutil.rmtree(staging_dir, ignore_errors=True)

@@ -266,6 +266,7 @@ async def _build_configure_payload(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     from cognis.api.executor_ws import _resolve_executor_mcp_payload
     from cognis.api.runtime_support import _resolve_web_config
+    from cognis.tools.skills import _qualified_skill_tool_name
 
     mcp_servers, scoped_secrets = await _resolve_executor_mcp_payload(row, app.state.providers)
     web_config = await _resolve_web_config(app.state.providers, row.owner_email)
@@ -287,19 +288,34 @@ async def _build_configure_payload(
                     "skill_id": skill.skill_id,
                     "version_id": skill.version_id,
                     "content_hash": skill.content_hash,
-                    "tools": [t.model_dump(mode="json") for t in skill.tools],
+                    "tools": [
+                        {
+                            **t.model_dump(mode="json"),
+                            "qualified_name": _qualified_skill_tool_name(skill.skill_id, t.name),
+                        }
+                        for t in skill.tools
+                    ],
                     "asset_manifest": [a.model_dump(mode="json") for a in skill.asset_manifest],
                 }
-                artifact_store = getattr(app.state.providers, "artifact_store", None)
+                artifact_store = getattr(app.state, "artifact_store", None)
                 if artifact_store and skill.asset_manifest:
+                    ttl_seconds = getattr(
+                        getattr(artifact_store, "_config", None),  # noqa: SLF001
+                        "signed_url_ttl_seconds",
+                        None,
+                    )
                     for asset_entry in manifest["asset_manifest"]:
                         ns = asset_entry.get("artifact_namespace", "skills")
                         oid = asset_entry.get("artifact_object_id", "")
+                        filename = asset_entry.get("filename", "")
                         if oid:
                             with contextlib.suppress(Exception):
-                                asset_entry[
-                                    "signed_url"
-                                ] = await artifact_store.async_get_signed_url(ns, oid)
+                                asset_entry["url"] = await artifact_store.async_get_public_url(
+                                    ns,
+                                    oid,
+                                    filename,
+                                    ttl_seconds=ttl_seconds,
+                                )
                 skill_manifests.append(manifest)
     except Exception:
         _logger.warning(

@@ -468,70 +468,16 @@ class ExecutorRunner:
         """Register executable skill tool handlers from controller-provided manifests.
 
         Each manifest contains skill metadata, tool specs with recipes,
-        and asset references with signed URLs for staging.
+        and asset references with controller-signed URLs for on-demand staging.
         """
-        import hashlib
-        import shutil
-        import tempfile
-        from pathlib import Path
-
-        import httpx
-
         for manifest in skill_manifests_raw:
             skill_id = manifest.get("skill_id", "")
             skill_tools = manifest.get("tools", [])
             asset_manifest = manifest.get("asset_manifest", [])
 
-            # Stage assets for this skill
-            staging_dir = Path(tempfile.mkdtemp(prefix=f"cognis_skill_{skill_id[:8]}_"))
-            staged_ok = True
-            for asset in asset_manifest:
-                filename = asset.get("filename", "")
-                signed_url = asset.get("signed_url", "")
-                expected_hash = asset.get("content_hash", "")
-                if not filename or not signed_url:
-                    continue
-                # Path traversal protection
-                asset_path = (staging_dir / filename).resolve()
-                if not str(asset_path).startswith(str(staging_dir.resolve())):
-                    logger.warning(
-                        "Unsafe skill asset path rejected",
-                        extra={"extra_data": {"skill_id": skill_id, "filename": filename}},
-                    )
-                    staged_ok = False
-                    break
-                asset_path.parent.mkdir(parents=True, exist_ok=True)
-                try:
-                    async with httpx.AsyncClient(timeout=30) as client:
-                        resp = await client.get(signed_url)
-                        resp.raise_for_status()
-                    content = resp.content
-                    if expected_hash:
-                        actual_hash = hashlib.sha256(content).hexdigest()
-                        if actual_hash != expected_hash:
-                            logger.warning(
-                                "Skill asset hash mismatch",
-                                extra={"extra_data": {"skill_id": skill_id, "filename": filename}},
-                            )
-                            staged_ok = False
-                            break
-                    asset_path.write_bytes(content)
-                except Exception:
-                    logger.warning(
-                        "Failed to stage skill asset",
-                        extra={"extra_data": {"skill_id": skill_id, "filename": filename}},
-                        exc_info=True,
-                    )
-                    staged_ok = False
-                    break
-
-            if not staged_ok:
-                shutil.rmtree(staging_dir, ignore_errors=True)
-                continue
-
             # Register handlers for each tool in this skill
             for tool_spec in skill_tools:
-                tool_name = tool_spec.get("name", "")
+                tool_name = tool_spec.get("qualified_name") or tool_spec.get("name", "")
                 recipe = tool_spec.get("recipe")
                 if not tool_name or not recipe:
                     continue
@@ -552,23 +498,25 @@ class ExecutorRunner:
                 )
                 self._configured_tool_definitions.append(tool_def)
                 self._tool_handlers[tool_name] = self._build_skill_recipe_handler(
-                    recipe, staging_dir, secrets
+                    recipe,
+                    asset_manifest,
+                    secrets,
                 )
-
-            # Track staging dir for cleanup
-            if not hasattr(self, "_skill_staging_dirs"):
-                self._skill_staging_dirs: list[Path] = []
-            self._skill_staging_dirs.append(staging_dir)
 
     def _build_skill_recipe_handler(
         self,
         recipe: dict[str, Any],
-        staging_dir: Any,
+        asset_manifest: list[dict[str, Any]],
         secrets: dict[str, str],
     ) -> Any:
         """Build a handler closure for a skill tool recipe."""
         import asyncio
+        import hashlib
+        import shutil
+        import tempfile
         from pathlib import Path
+
+        import httpx
 
         mode = recipe.get("mode", "command")
         entry = recipe.get("entry", "")
@@ -578,49 +526,88 @@ class ExecutorRunner:
         working_dir = recipe.get("working_dir")
         secret_placeholders = recipe.get("secret_placeholders", [])
 
+        def resolve_staged_path(base_dir: Path, relative_path: str) -> Path:
+            target = (base_dir / relative_path).resolve()
+            if not target.is_relative_to(base_dir.resolve()):
+                raise ValueError(f"Unsafe recipe path rejected: {relative_path}")
+            return target
+
         async def handler(arguments: dict[str, Any], context: Any) -> str:
-            env = dict(os.environ)
-            env.update(recipe_env)
-            for placeholder in secret_placeholders:
-                if placeholder in secrets:
-                    env[placeholder] = secrets[placeholder]
-            env["SKILL_STAGING_DIR"] = str(staging_dir)
-
-            cwd = Path(staging_dir) / working_dir if working_dir else staging_dir
-
-            if mode == "script":
-                script_path = Path(staging_dir) / entry
-                if not script_path.exists():
-                    return f"Script not found: {entry}"
-                script_path.chmod(0o755)
-                cmd = [str(script_path), *recipe_args]
-            elif mode == "command":
-                cmd = [entry, *recipe_args]
-            else:
-                return f"Unsupported recipe mode: {mode}"
-
-            for key, value in arguments.items():
-                cmd = [c.replace(f"{{{key}}}", str(value)) for c in cmd]
-                env[f"SKILL_ARG_{key.upper()}"] = str(value)
-
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                cwd=str(cwd),
-                env=env,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
+            staging_dir = Path(tempfile.mkdtemp(prefix="cognis_skill_"))
             try:
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=recipe_timeout)
-            except TimeoutError:
-                proc.kill()
-                return f"Skill tool execution timed out after {recipe_timeout}s"
+                try:
+                    async def _run() -> str:
+                        proc: asyncio.subprocess.Process | None = None
+                        async with httpx.AsyncClient(timeout=recipe_timeout) as client:
+                            for asset in asset_manifest:
+                                filename = asset.get("filename", "")
+                                asset_url = asset.get("url", "")
+                                expected_hash = asset.get("content_hash", "")
+                                if not filename or not asset_url:
+                                    continue
+                                asset_path = resolve_staged_path(staging_dir, filename)
+                                asset_path.parent.mkdir(parents=True, exist_ok=True)
+                                try:
+                                    response = await client.get(asset_url)
+                                    response.raise_for_status()
+                                except Exception as exc:
+                                    return f"Failed to stage asset {filename}: {exc}"
+                                content = response.content
+                                if expected_hash:
+                                    actual_hash = hashlib.sha256(content).hexdigest()
+                                    if actual_hash != expected_hash:
+                                        return f"Asset hash mismatch for {filename}"
+                                asset_path.write_bytes(content)
 
-            output = stdout.decode(errors="replace")
-            if proc.returncode != 0:
-                err = stderr.decode(errors="replace")
-                return f"Exit code {proc.returncode}\n{output}\n{err}".strip()
-            return output
+                        env = dict(os.environ)
+                        env.update(recipe_env)
+                        for placeholder in secret_placeholders:
+                            if placeholder in secrets:
+                                env[placeholder] = secrets[placeholder]
+                        env["SKILL_STAGING_DIR"] = str(staging_dir)
+
+                        cwd = resolve_staged_path(staging_dir, working_dir) if working_dir else staging_dir
+
+                        if mode == "script":
+                            script_path = resolve_staged_path(staging_dir, entry)
+                            if not script_path.exists():
+                                return f"Script not found: {entry}"
+                            script_path.chmod(0o755)
+                            cmd = [str(script_path), *recipe_args]
+                        elif mode == "command":
+                            cmd = [entry, *recipe_args]
+                        else:
+                            return f"Unsupported recipe mode: {mode}"
+
+                        for key, value in arguments.items():
+                            cmd = [c.replace(f"{{{key}}}", str(value)) for c in cmd]
+                            env[f"SKILL_ARG_{key.upper()}"] = str(value)
+
+                        proc = await asyncio.create_subprocess_exec(
+                            *cmd,
+                            cwd=str(cwd),
+                            env=env,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                        )
+                        try:
+                            stdout, stderr = await proc.communicate()
+                        except asyncio.CancelledError:
+                            if proc.returncode is None:
+                                proc.kill()
+                                await proc.wait()
+                            raise
+                        output = stdout.decode(errors="replace")
+                        if proc.returncode != 0:
+                            err = stderr.decode(errors="replace")
+                            return f"Exit code {proc.returncode}\n{output}\n{err}".strip()
+                        return output
+
+                    return await asyncio.wait_for(_run(), timeout=recipe_timeout)
+                except TimeoutError:
+                    return f"Skill tool execution timed out after {recipe_timeout}s"
+            finally:
+                shutil.rmtree(staging_dir, ignore_errors=True)
 
         return handler
 

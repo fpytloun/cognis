@@ -1057,23 +1057,15 @@ tools:
 This lets Cognis keep all visible skills discoverable while still encouraging
 explicit skill loading and preserving prompt caching.
 
-### Filesystem Skills (read-only)
+### Cloud-Native Skill Storage
 
-Skills can also be loaded from `./skills/` or `~/.config/cognis/skills/`
-as read-only definitions. These are synced to the DB on startup with
-`source="file"` and cannot be edited via the UI.
+Skills are managed as Cognis records backed by the database and artifact store.
+System skills may be seeded from packaged application resources on bootstrap,
+but skills are not discovered from editable controller filesystem directories.
 
-```
-skills/
-  git-release/
-    SKILL.md          # Instructions + tool definitions in frontmatter
-    templates/
-      release-notes.md
-```
-
-These filesystem skills use the same compatibility rules: plain `SKILL.md`
-content loads as instructions, and optional Cognis extensions can add
-`steps:` or `workflow_templates:` without changing the base format.
+At runtime, executors receive only temporary staged copies of the specific
+assets required by the selected skill tool recipe. The controller remains the
+source of truth for skill metadata, versions, and assets.
 
 ## Complete Tool Call Flow
 

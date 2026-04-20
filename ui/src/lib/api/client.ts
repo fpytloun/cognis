@@ -731,6 +731,12 @@ export const api = {
       return request<SkillVersion[]>(`/api/v1/skills/${skillId}/versions`);
     },
 
+    restoreVersion(skillId: string, versionId: string): Promise<Skill> {
+      return request<Skill>(`/api/v1/skills/${skillId}/versions/${versionId}/restore`, {
+        method: 'POST'
+      });
+    },
+
     import(data: SkillImportRequest): Promise<Skill> {
       return request<Skill>('/api/v1/skills/import', { method: 'POST', body: JSON.stringify(data) });
     },

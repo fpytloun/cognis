@@ -17,6 +17,8 @@ from pydantic import ValidationError
 
 from cognis.api.models import (
     PendingPauseResponse,
+    SkillResponse,
+    SkillVersionResponse,
     StepRunResponse,
     TaskResponse,
 )
@@ -117,6 +119,48 @@ class TestPendingPauseShapeContract:
             {"label": "Yes", "action": "Yes"},
             {"label": "No", "action": "No"},
         ]
+
+
+class TestSkillResponseContracts:
+    def test_skill_version_accepts_asset_manifest_entries(self) -> None:
+        response = SkillVersionResponse(
+            version_id="sv-1",
+            skill_id="skill-1",
+            version_number=1,
+            content_hash="a" * 64,
+            instructions="hello",
+            asset_manifest=[
+                {
+                    "filename": "scripts/tool.py",
+                    "asset_id": "sa-1",
+                    "artifact_namespace": "skills",
+                    "artifact_object_id": "ska-1",
+                    "content_hash": "b" * 64,
+                    "size_bytes": 10,
+                    "content_type": "text/x-python",
+                    "url": "https://example.test/tool.py",
+                }
+            ],
+        )
+        assert response.asset_manifest is not None
+        assert response.asset_manifest[0].artifact_object_id == "ska-1"
+
+    def test_skill_response_round_trips_current_version_shape(self) -> None:
+        response = SkillResponse(
+            skill_id="skill-1",
+            name="Skill One",
+            instructions="hello",
+            attach_to_all_agents=False,
+            current_version=SkillVersionResponse(
+                version_id="sv-1",
+                skill_id="skill-1",
+                version_number=1,
+                content_hash="a" * 64,
+                instructions="hello",
+            ),
+        )
+        assert response.current_version is not None
+        assert response.current_version.version_id == "sv-1"
 
     def test_normalize_options_from_mixed_shape_drops_junk(self) -> None:
         normalized = _normalize_pause_options([{"label": "A"}, 42, "B"])

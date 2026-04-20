@@ -2385,7 +2385,7 @@ async def update_skill(
     if row is None:
         return None
     if row.source not in ("db", "imported"):
-        raise ValueError("Cannot update file-sourced skills")
+        raise ValueError("Cannot update read-only skills")
     if row.is_system:
         raise ValueError("Cannot modify system skills directly")
     # Prevent non-owners from mutating global skills
@@ -2443,7 +2443,7 @@ async def delete_skill(
     if row is None:
         return False
     if row.source not in ("db", "imported"):
-        raise ValueError("Cannot delete file-sourced skills")
+        raise ValueError("Cannot delete read-only skills")
     if row.is_system:
         raise ValueError("Cannot delete system skills")
     if owner_email is not None and row.owner_email is None:
@@ -2594,9 +2594,18 @@ async def create_skill_asset(
 async def list_skill_assets(session: AsyncSession, skill_version_id: str) -> list[SkillAssetRow]:
     """List all assets for a skill version."""
     result = await session.execute(
-        select(SkillAssetRow).where(SkillAssetRow.skill_version_id == skill_version_id)
+        select(SkillAssetRow)
+        .where(SkillAssetRow.skill_version_id == skill_version_id)
+        .order_by(SkillAssetRow.filename.asc())
     )
     return list(result.scalars().all())
+
+
+async def get_skill_asset(session: AsyncSession, asset_id: str) -> SkillAssetRow | None:
+    """Get a skill asset by ID."""
+
+    result = await session.execute(select(SkillAssetRow).where(SkillAssetRow.asset_id == asset_id))
+    return result.scalar_one_or_none()
 
 
 # --- Executors ---

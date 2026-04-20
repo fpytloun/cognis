@@ -7,10 +7,25 @@ skills by ID; runtime resolves to the current published version.
 
 from __future__ import annotations
 
+import posixpath
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+
+def _validate_skill_relative_path(value: str, *, field_name: str) -> str:
+    candidate = value.replace("\\", "/").strip()
+    if not candidate:
+        raise ValueError(f"{field_name} cannot be empty")
+    normalized = posixpath.normpath(candidate)
+    if normalized in {"", ".", ".."}:
+        raise ValueError(f"{field_name} is invalid")
+    if normalized.startswith("../") or normalized.startswith("/"):
+        raise ValueError(f"{field_name} must stay within the staged skill workspace")
+    if "/../" in f"/{normalized}":
+        raise ValueError(f"{field_name} must stay within the staged skill workspace")
+    return normalized[2:] if normalized.startswith("./") else normalized
 
 # ---------------------------------------------------------------------------
 # Executable skill tool recipe
@@ -37,6 +52,21 @@ class SkillToolRecipe(BaseModel):
     required_assets: list[str] = Field(default_factory=list)
     secret_placeholders: list[str] = Field(default_factory=list)
     working_dir: str | None = None  # relative to staged asset dir
+
+    @model_validator(mode="after")
+    def _validate_paths(self) -> SkillToolRecipe:
+        if self.mode == "script":
+            self.entry = _validate_skill_relative_path(self.entry, field_name="entry")
+        if self.working_dir is not None:
+            self.working_dir = _validate_skill_relative_path(
+                self.working_dir,
+                field_name="working_dir",
+            )
+        self.required_assets = [
+            _validate_skill_relative_path(item, field_name="required_assets")
+            for item in self.required_assets
+        ]
+        return self
 
 
 class SkillToolSpec(BaseModel):
@@ -66,9 +96,13 @@ class SkillAssetRef(BaseModel):
 
     filename: str
     asset_id: str
+    artifact_namespace: str = "skills"
+    artifact_object_id: str
     content_hash: str
     size_bytes: int = 0
     content_type: str = "application/octet-stream"
+    url: str | None = None
+    signed_url: str | None = None
 
 
 class ImportProvenance(BaseModel):
@@ -183,7 +217,9 @@ class SkillImportRequest(BaseModel):
 
     url: str | None = None
     content: str | None = None  # inline SKILL.md or YAML content
-    format: str | None = None  # "skill_md" | "cognis_yaml" (auto-detected if None)
+    content_b64: str | None = None
+    filename: str | None = None
+    format: str | None = None  # "skill_md" | "cognis_yaml" | "cognis_package"
     name: str | None = None  # override imported name
     tags: list[str] | None = None  # override imported tags
     auto_load: bool = False

@@ -145,6 +145,15 @@ def select_static_tools(agent: Any | None = None) -> list[ToolDefinition]:
 
     disabled_categories = set(agent.tools.get("disabled_categories") or [])
     disabled_tools = set(agent.tools.get("disabled_tools") or [])
+    skill_mutation_tools = {
+        "skill_write",
+        "skill_delete",
+        "skill_import_url",
+        "skill_restore_version",
+        "skill_asset_write",
+        "skill_asset_delete",
+    }
+    allow_skill_mutations = getattr(agent, "agent_type", "primary") != "secondary"
 
     selected: list[ToolDefinition] = []
     for tool in definitions:
@@ -156,6 +165,8 @@ def select_static_tools(agent: Any | None = None) -> list[ToolDefinition]:
         if tool.category == "orchestration":
             if delegation_enabled:
                 selected.append(tool)
+            continue
+        if not allow_skill_mutations and tool.name in skill_mutation_tools:
             continue
         if (
             allow_all_builtins
@@ -178,6 +189,8 @@ def _build_handler_map(session_factory: Any, status_provider: Any) -> dict[str, 
 def build_registry_with_handlers(
     tools: list[ToolDefinition],
     handler_map: dict[str, Any],
+    *,
+    artifact_store: Any | None = None,
 ) -> ToolRegistry:
     """Build a ToolRegistry with actual handlers attached.
 
@@ -193,7 +206,7 @@ def build_registry_with_handlers(
             # Build skill handler dynamically from execution metadata
             from cognis.providers.executor.in_process import _build_skill_handler
 
-            handler = _build_skill_handler(tool)
+            handler = _build_skill_handler(tool, artifact_store=artifact_store)
         registry.register(RegisteredTool(definition=tool, handler=cast(Any, handler)))
     return registry
 
@@ -278,6 +291,7 @@ def build_step_runtime_factory(
     shared_registry: ToolRegistry,
     shared_connection: Any,
     session_factory: Any,
+    artifact_store: Any | None = None,
 ) -> RuntimeFactory:
     """Create a per-step runtime factory.
 
@@ -542,7 +556,11 @@ def build_step_runtime_factory(
                 session_factory,
                 getattr(providers.executor, "status_provider", None),
             )
-            registry = build_registry_with_handlers(agent_tools, handler_map)
+            registry = build_registry_with_handlers(
+                agent_tools,
+                handler_map,
+                artifact_store=artifact_store,
+            )
             connection = InProcessExecutorConnection(
                 shared_connection.handle,
                 registry,

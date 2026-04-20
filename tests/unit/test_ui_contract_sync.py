@@ -21,6 +21,8 @@ import pytest
 from cognis.api.models import (
     PendingPauseResponse,
     SessionResponse,
+    SkillResponse,
+    SkillVersionResponse,
     StepRunResponse,
     TaskResponse,
 )
@@ -39,6 +41,8 @@ _MODELS_TO_CHECK = (
     ("StepRun", StepRunResponse),
     ("PendingPause", PendingPauseResponse),
     ("Session", SessionResponse),
+    ("Skill", SkillResponse),
+    ("SkillVersion", SkillVersionResponse),
 )
 
 
@@ -105,6 +109,8 @@ def test_ui_interface_covers_api_model_fields(interface_name: str, model_cls: ty
         "StepRun": set(),
         "PendingPause": set(),
         "Session": set(),
+        "Skill": set(),
+        "SkillVersion": set(),
     }.get(interface_name, set())
     missing -= allowed_missing
 

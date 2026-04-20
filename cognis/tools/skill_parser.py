@@ -164,6 +164,8 @@ def parse_cognis_yaml(content: str) -> dict[str, Any]:
         "tools": [tool.model_dump(mode="json") for tool in tools],
         "prompt_templates": data.get("prompt_templates") or {},
         "secret_placeholders": data.get("secret_placeholders") or [],
+        "provenance": data.get("provenance") or None,
+        "asset_manifest": data.get("asset_manifest") or [],
         "schema_version": data.get("schema_version", 1),
     }
 
@@ -224,6 +226,8 @@ def compute_content_hash(
     instructions: str,
     tools: list[dict[str, Any]] | None = None,
     prompt_templates: dict[str, Any] | None = None,
+    secret_placeholders: list[str] | None = None,
+    asset_manifest: list[dict[str, Any]] | None = None,
 ) -> str:
     """Compute SHA-256 hash of canonical skill content."""
     import json
@@ -233,6 +237,8 @@ def compute_content_hash(
             "instructions": instructions,
             "tools": tools or [],
             "prompt_templates": prompt_templates or {},
+            "secret_placeholders": secret_placeholders or [],
+            "asset_manifest": asset_manifest or [],
         },
         sort_keys=True,
         ensure_ascii=True,
@@ -286,7 +292,10 @@ def export_cognis_yaml(data: SkillExportData) -> str:
     if data.provenance:
         export_dict["provenance"] = data.provenance.model_dump(mode="json", exclude_none=True)
     if data.asset_manifest:
-        export_dict["asset_manifest"] = [a.model_dump(mode="json") for a in data.asset_manifest]
+        export_dict["asset_manifest"] = [
+            a.model_dump(mode="json", exclude_none=True, exclude={"url", "signed_url"})
+            for a in data.asset_manifest
+        ]
 
     return yaml.dump(export_dict, default_flow_style=False, sort_keys=False)
 

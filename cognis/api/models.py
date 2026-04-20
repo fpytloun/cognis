@@ -843,6 +843,26 @@ class MCPServerTestResponse(BaseModel):
     items: list[MCPServerTestItemResponse] = Field(default_factory=list)
 
 
+class SkillAssetResponse(BaseModel):
+    filename: str
+    asset_id: str
+    artifact_namespace: str
+    artifact_object_id: str
+    content_hash: str
+    size_bytes: int
+    content_type: str
+    url: str | None = None
+
+
+class SkillAssetInput(BaseModel):
+    filename: str
+    existing_asset_id: str | None = None
+    source_artifact_id: str | None = None
+    content: str | None = None
+    content_b64: str | None = None
+    content_type: str | None = None
+
+
 class SkillVersionResponse(BaseModel):
     version_id: str
     skill_id: str
@@ -859,7 +879,7 @@ class SkillVersionResponse(BaseModel):
     import_checksum: str | None = None
     imported_at: datetime | None = None
     import_format: str | None = None
-    asset_manifest: list[dict[str, Any]] | None = None
+    asset_manifest: list[SkillAssetResponse] | None = None
     created_at: datetime | None = None
 
 
@@ -892,6 +912,7 @@ class SkillCreateRequest(BaseModel):
     attach_to_all_agents: bool | None = None
     auto_load: bool | None = None
     secret_placeholders: list[str] | None = None
+    assets: list[SkillAssetInput] | None = None
 
 
 class SkillUpdateRequest(BaseModel):
@@ -904,11 +925,14 @@ class SkillUpdateRequest(BaseModel):
     attach_to_all_agents: bool | None = None
     auto_load: bool | None = None
     secret_placeholders: list[str] | None = None
+    assets: list[SkillAssetInput] | None = None
 
 
 class SkillImportRequest(BaseModel):
     url: str | None = None
     content: str | None = None
+    content_b64: str | None = None
+    filename: str | None = None
     format: str | None = None
     name: str | None = None
     tags: list[str] | None = None
@@ -918,8 +942,11 @@ class SkillImportRequest(BaseModel):
 
 class SkillExportResponse(BaseModel):
     format: str
-    content: str
+    content: str | None = None
+    content_b64: str | None = None
+    content_type: str | None = None
     filename: str
+    warnings: list[str] = Field(default_factory=list)
 
 
 class ExecutorStatusResponse(BaseModel):

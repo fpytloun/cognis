@@ -18,6 +18,11 @@ from cognis.tools.skill_parser import (
     parse_skill_md,
     resolve_github_url,
 )
+from cognis.tools.skill_service import (
+    export_cognis_package,
+    normalize_skill_asset_filename,
+    parse_cognis_package,
+)
 from cognis.tools.skills import (
     build_available_skills_metadata,
     discoverable_skill_tools_to_definitions,
@@ -217,6 +222,35 @@ def test_compute_content_hash_differs_on_change() -> None:
     assert h1 != h2
 
 
+def test_compute_content_hash_differs_for_assets_and_placeholders() -> None:
+    asset_manifest = [
+        {
+            "filename": "tool.py",
+            "asset_id": "sa_123",
+            "artifact_namespace": "skills",
+            "artifact_object_id": "ska_123",
+            "content_hash": "abc",
+            "size_bytes": 10,
+            "content_type": "text/x-python",
+        }
+    ]
+    h1 = compute_content_hash(
+        "instructions",
+        [{"name": "t"}],
+        {"k": "v"},
+        ["API_KEY"],
+        asset_manifest,
+    )
+    h2 = compute_content_hash(
+        "instructions",
+        [{"name": "t"}],
+        {"k": "v"},
+        ["API_KEY"],
+        [],
+    )
+    assert h1 != h2
+
+
 # ---------------------------------------------------------------------------
 # Export
 # ---------------------------------------------------------------------------
@@ -259,6 +293,37 @@ def test_export_cognis_yaml_round_trip() -> None:
     parsed = parse_cognis_yaml(exported)
     assert parsed["name"] == "yaml-skill"
     assert parsed["instructions"] == "Do things"
+
+
+def test_export_cognis_package_round_trip() -> None:
+    from cognis.models.skill import SkillAssetRef, SkillExportData
+
+    data = SkillExportData(
+        name="packaged-skill",
+        description="Package test",
+        instructions="Use the packaged asset.",
+        asset_manifest=[
+            SkillAssetRef(
+                filename="scripts/run.py",
+                asset_id="sa_1",
+                artifact_namespace="skills",
+                artifact_object_id="ska_1",
+                content_hash="abc",
+                size_bytes=14,
+                content_type="text/x-python",
+            )
+        ],
+    )
+    exported = export_cognis_package(data, {"scripts/run.py": b"print('hello')\n"})
+    parsed, _member = parse_cognis_package(exported)
+    assert parsed["name"] == "packaged-skill"
+    assert parsed["instructions"] == "Use the packaged asset."
+    assert parsed["assets"][0]["filename"] == "scripts/run.py"
+
+
+def test_normalize_skill_asset_filename_preserves_dotfiles() -> None:
+    assert normalize_skill_asset_filename(".env") == ".env"
+    assert normalize_skill_asset_filename("./.config/toolrc") == ".config/toolrc"
 
 
 # ---------------------------------------------------------------------------
@@ -527,7 +592,7 @@ def test_skill_management_tool_count() -> None:
     from cognis.tools.builtin.skill_management import skill_management_tools
 
     tools = skill_management_tools()
-    assert len(tools) == 7  # list, load, get, write, delete, import_url, export
+    assert len(tools) == 11
 
 
 # ---------------------------------------------------------------------------

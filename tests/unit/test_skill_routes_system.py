@@ -154,3 +154,160 @@ def test_reset_system_skill_is_idempotent_when_already_default(
 
         assert reset.status_code == 200
         assert reset.json()["current_version_id"] == original_version
+
+
+def test_skill_update_can_attach_artifact_backed_asset(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        asyncio.run(_seed_user(client.app))
+        headers = _auth_headers(client.app, email="user@example.com")
+
+        created = client.post(
+            "/api/v1/skills",
+            headers=headers,
+            json={"name": "Asset Skill", "instructions": "hello"},
+        )
+        assert created.status_code == 201
+        skill_id = created.json()["skill_id"]
+
+        uploaded = client.post(
+            "/api/v1/artifacts/upload",
+            headers=headers,
+            data={"purpose": "skill_asset"},
+            files={"file": ("tool.py", b"print('hi')\n", "text/x-python")},
+        )
+        assert uploaded.status_code == 200
+        artifact_id = uploaded.json()["artifact_id"]
+
+        updated = client.put(
+            f"/api/v1/skills/{skill_id}",
+            headers=headers,
+            json={
+                "assets": [
+                    {
+                        "filename": "scripts/tool.py",
+                        "source_artifact_id": artifact_id,
+                        "content_type": "text/x-python",
+                    }
+                ]
+            },
+        )
+        assert updated.status_code == 200
+        body = updated.json()
+        assert body["current_version"]["asset_manifest"][0]["filename"] == "scripts/tool.py"
+        assert body["current_version"]["asset_manifest"][0]["artifact_namespace"] == "skills"
+        assert body["current_version"]["asset_manifest"][0]["url"] is not None
+
+
+def test_skill_version_can_be_restored(monkeypatch: object, tmp_path: Path) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        asyncio.run(_seed_user(client.app))
+        headers = _auth_headers(client.app, email="user@example.com")
+
+        created = client.post(
+            "/api/v1/skills",
+            headers=headers,
+            json={"name": "Versioned", "instructions": "one"},
+        )
+        assert created.status_code == 201
+        skill_id = created.json()["skill_id"]
+        first_version_id = created.json()["current_version_id"]
+
+        updated = client.put(
+            f"/api/v1/skills/{skill_id}",
+            headers=headers,
+            json={"instructions": "two"},
+        )
+        assert updated.status_code == 200
+        assert updated.json()["current_version_id"] != first_version_id
+
+        restored = client.post(
+            f"/api/v1/skills/{skill_id}/versions/{first_version_id}/restore",
+            headers=headers,
+        )
+        assert restored.status_code == 200
+        assert restored.json()["current_version_id"] == first_version_id
+        assert restored.json()["instructions"] == "one"
+
+
+def test_skill_update_with_identical_content_does_not_create_new_version(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        asyncio.run(_seed_user(client.app))
+        headers = _auth_headers(client.app, email="user@example.com")
+
+        created = client.post(
+            "/api/v1/skills",
+            headers=headers,
+            json={"name": "Stable", "instructions": "same"},
+        )
+        assert created.status_code == 201
+        current_version_id = created.json()["current_version_id"]
+
+        updated = client.put(
+            f"/api/v1/skills/{created.json()['skill_id']}",
+            headers=headers,
+            json={"instructions": "same"},
+        )
+        assert updated.status_code == 200
+        assert updated.json()["current_version_id"] == current_version_id
+
+
+def test_skill_metadata_edit_with_existing_assets_does_not_create_new_version(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        asyncio.run(_seed_user(client.app))
+        headers = _auth_headers(client.app, email="user@example.com")
+
+        created = client.post(
+            "/api/v1/skills",
+            headers=headers,
+            json={"name": "Asset Stable", "instructions": "hello"},
+        )
+        assert created.status_code == 201
+        skill_id = created.json()["skill_id"]
+
+        uploaded = client.post(
+            "/api/v1/artifacts/upload",
+            headers=headers,
+            data={"purpose": "skill_asset"},
+            files={"file": ("tool.py", b"print('hi')\n", "text/x-python")},
+        )
+        assert uploaded.status_code == 200
+
+        updated = client.put(
+            f"/api/v1/skills/{skill_id}",
+            headers=headers,
+            json={
+                "assets": [
+                    {
+                        "filename": "scripts/tool.py",
+                        "source_artifact_id": uploaded.json()["artifact_id"],
+                        "content_type": "text/x-python",
+                    }
+                ]
+            },
+        )
+        assert updated.status_code == 200
+        current_version_id = updated.json()["current_version_id"]
+        asset_manifest = updated.json()["current_version"]["asset_manifest"]
+
+        metadata_only = client.put(
+            f"/api/v1/skills/{skill_id}",
+            headers=headers,
+            json={
+                "name": "Asset Stable Renamed",
+                "assets": [
+                    {
+                        "filename": asset_manifest[0]["filename"],
+                        "existing_asset_id": asset_manifest[0]["asset_id"],
+                        "content_type": asset_manifest[0]["content_type"],
+                    }
+                ],
+            },
+        )
+        assert metadata_only.status_code == 200
+        assert metadata_only.json()["current_version_id"] == current_version_id

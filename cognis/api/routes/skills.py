@@ -1,13 +1,15 @@
-"""Skill CRUD, import/export, and versioning routes."""
+"""Skill CRUD, import/export, versioning, and asset-aware routes."""
 
 from __future__ import annotations
 
+import base64
 from typing import Any
 
 from fastapi import APIRouter, Request
 
-from cognis.api.common import api_exception, require_current_user
+from cognis.api.common import api_exception, forbid_mutation_for_viewer, require_current_user
 from cognis.api.models import (
+    SkillAssetResponse,
     SkillCreateRequest,
     SkillExportResponse,
     SkillImportRequest,
@@ -16,32 +18,37 @@ from cognis.api.models import (
     SkillVersionResponse,
 )
 from cognis.core.system_skills import get_system_skill_default
+from cognis.models.skill import ImportProvenance, SkillExportData
 from cognis.store.queries import (
     create_skill,
-    create_skill_version,
     delete_skill,
     get_next_version_number,
     get_skill_scoped,
-    get_skill_version,
     list_skill_versions,
     list_skills,
     reset_skill_to_defaults,
     set_current_version,
     update_skill,
 )
-from cognis.tools.skill_parser import (
-    compute_content_hash,
-    export_cognis_yaml,
-    export_skill_md,
-    parse_skill_content,
+from cognis.tools.skill_import import import_skill_from_url
+from cognis.tools.skill_parser import export_cognis_yaml, export_skill_md, parse_skill_content
+from cognis.tools.skill_service import (
+    asset_refs_to_inputs,
+    create_skill_version_with_assets,
+    export_cognis_package,
+    load_export_assets,
+    load_skill_asset_refs,
+    normalize_prompt_templates,
+    normalize_secret_placeholders,
+    normalize_skill_tools,
+    parse_cognis_package,
+    resolve_current_skill_version,
 )
 
 router = APIRouter(tags=["skills"])
 
 
 def _coerce_tools_list(value: Any) -> list[dict[str, Any]] | None:
-    """Normalize legacy dict-shaped skill tool persistence into list[dict]."""
-
     if value is None:
         return None
     if isinstance(value, list):
@@ -51,7 +58,16 @@ def _coerce_tools_list(value: Any) -> list[dict[str, Any]] | None:
     return None
 
 
-def _version_to_response(row: Any) -> SkillVersionResponse:
+def _asset_to_response(ref: Any) -> SkillAssetResponse:
+    payload = ref.model_dump(mode="json") if hasattr(ref, "model_dump") else ref
+    return SkillAssetResponse.model_validate(payload)
+
+
+def _version_to_response(
+    row: Any,
+    *,
+    asset_refs: list[Any] | None = None,
+) -> SkillVersionResponse:
     return SkillVersionResponse(
         version_id=row.version_id,
         skill_id=row.skill_id,
@@ -68,20 +84,32 @@ def _version_to_response(row: Any) -> SkillVersionResponse:
         import_checksum=row.import_checksum,
         imported_at=row.imported_at,
         import_format=row.import_format,
-        asset_manifest=row.asset_manifest,
+        asset_manifest=[_asset_to_response(asset) for asset in (asset_refs or [])],
         created_at=row.created_at,
     )
 
 
-def _skill_to_response(row: Any, version_row: Any | None = None) -> SkillResponse:
-    current_version = _version_to_response(version_row) if version_row else None
+def _skill_to_response(
+    row: Any,
+    *,
+    version_row: Any | None = None,
+    asset_refs: list[Any] | None = None,
+) -> SkillResponse:
+    current_version = (
+        _version_to_response(version_row, asset_refs=asset_refs) if version_row is not None else None
+    )
+    instructions = version_row.instructions if version_row is not None else row.instructions
+    tools = _coerce_tools_list(version_row.tools if version_row is not None else row.tools)
+    prompt_templates = (
+        version_row.prompt_templates if version_row is not None else row.prompt_templates
+    )
     return SkillResponse(
         skill_id=row.skill_id,
         name=row.name,
         description=row.description,
-        instructions=row.instructions,
-        tools=_coerce_tools_list(row.tools),
-        prompt_templates=row.prompt_templates,
+        instructions=instructions,
+        tools=tools,
+        prompt_templates=prompt_templates,
         tags=row.tags,
         attach_to_all_agents=row.auto_load,
         auto_load=row.auto_load,
@@ -104,19 +132,72 @@ def _resolve_attach_to_all_agents(
     return bool(legacy) if legacy is not None else False
 
 
+async def _load_skill_response(request: Request, session: Any, row: Any) -> SkillResponse:
+    artifact_store = request.app.state.artifact_store
+    version_row = await resolve_current_skill_version(session, row)
+    asset_refs = []
+    if version_row is not None:
+        asset_refs = await load_skill_asset_refs(session, version_row, artifact_store=artifact_store)
+    return _skill_to_response(row, version_row=version_row, asset_refs=asset_refs)
+
+
+def _provenance_from_payload(data: dict[str, Any], fallback_format: str | None = None) -> ImportProvenance | None:
+    raw = data.get("provenance")
+    if not isinstance(raw, dict):
+        if fallback_format is None:
+            return None
+        return ImportProvenance(import_format=fallback_format)
+    payload = dict(raw)
+    if fallback_format and not payload.get("import_format"):
+        payload["import_format"] = fallback_format
+    return ImportProvenance.model_validate(payload)
+
+
+def _asset_inputs_from_request(items: list[Any] | None) -> list[dict[str, Any]] | None:
+    if items is None:
+        return None
+    return [item.model_dump(exclude_none=True) if hasattr(item, "model_dump") else dict(item) for item in items]
+
+
+def _canonical_asset_inputs(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    canonical: list[dict[str, Any]] = []
+    for item in items:
+        payload = dict(item)
+        if payload.get("existing_asset_id"):
+            payload.pop("content_type", None)
+        canonical.append(payload)
+    return canonical
+
+
+def _export_warnings(format_name: str, export_data: SkillExportData) -> list[str]:
+    warnings: list[str] = []
+    if format_name == "skill_md":
+        if export_data.asset_manifest:
+            warnings.append(
+                "SKILL.md export drops embedded asset files. Use cognis_package for a full-fidelity export."
+            )
+        if export_data.prompt_templates:
+            warnings.append(
+                "SKILL.md export preserves prompt_templates as Cognis-only frontmatter. Other runtimes may ignore them."
+            )
+        if export_data.secret_placeholders:
+            warnings.append(
+                "SKILL.md export preserves secret_placeholders as Cognis-only frontmatter. Other runtimes may ignore them."
+            )
+    if format_name == "cognis_yaml" and export_data.asset_manifest:
+        warnings.append(
+            "Cognis YAML export includes asset metadata only. Use cognis_package for a portable export with files included."
+        )
+    return warnings
+
+
 @router.get("/api/v1/skills", response_model=list[SkillResponse])
 async def list_skills_route(request: Request) -> list[SkillResponse]:
     user = require_current_user(request)
     async with request.app.state.session_factory() as session:
         rows = await list_skills(session, owner_email=user.email)
-        # Hydrate current versions for all skills that have one
-        version_map: dict[str, Any] = {}
-        for row in rows:
-            if row.current_version_id:
-                ver = await get_skill_version(session, row.current_version_id)
-                if ver:
-                    version_map[row.skill_id] = ver
-    return [_skill_to_response(row, version_map.get(row.skill_id)) for row in rows]
+        responses = [await _load_skill_response(request, session, row) for row in rows]
+    return responses
 
 
 @router.get("/api/v1/skills/{skill_id}", response_model=SkillResponse)
@@ -126,106 +207,186 @@ async def get_skill_route(request: Request, skill_id: str) -> SkillResponse:
         row = await get_skill_scoped(session, skill_id, owner_email=user.email)
         if row is None:
             raise api_exception(404, "not_found", "Skill not found")
-        version_row = None
-        if row.current_version_id:
-            version_row = await get_skill_version(session, row.current_version_id)
-    return _skill_to_response(row, version_row)
+        return await _load_skill_response(request, session, row)
 
 
 @router.post("/api/v1/skills", response_model=SkillResponse, status_code=201)
 async def create_skill_route(request: Request, body: SkillCreateRequest) -> SkillResponse:
+    forbid_mutation_for_viewer(request)
     user = require_current_user(request)
+    try:
+        tools = normalize_skill_tools(body.tools)
+        prompt_templates = normalize_prompt_templates(body.prompt_templates)
+        secret_placeholders = normalize_secret_placeholders(body.secret_placeholders)
+        assets = _asset_inputs_from_request(body.assets)
+    except ValueError as exc:
+        raise api_exception(400, "validation_error", str(exc)) from exc
     async with request.app.state.session_factory() as session:
         row = await create_skill(
             session,
             name=body.name,
             description=body.description,
             instructions=body.instructions,
-            tools=body.tools,
-            prompt_templates=body.prompt_templates,
+            tools=tools,
+            prompt_templates=prompt_templates,
             tags=body.tags,
             auto_load=_resolve_attach_to_all_agents(body),
             owner_email=user.email,
         )
-        # Create initial version
-        content_hash = compute_content_hash(body.instructions, body.tools, body.prompt_templates)
-        version_row = await create_skill_version(
-            session,
-            skill_id=row.skill_id,
-            version_number=1,
-            content_hash=content_hash,
-            instructions=body.instructions,
-            tools=body.tools,
-            prompt_templates=body.prompt_templates,
-            secret_placeholders=body.secret_placeholders,
-        )
+        try:
+            version_row = await create_skill_version_with_assets(
+                session,
+                request.app.state.artifact_store,
+                skill_id=row.skill_id,
+                version_number=1,
+                owner_email=user.email,
+                instructions=body.instructions,
+                tools=tools,
+                prompt_templates=prompt_templates,
+                secret_placeholders=secret_placeholders,
+                assets=assets,
+                allow_binary_assets=True,
+            )
+        except ValueError as exc:
+            raise api_exception(400, "validation_error", str(exc)) from exc
         await set_current_version(session, row.skill_id, version_row.version_id)
         row.current_version_id = version_row.version_id
         await session.commit()
-    return _skill_to_response(row, version_row)
+        return await _load_skill_response(request, session, row)
 
 
 @router.put("/api/v1/skills/{skill_id}", response_model=SkillResponse)
 async def update_skill_route(
     request: Request, skill_id: str, body: SkillUpdateRequest
 ) -> SkillResponse:
+    forbid_mutation_for_viewer(request)
     user = require_current_user(request)
     updates = body.model_dump(exclude_none=True)
     if not updates:
         raise api_exception(400, "validation_error", "No fields to update")
-    if "attach_to_all_agents" in updates:
-        updates["auto_load"] = updates.pop("attach_to_all_agents")
     async with request.app.state.session_factory() as session:
         row = await get_skill_scoped(session, skill_id, owner_email=user.email)
         if row is None:
             raise api_exception(404, "not_found", "Skill not found")
+        current_version = await resolve_current_skill_version(session, row)
+        current_assets = (
+            await load_skill_asset_refs(session, current_version) if current_version is not None else []
+        )
+
         try:
-            row = await update_skill(session, skill_id, owner_email=user.email, **updates)
+            instructions = body.instructions
+            if instructions is None:
+                instructions = (
+                    current_version.instructions if current_version is not None else row.instructions
+                )
+            tools = normalize_skill_tools(body.tools) if body.tools is not None else (
+                current_version.tools if current_version is not None else row.tools
+            )
+            prompt_templates = (
+                normalize_prompt_templates(body.prompt_templates)
+                if body.prompt_templates is not None
+                else (
+                    current_version.prompt_templates
+                    if current_version is not None
+                    else row.prompt_templates
+                )
+            )
+            secret_placeholders = (
+                normalize_secret_placeholders(body.secret_placeholders)
+                if body.secret_placeholders is not None
+                else (current_version.secret_placeholders if current_version is not None else None)
+            )
+            asset_inputs = (
+                _asset_inputs_from_request(body.assets)
+                if body.assets is not None
+                else asset_refs_to_inputs(current_assets)
+            )
+        except ValueError as exc:
+            raise api_exception(400, "validation_error", str(exc)) from exc
+
+        metadata_updates: dict[str, Any] = {}
+        if body.name is not None:
+            metadata_updates["name"] = body.name
+        if body.description is not None:
+            metadata_updates["description"] = body.description
+        if body.tags is not None:
+            metadata_updates["tags"] = body.tags
+        if body.attach_to_all_agents is not None or body.auto_load is not None:
+            metadata_updates["auto_load"] = _resolve_attach_to_all_agents(body)
+
+        current_instructions = current_version.instructions if current_version is not None else row.instructions
+        current_tools = current_version.tools if current_version is not None else row.tools
+        current_templates = (
+            current_version.prompt_templates if current_version is not None else row.prompt_templates
+        )
+        current_placeholders = (
+            current_version.secret_placeholders if current_version is not None else None
+        )
+        current_asset_inputs = _canonical_asset_inputs(asset_refs_to_inputs(current_assets))
+        comparable_asset_inputs = _canonical_asset_inputs(asset_inputs)
+        content_changed = (
+            (body.instructions is not None and instructions != current_instructions)
+            or (body.tools is not None and (tools or []) != (current_tools or []))
+            or (body.prompt_templates is not None and (prompt_templates or {}) != (current_templates or {}))
+            or (body.secret_placeholders is not None and (secret_placeholders or []) != (current_placeholders or []))
+            or (body.assets is not None and comparable_asset_inputs != current_asset_inputs)
+        )
+        if content_changed:
+            metadata_updates.update(
+                {
+                    "instructions": instructions,
+                    "tools": tools,
+                    "prompt_templates": prompt_templates,
+                }
+            )
+
+        try:
+            updated_row = await update_skill(
+                session,
+                skill_id,
+                owner_email=user.email,
+                **metadata_updates,
+            )
         except ValueError as exc:
             message = str(exc)
             if message == "Cannot modify system skills directly":
                 raise api_exception(403, "forbidden", message) from exc
             raise api_exception(400, "validation_error", message) from exc
-        if row is None:
+        if updated_row is None:
             raise api_exception(404, "not_found", "Skill not found")
 
-        # Create new version if content changed
-        version_row = None
-        content_fields = {"instructions", "tools", "prompt_templates", "secret_placeholders"}
-        if content_fields & set(updates.keys()):
-            instructions = updates.get("instructions", row.instructions)
-            tools = updates.get("tools", row.tools)
-            templates = updates.get("prompt_templates", row.prompt_templates)
-            # Preserve existing secret_placeholders if not explicitly updated
-            prev_placeholders = None
-            if row.current_version_id:
-                prev_ver = await get_skill_version(session, row.current_version_id)
-                if prev_ver:
-                    prev_placeholders = prev_ver.secret_placeholders
-            secret_placeholders = updates.get("secret_placeholders", prev_placeholders)
-            content_hash = compute_content_hash(instructions, tools, templates)
-            next_num = await get_next_version_number(session, skill_id)
-            version_row = await create_skill_version(
-                session,
-                skill_id=skill_id,
-                version_number=next_num,
-                content_hash=content_hash,
-                instructions=instructions,
-                tools=tools,
-                prompt_templates=templates,
-                secret_placeholders=secret_placeholders,
-            )
+        if content_changed:
+            try:
+                version_row = await create_skill_version_with_assets(
+                    session,
+                    request.app.state.artifact_store,
+                    skill_id=skill_id,
+                    version_number=await get_next_version_number(session, skill_id),
+                    owner_email=user.email,
+                    instructions=instructions,
+                    tools=tools,
+                    prompt_templates=prompt_templates,
+                    secret_placeholders=secret_placeholders,
+                    assets=asset_inputs,
+                    allow_binary_assets=True,
+                    source_url=current_version.source_url if current_version is not None else None,
+                    resolved_url=current_version.resolved_url if current_version is not None else None,
+                    commit_sha=current_version.commit_sha if current_version is not None else None,
+                    import_checksum=current_version.import_checksum if current_version is not None else None,
+                    imported_at=current_version.imported_at if current_version is not None else None,
+                    import_format=current_version.import_format if current_version is not None else None,
+                )
+            except ValueError as exc:
+                raise api_exception(400, "validation_error", str(exc)) from exc
             await set_current_version(session, skill_id, version_row.version_id)
-            row.current_version_id = version_row.version_id
-        elif row.current_version_id:
-            version_row = await get_skill_version(session, row.current_version_id)
-
+            updated_row.current_version_id = version_row.version_id
         await session.commit()
-    return _skill_to_response(row, version_row)
+        return await _load_skill_response(request, session, updated_row)
 
 
 @router.delete("/api/v1/skills/{skill_id}", status_code=204)
 async def delete_skill_route(request: Request, skill_id: str) -> None:
+    forbid_mutation_for_viewer(request)
     user = require_current_user(request)
     async with request.app.state.session_factory() as session:
         row = await get_skill_scoped(session, skill_id, owner_email=user.email)
@@ -244,6 +405,7 @@ async def delete_skill_route(request: Request, skill_id: str) -> None:
 
 @router.post("/api/v1/skills/{skill_id}/reset", response_model=SkillResponse)
 async def reset_skill_route(request: Request, skill_id: str) -> SkillResponse:
+    forbid_mutation_for_viewer(request)
     user = require_current_user(request)
     if user.role != "admin":
         raise api_exception(403, "forbidden", "Only admins can reset system skills")
@@ -256,63 +418,65 @@ async def reset_skill_route(request: Request, skill_id: str) -> SkillResponse:
         defaults = get_system_skill_default(skill_id)
         if defaults is None:
             raise api_exception(404, "not_found", "System skill defaults not found")
-
-        current_hash = compute_content_hash(
-            row.instructions,
-            row.tools,
-            row.prompt_templates,
+        current_version = await resolve_current_skill_version(session, row)
+        current_tools = current_version.tools if current_version is not None else row.tools
+        current_templates = (
+            current_version.prompt_templates if current_version is not None else row.prompt_templates
         )
-        default_hash = compute_content_hash(
-            str(defaults["instructions"]),
-            defaults.get("tools"),
-            defaults.get("prompt_templates"),
+        current_assets = (
+            await load_skill_asset_refs(session, current_version) if current_version is not None else []
         )
-        if current_hash == default_hash:
-            version_row = None
-            if row.current_version_id:
-                version_row = await get_skill_version(session, row.current_version_id)
-            return _skill_to_response(row, version_row)
-
-        row = await reset_skill_to_defaults(
-            session,
-            skill_id,
-            name=str(defaults["name"]),
-            description=(
-                str(defaults["description"]) if defaults.get("description") is not None else None
-            ),
-            instructions=str(defaults["instructions"]),
-            tools=defaults.get("tools"),
-            prompt_templates=defaults.get("prompt_templates"),
-            tags=list(defaults["tags"]),
-            auto_load=False,
-        )
+        if (
+            row.name == str(defaults["name"])
+            and row.description
+            == (str(defaults["description"]) if defaults.get("description") is not None else None)
+            and (current_version.instructions if current_version is not None else row.instructions)
+            == str(defaults["instructions"])
+            and current_tools == normalize_skill_tools(defaults.get("tools"))
+            and current_templates == normalize_prompt_templates(defaults.get("prompt_templates"))
+            and (row.tags or []) == list(defaults["tags"])
+            and not row.auto_load
+            and not current_assets
+        ):
+            return await _load_skill_response(request, session, row)
+        try:
+            row = await reset_skill_to_defaults(
+                session,
+                skill_id,
+                name=str(defaults["name"]),
+                description=str(defaults["description"]) if defaults.get("description") is not None else None,
+                instructions=str(defaults["instructions"]),
+                tools=normalize_skill_tools(defaults.get("tools")),
+                prompt_templates=normalize_prompt_templates(defaults.get("prompt_templates")),
+                tags=list(defaults["tags"]),
+                auto_load=False,
+            )
+        except ValueError as exc:
+            raise api_exception(400, "validation_error", str(exc)) from exc
         assert row is not None
-
-        content_hash = compute_content_hash(row.instructions, row.tools, row.prompt_templates)
-        next_num = await get_next_version_number(session, skill_id)
-        version_row = await create_skill_version(
-            session,
-            skill_id=skill_id,
-            version_number=next_num,
-            content_hash=content_hash,
-            instructions=row.instructions,
-            tools=row.tools,
-            prompt_templates=row.prompt_templates,
-            secret_placeholders=None,
-        )
+        try:
+            version_row = await create_skill_version_with_assets(
+                session,
+                request.app.state.artifact_store,
+                skill_id=skill_id,
+                version_number=await get_next_version_number(session, skill_id),
+                owner_email=user.email,
+                instructions=row.instructions,
+                tools=row.tools,
+                prompt_templates=row.prompt_templates,
+                secret_placeholders=None,
+                assets=None,
+                allow_binary_assets=True,
+            )
+        except ValueError as exc:
+            raise api_exception(400, "validation_error", str(exc)) from exc
         await set_current_version(session, row.skill_id, version_row.version_id)
         row.current_version_id = version_row.version_id
         await session.commit()
-    return _skill_to_response(row, version_row)
+        return await _load_skill_response(request, session, row)
 
 
-# --- Versions ---
-
-
-@router.get(
-    "/api/v1/skills/{skill_id}/versions",
-    response_model=list[SkillVersionResponse],
-)
+@router.get("/api/v1/skills/{skill_id}/versions", response_model=list[SkillVersionResponse])
 async def list_skill_versions_route(request: Request, skill_id: str) -> list[SkillVersionResponse]:
     user = require_current_user(request)
     async with request.app.state.session_factory() as session:
@@ -320,41 +484,90 @@ async def list_skill_versions_route(request: Request, skill_id: str) -> list[Ski
         if row is None:
             raise api_exception(404, "not_found", "Skill not found")
         versions = await list_skill_versions(session, skill_id)
-    return [_version_to_response(v) for v in versions]
+        return [
+            _version_to_response(
+                version,
+                asset_refs=await load_skill_asset_refs(
+                    session,
+                    version,
+                    artifact_store=request.app.state.artifact_store,
+                ),
+            )
+            for version in versions
+        ]
 
 
-# --- Import / Export ---
+@router.post("/api/v1/skills/{skill_id}/versions/{version_id}/restore", response_model=SkillResponse)
+async def restore_skill_version_route(
+    request: Request,
+    skill_id: str,
+    version_id: str,
+) -> SkillResponse:
+    forbid_mutation_for_viewer(request)
+    user = require_current_user(request)
+    async with request.app.state.session_factory() as session:
+        row = await get_skill_scoped(session, skill_id, owner_email=user.email)
+        if row is None:
+            raise api_exception(404, "not_found", "Skill not found")
+        if row.is_system:
+            raise api_exception(403, "forbidden", "System skills cannot be restored")
+        versions = {version.version_id: version for version in await list_skill_versions(session, skill_id)}
+        version_row = versions.get(version_id)
+        if version_row is None:
+            raise api_exception(404, "not_found", "Skill version not found")
+        await set_current_version(session, skill_id, version_id)
+        row.current_version_id = version_id
+        row.instructions = version_row.instructions
+        row.tools = version_row.tools
+        row.prompt_templates = version_row.prompt_templates
+        await session.commit()
+        return await _load_skill_response(request, session, row)
 
 
 @router.post("/api/v1/skills/import", response_model=SkillResponse, status_code=201)
 async def import_skill_route(request: Request, body: SkillImportRequest) -> SkillResponse:
-    """Import a skill from URL or inline content."""
+    forbid_mutation_for_viewer(request)
     user = require_current_user(request)
 
-    if body.url:
-        from cognis.tools.skill_import import import_skill_from_url
-
-        try:
+    provenance: ImportProvenance | None = None
+    try:
+        if body.url:
             skill_data, provenance = await import_skill_from_url(body.url)
-        except ValueError as exc:
-            raise api_exception(400, "validation_error", str(exc)) from exc
-    elif body.content:
-        try:
+        elif body.content_b64:
+            try:
+                raw_content = base64.b64decode(body.content_b64, validate=True)
+            except Exception as exc:
+                raise api_exception(400, "validation_error", "content_b64 must be valid base64") from exc
+            import_format = body.format or (
+                "cognis_package"
+                if (body.filename or "").lower().endswith(".zip")
+                else None
+            )
+            if import_format == "cognis_package":
+                skill_data, _member = parse_cognis_package(raw_content)
+                provenance = _provenance_from_payload(skill_data, "cognis_package")
+            else:
+                text_content = raw_content.decode("utf-8")
+                skill_data = parse_skill_content(text_content, format=import_format)
+                provenance = _provenance_from_payload(skill_data, import_format)
+        elif body.content:
             skill_data = parse_skill_content(body.content, format=body.format)
-        except ValueError as exc:
-            raise api_exception(400, "validation_error", str(exc)) from exc
-        provenance = None
-    else:
-        raise api_exception(400, "validation_error", "Either 'url' or 'content' is required")
-
-    name = body.name or skill_data.get("name") or "Imported Skill"
-    instructions = skill_data.get("instructions", "")
-    tools = skill_data.get("tools")
-    templates = skill_data.get("prompt_templates")
-    tags = body.tags or skill_data.get("tags") or []
-    secret_placeholders = skill_data.get("secret_placeholders")
-
-    content_hash = compute_content_hash(instructions, tools, templates)
+            provenance = _provenance_from_payload(skill_data, body.format)
+        else:
+            raise api_exception(
+                400,
+                "validation_error",
+                "One of 'url', 'content', or 'content_b64' is required",
+            )
+        name = body.name or str(skill_data.get("name") or "Imported Skill")
+        instructions = str(skill_data.get("instructions") or "")
+        tools = normalize_skill_tools(skill_data.get("tools"))
+        prompt_templates = normalize_prompt_templates(skill_data.get("prompt_templates"))
+        secret_placeholders = normalize_secret_placeholders(skill_data.get("secret_placeholders"))
+        tags = body.tags or skill_data.get("tags") or []
+        assets = skill_data.get("assets")
+    except ValueError as exc:
+        raise api_exception(400, "validation_error", str(exc)) from exc
 
     async with request.app.state.session_factory() as session:
         row = await create_skill(
@@ -363,90 +576,110 @@ async def import_skill_route(request: Request, body: SkillImportRequest) -> Skil
             description=skill_data.get("description"),
             instructions=instructions,
             tools=tools,
-            prompt_templates=templates,
+            prompt_templates=prompt_templates,
             tags=tags,
             auto_load=_resolve_attach_to_all_agents(body),
             source="imported",
             owner_email=user.email,
         )
-        version_row = await create_skill_version(
-            session,
-            skill_id=row.skill_id,
-            version_number=1,
-            content_hash=content_hash,
-            instructions=instructions,
-            tools=tools,
-            prompt_templates=templates,
-            secret_placeholders=secret_placeholders,
-            source_url=provenance.source_url if provenance else None,
-            resolved_url=provenance.resolved_url if provenance else None,
-            commit_sha=provenance.commit_sha if provenance else None,
-            import_checksum=provenance.import_checksum if provenance else None,
-            imported_at=provenance.imported_at if provenance else None,
-            import_format=provenance.import_format if provenance else None,
-        )
+        try:
+            version_row = await create_skill_version_with_assets(
+                session,
+                request.app.state.artifact_store,
+                skill_id=row.skill_id,
+                version_number=1,
+                owner_email=user.email,
+                instructions=instructions,
+                tools=tools,
+                prompt_templates=prompt_templates,
+                secret_placeholders=secret_placeholders,
+                assets=assets if isinstance(assets, list) else None,
+                allow_binary_assets=True,
+                source_url=provenance.source_url if provenance else None,
+                resolved_url=provenance.resolved_url if provenance else None,
+                commit_sha=provenance.commit_sha if provenance else None,
+                import_checksum=provenance.import_checksum if provenance else None,
+                imported_at=provenance.imported_at if provenance else None,
+                import_format=provenance.import_format if provenance else body.format,
+            )
+        except ValueError as exc:
+            raise api_exception(400, "validation_error", str(exc)) from exc
         await set_current_version(session, row.skill_id, version_row.version_id)
         row.current_version_id = version_row.version_id
         await session.commit()
-    return _skill_to_response(row, version_row)
+        return await _load_skill_response(request, session, row)
 
 
-@router.post(
-    "/api/v1/skills/{skill_id}/export",
-    response_model=SkillExportResponse,
-)
+@router.post("/api/v1/skills/{skill_id}/export", response_model=SkillExportResponse)
 async def export_skill_route(
     request: Request,
     skill_id: str,
     format: str = "skill_md",
 ) -> SkillExportResponse:
-    """Export a skill as SKILL.md or Cognis YAML."""
     user = require_current_user(request)
+    if format not in {"skill_md", "cognis_yaml", "cognis_package"}:
+        raise api_exception(400, "validation_error", "Unsupported export format")
     async with request.app.state.session_factory() as session:
         row = await get_skill_scoped(session, skill_id, owner_email=user.email)
         if row is None:
             raise api_exception(404, "not_found", "Skill not found")
-        version_row = None
-        if row.current_version_id:
-            version_row = await get_skill_version(session, row.current_version_id)
-
-    from cognis.models.skill import ImportProvenance, SkillAssetRef, SkillExportData
+        version_row = await resolve_current_skill_version(session, row)
+        asset_refs: list[Any] = []
+        asset_bytes: dict[str, bytes] = {}
+        if version_row is not None:
+            asset_refs, asset_bytes = await load_export_assets(
+                session,
+                request.app.state.artifact_store,
+                version_row,
+            )
 
     provenance = None
-    asset_manifest: list[SkillAssetRef] = []
-    if version_row:
-        if version_row.source_url:
-            provenance = ImportProvenance(
-                source_url=version_row.source_url,
-                resolved_url=version_row.resolved_url,
-                commit_sha=version_row.commit_sha,
-                import_checksum=version_row.import_checksum,
-                imported_at=version_row.imported_at,
-                import_format=version_row.import_format,
-            )
-        if version_row.asset_manifest:
-            asset_manifest = [SkillAssetRef.model_validate(a) for a in version_row.asset_manifest]
+    if version_row is not None and version_row.source_url:
+        provenance = ImportProvenance(
+            source_url=version_row.source_url,
+            resolved_url=version_row.resolved_url,
+            commit_sha=version_row.commit_sha,
+            import_checksum=version_row.import_checksum,
+            imported_at=version_row.imported_at,
+            import_format=version_row.import_format,
+        )
 
     export_data = SkillExportData(
         name=row.name,
         description=row.description,
         tags=row.tags or [],
         auto_load=row.auto_load,
-        instructions=version_row.instructions if version_row else row.instructions,
-        tools=version_row.tools or [] if version_row else row.tools or [],
+        instructions=version_row.instructions if version_row is not None else row.instructions,
+        tools=version_row.tools or [] if version_row is not None else row.tools or [],
         prompt_templates=version_row.prompt_templates or {}
-        if version_row
+        if version_row is not None
         else row.prompt_templates or {},
-        secret_placeholders=version_row.secret_placeholders or [] if version_row else [],
+        secret_placeholders=version_row.secret_placeholders or [] if version_row is not None else [],
         provenance=provenance,
-        asset_manifest=asset_manifest,
+        asset_manifest=asset_refs,
     )
+    warnings = _export_warnings(format, export_data)
 
+    if format == "cognis_package":
+        content = export_cognis_package(export_data, asset_bytes)
+        safe_name = row.name.lower().replace(" ", "-")
+        return SkillExportResponse(
+            format=format,
+            content_b64=base64.b64encode(content).decode("ascii"),
+            content_type="application/zip",
+            filename=f"{safe_name}.cognis-skill.zip",
+            warnings=warnings,
+        )
     if format == "cognis_yaml":
         content = export_cognis_yaml(export_data)
         filename = f"{row.name.lower().replace(' ', '-')}.yaml"
     else:
         content = export_skill_md(export_data)
         filename = "SKILL.md"
-
-    return SkillExportResponse(format=format, content=content, filename=filename)
+    return SkillExportResponse(
+        format=format,
+        content=content,
+        content_type="text/plain; charset=utf-8",
+        filename=filename,
+        warnings=warnings,
+    )

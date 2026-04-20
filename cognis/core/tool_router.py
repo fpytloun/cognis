@@ -485,10 +485,18 @@ class ToolRouter:
                     arguments=dict(tool_call.arguments),
                     session_factory=self._session_factory,
                     user_email=current_user_email.get(),
+                    artifact_store=self.artifact_store,
                 )
             # Signal same-turn refresh for mutation tools so the agent loop
             # can re-resolve skills before the next model call.
-            _SKILL_MUTATION_TOOLS = {"skill_write", "skill_delete", "skill_import_url"}
+            _SKILL_MUTATION_TOOLS = {
+                "skill_write",
+                "skill_delete",
+                "skill_import_url",
+                "skill_restore_version",
+                "skill_asset_write",
+                "skill_asset_delete",
+            }
             needs_refresh = tool_call.name in _SKILL_MUTATION_TOOLS and not result.is_error
             combined_meta: dict[str, Any] = {"evaluation": eval_meta}
             if needs_refresh:

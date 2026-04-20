@@ -587,8 +587,28 @@ export interface SkillVersion {
   import_checksum: string | null;
   imported_at: string | null;
   import_format: string | null;
-  asset_manifest: Record<string, unknown>[] | null;
+  asset_manifest: SkillAsset[] | null;
   created_at: string | null;
+}
+
+export interface SkillAsset {
+  filename: string;
+  asset_id: string;
+  artifact_namespace: string;
+  artifact_object_id: string;
+  content_hash: string;
+  size_bytes: number;
+  content_type: string;
+  url: string | null;
+}
+
+export interface SkillAssetInput {
+  filename: string;
+  existing_asset_id?: string;
+  source_artifact_id?: string;
+  content?: string;
+  content_b64?: string;
+  content_type?: string;
 }
 
 export interface Skill {
@@ -620,6 +640,7 @@ export interface SkillCreate {
   attach_to_all_agents?: boolean;
   auto_load?: boolean;
   secret_placeholders?: string[];
+  assets?: SkillAssetInput[];
 }
 
 export interface SkillUpdate {
@@ -632,11 +653,14 @@ export interface SkillUpdate {
   attach_to_all_agents?: boolean;
   auto_load?: boolean;
   secret_placeholders?: string[];
+  assets?: SkillAssetInput[];
 }
 
 export interface SkillImportRequest {
   url?: string;
   content?: string;
+  content_b64?: string;
+  filename?: string;
   format?: string;
   name?: string;
   tags?: string[];
@@ -646,8 +670,11 @@ export interface SkillImportRequest {
 
 export interface SkillExportResponse {
   format: string;
-  content: string;
+  content: string | null;
+  content_b64: string | null;
+  content_type: string | null;
   filename: string;
+  warnings: string[];
 }
 
 export interface TaskDelivery {
