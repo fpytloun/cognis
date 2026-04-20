@@ -28,7 +28,7 @@ import X from 'lucide-svelte/icons/x';
   import ConfirmDialog from '$lib/components/ui/ConfirmDialog.svelte';
   import Sheet from '$lib/components/ui/Sheet.svelte';
   import Button from '$lib/components/ui/Button.svelte';
-  import Tooltip from '$lib/components/ui/Tooltip.svelte';
+  import { sidebarTooltip } from '$lib/actions/sidebarTooltip';
   import BottomTabBar from '$lib/components/BottomTabBar.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import { closeShortcutHelp, openShortcutHelp, requestCancelActiveTurn, requestChatComposerFocus, shortcutHelpOpen } from '$lib/shortcuts';
@@ -353,30 +353,36 @@ import X from 'lucide-svelte/icons/x';
           {/if}
 
           <!--
-            Nav links. Block anchors stacked by \`space-y-*\` in the
-            nav. When the sidebar is collapsed, each link becomes a
-            hover group with an inline right-side tooltip so the label
-            is still discoverable. The tooltip lives inside the \`<a>\`
-            and is positioned absolutely, so it doesn't participate in
-            layout and cannot break the sidebar's vertical stacking.
+            Nav links. When the sidebar is collapsed each link uses the
+            \`sidebarTooltip\` action, which renders the label as a
+            \`position: fixed\` element appended to \`document.body\`.
+            That way the tooltip is not a descendant of the sidebar's
+            overflow-hidden / overflow-y-auto ancestors, and can cross
+            the sidebar's right edge without forcing a horizontal
+            scrollbar on the nav column.
           -->
           <nav class={`space-y-1 ${sidebarExpanded ? 'mt-6 space-y-2' : 'mt-4'}`}>
             {#each navigationItems as item}
-              <a
-                aria-label={`Open ${item.label}`}
-                class={`group relative flex items-center rounded-2xl text-sm transition ${$page.url.pathname.startsWith(item.href) ? 'bg-sky-500/20 text-white' : 'text-slate-300 hover:bg-slate-800 hover:text-white'} ${sidebarExpanded ? 'gap-3 px-4 py-3' : 'justify-center px-2 py-3'}`}
-                href={item.href}
-              >
-                <svelte:component this={item.icon} class="h-4 w-4 shrink-0" />
-                {#if sidebarExpanded}
+              {#if sidebarExpanded}
+                <a
+                  aria-label={`Open ${item.label}`}
+                  class={`flex items-center rounded-2xl text-sm transition ${$page.url.pathname.startsWith(item.href) ? 'bg-sky-500/20 text-white' : 'text-slate-300 hover:bg-slate-800 hover:text-white'} gap-3 px-4 py-3`}
+                  href={item.href}
+                >
+                  <svelte:component this={item.icon} class="h-4 w-4 shrink-0" />
                   <span>{item.label}</span>
-                {:else}
-                  <span
-                    aria-hidden="true"
-                    class="pointer-events-none absolute left-full top-1/2 z-40 ml-3 -translate-y-1/2 whitespace-nowrap rounded-lg border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-slate-200 opacity-0 shadow-lg transition-opacity duration-100 group-hover:opacity-100 group-focus-visible:opacity-100"
-                  >{item.label}</span>
-                {/if}
-              </a>
+                </a>
+              {:else}
+                <a
+                  use:sidebarTooltip={item.label}
+                  aria-label={`Open ${item.label}`}
+                  title={item.label}
+                  class={`flex items-center justify-center rounded-2xl px-2 py-3 text-sm transition ${$page.url.pathname.startsWith(item.href) ? 'bg-sky-500/20 text-white' : 'text-slate-300 hover:bg-slate-800 hover:text-white'}`}
+                  href={item.href}
+                >
+                  <svelte:component this={item.icon} class="h-4 w-4 shrink-0" />
+                </a>
+              {/if}
             {/each}
           </nav>
         </div>
@@ -418,69 +424,59 @@ import X from 'lucide-svelte/icons/x';
             <Button class="w-full justify-center" variant="secondary" onclick={handleLogout}>Sign out</Button>
           {:else}
             <!--
-              Collapsed footer icons. Inline tooltips via group-hover on
-              each button/wrapper, same pattern as the nav items above.
-              A full Tooltip component wrapper would flip each child to
-              \`inline-flex\` which would break the vertical stack.
+              Collapsed footer icons. Each icon uses the same
+              fixed-position \`sidebarTooltip\` action as the nav links
+              above so the label crosses the sidebar edge without
+              producing a scrollbar.
             -->
             <div class="flex flex-col items-center gap-2">
-              <span class="group relative" aria-label={`WebSocket ${$wsState.status}`}>
-                <span class={`inline-flex h-2.5 w-2.5 rounded-full ${websocketStatusTone()}`}></span>
-                <span
-                  aria-hidden="true"
-                  class="pointer-events-none absolute left-full top-1/2 z-40 ml-3 -translate-y-1/2 whitespace-nowrap rounded-lg border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-slate-200 opacity-0 shadow-lg transition-opacity duration-100 group-hover:opacity-100"
-                >WebSocket {websocketStatusLabel()}</span>
-              </span>
-              <span class="group relative inline-flex">
+              <span
+                use:sidebarTooltip={`WebSocket ${websocketStatusLabel()}`}
+                class={`inline-flex h-2.5 w-2.5 rounded-full ${websocketStatusTone()}`}
+                aria-label={`WebSocket ${$wsState.status}`}
+              ></span>
+              <div use:sidebarTooltip={'Help'} class="inline-flex">
                 <Button aria-label="Open keyboard shortcuts" class="h-9 w-9" size="icon" variant="ghost" onclick={openShortcutHelp}>
                   <CircleHelp class="h-4 w-4" />
                 </Button>
-                <span
-                  aria-hidden="true"
-                  class="pointer-events-none absolute left-full top-1/2 z-40 ml-3 -translate-y-1/2 whitespace-nowrap rounded-lg border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-slate-200 opacity-0 shadow-lg transition-opacity duration-100 group-hover:opacity-100 group-focus-within:opacity-100"
-                >Help</span>
-              </span>
+              </div>
               {#if $auth.user?.role === 'admin'}
-                <span class="group relative inline-flex">
+                <div use:sidebarTooltip={'Getting started'} class="inline-flex">
                   <Button aria-label="Open getting started guide" class="h-9 w-9" size="icon" variant="ghost" onclick={() => goto('/getting-started')}>
                     <BookOpen class="h-4 w-4" />
                   </Button>
-                  <span
-                    aria-hidden="true"
-                    class="pointer-events-none absolute left-full top-1/2 z-40 ml-3 -translate-y-1/2 whitespace-nowrap rounded-lg border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-slate-200 opacity-0 shadow-lg transition-opacity duration-100 group-hover:opacity-100 group-focus-within:opacity-100"
-                  >Getting started</span>
-                </span>
+                </div>
               {/if}
               {#if $wsState.status === 'stalled'}
-                <span class="group relative inline-flex">
+                <div use:sidebarTooltip={'Reconnect WebSocket'} class="inline-flex">
                   <Button aria-label="Reconnect WebSocket" class="h-9 w-9" size="icon" variant="ghost" onclick={() => wsClient.connect()}>
                     <RefreshCw class="h-4 w-4" />
                   </Button>
-                  <span
-                    aria-hidden="true"
-                    class="pointer-events-none absolute left-full top-1/2 z-40 ml-3 -translate-y-1/2 whitespace-nowrap rounded-lg border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-slate-200 opacity-0 shadow-lg transition-opacity duration-100 group-hover:opacity-100 group-focus-within:opacity-100"
-                  >Reconnect WebSocket</span>
-                </span>
+                </div>
               {/if}
             </div>
           {/if}
-          <button
-            class={`group relative flex items-center rounded-xl text-xs text-slate-400 transition hover:bg-slate-800 hover:text-white ${sidebarExpanded ? 'w-full justify-center gap-2 px-3 py-2' : 'w-full justify-center py-2'}`}
-            onclick={toggleSidebar}
-            type="button"
-            aria-label={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
-          >
-            {#if sidebarCollapsed}
+          {#if sidebarCollapsed}
+            <button
+              use:sidebarTooltip={'Expand sidebar'}
+              class="flex w-full items-center justify-center rounded-xl py-2 text-xs text-slate-400 transition hover:bg-slate-800 hover:text-white"
+              onclick={toggleSidebar}
+              type="button"
+              aria-label="Expand sidebar"
+            >
               <ChevronsRight class="h-4 w-4" />
-              <span
-                aria-hidden="true"
-                class="pointer-events-none absolute left-full top-1/2 z-40 ml-3 -translate-y-1/2 whitespace-nowrap rounded-lg border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-slate-200 opacity-0 shadow-lg transition-opacity duration-100 group-hover:opacity-100 group-focus-visible:opacity-100"
-              >Expand sidebar</span>
-            {:else}
+            </button>
+          {:else}
+            <button
+              class="flex w-full items-center justify-center gap-2 rounded-xl px-3 py-2 text-xs text-slate-400 transition hover:bg-slate-800 hover:text-white"
+              onclick={toggleSidebar}
+              type="button"
+              aria-label="Collapse sidebar"
+            >
               <ChevronsLeft class="h-4 w-4" />
               <span>Collapse</span>
-            {/if}
-          </button>
+            </button>
+          {/if}
         </div>
       </aside>
 
