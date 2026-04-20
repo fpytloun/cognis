@@ -253,6 +253,19 @@ import X from 'lucide-svelte/icons/x';
   let showMobileHeader = $derived(!isChatDetailRoute);
   let shouldReserveBottomTabSpace = $derived(!isChatDetailRoute);
 
+  // Route changes can leave `--kb-offset` non-zero if the iOS keyboard
+  // was still dismissing when the user tapped a nav link. Elements on
+  // other pages don't read this variable today, but having it stuck at
+  // the keyboard height produces visible padding gaps (the bottom tab
+  // bar sat above a dark strip on Tasks/Agents/etc. after leaving
+  // Chat). Zero it on every navigation so pages always boot with a
+  // clean viewport state.
+  $effect(() => {
+    void $page.url.pathname;
+    if (typeof document === 'undefined') return;
+    document.documentElement.style.setProperty('--kb-offset', '0px');
+  });
+
   function websocketStatusLabel(): string {
     if ($wsState.status === 'connected') return 'Connected';
     if ($wsState.status === 'stalled') return 'Disconnected';
