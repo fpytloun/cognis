@@ -12,9 +12,17 @@ import Copy from 'lucide-svelte/icons/copy';
   import { formatAbsoluteTime, formatCompactTime } from '$lib/time';
   import type { Agent } from '$lib/types/api';
 
-  let { item, agent = null } = $props<{
+  let { item, agent = null, compact = false } = $props<{
     item: MessageTimelineItem;
     agent?: Agent | null;
+    /**
+     * Diagnostic / log-viewer mode. Drops the leading avatar column
+     * and the max-width cap so the message text takes the full
+     * container width — used inside SessionLogsDrawer where the
+     * reader wants to read raw conversation content rather than a
+     * styled chat view.
+     */
+    compact?: boolean;
   }>();
 
   const agentName = $derived(
@@ -38,6 +46,7 @@ import Copy from 'lucide-svelte/icons/copy';
   const codeCopyResetTimers = new Map<string, number>();
 
   function sizeClass(): string {
+    if (compact) return 'w-full min-w-0';
     return item.role === 'assistant'
       ? 'min-w-0 flex-1 xl:max-w-3xl'
       : 'w-full min-w-0 sm:max-w-[88%] xl:max-w-2xl';
@@ -209,24 +218,26 @@ import Copy from 'lucide-svelte/icons/copy';
   standard messaging-app conventions on mobile.
 -->
 {#if item.role === 'assistant'}
-  <div class="flex w-full min-w-0 items-start gap-2 sm:gap-3">
-    <div class="relative mt-0.5 shrink-0">
-      {#if agent}
-        <button
-          type="button"
-          class="block rounded-2xl transition hover:ring-2 hover:ring-sky-400/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400"
-          aria-label={`View ${agentName} profile`}
-          onclick={() => { showAgentProfile = !showAgentProfile; }}
-        >
+  <div class={`flex w-full min-w-0 items-start ${compact ? '' : 'gap-2 sm:gap-3'}`}>
+    {#if !compact}
+      <div class="relative mt-0.5 shrink-0">
+        {#if agent}
+          <button
+            type="button"
+            class="block rounded-2xl transition hover:ring-2 hover:ring-sky-400/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400"
+            aria-label={`View ${agentName} profile`}
+            onclick={() => { showAgentProfile = !showAgentProfile; }}
+          >
+            <AgentAvatar name={agentName} avatarUrl={agentAvatarUrl} class="h-8 w-8 text-xs" />
+          </button>
+          {#if showAgentProfile}
+            <AgentProfilePopover {agent} onClose={() => { showAgentProfile = false; }} />
+          {/if}
+        {:else}
           <AgentAvatar name={agentName} avatarUrl={agentAvatarUrl} class="h-8 w-8 text-xs" />
-        </button>
-        {#if showAgentProfile}
-          <AgentProfilePopover {agent} onClose={() => { showAgentProfile = false; }} />
         {/if}
-      {:else}
-        <AgentAvatar name={agentName} avatarUrl={agentAvatarUrl} class="h-8 w-8 text-xs" />
-      {/if}
-    </div>
+      </div>
+    {/if}
     <article class={`overflow-hidden rounded-[1.4rem] px-3 py-2.5 shadow-card sm:rounded-3xl sm:px-4 sm:py-3 ${sizeClass()} ${bubbleClass()}`}>
       {#if item.html}
         <div use:addCodeCopyButtons={item.html} class={`chat-markdown prose max-w-none overflow-x-auto break-words prose-pre:overflow-x-auto ${proseClass()}`}>{@html item.html}</div>

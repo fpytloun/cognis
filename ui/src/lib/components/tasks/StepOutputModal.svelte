@@ -113,10 +113,26 @@
   });
 </script>
 
-<div class="fixed inset-0 z-[90] flex items-center justify-center bg-slate-950/85 px-4 py-6 backdrop-blur" role="presentation">
+<!--
+  Full step output modal. Raised above the mobile bottom tab bar and
+  safe-area-padded so the modal edges never tuck under iPhone's
+  Dynamic Island or home indicator. The panel uses
+  \`max-w-3xl max-h-full\` so its content scrolls internally without
+  pushing the page wider than the viewport.
+-->
+<div
+  class="fixed inset-0 z-[95] flex items-stretch justify-center bg-slate-950/85 px-3 pt-[calc(0.75rem+env(safe-area-inset-top))] pb-[calc(0.75rem+env(safe-area-inset-bottom))] backdrop-blur sm:items-center sm:px-4 sm:py-6"
+  role="presentation"
+>
   <button class="absolute inset-0" onclick={onclose} type="button" aria-label="Close full output"></button>
-  <div bind:this={container} class="relative z-10 w-full max-w-3xl overflow-hidden rounded-[2rem] border border-slate-800 bg-slate-950 shadow-card" role="dialog" aria-modal="true" aria-labelledby="step-output-title">
-    <div class="border-b border-slate-800 px-5 py-4 sm:px-6">
+  <div
+    bind:this={container}
+    class="relative z-10 flex max-h-full w-full max-w-3xl flex-col overflow-hidden rounded-[1.75rem] border border-slate-800 bg-slate-950 shadow-card"
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby="step-output-title"
+  >
+    <div class="shrink-0 border-b border-slate-800 px-5 py-4 sm:px-6">
       <div class="flex items-start justify-between gap-4">
         <div class="min-w-0">
           <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Full output</p>
@@ -134,7 +150,7 @@
       </div>
     </div>
 
-    <div class="max-h-[75vh] space-y-5 overflow-y-auto px-5 py-5 sm:px-6">
+    <div class="min-h-0 flex-1 space-y-5 overflow-y-auto overflow-x-hidden px-5 py-5 sm:px-6">
       {#if summary}
         <section>
           <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Summary</p>
