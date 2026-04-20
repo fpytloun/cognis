@@ -373,11 +373,26 @@
     return null;
   }
 
+  function defaultProviderModelId(): string {
+    const defaultProvider =
+      providers.find((provider) => provider.is_default) ??
+      providers.find((provider) => provider.provider_id === 'default') ??
+      null;
+    const defaultModel = typeof defaultProvider?.config?.default_model === 'string'
+      ? defaultProvider.config.default_model
+      : '';
+    return defaultModel.trim();
+  }
+
+  function effectiveRouteModelId(routeKey: RoutingKey): string {
+    return routingForm[routeKey].model.trim() || defaultProviderModelId();
+  }
+
   function routeThinkingEffortOptions(routeKey: RoutingKey): string[] {
     if (!TEXT_ROUTING_KEYS.includes(routeKey as (typeof TEXT_ROUTING_KEYS)[number])) {
       return [];
     }
-    const modelEntry = findModelEntry(routingForm[routeKey].model);
+    const modelEntry = findModelEntry(effectiveRouteModelId(routeKey));
     return (modelEntry?.reasoning_efforts ?? []).filter((value) => value !== 'default');
   }
 
@@ -837,20 +852,20 @@
     try {
       modelRouting = await api.modelRouting.update({
         default: {
-          model: routingForm.default.model || null,
-          reasoning_effort: routingForm.default.model ? routingForm.default.reasoningEffort || null : null
+          model: routingForm.default.model || (routingForm.default.reasoningEffort ? effectiveRouteModelId('default') : '') || null,
+          reasoning_effort: routingForm.default.reasoningEffort || null
         },
         classifier: {
-          model: routingForm.classifier.model || null,
-          reasoning_effort: routingForm.classifier.model ? routingForm.classifier.reasoningEffort || null : null
+          model: routingForm.classifier.model || (routingForm.classifier.reasoningEffort ? effectiveRouteModelId('classifier') : '') || null,
+          reasoning_effort: routingForm.classifier.reasoningEffort || null
         },
         compaction: {
-          model: routingForm.compaction.model || null,
-          reasoning_effort: routingForm.compaction.model ? routingForm.compaction.reasoningEffort || null : null
+          model: routingForm.compaction.model || (routingForm.compaction.reasoningEffort ? effectiveRouteModelId('compaction') : '') || null,
+          reasoning_effort: routingForm.compaction.reasoningEffort || null
         },
         evaluator: {
-          model: routingForm.evaluator.model || null,
-          reasoning_effort: routingForm.evaluator.model ? routingForm.evaluator.reasoningEffort || null : null
+          model: routingForm.evaluator.model || (routingForm.evaluator.reasoningEffort ? effectiveRouteModelId('evaluator') : '') || null,
+          reasoning_effort: routingForm.evaluator.reasoningEffort || null
         },
         speech_to_text: {
           model: routingForm.speech_to_text.model || null,
@@ -870,18 +885,6 @@
     } finally {
       busy = false;
     }
-  }
-
-  function copyDefaultModelToAll(): void {
-    if (!routingForm.default.model) {
-      return;
-    }
-    routingForm = {
-      ...routingForm,
-      classifier: { ...routingForm.default },
-      compaction: { ...routingForm.default },
-      evaluator: { ...routingForm.default }
-    };
   }
 
   async function saveSecret(): Promise<void> {
@@ -1661,7 +1664,6 @@
             <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Model routing</p>
             <h2 class="mt-1 text-lg font-semibold text-white">Task-type routing</h2>
           </div>
-          <Button variant="secondary" onclick={copyDefaultModelToAll}>Copy default route to text routes</Button>
         </div>
 
         <div class="mt-4 grid gap-4 md:grid-cols-2">
@@ -1687,10 +1689,10 @@
                   </select>
                   {#if routeThinkingEffortOptions(route.key).length === 0}
                     <span class="block text-xs text-slate-500">
-                      {route.key === 'classifier' || route.key === 'compaction' || route.key === 'evaluator'
-                        ? 'Defaults to Low unless you choose an explicit route model.'
-                        : 'Select a known route model to choose a Thinking effort.'}
+                      Select or resolve a model first to choose a Thinking effort.
                     </span>
+                  {:else}
+                    <span class="block text-xs text-slate-500">Uses the model default when unset.</span>
                   {/if}
                 </div>
               {/if}

@@ -111,6 +111,35 @@ def test_model_routing_put_round_trips_nested_entries_and_deletes_legacy_rows(
         asyncio.run(_assert_db())
 
 
+def test_model_routing_get_does_not_invent_reasoning_defaults(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> None:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="admin@example.com",
+                    name="Admin",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="admin",
+                )
+                await session.commit()
+
+        asyncio.run(_seed())
+
+        headers = _auth_headers(app, email="admin@example.com", role="admin")
+        response = client.get("/api/v1/model-routing", headers=headers)
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["classifier"] == {"model": None, "reasoning_effort": None}
+        assert payload["compaction"] == {"model": None, "reasoning_effort": None}
+        assert payload["evaluator"] == {"model": None, "reasoning_effort": None}
+
+
 def test_model_routing_put_rejects_reasoning_effort_for_non_text_routes(
     monkeypatch: object, tmp_path: Path
 ) -> None:

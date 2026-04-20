@@ -54,12 +54,6 @@ PROXY_MODEL_INFO_CACHE_TTL = 300.0  # 5 minutes for successful proxy /model/info
 PROXY_MODEL_INFO_NEGATIVE_TTL = 30.0  # 30 seconds negative cache for failures
 SAFE_PROVIDER_KWARGS = {"api_base", "api_version", "base_url", "timeout"}
 _CACHE_MISS = object()
-_DEFAULT_TASK_TYPE_REASONING_EFFORTS: dict[str, str] = {
-    "classifier": "low",
-    "compaction": "low",
-    "evaluator": "low",
-}
-
 # Preset-to-litellm model prefix mapping.  LiteLLM uses the prefix to
 # determine which provider API to use.  Standard presets (openai, anthropic)
 # are recognised by litellm natively and need no prefix.
@@ -631,14 +625,12 @@ class LiteLLMProvider:
     async def _get_route_reasoning_effort(self, task_type: str) -> str | None:
         async with self.session_factory() as session:
             route = await session.get(ModelRouting, task_type)
-        if route is None:
-            return _DEFAULT_TASK_TYPE_REASONING_EFFORTS.get(task_type)
-        if not isinstance(route.config, dict):
-            return _DEFAULT_TASK_TYPE_REASONING_EFFORTS.get(task_type)
+        if route is None or not isinstance(route.config, dict):
+            return None
         normalized = normalize_reasoning_level(route.config.get("reasoning_effort"))
         if normalized == "default":
-            return _DEFAULT_TASK_TYPE_REASONING_EFFORTS.get(task_type)
-        return normalized or _DEFAULT_TASK_TYPE_REASONING_EFFORTS.get(task_type)
+            return None
+        return normalized
 
     async def _merge_litellm_model_info(
         self,

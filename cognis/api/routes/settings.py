@@ -53,26 +53,16 @@ _ROUTING_TASK_TYPES: tuple[str, ...] = (
     "image_generation",
 )
 _TEXT_ROUTING_TASK_TYPES = frozenset({"default", "classifier", "compaction", "evaluator"})
-_ROUTING_REASONING_DEFAULTS: dict[str, str] = {
-    "classifier": "low",
-    "compaction": "low",
-    "evaluator": "low",
-}
 
 
 def _routing_entry_from_row(task_type: str, row: Any | None) -> dict[str, str | None]:
     if row is None:
-        return {
-            "model": None,
-            "reasoning_effort": _ROUTING_REASONING_DEFAULTS.get(task_type),
-        }
+        return {"model": None, "reasoning_effort": None}
     reasoning_effort: str | None = None
     if task_type in _TEXT_ROUTING_TASK_TYPES and isinstance(getattr(row, "config", None), dict):
         reasoning_effort = normalize_reasoning_level(row.config.get("reasoning_effort"))
         if reasoning_effort == "default":
             reasoning_effort = None
-    if reasoning_effort is None:
-        reasoning_effort = _ROUTING_REASONING_DEFAULTS.get(task_type)
     return {"model": getattr(row, "model", None), "reasoning_effort": reasoning_effort}
 
 
