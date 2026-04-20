@@ -25,7 +25,7 @@ from cognis.api.models import (
     StepRunResponse,
     TaskResponse,
 )
-from cognis.api.serializers import step_run_to_response
+from cognis.api.serializers import llm_provider_to_response, step_run_to_response
 from cognis.core.management import _normalize_pause_context, _normalize_pause_options
 
 
@@ -237,3 +237,71 @@ class TestModelRoutingContracts:
         assert response.default.model == "gpt-5.4"
         assert response.default.reasoning_effort == "xhigh"
         assert response.speech_to_text.model == "gpt-4o-transcribe"
+
+
+class TestLLMProviderSerializer:
+    """Provider list enriches stored models with derived capability fields."""
+
+    def _provider_row(self, **config_overrides: object) -> _FakeRow:
+        config = {
+            "preset": "openai",
+            "default_model": "gpt-5.4",
+            "models": [
+                {
+                    "model_id": "gpt-5.4",
+                    "supports_reasoning": True,
+                },
+                {
+                    "model_id": "gpt-4o-mini",
+                    "supports_reasoning": False,
+                },
+            ],
+            **config_overrides,
+        }
+        return _FakeRow(
+            provider_id="openai",
+            display_name="OpenAI",
+            location="controller",
+            backend="litellm",
+            config=config,
+            is_default=True,
+            status="active",
+            created_at=None,
+            updated_at=None,
+            last_test=None,
+        )
+
+    def test_reasoning_model_gets_reasoning_efforts_populated(self) -> None:
+        response = llm_provider_to_response(self._provider_row())
+
+        reasoning_model = next(m for m in response.models if m["model_id"] == "gpt-5.4")
+        assert reasoning_model["reasoning_efforts"] == [
+            "default",
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+        ]
+
+    def test_non_reasoning_model_keeps_empty_reasoning_efforts(self) -> None:
+        response = llm_provider_to_response(self._provider_row())
+
+        standard_model = next(m for m in response.models if m["model_id"] == "gpt-4o-mini")
+        assert standard_model.get("reasoning_efforts", []) == []
+
+    def test_explicitly_configured_reasoning_efforts_are_preserved(self) -> None:
+        response = llm_provider_to_response(
+            self._provider_row(
+                models=[
+                    {
+                        "model_id": "gpt-5.4",
+                        "supports_reasoning": True,
+                        "reasoning_efforts": ["default", "low", "high"],
+                    }
+                ]
+            )
+        )
+
+        reasoning_model = next(m for m in response.models if m["model_id"] == "gpt-5.4")
+        assert reasoning_model["reasoning_efforts"] == ["default", "low", "high"]

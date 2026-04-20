@@ -76,6 +76,52 @@ def reasoning_efforts_for_model(
     return list(profile.available_efforts)
 
 
+def enrich_model_entry(
+    entry: dict[str, Any],
+    *,
+    provider_preset: str = "",
+) -> dict[str, Any]:
+    """Populate derived capability fields on a stored model entry.
+
+    This runs on read so provider list payloads and on-demand ``get_model_info``
+    return consistent values without requiring admins to re-save their
+    provider configurations. Currently fills:
+
+    - ``reasoning_efforts`` — computed from ``supports_reasoning`` + model id
+
+    Explicitly-configured values are preserved: the helper only fills fields
+    that are missing or empty.
+    """
+
+    if not isinstance(entry, dict):
+        return entry
+
+    model_id = entry.get("model_id")
+    if not isinstance(model_id, str) or not model_id:
+        return entry
+
+    supports_reasoning = bool(entry.get("supports_reasoning"))
+    existing_efforts = entry.get("reasoning_efforts")
+    if supports_reasoning and (not isinstance(existing_efforts, list) or not existing_efforts):
+        try:
+            preview_source = {
+                key: value
+                for key, value in entry.items()
+                if key in ModelInfo.model_fields
+            }
+            preview_source.setdefault("model_id", model_id)
+            model_info = ModelInfo.model_validate(preview_source)
+        except Exception:
+            model_info = None
+        entry["reasoning_efforts"] = reasoning_efforts_for_model(
+            model_id,
+            provider_preset=provider_preset,
+            model_info=model_info,
+            supports_reasoning=True,
+        )
+    return entry
+
+
 def remap_reasoning_effort_to_available(
     value: str | None,
     *,

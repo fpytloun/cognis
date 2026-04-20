@@ -33,6 +33,7 @@ from cognis.api.models import (
 from cognis.logging import get_logger
 from cognis.models.task import TaskModel
 from cognis.models.workflow import Workflow
+from cognis.providers.llm.reasoning import enrich_model_entry
 
 logger = get_logger(__name__)
 
@@ -157,6 +158,15 @@ def setting_to_response(row: Any) -> SettingResponse:
 def llm_provider_to_response(row: Any) -> LLMProviderResponse:
     config = dict(row.config or {})
     last_test = getattr(row, "last_test", None)
+    preset = str(config.get("preset", "") or "").lower()
+    raw_models = config.get("models", [])
+    enriched_models: list[dict[str, Any]] = []
+    if isinstance(raw_models, list):
+        for entry in raw_models:
+            if isinstance(entry, dict):
+                enriched_models.append(enrich_model_entry(dict(entry), provider_preset=preset))
+            else:
+                enriched_models.append(entry)
     return LLMProviderResponse(
         provider_id=row.provider_id,
         display_name=row.display_name,
@@ -167,7 +177,7 @@ def llm_provider_to_response(row: Any) -> LLMProviderResponse:
         status=row.status,
         created_at=row.created_at,
         updated_at=row.updated_at,
-        models=list(config.get("models", [])) if isinstance(config.get("models", []), list) else [],
+        models=enriched_models,
         last_test=ProviderTestResultResponse.model_validate(last_test) if last_test else None,
     )
 
