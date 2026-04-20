@@ -37,6 +37,7 @@ from cognis.store.queries import (
     pick_ready_task,
     update_task_status,
     update_task_workflow_state,
+    update_workflow,
 )
 
 logger = get_logger(__name__)
@@ -961,6 +962,14 @@ class TaskQueue:
                     TaskStatus.FAILED,
                     TaskStatus.CANCELLED,
                 }:
+                    if str(getattr(workflow, "lifecycle", "persistent")) == "ephemeral":
+                        async with self._session_factory() as db_session:
+                            await update_workflow(
+                                db_session,
+                                workflow.workflow_id,
+                                updates={"archived_at": datetime.now(UTC)},
+                            )
+                            await db_session.commit()
                     await self.resolve_dependencies(result.task_id)
 
             except asyncio.CancelledError:

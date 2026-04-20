@@ -128,6 +128,8 @@ class SkillVersion(BaseModel):
     tools: list[SkillToolSpec] = Field(default_factory=list)
     prompt_templates: dict[str, str] = Field(default_factory=dict)
     secret_placeholders: list[str] = Field(default_factory=list)
+    steps: list[dict[str, Any]] = Field(default_factory=list)
+    decomposition_source_hash: str | None = None
     provenance: ImportProvenance | None = None
     asset_manifest: list[SkillAssetRef] = Field(default_factory=list)
     created_at: datetime | None = None
@@ -169,6 +171,8 @@ class ResolvedSkill(BaseModel):
     tools: list[SkillToolSpec] = Field(default_factory=list)
     prompt_templates: dict[str, str] = Field(default_factory=dict)
     secret_placeholders: list[str] = Field(default_factory=list)
+    steps: list[dict[str, Any]] = Field(default_factory=list)
+    decomposition_source_hash: str | None = None
     asset_manifest: list[SkillAssetRef] = Field(default_factory=list)
     auto_load: bool = False  # Internal flag: attached to all agents
     attached: bool = False
@@ -237,6 +241,8 @@ class SkillExportData(BaseModel):
     tools: list[dict[str, Any]] = Field(default_factory=list)
     prompt_templates: dict[str, str] = Field(default_factory=dict)
     secret_placeholders: list[str] = Field(default_factory=list)
+    steps: list[dict[str, Any]] = Field(default_factory=list)
+    decomposition_source_hash: str | None = None
     provenance: ImportProvenance | None = None
     asset_manifest: list[SkillAssetRef] = Field(default_factory=list)
 

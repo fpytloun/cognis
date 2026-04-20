@@ -12,10 +12,19 @@ from cognis.core.management import (
 from cognis.store.queries import create_workflow, delete_workflow, get_workflow, update_workflow
 
 
-async def list_workflows_for_user(*, workflow_registry: Any, owner_email: str) -> list[Any]:
+async def list_workflows_for_user(
+    *,
+    workflow_registry: Any,
+    owner_email: str,
+    include_ephemeral: bool = False,
+) -> list[Any]:
     """List workflows visible to the user."""
 
-    return await workflow_registry.list_all(owner_email=owner_email, include_disabled=True)
+    return await workflow_registry.list_all(
+        owner_email=owner_email,
+        include_disabled=True,
+        include_ephemeral=include_ephemeral,
+    )
 
 
 async def get_workflow_for_user(
@@ -38,6 +47,7 @@ async def create_user_workflow(
     session_factory: Any,
     owner_email: str,
     payload: dict[str, Any],
+    allow_ephemeral: bool = False,
 ) -> Any:
     """Create a user-owned workflow after validation."""
 
@@ -54,7 +64,11 @@ async def create_user_workflow(
         "steps": payload["steps"],
         "is_system": False,
         "owner_email": owner_email,
+        "lifecycle": payload.get("lifecycle", "persistent"),
+        "lineage": payload.get("lineage"),
     }
+    if definition["lifecycle"] == "ephemeral" and not allow_ephemeral:
+        raise ValueError("Ephemeral lifecycle is reserved for composed workflows")
     definition = validate_workflow_definition(definition)
 
     async with session_factory() as session:
@@ -67,6 +81,7 @@ async def create_user_workflow(
             version=int(definition.get("version", 1)),
             is_system=False,
             owner_email=owner_email,
+            lifecycle=str(definition.get("lifecycle", "persistent")),
         )
         await session.commit()
         await session.refresh(row)
@@ -79,6 +94,7 @@ async def update_user_workflow(
     workflow_id: str,
     owner_email: str,
     payload: dict[str, Any],
+    allow_ephemeral: bool = False,
 ) -> Any:
     """Update a user-owned workflow after validation and active-run checks."""
 
@@ -88,6 +104,8 @@ async def update_user_workflow(
             raise ValueError("Workflow not found")
         if row.is_system:
             raise ValueError("System workflows are read-only")
+        if getattr(row, "lifecycle", "persistent") == "ephemeral":
+            raise ValueError("Ephemeral workflows are read-only; promote or duplicate them first")
         if row.owner_email != owner_email:
             raise ValueError("Workflow access denied")
 
@@ -102,6 +120,8 @@ async def update_user_workflow(
         definition["workflow_id"] = workflow_id
         definition["is_system"] = False
         definition["owner_email"] = owner_email
+        if definition.get("lifecycle") == "ephemeral" and not allow_ephemeral:
+            raise ValueError("Ephemeral lifecycle is reserved for composed workflows")
         definition = validate_workflow_definition(definition)
         ok = await update_workflow(
             session,
@@ -114,6 +134,11 @@ async def update_user_workflow(
                     else {}
                 ),
                 **({"version": payload["version"]} if payload.get("version") is not None else {}),
+                **(
+                    {"lifecycle": payload["lifecycle"]}
+                    if payload.get("lifecycle") is not None
+                    else {}
+                ),
                 "definition": definition,
             },
         )
@@ -138,6 +163,8 @@ async def delete_user_workflow(
             raise ValueError("Workflow not found")
         if row.is_system:
             raise ValueError("System workflows are read-only")
+        if getattr(row, "lifecycle", "persistent") == "ephemeral":
+            raise ValueError("Ephemeral workflows are read-only; promote or duplicate them first")
         if row.owner_email != owner_email:
             raise ValueError("Workflow access denied")
 
@@ -178,6 +205,8 @@ async def duplicate_visible_workflow(
     definition["name"] = f"{workflow.name} Copy"
     definition["is_system"] = False
     definition["owner_email"] = owner_email
+    definition["lifecycle"] = "persistent"
+    definition["archived_at"] = None
     definition = validate_workflow_definition(definition)
 
     async with session_factory() as session:
@@ -190,6 +219,7 @@ async def duplicate_visible_workflow(
             version=int(definition.get("version", 1)),
             is_system=False,
             owner_email=owner_email,
+            lifecycle="persistent",
         )
         await session.commit()
         await session.refresh(row)

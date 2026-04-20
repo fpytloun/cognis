@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { beforeNavigate } from '$app/navigation';
+import { beforeNavigate } from '$app/navigation';
+import { page } from '$app/stores';
   import { onMount } from 'svelte';
   import ArrowDown from 'lucide-svelte/icons/arrow-down';
 import ArrowUp from 'lucide-svelte/icons/arrow-up';
@@ -41,6 +42,7 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
   let dragIndex = -1;
   let initialSnapshot = JSON.stringify(form);
   let mobileWorkflowActionsOpen = false;
+  let showEphemeral = false;
 
   function canEditSystemWorkflowField(field: 'stepReasoning' | 'stepMaxAttempts'): boolean {
     if (!selectedWorkflow?.is_system) return true;
@@ -77,7 +79,7 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
     error = '';
     try {
       [workflows, secondaryAgents] = await Promise.all([
-        api.workflows.listAll({ include_disabled: true }),
+        api.workflows.listAll({ include_disabled: true, include_ephemeral: showEphemeral }),
         api.agents.listAll({ agent_type: 'secondary' }),
       ]);
       const nextSelected = selectedId ? workflows.find((workflow) => workflow.workflow_id === selectedId) : selectedWorkflow ? workflows.find((workflow) => workflow.workflow_id === selectedWorkflow?.workflow_id) : workflows[0];
@@ -120,6 +122,38 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
     form = createEmptyWorkflowForm();
     error = '';
     initialSnapshot = JSON.stringify(form);
+  }
+
+  async function loadDraftFromQuery(): Promise<void> {
+    const workflowId = $page.url.searchParams.get('draftFrom');
+    if (!workflowId) return;
+    try {
+      const source = await api.workflows.detail(workflowId);
+      const nextForm = workflowToFormState(source);
+      selectedWorkflow = null;
+      form = {
+        ...nextForm,
+        workflowId: '',
+        lifecycle: 'persistent',
+        name: source.name.endsWith(' Copy') ? source.name : `${source.name} Copy`,
+        lineage: {
+          ...(source.lineage ?? {}),
+          base_workflow_id: source.workflow_id,
+          composition_source: 'promoted'
+        }
+      };
+      error = '';
+      initialSnapshot = JSON.stringify(form);
+      addToast('Workflow draft loaded from task history.', 'success');
+    } catch (caughtError) {
+      error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to load workflow draft');
+    }
+  }
+
+  function toggleShowEphemeral(): void {
+    showEphemeral = !showEphemeral;
+    void loadWorkflows(selectedWorkflow?.workflow_id);
   }
 
   async function duplicateSelectedWorkflow(): Promise<void> {
@@ -180,6 +214,9 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
           formStateToSystemWorkflowOverridePayload(form)
         );
         await loadWorkflows(updated.workflow_id);
+      } else if (selectedWorkflow?.lifecycle === 'ephemeral') {
+        error = 'Ephemeral workflows are historical artifacts. Promote or duplicate them into a persistent workflow instead.';
+        return;
       } else if (selectedWorkflow) {
         const updated = await api.workflows.update(selectedWorkflow.workflow_id, payload);
         await loadWorkflows(updated.workflow_id);
@@ -198,7 +235,7 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
   }
 
   async function deleteSelectedWorkflow(): Promise<void> {
-    if (!selectedWorkflow || selectedWorkflow.is_system) {
+    if (!selectedWorkflow || selectedWorkflow.is_system || selectedWorkflow.lifecycle === 'ephemeral') {
       return;
     }
     const confirmed = await confirmAction({
@@ -287,7 +324,7 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
 
   onMount(() => {
     const cleanup = installBeforeUnloadGuard(isDirty);
-    void loadWorkflows();
+    void loadWorkflows().then(() => loadDraftFromQuery());
     return cleanup;
   });
 </script>
@@ -314,8 +351,8 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
         <Button variant="secondary" onclick={newWorkflow}>New workflow</Button>
         <Button variant="secondary" onclick={duplicateSelectedWorkflow} disabled={!selectedWorkflow}>Duplicate</Button>
         <Button variant="secondary" onclick={downloadCurrentWorkflow}>Export YAML</Button>
-        <Button variant="danger" onclick={deleteSelectedWorkflow} disabled={!selectedWorkflow || selectedWorkflow.is_system}>Delete</Button>
-        <Button onclick={saveWorkflow} disabled={saving || (!!selectedWorkflow?.is_system && (selectedWorkflow.editable_fields?.length ?? 0) === 0)}>{saving ? 'Saving…' : selectedWorkflow?.is_system ? 'Save overrides' : 'Save workflow'}</Button>
+        <Button variant="danger" onclick={deleteSelectedWorkflow} disabled={!selectedWorkflow || selectedWorkflow.is_system || selectedWorkflow.lifecycle === 'ephemeral'}>Delete</Button>
+        <Button onclick={saveWorkflow} disabled={saving || (selectedWorkflow?.is_system && (selectedWorkflow.editable_fields?.length ?? 0) === 0) || selectedWorkflow?.lifecycle === 'ephemeral'}>{saving ? 'Saving…' : selectedWorkflow?.is_system ? 'Save overrides' : 'Save workflow'}</Button>
       </div>
     </div>
 
@@ -328,12 +365,19 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
     <div class="grid gap-5 lg:grid-cols-[320px_minmax(0,1fr)]">
       <aside class="space-y-5">
         <Card class="p-4">
+          <label class="flex items-center justify-between gap-3 text-sm text-slate-200">
+            <span>Show ephemeral workflows</span>
+            <input checked={showEphemeral} class="h-4 w-4 rounded border-slate-600 bg-slate-950" type="checkbox" onchange={toggleShowEphemeral} />
+          </label>
+          <p class="mt-2 text-xs text-slate-500">Debug view for archived and historical composed workflows.</p>
+        </Card>
+        <Card class="p-4">
           <div class="space-y-2">
             {#each workflows as workflow}
               <button class={`w-full rounded-2xl border px-4 py-3 text-left transition ${workflow.workflow_id === selectedWorkflow?.workflow_id ? 'border-sky-400/40 bg-sky-500/10 text-white' : 'border-slate-800 bg-slate-950/70 text-slate-200 hover:border-slate-700'}`} onclick={() => selectWorkflow(workflow)}>
                 <div class="flex flex-wrap items-center justify-between gap-3">
                   <span class="min-w-0 flex-1 truncate font-medium">{workflow.name}</span>
-                  <span class="shrink-0 rounded-full border border-slate-700 px-2.5 py-1 text-[11px] uppercase tracking-[0.2em] text-slate-400">{workflow.disabled ? 'disabled' : workflow.is_system ? 'system' : 'user'}</span>
+                  <span class="shrink-0 rounded-full border border-slate-700 px-2.5 py-1 text-[11px] uppercase tracking-[0.2em] text-slate-400">{workflow.disabled ? 'disabled' : workflow.lifecycle === 'ephemeral' ? 'ephemeral' : workflow.is_system ? 'system' : 'user'}</span>
                 </div>
                 <p class="mt-2 break-all text-xs leading-5 text-slate-400">{workflow.workflow_id}</p>
               </button>
@@ -367,6 +411,11 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
             {#if selectedWorkflow.override_warnings.length > 0}
               <p class="mt-3 text-xs text-sky-50/90">{selectedWorkflow.override_warnings.join(' ')}</p>
             {/if}
+          </Card>
+        {:else if selectedWorkflow?.lifecycle === 'ephemeral'}
+          <Card class="border border-violet-500/30 bg-violet-500/10 p-4 text-sm text-violet-100">
+            <p class="font-medium">Ephemeral workflow</p>
+            <p class="mt-1 text-violet-100/80">This workflow is a historical composed artifact. It is read-only. Promote it into a new persistent workflow to edit or reuse it.</p>
           </Card>
         {/if}
 
@@ -866,7 +915,7 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
         <Button
           class="flex-1 justify-center"
           onclick={saveWorkflow}
-          disabled={saving || (!!selectedWorkflow?.is_system && (selectedWorkflow.editable_fields?.length ?? 0) === 0)}
+          disabled={saving || (!!selectedWorkflow?.is_system && (selectedWorkflow.editable_fields?.length ?? 0) === 0) || selectedWorkflow?.lifecycle === 'ephemeral'}
         >
           {saving ? 'Saving…' : selectedWorkflow?.is_system ? 'Save overrides' : 'Save workflow'}
         </Button>
@@ -878,7 +927,7 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
         <Button class="w-full justify-center" variant="secondary" onclick={() => { mobileWorkflowActionsOpen = false; void newWorkflow(); }}>New workflow</Button>
         <Button class="w-full justify-center" variant="secondary" onclick={() => { mobileWorkflowActionsOpen = false; void duplicateSelectedWorkflow(); }} disabled={!selectedWorkflow}>Duplicate</Button>
         <Button class="w-full justify-center" variant="secondary" onclick={() => { mobileWorkflowActionsOpen = false; downloadCurrentWorkflow(); }}>Export YAML</Button>
-        <Button class="w-full justify-center" variant="danger" onclick={() => { mobileWorkflowActionsOpen = false; void deleteSelectedWorkflow(); }} disabled={!selectedWorkflow || selectedWorkflow.is_system}>Delete</Button>
+        <Button class="w-full justify-center" variant="danger" onclick={() => { mobileWorkflowActionsOpen = false; void deleteSelectedWorkflow(); }} disabled={!selectedWorkflow || selectedWorkflow.is_system || selectedWorkflow.lifecycle === 'ephemeral'}>Delete</Button>
       </div>
     </Sheet>
   </section>

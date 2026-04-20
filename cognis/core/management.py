@@ -347,5 +347,7 @@ def workflow_row_to_summary(row: Any) -> dict[str, Any]:
         "version": response.version,
         "is_system": response.is_system,
         "owner_email": response.owner_email,
+        "lifecycle": response.lifecycle,
+        "archived_at": response.archived_at.isoformat() if response.archived_at else None,
         "tags": response.tags,
     }

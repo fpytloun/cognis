@@ -24,6 +24,7 @@ from cognis.api.models import (
     SkillVersionResponse,
     StepRunResponse,
     TaskResponse,
+    WorkflowResponse,
 )
 from cognis.api.serializers import llm_provider_to_response, step_run_to_response
 from cognis.core.management import _normalize_pause_context, _normalize_pause_options
@@ -182,6 +183,22 @@ class TestSkillResponseContracts:
         assert response.current_version is not None
         assert response.current_version.version_id == "sv-1"
 
+    def test_skill_version_round_trips_decomposition_fields(self) -> None:
+        response = SkillVersionResponse(
+            version_id="sv-1",
+            skill_id="skill-1",
+            version_number=2,
+            content_hash="a" * 64,
+            instructions="hello",
+            steps=[{"name": "plan", "type": "run", "prompt": "Plan it"}],
+            decomposition_source_hash="b" * 64,
+            decomposition_stale=True,
+        )
+
+        assert response.steps is not None
+        assert response.steps[0]["name"] == "plan"
+        assert response.decomposition_stale is True
+
     def test_normalize_options_from_mixed_shape_drops_junk(self) -> None:
         normalized = _normalize_pause_options([{"label": "A"}, 42, "B"])
         assert normalized == [{"label": "A"}, {"label": "B", "action": "B"}]
@@ -217,6 +234,18 @@ class TestTaskResponseRoundTrip:
         assert response.description == ""
         assert response.workflow_state is None
         assert response.completion_mode_family == "default"
+
+
+def test_workflow_response_round_trips_lifecycle_and_lineage() -> None:
+    response = WorkflowResponse(
+        workflow_id="wf-1",
+        name="Workflow",
+        lifecycle="ephemeral",
+        lineage={"base_workflow_id": "system:software-development"},
+    )
+
+    assert response.lifecycle == "ephemeral"
+    assert response.lineage == {"base_workflow_id": "system:software-development"}
 
 
 class TestModelRoutingContracts:

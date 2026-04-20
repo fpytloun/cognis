@@ -78,6 +78,7 @@ from cognis.models.workflow import (
     CompletionDeliveryPolicy,
     StepDefinition,
     StepOutput,
+    Workflow,
     WorkflowState,
 )
 from cognis.providers.retry import is_retryable_http_error
@@ -97,6 +98,7 @@ from cognis.store.queries import (
 from cognis.tools.builtin.orchestration import (
     OrchestrationMode,
     handle_delegate_tool_call,
+    is_composition_tool,
     is_orchestration_tool,
     is_subsession_tool,
     is_task_tool,
@@ -4203,6 +4205,13 @@ class AgentLoop:
                 is_error=True,
             )
 
+        validation_error = self._validate_controller_tool_arguments(tc.name, tc.arguments)
+        if validation_error is not None:
+            return ToolResult(
+                output=json.dumps(validation_error.as_tool_result()),
+                is_error=True,
+            )
+
         # Dispatch by tool name
         if tc.name == "delegate":
             return await self._handle_delegate(
@@ -4217,6 +4226,8 @@ class AgentLoop:
             return await self._handle_subsession_management(tc, ctx=ctx)
         elif is_task_tool(tc.name):
             return await self._handle_task_tool(tc, ctx=ctx, events_to_record=events_to_record)
+        elif is_composition_tool(tc.name):
+            return await self._handle_composition_tool(tc, ctx=ctx, events_to_record=events_to_record)
         elif is_workflow_tool(tc.name):
             return await self._handle_workflow_tool(tc, ctx=ctx)
         else:
@@ -4494,6 +4505,7 @@ class AgentLoop:
             task_workflow_run_response,
         )
         from cognis.store.queries import (
+            get_agent,
             get_session_row,
             get_task,
             list_step_runs_for_task,
@@ -4524,6 +4536,19 @@ class AgentLoop:
                 raw_agent_id = tc.arguments.get("agent_id")
                 if not raw_agent_id or raw_agent_id == "self":
                     raw_agent_id = ctx.agent.agent_id
+
+                async with self.session_manager.session_factory() as db:
+                    agent_row = await get_agent(db, str(raw_agent_id))
+                if agent_row is None or agent_row.owner_email != ctx.session.user_email:
+                    return ToolResult(
+                        output=json.dumps(
+                            {
+                                "status": "error",
+                                "message": "Agent not found or not accessible.",
+                            }
+                        ),
+                        is_error=True,
+                    )
 
                 workflow_id = tc.arguments.get("workflow_id")
                 if workflow_id:
@@ -5642,6 +5667,495 @@ class AgentLoop:
         return ToolResult(
             output=json.dumps({"error": f"Unknown workflow tool: {tc.name}"}),
             is_error=True,
+        )
+
+    async def _handle_composition_tool(
+        self,
+        tc: ToolCall,
+        *,
+        ctx: StepContext,
+        events_to_record: list[SessionEvent],
+    ) -> ToolResult:
+        """Handle workflow composition from the main chat agent."""
+
+        from cognis.core.schedule_management import create_user_schedule
+        from cognis.core.workflow_composition import (
+            ComposeAndRunWorkflowArgs,
+            SkillMaterial,
+            compose_workflow_plan,
+            decompose_skill_material,
+            validate_composed_workflow,
+            workflow_preview_payload,
+        )
+        from cognis.core.workflow_management import (
+            create_user_workflow,
+            get_workflow_for_user,
+        )
+        from cognis.models.task import TaskDelivery
+        from cognis.store.queries import (
+            create_skill_version,
+            delete_workflow,
+            get_agent,
+            get_next_version_number,
+            get_skill_scoped,
+            list_skills,
+            set_current_version,
+        )
+        from cognis.tools.skill_parser import compute_content_hash
+        from cognis.tools.skill_service import (
+            compute_decomposition_source_hash,
+            resolve_current_skill_version,
+        )
+
+        if tc.name != "compose_and_run_workflow":
+            return ToolResult(
+                output=json.dumps({"error": f"Unknown composition tool: {tc.name}"}),
+                is_error=True,
+            )
+
+        task_queue = self._task_queue
+        if task_queue is None:
+            return ToolResult(
+                output=json.dumps({"error": "Task queue is not available."}),
+                is_error=True,
+            )
+        if getattr(self.providers, "llm", None) is None:
+            return ToolResult(
+                output=json.dumps({"error": "LLM provider is not available."}),
+                is_error=True,
+            )
+
+        try:
+            args = ComposeAndRunWorkflowArgs.model_validate(tc.arguments)
+        except Exception as exc:
+            return ToolResult(output=json.dumps({"error": str(exc)}), is_error=True)
+
+        workflow_registry = _workflow_registry_for_agent_loop(self)
+        owner_email = ctx.session.user_email
+        raw_agent_id = args.agent_id or ctx.agent.agent_id
+        if raw_agent_id == "self":
+            raw_agent_id = ctx.agent.agent_id
+        async with self.session_manager.session_factory() as db:
+            agent_row = await get_agent(db, str(raw_agent_id))
+        if agent_row is None or agent_row.owner_email != owner_email:
+            return ToolResult(
+                output=json.dumps({"error": "Agent not found or not accessible."}),
+                is_error=True,
+            )
+
+        def _coerce_skill_tools(value: Any) -> list[dict[str, Any]] | None:
+            if value is None:
+                return None
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+            if isinstance(value, dict):
+                return [value]
+            return None
+
+        base_workflow = None
+        if args.base_workflow_id:
+            base_workflow = await get_workflow_for_user(
+                workflow_registry=workflow_registry,
+                workflow_id=args.base_workflow_id,
+                owner_email=owner_email,
+            )
+            if base_workflow is None:
+                return ToolResult(
+                    output=json.dumps({"error": "Base workflow not found or not accessible."}),
+                    is_error=True,
+                )
+
+        available_workflows = await workflow_registry.list_all(owner_email=owner_email)
+        template_hints = list(args.template_hints)
+        if args.base_workflow_id and args.base_workflow_id not in template_hints:
+            template_hints.append(args.base_workflow_id)
+
+        async def _load_skill_materials() -> list[SkillMaterial]:
+            if not args.skill_hints:
+                return []
+            materials: list[SkillMaterial] = []
+            async with self.session_manager.session_factory() as db:
+                visible_rows = await list_skills(db, owner_email=owner_email)
+                rows_by_id = {row.skill_id: row for row in visible_rows}
+                rows_by_name = {str(row.name).lower(): row for row in visible_rows}
+                for hint in args.skill_hints:
+                    row = rows_by_id.get(hint) or rows_by_name.get(hint.lower())
+                    if row is None:
+                        raise ValueError(f"Unknown skill hint: {hint}")
+                    version_row = await resolve_current_skill_version(db, row)
+                    instructions = version_row.instructions if version_row is not None else row.instructions
+                    tools = _coerce_skill_tools(version_row.tools if version_row is not None else row.tools) or []
+                    prompt_templates = (
+                        version_row.prompt_templates if version_row is not None else row.prompt_templates
+                    ) or {}
+                    steps = [
+                        item
+                        for item in ((getattr(version_row, "steps", None) if version_row is not None else None) or [])
+                        if isinstance(item, dict)
+                    ]
+                    materials.append(
+                        SkillMaterial(
+                            skill_id=row.skill_id,
+                            name=row.name,
+                            description=row.description,
+                            instructions=instructions,
+                            tools=tools,
+                            prompt_templates=prompt_templates,
+                            steps=steps,
+                            decomposition_source_hash=(
+                                getattr(version_row, "decomposition_source_hash", None)
+                                if version_row is not None
+                                else None
+                            ),
+                            current_source_hash=compute_decomposition_source_hash(instructions),
+                        )
+                    )
+            return materials
+
+        async def _persist_skill_steps(material: SkillMaterial) -> None:
+            async with self.session_manager.session_factory() as db:
+                row = await get_skill_scoped(db, material.skill_id, owner_email=owner_email)
+                if row is None:
+                    return
+                if row.owner_email != owner_email or row.is_system or row.source not in {"db", "imported"}:
+                    return
+                current_version_row = await resolve_current_skill_version(db, row)
+                if current_version_row is None:
+                    return
+                version_number = await get_next_version_number(db, row.skill_id)
+                version_row = await create_skill_version(
+                    db,
+                    skill_id=row.skill_id,
+                    version_number=version_number,
+                    content_hash=compute_content_hash(
+                        current_version_row.instructions,
+                        _coerce_skill_tools(current_version_row.tools),
+                        current_version_row.prompt_templates,
+                        current_version_row.secret_placeholders,
+                        current_version_row.asset_manifest,
+                        material.steps,
+                    ),
+                    instructions=current_version_row.instructions,
+                    tools=_coerce_skill_tools(current_version_row.tools),
+                    prompt_templates=current_version_row.prompt_templates,
+                    secret_placeholders=current_version_row.secret_placeholders,
+                    steps=material.steps,
+                    decomposition_source_hash=compute_decomposition_source_hash(
+                        current_version_row.instructions
+                    ),
+                    source_url=current_version_row.source_url,
+                    resolved_url=current_version_row.resolved_url,
+                    commit_sha=current_version_row.commit_sha,
+                    import_checksum=current_version_row.import_checksum,
+                    imported_at=current_version_row.imported_at,
+                    import_format=current_version_row.import_format,
+                    asset_manifest=current_version_row.asset_manifest,
+                    schema_version=current_version_row.schema_version,
+                )
+                await set_current_version(db, row.skill_id, version_row.version_id)
+                await db.commit()
+
+        try:
+            skill_materials = await _load_skill_materials()
+        except ValueError as exc:
+            return ToolResult(output=json.dumps({"error": str(exc)}), is_error=True)
+
+        for material in skill_materials:
+            needs_decomposition = args.decompose_skills == "always" or (
+                args.decompose_skills == "auto"
+                and (
+                    not material.steps
+                    or material.decomposition_source_hash != material.current_source_hash
+                )
+            )
+            if not needs_decomposition:
+                continue
+            try:
+                decomposition = await decompose_skill_material(
+                    llm=self.providers.llm,
+                    skill_id=material.skill_id,
+                    name=material.name,
+                    description=material.description,
+                    instructions=material.instructions,
+                    tools=material.tools,
+                    prompt_templates=material.prompt_templates,
+                )
+            except Exception as exc:
+                return ToolResult(
+                    output=json.dumps({"error": f"Failed to decompose skill '{material.name}': {exc}"}),
+                    is_error=True,
+                )
+            material.steps = decomposition.steps
+            try:
+                await _persist_skill_steps(material)
+            except Exception as exc:
+                return ToolResult(
+                    output=json.dumps(
+                        {"error": f"Failed to persist decomposition for skill '{material.name}': {exc}"}
+                    ),
+                    is_error=True,
+                )
+            material.decomposition_source_hash = material.current_source_hash
+
+        schedule_requested = isinstance(args.schedule, dict)
+        validation_feedback: str | None = None
+        composer_output = None
+        workflow = None
+        created_workflow_ids: list[str] = []
+
+        async def _cleanup_created_workflows() -> None:
+            for workflow_id in reversed(created_workflow_ids):
+                with contextlib.suppress(Exception):
+                    async with self.session_manager.session_factory() as db:
+                        await delete_workflow(db, workflow_id)
+                        await db.commit()
+        for attempt_index in range(2):
+            try:
+                composer_output = await compose_workflow_plan(
+                    llm=self.providers.llm,
+                    intent=args.intent,
+                    context=args.context,
+                    available_workflows=available_workflows,
+                    template_hints=template_hints,
+                    base_workflow=base_workflow,
+                    skill_materials=skill_materials,
+                    persist=args.persist,
+                    schedule_requested=schedule_requested,
+                    validator_feedback=validation_feedback,
+                )
+                if composer_output.action == "reuse_existing":
+                    if not composer_output.workflow_id:
+                        raise ValueError("Composer chose reuse_existing without workflow_id")
+                    workflow = await get_workflow_for_user(
+                        workflow_registry=workflow_registry,
+                        workflow_id=composer_output.workflow_id,
+                        owner_email=owner_email,
+                    )
+                    if workflow is None:
+                        raise ValueError("Composer selected an unknown workflow")
+                else:
+                    workflow_payload = dict(composer_output.workflow or {})
+                    workflow_payload.update(
+                        {
+                            "workflow_id": workflow_payload.get("workflow_id") or "wf_composed_preview",
+                            "name": workflow_payload.get("name")
+                            or composer_output.title
+                            or args.title
+                            or "Composed Workflow",
+                            "description": workflow_payload.get("description") or args.intent,
+                            "is_system": False,
+                            "owner_email": owner_email,
+                            "lifecycle": "persistent"
+                            if (args.persist or schedule_requested)
+                            else "ephemeral",
+                            "archived_at": None,
+                            "lineage": {
+                                "base_workflow_id": base_workflow.workflow_id if base_workflow else None,
+                                "source_skill_ids": [material.skill_id for material in skill_materials],
+                                "composition_source": "agent_composed",
+                                "composition_intent": args.intent,
+                            },
+                        }
+                    )
+                    workflow = validate_composed_workflow(workflow_payload)
+                break
+            except Exception as exc:
+                validation_feedback = str(exc)
+                if attempt_index == 1:
+                    composer_output = None
+                    workflow = None
+                    break
+
+        fallback_used = False
+        if workflow is None:
+            fallback_used = True
+            workflow = await get_workflow_for_user(
+                workflow_registry=workflow_registry,
+                workflow_id="system:general-task",
+                owner_email=owner_email,
+            )
+            assert workflow is not None
+
+        persisted_workflow_id = workflow.workflow_id
+        if not fallback_used and composer_output is not None and composer_output.action == "create_derived":
+            try:
+                created_row = await create_user_workflow(
+                    session_factory=self.session_manager.session_factory,
+                    owner_email=owner_email,
+                    payload=workflow.model_dump(mode="json"),
+                    allow_ephemeral=True,
+                )
+            except ValueError as exc:
+                return ToolResult(output=json.dumps({"error": str(exc)}), is_error=True)
+            persisted_workflow_id = created_row.workflow_id
+            created_workflow_ids.append(created_row.workflow_id)
+            workflow = Workflow.model_validate(created_row.definition)
+        elif schedule_requested and str(workflow.lifecycle) != "persistent":
+            persistent_payload = workflow.model_dump(mode="json")
+            persistent_payload["workflow_id"] = None
+            persistent_payload["lifecycle"] = "persistent"
+            persistent_payload["archived_at"] = None
+            persistent_payload["lineage"] = {
+                **(workflow.lineage.model_dump(mode="json") if workflow.lineage else {}),
+                "base_workflow_id": workflow.workflow_id,
+                "composition_source": "agent_composed",
+            }
+            try:
+                created_row = await create_user_workflow(
+                    session_factory=self.session_manager.session_factory,
+                    owner_email=owner_email,
+                    payload=persistent_payload,
+                    allow_ephemeral=True,
+                )
+            except ValueError as exc:
+                return ToolResult(output=json.dumps({"error": str(exc)}), is_error=True)
+            persisted_workflow_id = created_row.workflow_id
+            created_workflow_ids.append(created_row.workflow_id)
+            workflow = Workflow.model_validate(created_row.definition)
+
+        delivery_raw = args.delivery if isinstance(args.delivery, dict) else {}
+        completion_delivery = CompletionDeliveryPolicy(
+            completion_mode_family=str(delivery_raw.get("completion_mode_family", "default")),
+            allow_silent_completion=bool(delivery_raw.get("allow_silent_completion", False)),
+        )
+        task_delivery = TaskDelivery(
+            mode=str(
+                delivery_raw.get(
+                    "mode",
+                    "latest_active_for_agent" if schedule_requested else "same_conversation",
+                )
+            ),
+            target=(
+                str(delivery_raw["target"]) if isinstance(delivery_raw.get("target"), str) else None
+            ),
+        )
+
+        schedule_id: str | None = None
+        task_id: str | None = None
+        title = composer_output.title if composer_output and composer_output.title else args.title
+        title = title or (args.intent.strip()[:80] if args.intent.strip() else workflow.name)
+        expected_output = args.expected_output or (
+            composer_output.expected_output if composer_output else None
+        )
+        if schedule_requested:
+            schedule_payload = dict(args.schedule or {})
+            schedule_payload.update(
+                {
+                    "name": schedule_payload.get("name") or title,
+                    "description": schedule_payload.get("description") or args.context or args.intent,
+                    "agent_id": raw_agent_id,
+                    "workflow_id": persisted_workflow_id,
+                    "task_template": {
+                        "title": title,
+                        "description": args.context or args.intent,
+                        "expected_output": expected_output,
+                        "priority": args.priority or 0,
+                        "workflow_id": persisted_workflow_id,
+                        "delivery": task_delivery.model_dump(mode="json"),
+                        "workspace_root": ctx.workspace_root,
+                        "working_directory": ctx.working_directory,
+                    },
+                    "completion_mode_family": completion_delivery.completion_mode_family,
+                    "allow_silent_completion": completion_delivery.allow_silent_completion,
+                }
+            )
+            try:
+                schedule_row = await create_user_schedule(
+                    session_factory=self.session_manager.session_factory,
+                    scheduler=None,
+                    workflow_registry=workflow_registry,
+                    owner_email=owner_email,
+                    payload=schedule_payload,
+                )
+            except ValueError as exc:
+                await _cleanup_created_workflows()
+                return ToolResult(output=json.dumps({"error": str(exc)}), is_error=True)
+            schedule_id = schedule_row.schedule_id
+        else:
+            try:
+                task = await task_queue.submit(
+                    created_by=owner_email,
+                    agent_id=raw_agent_id,
+                    title=title,
+                    description=args.context or args.intent,
+                    expected_output=expected_output,
+                    priority=args.priority or 0,
+                    source_type="agent",
+                    source_ref=ctx.conversation.conversation_id,
+                    delivery=task_delivery,
+                    completion_delivery=completion_delivery,
+                    workflow_id=persisted_workflow_id,
+                    workspace_root=ctx.workspace_root,
+                    working_directory=ctx.working_directory,
+                )
+            except (ValueError, RuntimeError) as exc:
+                await _cleanup_created_workflows()
+                return ToolResult(output=json.dumps({"error": str(exc)}), is_error=True)
+            task_id = task.task_id
+            events_to_record.append(
+                SessionEvent(
+                    type="delegation",
+                    data={
+                        "mode": "task",
+                        "call_id": tc.call_id,
+                        "task": task.title,
+                        "child_session_id": task.task_id,
+                        "status": "started",
+                    },
+                )
+            )
+            await self.event_bus.publish(
+                Event(
+                    type=EventType.DELEGATION_STARTED,
+                    data={
+                        "conversation_id": ctx.conversation.conversation_id,
+                        "parent_session_id": ctx.session.session_id,
+                        "child_session_id": task.task_id,
+                        "mode": "task",
+                        "agent_id": task.agent_id,
+                        "task": task.title,
+                    },
+                )
+            )
+
+        preview = workflow_preview_payload(workflow)
+        events_to_record.append(
+            SessionEvent(
+                type="workflow_composed",
+                data={
+                    "workflow_id": persisted_workflow_id,
+                    "workflow_name": workflow.name,
+                    "lifecycle": str(workflow.lifecycle),
+                    "steps": preview["steps"],
+                    "task_id": task_id,
+                    "schedule_id": schedule_id,
+                },
+            )
+        )
+        await self.event_bus.publish(
+            Event(
+                type=EventType.WORKFLOW_COMPOSED,
+                data={
+                    "conversation_id": ctx.conversation.conversation_id,
+                    "workflow_id": persisted_workflow_id,
+                    "workflow_name": workflow.name,
+                    "lifecycle": str(workflow.lifecycle),
+                    "steps": preview["steps"],
+                    "task_id": task_id,
+                    "schedule_id": schedule_id,
+                },
+            )
+        )
+        return ToolResult(
+            output=json.dumps(
+                {
+                    "task_id": task_id,
+                    "schedule_id": schedule_id,
+                    "workflow_id": persisted_workflow_id,
+                    "workflow_preview": preview,
+                    "fallback_used": fallback_used,
+                }
+            )
         )
 
     async def _emergency_flush_events(
@@ -7283,6 +7797,7 @@ class AgentLoop:
     def _get_controller_tool_parameters(self, tool_name: str) -> dict[str, Any] | None:
         """Return the parameters schema for a controller tool, or None."""
 
+        from cognis.tools.builtin.orchestration import orchestration_tools
         from cognis.tools.builtin.workflow import (
             LIST_CREDENTIALS_TOOL,
             REQUEST_AUTH_CHALLENGE_TOOL,
@@ -7305,6 +7820,8 @@ class AgentLoop:
             LIST_CREDENTIALS_TOOL.name: LIST_CREDENTIALS_TOOL,
             SEARCH_TOOLS_TOOL.name: SEARCH_TOOLS_TOOL,
         }
+        for tool_def in orchestration_tools(OrchestrationMode.FULL):
+            registry[tool_def.name] = tool_def
         tool_def = registry.get(tool_name)
         return tool_def.parameters if tool_def is not None else None
 

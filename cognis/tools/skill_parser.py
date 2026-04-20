@@ -47,6 +47,7 @@ def parse_skill_md(content: str) -> dict[str, Any]:
             "tools": [],
             "prompt_templates": {},
             "secret_placeholders": [],
+            "steps": [],
         }
 
     frontmatter_text = match.group(1)
@@ -86,6 +87,10 @@ def parse_skill_md(content: str) -> dict[str, Any]:
     if not isinstance(secret_placeholders, list):
         secret_placeholders = []
 
+    raw_steps = frontmatter.get("steps") or []
+    if not isinstance(raw_steps, list):
+        raw_steps = []
+
     return {
         "name": name,
         "description": description,
@@ -94,6 +99,8 @@ def parse_skill_md(content: str) -> dict[str, Any]:
         "tools": [tool.model_dump(mode="json") for tool in tools],
         "prompt_templates": prompt_templates,
         "secret_placeholders": [str(s) for s in secret_placeholders],
+        "steps": [item for item in raw_steps if isinstance(item, dict)],
+        "decomposition_source_hash": frontmatter.get("decomposition_source_hash"),
     }
 
 
@@ -164,6 +171,8 @@ def parse_cognis_yaml(content: str) -> dict[str, Any]:
         "tools": [tool.model_dump(mode="json") for tool in tools],
         "prompt_templates": data.get("prompt_templates") or {},
         "secret_placeholders": data.get("secret_placeholders") or [],
+        "steps": [item for item in (data.get("steps") or []) if isinstance(item, dict)],
+        "decomposition_source_hash": data.get("decomposition_source_hash"),
         "provenance": data.get("provenance") or None,
         "asset_manifest": data.get("asset_manifest") or [],
         "schema_version": data.get("schema_version", 1),
@@ -228,6 +237,7 @@ def compute_content_hash(
     prompt_templates: dict[str, Any] | None = None,
     secret_placeholders: list[str] | None = None,
     asset_manifest: list[dict[str, Any]] | None = None,
+    steps: list[dict[str, Any]] | None = None,
 ) -> str:
     """Compute SHA-256 hash of canonical skill content."""
     import json
@@ -239,6 +249,7 @@ def compute_content_hash(
             "prompt_templates": prompt_templates or {},
             "secret_placeholders": secret_placeholders or [],
             "asset_manifest": asset_manifest or [],
+            "steps": steps or [],
         },
         sort_keys=True,
         ensure_ascii=True,
@@ -266,6 +277,10 @@ def export_skill_md(data: SkillExportData) -> str:
         frontmatter["prompt_templates"] = data.prompt_templates
     if data.secret_placeholders:
         frontmatter["secret_placeholders"] = data.secret_placeholders
+    if data.steps:
+        frontmatter["steps"] = data.steps
+    if data.decomposition_source_hash:
+        frontmatter["decomposition_source_hash"] = data.decomposition_source_hash
 
     fm_text = yaml.dump(frontmatter, default_flow_style=False, sort_keys=False).strip()
     return f"---\n{fm_text}\n---\n\n{data.instructions}\n"
@@ -289,6 +304,8 @@ def export_cognis_yaml(data: SkillExportData) -> str:
         export_dict["prompt_templates"] = data.prompt_templates
     if data.secret_placeholders:
         export_dict["secret_placeholders"] = data.secret_placeholders
+    if data.steps:
+        export_dict["steps"] = data.steps
     if data.provenance:
         export_dict["provenance"] = data.provenance.model_dump(mode="json", exclude_none=True)
     if data.asset_manifest:
@@ -296,6 +313,8 @@ def export_cognis_yaml(data: SkillExportData) -> str:
             a.model_dump(mode="json", exclude_none=True, exclude={"url", "signed_url"})
             for a in data.asset_manifest
         ]
+    if data.decomposition_source_hash:
+        export_dict["decomposition_source_hash"] = data.decomposition_source_hash
 
     return yaml.dump(export_dict, default_flow_style=False, sort_keys=False)
 

@@ -423,6 +423,26 @@ describe('chat timeline helpers', () => {
     expect(noticeTwice).toHaveLength(2);
   });
 
+  it('renders workflow composition events as timeline cards', () => {
+    const items = applyWebSocketEvent([], {
+      type: 'workflow_composed',
+      workflow_id: 'wf_1',
+      workflow_name: 'Evening Summary',
+      lifecycle: 'ephemeral',
+      task_id: 'task_1',
+      steps: ['gather', 'summarize']
+    });
+
+    expect(items[0]).toMatchObject({
+      kind: 'workflow_composed',
+      workflowId: 'wf_1',
+      workflowName: 'Evening Summary',
+      lifecycle: 'ephemeral',
+      taskId: 'task_1',
+      steps: ['gather', 'summarize']
+    });
+  });
+
   describe('step_request_input helpers', () => {
     it('finds the most recent unresolved step_request_input tool call', () => {
       const timeline = applyWebSocketEvent([], {

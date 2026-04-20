@@ -11,6 +11,7 @@ type TaskDetailApi = {
   };
   workflows: {
     listAll(): Promise<Workflow[]>;
+    detail(workflowId: string): Promise<Workflow>;
   };
   conversations: {
     listAll(): Promise<Conversation[]>;
@@ -41,10 +42,19 @@ export async function loadTaskPageData(api: TaskDetailApi, taskId: string): Prom
     api.tasks.listAll()
   ]);
 
+  let workflows = workflowsResult.status === 'fulfilled' ? workflowsResult.value : [];
+  if (task.workflow_id && !workflows.some((workflow) => workflow.workflow_id === task.workflow_id)) {
+    try {
+      workflows = [...workflows, await api.workflows.detail(task.workflow_id)];
+    } catch {
+      // Leave the auxiliary workflow list best-effort; task detail already loaded.
+    }
+  }
+
   return {
     task,
     agents: agentsResult.status === 'fulfilled' ? agentsResult.value : [],
-    workflows: workflowsResult.status === 'fulfilled' ? workflowsResult.value : [],
+    workflows,
     conversations: conversationsResult.status === 'fulfilled' ? conversationsResult.value : [],
     allTasks: tasksResult.status === 'fulfilled' ? tasksResult.value : [],
     auxiliaryError:

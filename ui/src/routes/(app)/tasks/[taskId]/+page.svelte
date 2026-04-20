@@ -117,6 +117,17 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
     return workflows.find((w) => w.workflow_id === workflowId)?.name ?? workflowId;
   }
 
+  function currentWorkflow(): Workflow | null {
+    if (!task?.workflow_id) return null;
+    const workflowId = task.workflow_id;
+    return workflows.find((workflow) => workflow.workflow_id === workflowId) ?? null;
+  }
+
+  async function promoteWorkflowFromTask(): Promise<void> {
+    if (!task?.workflow_id) return;
+    await goto(`/workflows?draftFrom=${encodeURIComponent(task.workflow_id)}`);
+  }
+
   function agentFor(agentId: string | null): Agent | null {
     if (!agentId) return null;
     return agents.find((a) => a.agent_id === agentId) ?? null;
@@ -1471,6 +1482,9 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
                   {/if}
                 </div>
               {/if}
+              {#if currentWorkflow()?.lifecycle === 'ephemeral'}
+                <Button class="mt-4" size="sm" variant="secondary" onclick={() => void promoteWorkflowFromTask()}>Promote workflow</Button>
+              {/if}
               {#if hasFinalTaskOutput(task)}
                 <p class="mt-4 text-xs text-slate-500">The finalized deliverable stays in the full step output modal to keep this summary lightweight.</p>
               {/if}
@@ -1635,6 +1649,9 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
                 <span class="rounded-full border border-slate-700 bg-slate-950/80 px-2.5 py-1">Format {finalTaskResultFormat(task)}</span>
               {/if}
             </div>
+          {/if}
+          {#if currentWorkflow()?.lifecycle === 'ephemeral'}
+            <Button class="mt-4" size="sm" variant="secondary" onclick={() => void promoteWorkflowFromTask()}>Promote workflow</Button>
           {/if}
           {#if hasFinalTaskOutput(task)}
             <p class="mt-4 text-xs text-slate-500">The finalized deliverable stays in the full step output modal to keep this summary lightweight.</p>

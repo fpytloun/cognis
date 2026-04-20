@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from cognis.models.skill import SkillAssetRef, SkillExportData, SkillToolSpec
+from cognis.models.workflow import StepDefinition
 from cognis.store.queries import (
     create_skill_asset,
     create_skill_version,
@@ -126,6 +127,27 @@ def normalize_secret_placeholders(value: Any) -> list[str] | None:
     if not isinstance(value, list):
         raise ValueError("secret_placeholders must be a list of strings")
     return [str(item).strip() for item in value if str(item).strip()]
+
+
+def normalize_skill_steps(value: Any) -> list[dict[str, Any]] | None:
+    """Validate skill decomposition step fragments."""
+
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise ValueError("steps must be a list of workflow step objects")
+    normalized: list[dict[str, Any]] = []
+    for raw in value:
+        if not isinstance(raw, dict):
+            raise ValueError("steps must be a list of workflow step objects")
+        normalized.append(StepDefinition.model_validate(raw).model_dump(mode="json"))
+    return normalized
+
+
+def compute_decomposition_source_hash(instructions: str) -> str:
+    """Compute a stable hash for the instruction text that produced decomposition."""
+
+    return hashlib.sha256(instructions.strip().encode("utf-8")).hexdigest()
 
 
 def normalize_skill_asset_filename(filename: str) -> str:
@@ -332,6 +354,7 @@ async def create_skill_version_with_assets(
     tools: list[dict[str, Any]] | None,
     prompt_templates: dict[str, Any] | None,
     secret_placeholders: list[str] | None,
+    steps: list[dict[str, Any]] | None,
     assets: list[dict[str, Any]] | None,
     allow_binary_assets: bool,
     source_url: str | None = None,
@@ -341,10 +364,12 @@ async def create_skill_version_with_assets(
     imported_at: Any | None = None,
     import_format: str | None = None,
     schema_version: int = 1,
+    decomposition_source_hash: str | None = None,
 ) -> Any:
     normalized_tools = normalize_skill_tools(tools)
     normalized_templates = normalize_prompt_templates(prompt_templates)
     normalized_placeholders = normalize_secret_placeholders(secret_placeholders)
+    normalized_steps = normalize_skill_steps(steps)
     prepared_assets = await prepare_skill_assets(
         session,
         artifact_store,
@@ -385,6 +410,7 @@ async def create_skill_version_with_assets(
         normalized_templates,
         normalized_placeholders,
         asset_manifest,
+        normalized_steps,
     )
     version_row = await create_skill_version(
         session,
@@ -395,6 +421,8 @@ async def create_skill_version_with_assets(
         tools=normalized_tools,
         prompt_templates=normalized_templates,
         secret_placeholders=normalized_placeholders,
+        steps=normalized_steps,
+        decomposition_source_hash=decomposition_source_hash,
         source_url=source_url,
         resolved_url=resolved_url,
         commit_sha=commit_sha,

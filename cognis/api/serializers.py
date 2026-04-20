@@ -339,6 +339,13 @@ def workflow_to_response(row: Any) -> WorkflowResponse:
         steps=list(definition.get("steps", [])),
         is_system=row.is_system,
         owner_email=row.owner_email,
+        lifecycle=getattr(row, "lifecycle", str(definition.get("lifecycle", "persistent"))),
+        archived_at=getattr(row, "archived_at", None),
+        lineage=(
+            dict(definition.get("lineage", {}))
+            if isinstance(definition.get("lineage"), Mapping)
+            else None
+        ),
         editable_fields=list(getattr(row, "editable_fields", []) or []),
         has_overrides=bool(getattr(row, "has_overrides", False)),
         disabled=bool(getattr(row, "disabled", False)),

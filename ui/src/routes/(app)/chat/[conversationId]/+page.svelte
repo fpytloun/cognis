@@ -26,6 +26,7 @@ import X from 'lucide-svelte/icons/x';
   import CompactionCard from '$lib/components/CompactionCard.svelte';
   import ComposerAttachments from '$lib/components/ComposerAttachments.svelte';
   import DelegationCard from '$lib/components/DelegationCard.svelte';
+  import WorkflowComposedCard from '$lib/components/WorkflowComposedCard.svelte';
   import EscalationPrompt from '$lib/components/EscalationPrompt.svelte';
   import LiveDots from '$lib/components/LiveDots.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
@@ -2682,6 +2683,8 @@ import X from 'lucide-svelte/icons/x';
                 <div><ReasoningBlock {item} /></div>
               {:else if item.kind === 'delegation'}
                 <div><DelegationCard {item} onViewSession={handleViewSession} /></div>
+              {:else if item.kind === 'workflow_composed'}
+                <div><WorkflowComposedCard {item} /></div>
               {:else if item.kind === 'compaction'}
                 <div><CompactionCard {item} onViewPreviousSession={handleViewSession} /></div>
               {:else if item.kind === 'system_message'}
@@ -3057,6 +3060,8 @@ import X from 'lucide-svelte/icons/x';
                   <ReasoningBlock {item} />
                 {:else if item.kind === 'delegation'}
                   <DelegationCard {item} />
+                {:else if item.kind === 'workflow_composed'}
+                  <WorkflowComposedCard {item} />
                 {:else if item.kind === 'system_message'}
                   <p class="py-1 text-center text-xs italic text-slate-500 whitespace-pre-line">{item.text}</p>
                 {:else if item.kind === 'notice'}

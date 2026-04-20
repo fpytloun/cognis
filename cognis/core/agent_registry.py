@@ -327,6 +327,51 @@ Respond with a single JSON object:
 The "feedback" field is shown to the agent on revise — make it specific \
 and actionable so the agent knows exactly what to fix."""
 
+_WORKFLOW_COMPOSER_PROMPT = """\
+You are a workflow composer. Respond with a single JSON object and nothing else.
+
+Your job is to choose between:
+- reusing an existing workflow unchanged
+- creating a derived workflow definition adapted to the request
+
+Rules:
+- Reuse an existing workflow only when it already fits without modification.
+- Never mutate or suggest mutating a system workflow in place.
+- Prefer smaller proportional workflows over copying large templates unchanged.
+- Synthesis/report/final steps should usually require deliverables.
+- Gather/inspect/fetch steps may set require_deliverable=false when a lightweight step output is enough.
+- If a schedule is requested, prefer a reusable persistent shape.
+
+Return JSON:
+{
+  "action": "reuse_existing" | "create_derived",
+  "workflow_id": "...",  // required for reuse_existing
+  "workflow": { ... },     // required for create_derived
+  "rationale": "...",
+  "title": "...",
+  "expected_output": "..."
+}
+
+The workflow object must be a valid Cognis workflow definition except that the
+controller will assign workflow_id, owner_email, lifecycle, archived_at, and lineage."""
+
+_SKILL_DECOMPOSER_PROMPT = """\
+You decompose a skill into reusable Cognis workflow step fragments.
+
+Rules:
+- Return only valid StepDefinition-style objects.
+- Use run steps unless a human approval gate is clearly necessary.
+- Prefer a small number of meaningful steps.
+- Keep gather/inspect steps lightweight.
+- Use require_deliverable=true for synthesis/report/final artifact steps.
+- Do not invent tools or fields outside the workflow schema.
+
+Return JSON:
+{
+  "rationale": "...",
+  "steps": [ ... ]
+}"""
+
 
 # ---------------------------------------------------------------------------
 # System agent definitions
@@ -489,6 +534,20 @@ SYSTEM_AGENTS: dict[str, AgentDefinition] = {
             "Evaluator",
             "Workflow step completion evaluation",
             _EVALUATOR_PROMPT,
+            hidden=True,
+        ),
+        _system_agent(
+            "system:workflow_composer",
+            "Workflow Composer",
+            "Structured workflow composition",
+            _WORKFLOW_COMPOSER_PROMPT,
+            hidden=True,
+        ),
+        _system_agent(
+            "system:skill_decomposer",
+            "Skill Decomposer",
+            "Structured decomposition of skills into workflow steps",
+            _SKILL_DECOMPOSER_PROMPT,
             hidden=True,
         ),
     ]

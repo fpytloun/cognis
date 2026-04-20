@@ -581,6 +581,9 @@ export interface SkillVersion {
   tools: Record<string, unknown>[] | null;
   prompt_templates: Record<string, unknown> | null;
   secret_placeholders: string[] | null;
+  steps: Record<string, unknown>[] | null;
+  decomposition_source_hash: string | null;
+  decomposition_stale: boolean;
   source_url: string | null;
   resolved_url: string | null;
   commit_sha: string | null;
@@ -618,6 +621,7 @@ export interface Skill {
   instructions: string;
   tools: Record<string, unknown>[] | null;
   prompt_templates: Record<string, unknown> | null;
+  steps: Record<string, unknown>[] | null;
   tags: string[] | null;
   attach_to_all_agents: boolean;
   auto_load?: boolean;
@@ -636,6 +640,8 @@ export interface SkillCreate {
   instructions: string;
   tools?: Record<string, unknown>[];
   prompt_templates?: Record<string, unknown>;
+  steps?: Record<string, unknown>[];
+  decomposition_source_hash?: string;
   tags?: string[];
   attach_to_all_agents?: boolean;
   auto_load?: boolean;
@@ -649,6 +655,8 @@ export interface SkillUpdate {
   instructions?: string;
   tools?: Record<string, unknown>[];
   prompt_templates?: Record<string, unknown>;
+  steps?: Record<string, unknown>[];
+  decomposition_source_hash?: string;
   tags?: string[];
   attach_to_all_agents?: boolean;
   auto_load?: boolean;
@@ -675,6 +683,13 @@ export interface SkillExportResponse {
   content_type: string | null;
   filename: string;
   warnings: string[];
+}
+
+export interface SkillDecompositionPreview {
+  skill_id: string;
+  source_hash: string;
+  rationale: string;
+  steps: Record<string, unknown>[];
 }
 
 export interface TaskDelivery {
@@ -831,6 +846,9 @@ export interface Workflow {
   steps: WorkflowStep[];
   is_system: boolean;
   owner_email: string | null;
+  lifecycle: 'persistent' | 'ephemeral' | string;
+  archived_at: string | null;
+  lineage: Record<string, unknown> | null;
   editable_fields: string[];
   has_overrides: boolean;
   disabled: boolean;
@@ -1146,6 +1164,17 @@ export interface WebSocketWorkflowStepStartedEvent {
   step_run_id?: string;
 }
 
+export interface WebSocketWorkflowComposedEvent {
+  type: 'workflow_composed';
+  conversation_id?: string;
+  task_id?: string | null;
+  schedule_id?: string | null;
+  workflow_id: string;
+  workflow_name: string;
+  lifecycle: string;
+  steps: string[];
+}
+
 export interface WebSocketWorkflowStepCompletedEvent {
   type: 'workflow_step_completed';
   conversation_id?: string;
@@ -1363,6 +1392,7 @@ export type CognisWebSocketEvent =
   | WebSocketDelegationProgressEvent
   | WebSocketDelegationCompletedEvent
   | WebSocketDelegationFailedEvent
+  | WebSocketWorkflowComposedEvent
   | WebSocketWorkflowStepStartedEvent
   | WebSocketWorkflowStepCompletedEvent
   | WebSocketWorkflowGateEvent

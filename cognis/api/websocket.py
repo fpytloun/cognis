@@ -609,6 +609,21 @@ class WebSocketConnectionManager:
                         }
                     )
                     replayed += 1
+                elif event_type == "workflow_composed":
+                    await connection.send_json(
+                        {
+                            "type": "workflow_composed",
+                            "conversation_id": conversation_id,
+                            "task_id": data.get("task_id"),
+                            "schedule_id": data.get("schedule_id"),
+                            "workflow_id": data.get("workflow_id"),
+                            "workflow_name": data.get("workflow_name")
+                            or data.get("workflow_id"),
+                            "lifecycle": data.get("lifecycle", "ephemeral"),
+                            "steps": data.get("steps") or [],
+                        }
+                    )
+                    replayed += 1
                 elif event_type == "delegation":
                     status = data.get("status")
                     if status == "completed":
@@ -1423,6 +1438,17 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
             "task_id": event.data.get("task_id"),
             "step_name": event.data.get("step_name"),
             "attempt": event.data.get("attempt", 1),
+        }
+    if event.type == EventType.WORKFLOW_COMPOSED:
+        return {
+            "type": "workflow_composed",
+            "conversation_id": conversation_id,
+            "task_id": event.data.get("task_id"),
+            "schedule_id": event.data.get("schedule_id"),
+            "workflow_id": event.data.get("workflow_id"),
+            "workflow_name": event.data.get("workflow_name"),
+            "lifecycle": event.data.get("lifecycle"),
+            "steps": event.data.get("steps"),
         }
     if event.type == EventType.SYSTEM_NOTICE:
         return {

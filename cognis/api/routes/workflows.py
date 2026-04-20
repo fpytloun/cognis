@@ -58,10 +58,13 @@ async def workflow_list(
     cursor: str | None = None,
     limit: int = Query(default=20, ge=1, le=100),
     include_disabled: bool = Query(default=False),
+    include_ephemeral: bool = Query(default=False),
 ) -> CursorPage[WorkflowResponse]:
     user = require_current_user(request)
     workflows = await request.app.state.workflow_registry.list_all(
-        owner_email=user.email, include_disabled=include_disabled
+        owner_email=user.email,
+        include_disabled=include_disabled,
+        include_ephemeral=include_ephemeral,
     )
     items = [workflow_to_response(workflow) for workflow in workflows]
     page_items, next_cursor, has_more = paginate_items(
@@ -78,11 +81,14 @@ async def workflow_create(request: Request, payload: WorkflowRequest) -> Workflo
     forbid_mutation_for_viewer(request)
     user = require_current_user(request)
     _validate_workflow_payload(payload.model_dump(mode="json"))
-    row = await create_user_workflow(
-        session_factory=request.app.state.session_factory,
-        owner_email=user.email,
-        payload=payload.model_dump(mode="json"),
-    )
+    try:
+        row = await create_user_workflow(
+            session_factory=request.app.state.session_factory,
+            owner_email=user.email,
+            payload=payload.model_dump(mode="json"),
+        )
+    except ValueError as exc:
+        raise api_exception(400, "validation_error", str(exc)) from exc
     return workflow_to_response(row)
 
 
@@ -127,6 +133,8 @@ async def workflow_update_route(
             raise api_exception(404, "not_found", message) from exc
         if message in {"System workflows are read-only", "Workflow access denied"}:
             raise api_exception(403, "forbidden", message) from exc
+        if message == "Ephemeral lifecycle is reserved for composed workflows":
+            raise api_exception(400, "validation_error", message) from exc
         raise api_exception(409, "conflict", message) from exc
     return workflow_to_response(row)
 
