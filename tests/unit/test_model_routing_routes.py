@@ -185,6 +185,95 @@ def test_model_routing_put_rejects_reasoning_effort_for_non_text_routes(
         assert "does not support reasoning_effort" in response.json()["error"]["message"]
 
 
+def test_model_routing_put_rejects_non_transcription_model_for_speech_to_text(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> None:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="admin@example.com",
+                    name="Admin",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="admin",
+                )
+                await create_llm_provider(
+                    session,
+                    provider_id="openai",
+                    display_name="OpenAI",
+                    location="controller",
+                    backend="litellm",
+                    config={
+                        "preset": "openai",
+                        "default_model": "gpt-5.4",
+                        "models": [{"model_id": "gpt-5.4", "supports_reasoning": True}],
+                    },
+                    status="active",
+                )
+                await session.commit()
+
+        asyncio.run(_seed())
+
+        headers = _auth_headers(app, email="admin@example.com", role="admin")
+        response = client.put(
+            "/api/v1/model-routing",
+            headers=headers,
+            json={"speech_to_text": {"model": "gpt-5.4", "reasoning_effort": None}},
+        )
+
+        assert response.status_code == 422
+        assert "not eligible" in response.json()["error"]["message"]
+
+
+def test_model_routing_put_rejects_non_image_model_for_image_generation(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> None:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="admin@example.com",
+                    name="Admin",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="admin",
+                )
+                await create_llm_provider(
+                    session,
+                    provider_id="openai",
+                    display_name="OpenAI",
+                    location="controller",
+                    backend="litellm",
+                    config={
+                        "preset": "openai",
+                        "default_model": "gpt-image-1",
+                        "models": [
+                            {"model_id": "gpt-5.4", "supports_reasoning": True},
+                            {"model_id": "gpt-image-1", "supports_image_generation": True},
+                        ],
+                    },
+                    status="active",
+                )
+                await session.commit()
+
+        asyncio.run(_seed())
+
+        headers = _auth_headers(app, email="admin@example.com", role="admin")
+        response = client.put(
+            "/api/v1/model-routing",
+            headers=headers,
+            json={"image_generation": {"model": "gpt-5.4", "reasoning_effort": None}},
+        )
+
+        assert response.status_code == 422
+        assert "not eligible" in response.json()["error"]["message"]
+
+
 def test_model_routing_put_rejects_invalid_reasoning_effort_value(
     monkeypatch: object, tmp_path: Path
 ) -> None:

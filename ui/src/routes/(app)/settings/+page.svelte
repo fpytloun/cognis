@@ -359,6 +359,11 @@
     return collectModelOptions(providers);
   }
 
+  function looksLikeTranscriptionModel(value: string): boolean {
+    const normalized = value.trim().toLowerCase().replaceAll('_', '-');
+    return normalized.includes('transcribe') || normalized.includes('whisper') || normalized.includes('speech-to-text');
+  }
+
   function findModelEntry(modelId: string): ModelEntry | null {
     const normalized = modelId.trim();
     if (!normalized) {
@@ -394,6 +399,20 @@
     }
     const modelEntry = findModelEntry(effectiveRouteModelId(routeKey));
     return (modelEntry?.reasoning_efforts ?? []).filter((value) => value !== 'default');
+  }
+
+  function routeModelOptions(routeKey: RoutingKey): Array<{ value: string; label: string; providerId: string }> {
+    const options = modelOptions();
+    if (routeKey === 'image_generation') {
+      return options.filter((option) => findModelEntry(option.value)?.supports_image_generation);
+    }
+    if (routeKey === 'speech_to_text') {
+      return options.filter((option) => {
+        const entry = findModelEntry(option.value);
+        return looksLikeTranscriptionModel(option.value) || looksLikeTranscriptionModel(entry?.display_name ?? '');
+      });
+    }
+    return options;
   }
 
   function syncRouteThinkingEffort(routeKey: RoutingKey): void {
@@ -1673,7 +1692,7 @@
                 <span>{route.label}</span>
                 <select bind:value={routingForm[route.key].model} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" onchange={() => syncRouteThinkingEffort(route.key)}>
                   <option value="">Use provider default</option>
-                  {#each modelOptions() as option}
+                  {#each routeModelOptions(route.key) as option}
                     <option value={option.value}>{option.label}</option>
                   {/each}
                 </select>

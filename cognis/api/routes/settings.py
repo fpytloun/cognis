@@ -55,6 +55,27 @@ _ROUTING_TASK_TYPES: tuple[str, ...] = (
 _TEXT_ROUTING_TASK_TYPES = frozenset({"default", "classifier", "compaction", "evaluator"})
 
 
+def _looks_like_transcription_model(model_name: str) -> bool:
+    normalized = model_name.strip().lower().replace("_", "-")
+    return any(token in normalized for token in ("transcribe", "whisper", "speech-to-text"))
+
+
+def _route_model_is_eligible(
+    task_type: str,
+    *,
+    model_id: str,
+    model_info: Any,
+) -> bool:
+    if task_type == "speech_to_text":
+        display_name = getattr(model_info, "display_name", None)
+        return _looks_like_transcription_model(model_id) or (
+            isinstance(display_name, str) and _looks_like_transcription_model(display_name)
+        )
+    if task_type == "image_generation":
+        return bool(getattr(model_info, "supports_image_generation", False))
+    return True
+
+
 def _routing_entry_from_row(task_type: str, row: Any | None) -> dict[str, str | None]:
     if row is None:
         return {"model": None, "reasoning_effort": None}
@@ -449,6 +470,17 @@ async def model_routing_put(
 
         normalized_model = entry.model.strip()
         resolved_provider_id = await llm.find_provider_for_model(normalized_model)
+        model_info = await llm.get_model_info(normalized_model, provider_id=resolved_provider_id)
+        if not _route_model_is_eligible(
+            task_type,
+            model_id=normalized_model,
+            model_info=model_info,
+        ):
+            raise api_exception(
+                422,
+                "validation_error",
+                f"{task_type} model {normalized_model!r} is not eligible for that route",
+            )
         config: dict[str, str] | None = None
         if isinstance(entry.reasoning_effort, str) and entry.reasoning_effort.strip():
             normalized_effort = normalize_reasoning_level(entry.reasoning_effort)
@@ -469,7 +501,6 @@ async def model_routing_put(
                     "validation_error",
                     f"{task_type} does not support reasoning_effort",
                 )
-            model_info = await llm.get_model_info(normalized_model, provider_id=resolved_provider_id)
             if normalized_effort not in model_info.reasoning_efforts:
                 raise api_exception(
                     422,
