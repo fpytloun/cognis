@@ -7,7 +7,11 @@ import json
 
 import pytest
 
-from cognis.core.step_evaluator import StepEvaluator, is_evaluator_malfunction
+from cognis.core.step_evaluator import (
+    DEFAULT_EVALUATOR_TIMEOUT_MS,
+    StepEvaluator,
+    is_evaluator_malfunction,
+)
 from cognis.models.workflow import CompletionConfig, StepDefinition, StepOutput
 
 
@@ -69,6 +73,23 @@ class _CaptureLLM:
         return {
             "choices": [{"message": {"content": '{"decision": "approved", "reasoning": "ok"}'}}]
         }
+
+
+class _SessionFactory:
+    def __init__(self, value: object) -> None:
+        self.value = value
+
+    def __call__(self) -> object:
+        value = self.value
+
+        class _Context:
+            async def __aenter__(self) -> object:
+                return value
+
+            async def __aexit__(self, exc_type: object, exc: object, tb: object) -> bool:
+                return False
+
+        return _Context()
 
 
 def _step_def(prompt: str = "Implement the feature") -> StepDefinition:
@@ -138,6 +159,24 @@ async def test_evaluator_timeout_forces_failure() -> None:
     assert result.decision == "failed"
     assert is_evaluator_malfunction(result) is True
     assert "timed out" in result.reasoning.lower()
+
+
+@pytest.mark.asyncio
+async def test_from_session_factory_uses_seeded_timeout_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _fake_get_setting_value(session: object, key: str, default: object = None) -> object:
+        del session
+        assert key == "evaluator.timeout_ms"
+        assert default == DEFAULT_EVALUATOR_TIMEOUT_MS
+        return default
+
+    monkeypatch.setattr("cognis.core.step_evaluator.get_setting_value", _fake_get_setting_value)
+
+    evaluator = await StepEvaluator.from_session_factory(
+        session_factory=_SessionFactory(object()),
+        llm=_LLM(),
+    )
+
+    assert evaluator.evaluator_timeout_seconds == DEFAULT_EVALUATOR_TIMEOUT_MS / 1000
 
 
 @pytest.mark.asyncio

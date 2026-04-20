@@ -27,6 +27,7 @@ from cognis.store.queries import get_setting_value
 logger = get_logger(__name__)
 
 EVALUATOR_MALFUNCTION_REASON_PREFIX = "Evaluator malfunction:"
+DEFAULT_EVALUATOR_TIMEOUT_MS = 180000
 
 EVALUATIONS_TOTAL = Counter(
     "cognis_evaluations_total",
@@ -133,10 +134,18 @@ class StepEvaluator:
     ) -> StepEvaluator:
         """Create an evaluator with DB-backed settings."""
         async with session_factory() as db_session:
-            timeout_ms = await get_setting_value(db_session, "evaluator.timeout_ms", 30000)
+            timeout_ms = await get_setting_value(
+                db_session,
+                "evaluator.timeout_ms",
+                DEFAULT_EVALUATOR_TIMEOUT_MS,
+            )
         return cls(
             llm=llm,
-            evaluator_timeout_seconds=(timeout_ms / 1000 if isinstance(timeout_ms, int) else 30.0),
+            evaluator_timeout_seconds=(
+                timeout_ms / 1000
+                if isinstance(timeout_ms, int)
+                else DEFAULT_EVALUATOR_TIMEOUT_MS / 1000
+            ),
         )
 
     async def evaluate(

@@ -38,6 +38,7 @@ DEFAULT_SETTINGS: Final[dict[str, tuple[str, object]]] = {
     "session.max_context_tokens": ("session", 250000),
     "session.compaction_threshold": ("session", 0.85),
     "session.compaction_preserve_turns": ("session", 10),
+    "session.step_timeout_seconds": ("session", 3600),
     "session.max_tool_calls_per_turn": ("session", 200),
     "session.idle_timeout_seconds": ("session", 1800),
     "session.max_session_age_seconds": ("session", 86400),
@@ -45,6 +46,7 @@ DEFAULT_SETTINGS: Final[dict[str, tuple[str, object]]] = {
     "session.max_queued_messages": ("session", 5),
     "session.escalation_timeout_seconds": ("session", 300),
     "session.cache_max_entries": ("session", 200),
+    "evaluator.timeout_ms": ("evaluator", 180000),
     "decision_engine.inline_max_length": ("decision_engine", 200),
     "security.non_bypassable_tools": (
         "security",

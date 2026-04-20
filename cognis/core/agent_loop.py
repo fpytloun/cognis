@@ -252,7 +252,7 @@ ToolResultCallback = Callable[
 
 # Default limits
 DEFAULT_MAX_TOOL_CALLS = 200
-DEFAULT_STEP_TIMEOUT_SECONDS = 600  # 10 minutes
+DEFAULT_STEP_TIMEOUT_SECONDS = 3600  # 1 hour
 _MAX_TOOL_DATA_BYTES = 10_240  # 10 KB truncation limit for WS events
 _MAX_INTARIS_TOOL_RESULT = 50_000  # Intaris gets the middle-truncated preview
 _MAX_TODO_REPROMPTS = 3  # Max re-prompts for incomplete todos before force-completing
@@ -1222,6 +1222,7 @@ class AgentLoop:
         event_bus: EventBus,
         session_lock: SessionLock,
         pause_waiter: PauseWaiter,
+        default_step_timeout_seconds: int = DEFAULT_STEP_TIMEOUT_SECONDS,
         tool_output_store: Any = None,
         step_context_assembler: Any = None,  # DEPRECATED — kept for backward compat
         step_runtime_factory: Any = None,
@@ -1236,6 +1237,7 @@ class AgentLoop:
         self.event_bus = event_bus
         self.session_lock = session_lock
         self.pause_waiter = pause_waiter
+        self.default_step_timeout_seconds = max(1, int(default_step_timeout_seconds))
         self.tool_output_store = tool_output_store
         self.notification_service: Any = None
         self._task_queue: Any = None
@@ -1285,11 +1287,7 @@ class AgentLoop:
             },
         )
         await self.session_lock.acquire(ctx.session.session_id)
-        timeout_seconds = DEFAULT_STEP_TIMEOUT_SECONDS
-        if ctx.agent.execution:
-            timeout_seconds = int(
-                ctx.agent.execution.get("step_timeout_seconds", DEFAULT_STEP_TIMEOUT_SECONDS)
-            )
+        timeout_seconds = self._resolve_step_timeout_seconds(ctx)
         try:
             return await asyncio.wait_for(
                 self._execute_step(
@@ -6140,6 +6138,14 @@ class AgentLoop:
     def _should_count_tool_call(tool_name: str) -> bool:
         return tool_name not in CONTROLLER_TOOLS
 
+    def _resolve_step_timeout_seconds(self, ctx: StepContext) -> int:
+        timeout_seconds = self.default_step_timeout_seconds
+        if ctx.agent.execution:
+            timeout_seconds = int(
+                ctx.agent.execution.get("step_timeout_seconds", timeout_seconds)
+            )
+        return max(1, timeout_seconds)
+
     def _is_parallelizable_regular_tool_call(
         self,
         ctx: StepContext,
@@ -6162,7 +6168,9 @@ class AgentLoop:
                 tc.name,
                 tool_id=stable_tool_id(registered.definition),
             )
-        return permission is Permission.ALLOW
+        # Safe read-only tools can batch even when they still go through
+        # guardrails evaluation. Only explicit deny should force serialization.
+        return permission is not Permission.DENY
 
     async def _execute_regular_tool(
         self,

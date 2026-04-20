@@ -31,7 +31,13 @@ async def test_bootstrap_creates_keys_db_and_settings(monkeypatch: object, tmp_p
         coding_skill = await get_skill(session, "cognis-coding")
         task_skill = await get_skill(session, "cognis-task-manager")
         workflow_skill = await get_skill(session, "cognis-workflow-manager")
+        step_timeout = await get_setting(session, "session.step_timeout_seconds")
+        evaluator_timeout = await get_setting(session, "evaluator.timeout_ms")
     assert len(settings) == len(DEFAULT_SETTINGS)
+    assert step_timeout is not None
+    assert step_timeout.value == 3600
+    assert evaluator_timeout is not None
+    assert evaluator_timeout.value == 180000
     assert coding_skill is not None
     assert task_skill is not None
     assert workflow_skill is not None

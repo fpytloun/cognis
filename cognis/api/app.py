@@ -275,6 +275,7 @@ def create_app() -> FastAPI:
         )
 
         from cognis.core.artifact_maintenance import ArtifactMaintenanceService
+        from cognis.store.queries import get_setting_value
 
         artifact_maintenance = ArtifactMaintenanceService(
             session_factory=session_factory,
@@ -306,6 +307,12 @@ def create_app() -> FastAPI:
             session_factory=session_factory,
             artifact_store=artifact_store,
         )
+        async with session_factory() as session:
+            step_timeout_seconds = await get_setting_value(
+                session,
+                "session.step_timeout_seconds",
+                3600,
+            )
         agent_loop = AgentLoop(
             providers=providers,
             session_manager=session_manager,
@@ -317,6 +324,9 @@ def create_app() -> FastAPI:
             event_bus=event_bus,
             session_lock=session_lock,
             pause_waiter=pause_waiter,
+            default_step_timeout_seconds=(
+                int(step_timeout_seconds) if isinstance(step_timeout_seconds, int) else 3600
+            ),
             tool_output_store=tool_output_store,
             step_runtime_factory=step_runtime_factory,
         )

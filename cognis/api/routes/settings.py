@@ -151,6 +151,10 @@ async def setting_update(
     elif key in {"executors.allow_in_process", "executors.allow_subprocess"}:
         policy = await load_executor_policy(request.app.state.session_factory)
         await request.app.state.providers.executor.apply_policy(policy)
+    elif key == "session.step_timeout_seconds":
+        request.app.state.agent_loop.default_step_timeout_seconds = max(1, int(payload.value))
+    elif key == "evaluator.timeout_ms":
+        request.app.state.step_evaluator.evaluator_timeout_seconds = max(1, int(payload.value)) / 1000
     return setting_to_response(row)
 
 

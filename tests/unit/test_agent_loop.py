@@ -28,7 +28,14 @@ from cognis.core.agent_loop import (
 from cognis.core.runtime import ResolvedStepRuntime, build_local_executor_environment
 from cognis.models.agent import AgentDefinition, AgentPermissions
 from cognis.models.session import EventAppendResult, ReasoningReportResult, SessionEvent
-from cognis.models.tool import Permission, ToolCall, ToolDefinition, ToolResult, ToolSource
+from cognis.models.tool import (
+    Permission,
+    ToolCall,
+    ToolDefinition,
+    ToolResult,
+    ToolSource,
+    stable_tool_id,
+)
 from cognis.models.workflow import (
     CompletionDeliveryPolicy,
     StepDefinition,
@@ -223,6 +230,126 @@ def test_stream_accumulator_collects_usage() -> None:
     assert acc.usage["total_tokens"] == 30
     assert acc.usage["cached_tokens"] == 7
     assert acc.usage["reasoning_tokens"] == 2
+
+
+@pytest.mark.asyncio
+async def test_run_step_uses_configured_default_step_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    async def _fake_wait_for(awaitable: object, timeout: float) -> StepOutput:
+        captured["timeout"] = timeout
+        close = getattr(awaitable, "close", None)
+        if callable(close):
+            close()
+        return StepOutput(summary="done")
+
+    monkeypatch.setattr("cognis.core.agent_loop.asyncio.wait_for", _fake_wait_for)
+
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=SimpleNamespace(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+        default_step_timeout_seconds=3600,
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+    )
+
+    output = await agent_loop.run_step(ctx)
+
+    assert output is not None
+    assert captured["timeout"] == 3600
+
+
+@pytest.mark.asyncio
+async def test_run_step_prefers_agent_timeout_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    async def _fake_wait_for(awaitable: object, timeout: float) -> StepOutput:
+        captured["timeout"] = timeout
+        close = getattr(awaitable, "close", None)
+        if callable(close):
+            close()
+        return StepOutput(summary="done")
+
+    monkeypatch.setattr("cognis.core.agent_loop.asyncio.wait_for", _fake_wait_for)
+
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=SimpleNamespace(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+        default_step_timeout_seconds=3600,
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(
+            agent_id="agent-1",
+            owner_email="user@example.com",
+            name="Agent",
+            execution={"step_timeout_seconds": 42},
+        ),
+        policy=CHAT_POLICY,
+    )
+
+    output = await agent_loop.run_step(ctx)
+
+    assert output is not None
+    assert captured["timeout"] == 42
+
+
+def test_read_only_web_tools_parallelize_under_evaluate_permission() -> None:
+    agent_loop = AgentLoop.__new__(AgentLoop)
+    agent_loop.tool_router = SimpleNamespace(_is_non_bypassable=lambda _name, non_bypassable: non_bypassable)
+    tool = ToolDefinition(
+        name="web_fetch",
+        description="Fetch a URL",
+        parameters={},
+        source=ToolSource(type="executor"),
+        category="web",
+        read_only=True,
+    )
+    registry = {"web_fetch": SimpleNamespace(definition=tool)}
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(
+            agent_id="agent-1",
+            owner_email="user@example.com",
+            name="Agent",
+            permissions=AgentPermissions(tool_permissions={stable_tool_id(tool): Permission.EVALUATE}),
+        ),
+        policy=CHAT_POLICY,
+    )
+
+    assert (
+        agent_loop._is_parallelizable_regular_tool_call(
+            ctx,
+            ToolCall(call_id="call-1", name="web_fetch", arguments={}),
+            registry,
+        )
+        is True
+    )
 
 
 # ---------------------------------------------------------------------------

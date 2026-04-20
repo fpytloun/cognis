@@ -1158,3 +1158,17 @@ class TestSettingsSchema:
         category, default = DEFAULT_SETTINGS["web.backend"]
         assert category == "web"
         assert default == "direct"
+
+    def test_positive_timeout_settings_accept_positive_values(self) -> None:
+        from cognis.settings_schema import validate_setting_value
+
+        validate_setting_value("session.step_timeout_seconds", 3600)
+        validate_setting_value("evaluator.timeout_ms", 180000)
+
+    def test_positive_timeout_settings_reject_zero(self) -> None:
+        from cognis.settings_schema import validate_setting_value
+
+        with pytest.raises(ValueError, match="greater than zero"):
+            validate_setting_value("session.step_timeout_seconds", 0)
+        with pytest.raises(ValueError, match="greater than zero"):
+            validate_setting_value("evaluator.timeout_ms", 0)

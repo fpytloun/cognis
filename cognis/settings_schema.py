@@ -9,6 +9,8 @@ from cognis.bootstrap import DEFAULT_SETTINGS
 _POSITIVE_INT_KEYS = {
     "security.api_read_requests_per_minute",
     "security.api_write_requests_per_minute",
+    "session.step_timeout_seconds",
+    "evaluator.timeout_ms",
 }
 
 _ENUM_KEYS: dict[str, set[str]] = {
