@@ -22,6 +22,7 @@ from cognis.tools.skill_service import (
     load_skill_asset_refs,
     normalize_prompt_templates,
     normalize_secret_placeholders,
+    normalize_skill_steps,
     normalize_skill_tools,
     resolve_current_skill_version,
 )
@@ -158,6 +159,21 @@ SKILL_WRITE_TOOL = ToolDefinition(
                 "type": "array",
                 "items": {"type": "string"},
                 "description": "Environment variable placeholders required by this skill",
+            },
+            "steps": {
+                "type": "array",
+                "items": {"type": "object"},
+                "description": (
+                    "Optional workflow decomposition for this skill. Each item must be a workflow step "
+                    "object and may include step_profile_id, step_profile_mode, and inline step_profile."
+                ),
+            },
+            "decomposition_source_hash": {
+                "type": "string",
+                "description": (
+                    "Optional hash proving the steps were generated from the current instructions. "
+                    "When omitted, Cognis will compute one automatically if steps are provided."
+                ),
             },
             "attach_to_all_agents": {
                 "type": "boolean",
@@ -552,6 +568,7 @@ async def _handle_skill_load(
         asset_refs = (
             await load_skill_asset_refs(session, version_row) if version_row is not None else []
         )
+        steps = getattr(version_row, "steps", None) if version_row is not None else None
 
     protected_context_parts = [
         "<loaded_skill>",
@@ -572,6 +589,10 @@ async def _handle_skill_load(
             + json.dumps(templates, indent=2, default=str)
             + "\n</prompt_templates>"
         )
+    if steps:
+        protected_context_parts.append(
+            "<workflow_steps>\n" + json.dumps(steps, indent=2, default=str) + "\n</workflow_steps>"
+        )
     protected_context_parts.append("</loaded_skill>")
 
     result = {
@@ -580,6 +601,7 @@ async def _handle_skill_load(
         "description": row.description,
         "loaded": True,
         "tool_count": len(tools or []),
+        "step_count": len(steps or []),
         "template_count": len(templates or {}),
         "asset_count": len(asset_refs),
         "message": "Skill loaded into working context for this turn.",
@@ -629,8 +651,10 @@ async def _handle_skill_get(
                 "content_hash": current_version.content_hash,
                 "instructions": current_version.instructions,
                 "tools": current_version.tools,
+                "steps": getattr(current_version, "steps", None),
                 "prompt_templates": current_version.prompt_templates,
                 "secret_placeholders": current_version.secret_placeholders,
+                "decomposition_source_hash": getattr(current_version, "decomposition_source_hash", None),
                 "source_url": current_version.source_url,
                 "resolved_url": current_version.resolved_url,
                 "import_checksum": current_version.import_checksum,
@@ -719,11 +743,24 @@ async def _handle_skill_write(
         tools = normalize_skill_tools(arguments.get("tools"))
         templates = normalize_prompt_templates(arguments.get("prompt_templates"))
         secret_placeholders = normalize_secret_placeholders(arguments.get("secret_placeholders"))
+        steps = normalize_skill_steps(arguments.get("steps"))
     except ValueError as exc:
         return ToolResult(output=str(exc), is_error=True)
     tags = arguments.get("tags")
     attach_to_all_agents = _resolve_attach_to_all_agents(arguments)
     description = arguments.get("description")
+    decomposition_source_hash = arguments.get("decomposition_source_hash")
+    if decomposition_source_hash is not None:
+        decomposition_source_hash = str(decomposition_source_hash).strip() or None
+    current_source_hash = compute_decomposition_source_hash(instructions)
+    if steps is not None and decomposition_source_hash is not None and decomposition_source_hash != current_source_hash:
+        return ToolResult(
+            output=(
+                "steps do not match the current instructions; decomposition_source_hash is stale. "
+                "Refresh the decomposition before saving."
+            ),
+            is_error=True,
+        )
 
     async with session_factory() as session:
         created_new_skill = False
@@ -783,7 +820,7 @@ async def _handle_skill_write(
                 tools=tools,
                 prompt_templates=templates,
                 secret_placeholders=secret_placeholders,
-                steps=getattr(current_version, "steps", None) if current_version is not None else None,
+                steps=steps if steps is not None else (getattr(current_version, "steps", None) if current_version is not None else None),
                 assets=assets,
                 allow_binary_assets=False,
                 source_url=current_version.source_url if current_version is not None else None,
@@ -793,7 +830,11 @@ async def _handle_skill_write(
                 imported_at=current_version.imported_at if current_version is not None else None,
                 import_format=current_version.import_format if current_version is not None else None,
                 decomposition_source_hash=(
-                    getattr(current_version, "decomposition_source_hash", None)
+                    decomposition_source_hash
+                    if steps is not None and decomposition_source_hash is not None
+                    else current_source_hash
+                    if steps is not None
+                    else getattr(current_version, "decomposition_source_hash", None)
                     if current_version is not None
                     else None
                 ),
@@ -825,6 +866,7 @@ async def _handle_skill_write(
         "version_id": version_row.version_id,
         "version_number": next_num,
         "content_hash": version_row.content_hash,
+        "step_count": len(steps if steps is not None else getattr(version_row, "steps", None) or []),
     }
     return ToolResult(output=json.dumps(result, indent=2), metadata=metadata or None)
 

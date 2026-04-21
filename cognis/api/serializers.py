@@ -32,6 +32,7 @@ from cognis.api.models import (
 )
 from cognis.logging import get_logger
 from cognis.models.task import TaskModel
+from cognis.models.tool import stable_tool_id
 from cognis.models.workflow import Workflow
 from cognis.providers.llm.reasoning import enrich_model_entry
 
@@ -402,6 +403,7 @@ def credential_to_response(row: Any) -> CredentialResponse:
 
 def tool_to_response(row: Any) -> ToolResponse:
     return ToolResponse(
+        tool_id=stable_tool_id(row),
         name=row.name,
         description=row.description,
         parameters=row.parameters if isinstance(row.parameters, dict) else {},

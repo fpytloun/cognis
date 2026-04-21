@@ -8,6 +8,7 @@ import GitBranch from 'lucide-svelte/icons/git-branch';
 import Import from 'lucide-svelte/icons/import';
 import ListChecks from 'lucide-svelte/icons/list-checks';
 import LoaderCircle from 'lucide-svelte/icons/loader-circle';
+import RotateCcw from 'lucide-svelte/icons/rotate-ccw';
 import Plug from 'lucide-svelte/icons/plug';
 import Plus from 'lucide-svelte/icons/plus';
 import Search from 'lucide-svelte/icons/search';
@@ -40,6 +41,7 @@ import Server from 'lucide-svelte/icons/server';
     isCachedObservedTool,
     mergeToolInventories
   } from '$lib/tools-registry';
+  import { STEP_PROFILE_CAPABILITIES, STEP_PROFILE_GROUPS } from '$lib/workflows';
   import type { ExecutorConfig, MCPServerConfigResponse, IntarisMCPServer, Skill, ToolDefinitionSummary, SystemDiagnostics } from '$lib/types/api';
 
   type ToolsTab = 'builtin' | 'intaris_mcp' | 'executor_mcp' | 'skills';
@@ -64,6 +66,8 @@ import Server from 'lucide-svelte/icons/server';
 
   let expandedTools: Set<string> = new Set();
   let expandedGroups: Set<string> = new Set();
+  let overrideEditors: Record<string, { profile_group: string; capabilities: string[] }> = {};
+  let actionBusyKeys: Set<string> = new Set();
   let skillsSearch = '';
 
   function toggleGroup(key: string) {
@@ -154,6 +158,123 @@ import Server from 'lucide-svelte/icons/server';
       addToast('Failed to load tools data', 'error');
     } finally {
       loading = false;
+    }
+  }
+
+  function classificationManageable(tool: ToolDefinitionSummary): boolean {
+    return tool.source.type === 'local_mcp' || tool.source.type === 'intaris_mcp';
+  }
+
+  function setActionBusy(key: string, busy: boolean): void {
+    if (busy) {
+      actionBusyKeys = new Set([...actionBusyKeys, key]);
+    } else {
+      const next = new Set(actionBusyKeys);
+      next.delete(key);
+      actionBusyKeys = next;
+    }
+  }
+
+  function isActionBusy(key: string): boolean {
+    return actionBusyKeys.has(key);
+  }
+
+  function ensureOverrideEditor(tool: ToolDefinitionSummary): void {
+    const key = getToolKey(tool);
+    if (overrideEditors[key]) return;
+    overrideEditors = {
+      ...overrideEditors,
+      [key]: {
+        profile_group: tool.profile_group || 'development',
+        capabilities: [...(tool.capabilities || ['read'])]
+      }
+    };
+  }
+
+  function overrideDraft(tool: ToolDefinitionSummary): { profile_group: string; capabilities: string[] } {
+    const key = getToolKey(tool);
+    return overrideEditors[key] ?? {
+      profile_group: tool.profile_group || 'development',
+      capabilities: [...(tool.capabilities || ['read'])]
+    };
+  }
+
+  function toggleOverrideCapability(tool: ToolDefinitionSummary, capability: string): void {
+    const key = getToolKey(tool);
+    ensureOverrideEditor(tool);
+    const current = overrideEditors[key];
+    const nextCaps = current.capabilities.includes(capability)
+      ? current.capabilities.filter((item) => item !== capability)
+      : [...current.capabilities, capability].sort();
+    overrideEditors = {
+      ...overrideEditors,
+      [key]: { ...current, capabilities: nextCaps }
+    };
+  }
+
+  async function rerunToolClassification(tool: ToolDefinitionSummary): Promise<void> {
+    if (!tool.tool_id) return;
+    const busyKey = `rerun:${tool.tool_id}`;
+    setActionBusy(busyKey, true);
+    try {
+      await api.tools.requeueClassification({ tool_id: tool.tool_id });
+      addToast('Tool classification queued.', 'success');
+      await loadData();
+    } catch (err) {
+      addToast(err instanceof Error ? err.message : 'Failed to queue classification', 'error');
+    } finally {
+      setActionBusy(busyKey, false);
+    }
+  }
+
+  async function rerunAllPending(): Promise<void> {
+    const busyKey = 'rerun:pending';
+    setActionBusy(busyKey, true);
+    try {
+      const result = await api.tools.requeueClassification({ pending_only: true });
+      addToast(`Queued ${result.updated} pending classifications.`, 'success');
+      await loadData();
+    } catch (err) {
+      addToast(err instanceof Error ? err.message : 'Failed to queue pending classifications', 'error');
+    } finally {
+      setActionBusy(busyKey, false);
+    }
+  }
+
+  async function saveToolOverride(tool: ToolDefinitionSummary): Promise<void> {
+    if (!tool.tool_id) return;
+    const key = getToolKey(tool);
+    ensureOverrideEditor(tool);
+    const draft = overrideEditors[key];
+    const busyKey = `override:${tool.tool_id}`;
+    setActionBusy(busyKey, true);
+    try {
+      await api.tools.overrideClassification({
+        tool_id: tool.tool_id,
+        profile_group: draft.profile_group,
+        capabilities: draft.capabilities
+      });
+      addToast('Tool classification override saved.', 'success');
+      await loadData();
+    } catch (err) {
+      addToast(err instanceof Error ? err.message : 'Failed to save classification override', 'error');
+    } finally {
+      setActionBusy(busyKey, false);
+    }
+  }
+
+  async function resetToolOverride(tool: ToolDefinitionSummary): Promise<void> {
+    if (!tool.tool_id) return;
+    const busyKey = `reset:${tool.tool_id}`;
+    setActionBusy(busyKey, true);
+    try {
+      await api.tools.resetClassificationOverride({ tool_id: tool.tool_id });
+      addToast('Tool classification override reset.', 'success');
+      await loadData();
+    } catch (err) {
+      addToast(err instanceof Error ? err.message : 'Failed to reset classification override', 'error');
+    } finally {
+      setActionBusy(busyKey, false);
     }
   }
 
@@ -334,6 +455,9 @@ import Server from 'lucide-svelte/icons/server';
           {/each}
         </select>
         <span class="text-sm text-zinc-500">{filteredBuiltinTools.length} tools</span>
+        <Button size="sm" variant="secondary" disabled={isActionBusy('rerun:pending')} onclick={() => void rerunAllPending()}>
+          <RotateCcw class="w-4 h-4 mr-1" /> Re-run all pending
+        </Button>
       </div>
 
       {#each groupedBuiltinTools as group}
@@ -377,6 +501,9 @@ import Server from 'lucide-svelte/icons/server';
           <input type="text" placeholder="Search Intaris MCP tools..." bind:value={intarisSearch} class="w-full pl-10 pr-4 py-2 bg-zinc-800 border border-zinc-700 rounded-lg text-sm text-zinc-200 placeholder-zinc-500 focus:outline-none focus:border-blue-500" />
         </div>
         <span class="text-sm text-zinc-500">{filteredIntarisTools.length} tools</span>
+        <Button size="sm" variant="secondary" disabled={isActionBusy('rerun:pending')} onclick={() => void rerunAllPending()}>
+          <RotateCcw class="w-4 h-4 mr-1" /> Re-run all pending
+        </Button>
         <div class="ml-auto">
           {#if intarisUrl}
             <a href={intarisUrl} target="_blank" rel="noopener noreferrer" class="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm text-blue-400 hover:text-blue-300 border border-zinc-700 rounded-lg hover:border-zinc-600 transition-colors">
@@ -440,6 +567,9 @@ import Server from 'lucide-svelte/icons/server';
           <input type="text" placeholder="Search executor MCP tools..." bind:value={executorMcpSearch} class="w-full pl-10 pr-4 py-2 bg-zinc-800 border border-zinc-700 rounded-lg text-sm text-zinc-200 placeholder-zinc-500 focus:outline-none focus:border-blue-500" />
         </div>
         <span class="text-sm text-zinc-500">{filteredExecutorMcpTools.length} tools</span>
+        <Button size="sm" variant="secondary" disabled={isActionBusy('rerun:pending')} onclick={() => void rerunAllPending()}>
+          <RotateCcw class="w-4 h-4 mr-1" /> Re-run all pending
+        </Button>
         <div class="ml-auto">
           <a href="/settings#tools" class="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm text-blue-400 hover:text-blue-300 border border-zinc-700 rounded-lg hover:border-zinc-600 transition-colors">
             <Settings class="w-3.5 h-3.5" />
@@ -763,5 +893,55 @@ import Server from 'lucide-svelte/icons/server';
       {#if tool.source.server_name}<span>Server: <span class="text-zinc-400">{tool.source.server_name}</span></span>{/if}
       {#if !tool.read_only}<span>Non-bypassable: <span class="text-zinc-400">{tool.non_bypassable ? 'Yes' : 'No'}</span></span>{/if}
     </div>
+    {#if classificationManageable(tool)}
+      {@const overrideKey = getToolKey(tool)}
+      {@const draft = overrideDraft(tool)}
+      <div class="space-y-3 rounded-lg border border-zinc-700/50 bg-zinc-950/60 p-3">
+        <div class="flex flex-wrap items-center gap-2">
+          <Button size="sm" variant="secondary" disabled={isActionBusy('rerun:' + tool.tool_id)} onclick={() => void rerunToolClassification(tool)}>
+            <RotateCcw class="w-4 h-4 mr-1" /> Re-run classification
+          </Button>
+          {#if tool.classification_source === 'override'}
+            <Button size="sm" variant="ghost" disabled={isActionBusy('reset:' + tool.tool_id)} onclick={() => void resetToolOverride(tool)}>
+              Reset override
+            </Button>
+          {/if}
+        </div>
+        <div class="grid gap-3 md:grid-cols-2">
+          <label class="space-y-1 text-xs text-zinc-400">
+            <span>Override group</span>
+            <select
+              class="w-full rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-100"
+              value={draft.profile_group}
+              onchange={(event) => {
+                ensureOverrideEditor(tool);
+                overrideEditors = {
+                  ...overrideEditors,
+                  [overrideKey]: { ...draft, profile_group: (event.currentTarget as HTMLSelectElement).value }
+                };
+              }}
+            >
+              {#each STEP_PROFILE_GROUPS.filter((group) => group !== 'memory' && group !== 'system') as group}
+                <option value={group}>{group}</option>
+              {/each}
+            </select>
+          </label>
+          <div class="space-y-1 text-xs text-zinc-400">
+            <span>Override capabilities</span>
+            <div class="flex flex-wrap gap-3 rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-100">
+              {#each STEP_PROFILE_CAPABILITIES as capability}
+                <label class="inline-flex items-center gap-2">
+                  <input type="checkbox" checked={draft.capabilities.includes(capability)} onchange={() => toggleOverrideCapability(tool, capability)} />
+                  <span>{capability}</span>
+                </label>
+              {/each}
+            </div>
+          </div>
+        </div>
+        <div>
+          <Button size="sm" variant="primary" disabled={isActionBusy('override:' + tool.tool_id)} onclick={() => void saveToolOverride(tool)}>Save override</Button>
+        </div>
+      </div>
+    {/if}
   </div>
 {/snippet}

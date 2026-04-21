@@ -218,6 +218,7 @@ export interface ToolParameters {
 }
 
 export interface ToolDefinitionSummary {
+  tool_id?: string | null;
   name: string;
   description: string;
   parameters: ToolParameters;

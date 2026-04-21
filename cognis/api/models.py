@@ -823,6 +823,7 @@ class CredentialResponse(BaseModel):
 
 
 class ToolResponse(BaseModel):
+    tool_id: str | None = None
     name: str
     description: str
     parameters: dict[str, Any] = Field(default_factory=dict)
@@ -883,6 +884,22 @@ class EffectiveToolsPreviewRequest(BaseModel):
     execution: dict[str, Any] = Field(default_factory=dict)
     skills: dict[str, Any] = Field(default_factory=dict)
     agent_id: str | None = None
+
+
+class ToolClassificationRequeueRequest(BaseModel):
+    tool_id: str | None = None
+    pending_only: bool = False
+
+
+class ToolClassificationOverrideRequest(BaseModel):
+    tool_id: str
+    profile_group: str
+    capabilities: list[str] = Field(default_factory=list)
+
+
+class ToolClassificationActionResponse(BaseModel):
+    updated: int = 0
+    status: str = "ok"
 
 
 class MCPServerResponse(BaseModel):

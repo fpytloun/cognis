@@ -26,6 +26,9 @@ from cognis.api.models import (
     StepProfileResponse,
     StepRunResponse,
     TaskResponse,
+    ToolClassificationActionResponse,
+    ToolClassificationOverrideRequest,
+    ToolClassificationRequeueRequest,
     ToolResponse,
     WorkflowResponse,
 )
@@ -334,6 +337,24 @@ def test_step_profile_response_round_trips_matrix_shape() -> None:
     assert response.has_override is True
     assert response.is_custom is False
     assert response.config["matrix"]["filesystem"] == ["read", "write"]
+
+
+def test_tool_classification_action_models_round_trip() -> None:
+    requeue = ToolClassificationRequeueRequest(
+        tool_id="mcp:github:search/issues", pending_only=False
+    )
+    override = ToolClassificationOverrideRequest(
+        tool_id="mcp:github:search/issues",
+        profile_group="development",
+        capabilities=["read"],
+    )
+    response = ToolClassificationActionResponse(updated=1, status="queued")
+
+    assert requeue.tool_id == "mcp:github:search/issues"
+    assert override.profile_group == "development"
+    assert override.capabilities == ["read"]
+    assert response.updated == 1
+    assert response.status == "queued"
 
 
 class TestModelRoutingContracts:

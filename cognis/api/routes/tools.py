@@ -5,12 +5,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import uuid
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from time import monotonic
 from typing import Any
 
 from fastapi import APIRouter, Request
 from pydantic import ValidationError
+from sqlalchemy import select
 
 from cognis.api.common import (
     api_exception,
@@ -30,6 +31,9 @@ from cognis.api.models import (
     MCPServerTestItemResponse,
     MCPServerTestResponse,
     MCPServerUpdateRequest,
+    ToolClassificationActionResponse,
+    ToolClassificationOverrideRequest,
+    ToolClassificationRequeueRequest,
     ToolResponse,
 )
 from cognis.api.runtime_support import (
@@ -48,13 +52,16 @@ from cognis.core.executor_policy import load_executor_policy
 from cognis.core.executor_resolution import is_tool_enabled, select_executor_for_agent
 from cognis.models.agent import AgentDefinition, AgentPermissions
 from cognis.models.tool import (
+    AUTO_PROFILE_GROUPS,
     MCP_SERVER_IDS_KEY,
     ExecutorConfig,
     MCPServerConfig,
+    ToolCapability,
     ToolDefinition,
     stable_tool_id,
     tool_display_name,
 )
+from cognis.store.models import ToolClassificationRow
 from cognis.store.queries import (
     create_mcp_server,
     delete_mcp_server,
@@ -64,6 +71,7 @@ from cognis.store.queries import (
     list_executors,
     mcp_server_referenced_by_executors,
     update_mcp_server,
+    upsert_tool_classification,
 )
 from cognis.store.queries import (
     list_mcp_servers as list_global_mcp_servers,
@@ -79,6 +87,10 @@ from cognis.tools.mcp import (
 )
 
 router = APIRouter(tags=["tools"])
+
+
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
 
 
 def _sanitize_mcp_error(error: Exception) -> str:
@@ -240,6 +252,23 @@ def _tool_permission(agent: AgentDefinition, tool: ToolDefinition) -> str:
     if agent.permissions.tool_permissions and tool_id in agent.permissions.tool_permissions:
         return str(agent.permissions.tool_permissions[tool_id])
     return str(agent.permissions.resolve_permission(tool_display_name(tool), tool_id=tool_id))
+
+
+async def _get_classification_row_for_tool(
+    request: Request,
+    *,
+    user_email: str,
+    tool_id: str,
+) -> ToolClassificationRow | None:
+    async with request.app.state.session_factory() as session:
+        return (
+            await session.execute(
+                select(ToolClassificationRow).where(
+                    ToolClassificationRow.tool_id == tool_id,
+                    ToolClassificationRow.scope_key == user_email,
+                )
+            )
+        ).scalars().first()
 
 
 async def _discover_temp_mcp_tools(
@@ -919,6 +948,132 @@ async def delete_mcp_server_route(request: Request, server_id: str) -> dict[str,
             raise api_exception(404, "not_found", "MCP server not found")
         await session.commit()
     return {"status": "deleted"}
+
+
+@router.post(
+    "/api/v1/tools/classification/requeue",
+    response_model=ToolClassificationActionResponse,
+)
+async def requeue_tool_classification(
+    request: Request,
+    payload: ToolClassificationRequeueRequest,
+) -> ToolClassificationActionResponse:
+    user = require_current_user(request)
+    now = _utcnow()
+    updated = 0
+    async with request.app.state.session_factory() as session:
+        if payload.tool_id:
+            row = (
+                await session.execute(
+                    select(ToolClassificationRow).where(
+                        ToolClassificationRow.tool_id == payload.tool_id,
+                        ToolClassificationRow.scope_key == user.email,
+                    )
+                )
+            ).scalars().first()
+            if row is None:
+                raise api_exception(404, "not_found", "Tool classification not found")
+            rows = [row]
+        else:
+            query = select(ToolClassificationRow).where(
+                ToolClassificationRow.scope_key == user.email
+            )
+            if payload.pending_only:
+                query = query.where(ToolClassificationRow.status == "pending")
+            rows = list((await session.execute(query)).scalars().all())
+        for row in rows:
+            row.status = "pending"
+            row.next_retry_at = now
+            row.last_error = None
+            row.attempts = 0
+            row.category = None
+            row.capabilities = None
+            row.classification_source = None
+            row.classification_confidence = None
+        updated = len(rows)
+        await session.commit()
+    if updated:
+        request.app.state.tool_classification_queue._wake_event.set()
+    return ToolClassificationActionResponse(updated=updated, status="queued")
+
+
+@router.put(
+    "/api/v1/tools/classification/override",
+    response_model=ToolClassificationActionResponse,
+)
+async def override_tool_classification(
+    request: Request,
+    payload: ToolClassificationOverrideRequest,
+) -> ToolClassificationActionResponse:
+    user = require_current_user(request)
+    row = await _get_classification_row_for_tool(
+        request, user_email=user.email, tool_id=payload.tool_id
+    )
+    if row is None:
+        raise api_exception(404, "not_found", "Tool classification not found")
+    if payload.profile_group not in AUTO_PROFILE_GROUPS:
+        raise api_exception(400, "validation_error", "Invalid profile_group")
+    try:
+        capabilities = [str(ToolCapability(item)) for item in payload.capabilities]
+    except ValueError as exc:
+        raise api_exception(400, "validation_error", str(exc)) from exc
+    if not capabilities:
+        raise api_exception(400, "validation_error", "At least one capability is required")
+    async with request.app.state.session_factory() as session:
+        fresh = await session.get(ToolClassificationRow, row.classification_id)
+        assert fresh is not None
+        await upsert_tool_classification(
+            session,
+            scope_key=fresh.scope_key,
+            owner_email=fresh.owner_email,
+            tool_id=fresh.tool_id,
+            source_type=fresh.source_type,
+            fingerprint=fresh.fingerprint,
+            tool_payload=dict(fresh.tool_payload or {}),
+            status="ready",
+            category=payload.profile_group,
+            capabilities=capabilities,
+            classification_source="override",
+            classification_confidence=1.0,
+            attempts=fresh.attempts,
+            next_retry_at=None,
+            last_attempt_at=fresh.last_attempt_at,
+            last_error=None,
+        )
+        await session.commit()
+    return ToolClassificationActionResponse(updated=1, status="override_saved")
+
+
+@router.post(
+    "/api/v1/tools/classification/reset-override",
+    response_model=ToolClassificationActionResponse,
+)
+async def reset_tool_classification_override(
+    request: Request,
+    payload: ToolClassificationRequeueRequest,
+) -> ToolClassificationActionResponse:
+    user = require_current_user(request)
+    if not payload.tool_id:
+        raise api_exception(400, "validation_error", "tool_id is required")
+    row = await _get_classification_row_for_tool(
+        request, user_email=user.email, tool_id=payload.tool_id
+    )
+    if row is None:
+        raise api_exception(404, "not_found", "Tool classification not found")
+    async with request.app.state.session_factory() as session:
+        fresh = await session.get(ToolClassificationRow, row.classification_id)
+        assert fresh is not None
+        fresh.status = "pending"
+        fresh.attempts = 0
+        fresh.next_retry_at = _utcnow()
+        fresh.last_error = None
+        fresh.category = None
+        fresh.capabilities = None
+        fresh.classification_source = None
+        fresh.classification_confidence = None
+        await session.commit()
+    request.app.state.tool_classification_queue._wake_event.set()
+    return ToolClassificationActionResponse(updated=1, status="override_reset")
 
 
 def _normalize_mcp_args(args: list[str] | None) -> list[str]:

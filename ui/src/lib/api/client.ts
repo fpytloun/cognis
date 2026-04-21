@@ -556,6 +556,27 @@ export const api = {
       return request<ToolDefinitionSummary[]>('/api/v1/intaris/mcp/tools');
     },
 
+    requeueClassification(payload: Record<string, unknown>): Promise<{ updated: number; status: string }> {
+      return request<{ updated: number; status: string }>('/api/v1/tools/classification/requeue', {
+        method: 'POST',
+        body: JSON.stringify(payload)
+      });
+    },
+
+    overrideClassification(payload: Record<string, unknown>): Promise<{ updated: number; status: string }> {
+      return request<{ updated: number; status: string }>('/api/v1/tools/classification/override', {
+        method: 'PUT',
+        body: JSON.stringify(payload)
+      });
+    },
+
+    resetClassificationOverride(payload: Record<string, unknown>): Promise<{ updated: number; status: string }> {
+      return request<{ updated: number; status: string }>('/api/v1/tools/classification/reset-override', {
+        method: 'POST',
+        body: JSON.stringify(payload)
+      });
+    },
+
     testAgentMcp(agentId: string): Promise<MCPServerTestResponse> {
       return request<MCPServerTestResponse>(`/api/v1/agents/${agentId}/mcp/test`, {
         method: 'POST'
