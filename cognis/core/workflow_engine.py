@@ -1565,8 +1565,12 @@ class WorkflowEngine:
         """Build evaluator task context with any one-shot operator instruction."""
 
         parts: list[str] = []
+        if task.title:
+            parts.append(f"Task title: {task.title}")
         if task.description:
-            parts.append(task.description)
+            parts.append(f"Task description: {task.description}")
+        if task.expected_output:
+            parts.append(f"Expected output: {task.expected_output}")
         if state.last_operator_instruction:
             parts.append(
                 f"Operator instruction for this step: {state.last_operator_instruction.strip()}"

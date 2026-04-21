@@ -30,20 +30,6 @@ from cognis.store.queries import (
 logger = get_logger(__name__)
 
 
-_PLAN_EVALUATOR_PROMPT = """\
-Evaluate whether the plan is concrete and implementation-ready.
-
-Approve only when the written plan clearly covers:
-- files or areas to inspect/modify
-- key risks or edge cases
-- validation or testing approach
-
-Return "revise" when the plan is vague, missing affected files, missing tests,
-or missing key risks. A self-reported failure can still be revised if the plan
-is salvageable.
-"""
-
-
 # ---------------------------------------------------------------------------
 # System workflows (bundled, read-only)
 # ---------------------------------------------------------------------------
@@ -142,11 +128,7 @@ RESEARCH_WORKFLOW = Workflow(
                 "Write the plan itself as the step deliverable."
             ),
             input=StepInputConfig(type="null"),
-            completion=CompletionConfig(
-                evaluate=True,
-                max_attempts=5,
-                evaluator_prompt=_PLAN_EVALUATOR_PROMPT,
-            ),
+            completion=CompletionConfig(evaluate=True, max_attempts=5),
             outcome_routes=[OutcomeRoute(status="failed", action="gate")],
             require_deliverable=True,
         ),
@@ -226,7 +208,6 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
             completion=CompletionConfig(
                 evaluate=True,
                 max_attempts=5,
-                evaluator_prompt=_PLAN_EVALUATOR_PROMPT,
             ),
             outcome_routes=[OutcomeRoute(status="failed", action="gate")],
             require_deliverable=True,

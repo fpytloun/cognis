@@ -101,12 +101,16 @@ def test_build_step_task_context_includes_operator_instruction() -> None:
             task_id="task-1",
             title="Task",
             description="Build feature",
+            expected_output="Concrete implementation plan with tests.",
             created_by="user@example.com",
             agent_id="agent-1",
         ),
         WorkflowState(last_operator_instruction="Incorporate the review and continue."),
     )
 
+    assert "Task title: Task" in task_context
+    assert "Task description: Build feature" in task_context
+    assert "Expected output: Concrete implementation plan with tests." in task_context
     assert "Build feature" in task_context
     assert "Operator instruction for this step" in task_context
     assert "Incorporate the review and continue." in task_context

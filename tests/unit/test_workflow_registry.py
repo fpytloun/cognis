@@ -124,6 +124,24 @@ def test_software_development_review_steps_use_outcome_routes() -> None:
         assert step.outcome_routes == [OutcomeRoute(status="failed", action="gate")]
 
 
+def test_research_plan_step_uses_generic_evaluator_prompt() -> None:
+    plan_step = next(step for step in RESEARCH_WORKFLOW.steps if step.name == "plan")
+
+    assert plan_step.completion is not None
+    assert plan_step.completion.evaluator_prompt is None
+    assert "Expected deliverables and format" in plan_step.prompt
+
+
+def test_software_development_plan_step_uses_generic_evaluator_prompt() -> None:
+    plan_step = next(
+        step for step in SOFTWARE_DEVELOPMENT_WORKFLOW.steps if step.name == "plan"
+    )
+
+    assert plan_step.completion is not None
+    assert plan_step.completion.evaluator_prompt is None
+    assert "Files to create/modify (with rationale)" in plan_step.prompt
+
+
 def test_validate_workflow_accepts_valid_definition() -> None:
     workflow = Workflow(
         workflow_id="test:valid",
