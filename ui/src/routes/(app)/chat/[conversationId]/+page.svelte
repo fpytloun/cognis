@@ -118,6 +118,7 @@ import X from 'lucide-svelte/icons/x';
   let escalationResolutionPending = $state<Escalation | null>(null);
   let escalationError = $state('');
   let escalationCountdownTimer: number | null = null;
+  let notificationRefreshTimer: number | null = null;
   let awaitingAssistantStart = $state(false);
   let turnInProgress = $state(false);
   let lastSubmittedMessage = '';
@@ -140,9 +141,11 @@ import X from 'lucide-svelte/icons/x';
   let subSessionLastSeq = $state(0);
   let subSessionPollDelayMs = $state(SESSION_LOG_POLL_INTERVAL_MS);
   let timelineEl = $state<HTMLDivElement | null>(null);
+  let timelineContentEl = $state<HTMLDivElement | null>(null);
   let userScrolledUp = $state(false);
   let programmaticScroll = false;
   let lastTimelineScrollTop = $state(0);
+  let composerChromeEl = $state<HTMLDivElement | null>(null);
   let selectedChannel = $state('all');
   let chatSidebarCollapsed = $state(false);
   interface SessionInfoData {
@@ -321,13 +324,15 @@ import X from 'lucide-svelte/icons/x';
     }
   }
 
-  function latestChatTodos(items: TimelineItem[]): ChatTodo[] {
+  function latestChatTodos(items: TimelineItem[], resetOnUserMessage = true): ChatTodo[] {
     let lowerBound = 0;
-    for (let index = items.length - 1; index >= 0; index -= 1) {
-      const item = items[index];
-      if (item?.kind === 'message' && item.role === 'user') {
-        lowerBound = index;
-        break;
+    if (resetOnUserMessage) {
+      for (let index = items.length - 1; index >= 0; index -= 1) {
+        const item = items[index];
+        if (item?.kind === 'message' && item.role === 'user') {
+          lowerBound = index;
+          break;
+        }
       }
     }
 
@@ -407,7 +412,7 @@ import X from 'lucide-svelte/icons/x';
   const terminalTodoStatuses = new Set(['completed', 'cancelled']);
 
   let chatTodos = $derived.by(() => {
-    const latestTodos = latestChatTodos(timeline);
+    const latestTodos = latestChatTodos(timeline, currentConversation?.context?.type === 'web');
     if (latestTodos.length > 0) {
       return latestTodos;
     }
@@ -429,8 +434,29 @@ import X from 'lucide-svelte/icons/x';
     inProgress: activeChatTodos.filter((todo) => todo.status === 'in_progress').length,
     pending: activeChatTodos.filter((todo) => todo.status === 'pending').length,
   }));
+  const LIVE_TASK_SESSION_STATES = new Set(['active', 'idle']);
+
+  function hasRunningTimelineActivity(items: TimelineItem[]): boolean {
+    return items.some((item) => {
+      if (item.kind === 'tool_call') {
+        return item.status === 'started' || item.status === 'running';
+      }
+      if (item.kind === 'delegation') {
+        return item.status === 'started' || item.status === 'running';
+      }
+      return false;
+    });
+  }
+
+  function isCurrentTaskConversationLive(): boolean {
+    if (currentConversation?.context?.type !== 'task') return false;
+    const status = activeSessionStatus();
+    return status !== null && LIVE_TASK_SESSION_STATES.has(status);
+  }
+
   let showTurnProgress = $derived.by(() =>
-    turnInProgress && !timeline.some((item) => item.kind === 'message' && item.role === 'assistant' && item.streaming)
+    (turnInProgress || isCurrentTaskConversationLive() || hasRunningTimelineActivity(timeline))
+      && !timeline.some((item) => item.kind === 'message' && item.role === 'assistant' && item.streaming)
   );
   let isPreSessionConversation = $derived.by(() =>
     isPreSessionChatConversation(currentConversation, sessions.length)
@@ -439,6 +465,13 @@ import X from 'lucide-svelte/icons/x';
   function contextTypeBadge(conversation: Conversation): string {
     const t = conversation.context?.type ?? 'unknown';
     return t.charAt(0).toUpperCase() + t.slice(1).toLowerCase();
+  }
+
+  function conversationTaskId(conversation: Conversation | null): string | null {
+    if (!conversation || conversation.context?.type !== 'task') return null;
+    return typeof conversation.context?.ref === 'string' && conversation.context.ref.length > 0
+      ? conversation.context.ref
+      : null;
   }
 
   function socketErrorMessage(event: import('$lib/types/api').WebSocketErrorEvent): string {
@@ -467,16 +500,74 @@ import X from 'lucide-svelte/icons/x';
     return event.message;
   }
 
+  function timestampValue(value: string | null | undefined): number {
+    if (!value) return 0;
+    const parsed = Date.parse(value);
+    return Number.isNaN(parsed) ? 0 : parsed;
+  }
+
+  function conversationActivityValue(conversation: Conversation): number {
+    return Math.max(
+      timestampValue(conversation.last_message_at),
+      timestampValue(conversation.updated_at),
+      timestampValue(conversation.created_at)
+    );
+  }
+
+  function sortConversationsByActivity(items: Conversation[]): Conversation[] {
+    return [...items].sort((left, right) => {
+      const activityDelta = conversationActivityValue(right) - conversationActivityValue(left);
+      if (activityDelta !== 0) return activityDelta;
+      const updatedDelta = timestampValue(right.updated_at) - timestampValue(left.updated_at);
+      if (updatedDelta !== 0) return updatedDelta;
+      return right.conversation_id.localeCompare(left.conversation_id);
+    });
+  }
+
+  function mergeConversationList(items: Conversation[], { reset = false }: { reset?: boolean } = {}): void {
+    const next = reset ? [] : [...conversations];
+    const indexById = new Map(next.map((conversation, index) => [conversation.conversation_id, index]));
+    for (const conversation of items) {
+      const index = indexById.get(conversation.conversation_id);
+      if (index === undefined) {
+        indexById.set(conversation.conversation_id, next.length);
+        next.push(conversation);
+      } else {
+        next[index] = conversation;
+      }
+    }
+    conversations = sortConversationsByActivity(next);
+  }
+
+  function patchConversationInList(
+    conversationId: string,
+    patch: Partial<Conversation>,
+    options: { touchUpdatedAt?: boolean; touchLastMessageAt?: boolean } = {}
+  ): void {
+    const index = conversations.findIndex((conversation) => conversation.conversation_id === conversationId);
+    if (index < 0) return;
+    const now = new Date().toISOString();
+    const existing = conversations[index];
+    const updated: Conversation = {
+      ...existing,
+      ...patch,
+      updated_at: options.touchUpdatedAt ? patch.updated_at ?? now : patch.updated_at ?? existing.updated_at,
+      last_message_at: options.touchLastMessageAt ? patch.last_message_at ?? now : patch.last_message_at ?? existing.last_message_at,
+    };
+    const next = [...conversations];
+    next[index] = updated;
+    conversations = sortConversationsByActivity(next);
+    if (currentConversation?.conversation_id === conversationId) {
+      currentConversation = { ...currentConversation, ...updated };
+    }
+  }
+
   function syncConversationActiveSession(activeSessionId: string | null | undefined): void {
     if (!currentConversation || !activeSessionId || currentConversation.active_session_id === activeSessionId) {
       return;
     }
     currentConversation = { ...currentConversation, active_session_id: activeSessionId };
-    const index = conversations.findIndex((conversation) => conversation.conversation_id === currentConversation?.conversation_id);
-    if (index >= 0) {
-      conversations[index] = { ...conversations[index], active_session_id: activeSessionId };
-      conversations = [...conversations];
-    }
+    patchConversationInList(currentConversation.conversation_id, { active_session_id: activeSessionId }, { touchUpdatedAt: true });
   }
 
   async function loadConversationPage(reset = false): Promise<void> {
@@ -487,7 +578,7 @@ import X from 'lucide-svelte/icons/x';
       agentId: agentFilter,
       status: selectedConversationStatus,
     });
-    conversations = reset ? response.items : [...conversations, ...response.items];
+    mergeConversationList(response.items, { reset });
     conversationCursor = response.cursor;
     conversationsHasMore = response.has_more;
   }
@@ -693,13 +784,15 @@ import X from 'lucide-svelte/icons/x';
 
   /** Seed escalation list from Intaris on conversation open (catch up). */
   async function refreshEscalations(): Promise<void> {
-    if (document.hidden) return;
+    if (!currentConversation || document.hidden) return;
     try {
-      const filtered = (await api.notifications.list(currentConversation?.conversation_id ?? null))
+      const taskId = conversationTaskId(currentConversation);
+      const notifications = taskId
+        ? await api.notifications.list(null, { taskId })
+        : await api.notifications.list(currentConversation.conversation_id);
+      const filtered = notifications
         .filter((item) => item.notification_type === 'escalation')
-        .filter(
-          (item) => sessionIds.size === 0 || item.session_id === null || sessionIds.has(item.session_id)
-        )
+        .filter((item) => (taskId ? item.task_id === taskId : true))
         .map((item) => ({
           call_id: item.notification_id,
           session_id: item.session_id,
@@ -790,6 +883,22 @@ import X from 'lucide-svelte/icons/x';
       window.clearInterval(escalationCountdownTimer);
       escalationCountdownTimer = null;
     }
+  }
+
+  function stopNotificationRefreshPolling(): void {
+    if (notificationRefreshTimer !== null) {
+      window.clearInterval(notificationRefreshTimer);
+      notificationRefreshTimer = null;
+    }
+  }
+
+  function startNotificationRefreshPolling(): void {
+    stopNotificationRefreshPolling();
+    notificationRefreshTimer = window.setInterval(() => {
+      if (document.hidden || !currentConversation) return;
+      void refreshEscalations();
+      void refreshPendingDirectQuestion();
+    }, 5000);
   }
 
   function syncVisibleWindow(): void {
@@ -1124,9 +1233,7 @@ import X from 'lucide-svelte/icons/x';
       currentConversation = conversation;
       initialLoadTimedOut = false;
       persistLastOpenedConversation(conversation);
-      if (!conversations.some((item) => item.conversation_id === conversation.conversation_id)) {
-        conversations = [conversation, ...conversations];
-      }
+      mergeConversationList([conversation]);
       queuedCount = 0;
       turnInProgress = false;
       awaitingAssistantStart = false;
@@ -1151,11 +1258,10 @@ import X from 'lucide-svelte/icons/x';
         ...(currentConversation ?? conversation),
         has_unread: false,
       };
-      const idx = conversations.findIndex((c) => c.conversation_id === conversationId);
-      if (idx >= 0 && currentConversation) {
-        conversations[idx] = { ...conversations[idx], has_unread: false, active_session_id: currentConversation.active_session_id };
-        conversations = [...conversations];
-      }
+      patchConversationInList(conversationId, {
+        has_unread: false,
+        active_session_id: currentConversation.active_session_id,
+      });
     } catch (caughtError) {
       if (isStaleConversationLoad(requestId)) {
         return;
@@ -1371,11 +1477,8 @@ import X from 'lucide-svelte/icons/x';
 
     try {
       currentConversation = await api.conversations.update(currentConversation.conversation_id, { title: newTitle });
-      // Update sidebar
-      const idx = conversations.findIndex((c) => c.conversation_id === currentConversation?.conversation_id);
-      if (idx >= 0 && currentConversation) {
-        conversations[idx] = currentConversation;
-        conversations = [...conversations];
+      if (currentConversation) {
+        mergeConversationList([currentConversation]);
       }
     } catch (caughtError) {
       addToast(asApiError(caughtError).message, 'error', 4_000, 'Unable to update title');
@@ -1413,6 +1516,17 @@ import X from 'lucide-svelte/icons/x';
   /** Slash commands that are handled as system actions, not chat messages. */
   const SYSTEM_SLASH_COMMANDS = ['/approve', '/deny', '/compact', '/summarize', '/new', '/reset', '/clear', '/stop', '/cancel', '/context', '/info', '/lsp', '/model', '/thinking', '/help'];
 
+  function normalizeSlashCommandInput(value: string): string {
+    const trimmed = value.trim();
+    if (!trimmed.startsWith('/')) return trimmed;
+    return `/${trimmed.slice(1).trimStart()}`;
+  }
+
+  function isSystemSlashCommand(value: string): boolean {
+    const normalized = normalizeSlashCommandInput(value);
+    return SYSTEM_SLASH_COMMANDS.some((command) => normalized === command || normalized.startsWith(`${command} `));
+  }
+
   /** Slash command suggestions shown when user types /. */
   const SLASH_SUGGESTIONS = [
     { command: '/help', description: 'Show available commands' },
@@ -1434,7 +1548,7 @@ import X from 'lucide-svelte/icons/x';
   let slashSelectedIndex = $state(0);
 
   function updateSlashSuggestions(): void {
-    const val = composer.trimStart();
+    const val = normalizeSlashCommandInput(composer);
     if (val.startsWith('/') && !val.includes(' ') && val.length < 20) {
       const filter = val.toLowerCase();
       slashFilteredSuggestions = SLASH_SUGGESTIONS.filter((s) => s.command.startsWith(filter));
@@ -1464,7 +1578,9 @@ import X from 'lucide-svelte/icons/x';
     if ((!content && composerAttachments.length === 0) || !currentConversation || isReadOnly(currentConversation)) return;
     if (pendingDirectQuestion && directQuestionSubmitting) return;
 
-    const isSlashCommand = SYSTEM_SLASH_COMMANDS.some((cmd) => content.startsWith(cmd));
+    const normalizedSlashCommand = normalizeSlashCommandInput(content);
+    const isSlashCommand = isSystemSlashCommand(content);
+    const outboundContent = isSlashCommand ? normalizedSlashCommand : content;
 
     // Detect a `step_request_input` tool call sitting in the timeline
     // waiting for a reply. This is the source-of-truth signal that the
@@ -1492,6 +1608,10 @@ import X from 'lucide-svelte/icons/x';
       lastRecoverableMessage = '';
       turnInProgress = true;
       awaitingAssistantStart = true;
+      patchConversationInList(currentConversation.conversation_id, { has_unread: false }, {
+        touchUpdatedAt: true,
+        touchLastMessageAt: true,
+      });
     }
     error = '';
     composer = '';
@@ -1552,7 +1672,7 @@ import X from 'lucide-svelte/icons/x';
     syncVisibleWindow();
     userScrolledUp = false;
     scrollToBottom();
-    wsClient.sendMessage(currentConversation.conversation_id, content, attachments);
+    wsClient.sendMessage(currentConversation.conversation_id, outboundContent, attachments);
   }
 
   async function uploadFiles(files: File[]): Promise<void> {
@@ -1694,13 +1814,20 @@ import X from 'lucide-svelte/icons/x';
       const otherConvId = event.conversation_id;
       if (event.type === 'message_complete' || event.type === 'workflow_completed' || event.type === 'workflow_failed') {
         const idx = conversations.findIndex((c) => c.conversation_id === otherConvId);
-        if (idx >= 0 && !conversations[idx].has_unread) {
-          conversations[idx] = { ...conversations[idx], has_unread: true };
-          conversations = [...conversations];
+        const conversation = idx >= 0 ? conversations[idx] : null;
+        if (idx >= 0) {
+          patchConversationInList(
+            otherConvId,
+            { has_unread: true },
+            {
+              touchUpdatedAt: true,
+              touchLastMessageAt: event.type === 'message_complete',
+            }
+          );
         }
         // Browser notification
-        const convTitle = idx >= 0 ? (conversations[idx].title ?? 'Conversation') : 'Conversation';
-        const agentId = idx >= 0 ? conversations[idx].agent_id : '';
+        const convTitle = conversation?.title ?? 'Conversation';
+        const agentId = conversation?.agent_id ?? '';
         const agentObj = agents.find((a) => a.agent_id === agentId);
         const agentLabel = agentObj?.display_name ?? agentObj?.name ?? 'Cognis';
         if (event.type === 'workflow_completed') {
@@ -1712,6 +1839,32 @@ import X from 'lucide-svelte/icons/x';
         }
       }
       return;
+    }
+
+    if (currentConversation) {
+      if (event.type === 'user_message' || event.type === 'message_complete') {
+        patchConversationInList(currentConversation.conversation_id, { has_unread: false }, {
+          touchUpdatedAt: true,
+          touchLastMessageAt: true,
+        });
+      } else if (
+        event.type === 'chunk'
+        || event.type === 'tool_call'
+        || event.type === 'tool_result'
+        || event.type === 'reasoning'
+        || event.type === 'delegation_started'
+        || event.type === 'delegation_completed'
+        || event.type === 'delegation_failed'
+        || event.type === 'workflow_composed'
+        || event.type === 'workflow_step_started'
+        || event.type === 'workflow_step_completed'
+        || event.type === 'workflow_completed'
+        || event.type === 'workflow_failed'
+        || event.type === 'workflow_cancelled'
+        || event.type === 'session_compacted'
+      ) {
+        patchConversationInList(currentConversation.conversation_id, { has_unread: false }, { touchUpdatedAt: true });
+      }
     }
 
     // Filter sub-session tool/chunk events from the main timeline (defense-in-depth)
@@ -1849,11 +2002,7 @@ import X from 'lucide-svelte/icons/x';
       if (currentConversation && event.conversation_id === currentConversation.conversation_id) {
         if (typeof event.title === 'string') {
           currentConversation = { ...currentConversation, title: event.title };
-          const idx = conversations.findIndex((c) => c.conversation_id === currentConversation?.conversation_id);
-          if (idx >= 0 && currentConversation) {
-            conversations[idx] = { ...conversations[idx], title: event.title };
-            conversations = [...conversations];
-          }
+          patchConversationInList(currentConversation.conversation_id, { title: event.title }, { touchUpdatedAt: true });
         }
       }
       return;
@@ -2035,21 +2184,24 @@ import X from 'lucide-svelte/icons/x';
     }
   });
 
-  // The todo drawer takes vertical space above the composer. When it
-  // appears, the chat timeline's client height shrinks by that amount
-  // and the bottom of the conversation slips out of view, which the
-  // user perceives as the page \"jumping\" and auto-scroll breaking.
-  // Re-anchor to the bottom whenever the drawer's visibility or
-  // expanded state changes; this is a no-op when the user has
-  // intentionally scrolled up.
   $effect(() => {
-    void shouldShowChatTodoDrawer;
-    void chatTodoDrawerOpen;
-    requestAnimationFrame(() => scrollToBottom());
+    if ((!timelineContentEl && !composerChromeEl) || typeof ResizeObserver === 'undefined') {
+      return;
+    }
+    const observer = new ResizeObserver(() => {
+      requestAnimationFrame(() => scrollToBottom());
+    });
+    if (timelineContentEl) {
+      observer.observe(timelineContentEl);
+    }
+    if (composerChromeEl) {
+      observer.observe(composerChromeEl);
+    }
+    return () => observer.disconnect();
   });
 
   $effect(() => {
-    const latestTodos = latestChatTodos(timeline);
+    const latestTodos = latestChatTodos(timeline, currentConversation?.context?.type === 'web');
     if (latestTodos.length > 0) {
       retainedChatTodos = latestTodos;
       return;
@@ -2083,7 +2235,7 @@ import X from 'lucide-svelte/icons/x';
     if (query) {
       list = list.filter((c) => conversationTitle(c).toLowerCase().includes(query));
     }
-    return list;
+    return sortConversationsByActivity(list);
   });
 
   let displayedTimeline = $derived(timeline.slice(visibleStartIndex));
@@ -2112,6 +2264,7 @@ import X from 'lucide-svelte/icons/x';
       }
     };
     document.addEventListener('visibilitychange', visibilityHandler);
+    startNotificationRefreshPolling();
 
     void initialize();
 
@@ -2122,6 +2275,7 @@ import X from 'lucide-svelte/icons/x';
       unsubscribeComposerFocus?.();
       unsubscribeCancelTurn?.();
       stopEscalationCountdown();
+      stopNotificationRefreshPolling();
       if (visibilityHandler) {
         document.removeEventListener('visibilitychange', visibilityHandler);
       }
@@ -2424,9 +2578,18 @@ import X from 'lucide-svelte/icons/x';
                   </button>
                 {/if}
 
-                <span class="rounded-full border border-slate-700 bg-slate-800/60 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-widest text-slate-400">
-                  {contextTypeBadge(currentConversation)}
-                </span>
+                {#if conversationTaskId(currentConversation)}
+                  <a
+                    href="/tasks/{conversationTaskId(currentConversation)}"
+                    class="rounded-full border border-slate-700 bg-slate-800/60 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-widest text-slate-400 transition hover:border-sky-400/40 hover:text-sky-200"
+                  >
+                    {contextTypeBadge(currentConversation)}
+                  </a>
+                {:else}
+                  <span class="rounded-full border border-slate-700 bg-slate-800/60 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-widest text-slate-400">
+                    {contextTypeBadge(currentConversation)}
+                  </span>
+                {/if}
 
                 {#if sessions.length > 1}
                   <span class="rounded-full border border-slate-700 bg-slate-800/60 px-2 py-0.5 text-[10px] font-medium text-slate-400" title="Sub-sessions">
@@ -2504,9 +2667,18 @@ import X from 'lucide-svelte/icons/x';
                 <span>{panelAgent.display_name ?? panelAgent.name}</span>
               </div>
             {/if}
-            <span class="rounded-full border border-slate-700 bg-slate-800/60 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-widest text-slate-400">
-              {contextTypeBadge(currentConversation)}
-            </span>
+            {#if conversationTaskId(currentConversation)}
+              <a
+                href="/tasks/{conversationTaskId(currentConversation)}"
+                class="rounded-full border border-slate-700 bg-slate-800/60 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-widest text-slate-400 transition hover:border-sky-400/40 hover:text-sky-200"
+              >
+                {contextTypeBadge(currentConversation)}
+              </a>
+            {:else}
+              <span class="rounded-full border border-slate-700 bg-slate-800/60 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-widest text-slate-400">
+                {contextTypeBadge(currentConversation)}
+              </span>
+            {/if}
             {#if sessions.length > 1}
               <span class="rounded-full border border-slate-700 bg-slate-800/60 px-2 py-0.5 text-[10px] font-medium text-slate-400">{sessions.length} sessions</span>
             {/if}
@@ -2648,86 +2820,88 @@ import X from 'lucide-svelte/icons/x';
         <!-- Timeline -->
         <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
         <div
-          class="relative min-h-0 flex-1 space-y-3 overflow-y-auto px-2.5 py-1.5 sm:p-4"
+          class="relative min-h-0 flex-1 overflow-y-auto px-2.5 py-1.5 sm:p-4"
           bind:this={timelineEl}
           onscroll={handleTimelineScroll}
           onclick={closeHeaderInfo}
         >
-          {#if visibleStartIndex > 0}
-            <div class="flex justify-center">
-              <Button size="sm" variant="secondary" onclick={loadOlder}>Load older messages</Button>
-            </div>
-          {/if}
-
-          {#if !currentConversation && !error}
-            <div class="rounded-2xl border border-dashed border-slate-700 px-4 py-10 text-center text-sm text-slate-400">
-              {#if initialLoadTimedOut}
-                Conversation data is still loading. Use Retry above if it stays stuck.
-              {:else}
-                Loading conversation history and preparing the live stream.
-              {/if}
-            </div>
-          {:else if displayedTimeline.length === 0}
-            <p class="px-4 py-16 text-center text-sm text-slate-500">
-              Send the first message to start this conversation.
-            </p>
-          {:else}
-            {#each displayedTimeline as item (item.id)}
-              {#if item.kind === 'message'}
-                <div class={`flex min-w-0 ${item.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                  <ChatMessage {item} agent={currentConversation ? conversationAgent(currentConversation) ?? null : null} />
-                </div>
-              {:else if item.kind === 'tool_call'}
-                <div><ToolCallBlock {item} /></div>
-              {:else if item.kind === 'reasoning'}
-                <div><ReasoningBlock {item} /></div>
-              {:else if item.kind === 'delegation'}
-                <div><DelegationCard {item} onViewSession={handleViewSession} /></div>
-              {:else if item.kind === 'workflow_composed'}
-                <div><WorkflowComposedCard {item} /></div>
-              {:else if item.kind === 'compaction'}
-                <div><CompactionCard {item} onViewPreviousSession={handleViewSession} /></div>
-              {:else if item.kind === 'system_message'}
-                <p class="py-1 text-center text-xs italic text-slate-500 whitespace-pre-line">{item.text}</p>
-              {:else}
-                <article class={`rounded-3xl border px-4 py-4 text-sm shadow-card ${item.tone === 'warning' ? 'border-amber-500/30 bg-amber-500/10 text-amber-100' : item.tone === 'error' ? 'border-rose-500/30 bg-rose-500/10 text-rose-100' : 'border-slate-700 bg-slate-900 text-slate-200'}`}>
-                  <h3 class="font-semibold">{item.title}</h3>
-                  <p class="mt-2 leading-6">{item.description}</p>
-                </article>
-              {/if}
-            {/each}
-          {/if}
-
-          <!-- Escalation prompts (sequential: show one at a time) -->
-          {#if escalationResolutionPending}
-            <div class="rounded-3xl border border-amber-500/30 bg-amber-500/10 px-4 py-4 shadow-card">
-              <div class="flex flex-wrap items-center justify-between gap-4">
-                <div>
-                  <p class="text-xs font-medium uppercase tracking-[0.25em] text-amber-200">Approval submitted</p>
-                  <h3 class="mt-1 text-base font-semibold text-white">{escalationResolutionPending.tool_name ?? 'Escalated action'}</h3>
-                </div>
-                <LiveDots inline={true} size="sm" tone="amber" label="Waiting for controller acknowledgement" />
+          <div bind:this={timelineContentEl} class="space-y-3">
+            {#if visibleStartIndex > 0}
+              <div class="flex justify-center">
+                <Button size="sm" variant="secondary" onclick={loadOlder}>Load older messages</Button>
               </div>
-            </div>
-          {:else if escalations.length > 0}
-            {@const current = escalations[0]}
-            <div class="space-y-3">
-              <EscalationPrompt
-                item={current}
-                secondsRemaining={escalationSecondsRemaining(current)}
-                pending={escalationBusyCallId === current.call_id}
-                queuedCount={escalations.length - 1}
-                onApprove={() => handleEscalationDecision(current.call_id, 'approve')}
-                onDeny={() => handleEscalationDecision(current.call_id, 'deny')}
-              />
-            </div>
-          {/if}
+            {/if}
 
-          {#if showTurnProgress}
-            <div class="flex items-center gap-3 px-2 py-2">
-              <LiveDots />
-            </div>
-          {/if}
+            {#if !currentConversation && !error}
+              <div class="rounded-2xl border border-dashed border-slate-700 px-4 py-10 text-center text-sm text-slate-400">
+                {#if initialLoadTimedOut}
+                  Conversation data is still loading. Use Retry above if it stays stuck.
+                {:else}
+                  Loading conversation history and preparing the live stream.
+                {/if}
+              </div>
+            {:else if displayedTimeline.length === 0}
+              <p class="px-4 py-16 text-center text-sm text-slate-500">
+                Send the first message to start this conversation.
+              </p>
+            {:else}
+              {#each displayedTimeline as item (item.id)}
+                {#if item.kind === 'message'}
+                  <div class={`flex min-w-0 ${item.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                    <ChatMessage {item} agent={currentConversation ? conversationAgent(currentConversation) ?? null : null} />
+                  </div>
+                {:else if item.kind === 'tool_call'}
+                  <div><ToolCallBlock {item} /></div>
+                {:else if item.kind === 'reasoning'}
+                  <div><ReasoningBlock {item} /></div>
+                {:else if item.kind === 'delegation'}
+                  <div><DelegationCard {item} onViewSession={handleViewSession} /></div>
+                {:else if item.kind === 'workflow_composed'}
+                  <div><WorkflowComposedCard {item} /></div>
+                {:else if item.kind === 'compaction'}
+                  <div><CompactionCard {item} onViewPreviousSession={handleViewSession} /></div>
+                {:else if item.kind === 'system_message'}
+                  <p class="py-1 text-center text-xs italic text-slate-500 whitespace-pre-line">{item.text}</p>
+                {:else}
+                  <article class={`rounded-3xl border px-4 py-4 text-sm shadow-card ${item.tone === 'warning' ? 'border-amber-500/30 bg-amber-500/10 text-amber-100' : item.tone === 'error' ? 'border-rose-500/30 bg-rose-500/10 text-rose-100' : 'border-slate-700 bg-slate-900 text-slate-200'}`}>
+                    <h3 class="font-semibold">{item.title}</h3>
+                    <p class="mt-2 leading-6">{item.description}</p>
+                  </article>
+                {/if}
+              {/each}
+            {/if}
+
+            <!-- Escalation prompts (sequential: show one at a time) -->
+            {#if escalationResolutionPending}
+              <div class="rounded-3xl border border-amber-500/30 bg-amber-500/10 px-4 py-4 shadow-card">
+                <div class="flex flex-wrap items-center justify-between gap-4">
+                  <div>
+                    <p class="text-xs font-medium uppercase tracking-[0.25em] text-amber-200">Approval submitted</p>
+                    <h3 class="mt-1 text-base font-semibold text-white">{escalationResolutionPending.tool_name ?? 'Escalated action'}</h3>
+                  </div>
+                  <LiveDots inline={true} size="sm" tone="amber" label="Waiting for controller acknowledgement" />
+                </div>
+              </div>
+            {:else if escalations.length > 0}
+              {@const current = escalations[0]}
+              <div class="space-y-3">
+                <EscalationPrompt
+                  item={current}
+                  secondsRemaining={escalationSecondsRemaining(current)}
+                  pending={escalationBusyCallId === current.call_id}
+                  queuedCount={escalations.length - 1}
+                  onApprove={() => handleEscalationDecision(current.call_id, 'approve')}
+                  onDeny={() => handleEscalationDecision(current.call_id, 'deny')}
+                />
+              </div>
+            {/if}
+
+            {#if showTurnProgress}
+              <div class="flex items-center gap-3 px-2 py-2">
+                <LiveDots />
+              </div>
+            {/if}
+          </div>
 
           <!-- Scroll to bottom button -->
           {#if userScrolledUp}
@@ -2770,15 +2944,11 @@ import X from 'lucide-svelte/icons/x';
             Composer container. \`--kb-offset\` is published by the
             viewport store using \`visualViewport\`; on iOS this pushes
             the composer above the on-screen keyboard so the input
-            stays visible. The wrapper uses the page background colour
-            (\`bg-slate-950\`) so the area filled by the kb-offset
-            padding does not briefly expose the keyboard surface when
-            iOS animates the viewport resize — on focus-out in
-            particular there is a short gap where the visualViewport
-            has not yet grown back, and a transparent wrapper would
-            show the darker keyboard background through the page.
+            stays visible. Keep the wrapper visually neutral so the
+            composer feels like part of the page rather than a dark
+            boxed footer.
           -->
-          <div class="shrink-0 space-y-3 bg-slate-950" style="padding-bottom: var(--kb-offset, 0px);">
+          <div bind:this={composerChromeEl} class="shrink-0 space-y-3" style="padding-bottom: var(--kb-offset, 0px);">
           <!--
             Compact todo drawer. Single-line header ("Todos · N active
             · X in progress"), and each todo renders as a single line:
@@ -2901,7 +3071,7 @@ import X from 'lucide-svelte/icons/x';
                 submits, and the stored Enter-to-send preference still
                 applies for users who opted in.
             -->
-            <div class="flex items-center gap-1 rounded-3xl border border-slate-700 bg-slate-900/70 px-2 py-1 transition focus-within:border-sky-400/50 focus-within:ring-2 focus-within:ring-sky-400/20">
+            <div class="flex items-center gap-1 rounded-3xl border border-slate-700 bg-transparent px-2 py-1 transition focus-within:border-sky-400/50 focus-within:ring-2 focus-within:ring-sky-400/20">
               <label
                 aria-label="Attach files"
                 class={`inline-flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center rounded-full text-slate-400 transition hover:bg-slate-800/60 hover:text-slate-200 focus-within:bg-slate-800/60 focus-within:text-slate-200 ${directQuestionSubmitting ? 'pointer-events-none opacity-40' : ''}`}

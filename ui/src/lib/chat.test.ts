@@ -239,6 +239,30 @@ describe('chat timeline helpers', () => {
     });
   });
 
+  it('settles the stale assistant stream state once tool activity starts', () => {
+    const streaming = applyWebSocketEvent([], {
+      type: 'chunk',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      message_id: 'msg_live',
+      content: 'Working on it',
+      index: 0
+    });
+
+    const withTool = applyWebSocketEvent(streaming, {
+      type: 'tool_call',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      call_id: 'call_live_1',
+      tool_name: 'bash',
+      status: 'started',
+      arguments: { command: 'pwd' }
+    });
+
+    expect(withTool[0]).toMatchObject({ kind: 'message', role: 'assistant', streaming: false });
+    expect(withTool[1]).toMatchObject({ kind: 'tool_call', callId: 'call_live_1' });
+  });
+
   it('turns history gaps into visible warning notices', () => {
     const items = normalizeHistory([
       {

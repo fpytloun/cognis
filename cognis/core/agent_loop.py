@@ -6941,7 +6941,10 @@ class AgentLoop:
                     "call_id": tc.call_id,
                     "tool_name": tc.name,
                     "tool_id": tool_id,
+                    "result": ws_preview,
                     "is_error": result.is_error,
+                    "duration_ms": result.duration_ms,
+                    "evaluation": eval_meta,
                 },
             )
         )
@@ -7148,6 +7151,7 @@ class AgentLoop:
                         "call_id": item.tool_call.call_id,
                         "tool_name": item.tool_call.name,
                         "tool_id": item.tool_id,
+                        "arguments": item.tool_call.arguments,
                     },
                 )
             )

@@ -27,13 +27,25 @@ export function boardColumnForStatus(status: string): TaskBoardColumnId {
 }
 
 export function sortTasks(tasks: Task[]): Task[] {
+  const activityValue = (task: Task): string =>
+    task.updated_at ?? task.completed_at ?? task.started_at ?? task.created_at ?? '';
+  const isDone = (task: Task): boolean => ['completed', 'failed', 'cancelled'].includes(task.status);
+
   return [...tasks].sort((left, right) => {
+    if (isDone(left) !== isDone(right)) {
+      return isDone(left) ? 1 : -1;
+    }
+    if (!isDone(left) && left.priority !== right.priority) {
+      return right.priority - left.priority;
+    }
+    const activityDelta = activityValue(right).localeCompare(activityValue(left));
+    if (activityDelta !== 0) {
+      return activityDelta;
+    }
     if (left.priority !== right.priority) {
       return right.priority - left.priority;
     }
-    return (right.completed_at ?? right.started_at ?? right.created_at ?? '').localeCompare(
-      left.completed_at ?? left.started_at ?? left.created_at ?? ''
-    );
+    return right.task_id.localeCompare(left.task_id);
   });
 }
 

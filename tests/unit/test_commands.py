@@ -238,6 +238,34 @@ async def test_help_lists_stop_and_alias_commands() -> None:
 
 
 @pytest.mark.asyncio
+async def test_help_tolerates_accidental_space_after_slash() -> None:
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=None,
+        session_cache=None,
+        compaction_strategy=None,
+        providers=None,
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(
+            **_NotificationService().__dict__,
+            list_pending=AsyncMock(return_value=[]),
+        ),
+    )
+
+    result = await dispatcher.dispatch(
+        "/ help",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert result is not None
+    assert result.type == "system_message"
+    assert "/help" in (result.text or "")
+
+
+@pytest.mark.asyncio
 async def test_stop_recovers_local_pause_when_notification_resolution_fails() -> None:
     pause_waiter = PauseWaiter()
     pause_waiter.register(

@@ -50,6 +50,9 @@ class _FakeQueryResult:
     def scalars(self) -> _FakeScalarResult:
         return _FakeScalarResult(self._rows)
 
+    def scalar_one_or_none(self) -> Any:
+        return self._rows[0] if self._rows else None
+
 
 class _FakeListSession:
     def __init__(self, rows: list[Any], tasks: dict[str, Any]) -> None:
@@ -121,14 +124,25 @@ class _FakePauseWaiter:
 
 
 class _FakeGuardrails:
-    def __init__(self, *, fail: bool = False, order: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        fail: bool = False,
+        order: list[str] | None = None,
+        escalations: dict[str, Any] | None = None,
+    ) -> None:
         self.fail = fail
         self.order = order if order is not None else []
+        self.escalations = escalations or {}
 
     async def submit_decision(self, call_id: str, decision: str, note: str | None = None) -> None:
         self.order.append("submit")
         if self.fail:
             raise RuntimeError("submit failed")
+
+    async def get_escalation(self, call_id: str) -> Any:
+        self.order.append("get_escalation")
+        return self.escalations.get(call_id)
 
 
 class _FakeEventBus:
@@ -266,3 +280,73 @@ async def test_list_pending_omits_and_orphans_notifications_for_terminal_tasks(
     assert [notification.notification_id for notification in pending] == ["notif_active"]
     assert stale_row.status == "resolved"
     assert stale_row.resolution == {"decision": "cancel", "reason": "task_terminal"}
+
+
+@pytest.mark.asyncio
+async def test_list_pending_reconciles_externally_resolved_submitted_escalations() -> None:
+    row = _notification_row()
+    row.task_id = "task_live"
+    row.resolution = {"decision": "approve", "state": "submitted", "note": "approved in intaris"}
+    event_bus = _FakeEventBus()
+    service = NotificationService(
+        session_factory=_FakeListSessionFactory([row], {"task_live": _task_row("task_live", "paused")}),
+        pause_waiter=_FakePauseWaiter(),
+        event_bus=event_bus,
+        providers=SimpleNamespace(
+            guardrails=_FakeGuardrails(
+                escalations={
+                    "call-1": SimpleNamespace(
+                        call_id="call-1",
+                        resolved=True,
+                        decision="approve",
+                    )
+                }
+            )
+        ),
+    )
+
+    pending = await service.list_pending("user@example.com", conversation_id="conv-1")
+
+    assert pending == []
+    assert row.status == "resolved"
+    assert row.resolution["state"] == "resolved_remote"
+    assert row.resolution["decision"] == "approve"
+    assert event_bus.events[-1].data["notification_id"] == "call-1"
+
+
+@pytest.mark.asyncio
+async def test_list_pending_keeps_remote_resolution_visible_when_waiter_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = _notification_row()
+    row.task_id = "task_live"
+    event_bus = _FakeEventBus()
+
+    async def _fake_get_task(session: Any, task_id: str) -> Any:
+        return _task_row(task_id, "paused")
+
+    monkeypatch.setattr("cognis.core.notifications.get_task", _fake_get_task)
+
+    service = NotificationService(
+        session_factory=_FakeListSessionFactory([row], {"task_live": _task_row("task_live", "paused")}),
+        pause_waiter=_FakePauseWaiter(should_resolve=False),
+        event_bus=event_bus,
+        providers=SimpleNamespace(
+            guardrails=_FakeGuardrails(
+                escalations={
+                    "call-1": SimpleNamespace(
+                        call_id="call-1",
+                        resolved=True,
+                        decision="approve",
+                    )
+                }
+            )
+        ),
+    )
+
+    pending = await service.list_pending("user@example.com", conversation_id="conv-1")
+
+    assert [notification.notification_id for notification in pending] == ["call-1"]
+    assert row.status == "pending"
+    assert row.resolution["state"] == "submitted_remote"
+    assert event_bus.events == []

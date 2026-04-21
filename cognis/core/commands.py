@@ -126,6 +126,7 @@ class CommandDispatcher:
         stripped = command.strip()
         if not stripped.startswith("/"):
             return None
+        stripped = f"/{stripped[1:].lstrip()}"
 
         # /compact or /summarize
         if stripped in ("/compact", "/summarize"):

@@ -527,6 +527,7 @@ class TaskResponse(BaseModel):
     created_at: datetime | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
+    updated_at: datetime | None = None
     result_summary: str | None = None
     result_data: dict[str, Any] | None = None
     applied_completion_mode: str | None = None

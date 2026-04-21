@@ -1007,7 +1007,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
                     <Button size="sm" variant="secondary" onclick={() => openOutputModalForStep(selectedStepGroup.stepName)}>Open output</Button>
                   {/if}
                   {#if stepHasLogs[selectedStepGroup.stepName]}
-                    <Button size="sm" variant="ghost" onclick={() => openSessionLogsForStep(selectedStepGroup.stepName)}>Open logs</Button>
+                    <Button size="sm" variant="secondary" onclick={() => openSessionLogsForStep(selectedStepGroup.stepName)}>Open logs</Button>
                   {/if}
                   <Button class="lg:hidden" size="sm" variant="secondary" onclick={() => openStepDetail(selectedStepGroup.stepName)}>
                     <PanelRightOpen class="mr-1.5 h-3.5 w-3.5" />
@@ -1242,7 +1242,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
                       </div>
                       <div class="flex items-center gap-2">
                         {#if latestAttempt.output?.session_id || latestAttempt.session_id}
-                          <Button size="sm" variant="ghost" onclick={() => openSessionLogs(latestAttempt)}>Logs</Button>
+                          <Button size="sm" variant="secondary" onclick={() => openSessionLogs(latestAttempt)}>Logs</Button>
                         {/if}
                         <Tooltip text={displayStepStatusHint(latestAttempt)}>
                           <span class="cursor-help rounded-full border px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wider {statusColors[visibleStatus] ?? 'border-slate-600 text-slate-400'}">{visibleStatus}</span>
@@ -1683,7 +1683,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
             <div class="flex items-center justify-between gap-3">
               <span class="rounded-full border px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wider {statusColors[visibleStatus] ?? 'border-slate-600 text-slate-400'}">{visibleStatus}</span>
               {#if latestAttempt.output?.session_id || latestAttempt.session_id}
-                <Button size="sm" variant="ghost" onclick={() => openSessionLogs(latestAttempt)}>Logs</Button>
+                <Button size="sm" variant="secondary" onclick={() => openSessionLogs(latestAttempt)}>Logs</Button>
               {/if}
             </div>
             {#if summary}

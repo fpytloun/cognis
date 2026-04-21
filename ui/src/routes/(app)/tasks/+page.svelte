@@ -1,6 +1,7 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
   import { onMount } from 'svelte';
+  import ChevronDown from 'lucide-svelte/icons/chevron-down';
 
   import { api, asApiError } from '$lib/api/client';
   import AgentSelect from '$lib/components/AgentSelect.svelte';
@@ -13,6 +14,7 @@
   import { confirmAction } from '$lib/stores/confirm';
   import { addToast } from '$lib/stores/toasts';
   import { workspaceHealth } from '$lib/system';
+  import { formatAbsoluteTime, formatRelativeTime } from '$lib/time';
   import { TASK_BOARD_COLUMNS, boardColumnForStatus, matchesTaskFilters, sortTasks, type TaskFilterState, type TaskBoardColumnId } from '$lib/tasks';
   import type { Agent, Conversation, Skill, Task, Workflow } from '$lib/types/api';
 
@@ -30,6 +32,7 @@
   let skills = $state<Skill[]>([]);
   let conversations = $state<Conversation[]>([]);
   let showCreateModal = $state(false);
+  let expandedDoneGroups = $state<Set<string>>(new Set());
 
   // Multi-select
   let selectedIds = $state<Set<string>>(new Set());
@@ -104,6 +107,62 @@
   function workflowName(workflowId: string | null): string {
     if (!workflowId) return 'auto';
     return workflows.find((w) => w.workflow_id === workflowId)?.name ?? workflowId;
+  }
+
+  interface TaskDoneGroup {
+    key: string;
+    title: string;
+    latest: Task;
+    tasks: Task[];
+  }
+
+  function taskGroupKey(task: Task): string {
+    const normalizedTitle = task.title.trim().toLowerCase();
+    return [
+      normalizedTitle || task.task_id,
+      task.workflow_id ?? 'auto',
+      task.agent_id,
+      task.status,
+      task.source_type,
+      task.source_ref ?? 'none',
+    ].join('::');
+  }
+
+  function taskActivityLabel(task: Task): string | null {
+    return task.updated_at ?? task.completed_at ?? task.started_at ?? task.created_at;
+  }
+
+  function taskGroupTitle(task: Task): string {
+    return task.title.trim() || task.task_id;
+  }
+
+  let doneTaskGroups = $derived.by(() => {
+    const groups = new Map<string, TaskDoneGroup>();
+    for (const task of tasksForColumn('done')) {
+      const key = taskGroupKey(task);
+      const existing = groups.get(key);
+      if (existing) {
+        existing.tasks.push(task);
+        continue;
+      }
+      groups.set(key, {
+        key,
+        title: taskGroupTitle(task),
+        latest: task,
+        tasks: [task],
+      });
+    }
+    return [...groups.values()];
+  });
+
+  function toggleDoneGroup(groupKey: string): void {
+    const next = new Set(expandedDoneGroups);
+    if (next.has(groupKey)) {
+      next.delete(groupKey);
+    } else {
+      next.add(groupKey);
+    }
+    expandedDoneGroups = next;
   }
 
   function tasksForColumn(columnId: TaskBoardColumnId): Task[] {
@@ -509,15 +568,63 @@
         {#if mobileActiveColumn === column.id}
           <section class="mt-3 space-y-2" aria-label={column.label}>
             <div class="space-y-2">
-              {#each tasksForColumn(column.id) as task (task.task_id)}
-                <TaskCard
-                  {task}
-                  workflowName={workflowName(task.workflow_id)}
-                  selected={selectedIds.has(task.task_id)}
-                  onclick={(event) => handleCardClick(event, task.task_id, column.id)}
-                />
-              {/each}
-              {#if tasksForColumn(column.id).length === 0}
+              {#if column.id === 'done'}
+                {#each doneTaskGroups as group (group.key)}
+                  <article class="rounded-2xl border border-slate-800 bg-slate-950/70 p-3">
+                    <div class="flex items-start gap-3">
+                      <button
+                        type="button"
+                        class="mt-0.5 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-slate-700 bg-slate-900/70 text-slate-400 transition hover:border-slate-600 hover:text-white"
+                        onclick={() => toggleDoneGroup(group.key)}
+                        aria-label={expandedDoneGroups.has(group.key) ? 'Collapse task group' : 'Expand task group'}
+                      >
+                        <ChevronDown class={`h-4 w-4 transition ${expandedDoneGroups.has(group.key) ? 'rotate-180' : ''}`} />
+                      </button>
+                      <div class="min-w-0 flex-1 space-y-2">
+                        <div class="flex flex-wrap items-center justify-between gap-2 px-1">
+                          <span class="text-xs uppercase tracking-[0.2em] text-slate-500">{group.title}</span>
+                          {#if group.tasks.length > 1}
+                            <span class="rounded-full border border-slate-700 bg-slate-900 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-slate-300">{group.tasks.length}</span>
+                          {/if}
+                        </div>
+                        <TaskCard
+                          task={group.latest}
+                          workflowName={workflowName(group.latest.workflow_id)}
+                          selected={selectedIds.has(group.latest.task_id)}
+                          onclick={(event) => handleCardClick(event, group.latest.task_id, column.id)}
+                        />
+                        {#if taskActivityLabel(group.latest)}
+                          <p class="px-1 text-[11px] text-slate-500" title={formatAbsoluteTime(taskActivityLabel(group.latest)!)}>
+                            Last activity {formatRelativeTime(taskActivityLabel(group.latest)!)}
+                          </p>
+                        {/if}
+                      </div>
+                    </div>
+                    {#if expandedDoneGroups.has(group.key) && group.tasks.length > 1}
+                      <div class="mt-3 space-y-2 border-t border-slate-800 pt-3">
+                        {#each group.tasks.slice(1) as task (task.task_id)}
+                          <TaskCard
+                            {task}
+                            workflowName={workflowName(task.workflow_id)}
+                            selected={selectedIds.has(task.task_id)}
+                            onclick={(event) => handleCardClick(event, task.task_id, column.id)}
+                          />
+                        {/each}
+                      </div>
+                    {/if}
+                  </article>
+                {/each}
+              {:else}
+                {#each tasksForColumn(column.id) as task (task.task_id)}
+                  <TaskCard
+                    {task}
+                    workflowName={workflowName(task.workflow_id)}
+                    selected={selectedIds.has(task.task_id)}
+                    onclick={(event) => handleCardClick(event, task.task_id, column.id)}
+                  />
+                {/each}
+              {/if}
+              {#if (column.id === 'done' ? doneTaskGroups.length : tasksForColumn(column.id).length) === 0}
                 <p class="py-8 text-center text-sm text-slate-500">No tasks.</p>
               {/if}
             </div>
@@ -556,22 +663,70 @@
             </div>
 
             <div class="flex-1 space-y-2 overflow-y-auto">
-              {#each tasksForColumn(column.id) as task (task.task_id)}
-                <div
-                  draggable={!filtersActive}
-                  ondragstart={() => (dragState = { taskId: task.task_id, column: column.id })}
-                  ondragend={() => { dragState = null; dropTargetColumn = null; }}
-                  ondragover={(event: DragEvent) => event.preventDefault()}
-                  ondrop={(event: DragEvent) => { event.stopPropagation(); handleColumnDrop(column.id, task.task_id); }}
-                >
-                  <TaskCard
-                    {task}
-                    workflowName={workflowName(task.workflow_id)}
-                    selected={selectedIds.has(task.task_id)}
-                    onclick={(event) => handleCardClick(event, task.task_id, column.id)}
-                  />
-                </div>
-              {/each}
+              {#if column.id === 'done'}
+                {#each doneTaskGroups as group (group.key)}
+                  <article class="rounded-2xl border border-slate-800 bg-slate-950/70 p-3">
+                    <div class="flex items-start gap-3">
+                      <button
+                        type="button"
+                        class="mt-0.5 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-slate-700 bg-slate-900/70 text-slate-400 transition hover:border-slate-600 hover:text-white"
+                        onclick={() => toggleDoneGroup(group.key)}
+                        aria-label={expandedDoneGroups.has(group.key) ? 'Collapse task group' : 'Expand task group'}
+                      >
+                        <ChevronDown class={`h-4 w-4 transition ${expandedDoneGroups.has(group.key) ? 'rotate-180' : ''}`} />
+                      </button>
+                      <div class="min-w-0 flex-1 space-y-2">
+                        <div class="flex flex-wrap items-center justify-between gap-2 px-1">
+                          <span class="text-xs uppercase tracking-[0.2em] text-slate-500">{group.title}</span>
+                          {#if group.tasks.length > 1}
+                            <span class="rounded-full border border-slate-700 bg-slate-900 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-slate-300">{group.tasks.length}</span>
+                          {/if}
+                        </div>
+                        <TaskCard
+                          task={group.latest}
+                          workflowName={workflowName(group.latest.workflow_id)}
+                          selected={selectedIds.has(group.latest.task_id)}
+                          onclick={(event) => handleCardClick(event, group.latest.task_id, column.id)}
+                        />
+                        {#if taskActivityLabel(group.latest)}
+                          <p class="px-1 text-[11px] text-slate-500" title={formatAbsoluteTime(taskActivityLabel(group.latest)!)}>
+                            Last activity {formatRelativeTime(taskActivityLabel(group.latest)!)}
+                          </p>
+                        {/if}
+                      </div>
+                    </div>
+                    {#if expandedDoneGroups.has(group.key) && group.tasks.length > 1}
+                      <div class="mt-3 space-y-2 border-t border-slate-800 pt-3">
+                        {#each group.tasks.slice(1) as task (task.task_id)}
+                          <TaskCard
+                            {task}
+                            workflowName={workflowName(task.workflow_id)}
+                            selected={selectedIds.has(task.task_id)}
+                            onclick={(event) => handleCardClick(event, task.task_id, column.id)}
+                          />
+                        {/each}
+                      </div>
+                    {/if}
+                  </article>
+                {/each}
+              {:else}
+                {#each tasksForColumn(column.id) as task (task.task_id)}
+                  <div
+                    draggable={!filtersActive}
+                    ondragstart={() => (dragState = { taskId: task.task_id, column: column.id })}
+                    ondragend={() => { dragState = null; dropTargetColumn = null; }}
+                    ondragover={(event: DragEvent) => event.preventDefault()}
+                    ondrop={(event: DragEvent) => { event.stopPropagation(); handleColumnDrop(column.id, task.task_id); }}
+                  >
+                    <TaskCard
+                      {task}
+                      workflowName={workflowName(task.workflow_id)}
+                      selected={selectedIds.has(task.task_id)}
+                      onclick={(event) => handleCardClick(event, task.task_id, column.id)}
+                    />
+                  </div>
+                {/each}
+              {/if}
             </div>
           </section>
         {/each}

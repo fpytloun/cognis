@@ -1,6 +1,8 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
   import ArrowDown from 'lucide-svelte/icons/arrow-down';
+  import ChevronDown from 'lucide-svelte/icons/chevron-down';
+  import ChevronUp from 'lucide-svelte/icons/chevron-up';
 
   import { api, asApiError } from '$lib/api/client';
   import {
@@ -9,15 +11,16 @@
     SESSION_LOG_PAGE_SIZE,
     SESSION_LOG_POLL_INTERVAL_MS
   } from '$lib/chat-page';
-  import { normalizeHistory, type TimelineItem } from '$lib/chat';
+  import { normalizeHistory, type TimelineItem, type ToolCallTimelineItem } from '$lib/chat';
   import ChatMessage from '$lib/components/ChatMessage.svelte';
   import DelegationCard from '$lib/components/DelegationCard.svelte';
+  import EscalationPrompt from '$lib/components/EscalationPrompt.svelte';
   import LiveDots from '$lib/components/LiveDots.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import ReasoningBlock from '$lib/components/ReasoningBlock.svelte';
   import ToolCallBlock from '$lib/components/ToolCallBlock.svelte';
   import Button from '$lib/components/ui/Button.svelte';
-  import type { MessageEvent } from '$lib/types/api';
+  import type { Escalation, MessageEvent } from '$lib/types/api';
 
   let {
     conversationId,
@@ -38,11 +41,105 @@
   let lastSeq = $state(0);
   let pollDelayMs = $state(SESSION_LOG_POLL_INTERVAL_MS);
   let currentSessionStatus = $state<string | null>(null);
+  let chatTodoDrawerOpen = $state(true);
+  let escalations = $state<Escalation[]>([]);
+  let escalationBusyCallId = $state<string | null>(null);
 
   let initialLoadDone = $state(false);
   let timelineEl = $state<HTMLDivElement | null>(null);
+  let timelineContentEl = $state<HTMLDivElement | null>(null);
+  let footerChromeEl = $state<HTMLDivElement | null>(null);
   let userScrolledUp = $state(false);
   let programmaticScroll = false;
+
+  interface SessionTodo {
+    content: string;
+    status: string;
+    priority: string;
+  }
+
+  const terminalTodoStatuses = new Set(['completed', 'cancelled']);
+
+  function normalizeToolName(name: string): string {
+    return name.toLowerCase().replace(/_/g, '');
+  }
+
+  function parseTodos(value: unknown): SessionTodo[] {
+    if (!Array.isArray(value)) return [];
+    return value
+      .map((item) => {
+        if (!item || typeof item !== 'object') return null;
+        const record = item as Record<string, unknown>;
+        const content = typeof record.content === 'string' ? record.content.trim() : '';
+        if (!content) return null;
+        return {
+          content,
+          status: typeof record.status === 'string' ? record.status : 'pending',
+          priority: typeof record.priority === 'string' ? record.priority : 'medium'
+        } satisfies SessionTodo;
+      })
+      .filter((item): item is SessionTodo => item !== null);
+  }
+
+  function parsedToolResult(item: ToolCallTimelineItem): Record<string, unknown> | null {
+    if (typeof item.result !== 'string') return null;
+    try {
+      const parsed = JSON.parse(item.result.replace(/^<tool_result[^>]*>\n?/, '').replace(/\n?<\/tool_result>\s*$/, ''));
+      return parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function latestSessionTodos(items: TimelineItem[]): SessionTodo[] {
+    for (let index = items.length - 1; index >= 0; index -= 1) {
+      const item = items[index];
+      if (item?.kind !== 'tool_call') continue;
+      const toolName = normalizeToolName(item.toolName);
+      if (toolName === 'steptodowrite') {
+        const parsed = parsedToolResult(item);
+        if (Array.isArray(parsed?.todos)) {
+          return parseTodos(parsed.todos);
+        }
+        if (item.status === 'started' && Array.isArray(item.arguments?.todos)) {
+          return parseTodos(item.arguments.todos);
+        }
+        return [];
+      }
+      if (toolName === 'steptodolist') {
+        const parsed = parsedToolResult(item);
+        if (Array.isArray(parsed?.todos)) {
+          return parseTodos(parsed.todos);
+        }
+        return [];
+      }
+    }
+
+    return [];
+  }
+
+  function todoStatusDot(status: string): string {
+    if (status === 'completed') return 'bg-emerald-400';
+    if (status === 'cancelled') return 'bg-slate-600';
+    if (status === 'in_progress') return 'bg-sky-400';
+    return 'bg-amber-400';
+  }
+
+  function todoPriorityClass(priority: string): string {
+    if (priority === 'high') return 'text-rose-300';
+    if (priority === 'low') return 'text-slate-500';
+    return 'text-slate-400';
+  }
+
+  let sessionTodos = $derived.by(() => latestSessionTodos(timeline));
+  let activeSessionTodos = $derived.by(() => sessionTodos.filter((todo) => !terminalTodoStatuses.has(todo.status)));
+  let shouldShowTodoDrawer = $derived(activeSessionTodos.length > 0);
+  let todoCounts = $derived.by(() => ({
+    inProgress: activeSessionTodos.filter((todo) => todo.status === 'in_progress').length,
+    pending: activeSessionTodos.filter((todo) => todo.status === 'pending').length,
+  }));
+
+  const liveSessionStates = new Set(['active', 'idle', 'running']);
 
   function scrollToBottom(force = false): void {
     if (!timelineEl || (!force && userScrolledUp)) return;
@@ -64,13 +161,50 @@
     scrollToBottom(true);
   }
 
-  function hasStreamingTimelineItem(items: TimelineItem[]): boolean {
-    return items.some((item) => {
-      if (item.kind === 'message' || item.kind === 'reasoning') {
-        return item.streaming === true;
+  function isSessionLive(status: string | null): boolean {
+    if (!status) return false;
+    return liveSessionStates.has(status);
+  }
+
+  function sortEscalations(items: Escalation[]): Escalation[] {
+    return [...items].sort((left, right) => (left.received_at ?? 0) - (right.received_at ?? 0));
+  }
+
+  function escalationSecondsRemaining(item: Escalation): number {
+    const timeoutSeconds = item.timeout_seconds ?? 300;
+    const receivedAt = item.received_at ?? Date.now();
+    return Math.max(Math.ceil(timeoutSeconds - (Date.now() - receivedAt) / 1000), 0);
+  }
+
+  async function refreshEscalations(): Promise<void> {
+    const notifications = await api.notifications.list(null, { sessionId });
+    escalations = sortEscalations(
+      notifications
+        .filter((item) => item.notification_type === 'escalation' && item.session_id === sessionId)
+        .map((item) => ({
+          call_id: item.notification_id,
+          session_id: item.session_id,
+          tool_name: typeof item.payload.tool_name === 'string' ? item.payload.tool_name : null,
+          decision: 'escalate',
+          resolved: false,
+          reasoning: typeof item.payload.reasoning === 'string' ? item.payload.reasoning : null,
+          risk: typeof item.payload.risk === 'string' ? item.payload.risk : null,
+          timeout_seconds: typeof item.payload.timeout_seconds === 'number' ? item.payload.timeout_seconds : 300,
+          received_at: item.created_at ? Date.parse(item.created_at) : Date.now(),
+        }) satisfies Escalation)
+    );
+  }
+
+  async function resolveEscalation(notificationId: string, decision: 'approve' | 'deny'): Promise<void> {
+    escalationBusyCallId = notificationId;
+    try {
+      await api.notifications.resolve(notificationId, { decision });
+      await refreshEscalations();
+    } finally {
+      if (escalationBusyCallId === notificationId) {
+        escalationBusyCallId = null;
       }
-      return false;
-    });
+    }
   }
 
   async function refreshSessionStatus(): Promise<void> {
@@ -85,6 +219,11 @@
     error = '';
     try {
       await refreshSessionStatus();
+      try {
+        await refreshEscalations();
+      } catch {
+        // Session logs remain usable even if escalation polling fails.
+      }
 
       if (refresh || !initialLoadDone) {
         const history: MessageEvent[] = [];
@@ -160,6 +299,28 @@
       if (pollTimer !== null) window.clearTimeout(pollTimer);
     };
   });
+
+  $effect(() => {
+    if (shouldShowTodoDrawer) {
+      chatTodoDrawerOpen = true;
+    }
+  });
+
+  $effect(() => {
+    if ((!timelineContentEl && !footerChromeEl) || typeof ResizeObserver === 'undefined') {
+      return;
+    }
+    const observer = new ResizeObserver(() => {
+      requestAnimationFrame(() => scrollToBottom());
+    });
+    if (timelineContentEl) {
+      observer.observe(timelineContentEl);
+    }
+    if (footerChromeEl) {
+      observer.observe(footerChromeEl);
+    }
+    return () => observer.disconnect();
+  });
 </script>
 
 <svelte:window onkeydown={handleKeydown} />
@@ -193,57 +354,112 @@
       </div>
     </div>
 
+    {#if escalations.length > 0}
+      {@const activeEscalation = escalations[0]}
+      <div class="border-b border-slate-800 px-4 py-3">
+        <EscalationPrompt
+          item={activeEscalation}
+          secondsRemaining={escalationSecondsRemaining(activeEscalation)}
+          pending={escalationBusyCallId === activeEscalation.call_id}
+          queuedCount={escalations.length - 1}
+          onApprove={() => resolveEscalation(activeEscalation.call_id, 'approve')}
+          onDeny={() => resolveEscalation(activeEscalation.call_id, 'deny')}
+        />
+      </div>
+    {/if}
+
     <div
-      class="relative min-h-0 flex-1 space-y-4 overflow-y-auto overflow-x-hidden overscroll-contain px-4 py-4 pb-4"
+      class="relative min-h-0 flex-1 overflow-y-auto overflow-x-hidden overscroll-contain px-4 py-4 pb-4"
       bind:this={timelineEl}
       onscroll={handleTimelineScroll}
     >
-      {#if loading}
-        <LoadingState />
-      {:else if error}
-        <p class="text-sm text-rose-400">{error}</p>
-      {:else if timeline.length === 0}
-        <p class="text-sm text-slate-500">No events recorded yet.</p>
-      {:else}
-        {#each timeline as item (item.id)}
-          {#if item.kind === 'message'}
-            <div class={`flex ${item.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-              <ChatMessage {item} compact />
-            </div>
-          {:else if item.kind === 'tool_call'}
-            <ToolCallBlock {item} />
-          {:else if item.kind === 'reasoning'}
-            <ReasoningBlock {item} />
-          {:else if item.kind === 'delegation'}
-            <DelegationCard {item} />
-          {:else if item.kind === 'notice'}
-            <div class="rounded-xl border border-slate-800/60 bg-slate-900/50 px-3 py-2 text-xs text-slate-400">
-              <p class="font-medium">{item.title}</p>
-              {#if item.description}<p class="mt-1 opacity-75">{item.description}</p>{/if}
-            </div>
-          {:else if item.kind === 'system_message'}
-            <div class="rounded-xl border border-amber-900/50 bg-amber-950/30 px-3 py-2 text-sm text-amber-100/90">
-              {item.text}
-            </div>
-          {:else if item.kind === 'compaction'}
-            <div class="rounded-xl border border-sky-900/40 bg-sky-950/20 px-3 py-3 text-sm text-sky-100/90">
-              <p class="font-medium">Conversation compacted</p>
-              <p class="mt-1 text-sky-100/70">{item.summaryPreview}</p>
-            </div>
-          {/if}
-        {/each}
-      {/if}
+      <div bind:this={timelineContentEl} class="space-y-4">
+        {#if loading}
+          <LoadingState />
+        {:else if error}
+          <p class="text-sm text-rose-400">{error}</p>
+        {:else if timeline.length === 0}
+          <p class="text-sm text-slate-500">No events recorded yet.</p>
+        {:else}
+          {#each timeline as item (item.id)}
+            {#if item.kind === 'message'}
+              <div class={`flex ${item.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                <ChatMessage {item} compact />
+              </div>
+            {:else if item.kind === 'tool_call'}
+              <ToolCallBlock {item} />
+            {:else if item.kind === 'reasoning'}
+              <ReasoningBlock {item} />
+            {:else if item.kind === 'delegation'}
+              <DelegationCard {item} />
+            {:else if item.kind === 'notice'}
+              <div class="rounded-xl border border-slate-800/60 bg-slate-900/50 px-3 py-2 text-xs text-slate-400">
+                <p class="font-medium">{item.title}</p>
+                {#if item.description}<p class="mt-1 opacity-75">{item.description}</p>{/if}
+              </div>
+            {:else if item.kind === 'system_message'}
+              <div class="rounded-xl border border-amber-900/50 bg-amber-950/30 px-3 py-2 text-sm text-amber-100/90">
+                {item.text}
+              </div>
+            {:else if item.kind === 'compaction'}
+              <div class="rounded-xl border border-sky-900/40 bg-sky-950/20 px-3 py-3 text-sm text-sky-100/90">
+                <p class="font-medium">Conversation compacted</p>
+                <p class="mt-1 text-sky-100/70">{item.summaryPreview}</p>
+              </div>
+            {/if}
+          {/each}
+        {/if}
+      </div>
 
       {#if userScrolledUp}
         <button class="sticky bottom-2 left-1/2 z-10 -translate-x-1/2 rounded-full border border-slate-700 bg-slate-900/90 p-2 shadow-lg transition hover:bg-slate-800" onclick={jumpToBottom} type="button" title="Scroll to latest">
           <ArrowDown class="h-4 w-4 text-slate-300" />
         </button>
-      {:else if !loading && !error && currentSessionStatus === 'active' && !hasStreamingTimelineItem(timeline)}
+      {:else if !loading && !error && isSessionLive(currentSessionStatus)}
         <div class="sticky bottom-2 left-1/2 z-10 w-fit -translate-x-1/2">
           <LiveDots label="Reading latest logs" size="sm" />
         </div>
       {/if}
     </div>
+
+    {#if shouldShowTodoDrawer}
+      <div bind:this={footerChromeEl} class="shrink-0 border-t border-slate-800/80 px-4 py-3">
+        <div class="rounded-xl border border-slate-800/60 bg-slate-900/40">
+          <button
+            class="flex w-full items-center justify-between gap-3 px-3 py-1.5 text-left text-sm transition hover:bg-slate-800/40"
+            onclick={() => { chatTodoDrawerOpen = !chatTodoDrawerOpen; }}
+            type="button"
+          >
+            <span class="truncate text-slate-300">
+              <span class="font-medium text-slate-200">Todos</span>
+              <span class="text-slate-500"> · {activeSessionTodos.length} active{#if todoCounts.inProgress > 0} · {todoCounts.inProgress} in progress{/if}{#if todoCounts.pending > 0} · {todoCounts.pending} pending{/if}</span>
+            </span>
+            {#if chatTodoDrawerOpen}
+              <ChevronUp class="h-3.5 w-3.5 shrink-0 text-slate-500" />
+            {:else}
+              <ChevronDown class="h-3.5 w-3.5 shrink-0 text-slate-500" />
+            {/if}
+          </button>
+          {#if chatTodoDrawerOpen}
+            <ul class="divide-y divide-slate-800/40 border-t border-slate-800/60">
+              {#each activeSessionTodos as todo}
+                <li class="flex items-center gap-2 px-3 py-1.5 text-sm text-slate-200">
+                  <span
+                    class={`inline-block h-2 w-2 shrink-0 rounded-full ${todoStatusDot(todo.status)}`}
+                    aria-label={todo.status.replace('_', ' ')}
+                    title={todo.status.replace('_', ' ')}
+                  ></span>
+                  <span class="min-w-0 flex-1 truncate">{todo.content}</span>
+                  {#if todo.priority !== 'medium'}
+                    <span class={`shrink-0 text-xs ${todoPriorityClass(todo.priority)}`}>{todo.priority}</span>
+                  {/if}
+                </li>
+              {/each}
+            </ul>
+          {/if}
+        </div>
+      </div>
+    {/if}
   </aside>
 </div>
 

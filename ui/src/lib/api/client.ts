@@ -1123,8 +1123,17 @@ export const api = {
   },
 
   notifications: {
-    list(conversationId?: string | null): Promise<Notification[]> {
-      return request<Notification[]>(`/api/v1/notifications${encodeQuery({ conversation_id: conversationId })}`);
+    list(
+      conversationId?: string | null,
+      params: { taskId?: string | null; sessionId?: string | null } = {}
+    ): Promise<Notification[]> {
+      return request<Notification[]>(
+        `/api/v1/notifications${encodeQuery({
+          conversation_id: conversationId,
+          task_id: params.taskId ?? null,
+          session_id: params.sessionId ?? null,
+        })}`
+      );
     },
 
     resolve(notificationId: string, payload: { decision: string; note?: string; response?: string; feedback?: string }): Promise<{ ok: boolean; notification_id: string; decision: string }> {

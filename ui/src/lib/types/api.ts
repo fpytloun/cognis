@@ -802,6 +802,7 @@ export interface Task {
   created_at: string | null;
   started_at: string | null;
   completed_at: string | null;
+  updated_at: string | null;
   result_summary: string | null;
   result_data: Record<string, unknown> | null;
   applied_completion_mode: 'default' | 'direct' | 'silent' | null;
@@ -1122,6 +1123,7 @@ export interface WebSocketToolCallEvent {
   tool_name: string;
   status: string;
   arguments?: Record<string, unknown>;
+  timestamp?: string | null;
 }
 
 export interface WebSocketDelegationStartedEvent {
@@ -1282,6 +1284,7 @@ export interface WebSocketToolResultEvent {
   result: string;
   is_error: boolean;
   duration_ms: number | null;
+  timestamp?: string | null;
   evaluation?: {
     decision: string;
     reasoning?: string;
@@ -1333,6 +1336,7 @@ export interface WebSocketEscalationEvent {
   type: 'escalation';
   conversation_id?: string;
   session_id?: string;
+  task_id?: string;
   call_id: string;
   tool_name: string | null;
   risk: string | null;

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -25,6 +26,7 @@ from cognis.store.queries import (
     create_task,
     create_user,
     set_session_intaris_session_id,
+    touch_conversation,
     update_conversation_active_session,
 )
 
@@ -1038,6 +1040,64 @@ def test_conversation_list_defaults_to_active_and_supports_archived_filter(
         ]
         assert deleted_id not in [
             item["conversation_id"] for item in archived_response.json()["items"]
+        ]
+
+
+def test_conversation_list_orders_by_latest_activity_even_without_messages(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> tuple[str, str]:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                older = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                    title="Older active conversation",
+                )
+                await touch_conversation(
+                    session,
+                    older.conversation_id,
+                    datetime.now(UTC) - timedelta(days=1),
+                )
+                newer = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                    title="Brand new conversation",
+                )
+                await session.commit()
+                return older.conversation_id, newer.conversation_id
+
+        older_id, newer_id = asyncio.run(_seed())
+
+        response = client.get(
+            "/api/v1/conversations",
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+
+        assert response.status_code == 200
+        assert [item["conversation_id"] for item in response.json()["items"]] == [
+            newer_id,
+            older_id,
         ]
 
 

@@ -105,11 +105,18 @@ def _get_service(request: Request) -> NotificationService:
 async def list_notifications(
     request: Request,
     conversation_id: str | None = None,
+    task_id: str | None = None,
+    session_id: str | None = None,
 ) -> list[NotificationResponse]:
     """List pending notifications for the current user."""
     user = require_current_user(request)
     svc = _get_service(request)
-    notifications = await svc.list_pending(user.email, conversation_id=conversation_id)
+    notifications = await svc.list_pending(
+        user.email,
+        conversation_id=conversation_id,
+        task_id=task_id,
+        session_id=session_id,
+    )
     return [_to_response(n) for n in notifications]
 
 

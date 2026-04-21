@@ -206,6 +206,7 @@ def task_to_response(task: TaskModel) -> TaskResponse:
         created_at=task.created_at,
         started_at=task.started_at,
         completed_at=task.completed_at,
+        updated_at=task.updated_at,
         result_summary=task.result_summary,
         result_data=task.result_data,
         applied_completion_mode=task.applied_completion_mode,

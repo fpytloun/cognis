@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import sqlalchemy as sa
-from sqlalchemy import delete, select, update
+from sqlalchemy import case, delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cognis.store.models import (
@@ -801,17 +801,20 @@ async def list_conversations(
 ) -> list[Conversation]:
     """List conversations for a user, optionally filtered by context type and agent.
 
-    Ordered by the timestamp of the last message (``last_message_at``) so that
-    conversations with the most recent real activity surface first. Metadata
-    updates (title edits, session reactivation, archive/unarchive) bump
-    ``updated_at`` and are used as a stable secondary sort for conversations
-    that have never received a message.
+    Ordered by the latest conversation activity timestamp so new conversations
+    and metadata changes surface immediately, even before the first message is
+    sent.
     """
+    latest_activity = case(
+        (Conversation.last_message_at.is_(None), Conversation.updated_at),
+        (Conversation.updated_at > Conversation.last_message_at, Conversation.updated_at),
+        else_=Conversation.last_message_at,
+    )
     query = (
         select(Conversation)
         .where(Conversation.user_email == user_email)
         .order_by(
-            Conversation.last_message_at.desc().nullslast(),
+            latest_activity.desc(),
             Conversation.updated_at.desc(),
             Conversation.conversation_id.asc(),
         )
@@ -843,6 +846,11 @@ async def get_latest_active_conversation_for_agent(
     conversations with a matching ``context_type`` column.
     """
 
+    latest_activity = case(
+        (Conversation.last_message_at.is_(None), Conversation.updated_at),
+        (Conversation.updated_at > Conversation.last_message_at, Conversation.updated_at),
+        else_=Conversation.last_message_at,
+    )
     query = (
         select(Conversation)
         .where(Conversation.user_email == user_email)
@@ -852,7 +860,7 @@ async def get_latest_active_conversation_for_agent(
     if context_type is not None:
         query = query.where(Conversation.context_type == context_type)
     query = query.order_by(
-        Conversation.last_message_at.desc().nullslast(),
+        latest_activity.desc(),
         Conversation.updated_at.desc(),
         Conversation.conversation_id.asc(),
     ).limit(1)

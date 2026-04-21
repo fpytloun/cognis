@@ -338,6 +338,31 @@ class IntarisProvider:
             breaker=self.session_breaker,
         )
 
+    async def get_escalation(self, call_id: str) -> EscalationRecord | None:
+        async def _do() -> EscalationRecord | None:
+            response = await self.client.get(
+                "/api/v1/audit",
+                params={"call_id": call_id},
+                headers=self._headers(user_email=current_user_email.get()),
+            )
+            response.raise_for_status()
+            data = response.json()
+            items = data.get("items", []) if isinstance(data, dict) else data
+            if not isinstance(items, list):
+                return None
+            for item in items:
+                record = EscalationRecord.model_validate(item)
+                if record.call_id == call_id:
+                    return record
+            return None
+
+        return await self._call_with_retry(
+            _do,
+            max_retries=2,
+            operation="intaris get_escalation",
+            breaker=self.session_breaker,
+        )
+
     async def record_events(
         self,
         session_id: str,

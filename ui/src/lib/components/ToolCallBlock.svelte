@@ -2,6 +2,7 @@
   import type { ToolCallTimelineItem } from '$lib/chat';
   import LiveDots from '$lib/components/LiveDots.svelte';
   import { highlightJson, looksLikeJson, prettyPrintJson } from '$lib/syntax/json';
+  import { formatAbsoluteTime, formatCompactTime } from '$lib/time';
 
   let { item } = $props<{ item: ToolCallTimelineItem }>();
 
@@ -10,6 +11,7 @@
   let outputExpanded = $state(false);
   let evalExpanded = $state(false);
   let autoExpanded = $state(false);
+  const nowDate = new Date();
 
   const LINES_PER_PAGE = 50;
   const startsExpanded = $derived(item.toolName.toLowerCase().replace(/_/g, '') === 'steprequestinput');
@@ -265,6 +267,12 @@
   <!-- Expanded content -->
   {#if expanded}
     <div class="space-y-3 border-t border-slate-800/60 px-4 py-3">
+      {#if item.timestamp}
+        <div class="flex items-center justify-between gap-3 text-[11px] text-slate-500">
+          <span>Executed</span>
+          <span title={formatAbsoluteTime(item.timestamp)}>{formatCompactTime(item.timestamp, nowDate)}</span>
+        </div>
+      {/if}
       {#if isStepRequestInput()}
         <div>
           <p class="mb-1 text-xs font-medium uppercase tracking-widest text-slate-500">Question</p>

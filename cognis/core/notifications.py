@@ -439,9 +439,12 @@ class NotificationService:
         user_email: str,
         *,
         conversation_id: str | None = None,
+        task_id: str | None = None,
+        session_id: str | None = None,
     ) -> list[Notification]:
         """List pending notifications for a user, optionally filtered by conversation."""
         stale_notification_ids: list[str] = []
+        resolved_submitted: set[str] = set()
         async with self._session_factory() as db:
             stmt = select(NotificationRow).where(
                 NotificationRow.user_email == user_email,
@@ -449,12 +452,24 @@ class NotificationService:
             )
             if conversation_id:
                 stmt = stmt.where(NotificationRow.conversation_id == conversation_id)
+            if task_id:
+                stmt = stmt.where(NotificationRow.task_id == task_id)
+            if session_id:
+                stmt = stmt.where(NotificationRow.session_id == session_id)
             stmt = stmt.order_by(NotificationRow.created_at.desc())
             result = await db.execute(stmt)
             rows = result.scalars().all()
+
+        for row in rows:
+            if await self._reconcile_remote_escalation(row):
+                resolved_submitted.add(row.notification_id)
+
+        async with self._session_factory() as db:
             visible_rows: list[Notification] = []
             task_status_cache: dict[str, str | None] = {}
             for row in rows:
+                if row.notification_id in resolved_submitted:
+                    continue
                 if row.task_id:
                     status = task_status_cache.get(row.task_id)
                     if row.task_id not in task_status_cache:
@@ -470,6 +485,94 @@ class NotificationService:
             await self.mark_orphaned(notification_id, reason="task_terminal")
 
         return visible_rows
+
+    async def _reconcile_remote_escalation(self, row: NotificationRow) -> bool:
+        """Resolve locally when Intaris already recorded an external decision."""
+        if row.notification_type != NotificationType.ESCALATION or row.status != "pending":
+            return False
+        resolution = row.resolution if isinstance(row.resolution, dict) else {}
+
+        try:
+            with scoped_runtime_context(user_email=row.user_email):
+                remote = await self._providers.guardrails.get_escalation(row.notification_id)
+        except Exception:
+            logger.warning(
+                "notification: failed to reconcile external escalation decision",
+                extra={"extra_data": {"notification_id": row.notification_id}},
+                exc_info=True,
+            )
+            return False
+        if remote is None or not remote.resolved:
+            return False
+
+        decision = remote.decision or str(resolution.get("decision") or "approve")
+        pause_waiter_ok = self._pause_waiter.resolve(
+            row.notification_id,
+            PauseResolution(decision=decision, data={"note": resolution.get("note", "")}),
+        )
+
+        if not pause_waiter_ok:
+            async with self._session_factory() as db:
+                await db.execute(
+                    update(NotificationRow)
+                    .where(NotificationRow.notification_id == row.notification_id)
+                    .values(
+                        resolution={
+                            **resolution,
+                            "decision": decision,
+                            "state": "submitted_remote",
+                        },
+                    )
+                )
+                await db.commit()
+            NOTIFICATION_ESCALATION_RECOVERY_PENDING.inc()
+            logger.warning(
+                "notification: external escalation decision recorded but local resume is pending recovery",
+                extra={"extra_data": {"notification_id": row.notification_id, "decision": decision}},
+            )
+            return False
+
+        now = datetime.now(UTC)
+        async with self._session_factory() as db:
+            await db.execute(
+                update(NotificationRow)
+                .where(NotificationRow.notification_id == row.notification_id)
+                .values(
+                    status="resolved",
+                    resolution={**resolution, "decision": decision, "state": "resolved_remote"},
+                    resolved_at=now,
+                )
+            )
+            await db.commit()
+
+        await self._event_bus.publish(
+            Event(
+                type=EventType.NOTIFICATION_RESOLVED,
+                data={
+                    "notification_id": row.notification_id,
+                    "notification_type": row.notification_type,
+                    "decision": decision,
+                },
+            )
+        )
+
+        safe_decision = decision if decision in {"approve", "deny", "continue", "cancel"} else "other"
+        NOTIFICATIONS_RESOLVED.labels(type=row.notification_type, decision=safe_decision).inc()
+        if row.created_at:
+            created_at = row.created_at if row.created_at.tzinfo is not None else row.created_at.replace(tzinfo=UTC)
+            NOTIFICATION_RESOLUTION_DURATION.labels(type=row.notification_type).observe((now - created_at).total_seconds())
+
+        logger.info(
+            "notification: reconciled external escalation decision",
+            extra={
+                "extra_data": {
+                    "notification_id": row.notification_id,
+                    "decision": decision,
+                    "task_id": row.task_id,
+                }
+            },
+        )
+        return True
 
     async def get(self, notification_id: str) -> Notification | None:
         """Get a single notification by ID."""

@@ -20,7 +20,7 @@ import json
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import WebSocket, WebSocketDisconnect
@@ -187,6 +187,7 @@ class WebSocketTurnObserver:
             "call_id": call_id,
             "tool_name": tool_name,
             "status": "started",
+            "timestamp": datetime.now(UTC).isoformat(),
         }
         if arguments is not None:
             payload["arguments"] = arguments
@@ -212,6 +213,7 @@ class WebSocketTurnObserver:
             "result": result,
             "is_error": is_error,
             "duration_ms": duration_ms,
+            "timestamp": datetime.now(UTC).isoformat(),
         }
         if evaluation:
             payload["evaluation"] = evaluation
@@ -1461,15 +1463,28 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
         "tool_call_started",
         "tool_call_completed",
     }:
+        if event.data.get("event") == "tool_call_completed":
+            return {
+                "type": "tool_result",
+                "conversation_id": conversation_id,
+                "session_id": event.data.get("session_id"),
+                "call_id": event.data.get("call_id"),
+                "tool_name": event.data.get("tool_name"),
+                "result": event.data.get("result", ""),
+                "is_error": bool(event.data.get("is_error", False)),
+                "duration_ms": event.data.get("duration_ms"),
+                "evaluation": event.data.get("evaluation"),
+                "timestamp": event.timestamp.isoformat() if event.timestamp else None,
+            }
         return {
             "type": "tool_call",
             "conversation_id": conversation_id,
             "session_id": event.data.get("session_id"),
             "call_id": event.data.get("call_id"),
             "tool_name": event.data.get("tool_name"),
-            "status": "completed"
-            if event.data.get("event") == "tool_call_completed"
-            else "started",
+            "status": "started",
+            "arguments": event.data.get("arguments"),
+            "timestamp": event.timestamp.isoformat() if event.timestamp else None,
         }
     if event.type == EventType.TASK_STARTED:
         return {

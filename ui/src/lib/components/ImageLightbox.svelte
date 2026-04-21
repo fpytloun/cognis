@@ -79,7 +79,7 @@
   aria-modal="true"
   aria-label={filename ?? alt}
   tabindex="-1"
-  class="fixed inset-0 z-[80] touch-none bg-slate-950/95"
+  class="app-viewport-overlay z-[95] overflow-hidden overscroll-contain touch-none bg-slate-950/95"
   onclick={onClose}
 >
   <!-- Image area. Centered, fills the viewport. Tapping the image
@@ -90,7 +90,7 @@
   <img
     {src}
     {alt}
-    class="absolute inset-0 m-auto max-h-[calc(100dvh-8rem)] max-w-[calc(100vw-2rem)] rounded-2xl object-contain shadow-2xl"
+    class="absolute inset-0 m-auto max-h-[calc(100%-5rem)] max-w-[calc(100%-1.5rem)] rounded-2xl object-contain shadow-2xl sm:max-h-[calc(100%-5.5rem)] sm:max-w-[calc(100%-2rem)]"
     onclick={(event) => event.stopPropagation()}
   />
 
@@ -98,11 +98,12 @@
     Toolbar. Absolutely positioned inside the fixed lightbox so the
     surrounding image flex layout can never push it out of view, and
     it carries its own solid background so it's always readable
-    against any image colour. `safe-area-inset-top` shifts it below
-    the Dynamic Island on iPhone PWAs.
+    against any image colour. The parent overlay already respects the
+    shared app-shell offsets, so the close button stays below the
+    mobile header and above the bottom tab bar.
   -->
   <div
-    class="absolute inset-x-0 top-0 flex items-center justify-between gap-2 bg-slate-950/85 px-4 pt-[calc(0.75rem+env(safe-area-inset-top))] pb-3 shadow-lg backdrop-blur"
+    class="absolute inset-x-0 top-0 flex items-center justify-between gap-2 bg-slate-950/85 px-3 py-3 shadow-lg backdrop-blur sm:px-4 sm:py-4"
     onclick={(event) => event.stopPropagation()}
   >
     <p class="min-w-0 flex-1 truncate text-sm text-slate-200">{filename ?? alt}</p>

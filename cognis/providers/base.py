@@ -128,6 +128,7 @@ class GuardrailsProvider(Protocol):
     async def list_pending_escalations(
         self, session_id: str | None = None
     ) -> list[EscalationRecord]: ...
+    async def get_escalation(self, call_id: str) -> EscalationRecord | None: ...
     async def record_events(
         self,
         session_id: str,

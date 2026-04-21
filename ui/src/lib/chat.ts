@@ -242,6 +242,52 @@ function removeWorkflowPromptNotices(items: TimelineItem[]): TimelineItem[] {
   );
 }
 
+function finalizeInFlightAssistantItems(items: TimelineItem[]): TimelineItem[] {
+  let changed = false;
+  const next = items.map((item) => {
+    if (item.kind === 'message' && item.role === 'assistant' && item.streaming) {
+      changed = true;
+      if (item.messageId) {
+        const streamer = getStreamer(item.messageId);
+        const finalHtml = streamer.finalize(item.content);
+        releaseStreamer(item.messageId);
+        return {
+          ...item,
+          html: finalHtml,
+          streaming: false,
+        } satisfies MessageTimelineItem;
+      }
+      return {
+        ...item,
+        streaming: false,
+      } satisfies MessageTimelineItem;
+    }
+    if (item.kind === 'reasoning' && item.streaming) {
+      changed = true;
+      return { ...item, streaming: false } satisfies ReasoningTimelineItem;
+    }
+    return item;
+  });
+  return changed ? next : items;
+}
+
+function insertBeforeTrailingStreamingAssistant(items: TimelineItem[], item: TimelineItem): void {
+  let insertionIndex = items.length;
+  for (let index = items.length - 1; index >= 0; index--) {
+    const candidate = items[index];
+    if (candidate.kind === 'message' && candidate.role === 'assistant' && candidate.streaming && candidate.seq === null) {
+      insertionIndex = index;
+      continue;
+    }
+    if (candidate.kind === 'reasoning' && candidate.streaming) {
+      insertionIndex = index;
+      continue;
+    }
+    break;
+  }
+  items.splice(insertionIndex, 0, item);
+}
+
 export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
   const items: TimelineItem[] = [];
   const toolCallIndexByCallId = new Map<string, number>();
@@ -766,6 +812,7 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
   }
 
   if (event.type === 'tool_call') {
+    next = finalizeInFlightAssistantItems(next);
     // Orchestration tools are displayed as delegation cards, not tool blocks
     if (['delegate', 'fork'].includes(event.tool_name)) return next;
     const itemId = `tool:${event.call_id}`;
@@ -776,7 +823,7 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
       callId: event.call_id,
       toolName: event.tool_name,
       status: event.status,
-      timestamp: new Date().toISOString(),
+      timestamp: event.timestamp ?? new Date().toISOString(),
       arguments: event.arguments
     };
     if (index >= 0) {
@@ -793,11 +840,12 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
       };
       return next;
     }
-    next.push(toolItem);
+    insertBeforeTrailingStreamingAssistant(next, toolItem);
     return next;
   }
 
   if (event.type === 'tool_result') {
+    next = finalizeInFlightAssistantItems(next);
     const itemId = `tool:${event.call_id}`;
     const evaluation = event.evaluation ?? undefined;
     const index = next.findIndex((item) => item.id === itemId && item.kind === 'tool_call');
@@ -806,6 +854,7 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
       next[index] = {
         ...existing,
         status: event.is_error ? 'failed' : 'completed',
+        timestamp: event.timestamp ?? existing.timestamp,
         result: event.result,
         isError: event.is_error,
         durationMs: event.duration_ms ?? undefined,
@@ -814,13 +863,13 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
       return next;
     }
     // tool_result arrived before tool_call — create a placeholder
-    next.push({
+    insertBeforeTrailingStreamingAssistant(next, {
       id: itemId,
       kind: 'tool_call',
       callId: event.call_id,
       toolName: event.tool_name,
       status: event.is_error ? 'failed' : 'completed',
-      timestamp: new Date().toISOString(),
+      timestamp: event.timestamp ?? new Date().toISOString(),
       result: event.result,
       isError: event.is_error,
       durationMs: event.duration_ms ?? undefined,
