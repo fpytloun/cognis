@@ -428,11 +428,11 @@ def _validate_step_completion_notification(
         if notification.mode == "direct":
             raise ValueError("notification.mode='direct' is only valid for successful completion")
         raise ValueError("notification.mode='silent' is only valid for successful completion")
-    effective_content = deliverable_content if deliverable_content is not None else step_output.content
+    effective_content = (
+        deliverable_content if deliverable_content is not None else step_output.content
+    )
     if notification.mode == "direct" and not effective_content.strip():
-        raise ValueError(
-            "notification.mode='direct' requires a non-empty deliverable to deliver"
-        )
+        raise ValueError("notification.mode='direct' requires a non-empty deliverable to deliver")
 
 
 def _find_gate_revise_action(pause: PendingPause) -> str | None:
@@ -791,7 +791,9 @@ def _normalize_token_usage(usage: Any) -> dict[str, int]:
 
     cached_tokens = _read_int(
         usage.get("cached_tokens"),
-        prompt_token_details.get("cached_tokens") if isinstance(prompt_token_details, dict) else None,
+        prompt_token_details.get("cached_tokens")
+        if isinstance(prompt_token_details, dict)
+        else None,
         input_token_details.get("cached_tokens") if isinstance(input_token_details, dict) else None,
     )
     if cached_tokens is not None:
@@ -810,7 +812,9 @@ def _normalize_token_usage(usage: Any) -> dict[str, int]:
         completion_token_details.get("reasoning_tokens")
         if isinstance(completion_token_details, dict)
         else None,
-        output_token_details.get("reasoning_tokens") if isinstance(output_token_details, dict) else None,
+        output_token_details.get("reasoning_tokens")
+        if isinstance(output_token_details, dict)
+        else None,
     )
     if reasoning_tokens is not None:
         normalized["reasoning_tokens"] = reasoning_tokens
@@ -1142,6 +1146,7 @@ class StepContext:
     workspace_root: str | None = None
     working_directory: str | None = None
     step_run_id: str | None = None
+    deliverable_step_run_id: str | None = None
     policy: ExecutionPolicy = field(default_factory=lambda: CHAT_POLICY)
     is_retry: bool = False  # True for re-attempt within the same step
     user_message: str = ""
@@ -1461,6 +1466,7 @@ class AgentLoop:
         parent_intaris_session_id: str,
         tool_registry: Any,
         executor_connection: Any,
+        deliverable_step_run_id: str | None = None,
         on_token: TokenCallback | None = None,
         on_tool_call: ToolCallCallback | None = None,
         on_tool_result: ToolResultCallback | None = None,
@@ -1491,7 +1497,12 @@ class AgentLoop:
             fallback_executor_connection=executor_connection,
         )
 
-        child_step = StepDefinition(name="delegation", type="run", prompt=task_description)
+        child_step = StepDefinition(
+            name="delegation",
+            type="run",
+            prompt=task_description,
+            require_deliverable=False,
+        )
         child_ctx = StepContext(
             step_definition=child_step,
             session=child_session,
@@ -1506,6 +1517,7 @@ class AgentLoop:
             executor_environment=child_runtime.executor_environment,
             workspace_root=current_workspace_root.get(),
             working_directory=current_effective_working_directory.get(),
+            deliverable_step_run_id=deliverable_step_run_id,
             orchestration_mode=OrchestrationMode.NONE,  # Sub-sessions cannot delegate
         )
 
@@ -1527,6 +1539,14 @@ class AgentLoop:
                 )
                 result_summary = output.summary if output and output.summary else "Completed."
                 result_content = output.content if output and output.content else ""
+                deliverable_data: dict[str, Any] = {}
+                if output and output.deliverable_id:
+                    deliverable_data = {
+                        "deliverable_id": output.deliverable_id,
+                        "deliverable_version": output.deliverable_version,
+                        "deliverable_format": output.deliverable_format,
+                        "deliverable_title": output.deliverable_title,
+                    }
 
                 # Update child session status — guarded
                 try:
@@ -1554,6 +1574,7 @@ class AgentLoop:
                                     "mode": "delegate",
                                     "result_summary": result_summary,
                                     "result_content": result_content,
+                                    **deliverable_data,
                                 },
                             )
                         ],
@@ -1663,6 +1684,7 @@ class AgentLoop:
         parent_intaris_session_id: str,
         tool_registry: Any,
         executor_connection: Any,
+        deliverable_step_run_id: str | None = None,
     ) -> None:
         """Async wrapper for _run_child_session that triggers follow-up turns.
 
@@ -1683,6 +1705,7 @@ class AgentLoop:
                 parent_intaris_session_id=parent_intaris_session_id,
                 tool_registry=tool_registry,
                 executor_connection=executor_connection,
+                deliverable_step_run_id=deliverable_step_run_id,
             )
             status = "completed" if output else "failed"
             result_summary = output.summary if output else None
@@ -1804,25 +1827,44 @@ class AgentLoop:
                 # Instead, send only a revision directive.  If the Intaris
                 # recording of evaluation feedback failed, deliver it inline.
                 if ctx.workflow_state and ctx.workflow_state.last_evaluation_feedback:
-                    effective_user_message = (
-                        "The evaluator has reviewed your previous attempt and "
-                        "requested revisions:\n\n"
-                        f"{ctx.workflow_state.last_evaluation_feedback}\n\n"
-                        "Please revise your work based on this feedback. "
-                        "When done, write_deliverable with the updated artifact "
-                        "and then call step_complete."
-                    )
+                    if self._deliverable_owner_step_run_id(ctx) is not None:
+                        effective_user_message = (
+                            "The evaluator has reviewed your previous attempt and "
+                            "requested revisions:\n\n"
+                            f"{ctx.workflow_state.last_evaluation_feedback}\n\n"
+                            "Please revise your work based on this feedback. "
+                            "When done, write_deliverable with the updated artifact "
+                            "and then call step_complete."
+                        )
+                    else:
+                        effective_user_message = (
+                            "The evaluator has reviewed your previous attempt and "
+                            "requested revisions:\n\n"
+                            f"{ctx.workflow_state.last_evaluation_feedback}\n\n"
+                            "Please revise your work based on this feedback. "
+                            "When done, return the updated result as a normal assistant "
+                            "message and then call step_complete."
+                        )
                     ctx.workflow_state.last_evaluation_feedback = None
                 else:
                     # Feedback was recorded to Intaris — it's already in the
                     # session history.  Send a minimal revision directive.
-                    effective_user_message = (
-                        "The evaluator has reviewed your previous attempt and "
-                        "requested revisions. Review the evaluation feedback "
-                        "above and revise your work accordingly. When done, "
-                        "write_deliverable with the updated artifact and then call "
-                        "step_complete."
-                    )
+                    if self._deliverable_owner_step_run_id(ctx) is not None:
+                        effective_user_message = (
+                            "The evaluator has reviewed your previous attempt and "
+                            "requested revisions. Review the evaluation feedback "
+                            "above and revise your work accordingly. When done, "
+                            "write_deliverable with the updated artifact and then call "
+                            "step_complete."
+                        )
+                    else:
+                        effective_user_message = (
+                            "The evaluator has reviewed your previous attempt and "
+                            "requested revisions. Review the evaluation feedback "
+                            "above and revise your work accordingly. When done, "
+                            "return the updated result as a normal assistant message and "
+                            "then call step_complete."
+                        )
             else:
                 # First attempt — build the full rich prompt with task context
                 # and prior step outputs.
@@ -2404,17 +2446,25 @@ class AgentLoop:
                     # Non-direct (sub-session / workflow step): require step_complete
                     STEP_REPROMPTS.inc()
                     step_reprompt_count += 1
+                    reminder = (
+                        "Internal controller reminder — this is not a new user message. "
+                        "Do not write a filler acknowledgment just for this reminder. "
+                    )
+                    if self._deliverable_owner_step_run_id(ctx) is not None:
+                        reminder += (
+                            "If the step is finished, ensure you have called write_deliverable "
+                            "for the final artifact and then call step_complete. "
+                        )
+                    else:
+                        reminder += (
+                            "If the step is finished, write the final result as a normal assistant "
+                            "message and then call step_complete. "
+                        )
+                    reminder += "Otherwise continue the work until it is actually complete. Do not repeat prior text unnecessarily."
                     messages.append(
                         {
                             "role": "system",
-                            "content": (
-                                "Internal controller reminder — this is not a new user message. "
-                                "Do not write a filler acknowledgment just for this reminder. "
-                                "If the step is finished, ensure you have called write_deliverable "
-                                "for the final artifact and then call step_complete with your summary. "
-                                "Otherwise continue the work until it is actually complete. Do not "
-                                "repeat prior text unnecessarily."
-                            ),
+                            "content": reminder,
                         }
                     )
                     _queue_audit_message(
@@ -2696,7 +2746,9 @@ class AgentLoop:
                         ctx,
                         content=content,
                         format=format_name,
-                        title=str(title).strip() if isinstance(title, str) and title.strip() else None,
+                        title=str(title).strip()
+                        if isinstance(title, str) and title.strip()
+                        else None,
                         target=(
                             str(target)
                             if isinstance(target, str) and target in {"channel", "none"}
@@ -2964,7 +3016,8 @@ class AgentLoop:
                     try:
                         deliverable_outputs = (
                             dict(current_deliverable.outputs)
-                            if current_deliverable is not None and isinstance(current_deliverable.outputs, dict)
+                            if current_deliverable is not None
+                            and isinstance(current_deliverable.outputs, dict)
                             else {}
                         )
                         step_complete_outputs = (
@@ -2989,13 +3042,19 @@ class AgentLoop:
                                 else None
                             ),
                             deliverable_version=(
-                                current_deliverable.version if current_deliverable is not None else None
+                                current_deliverable.version
+                                if current_deliverable is not None
+                                else None
                             ),
                             deliverable_format=(
-                                current_deliverable.format if current_deliverable is not None else None
+                                current_deliverable.format
+                                if current_deliverable is not None
+                                else None
                             ),
                             deliverable_title=(
-                                current_deliverable.title if current_deliverable is not None else None
+                                current_deliverable.title
+                                if current_deliverable is not None
+                                else None
                             ),
                             execution_evidence=dict(ctx.execution_evidence),
                             attachments=list(collected_attachments),
@@ -3008,7 +3067,9 @@ class AgentLoop:
                             ctx,
                             step_output,
                             deliverable_content=(
-                                current_deliverable.content if current_deliverable is not None else None
+                                current_deliverable.content
+                                if current_deliverable is not None
+                                else None
                             ),
                         )
                     except ValidationError as exc:
@@ -3141,10 +3202,16 @@ class AgentLoop:
                             "remaining todo as either completed or cancelled."
                         )
                     else:
-                        guidance = (
-                            "All todos are terminal (completed or cancelled). "
-                            "You may call step_complete when the deliverable is ready."
-                        )
+                        if self._deliverable_owner_step_run_id(ctx) is not None:
+                            guidance = (
+                                "All todos are terminal (completed or cancelled). "
+                                "You may call step_complete when the deliverable is ready."
+                            )
+                        else:
+                            guidance = (
+                                "All todos are terminal (completed or cancelled). "
+                                "You may call step_complete when the final result message is ready."
+                            )
                     # Canonical echo gives the model a verifiable view of
                     # what it actually wrote (the previous write-only
                     # ``{status, count}`` shape provoked repeated identical
@@ -4234,7 +4301,9 @@ class AgentLoop:
         elif is_task_tool(tc.name):
             return await self._handle_task_tool(tc, ctx=ctx, events_to_record=events_to_record)
         elif is_composition_tool(tc.name):
-            return await self._handle_composition_tool(tc, ctx=ctx, events_to_record=events_to_record)
+            return await self._handle_composition_tool(
+                tc, ctx=ctx, events_to_record=events_to_record
+            )
         elif is_workflow_tool(tc.name):
             return await self._handle_workflow_tool(tc, ctx=ctx)
         else:
@@ -4337,21 +4406,32 @@ class AgentLoop:
                 parent_intaris_session_id=parent_intaris_id,
                 tool_registry=ctx.tool_registry,
                 executor_connection=ctx.executor_connection,
+                deliverable_step_run_id=ctx.step_run_id,
             )
             if output:
+                if ctx.step_run_id is not None and output.deliverable_id is not None:
+                    self._clear_cached_deliverable(ctx)
                 # Prefer full content over summary for delegation results
                 result_text = output.content if output.content else output.summary
-                return ToolResult(
-                    output=json.dumps(
+                payload: dict[str, Any] = {
+                    "status": "completed",
+                    "session_id": child_session.session_id,
+                    "summary": output.summary,
+                    "result": result_text,
+                    "outputs": output.outputs,
+                    "deliverable_written": output.deliverable_id is not None,
+                }
+                if output.deliverable_id is not None:
+                    payload.update(
                         {
-                            "status": "completed",
-                            "session_id": child_session.session_id,
-                            "summary": output.summary,
-                            "result": result_text,
-                            "outputs": output.outputs,
-                        },
-                        default=str,
-                    ),
+                            "deliverable_id": output.deliverable_id,
+                            "deliverable_version": output.deliverable_version,
+                            "deliverable_format": output.deliverable_format,
+                            "deliverable_title": output.deliverable_title,
+                        }
+                    )
+                return ToolResult(
+                    output=json.dumps(payload, default=str),
                     metadata={"orchestration": True, "mode": "delegate", "wait": True},
                 )
             else:
@@ -4377,6 +4457,7 @@ class AgentLoop:
                     parent_intaris_session_id=parent_intaris_id,
                     tool_registry=ctx.tool_registry,
                     executor_connection=ctx.executor_connection,
+                    deliverable_step_run_id=ctx.step_run_id,
                 )
             )
             child_task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
@@ -5790,14 +5871,30 @@ class AgentLoop:
                     if row is None:
                         raise ValueError(f"Unknown skill hint: {hint}")
                     version_row = await resolve_current_skill_version(db, row)
-                    instructions = version_row.instructions if version_row is not None else row.instructions
-                    tools = _coerce_skill_tools(version_row.tools if version_row is not None else row.tools) or []
+                    instructions = (
+                        version_row.instructions if version_row is not None else row.instructions
+                    )
+                    tools = (
+                        _coerce_skill_tools(
+                            version_row.tools if version_row is not None else row.tools
+                        )
+                        or []
+                    )
                     prompt_templates = (
-                        version_row.prompt_templates if version_row is not None else row.prompt_templates
+                        version_row.prompt_templates
+                        if version_row is not None
+                        else row.prompt_templates
                     ) or {}
                     steps = [
                         item
-                        for item in ((getattr(version_row, "steps", None) if version_row is not None else None) or [])
+                        for item in (
+                            (
+                                getattr(version_row, "steps", None)
+                                if version_row is not None
+                                else None
+                            )
+                            or []
+                        )
                         if isinstance(item, dict)
                     ]
                     materials.append(
@@ -5824,7 +5921,11 @@ class AgentLoop:
                 row = await get_skill_scoped(db, material.skill_id, owner_email=owner_email)
                 if row is None:
                     return
-                if row.owner_email != owner_email or row.is_system or row.source not in {"db", "imported"}:
+                if (
+                    row.owner_email != owner_email
+                    or row.is_system
+                    or row.source not in {"db", "imported"}
+                ):
                     return
                 current_version_row = await resolve_current_skill_version(db, row)
                 if current_version_row is None:
@@ -5889,7 +5990,9 @@ class AgentLoop:
                 )
             except Exception as exc:
                 return ToolResult(
-                    output=json.dumps({"error": f"Failed to decompose skill '{material.name}': {exc}"}),
+                    output=json.dumps(
+                        {"error": f"Failed to decompose skill '{material.name}': {exc}"}
+                    ),
                     is_error=True,
                 )
             material.steps = decomposition.steps
@@ -5898,7 +6001,9 @@ class AgentLoop:
             except Exception as exc:
                 return ToolResult(
                     output=json.dumps(
-                        {"error": f"Failed to persist decomposition for skill '{material.name}': {exc}"}
+                        {
+                            "error": f"Failed to persist decomposition for skill '{material.name}': {exc}"
+                        }
                     ),
                     is_error=True,
                 )
@@ -5916,6 +6021,7 @@ class AgentLoop:
                     async with self.session_manager.session_factory() as db:
                         await delete_workflow(db, workflow_id)
                         await db.commit()
+
         for attempt_index in range(2):
             try:
                 composer_output = await compose_workflow_plan(
@@ -5944,7 +6050,8 @@ class AgentLoop:
                     workflow_payload = dict(composer_output.workflow or {})
                     workflow_payload.update(
                         {
-                            "workflow_id": workflow_payload.get("workflow_id") or "wf_composed_preview",
+                            "workflow_id": workflow_payload.get("workflow_id")
+                            or "wf_composed_preview",
                             "name": workflow_payload.get("name")
                             or composer_output.title
                             or args.title
@@ -5957,8 +6064,12 @@ class AgentLoop:
                             else "ephemeral",
                             "archived_at": None,
                             "lineage": {
-                                "base_workflow_id": base_workflow.workflow_id if base_workflow else None,
-                                "source_skill_ids": [material.skill_id for material in skill_materials],
+                                "base_workflow_id": base_workflow.workflow_id
+                                if base_workflow
+                                else None,
+                                "source_skill_ids": [
+                                    material.skill_id for material in skill_materials
+                                ],
                                 "composition_source": "agent_composed",
                                 "composition_intent": args.intent,
                             },
@@ -5984,7 +6095,11 @@ class AgentLoop:
             assert workflow is not None
 
         persisted_workflow_id = workflow.workflow_id
-        if not fallback_used and composer_output is not None and composer_output.action == "create_derived":
+        if (
+            not fallback_used
+            and composer_output is not None
+            and composer_output.action == "create_derived"
+        ):
             try:
                 created_row = await create_user_workflow(
                     session_factory=self.session_manager.session_factory,
@@ -6049,7 +6164,9 @@ class AgentLoop:
             schedule_payload.update(
                 {
                     "name": schedule_payload.get("name") or title,
-                    "description": schedule_payload.get("description") or args.context or args.intent,
+                    "description": schedule_payload.get("description")
+                    or args.context
+                    or args.intent,
                     "agent_id": raw_agent_id,
                     "workflow_id": persisted_workflow_id,
                     "task_template": {
@@ -6662,9 +6779,7 @@ class AgentLoop:
     def _resolve_step_timeout_seconds(self, ctx: StepContext) -> int:
         timeout_seconds = self.default_step_timeout_seconds
         if ctx.agent.execution:
-            timeout_seconds = int(
-                ctx.agent.execution.get("step_timeout_seconds", timeout_seconds)
-            )
+            timeout_seconds = int(ctx.agent.execution.get("step_timeout_seconds", timeout_seconds))
         return max(1, timeout_seconds)
 
     def _is_parallelizable_regular_tool_call(
@@ -7447,13 +7562,14 @@ class AgentLoop:
     async def _get_current_deliverable(self, ctx: StepContext) -> Deliverable | None:
         """Return the active deliverable for the current step run, if any."""
 
-        if ctx.step_run_id is None:
+        deliverable_step_run_id = self._deliverable_owner_step_run_id(ctx)
+        if deliverable_step_run_id is None:
             return None
         if ctx.current_deliverable_id and ctx.current_deliverable_content is not None:
             return Deliverable.model_validate(
                 {
                     "deliverable_id": ctx.current_deliverable_id,
-                    "step_run_id": ctx.step_run_id,
+                    "step_run_id": deliverable_step_run_id,
                     "version": ctx.current_deliverable_version or 1,
                     "content": ctx.current_deliverable_content,
                     "format": ctx.current_deliverable_format or "markdown",
@@ -7464,7 +7580,7 @@ class AgentLoop:
             )
 
         async with self.session_manager.session_factory() as db_session:
-            step_run = await get_step_run(db_session, ctx.step_run_id)
+            step_run = await get_step_run(db_session, deliverable_step_run_id)
             row = (
                 await get_deliverable(db_session, step_run.deliverable_id)
                 if step_run is not None and isinstance(step_run.deliverable_id, str)
@@ -7487,20 +7603,25 @@ class AgentLoop:
     ) -> Deliverable:
         """Persist a new deliverable version for the current step run."""
 
-        if ctx.step_run_id is None:
+        deliverable_step_run_id = self._deliverable_owner_step_run_id(ctx)
+        if deliverable_step_run_id is None:
             raise ValueError("not_in_workflow")
 
         async with self.session_manager.session_factory() as db_session:
             row = await create_deliverable(
                 db_session,
-                step_run_id=ctx.step_run_id,
+                step_run_id=deliverable_step_run_id,
                 content=content,
                 format=format,
                 title=title,
                 target=target,
                 outputs=outputs,
             )
-            await update_step_run(db_session, ctx.step_run_id, deliverable_id=row.deliverable_id)
+            await update_step_run(
+                db_session,
+                deliverable_step_run_id,
+                deliverable_id=row.deliverable_id,
+            )
             await db_session.commit()
         return self._cache_deliverable(ctx, row)
 
@@ -7511,22 +7632,27 @@ class AgentLoop:
             return []
         async with self.session_manager.session_factory() as db_session:
             rows = await list_deliverables_for_step_run(db_session, ctx.step_run_id)
-        return [self._cache_deliverable(ctx, row) if index == 0 else Deliverable.model_validate(
-            {
-                "deliverable_id": row.deliverable_id,
-                "step_run_id": row.step_run_id,
-                "version": row.version,
-                "content": row.content,
-                "format": row.format,
-                "title": row.title,
-                "target": row.target,
-                "outputs": row.outputs or {},
-                "status": row.status,
-                "evaluator_feedback": row.evaluator_feedback,
-                "created_at": row.created_at,
-                "updated_at": row.updated_at,
-            }
-        ) for index, row in enumerate(rows)]
+        return [
+            self._cache_deliverable(ctx, row)
+            if index == 0
+            else Deliverable.model_validate(
+                {
+                    "deliverable_id": row.deliverable_id,
+                    "step_run_id": row.step_run_id,
+                    "version": row.version,
+                    "content": row.content,
+                    "format": row.format,
+                    "title": row.title,
+                    "target": row.target,
+                    "outputs": row.outputs or {},
+                    "status": row.status,
+                    "evaluator_feedback": row.evaluator_feedback,
+                    "created_at": row.created_at,
+                    "updated_at": row.updated_at,
+                }
+            )
+            for index, row in enumerate(rows)
+        ]
 
     def _get_recovered_step_response(self, ctx: StepContext) -> str | None:
         """Return a persisted step-input response recovered after restart."""
@@ -7581,6 +7707,15 @@ class AgentLoop:
 
         for key in ("tools", "files_read", "files_written", "commands"):
             evidence[key] = evidence[key][:20]
+
+    def _deliverable_owner_step_run_id(self, ctx: StepContext) -> str | None:
+        """Return the step run that owns deliverables for this execution context."""
+
+        if ctx.step_run_id is not None:
+            return ctx.step_run_id
+        if ctx.deliverable_step_run_id is not None:
+            return ctx.deliverable_step_run_id
+        return None
 
     def _build_step_prompt(self, ctx: StepContext) -> str:
         """Build the step objective prompt.
@@ -7644,25 +7779,41 @@ class AgentLoop:
                 f"instruction:\n\n{operator_instruction}"
             )
 
-        parts.append(
-            "\n\n---\n"
-            "When you have completed the objective, call write_deliverable with the "
-            "canonical user-facing artifact for this step. Respect Expected output "
-            "closely for structure, tone, format, and level of detail. If "
-            "Expected output conflicts with the step completion contract, still "
-            "produce the minimum correct deliverable and write it via "
-            "write_deliverable. Free-text assistant messages during workflow steps are "
-            "reasoning and progress, not the final artifact. After writing the "
-            "deliverable, call step_complete with a summary, structured outputs, "
-            "verifiable claims, and an outcome when the completed step should "
-            "explicitly report rejection or failure. Use notification.mode='silent' only when the work "
-            "completed successfully, silent completion is allowed, and there is "
-            "nothing user-actionable to notify. Use notification.mode='direct' "
-            "for ready-to-read outputs like daily briefs, evening summaries, or "
-            "report digests when the result should be sent directly to the "
-            "resolved target channel. Otherwise omit notification and the "
-            "configured delivery family will be used automatically."
-        )
+        if self._deliverable_owner_step_run_id(ctx) is not None:
+            parts.append(
+                "\n\n---\n"
+                "When you have completed the objective, call write_deliverable with the "
+                "canonical user-facing artifact for this step. Respect Expected output "
+                "closely for structure, tone, format, and level of detail. If "
+                "Expected output conflicts with the step completion contract, still "
+                "produce the minimum correct deliverable and write it via "
+                "write_deliverable. Free-text assistant messages during workflow steps are "
+                "reasoning and progress, not the final artifact. After writing the "
+                "deliverable, call step_complete with a summary, structured outputs, "
+                "verifiable claims, and an outcome when the completed step should "
+                "explicitly report rejection or failure. Use notification.mode='silent' only when the work "
+                "completed successfully, silent completion is allowed, and there is "
+                "nothing user-actionable to notify. Use notification.mode='direct' "
+                "for ready-to-read outputs like daily briefs, evening summaries, or "
+                "report digests when the result should be sent directly to the "
+                "resolved target channel. Otherwise omit notification and the "
+                "configured delivery family will be used automatically."
+            )
+        else:
+            parts.append(
+                "\n\n---\n"
+                "When you have completed the objective, write the final result as a normal "
+                "assistant message. Respect Expected output closely for structure, tone, "
+                "format, and level of detail. Then call step_complete with a summary, structured "
+                "outputs, verifiable claims, and an outcome when the completed step should "
+                "explicitly report rejection or failure. Use notification.mode='silent' only when the work "
+                "completed successfully, silent completion is allowed, and there is "
+                "nothing user-actionable to notify. Use notification.mode='direct' "
+                "for ready-to-read outputs like daily briefs, evening summaries, or "
+                "report digests when the result should be sent directly to the "
+                "resolved target channel. Otherwise omit notification and the "
+                "configured delivery family will be used automatically."
+            )
 
         return "".join(parts)
 
@@ -7769,7 +7920,10 @@ class AgentLoop:
 
         tools: list[dict[str, Any]] = []
 
-        if ctx.policy.step_complete_available and ctx.step_run_id is not None:
+        if (
+            ctx.policy.step_complete_available
+            and self._deliverable_owner_step_run_id(ctx) is not None
+        ):
             tools.append(_to_schema(WRITE_DELIVERABLE_TOOL))
 
         # step_complete — only when the policy allows it.

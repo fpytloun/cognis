@@ -11,6 +11,7 @@ import pytest
 
 from cognis.core.agent_loop import (
     CHAT_POLICY,
+    DELEGATION_POLICY,
     SECONDARY_POLICY,
     WORKFLOW_POLICY,
     AgentLoop,
@@ -233,7 +234,9 @@ def test_stream_accumulator_collects_usage() -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_step_uses_configured_default_step_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_run_step_uses_configured_default_step_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     captured: dict[str, object] = {}
 
     async def _fake_wait_for(awaitable: object, timeout: float) -> StepOutput:
@@ -319,7 +322,9 @@ async def test_run_step_prefers_agent_timeout_override(monkeypatch: pytest.Monke
 
 def test_read_only_web_tools_parallelize_under_evaluate_permission() -> None:
     agent_loop = AgentLoop.__new__(AgentLoop)
-    agent_loop.tool_router = SimpleNamespace(_is_non_bypassable=lambda _name, non_bypassable: non_bypassable)
+    agent_loop.tool_router = SimpleNamespace(
+        _is_non_bypassable=lambda _name, non_bypassable: non_bypassable
+    )
     tool = ToolDefinition(
         name="web_fetch",
         description="Fetch a URL",
@@ -337,7 +342,9 @@ def test_read_only_web_tools_parallelize_under_evaluate_permission() -> None:
             agent_id="agent-1",
             owner_email="user@example.com",
             name="Agent",
-            permissions=AgentPermissions(tool_permissions={stable_tool_id(tool): Permission.EVALUATE}),
+            permissions=AgentPermissions(
+                tool_permissions={stable_tool_id(tool): Permission.EVALUATE}
+            ),
         ),
         policy=CHAT_POLICY,
     )
@@ -634,6 +641,7 @@ async def test_run_child_session_resolves_fresh_runtime() -> None:
     runtime_calls: list[tuple[str, str]] = []
     cleanup_called = False
     captured_tool_registry: list[object] = []
+    captured_contexts: list[object] = []
 
     async def _runtime_factory(*, agent: AgentDefinition, user_email: str) -> ResolvedStepRuntime:
         runtime_calls.append((agent.agent_id, user_email))
@@ -684,6 +692,7 @@ async def test_run_child_session_resolves_fresh_runtime() -> None:
 
     async def _fake_run_step(ctx: object, **_: object) -> StepOutput:
         assert hasattr(ctx, "tool_registry")
+        captured_contexts.append(ctx)
         captured_tool_registry.append(ctx.tool_registry)
         return StepOutput(
             summary="done",
@@ -719,6 +728,7 @@ async def test_run_child_session_resolves_fresh_runtime() -> None:
             parent_intaris_session_id="parent-intaris",
             tool_registry="parent-registry",
             executor_connection="parent-executor",
+            deliverable_step_run_id="sr-parent",
         )
     finally:
         monkeypatch.undo()
@@ -726,6 +736,9 @@ async def test_run_child_session_resolves_fresh_runtime() -> None:
     assert output is not None
     assert runtime_calls == [("agent-a", "user@example.com")]
     assert captured_tool_registry == ["child-registry"]
+    assert captured_contexts[0].deliverable_step_run_id == "sr-parent"
+    assert captured_contexts[0].step_definition.require_deliverable is False
+    assert cleanup_called is True
 
 
 class _ReminderStop(RuntimeError):
@@ -1031,7 +1044,7 @@ class _FinalAssistantContentLLM:
                                     "name": "step_complete",
                                     "arguments": '{"summary":"done","claims":["Delivered final text"]}',
                                 },
-                            }
+                            },
                         ]
                     }
                 }
@@ -1297,6 +1310,7 @@ async def test_step_complete_reprompt_is_system_message() -> None:
         system_initiated=True,
         is_retry=True,
         workflow_state=SimpleNamespace(last_evaluation_feedback="Please revise."),
+        step_run_id="sr-1",
         executor_environment=None,
         cancel_event=None,
         bootstrap_wait_for_intention=False,
@@ -1364,6 +1378,103 @@ def test_todo_schema_uses_completed_status() -> None:
     items = todo_tool["function"]["parameters"]["properties"]["todos"]["items"]
     assert items["required"] == ["content", "status"]
     assert "canonical workflow artifact" in write_deliverable_tool["function"]["description"]
+
+
+def test_delegation_schema_exposes_write_deliverable_for_workflow_backed_child() -> None:
+    loop = object.__new__(AgentLoop)
+    ctx = StepContext(
+        step_definition=StepDefinition(name="delegation", type="run", prompt=""),
+        session=SimpleNamespace(session_id="child", intaris_session_id="child"),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=DELEGATION_POLICY,
+        deliverable_step_run_id="sr-parent",
+    )
+
+    tools = loop._build_controller_tool_schemas(ctx)
+
+    assert any(tool["function"]["name"] == "write_deliverable" for tool in tools)
+
+
+@pytest.mark.asyncio
+async def test_handle_delegate_returns_deliverable_metadata_and_clears_parent_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=SimpleNamespace(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="implement", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-1",
+            intaris_session_id="intaris-1",
+            user_email="user@example.com",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=WORKFLOW_POLICY,
+        orchestration_mode=OrchestrationMode.DELEGATE_SYNC_ONLY,
+        step_run_id="sr-parent",
+        current_deliverable_id="dlv-stale",
+        current_deliverable_version=1,
+        current_deliverable_content="stale",
+        current_deliverable_format="markdown",
+        current_deliverable_title="Old",
+        current_deliverable_outputs={"old": True},
+        current_deliverable_status="approved",
+    )
+
+    captured: dict[str, object] = {}
+
+    async def _fake_handle_delegate_tool_call(*args: object, **kwargs: object):
+        return ToolResult(output=json.dumps({"status": "started"})), SimpleNamespace(
+            session_id="child-1",
+            agent_id="agent-1",
+        )
+
+    async def _fake_run_child_session(**kwargs: object) -> StepOutput:
+        captured.update(kwargs)
+        return StepOutput(
+            summary="done",
+            content="Final delegated artifact",
+            outputs={"files": ["a.py"]},
+            deliverable_id="dlv-new",
+            deliverable_version=2,
+            deliverable_format="markdown",
+            deliverable_title="Child result",
+        )
+
+    monkeypatch.setattr(
+        "cognis.core.agent_loop.handle_delegate_tool_call",
+        _fake_handle_delegate_tool_call,
+    )
+    monkeypatch.setattr(agent_loop, "_run_child_session", _fake_run_child_session)
+
+    result = await agent_loop._handle_delegate(
+        ToolCall(call_id="call-1", name="delegate", arguments={"task": "Investigate"}),
+        ctx=ctx,
+        events_to_record=[],
+    )
+
+    payload = json.loads(result.output)
+    assert payload["status"] == "completed"
+    assert payload["deliverable_written"] is True
+    assert payload["deliverable_id"] == "dlv-new"
+    assert payload["deliverable_version"] == 2
+    assert payload["deliverable_format"] == "markdown"
+    assert payload["deliverable_title"] == "Child result"
+    assert captured["deliverable_step_run_id"] == "sr-parent"
+    assert ctx.current_deliverable_id is None
+    assert ctx.current_deliverable_content is None
 
 
 @pytest.mark.asyncio
@@ -3342,6 +3453,8 @@ def test_step_prompt_respects_expected_output_without_allowing_silent_completion
         session=SimpleNamespace(session_id="sess-1", user_email="user@example.com"),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=WORKFLOW_POLICY,
+        step_run_id="sr-1",
         task_title="Daily summary",
         task_description="Summarize today.",
         task_expected_output="No assistant message.",
@@ -3350,7 +3463,4 @@ def test_step_prompt_respects_expected_output_without_allowing_silent_completion
     prompt = agent_loop._build_step_prompt(ctx)
 
     assert "Respect Expected output closely" in prompt
-    assert (
-        "write_deliverable with the canonical user-facing artifact"
-        in prompt
-    )
+    assert "write_deliverable with the canonical user-facing artifact" in prompt
