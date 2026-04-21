@@ -44,9 +44,9 @@ from cognis.models.workflow import (
     StepOutput,
     WorkflowState,
 )
-from cognis.tools.registry import RegisteredTool, ToolRegistry
 from cognis.tools.builtin.orchestration import OrchestrationMode
 from cognis.tools.builtin.tool_search import SEARCH_TOOLS_TOOL
+from cognis.tools.registry import RegisteredTool, ToolRegistry
 
 # ---------------------------------------------------------------------------
 # StreamAccumulator tests

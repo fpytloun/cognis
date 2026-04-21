@@ -2754,6 +2754,12 @@ class AgentLoop:
                                     ),
                                 }
                             )
+                            if on_tool_call:
+                                await on_tool_call(
+                                    trailing_call.name,
+                                    trailing_call.call_id,
+                                    trailing_call.arguments,
+                                )
                             _append_tool_call_event(events_to_record, trailing_call, trailing_tool_id)
                             messages.append(
                                 {

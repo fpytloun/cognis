@@ -1148,6 +1148,69 @@ async def test_run_turn_publishes_effective_user_message_content() -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_turn_delegation_inherits_conversation_execution_paths() -> None:
+    submit = AsyncMock(return_value=SimpleNamespace(task_id="task-1"))
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(run_direct_turn=AsyncMock()),
+        decision_engine=SimpleNamespace(
+            decide=AsyncMock(return_value=SimpleNamespace(decision="delegate"))
+        ),
+        task_queue=SimpleNamespace(submit=submit),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(
+            refresh=AsyncMock(return_value=SimpleNamespace(last_event_seq=0)),
+            get_context_usage=MagicMock(return_value=None),
+            get_entry=MagicMock(return_value=None),
+        ),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+    scheduler._publish_turn_completed = AsyncMock()  # type: ignore[method-assign]
+    scheduler._touch_conversation = AsyncMock()  # type: ignore[method-assign]
+    scheduler._select_workflow = AsyncMock(return_value="wf-1")  # type: ignore[method-assign]
+
+    await scheduler._run_turn(
+        conversation=SimpleNamespace(
+            conversation_id="conv-1",
+            title="",
+            user_email="user@example.com",
+            context=SimpleNamespace(
+                platform_data={
+                    "workspace_root": "/workspace/cognis",
+                    "working_directory": "/workspace/cognis/ui",
+                }
+            ),
+        ),
+        session=SimpleNamespace(session_id="sess-1"),
+        agent=SimpleNamespace(agent_id="agent-1"),
+        content="please handle this in the background",
+        user_email="user@example.com",
+        attachments=None,
+        outbound_attachments=None,
+        attachment_notice=None,
+        attachment_context=None,
+        system_initiated=False,
+        channel_deliverable=False,
+        delivery_id=None,
+        delivery_fallback_text=None,
+        bootstrap_wait_for_intention=False,
+        cancel_event=AsyncMock(),
+        turn_observers=(),
+    )
+
+    submit.assert_awaited_once()
+    assert submit.await_args.kwargs["workspace_root"] == "/workspace/cognis"
+    assert submit.await_args.kwargs["working_directory"] == "/workspace/cognis/ui"
+
+
+@pytest.mark.asyncio
 async def test_run_turn_merges_absorbed_delivery_metadata() -> None:
     async def _run_direct_turn(**kwargs: object) -> object:
         consume_boundary_batch = kwargs["consume_boundary_batch"]
