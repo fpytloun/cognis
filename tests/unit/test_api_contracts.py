@@ -23,6 +23,7 @@ from cognis.api.models import (
     PendingPauseResponse,
     SkillResponse,
     SkillVersionResponse,
+    StepProfileResponse,
     StepRunResponse,
     TaskResponse,
     ToolResponse,
@@ -306,6 +307,21 @@ def test_effective_tool_item_round_trips_classification_fields() -> None:
     assert response.capabilities == ["read"]
     assert response.classification_source == "llm"
     assert response.classification_confidence == pytest.approx(0.83)
+
+
+def test_step_profile_response_round_trips_matrix_shape() -> None:
+    response = StepProfileResponse(
+        profile_id="system:coding",
+        name="Coding",
+        mode="soft",
+        config={
+            "matrix": {"filesystem": ["read", "write"], "shell": ["write", "privileged"]},
+            "allow_tool_search": True,
+        },
+    )
+
+    assert response.profile_id == "system:coding"
+    assert response.config["matrix"]["filesystem"] == ["read", "write"]
 
 
 class TestModelRoutingContracts:

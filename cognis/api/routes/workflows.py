@@ -10,8 +10,15 @@ from cognis.api.common import (
     paginate_items,
     require_current_user,
 )
-from cognis.api.models import CursorPage, WorkflowRequest, WorkflowResponse, WorkflowUpdateRequest
+from cognis.api.models import (
+    CursorPage,
+    StepProfileResponse,
+    WorkflowRequest,
+    WorkflowResponse,
+    WorkflowUpdateRequest,
+)
 from cognis.api.serializers import workflow_to_response
+from cognis.core.step_profiles import list_step_profile_definitions
 from cognis.core.workflow_management import (
     create_user_workflow,
     delete_user_workflow,
@@ -27,6 +34,20 @@ from cognis.store.queries import (
 )
 
 router = APIRouter(prefix="/api/v1/workflows", tags=["workflows"])
+
+
+@router.get("/step-profiles", response_model=list[StepProfileResponse])
+async def workflow_step_profiles(request: Request) -> list[StepProfileResponse]:
+    require_current_user(request)
+    return [
+        StepProfileResponse(
+            profile_id=definition.profile_id,
+            name=definition.name,
+            mode=str(definition.mode),
+            config=definition.config.model_dump(mode="json"),
+        )
+        for definition in list_step_profile_definitions()
+    ]
 
 
 def _validate_workflow_payload(definition: dict[str, object]) -> None:

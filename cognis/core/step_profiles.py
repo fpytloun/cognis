@@ -137,6 +137,12 @@ STEP_PROFILES: dict[str, StepProfileDefinition] = {
 }
 
 
+def list_step_profile_definitions() -> list[StepProfileDefinition]:
+    """Return seeded step-profile definitions in stable order."""
+
+    return list(STEP_PROFILES.values())
+
+
 def resolve_step_profile(step: StepDefinition) -> ResolvedStepProfile:
     """Resolve the effective step profile for a step definition."""
 

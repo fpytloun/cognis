@@ -24,15 +24,15 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
     exportWorkflowYaml,
     formStateToSystemWorkflowOverridePayload,
     formStateToWorkflowPayload,
-    importWorkflowYaml,
+    importWorkflowYamlWithProfiles,
     STEP_PROFILE_CAPABILITIES,
-    STEP_PROFILE_OPTIONS,
+    buildStepProfileMap,
     workflowThinkingEfforts,
     validateWorkflowForm,
     workflowToFormState,
     type WorkflowFormState
   } from '$lib/workflows';
-  import type { Agent, ToolDefinitionSummary, Workflow } from '$lib/types/api';
+  import type { Agent, StepProfileDefinition, ToolDefinitionSummary, Workflow } from '$lib/types/api';
 
   let loading = true;
   let saving = false;
@@ -40,8 +40,11 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
   let importText = '';
   let workflows: Workflow[] = [];
   let secondaryAgents: Agent[] = [];
+  let stepProfiles: StepProfileDefinition[] = [];
+  let stepProfileMap: Record<string, StepProfileDefinition> = {};
   let availableTools: ToolDefinitionSummary[] = [];
   let availableToolCategories: string[] = [];
+  let stepProfileOptions: Array<{ id: string; label: string }> = [{ id: '', label: 'Unrestricted' }];
   let selectedWorkflow: Workflow | null = null;
   let form: WorkflowFormState = createEmptyWorkflowForm();
   let dragIndex = -1;
@@ -93,16 +96,22 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
     loading = true;
     error = '';
     try {
-      [workflows, secondaryAgents, availableTools] = await Promise.all([
+      [workflows, secondaryAgents, availableTools, stepProfiles] = await Promise.all([
         api.workflows.listAll({ include_disabled: true, include_ephemeral: showEphemeral }),
         api.agents.listAll({ agent_type: 'secondary' }),
-        api.tools.list()
+        api.tools.list(),
+        api.workflows.stepProfiles()
       ]);
+      stepProfileMap = buildStepProfileMap(stepProfiles);
+      stepProfileOptions = [
+        { id: '', label: 'Unrestricted' },
+        ...stepProfiles.map((profile) => ({ id: profile.profile_id, label: profile.name }))
+      ];
       availableToolCategories = [...new Set(availableTools.map((tool) => tool.category).filter(Boolean))].sort();
       const nextSelected = selectedId ? workflows.find((workflow) => workflow.workflow_id === selectedId) : selectedWorkflow ? workflows.find((workflow) => workflow.workflow_id === selectedWorkflow?.workflow_id) : workflows[0];
       if (nextSelected) {
         selectedWorkflow = nextSelected;
-        form = workflowToFormState(nextSelected);
+        form = workflowToFormState(nextSelected, stepProfileMap);
       } else {
         selectedWorkflow = null;
         form = createEmptyWorkflowForm();
@@ -120,7 +129,7 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
       return;
     }
     try {
-      const nextForm = workflowToFormState(workflow);
+      const nextForm = workflowToFormState(workflow, stepProfileMap);
       selectedWorkflow = workflow;
       form = nextForm;
       error = '';
@@ -148,7 +157,7 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
     if (workflowId) {
       try {
         const source = await api.workflows.detail(workflowId);
-        const nextForm = workflowToFormState(source);
+        const nextForm = workflowToFormState(source, stepProfileMap);
         selectedWorkflow = null;
         form = {
           ...nextForm,
@@ -176,7 +185,7 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
       const nextForm = stored
         ? stored.form
         : skillId
-          ? skillToWorkflowDraft(await api.skills.get(skillId))
+          ? skillToWorkflowDraft(await api.skills.get(skillId), undefined, stepProfileMap)
           : null;
       if (!nextForm) {
         return;
@@ -356,7 +365,7 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
   function addProfileCategory(index: number, category: string): void {
     const step = form.steps[index];
     if (step.stepProfileMatrix.some((row) => row.category === category)) return;
-    step.stepProfileMatrix = [...step.stepProfileMatrix, { category, capabilities: ['read'] }];
+    step.stepProfileMatrix = [...step.stepProfileMatrix, { category, capabilities: ['read'] }].sort((a, b) => a.category.localeCompare(b.category));
   }
 
   function removeProfileCategory(index: number, category: string): void {
@@ -378,6 +387,54 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
     target.value = '';
   }
 
+  function applyStepProfilePreset(index: number, profileId: string): void {
+    const step = form.steps[index];
+    const preset = stepProfileMap[profileId];
+    const baseMatrix = Object.entries(preset?.config.matrix ?? {})
+      .map(([category, capabilities]) => ({ category, capabilities: [...capabilities] }))
+      .sort((a, b) => a.category.localeCompare(b.category));
+    const baseAllowToolSearch = preset?.config.allow_tool_search !== false;
+    const baseIncludeText = Array.isArray(preset?.config.tool_overrides?.include)
+      ? preset.config.tool_overrides.include.join(', ')
+      : '';
+    const baseExcludeText = Array.isArray(preset?.config.tool_overrides?.exclude)
+      ? preset.config.tool_overrides.exclude.join(', ')
+      : '';
+    const baseMode = preset?.mode === 'hard' ? 'hard' : 'soft';
+    step.stepProfileId = profileId;
+    step.stepProfileBaseMatrix = baseMatrix;
+    step.stepProfileMatrix = baseMatrix.map((row) => ({ category: row.category, capabilities: [...row.capabilities] }));
+    step.stepProfileBaseAllowToolSearch = baseAllowToolSearch;
+    step.stepProfileAllowToolSearch = baseAllowToolSearch;
+    step.stepProfileBaseMode = baseMode;
+    step.stepProfileMode = baseMode;
+    step.stepProfileBaseIncludeText = baseIncludeText;
+    step.stepProfileBaseExcludeText = baseExcludeText;
+    step.stepProfileIncludeText = baseIncludeText;
+    step.stepProfileExcludeText = baseExcludeText;
+  }
+
+  function stepProfileHasCustomizations(index: number): boolean {
+    const step = form.steps[index];
+    if (!step) return false;
+    return (
+      JSON.stringify(step.stepProfileMatrix) !== JSON.stringify(step.stepProfileBaseMatrix) ||
+      step.stepProfileAllowToolSearch !== step.stepProfileBaseAllowToolSearch ||
+      step.stepProfileMode !== step.stepProfileBaseMode ||
+      step.stepProfileIncludeText.trim() !== step.stepProfileBaseIncludeText.trim() ||
+      step.stepProfileExcludeText.trim() !== step.stepProfileBaseExcludeText.trim()
+    );
+  }
+
+  function resetStepProfile(index: number): void {
+    const step = form.steps[index];
+    step.stepProfileMatrix = step.stepProfileBaseMatrix.map((row) => ({ category: row.category, capabilities: [...row.capabilities] }));
+    step.stepProfileAllowToolSearch = step.stepProfileBaseAllowToolSearch;
+    step.stepProfileMode = step.stepProfileBaseMode;
+    step.stepProfileIncludeText = step.stepProfileBaseIncludeText;
+    step.stepProfileExcludeText = step.stepProfileBaseExcludeText;
+  }
+
   function downloadCurrentWorkflow(): void {
     const blob = new Blob([exportWorkflowYaml(form)], { type: 'text/yaml;charset=utf-8' });
     const url = URL.createObjectURL(blob);
@@ -390,7 +447,7 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
 
   function importYaml(): void {
     try {
-      form = importWorkflowYaml(importText);
+      form = importWorkflowYamlWithProfiles(importText, stepProfileMap);
       selectedWorkflow = null;
       error = '';
       addToast('Workflow imported into the editor.', 'success');
@@ -716,8 +773,8 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
                       <div class="grid gap-4 md:grid-cols-3">
                         <label class="space-y-2 text-sm font-medium text-slate-200">
                           <span>Preset</span>
-                          <select bind:value={step.stepProfileId} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!canEditSystemProfileField()}>
-                            {#each STEP_PROFILE_OPTIONS as option}
+                          <select bind:value={step.stepProfileId} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!canEditSystemProfileField()} onchange={(event) => applyStepProfilePreset(index, (event.currentTarget as HTMLSelectElement).value)}>
+                            {#each stepProfileOptions as option}
                               <option value={option.id}>{option.label}</option>
                             {/each}
                           </select>
@@ -741,14 +798,21 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
                             <p class="text-sm font-medium text-slate-200">Capability matrix</p>
                             <p class="mt-1 text-xs text-slate-400">Rows are tool groups. Columns decide which capabilities are exposed or allowed for this step.</p>
                           </div>
-                          {#if remainingProfileCategories(index).length > 0}
-                            <select class="rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!canEditSystemProfileField()} onchange={(event) => handleAddProfileCategory(index, event)}>
-                              <option value="">Add group…</option>
-                              {#each remainingProfileCategories(index) as category}
-                                <option value={category}>{category}</option>
-                              {/each}
-                            </select>
-                          {/if}
+                          <div class="flex flex-wrap items-center gap-2">
+                            {#if stepProfileHasCustomizations(index)}
+                              <button type="button" class="rounded-xl border border-slate-700 px-3 py-2 text-xs font-medium text-slate-200 hover:border-slate-500 hover:text-white" disabled={!canEditSystemProfileField()} onclick={() => resetStepProfile(index)}>
+                                {step.stepProfileId ? 'Reset to preset' : 'Clear custom profile'}
+                              </button>
+                            {/if}
+                            {#if remainingProfileCategories(index).length > 0}
+                              <select class="rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!canEditSystemProfileField()} onchange={(event) => handleAddProfileCategory(index, event)}>
+                                <option value="">Add group…</option>
+                                {#each remainingProfileCategories(index) as category}
+                                  <option value={category}>{category}</option>
+                                {/each}
+                              </select>
+                            {/if}
+                          </div>
                         </div>
                         <div class="mt-3 overflow-x-auto">
                           <table class="min-w-full border-separate border-spacing-y-2 text-sm text-slate-200">

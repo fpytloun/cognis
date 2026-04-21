@@ -850,6 +850,20 @@ export interface WorkflowStep {
   require_deliverable?: boolean;
 }
 
+export interface StepProfileDefinition {
+  profile_id: string;
+  name: string;
+  mode: 'soft' | 'hard' | string;
+  config: {
+    matrix?: Record<string, string[]>;
+    tool_overrides?: {
+      include?: string[];
+      exclude?: string[];
+    } | null;
+    allow_tool_search?: boolean;
+  };
+}
+
 export interface Workflow {
   workflow_id: string;
   name: string;

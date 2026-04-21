@@ -1,6 +1,6 @@
 import { createId, isRecord } from '$lib/utils';
 import { createEmptyWorkflowForm, workflowToFormState, type WorkflowFormState } from '$lib/workflows';
-import type { Skill, SkillCreate, SkillUpdate, Workflow, WorkflowStep } from '$lib/types/api';
+import type { Skill, SkillCreate, SkillUpdate, StepProfileDefinition, Workflow, WorkflowStep } from '$lib/types/api';
 
 export const SKILL_WORKFLOW_DRAFT_STORAGE_KEY = 'cognis.skillWorkflowDraft';
 
@@ -370,7 +370,8 @@ export function formStateToSkillPayload(form: SkillFormState): SkillCreate | Ski
 
 export function skillToWorkflowDraft(
   skill: Skill,
-  steps?: Record<string, unknown>[] | null
+  steps?: Record<string, unknown>[] | null,
+  profileMap: Record<string, StepProfileDefinition> = {}
 ): WorkflowFormState {
   const effectiveSteps = Array.isArray(steps) && steps.length > 0 ? steps : skill.current_version?.steps ?? skill.steps ?? [];
   if (!Array.isArray(effectiveSteps) || effectiveSteps.length === 0) {
@@ -415,7 +416,7 @@ export function skillToWorkflowDraft(
     disableable: false,
     override_warnings: []
   };
-  return workflowToFormState(workflow);
+  return workflowToFormState(workflow, profileMap);
 }
 
 export function saveSkillWorkflowDraft(skillId: string, form: WorkflowFormState): void {

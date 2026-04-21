@@ -733,6 +733,13 @@ class WorkflowUpdateRequest(BaseModel):
     lineage: dict[str, Any] | None = None
 
 
+class StepProfileResponse(BaseModel):
+    profile_id: str
+    name: str
+    mode: str = "soft"
+    config: dict[str, Any] = Field(default_factory=dict)
+
+
 class WorkflowResponse(BaseModel):
     workflow_id: str
     name: str

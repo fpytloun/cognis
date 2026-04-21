@@ -55,6 +55,7 @@ import type {
   SkillVersion,
   SystemDiagnostics,
   StepRun,
+  StepProfileDefinition,
   Task,
   TaskDetail,
   ToolDefinitionSummary,
@@ -852,6 +853,10 @@ export const api = {
 
     detail(workflowId: string): Promise<Workflow> {
       return request<Workflow>(`/api/v1/workflows/${workflowId}`);
+    },
+
+    stepProfiles(): Promise<StepProfileDefinition[]> {
+      return request<StepProfileDefinition[]>('/api/v1/workflows/step-profiles');
     },
 
     create(payload: Record<string, unknown>): Promise<Workflow> {
