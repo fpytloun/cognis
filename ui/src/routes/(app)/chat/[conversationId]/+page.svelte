@@ -429,28 +429,14 @@ import X from 'lucide-svelte/icons/x';
     inProgress: activeChatTodos.filter((todo) => todo.status === 'in_progress').length,
     pending: activeChatTodos.filter((todo) => todo.status === 'pending').length,
   }));
-  const LIVE_TASK_SESSION_STATES = new Set(['active', 'idle']);
-
-  function hasRunningTimelineActivity(items: TimelineItem[]): boolean {
-    return items.some((item) => {
-      if (item.kind === 'tool_call') {
-        return item.status === 'started' || item.status === 'running';
-      }
-      if (item.kind === 'delegation') {
-        return item.status === 'started' || item.status === 'running';
-      }
-      return false;
-    });
-  }
-
-  function isCurrentTaskConversationLive(): boolean {
-    if (currentConversation?.context?.type !== 'task') return false;
+  function isCurrentNonWebConversationActive(): boolean {
+    if (!currentConversation || isWebConversation(currentConversation)) return false;
     const status = activeSessionStatus();
-    return status !== null && LIVE_TASK_SESSION_STATES.has(status);
+    return status === 'active';
   }
 
   let showTurnProgress = $derived.by(() =>
-    (turnInProgress || isCurrentTaskConversationLive() || hasRunningTimelineActivity(timeline))
+    (turnInProgress || isCurrentNonWebConversationActive())
       && !timeline.some((item) => item.kind === 'message' && item.role === 'assistant' && item.streaming)
   );
   let isPreSessionConversation = $derived.by(() =>
@@ -2017,8 +2003,13 @@ import X from 'lucide-svelte/icons/x';
 
     // Handle session_reset: clear timeline for new session
     if (event.type === 'session_reset') {
-      timeline = [];
+      timeline = applyWebSocketEvent([], {
+        type: 'system_message',
+        conversation_id: event.conversation_id,
+        text: 'Started a new session.',
+      });
       syncVisibleWindow();
+      scrollToBottom(true);
       // Refresh session list
       if (currentConversation) {
         api.conversations.sessions(currentConversation.conversation_id).then((s) => { sessions = s; }).catch(() => {});

@@ -16,6 +16,7 @@ from cognis.core.followups import (
     TaskResultFollowUp,
 )
 from cognis.core.immutable_prefix import ImmutablePrefixEntry
+from cognis.core.project_context import ProjectContextEntry, build_project_instruction_message
 from cognis.core.prompts import PromptContext
 from cognis.core.runtime import ExecutorEnvironmentSnapshot
 from cognis.models.agent import AgentDefinition, AgentLLMConfig
@@ -43,6 +44,7 @@ class _SessionCache:
         self.prefix_repair_needed = False
         self.last_repair_attempt_at: float | None = None
         self.mark_prefix_repair_calls = 0
+        self.project_contexts: dict[str, ProjectContextEntry] = {}
 
     async def refresh(self, session: SessionModel) -> object:
         del session
@@ -75,6 +77,21 @@ class _SessionCache:
     def get_prefix_entries(self, session_id: str) -> list[ImmutablePrefixEntry]:
         del session_id
         return list(self.prefix_entries)
+
+    def get_project_contexts(self, session_id: str) -> list[ProjectContextEntry]:
+        del session_id
+        return sorted(self.project_contexts.values(), key=lambda item: (item.seq, item.project_root))
+
+    def get_project_context(self, session_id: str, project_root: str | None) -> ProjectContextEntry | None:
+        del session_id
+        return None if project_root is None else self.project_contexts.get(project_root)
+
+    async def store_project_context(
+        self, session_id: str, project_context: ProjectContextEntry
+    ) -> ProjectContextEntry:
+        del session_id
+        self.project_contexts[project_context.project_root] = project_context
+        return project_context
 
     def needs_prefix_repair(self, session_id: str) -> bool:
         del session_id
@@ -352,12 +369,26 @@ async def test_context_assembler_runs_fetches_in_parallel_and_attaches_memory_se
 async def test_context_assembler_loads_root_project_instructions(tmp_path: Path) -> None:
     (tmp_path / "AGENTS.md").write_text("# Project instructions\nUse pytest.\n")
     (tmp_path / "README.md").write_text("# Readme\nHelpful overview.\n")
+    cache = _SessionCache()
+    cache.project_contexts[str(tmp_path)] = ProjectContextEntry(
+        project_root=str(tmp_path),
+        source_path=str(tmp_path / "AGENTS.md"),
+        content=build_project_instruction_message(
+            project_root=str(tmp_path),
+            source_path=str(tmp_path / "AGENTS.md"),
+            content="# Project instructions\nUse pytest.",
+            working_directory=str(tmp_path),
+        ),
+        content_hash="hash",
+        working_directory=str(tmp_path),
+        seq=20,
+    )
 
     assembler = ContextAssembler(
         memory=_Memory(),
         guardrails=_Guardrails(),
         llm=_LLM(),
-        session_cache=_SessionCache(),
+        session_cache=cache,
         session_manager=_SessionManager(),
         max_context_tokens=4096,
         compaction_threshold=0.85,
@@ -386,13 +417,14 @@ async def test_context_assembler_loads_root_project_instructions(tmp_path: Path)
         if message.get("role") == "system"
     ]
     assert any(
-        "Instructions from:" in content and "AGENTS.md" in content for content in system_messages
+        "Instructions for project at" in content and "AGENTS.md" in content
+        for content in system_messages
     )
     assert not any(
-        "Instructions from:" in content and "README.md" in content for content in system_messages
+        "README.md" in content for content in system_messages
     )
-    assert "Instructions from:" in str(result.messages[0]["content"])
-    assert "AGENTS.md" in str(result.messages[0]["content"])
+    assert "Instructions for project at" in str(result.messages[1]["content"])
+    assert "AGENTS.md" in str(result.messages[1]["content"])
 
 
 @pytest.mark.asyncio

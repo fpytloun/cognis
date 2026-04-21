@@ -44,6 +44,7 @@ from cognis.models.workflow import (
     StepOutput,
     WorkflowState,
 )
+from cognis.tools.registry import RegisteredTool, ToolRegistry
 from cognis.tools.builtin.orchestration import OrchestrationMode
 from cognis.tools.builtin.tool_search import SEARCH_TOOLS_TOOL
 
@@ -1154,6 +1155,87 @@ class _NoopSessionCache:
         return False
 
 
+class _ProjectContextProbeExecutor:
+    async def tool_execute(self, tool_call: ToolCall, timeout_seconds: int | None = None) -> ToolResult:
+        del timeout_seconds
+        if tool_call.name != "_project_context_probe":
+            return ToolResult(output="unexpected tool", is_error=True)
+        return ToolResult(
+            output="loaded",
+            metadata={
+                "project_context": {
+                    "status": "loaded",
+                    "project_root": "/workspace/cognis",
+                    "working_directory": "/workspace/cognis",
+                    "source_path": "/workspace/cognis/AGENTS.md",
+                    "content": (
+                        "Instructions for project at /workspace/cognis loaded from "
+                        "/workspace/cognis/AGENTS.md.\nProject root: /workspace/cognis\n"
+                        "Effective working directory: /workspace/cognis\n\n"
+                        "<project_instructions>\nUse pytest.\n</project_instructions>"
+                    ),
+                    "content_hash": "hash",
+                }
+            },
+        )
+
+
+class _ProjectContextLLM:
+    def __init__(self) -> None:
+        self.calls: list[list[dict[str, object]]] = []
+
+    def count_tokens(self, text: str, model: str | None = None) -> int:
+        del model
+        return len(text)
+
+    async def get_model_info(self, model: str | None) -> SimpleNamespace:
+        del model
+        return SimpleNamespace(
+            max_tools=None,
+            supports_parallel_tool_calls=False,
+            supports_tool_choice=False,
+            supports_cache_control=False,
+            supports_defer_loading=False,
+            provider="test",
+        )
+
+    async def stream_generate(self, messages: list[dict[str, object]], **_: object):
+        self.calls.append([dict(message) for message in messages])
+        if len(self.calls) == 1:
+            yield {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_list_project",
+                                    "function": {
+                                        "name": "list_directory",
+                                        "arguments": '{"path":"/workspace/cognis"}',
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+            return
+
+        assert any(
+            message.get("role") == "system"
+            and "Instructions for project at /workspace/cognis" in str(message.get("content"))
+            for message in messages
+        )
+        assert any(
+            message.get("role") == "tool"
+            and "project_instructions_loaded" in str(message.get("content"))
+            for message in messages
+        )
+        yield {"choices": [{"delta": {"content": "Done after reading instructions."}}]}
+        return
+
+
 async def _run_with_assembler(ctx: StepContext, assembler: _FakeContextAssembler) -> None:
     agent_loop = AgentLoop(
         providers=SimpleNamespace(llm=_FinalAssistantContentLLM(), guardrails=_NoopGuardrails()),
@@ -1190,6 +1272,68 @@ async def _run_reminder_capture(ctx: object) -> list[list[dict[str, object]]]:
     assert isinstance(output.error, str)
     assert len(fake_llm.calls) >= 2
     return fake_llm.calls
+
+
+@pytest.mark.asyncio
+async def test_project_context_is_loaded_before_project_touching_tool_runs() -> None:
+    fake_llm = _ProjectContextLLM()
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="list_directory",
+                description="List a directory",
+                parameters={"type": "object", "properties": {"path": {"type": "string"}}},
+                source=ToolSource(type="executor"),
+                read_only=True,
+            ),
+            handler=None,
+        )
+    )
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-project",
+            conversation_id="conv-project",
+            intaris_session_id="sess-project",
+            mnemory_session_id="mem-project",
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(
+            conversation_id="conv-project",
+            context=SimpleNamespace(platform_data={}),
+        ),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+        user_message="Inspect the cognis project",
+        tool_registry=registry,
+        executor_connection=_ProjectContextProbeExecutor(),
+        executor_environment=build_local_executor_environment(
+            executor_id="exec-project",
+            executor_type="in_process",
+            source="test",
+        ),
+        orchestration_mode=OrchestrationMode.FULL,
+    )
+
+    output = await agent_loop.run_step(ctx)
+
+    assert output is not None
+    assert output.content == "Done after reading instructions."
+    assert len(fake_llm.calls) == 2
 
 
 @pytest.mark.asyncio

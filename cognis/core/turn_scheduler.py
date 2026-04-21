@@ -60,7 +60,12 @@ from cognis.models.agent import AgentDefinition
 from cognis.models.artifact import ArtifactKind, AttachmentRef
 from cognis.models.session import BLOCKED_STATES, ConversationModel, SessionModel, SessionStatus
 from cognis.models.task import TaskDelivery
-from cognis.runtime_context import current_agent_id, current_user_email
+from cognis.runtime_context import (
+    current_agent_id,
+    current_effective_working_directory,
+    current_user_email,
+    current_workspace_root,
+)
 from cognis.store.models import FollowUpDedupeRow
 from cognis.tools.skills import resolve_skills_for_agent
 
@@ -1226,6 +1231,9 @@ class TurnScheduler:
         try:
             current_user_email.set(user_email)
             current_agent_id.set(agent.agent_id)
+            platform_data = conversation.context.platform_data or {}
+            current_workspace_root.set(platform_data.get("workspace_root"))
+            current_effective_working_directory.set(platform_data.get("working_directory"))
 
             if attachment_notice:
                 await self._notify_observers_system_message(
@@ -1299,6 +1307,8 @@ class TurnScheduler:
                     source_ref=conversation_id,
                     delivery=TaskDelivery(mode="same_conversation"),
                     workflow_id=workflow_id,
+                    workspace_root=current_workspace_root.get(),
+                    working_directory=current_effective_working_directory.get(),
                     status="queued",
                 )
 

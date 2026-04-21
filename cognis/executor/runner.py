@@ -34,6 +34,10 @@ from cognis.tools.executor.lsp import (
     cleanup_lsp_manager,
     resolve_lsp_runtime_config,
 )
+from cognis.tools.executor.project_context import (
+    INTERNAL_PROJECT_CONTEXT_PROBE_TOOL,
+    handle_project_context_probe,
+)
 from cognis.tools.executor.shell import cleanup_shell_manager
 from cognis.tools.mcp import (
     MCPClient,
@@ -372,6 +376,7 @@ class ExecutorRunner:
                 for name, handler in native_handlers.items()
                 if name in allowed_native or name in allowed_web
             }
+            self._tool_handlers[INTERNAL_PROJECT_CONTEXT_PROBE_TOOL] = handle_project_context_probe
             for tool in discovered_tools:
                 if tool.source.server_name is not None:
                     self._tool_handlers[tool.name] = self._build_mcp_handler(tool)

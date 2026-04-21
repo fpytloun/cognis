@@ -3,6 +3,11 @@ from __future__ import annotations
 import pytest
 
 from cognis.core.immutable_prefix import ImmutablePrefixEntry
+from cognis.core.project_context import (
+    ProjectContextEntry,
+    normalize_project_path,
+    project_context_event_data,
+)
 from cognis.core.session_cache import SessionCache
 from cognis.models.session import EventAppendResult, SessionEvent, SessionModel
 
@@ -197,6 +202,38 @@ async def test_store_prefix_snapshot_replaces_active_prefix() -> None:
         "Core v2",
     ]
     assert cache.needs_prefix_repair(session.session_id) is False
+
+
+@pytest.mark.asyncio
+async def test_session_cache_restores_project_context_from_recorded_events() -> None:
+    cache = SessionCache(_Guardrails(), max_entries=10)
+    session = _session()
+    await cache.refresh(session)
+
+    project_context = ProjectContextEntry(
+        project_root="/tmp/example",
+        source_path="/tmp/example/AGENTS.md",
+        content="Instructions for project at /tmp/example loaded from /tmp/example/AGENTS.md.",
+        content_hash="hash",
+        working_directory="/tmp/example",
+    )
+    append_result = EventAppendResult(ok=True, count=1, first_seq=20, last_seq=20)
+    await cache.append_recorded_events(
+        session,
+        [
+            SessionEvent(
+                type="developer_message",
+                data=project_context_event_data(project_context, turn_id="turn-1"),
+            )
+        ],
+        append_result,
+    )
+
+    loaded = cache.get_project_contexts(session.session_id)
+
+    assert len(loaded) == 1
+    assert loaded[0].project_root == normalize_project_path("/tmp/example")
+    assert loaded[0].seq == 20
 
 
 @pytest.mark.asyncio

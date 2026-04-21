@@ -568,6 +568,7 @@ def build_step_runtime_factory(
                 registry,
                 shared_connection.breaker,
                 runtime_metadata,
+                internal_handlers=getattr(shared_connection, "internal_handlers", None),
             )
             return ResolvedStepRuntime(
                 tool_registry=registry,

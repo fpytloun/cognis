@@ -895,6 +895,23 @@ async def update_conversation(
     return True
 
 
+async def update_conversation_context_data(
+    session: AsyncSession,
+    conversation_id: str,
+    *,
+    context_data: dict[str, object],
+) -> bool:
+    """Replace conversation context_data with the provided payload."""
+
+    row = await get_conversation(session, conversation_id)
+    if row is None:
+        return False
+    row.context_data = dict(context_data)
+    row.updated_at = datetime.now(UTC)
+    await session.flush()
+    return True
+
+
 async def mark_conversation_read(session: AsyncSession, conversation_id: str) -> bool:
     """Set last_read_at to now for unread tracking."""
     row = await get_conversation(session, conversation_id)
@@ -1475,6 +1492,32 @@ async def update_task_fields(
         .values(**values)
     )
     result = await session.execute(stmt)
+    return int(getattr(result, "rowcount", 0) or 0) > 0
+
+
+async def update_task_execution_paths(
+    session: AsyncSession,
+    task_id: str,
+    *,
+    workspace_root: str | None,
+    working_directory: str | None,
+) -> bool:
+    """Persist resolved execution paths for any task lifecycle state."""
+
+    if working_directory and not workspace_root:
+        workspace_root = working_directory
+    if workspace_root and not working_directory:
+        working_directory = workspace_root
+    _validate_task_execution_paths(workspace_root, working_directory)
+    result = await session.execute(
+        update(Task)
+        .where(Task.task_id == task_id)
+        .values(
+            workspace_root=workspace_root,
+            working_directory=working_directory,
+            updated_at=_utcnow(),
+        )
+    )
     return int(getattr(result, "rowcount", 0) or 0) > 0
 
 

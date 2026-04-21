@@ -486,11 +486,6 @@ class ContextAssembler:
             )
 
         cached_intention = self.session_cache.get_intention(session.session_id)
-        project_instructions = _load_project_instructions(
-            workspace_root=workspace_root,
-            effective_working_directory=effective_working_directory,
-            executor_environment=executor_environment,
-        )
         refreshed_cache_entry: Any | None = None
         performed_refresh = False
         if (
@@ -504,7 +499,7 @@ class ContextAssembler:
         prefix_entries = await self._ensure_immutable_prefix(
             session=session,
             agent=agent,
-            project_instructions=project_instructions,
+            project_instructions=[],
             memory_labels=conversation.context.memory_labels,
             context=cached_intention,
         )
@@ -716,6 +711,8 @@ class ContextAssembler:
                 {"role": "system", "content": immutable_prefix, "_immutable_prefix": True}
             )
 
+        messages.extend(self._project_context_messages(session.session_id))
+
         # ----- Mutable suffix -----
 
         messages.append(
@@ -906,6 +903,7 @@ class ContextAssembler:
         # Strip internal markers before sending to LLM
         for msg in messages:
             msg.pop("_immutable_prefix", None)
+            msg.pop("_project_context", None)
             msg.pop("_prior_context", None)
             msg.pop("_follow_up_context", None)
             msg.pop("_routing_reminder", None)
@@ -1031,15 +1029,10 @@ class ContextAssembler:
             if agent.llm_config and agent.llm_config.max_tokens is not None
             else model_info.max_output_tokens
         )
-        project_instructions = _load_project_instructions(
-            workspace_root=workspace_root,
-            effective_working_directory=effective_working_directory,
-            executor_environment=executor_environment,
-        )
         prefix_entries = await self._ensure_immutable_prefix(
             session=session,
             agent=agent,
-            project_instructions=project_instructions,
+            project_instructions=[],
             memory_labels=conversation.context.memory_labels,
             context=None,
             allow_empty_memory=True,
@@ -1077,6 +1070,8 @@ class ContextAssembler:
             messages.append(
                 {"role": "system", "content": immutable_prefix, "_immutable_prefix": True}
             )
+
+        messages.extend(self._project_context_messages(session.session_id))
 
         messages.append(
             {
@@ -1224,6 +1219,7 @@ class ContextAssembler:
 
         for msg in messages:
             msg.pop("_immutable_prefix", None)
+            msg.pop("_project_context", None)
             msg.pop("_prior_context", None)
             msg.pop("_follow_up_context", None)
             msg.pop("_routing_reminder", None)
@@ -1569,6 +1565,23 @@ class ContextAssembler:
             )
         return audit_messages
 
+    def _project_context_messages(self, session_id: str) -> list[dict[str, Any]]:
+        get_project_contexts = getattr(self.session_cache, "get_project_contexts", None)
+        if not callable(get_project_contexts):
+            return []
+        messages: list[dict[str, Any]] = []
+        for entry in get_project_contexts(session_id):
+            if not getattr(entry, "content", None):
+                continue
+            messages.append(
+                {
+                    "role": "system",
+                    "content": str(entry.content),
+                    "_project_context": True,
+                }
+            )
+        return messages
+
     def _compose_immutable_prefix(
         self,
         *,
@@ -1581,7 +1594,6 @@ class ContextAssembler:
         sections: list[str] = []
 
         identity_prompt = self._prefix_content(prefix_entries, "identity")
-        project_instructions = self._prefix_content(prefix_entries, "project_instructions")
         immutable_instructions = self._prefix_content(prefix_entries, "memory_instructions")
         immutable_core_memories = self._prefix_content(prefix_entries, "core_memories")
         compaction_summary = self._prefix_content(prefix_entries, "compaction_summary")
@@ -1606,13 +1618,6 @@ class ContextAssembler:
             tagged_instructions = _tagged_section("instructions", system_instructions)
             if tagged_instructions:
                 sections.append(tagged_instructions)
-
-        if project_instructions:
-            tagged_project_instructions = _tagged_section(
-                "project_instructions", project_instructions
-            )
-            if tagged_project_instructions:
-                sections.append(tagged_project_instructions)
 
         if immutable_instructions:
             sections.append(
@@ -2214,9 +2219,12 @@ def _is_protected_context_message(message: dict[str, Any]) -> bool:
 
     Protected messages that should never be pruned:
     - Consolidated immutable prefix
+    - Frozen project instruction messages loaded during the session
     - Prior step context (workflow step output from a previous step)
     """
     if message.get("_prior_context"):
+        return True
+    if message.get("_project_context"):
         return True
     return _is_immutable_prefix_message(message)
 

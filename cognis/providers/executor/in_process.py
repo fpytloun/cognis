@@ -36,6 +36,10 @@ from cognis.tools.executor.lsp import (
     build_lsp_unavailable_report,
     cleanup_lsp_manager,
 )
+from cognis.tools.executor.project_context import (
+    INTERNAL_PROJECT_CONTEXT_PROBE_TOOL,
+    handle_project_context_probe,
+)
 from cognis.tools.executor.shell import cleanup_shell_manager
 from cognis.tools.mcp import (
     MCPClient,
@@ -76,11 +80,13 @@ class InProcessExecutorConnection:
         registry: ToolRegistry,
         breaker: CircuitBreaker,
         runtime_metadata: dict[str, Any] | None = None,
+        internal_handlers: dict[str, Any] | None = None,
     ) -> None:
         self.handle = handle
         self.registry = registry
         self.breaker = breaker
         self.runtime_metadata = runtime_metadata or {}
+        self.internal_handlers = dict(internal_handlers or {})
         self._active_calls: dict[str, asyncio.Task[Any]] = {}
 
     async def rpc_call(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -118,9 +124,11 @@ class InProcessExecutorConnection:
         """Execute a tool call through the runtime registry."""
 
         registered_tool = self.registry.get(tool_call.name)
-        if registered_tool is None or registered_tool.handler is None:
+        handler = None if registered_tool is None else registered_tool.handler
+        if handler is None:
+            handler = self.internal_handlers.get(tool_call.name)
+        if handler is None:
             return ToolResult(output="Tool is not executable on this executor.", is_error=True)
-        handler = registered_tool.handler
 
         async def invoke_handler() -> ToolResult:
             start = perf_counter()
@@ -224,6 +232,7 @@ class InProcessExecutorProvider:
                 registry,
                 CircuitBreaker(failure_threshold=5, recovery_timeout=30.0),
                 runtime_metadata,
+                internal_handlers={INTERNAL_PROJECT_CONTEXT_PROBE_TOOL: handle_project_context_probe},
             )
         except TimeoutError:
             outcome = "timeout"

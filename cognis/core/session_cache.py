@@ -27,6 +27,12 @@ from cognis.core.immutable_prefix import (
     ImmutablePrefixEntry,
     sort_prefix_entries,
 )
+from cognis.core.project_context import (
+    PROJECT_CONTEXT_STATUS_LOADED,
+    ProjectContextEntry,
+    normalize_project_path,
+    project_context_from_event_data,
+)
 from cognis.logging import get_logger
 from cognis.models.session import EventAppendResult, SessionEvent, SessionModel
 
@@ -84,6 +90,7 @@ class CachedSessionState:
     # Per-session overrides (ephemeral, set via /model and /thinking commands)
     model_override: str | None = None
     reasoning_effort_override: str | None = None
+    project_contexts: dict[str, ProjectContextEntry] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +146,20 @@ def _serialize_entry(entry: CachedSessionState) -> str:
             "context_reserve_clamp_warned": entry.context_reserve_clamp_warned,
             "model_override": entry.model_override,
             "reasoning_effort_override": entry.reasoning_effort_override,
+            "project_contexts": [
+                {
+                    "project_root": item.project_root,
+                    "status": item.status,
+                    "source_path": item.source_path,
+                    "content": item.content,
+                    "content_hash": item.content_hash,
+                    "working_directory": item.working_directory,
+                    "seq": item.seq,
+                }
+                for item in sorted(
+                    entry.project_contexts.values(), key=lambda item: (item.seq, item.project_root)
+                )
+            ],
         },
         separators=(",", ":"),
     )
@@ -184,6 +205,29 @@ def _deserialize_entry(raw: str) -> CachedSessionState:
         context_reserve_clamp_warned=bool(data.get("context_reserve_clamp_warned", False)),
         model_override=data.get("model_override"),
         reasoning_effort_override=data.get("reasoning_effort_override"),
+        project_contexts={
+            entry.project_root: entry
+            for entry in (
+                ProjectContextEntry(
+                    project_root=str(item.get("project_root") or ""),
+                    status=str(item.get("status") or PROJECT_CONTEXT_STATUS_LOADED),
+                    source_path=normalize_project_path(item.get("source_path")),
+                    content=(
+                        str(item.get("content")) if isinstance(item.get("content"), str) else None
+                    ),
+                    content_hash=(
+                        str(item.get("content_hash"))
+                        if isinstance(item.get("content_hash"), str)
+                        else None
+                    ),
+                    working_directory=normalize_project_path(item.get("working_directory")),
+                    seq=int(item.get("seq") or 0),
+                )
+                for item in data.get("project_contexts", [])
+                if isinstance(item, dict) and isinstance(item.get("project_root"), str)
+            )
+            if entry.project_root
+        },
     )
     for raw_event in data.get("events", []):
         entry.events.append(
@@ -621,6 +665,60 @@ class SessionCache:
             return []
         return list(sort_prefix_entries(entry.prefix_entries))
 
+    def get_project_contexts(self, session_id: str) -> list[ProjectContextEntry]:
+        """Return frozen project contexts for the session in stable load order."""
+
+        entry = self.get_entry(session_id)
+        if entry is None:
+            return []
+        return sorted(entry.project_contexts.values(), key=lambda item: (item.seq, item.project_root))
+
+    def get_project_context(
+        self, session_id: str, project_root: str | None
+    ) -> ProjectContextEntry | None:
+        """Return one frozen project context by canonical project root."""
+
+        normalized = normalize_project_path(project_root)
+        if normalized is None:
+            return None
+        entry = self.get_entry(session_id)
+        if entry is None:
+            return None
+        return entry.project_contexts.get(normalized)
+
+    async def store_project_context(
+        self,
+        session_id: str,
+        project_context: ProjectContextEntry,
+    ) -> ProjectContextEntry:
+        """Persist one frozen project context in cache state."""
+
+        normalized_root = normalize_project_path(project_context.project_root)
+        if normalized_root is None:
+            raise ValueError("project_root is required")
+        entry = self.get_entry(session_id)
+        if entry is None:
+            raise KeyError(f"Unknown session cache entry: {session_id}")
+        normalized_context = ProjectContextEntry(
+            project_root=normalized_root,
+            status=project_context.status,
+            source_path=normalize_project_path(project_context.source_path),
+            content=project_context.content,
+            content_hash=project_context.content_hash,
+            working_directory=normalize_project_path(project_context.working_directory),
+            seq=int(project_context.seq or 0),
+        )
+        async with entry.lock:
+            existing = entry.project_contexts.get(normalized_root)
+            if existing is None:
+                entry.project_contexts[normalized_root] = normalized_context
+            elif existing.status != PROJECT_CONTEXT_STATUS_LOADED:
+                normalized_context.seq = existing.seq or normalized_context.seq
+                entry.project_contexts[normalized_root] = normalized_context
+            entry.touched_at = monotonic()
+        await self._redis_set(entry)
+        return entry.project_contexts[normalized_root]
+
     def needs_prefix_repair(self, session_id: str) -> bool:
         """Return whether the cache knows the session is missing a prefix snapshot."""
 
@@ -961,6 +1059,15 @@ class SessionCache:
 
     def _apply_cached_event(self, entry: CachedSessionState, event: CachedEvent) -> None:
         if event.type in PREFIX_EVENT_TYPES:
+            project_context = project_context_from_event_data(event.data, seq=event.seq)
+            if project_context is not None:
+                existing = entry.project_contexts.get(project_context.project_root)
+                if (
+                    existing is None
+                    or existing.status != PROJECT_CONTEXT_STATUS_LOADED
+                    or existing.seq <= 0
+                ):
+                    entry.project_contexts[project_context.project_root] = project_context
             entry.last_event_seq = max(entry.last_event_seq, event.seq)
             return
         if event.type == "compaction_summary":

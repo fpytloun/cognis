@@ -51,6 +51,12 @@ from cognis.core.harness_guards import (
     loop_guard_rejection_payload,
     record_tool_call,
 )
+from cognis.core.project_context import (
+    PROJECT_CONTEXT_STATUS_LOADED,
+    ProjectContextEntry,
+    normalize_project_path,
+    project_context_event_data,
+)
 from cognis.core.prompts import PromptContext
 from cognis.core.pruning import prune_tool_outputs
 from cognis.core.runtime import ExecutorEnvironmentSnapshot, ResolvedStepRuntime
@@ -111,6 +117,7 @@ from cognis.tools.builtin.orchestration import (
 )
 from cognis.tools.builtin.tool_search import SEARCH_TOOLS_TOOL, search_inventory
 from cognis.tools.classification import classify_tool_definitions_sync, resolve_tool_classifications
+from cognis.tools.executor.project_context import INTERNAL_PROJECT_CONTEXT_PROBE_TOOL
 
 logger = get_logger(__name__)
 
@@ -267,6 +274,9 @@ _MAX_TODO_REPROMPTS = 3  # Max re-prompts for incomplete todos before force-comp
 _MAX_STEP_COMPLETE_REPROMPTS = 3
 _MAX_TOOL_CALL_ARGUMENT_CHARS = 256_000
 _DELIVERABLE_PREVIEW_CHARS = 240
+_PROJECT_TOUCH_TOOL_NAMES = frozenset(
+    {"read", "write", "edit", "patch", "multiedit", "list_directory", "glob", "grep", "bash"}
+)
 
 
 def _normalize_todo_status(status: Any) -> str:
@@ -1976,6 +1986,8 @@ class AgentLoop:
         # ---------------------------------------------------------------
         # Step 3: Assemble context (reads Intaris history + memory)
         # ---------------------------------------------------------------
+        await self._ensure_known_project_context_loaded(ctx)
+
         # Derive prompt context from execution policy
         if ctx.policy is WORKFLOW_POLICY:
             _prompt_ctx = PromptContext.TASK_STEP
@@ -2564,6 +2576,7 @@ class AgentLoop:
                 )
 
             delegation_spawned = False
+            restart_llm_cycle = False
             prepared_regular_batch: list[_PreparedRegularToolCall] = []
             for tc_index, tc in enumerate(tool_calls):
                 self._raise_if_cancelled(ctx)
@@ -2665,6 +2678,114 @@ class AgentLoop:
                             )
                         record_tool_call(ctx.loop_guard_state, tc.name, tc.arguments)
                         continue
+
+                if tc.name in _PROJECT_TOUCH_TOOL_NAMES:
+                    if prepared_regular_batch:
+                        await self._execute_regular_tool_batch(
+                            ctx,
+                            prepared_regular_batch,
+                            events_to_record=events_to_record,
+                            messages=messages,
+                            collected_attachments=collected_attachments,
+                            pending_assistant_attachments=pending_assistant_attachments,
+                            discovered_tool_ids=discovered_tool_ids,
+                            on_token=on_token,
+                            on_tool_result=on_tool_result,
+                        )
+                        prepared_regular_batch.clear()
+                    loaded_project_context = await self._maybe_load_project_context_before_tool(
+                        ctx,
+                        tc=tc,
+                    )
+                    if loaded_project_context is not None:
+                        HARNESS_GUARD_TRIPS.labels(
+                            guard="project_context", tool_name=tool_id
+                        ).inc()
+                        _append_tool_call_event(events_to_record, tc, tool_id)
+                        rejection_payload = json.dumps(
+                            {
+                                "status": "retry",
+                                "reason": "project_instructions_loaded",
+                                "message": (
+                                    "Project instructions were loaded before accessing the repository. "
+                                    "Review them and re-issue the tool call if it is still needed."
+                                ),
+                                "project_root": loaded_project_context.project_root,
+                                "source_path": loaded_project_context.source_path,
+                                "required_action": "reissue_tool_call_after_reading_project_instructions",
+                            }
+                        )
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc.call_id,
+                                "content": rejection_payload,
+                            }
+                        )
+                        messages.append(
+                            {
+                                "role": "system",
+                                "content": loaded_project_context.content,
+                                "_project_context": True,
+                            }
+                        )
+                        _append_tool_result_event(
+                            events_to_record, tc, rejection_payload, True, tool_id=tool_id
+                        )
+                        if on_tool_result:
+                            await on_tool_result(
+                                tc.call_id,
+                                tc.name,
+                                rejection_payload,
+                                True,
+                                None,
+                                None,
+                            )
+                        for trailing_call in tool_calls[tc_index + 1 :]:
+                            trailing_tool_id = _tool_id_for_call(trailing_call.name, registry)
+                            trailing_payload = json.dumps(
+                                {
+                                    "status": "cancelled",
+                                    "reason": "project_instructions_loaded",
+                                    "message": (
+                                        "This tool call was not executed because the controller "
+                                        "loaded project instructions first. Re-plan and re-issue any "
+                                        "needed tool calls after reading them."
+                                    ),
+                                }
+                            )
+                            _append_tool_call_event(events_to_record, trailing_call, trailing_tool_id)
+                            messages.append(
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": trailing_call.call_id,
+                                    "content": trailing_payload,
+                                }
+                            )
+                            _append_tool_result_event(
+                                events_to_record,
+                                trailing_call,
+                                trailing_payload,
+                                True,
+                                tool_id=trailing_tool_id,
+                            )
+                            if on_tool_result:
+                                await on_tool_result(
+                                    trailing_call.call_id,
+                                    trailing_call.name,
+                                    trailing_payload,
+                                    True,
+                                    None,
+                                    None,
+                                )
+                        await self._flush_events_incremental(
+                            ctx,
+                            events_to_record,
+                            reason=f"tool_result:project_context:{tc.name}",
+                            on_token=on_token,
+                        )
+                        restart_llm_cycle = True
+                        break
 
                 # Record the (name, args) tuple so future calls can detect
                 # identical-in-a-row repeats.
@@ -3954,6 +4075,9 @@ class AgentLoop:
                     on_tool_result=on_tool_result,
                 )
                 prepared_regular_batch.clear()
+
+            if restart_llm_cycle:
+                continue
 
             if step_output is None and await self._consume_boundary_batch_if_available(
                 ctx,
@@ -7728,6 +7852,271 @@ class AgentLoop:
         if response is None:
             return None
         return str(response)
+
+    async def _ensure_known_project_context_loaded(self, ctx: StepContext) -> None:
+        known_root = normalize_project_path(ctx.workspace_root)
+        known_cwd = normalize_project_path(ctx.working_directory)
+        if known_root is None and known_cwd is None:
+            return
+        existing = self._session_project_context(ctx, known_root or known_cwd)
+        if existing is not None:
+            if known_root is None:
+                ctx.workspace_root = existing.project_root
+            if known_cwd is None and existing.working_directory is not None:
+                ctx.working_directory = existing.working_directory
+            return
+        await self._maybe_probe_and_store_project_context(
+            ctx,
+            raw_path=known_cwd or known_root,
+            path_kind="directory",
+        )
+
+    async def _maybe_load_project_context_before_tool(
+        self,
+        ctx: StepContext,
+        *,
+        tc: ToolCall,
+    ) -> ProjectContextEntry | None:
+        probe_arguments = self._project_probe_arguments(ctx, tc)
+        if probe_arguments is None:
+            return None
+        root_hint = normalize_project_path(ctx.workspace_root)
+        if root_hint is not None and self._session_project_context(ctx, root_hint) is not None:
+            return None
+        return await self._maybe_probe_and_store_project_context(
+            ctx,
+            raw_path=probe_arguments.get("path"),
+            path_kind=str(probe_arguments.get("path_kind") or "directory"),
+        )
+
+    def _project_probe_arguments(self, ctx: StepContext, tc: ToolCall) -> dict[str, str] | None:
+        if tc.name not in _PROJECT_TOUCH_TOOL_NAMES:
+            return None
+        raw_path: str | None = None
+        path_kind = "directory"
+        if tc.name in {"read", "write", "edit", "multiedit"}:
+            raw_path = tc.arguments.get("file_path") if isinstance(tc.arguments.get("file_path"), str) else None
+            path_kind = "file"
+        elif tc.name in {"list_directory", "glob", "grep"}:
+            raw_path = tc.arguments.get("path") if isinstance(tc.arguments.get("path"), str) else None
+        elif tc.name == "bash":
+            raw_path = tc.arguments.get("workdir") if isinstance(tc.arguments.get("workdir"), str) else None
+            if raw_path is None:
+                raw_path = ctx.working_directory or ctx.workspace_root
+            if raw_path is None:
+                return None
+        elif tc.name == "patch":
+            raw_path = ctx.working_directory or ctx.workspace_root
+            if raw_path is None:
+                return None
+        return {"path": raw_path or "", "path_kind": path_kind}
+
+    async def _maybe_probe_and_store_project_context(
+        self,
+        ctx: StepContext,
+        *,
+        raw_path: str | None,
+        path_kind: str,
+    ) -> ProjectContextEntry | None:
+        probe_result = await self._probe_project_context(
+            ctx,
+            raw_path=raw_path,
+            path_kind=path_kind,
+        )
+        if probe_result is None:
+            return None
+        project_root = normalize_project_path(probe_result.get("project_root"))
+        if project_root is None:
+            return None
+        working_directory = normalize_project_path(
+            probe_result.get("working_directory") or raw_path or ctx.working_directory
+        )
+        existing = self._session_project_context(ctx, project_root)
+        if existing is not None:
+            if ctx.workspace_root is None:
+                ctx.workspace_root = existing.project_root
+            if ctx.working_directory is None and existing.working_directory is not None:
+                ctx.working_directory = existing.working_directory
+            return None
+
+        if ctx.workspace_root is None:
+            ctx.workspace_root = project_root
+        if ctx.working_directory is None and working_directory is not None:
+            ctx.working_directory = working_directory
+
+        await self._persist_execution_paths(
+            ctx,
+            workspace_root=project_root,
+            working_directory=working_directory,
+        )
+
+        status = str(probe_result.get("status") or "")
+        if status != PROJECT_CONTEXT_STATUS_LOADED:
+            await self._store_session_project_context(
+                ctx,
+                ProjectContextEntry(
+                    project_root=project_root,
+                    status=status or "missing",
+                    working_directory=working_directory,
+                ),
+            )
+            return None
+
+        content = probe_result.get("content")
+        source_path = normalize_project_path(probe_result.get("source_path"))
+        if not isinstance(content, str) or not content.strip() or source_path is None:
+            return None
+        stored_entry = await self._store_session_project_context(
+            ctx,
+            ProjectContextEntry(
+                project_root=project_root,
+                status=PROJECT_CONTEXT_STATUS_LOADED,
+                source_path=source_path,
+                content=content,
+                content_hash=(
+                    str(probe_result.get("content_hash"))
+                    if isinstance(probe_result.get("content_hash"), str)
+                    else None
+                ),
+                working_directory=working_directory,
+            ),
+        )
+        await self._record_project_context_event(ctx, stored_entry)
+        return stored_entry
+
+    async def _probe_project_context(
+        self,
+        ctx: StepContext,
+        *,
+        raw_path: str | None,
+        path_kind: str,
+    ) -> dict[str, Any] | None:
+        executor = self._get_executor(ctx)
+        if executor is None:
+            return None
+        tool_call = ToolCall(
+            call_id=f"project_probe_{uuid.uuid4().hex[:12]}",
+            name=INTERNAL_PROJECT_CONTEXT_PROBE_TOOL,
+            arguments={
+                "path": raw_path,
+                "path_kind": path_kind,
+                "hint_text": self._project_hint_text(ctx),
+                "fallback_cwd": getattr(ctx.executor_environment, "cwd", None),
+                "fallback_home": getattr(ctx.executor_environment, "home", None),
+            },
+            runtime_metadata=self._tool_runtime_metadata(ctx),
+        )
+        try:
+            result = await executor.tool_execute(tool_call, timeout_seconds=10)
+        except Exception:
+            logger.debug(
+                "agent: project context probe failed",
+                extra={"extra_data": {"session_id": ctx.session.session_id}},
+                exc_info=True,
+            )
+            return None
+        if result.is_error or not isinstance(result.metadata, dict):
+            return None
+        payload = result.metadata.get("project_context")
+        return payload if isinstance(payload, dict) else None
+
+    def _project_hint_text(self, ctx: StepContext) -> str:
+        parts = [ctx.user_message, ctx.task_title, ctx.task_description, ctx.task_expected_output]
+        return "\n".join(part for part in parts if isinstance(part, str) and part.strip())
+
+    def _session_project_context(
+        self,
+        ctx: StepContext,
+        project_root: str | None,
+    ) -> ProjectContextEntry | None:
+        getter = getattr(self.session_cache, "get_project_context", None)
+        if not callable(getter):
+            return None
+        return getter(ctx.session.session_id, project_root)
+
+    async def _store_session_project_context(
+        self,
+        ctx: StepContext,
+        entry: ProjectContextEntry,
+    ) -> ProjectContextEntry:
+        get_entry = getattr(self.session_cache, "get_entry", None)
+        refresh = getattr(self.session_cache, "refresh", None)
+        if callable(get_entry) and get_entry(ctx.session.session_id) is None and callable(refresh):
+            await refresh(ctx.session)
+        store = getattr(self.session_cache, "store_project_context", None)
+        if not callable(store):
+            return entry
+        return await store(ctx.session.session_id, entry)
+
+    async def _record_project_context_event(
+        self,
+        ctx: StepContext,
+        entry: ProjectContextEntry,
+    ) -> None:
+        await self._record_events_strict(
+            ctx,
+            [
+                SessionEvent(
+                    type="developer_message",
+                    data=project_context_event_data(entry, turn_id=ctx.turn_id),
+                )
+            ],
+            reason="project_context_load",
+        )
+
+    async def _persist_execution_paths(
+        self,
+        ctx: StepContext,
+        *,
+        workspace_root: str,
+        working_directory: str | None,
+    ) -> None:
+        if self._session_factory is None:
+            return
+        working_directory = normalize_project_path(working_directory) or workspace_root
+        try:
+            async with self._session_factory() as db_session:
+                if ctx.task_id is not None:
+                    from cognis.store.queries import update_task_execution_paths
+
+                    await update_task_execution_paths(
+                        db_session,
+                        ctx.task_id,
+                        workspace_root=workspace_root,
+                        working_directory=working_directory,
+                    )
+                    if ctx.step_run_id is not None:
+                        await update_step_run(
+                            db_session,
+                            ctx.step_run_id,
+                            workspace_root=workspace_root,
+                            working_directory=working_directory,
+                        )
+                else:
+                    from cognis.store.queries import update_conversation_context_data
+
+                    platform_data = dict(getattr(ctx.conversation.context, "platform_data", {}) or {})
+                    platform_data["workspace_root"] = workspace_root
+                    platform_data["working_directory"] = working_directory
+                    await update_conversation_context_data(
+                        db_session,
+                        ctx.conversation.conversation_id,
+                        context_data=platform_data,
+                    )
+                    ctx.conversation.context.platform_data = platform_data
+                await db_session.commit()
+        except Exception:
+            logger.debug(
+                "agent: failed to persist execution paths",
+                extra={
+                    "extra_data": {
+                        "session_id": ctx.session.session_id,
+                        "conversation_id": ctx.conversation.conversation_id,
+                        "task_id": ctx.task_id,
+                    }
+                },
+                exc_info=True,
+            )
 
     def _tool_runtime_metadata(self, ctx: StepContext) -> dict[str, Any]:
         metadata: dict[str, Any] = {}
