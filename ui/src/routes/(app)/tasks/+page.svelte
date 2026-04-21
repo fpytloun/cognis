@@ -122,7 +122,6 @@
       normalizedTitle || task.task_id,
       task.workflow_id ?? 'auto',
       task.agent_id,
-      task.status,
       task.source_type,
       task.source_ref ?? 'none',
     ].join('::');
@@ -572,14 +571,18 @@
                 {#each doneTaskGroups as group (group.key)}
                   <article class="rounded-2xl border border-slate-800 bg-slate-950/70 p-3">
                     <div class="flex items-start gap-3">
-                      <button
-                        type="button"
-                        class="mt-0.5 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-slate-700 bg-slate-900/70 text-slate-400 transition hover:border-slate-600 hover:text-white"
-                        onclick={() => toggleDoneGroup(group.key)}
-                        aria-label={expandedDoneGroups.has(group.key) ? 'Collapse task group' : 'Expand task group'}
-                      >
-                        <ChevronDown class={`h-4 w-4 transition ${expandedDoneGroups.has(group.key) ? 'rotate-180' : ''}`} />
-                      </button>
+                      {#if group.tasks.length > 1}
+                        <button
+                          type="button"
+                          class="mt-0.5 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-slate-700 bg-slate-900/70 text-slate-400 transition hover:border-slate-600 hover:text-white"
+                          onclick={() => toggleDoneGroup(group.key)}
+                          aria-label={expandedDoneGroups.has(group.key) ? 'Collapse task group' : 'Expand task group'}
+                        >
+                          <ChevronDown class={`h-4 w-4 transition ${expandedDoneGroups.has(group.key) ? 'rotate-180' : ''}`} />
+                        </button>
+                      {:else}
+                        <div class="h-8 w-8 shrink-0"></div>
+                      {/if}
                       <div class="min-w-0 flex-1 space-y-2">
                         <div class="flex flex-wrap items-center justify-between gap-2 px-1">
                           <span class="text-xs uppercase tracking-[0.2em] text-slate-500">{group.title}</span>
@@ -667,14 +670,18 @@
                 {#each doneTaskGroups as group (group.key)}
                   <article class="rounded-2xl border border-slate-800 bg-slate-950/70 p-3">
                     <div class="flex items-start gap-3">
-                      <button
-                        type="button"
-                        class="mt-0.5 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-slate-700 bg-slate-900/70 text-slate-400 transition hover:border-slate-600 hover:text-white"
-                        onclick={() => toggleDoneGroup(group.key)}
-                        aria-label={expandedDoneGroups.has(group.key) ? 'Collapse task group' : 'Expand task group'}
-                      >
-                        <ChevronDown class={`h-4 w-4 transition ${expandedDoneGroups.has(group.key) ? 'rotate-180' : ''}`} />
-                      </button>
+                      {#if group.tasks.length > 1}
+                        <button
+                          type="button"
+                          class="mt-0.5 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-slate-700 bg-slate-900/70 text-slate-400 transition hover:border-slate-600 hover:text-white"
+                          onclick={() => toggleDoneGroup(group.key)}
+                          aria-label={expandedDoneGroups.has(group.key) ? 'Collapse task group' : 'Expand task group'}
+                        >
+                          <ChevronDown class={`h-4 w-4 transition ${expandedDoneGroups.has(group.key) ? 'rotate-180' : ''}`} />
+                        </button>
+                      {:else}
+                        <div class="h-8 w-8 shrink-0"></div>
+                      {/if}
                       <div class="min-w-0 flex-1 space-y-2">
                         <div class="flex flex-wrap items-center justify-between gap-2 px-1">
                           <span class="text-xs uppercase tracking-[0.2em] text-slate-500">{group.title}</span>
