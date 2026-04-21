@@ -31,7 +31,6 @@ import X from 'lucide-svelte/icons/x';
   import LiveDots from '$lib/components/LiveDots.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import NewChatModal from '$lib/components/NewChatModal.svelte';
-  import ReasoningBlock from '$lib/components/ReasoningBlock.svelte';
   import ToolCallBlock from '$lib/components/ToolCallBlock.svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import Card from '$lib/components/ui/Card.svelte';
@@ -64,7 +63,6 @@ import X from 'lucide-svelte/icons/x';
     findPendingStepRequestInputCall,
     optimisticallyResolveStepRequestInput,
     applyWebSocketEvent,
-    finalizeReasoningItems,
     normalizeHistory,
     type TimelineItem,
     type ToolCallTimelineItem
@@ -1831,7 +1829,6 @@ import X from 'lucide-svelte/icons/x';
         event.type === 'chunk'
         || event.type === 'tool_call'
         || event.type === 'tool_result'
-        || event.type === 'reasoning'
         || event.type === 'delegation_started'
         || event.type === 'delegation_completed'
         || event.type === 'delegation_failed'
@@ -1850,7 +1847,7 @@ import X from 'lucide-svelte/icons/x';
     // Filter sub-session tool/chunk events from the main timeline (defense-in-depth)
     const rootSid = currentConversation?.active_session_id;
     if (rootSid && 'session_id' in event && event.session_id && event.session_id !== rootSid) {
-      if (event.type === 'tool_call' || event.type === 'tool_result' || event.type === 'chunk' || event.type === 'reasoning') {
+      if (event.type === 'tool_call' || event.type === 'tool_result' || event.type === 'chunk') {
         return;
       }
     }
@@ -1909,7 +1906,7 @@ import X from 'lucide-svelte/icons/x';
       return;
     }
 
-    if (event.type === 'chunk' || event.type === 'tool_call' || event.type === 'delegation_started' || event.type === 'reasoning') {
+    if (event.type === 'chunk' || event.type === 'tool_call' || event.type === 'delegation_started') {
       awaitingAssistantStart = false;
       turnInProgress = true;
     }
@@ -1928,7 +1925,6 @@ import X from 'lucide-svelte/icons/x';
         pendingDirectQuestion = null;
       }
       directQuestionSubmitting = false;
-      timeline = finalizeReasoningItems(timeline);
       // Update context usage from message_complete
       if (event.type === 'message_complete' && event.context_usage) {
         contextUsage = event.context_usage;
@@ -2849,8 +2845,6 @@ import X from 'lucide-svelte/icons/x';
                   </div>
                 {:else if item.kind === 'tool_call'}
                   <div><ToolCallBlock {item} /></div>
-                {:else if item.kind === 'reasoning'}
-                  <div><ReasoningBlock {item} /></div>
                 {:else if item.kind === 'delegation'}
                   <div><DelegationCard {item} onViewSession={handleViewSession} /></div>
                 {:else if item.kind === 'workflow_composed'}
@@ -3223,8 +3217,6 @@ import X from 'lucide-svelte/icons/x';
                   </div>
                 {:else if item.kind === 'tool_call'}
                   <ToolCallBlock {item} />
-                {:else if item.kind === 'reasoning'}
-                  <ReasoningBlock {item} />
                 {:else if item.kind === 'delegation'}
                   <DelegationCard {item} />
                 {:else if item.kind === 'workflow_composed'}

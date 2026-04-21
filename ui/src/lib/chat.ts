@@ -27,7 +27,6 @@ export type TimelineItem =
   | ToolCallTimelineItem
   | DelegationTimelineItem
   | WorkflowComposedTimelineItem
-  | ReasoningTimelineItem
   | NoticeTimelineItem
   | SystemMessageTimelineItem
   | CompactionTimelineItem;
@@ -101,15 +100,6 @@ export interface WorkflowComposedTimelineItem {
   taskId: string | null;
   scheduleId: string | null;
   steps: string[];
-  timestamp: string | null;
-}
-
-export interface ReasoningTimelineItem {
-  id: string;
-  kind: 'reasoning';
-  messageId: string;
-  content: string;
-  streaming: boolean;
   timestamp: string | null;
 }
 
@@ -262,10 +252,6 @@ function finalizeInFlightAssistantItems(items: TimelineItem[]): TimelineItem[] {
         streaming: false,
       } satisfies MessageTimelineItem;
     }
-    if (item.kind === 'reasoning' && item.streaming) {
-      changed = true;
-      return { ...item, streaming: false } satisfies ReasoningTimelineItem;
-    }
     return item;
   });
   return changed ? next : items;
@@ -276,10 +262,6 @@ function insertBeforeTrailingStreamingAssistant(items: TimelineItem[], item: Tim
   for (let index = items.length - 1; index >= 0; index--) {
     const candidate = items[index];
     if (candidate.kind === 'message' && candidate.role === 'assistant' && candidate.streaming && candidate.seq === null) {
-      insertionIndex = index;
-      continue;
-    }
-    if (candidate.kind === 'reasoning' && candidate.streaming) {
       insertionIndex = index;
       continue;
     }
@@ -453,19 +435,6 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
         title: 'History incomplete',
         description: descriptionMap[reason] ?? 'Some persisted history could not be loaded completely.',
         tone: 'warning',
-        timestamp: event.timestamp
-      });
-      continue;
-    }
-
-    if (event.type === 'reasoning') {
-      const messageId = String(event.data.message_id ?? `reasoning-${eid}`);
-      items.push({
-        id: `reasoning:${messageId}:${eid}`,
-        kind: 'reasoning',
-        messageId,
-        content,
-        streaming: false,
         timestamp: event.timestamp
       });
       continue;
@@ -891,29 +860,6 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
     return next;
   }
 
-  if (event.type === 'reasoning') {
-    const itemId = `reasoning:${event.message_id}`;
-    const index = next.findIndex((item) => item.id === itemId && item.kind === 'reasoning');
-    if (index >= 0) {
-      const existing = next[index] as ReasoningTimelineItem;
-      next[index] = {
-        ...existing,
-        content: typeof event.seq === 'number' ? event.content : `${existing.content}${event.content}`,
-        streaming: typeof event.seq !== 'number'
-      };
-      return next;
-    }
-    next.push({
-      id: itemId,
-      kind: 'reasoning',
-      messageId: event.message_id,
-      content: event.content,
-      streaming: typeof event.seq !== 'number',
-      timestamp: new Date().toISOString()
-    });
-    return next;
-  }
-
   if (event.type === 'conversation_updated') {
     // Title updates are handled by the page handler directly, not the timeline
     return next;
@@ -1176,17 +1122,4 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
   }
 
   return next;
-}
-
-/** Mark all in-flight reasoning items as done streaming (e.g. on message_complete). */
-export function finalizeReasoningItems(items: TimelineItem[]): TimelineItem[] {
-  let changed = false;
-  const next = items.map((item) => {
-    if (item.kind === 'reasoning' && item.streaming) {
-      changed = true;
-      return { ...item, streaming: false };
-    }
-    return item;
-  });
-  return changed ? next : items;
 }

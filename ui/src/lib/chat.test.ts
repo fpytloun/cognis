@@ -239,6 +239,34 @@ describe('chat timeline helpers', () => {
     });
   });
 
+  it('ignores legacy internal reasoning events in persisted history', () => {
+    const items = normalizeHistory([
+      {
+        seq: 6,
+        type: 'reasoning',
+        data: {
+          message_id: 'msg_internal_1',
+          content: 'internal session reasoning'
+        },
+        timestamp: '2026-04-07T00:00:00Z'
+      }
+    ]);
+
+    expect(items).toEqual([]);
+  });
+
+  it('ignores live legacy internal reasoning events', () => {
+    const items = applyWebSocketEvent([], {
+      type: 'reasoning',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      message_id: 'msg_internal_1',
+      content: 'internal session reasoning'
+    });
+
+    expect(items).toEqual([]);
+  });
+
   it('keeps the assistant draft trailing behind live tool calls until completion', () => {
     const streaming = applyWebSocketEvent([], {
       type: 'chunk',

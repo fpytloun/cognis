@@ -568,19 +568,6 @@ class WebSocketConnectionManager:
                         }
                     )
                     replayed += 1
-                elif event_type == "reasoning":
-                    await connection.send_json(
-                        {
-                            "type": "reasoning",
-                            "conversation_id": conversation_id,
-                            "session_id": session.session_id,
-                            "seq": item.get("seq"),
-                            "message_id": data.get("message_id")
-                            or f"replay_reasoning_{item.get('seq', uuid.uuid4().hex)}",
-                            "content": data.get("content", ""),
-                        }
-                    )
-                    replayed += 1
                 elif event_type == "task_result":
                     await connection.send_json(
                         {

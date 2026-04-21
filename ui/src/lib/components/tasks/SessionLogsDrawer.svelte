@@ -17,7 +17,6 @@
   import EscalationPrompt from '$lib/components/EscalationPrompt.svelte';
   import LiveDots from '$lib/components/LiveDots.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
-  import ReasoningBlock from '$lib/components/ReasoningBlock.svelte';
   import ToolCallBlock from '$lib/components/ToolCallBlock.svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import type { Escalation, MessageEvent } from '$lib/types/api';
@@ -381,15 +380,13 @@
         {:else if timeline.length === 0}
           <p class="text-sm text-slate-500">No events recorded yet.</p>
         {:else}
-          {#each timeline as item (item.id)}
+            {#each timeline as item (item.id)}
             {#if item.kind === 'message'}
               <div class={`flex ${item.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                 <ChatMessage {item} compact />
               </div>
             {:else if item.kind === 'tool_call'}
               <ToolCallBlock {item} />
-            {:else if item.kind === 'reasoning'}
-              <ReasoningBlock {item} />
             {:else if item.kind === 'delegation'}
               <DelegationCard {item} />
             {:else if item.kind === 'notice'}
