@@ -66,3 +66,25 @@ async def test_project_context_probe_uses_project_hints_under_common_roots(tmp_p
     payload = result.metadata["project_context"]
     assert payload["status"] == "loaded"
     assert payload["project_root"] == str(project_root)
+
+
+@pytest.mark.asyncio
+async def test_project_context_probe_allows_explicit_path_outside_current_workspace(
+    tmp_path: Path,
+) -> None:
+    current_workspace = tmp_path / "current"
+    current_workspace.mkdir()
+    target_project = tmp_path / "obsidian"
+    target_project.mkdir()
+    (target_project / ".git").mkdir()
+    (target_project / "AGENTS.md").write_text("Use markdown notes.\n", encoding="utf-8")
+
+    result = await handle_project_context_probe(
+        {"path": str(target_project), "path_kind": "directory"},
+        _context(workspace_root=str(current_workspace), working_directory=str(current_workspace)),
+    )
+
+    payload = result.metadata["project_context"]
+    assert payload["status"] == "loaded"
+    assert payload["project_root"] == str(target_project)
+    assert payload["source_path"] == str(target_project / "AGENTS.md")

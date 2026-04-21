@@ -7940,27 +7940,32 @@ class AgentLoop:
         probe_arguments = self._project_probe_arguments(ctx, tc)
         if probe_arguments is None:
             return None
-        root_hint = normalize_project_path(ctx.workspace_root)
-        if root_hint is not None and self._session_project_context(ctx, root_hint) is not None:
-            return None
+        if not probe_arguments.get("explicit_path"):
+            root_hint = normalize_project_path(ctx.workspace_root)
+            if root_hint is not None and self._session_project_context(ctx, root_hint) is not None:
+                return None
         return await self._maybe_probe_and_store_project_context(
             ctx,
             raw_path=probe_arguments.get("path"),
             path_kind=str(probe_arguments.get("path_kind") or "directory"),
         )
 
-    def _project_probe_arguments(self, ctx: StepContext, tc: ToolCall) -> dict[str, str] | None:
+    def _project_probe_arguments(self, ctx: StepContext, tc: ToolCall) -> dict[str, Any] | None:
         if tc.name not in _PROJECT_TOUCH_TOOL_NAMES:
             return None
         raw_path: str | None = None
         path_kind = "directory"
+        explicit_path = False
         if tc.name in {"read", "write", "edit", "multiedit"}:
             raw_path = tc.arguments.get("file_path") if isinstance(tc.arguments.get("file_path"), str) else None
             path_kind = "file"
+            explicit_path = raw_path is not None
         elif tc.name in {"list_directory", "glob", "grep"}:
             raw_path = tc.arguments.get("path") if isinstance(tc.arguments.get("path"), str) else None
+            explicit_path = raw_path is not None
         elif tc.name == "bash":
             raw_path = tc.arguments.get("workdir") if isinstance(tc.arguments.get("workdir"), str) else None
+            explicit_path = raw_path is not None
             if raw_path is None:
                 raw_path = ctx.working_directory or ctx.workspace_root
             if raw_path is None:
@@ -7969,7 +7974,11 @@ class AgentLoop:
             raw_path = ctx.working_directory or ctx.workspace_root
             if raw_path is None:
                 return None
-        return {"path": raw_path or "", "path_kind": path_kind}
+        return {
+            "path": raw_path or "",
+            "path_kind": path_kind,
+            "explicit_path": explicit_path,
+        }
 
     async def _maybe_probe_and_store_project_context(
         self,

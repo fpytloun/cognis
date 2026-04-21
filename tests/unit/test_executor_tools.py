@@ -146,7 +146,7 @@ class TestReadTool:
         assert "1: hello" in result.output
 
     @pytest.mark.asyncio()
-    async def test_read_rejects_paths_outside_workspace_root(self, tmp_path: Path) -> None:
+    async def test_read_allows_explicit_paths_outside_workspace_root(self, tmp_path: Path) -> None:
         outside = tmp_path.parent / "outside.txt"
         outside.write_text("secret\n")
         context = _context(
@@ -155,8 +155,8 @@ class TestReadTool:
 
         result = await handle_read({"file_path": str(outside)}, context)
 
-        assert result.is_error
-        assert "escapes workspace root" in result.output
+        assert not result.is_error
+        assert "1: secret" in result.output
 
     @pytest.mark.asyncio()
     async def test_read_binary_file_returns_attachment_analysis_request(self, tmp_path: Path) -> None:

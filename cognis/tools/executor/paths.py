@@ -16,7 +16,12 @@ def resolve_path(
     default_to_home: bool = False,
     base: str = "cwd",
 ) -> Path:
-    """Resolve a tool path against runtime cwd/root rules."""
+    """Resolve a tool path against runtime cwd/root rules.
+
+    ``workspace_root`` remains available as a future policy hook and as an
+    anchor for relative paths, but explicit paths are not sandboxed here.
+    Guardrails decide whether a given path access is acceptable.
+    """
 
     metadata = context.runtime_metadata if context is not None else {}
     workspace_root = _runtime_workspace_root(metadata)
@@ -25,7 +30,7 @@ def resolve_path(
     if raw is None or raw == "":
         if default_to_home:
             if working_directory:
-                return _validate_workspace_path(working_directory, workspace_root)
+                return _normalize_resolved_path(working_directory)
             return Path.home()
         return working_directory or Path("")
 
@@ -35,10 +40,9 @@ def resolve_path(
         anchor = working_directory if base == "cwd" else workspace_root or working_directory
         if anchor is not None:
             path = anchor / path
-            anchored = True
     if workspace_root is None and not anchored:
         return path
-    return _validate_workspace_path(path, workspace_root)
+    return _normalize_resolved_path(path)
 
 
 def runtime_working_directory(metadata: dict[str, Any] | None) -> str | None:
@@ -70,12 +74,6 @@ def _path_or_none(raw: Any) -> Path | None:
         return None
 
 
-def _validate_workspace_path(path: Path, workspace_root: Path | None) -> Path:
+def _normalize_resolved_path(path: Path) -> Path:
     resolved = Path(os.path.realpath(path))
-    if workspace_root is None:
-        return path
-    try:
-        resolved.relative_to(workspace_root)
-    except ValueError as exc:
-        raise ValueError(f"Path escapes workspace root: {resolved}") from exc
     return resolved

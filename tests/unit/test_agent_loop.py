@@ -26,6 +26,7 @@ from cognis.core.agent_loop import (
     _filter_model_inventory_tools,
     _validate_step_completion_notification,
 )
+from cognis.core.project_context import ProjectContextEntry
 from cognis.core.runtime import ResolvedStepRuntime, build_local_executor_environment
 from cognis.models.agent import AgentDefinition, AgentPermissions
 from cognis.models.session import EventAppendResult, ReasoningReportResult, SessionEvent
@@ -746,6 +747,20 @@ class _ReminderStop(RuntimeError):
     pass
 
 
+def _test_model_info() -> SimpleNamespace:
+    return SimpleNamespace(
+        max_tools=None,
+        supports_parallel_tool_calls=False,
+        supports_tool_choice=False,
+        supports_cache_control=False,
+        supports_defer_loading=False,
+        supports_openai_allowed_tools=False,
+        supports_openai_namespace_tools=False,
+        supports_tool_search=False,
+        provider="test",
+    )
+
+
 class _FakeReminderLLM:
     def __init__(self) -> None:
         self.calls: list[list[dict[str, object]]] = []
@@ -754,14 +769,8 @@ class _FakeReminderLLM:
         return len(text)
 
     async def get_model_info(self, model: str | None) -> SimpleNamespace:
-        return SimpleNamespace(
-            max_tools=None,
-            supports_parallel_tool_calls=False,
-            supports_tool_choice=False,
-            supports_cache_control=False,
-            supports_defer_loading=False,
-            provider="test",
-        )
+        del model
+        return _test_model_info()
 
     async def stream_generate(self, messages: list[dict[str, object]], **_: object):
         self.calls.append([dict(message) for message in messages])
@@ -802,14 +811,7 @@ class _StepCompleteValidationLLM:
 
     async def get_model_info(self, model: str | None) -> SimpleNamespace:
         del model
-        return SimpleNamespace(
-            max_tools=None,
-            supports_parallel_tool_calls=False,
-            supports_tool_choice=False,
-            supports_cache_control=False,
-            supports_defer_loading=False,
-            provider="test",
-        )
+        return _test_model_info()
 
     async def stream_generate(self, messages: list[dict[str, object]], **_: object):
         self.calls.append([dict(message) for message in messages])
@@ -869,14 +871,7 @@ class _SilentStepCompleteValidationLLM:
 
     async def get_model_info(self, model: str | None) -> SimpleNamespace:
         del model
-        return SimpleNamespace(
-            max_tools=None,
-            supports_parallel_tool_calls=False,
-            supports_tool_choice=False,
-            supports_cache_control=False,
-            supports_defer_loading=False,
-            provider="test",
-        )
+        return _test_model_info()
 
     async def stream_generate(self, messages: list[dict[str, object]], **_: object):
         self.calls.append([dict(message) for message in messages])
@@ -937,14 +932,7 @@ class _StepCompleteOrderingLLM:
 
     async def get_model_info(self, model: str | None) -> SimpleNamespace:
         del model
-        return SimpleNamespace(
-            max_tools=None,
-            supports_parallel_tool_calls=False,
-            supports_tool_choice=False,
-            supports_cache_control=False,
-            supports_defer_loading=False,
-            provider="test",
-        )
+        return _test_model_info()
 
     async def stream_generate(self, messages: list[dict[str, object]], **_: object):
         self.calls.append([dict(message) for message in messages])
@@ -1007,14 +995,7 @@ class _FinalAssistantContentLLM:
 
     async def get_model_info(self, model: str | None) -> SimpleNamespace:
         del model
-        return SimpleNamespace(
-            max_tools=None,
-            supports_parallel_tool_calls=False,
-            supports_tool_choice=False,
-            supports_cache_control=False,
-            supports_defer_loading=False,
-            provider="test",
-        )
+        return _test_model_info()
 
     async def stream_generate(self, messages: list[dict[str, object]], **_: object):
         del messages
@@ -1063,14 +1044,7 @@ class _ToolCallCeilingLLM:
 
     async def get_model_info(self, model: str | None) -> SimpleNamespace:
         del model
-        return SimpleNamespace(
-            max_tools=None,
-            supports_parallel_tool_calls=False,
-            supports_tool_choice=False,
-            supports_cache_control=False,
-            supports_defer_loading=False,
-            provider="test",
-        )
+        return _test_model_info()
 
     async def stream_generate(self, messages: list[dict[str, object]], **_: object):
         del messages
@@ -1180,6 +1154,35 @@ class _ProjectContextProbeExecutor:
         )
 
 
+class _CrossProjectProbeExecutor:
+    def __init__(self) -> None:
+        self.probes: list[dict[str, object]] = []
+
+    async def tool_execute(self, tool_call: ToolCall, timeout_seconds: int | None = None) -> ToolResult:
+        del timeout_seconds
+        if tool_call.name != "_project_context_probe":
+            return ToolResult(output="unexpected tool", is_error=True)
+        self.probes.append(dict(tool_call.arguments))
+        return ToolResult(
+            output="loaded",
+            metadata={
+                "project_context": {
+                    "status": "loaded",
+                    "project_root": "/workspace/obsidian",
+                    "working_directory": "/workspace/obsidian",
+                    "source_path": "/workspace/obsidian/AGENTS.md",
+                    "content": (
+                        "Instructions for project at /workspace/obsidian loaded from "
+                        "/workspace/obsidian/AGENTS.md.\nProject root: /workspace/obsidian\n"
+                        "Effective working directory: /workspace/obsidian\n\n"
+                        "<project_instructions>\nUse markdown notes.\n</project_instructions>"
+                    ),
+                    "content_hash": "obsidian-hash",
+                }
+            },
+        )
+
+
 class _ProjectContextLLM:
     def __init__(self) -> None:
         self.calls: list[list[dict[str, object]]] = []
@@ -1190,14 +1193,7 @@ class _ProjectContextLLM:
 
     async def get_model_info(self, model: str | None) -> SimpleNamespace:
         del model
-        return SimpleNamespace(
-            max_tools=None,
-            supports_parallel_tool_calls=False,
-            supports_tool_choice=False,
-            supports_cache_control=False,
-            supports_defer_loading=False,
-            provider="test",
-        )
+        return _test_model_info()
 
     async def stream_generate(self, messages: list[dict[str, object]], **_: object):
         self.calls.append([dict(message) for message in messages])
@@ -1234,6 +1230,74 @@ class _ProjectContextLLM:
         )
         yield {"choices": [{"delta": {"content": "Done after reading instructions."}}]}
         return
+
+
+class _CrossProjectLLM:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def count_tokens(self, text: str, model: str | None = None) -> int:
+        del model
+        return len(text)
+
+    async def get_model_info(self, model: str | None) -> SimpleNamespace:
+        del model
+        return _test_model_info()
+
+    async def stream_generate(self, messages: list[dict[str, object]], **_: object):
+        self.calls += 1
+        if self.calls == 1:
+            yield {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_list_obsidian",
+                                    "function": {
+                                        "name": "list_directory",
+                                        "arguments": '{"path":"/workspace/obsidian"}',
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+            return
+
+        assert any(
+            message.get("role") == "system"
+            and "/workspace/obsidian/AGENTS.md" in str(message.get("content"))
+            for message in messages
+        )
+        yield {"choices": [{"delta": {"content": "Cross-project instructions loaded."}}]}
+        return
+
+
+class _ExistingProjectSessionCache(_NoopSessionCache):
+    def __init__(self) -> None:
+        self.project_contexts = {
+            "/workspace/current": ProjectContextEntry(
+                project_root="/workspace/current",
+                source_path="/workspace/current/AGENTS.md",
+                content="Current project instructions.",
+                content_hash="current-hash",
+                working_directory="/workspace/current",
+            )
+        }
+
+    def get_project_context(self, session_id: str, project_root: str | None) -> ProjectContextEntry | None:
+        del session_id
+        return None if project_root is None else self.project_contexts.get(project_root)
+
+    async def store_project_context(
+        self, session_id: str, project_context: ProjectContextEntry
+    ) -> ProjectContextEntry:
+        del session_id
+        self.project_contexts[project_context.project_root] = project_context
+        return project_context
 
 
 async def _run_with_assembler(ctx: StepContext, assembler: _FakeContextAssembler) -> None:
@@ -1334,6 +1398,72 @@ async def test_project_context_is_loaded_before_project_touching_tool_runs() -> 
     assert output is not None
     assert output.content == "Done after reading instructions."
     assert len(fake_llm.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_explicit_cross_project_path_still_triggers_project_probe() -> None:
+    fake_llm = _CrossProjectLLM()
+    probe_executor = _CrossProjectProbeExecutor()
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="list_directory",
+                description="List a directory",
+                parameters={"type": "object", "properties": {"path": {"type": "string"}}},
+                source=ToolSource(type="executor"),
+                read_only=True,
+            ),
+            handler=None,
+        )
+    )
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_ExistingProjectSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-cross-project",
+            conversation_id="conv-cross-project",
+            intaris_session_id="sess-cross-project",
+            mnemory_session_id="mem-cross-project",
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(
+            conversation_id="conv-cross-project",
+            context=SimpleNamespace(platform_data={}),
+        ),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+        user_message="Inspect the obsidian project",
+        tool_registry=registry,
+        executor_connection=probe_executor,
+        executor_environment=build_local_executor_environment(
+            executor_id="exec-cross-project",
+            executor_type="in_process",
+            source="test",
+        ),
+        workspace_root="/workspace/current",
+        working_directory="/workspace/current",
+        orchestration_mode=OrchestrationMode.FULL,
+    )
+
+    output = await agent_loop.run_step(ctx)
+
+    assert output is not None
+    assert output.content == "Cross-project instructions loaded."
+    assert len(probe_executor.probes) == 1
+    assert probe_executor.probes[0]["path"] == "/workspace/obsidian"
 
 
 @pytest.mark.asyncio
@@ -1744,14 +1874,7 @@ async def test_user_message_is_persisted_before_reasoning_and_tool_execution() -
 
         async def get_model_info(self, model: str | None) -> SimpleNamespace:
             del model
-            return SimpleNamespace(
-                max_tools=None,
-                supports_parallel_tool_calls=False,
-                supports_tool_choice=False,
-                supports_cache_control=False,
-                supports_defer_loading=False,
-                provider="test",
-            )
+            return _test_model_info()
 
         def count_tokens(self, text: str, model: str | None = None) -> int:
             del model
