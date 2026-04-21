@@ -18,6 +18,7 @@ Each workflow defines:
 - workflow identity and description
 - ordered steps
 - step type and prompts
+- optional step tool profiles
 - step deliverables authored via `write_deliverable`
 - optional evaluation or revision behavior
 - loop and gate behavior
@@ -31,6 +32,24 @@ The workflow editor is designed for operators and advanced users. Most end users
 - plan -> execute -> review flows for larger tasks
 - gated steps that pause for human approval
 - loops that retry or revise a step until it satisfies the evaluator
+
+## Step tool profiles
+
+Run steps can optionally define a step tool profile.
+
+- A profile narrows the tool surface for that step.
+- It works on top of the agent's existing tool access. It does not grant new capabilities.
+- `soft` mode changes the step's default tool exposure but still lets the agent discover additional allowed tools through tool search.
+- `hard` mode also limits what tool search can discover for that step.
+
+Profiles are expressed as a matrix:
+
+- rows are tool groups such as `filesystem`, `web`, `memory`, `shell`, or `browser`
+- columns are capabilities: `read`, `write`, `privileged`, `destructive`
+
+You can start from a shipped preset such as `Direct default`, `General task`, `Research`, `Coding`, or `Review`, then add an inline matrix and explicit include/exclude overrides for the specific step.
+
+Direct chat uses the same mechanism under the hood through the shipped `system:direct` workflow.
 
 ## Creating a workflow
 

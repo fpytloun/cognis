@@ -223,6 +223,9 @@ export interface ToolDefinitionSummary {
   parameters: ToolParameters;
   category: string;
   read_only: boolean;
+  capabilities: string[];
+  classification_source?: string | null;
+  classification_confidence?: number | null;
   source: ToolSource;
   timeout_seconds: number;
   non_bypassable: boolean;
@@ -244,6 +247,9 @@ export interface EffectiveToolItem {
   description: string;
   category: string;
   read_only: boolean;
+  capabilities: string[];
+  classification_source?: string | null;
+  classification_confidence?: number | null;
   source: ToolSource;
   permission: string;
   enabled: boolean;
@@ -821,12 +827,22 @@ export interface WorkflowStep {
   description?: string;
   prompt?: string;
   agent_override?: string | null;
-   reasoning_effort?: string | null;
+  reasoning_effort?: string | null;
   input?: {
     type: string;
     source?: string | string[] | null;
   } | string | string[] | null;
   allow_questions?: boolean;
+  step_profile_id?: string | null;
+  step_profile_mode?: 'soft' | 'hard' | string;
+  step_profile?: {
+    matrix?: Record<string, string[]>;
+    tool_overrides?: {
+      include?: string[];
+      exclude?: string[];
+    } | null;
+    allow_tool_search?: boolean;
+  } | null;
   completion?: Record<string, unknown> | null;
   gate?: Record<string, unknown> | null;
   on_reject?: Record<string, unknown> | null;

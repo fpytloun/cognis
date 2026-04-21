@@ -406,6 +406,9 @@ def tool_to_response(row: Any) -> ToolResponse:
         parameters=row.parameters if isinstance(row.parameters, dict) else {},
         category=row.category,
         read_only=row.read_only,
+        capabilities=[str(capability) for capability in getattr(row, "capabilities", []) or []],
+        classification_source=getattr(row, "classification_source", None),
+        classification_confidence=getattr(row, "classification_confidence", None),
         source=row.source.model_dump(mode="json")
         if hasattr(row.source, "model_dump")
         else row.source,

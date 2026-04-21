@@ -20,6 +20,15 @@ class Permission(StrEnum):
     DENY = "deny"
 
 
+class ToolCapability(StrEnum):
+    """Capability labels used by step profiles and tool classification."""
+
+    READ = "read"
+    WRITE = "write"
+    PRIVILEGED = "privileged"
+    DESTRUCTIVE = "destructive"
+
+
 class ToolSource(BaseModel):
     """Origin metadata for a tool definition."""
 
@@ -41,6 +50,9 @@ class ToolDefinition(BaseModel):
     source: ToolSource
     category: str = "general"
     read_only: bool = False
+    capabilities: list[ToolCapability] = Field(default_factory=list)
+    classification_source: str | None = None
+    classification_confidence: float | None = None
     requires_secrets: list[str] = Field(default_factory=list)
     timeout_seconds: int = 30
     non_bypassable: bool = False
@@ -49,6 +61,14 @@ class ToolDefinition(BaseModel):
     # Runtime-only metadata for executable skill tools (recipe, assets, etc.)
     # Not sent to the LLM — used by executor handlers for execution.
     execution_metadata: dict[str, Any] | None = None
+
+
+def tool_capabilities(tool: ToolDefinition) -> set[ToolCapability]:
+    """Return the normalized capability set for a tool."""
+
+    if tool.capabilities:
+        return {ToolCapability(capability) for capability in tool.capabilities}
+    return {ToolCapability.READ} if tool.read_only else {ToolCapability.WRITE}
 
 
 def stable_tool_id(tool: ToolDefinition) -> str:

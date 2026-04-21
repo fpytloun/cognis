@@ -4,11 +4,11 @@
 
 Step profiles give workflow authors a simple way to restrict the tool surface a step sees, so specialized workflows can stay focused without the author having to enumerate individual tools. This spec defines:
 
-- the `step_profile` field on workflow steps
-- the three profiles shipped in v1: `unrestricted`, `research`, `coding`
-- the tool classification taxonomy (category + side effect)
-- the classification pipeline for builtins, skills, and MCP tools
-- per-step `tool_overrides` (include/exclude)
+- seeded step-profile presets plus inline step-level profile matrices
+- the `step_profile_id`, `step_profile_mode`, and inline `step_profile` fields on workflow steps
+- the tool classification taxonomy (category + capabilities)
+- the classification pipeline for builtins, skills, MCP tools, and Intaris MCP tools
+- per-step explicit include/exclude overrides
 - the exposure resolution order and its relationship to deferred loading / tool search
 
 Related specs: [`06-tool-system.md`](06-tool-system.md), [`14-workflow-engine.md`](14-workflow-engine.md), [`21-workflow-deliverables.md`](21-workflow-deliverables.md), [`27-workflow-composer.md`](27-workflow-composer.md).
@@ -32,17 +32,17 @@ Two constraints shape the design:
 
 The default profile is `unrestricted`. It applies no filter. All tools exposed by the agent's executor are visible. `unrestricted` is the baseline for direct chat, `system:direct`, `system:general-task`, `system:creative`, every user-authored workflow, and every ad-hoc delegation.
 
-### 2. Restrictions are expressed as rule sets over classification
+### 2. Restrictions are expressed as a matrix over classification
 
-The three restrictive profiles (`research`, `coding`) are defined as rules over `(category, side_effect)`, not as hardcoded tool-name lists. This keeps profiles stable across MCP inventory changes: adding a new MCP tool automatically falls into the right profile bucket if its classification is present.
+Profiles are defined as a matrix over `(category, capability)`, not as hardcoded tool-name lists. This keeps profiles stable across MCP inventory changes: adding a new MCP tool automatically falls into the right profile bucket if its classification is present.
 
-### 3. Classification is optional and heuristic-assisted
+### 3. Classification is shared across all tool sources
 
-Builtins declare classification in code. Skills declare it in their manifest. MCP tools are classified at discovery time from the MCP tool annotations and narrow name heuristics. Admin overrides exist but are never required for tools to work.
+Builtins and executor-native tools declare classification in code. Skills can declare it in their manifests. MCP tools and Intaris MCP tools are classified from metadata, narrow heuristics, and an LLM classifier fallback. Read-only tools are classified too.
 
-### 4. Unclassified tools under restrictive profiles are hidden, not blocked
+### 4. Soft and hard modes are separate
 
-Under a restrictive profile, an unclassified MCP tool is hidden from the model but listed in the step editor with a one-click "include anyway" affordance. This respects the "user tools just work" promise — restrictions never silently drop the user's intent.
+`soft` mode narrows default exposure only. The step can still discover additional allowed tools through tool search. `hard` mode also narrows the searchable inventory for that step.
 
 ### 5. Per-step overrides, exclude wins
 
@@ -54,27 +54,28 @@ The three profile rule sets are defined in code, reviewed, and stable. Users do 
 
 ## Profile Semantics
 
-### `unrestricted` (default)
+### Presets and inline matrices
 
-Applies no filter. The tool exposure pipeline returns the full inventory unchanged. `tool_overrides` is ignored under `unrestricted` (there is nothing to override).
+Shipped presets are seeded in code and can be referenced by `step_profile_id`. A step can also provide an inline `step_profile` object with a matrix plus include/exclude overrides. When both are present, the inline matrix augments or replaces rows from the preset.
 
-### `research`
+### Capability columns
 
-Intended for steps that gather, analyze, and synthesize information.
+The capability columns are:
 
-Allowed when **all** hold:
+- `read`
+- `write`
+- `privileged`
+- `destructive`
 
-- `category ∈ {knowledge, web, memory, time, context, workflow, orchestration, system, deliverable}`
-- `side_effect ∈ {readonly}`, OR `category ∈ {memory, deliverable}` and `side_effect ∈ {readonly, write}` (memory and deliverable writes are always allowed)
-- tool is not `destructive`
+### Seeded presets in v1
 
-Typical visible tools:
+- `system:direct-default`
+- `system:general-task`
+- `system:research`
+- `system:coding`
+- `system:review`
 
-- web search, extract, crawl (readonly)
-- `memory_*` (full)
-- knowledge/context readers
-- `time_*` helpers
-- controller tools (`step_complete`, `step_todo_write`, `step_todo_list`, `write_deliverable`)
+These presets are intentionally agent-oriented rather than classical automation-oriented. They describe the default tool surface for an agent working inside a workflow step.
 
 Typical hidden tools:
 
@@ -82,25 +83,25 @@ Typical hidden tools:
 - `bash` / shell
 - MCP tools classified as `destructive` or `write` outside `memory`
 
-### `coding`
+### `system:direct-default`
 
-Intended for steps that modify code, run shells, or use language servers.
+The shipped direct-chat preset is intentionally soft. It includes:
 
-Allowed when any hold:
+- read access to common context and retrieval groups such as `filesystem`, `web`, and `datetime`
+- read and write access to `memory`
+- controller and workflow categories needed for normal chat execution
 
-- anything allowed by `research`
-- `category ∈ {filesystem, shell, lsp, code}` (all side effects allowed within these categories)
+### `system:research`
 
-Typical visible tools:
+Research presets focus on read-heavy categories with memory writes still available.
 
-- `research` set ∪
-- `edit`, `multiedit`, `patch`, `write`, `read`, `glob`, `grep` (filesystem)
-- `bash` (shell)
-- LSP diagnostics and code tools
+### `system:coding`
 
-Typical hidden tools:
+Coding presets extend research-style access with `filesystem`, `shell`, `lsp`, and other implementation-oriented categories.
 
-- `destructive` MCP tools outside the coding categories (for example, messaging `send_*` tools)
+### `system:review`
+
+Review presets are read-heavy like research, but include code-inspection categories such as `filesystem` and `lsp` without default write-heavy implementation access.
 
 ## Tool Classification Taxonomy
 
@@ -116,29 +117,30 @@ New categories added by this spec:
 
 No backward-incompatible changes to the category set.
 
-### Side effect (new, optional axis)
+### Capabilities (new axis)
 
 ```python
 class ToolDefinition(BaseModel):
     # existing fields
-    side_effect: Literal["readonly", "write", "destructive"] | None = None
+    capabilities: list[Literal["read", "write", "privileged", "destructive"]] = []
 ```
 
 Meaning:
 
-- `readonly` — pure read; never changes external state.
-- `write` — changes state but is reversible or limited to owned data.
-- `destructive` — irreversibly removes or broadly affects state.
+- `read` — pure read or observation.
+- `write` — mutates owned or local state.
+- `privileged` — broad system, browser, shell, or sensitive capability.
+- `destructive` — irreversible or broadly damaging action.
 
-When `side_effect` is `None`, the tool is treated as unclassified: visible under `unrestricted`, hidden under restrictive profiles (subject to overrides).
+When `capabilities` is empty, Cognis derives a default from `read_only` and narrow heuristics. Dynamic tools can be refined further by the classifier pipeline.
 
 ### Classification for MCP tools
 
-MCP tool metadata may include annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`). The classification pipeline maps them:
+MCP tool metadata may include annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`). The classification pipeline maps them into capabilities and can refine category from the tool metadata, name, description, and an LLM classifier fallback.
 
-- `readOnlyHint=true` → `side_effect="readonly"`
-- `destructiveHint=true` → `side_effect="destructive"`
-- `readOnlyHint=false` and no destructive hint → `side_effect="write"`
+- `readOnlyHint=true` → `capabilities=["read"]`
+- `destructiveHint=true` → include `"destructive"`
+- `readOnlyHint=false` and no destructive hint → include `"write"`
 - no annotations → fall through to heuristic
 
 ### Name/description heuristic (narrow)

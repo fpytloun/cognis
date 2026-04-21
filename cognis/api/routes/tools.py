@@ -68,6 +68,7 @@ from cognis.store.queries import (
 from cognis.store.queries import (
     list_mcp_servers as list_global_mcp_servers,
 )
+from cognis.tools.classification import classify_tool_definitions
 from cognis.tools.executor.definitions import executor_tool_definitions
 from cognis.tools.mcp import (
     MCPClient,
@@ -123,7 +124,10 @@ async def _discover_local_mcp_tools(
 @router.get("/api/v1/tools", response_model=list[ToolResponse])
 async def list_tools(request: Request) -> list[ToolResponse]:
     require_current_user(request)
-    return [tool_to_response(tool) for tool in select_static_tools()]
+    tools = await classify_tool_definitions(
+        select_static_tools(), llm=request.app.state.providers.llm
+    )
+    return [tool_to_response(tool) for tool in tools]
 
 
 @router.get("/api/v1/tools/local-mcp/observed", response_model=list[ToolResponse])
@@ -146,6 +150,7 @@ async def list_observed_local_mcp_tools(request: Request) -> list[ToolResponse]:
             tool.name,
         ),
     )
+    ordered = await classify_tool_definitions(ordered, llm=request.app.state.providers.llm)
     return [tool_to_response(tool) for tool in ordered]
 
 
@@ -153,7 +158,10 @@ async def list_observed_local_mcp_tools(request: Request) -> list[ToolResponse]:
 async def list_executor_tools(request: Request) -> list[ToolResponse]:
     """List executor-native tools with their definitions."""
     require_current_user(request)
-    return [tool_to_response(tool) for tool in executor_tool_definitions()]
+    tools = await classify_tool_definitions(
+        executor_tool_definitions(), llm=request.app.state.providers.llm
+    )
+    return [tool_to_response(tool) for tool in tools]
 
 
 @router.get("/api/v1/agents/{agent_id}/effective-tools", response_model=EffectiveToolsResponse)
@@ -384,6 +392,10 @@ async def _resolve_effective_tools_response(
     for warning in intaris_result.warnings:
         if warning not in warnings:
             warnings.append(warning)
+    configured_tools = await classify_tool_definitions(
+        configured_tools,
+        llm=request.app.state.providers.llm,
+    )
 
     configured_items = [
         EffectiveToolItemResponse(
@@ -392,6 +404,9 @@ async def _resolve_effective_tools_response(
             description=tool.description,
             category=tool.category,
             read_only=tool.read_only,
+            capabilities=[str(capability) for capability in tool.capabilities],
+            classification_source=tool.classification_source,
+            classification_confidence=tool.classification_confidence,
             source=tool.source.model_dump(mode="json"),
             permission=_tool_permission(agent, tool),
             enabled=True,
@@ -426,7 +441,11 @@ async def _resolve_effective_tools_response(
             for warning in merged_result.warnings:
                 if warning not in warnings:
                     warnings.append(warning)
-            for tool in merged_result.tools:
+            live_tools = await classify_tool_definitions(
+                merged_result.tools,
+                llm=request.app.state.providers.llm,
+            )
+            for tool in live_tools:
                 live_items.append(
                     EffectiveToolItemResponse(
                         tool_id=_tool_identifier(tool),
@@ -434,6 +453,9 @@ async def _resolve_effective_tools_response(
                         description=tool.description,
                         category=tool.category,
                         read_only=tool.read_only,
+                        capabilities=[str(capability) for capability in tool.capabilities],
+                        classification_source=tool.classification_source,
+                        classification_confidence=tool.classification_confidence,
                         source=tool.source.model_dump(mode="json"),
                         permission=_tool_permission(agent, tool),
                         enabled=True,
@@ -547,6 +569,7 @@ async def list_intaris_mcp_tools(request: Request) -> list[ToolResponse]:
             tool.name,
         ),
     )
+    ordered = await classify_tool_definitions(ordered, llm=request.app.state.providers.llm)
     return [tool_to_response(tool) for tool in ordered]
 
 
@@ -557,13 +580,19 @@ async def list_agent_tools(request: Request, agent_id: str) -> list[ToolResponse
     if agent is None:
         raise api_exception(404, "not_found", "Agent not found")
     require_owner_or_admin(request, agent.owner_email)
-    tools = [tool_to_response(tool) for tool in select_static_tools(agent)]
+    classified_static = await classify_tool_definitions(
+        select_static_tools(agent), llm=request.app.state.providers.llm
+    )
+    tools = [tool_to_response(tool) for tool in classified_static]
     agent_definition = AgentDefinition.model_validate(agent_to_response(agent).model_dump())
     try:
         discovered = await _discover_local_mcp_tools(request, agent_definition, agent.owner_email)
     except Exception:
         discovered = []
-    tools.extend(ToolResponse.model_validate(tool) for tool in discovered)
+    discovered = await classify_tool_definitions(discovered, llm=request.app.state.providers.llm)
+    tools.extend(
+        ToolResponse.model_validate(tool_to_response(tool).model_dump()) for tool in discovered
+    )
     return tools
 
 

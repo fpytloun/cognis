@@ -17,6 +17,7 @@ from pydantic import ValidationError
 
 from cognis.api.models import (
     DeliverableResponse,
+    EffectiveToolItemResponse,
     ModelRoutingEntry,
     ModelRoutingResponse,
     PendingPauseResponse,
@@ -24,6 +25,7 @@ from cognis.api.models import (
     SkillVersionResponse,
     StepRunResponse,
     TaskResponse,
+    ToolResponse,
     WorkflowResponse,
 )
 from cognis.api.serializers import llm_provider_to_response, step_run_to_response
@@ -248,14 +250,70 @@ def test_workflow_response_round_trips_lifecycle_and_lineage() -> None:
     assert response.lineage == {"base_workflow_id": "system:software-development"}
 
 
+def test_workflow_response_preserves_step_profile_shape() -> None:
+    response = WorkflowResponse(
+        workflow_id="wf-1",
+        name="Workflow",
+        steps=[
+            {
+                "name": "execute",
+                "type": "run",
+                "step_profile_id": "system:coding",
+                "step_profile_mode": "hard",
+                "step_profile": {
+                    "matrix": {"filesystem": ["read", "write"]},
+                    "tool_overrides": {"include": ["read"], "exclude": ["bash"]},
+                    "allow_tool_search": False,
+                },
+            }
+        ],
+    )
+
+    assert response.steps[0]["step_profile_id"] == "system:coding"
+    assert response.steps[0]["step_profile_mode"] == "hard"
+    assert response.steps[0]["step_profile"]["matrix"]["filesystem"] == ["read", "write"]
+
+
+def test_tool_response_round_trips_classification_fields() -> None:
+    response = ToolResponse(
+        name="read",
+        description="Read a file",
+        category="filesystem",
+        read_only=True,
+        capabilities=["read"],
+        classification_source="declared",
+        classification_confidence=1.0,
+    )
+
+    assert response.capabilities == ["read"]
+    assert response.classification_source == "declared"
+    assert response.classification_confidence == 1.0
+
+
+def test_effective_tool_item_round_trips_classification_fields() -> None:
+    response = EffectiveToolItemResponse(
+        tool_id="builtin:read",
+        name="read",
+        description="Read a file",
+        category="filesystem",
+        read_only=True,
+        capabilities=["read"],
+        classification_source="llm",
+        classification_confidence=0.83,
+        permission="allow",
+    )
+
+    assert response.capabilities == ["read"]
+    assert response.classification_source == "llm"
+    assert response.classification_confidence == pytest.approx(0.83)
+
+
 class TestModelRoutingContracts:
     def test_model_routing_defaults_to_empty_route_entries(self) -> None:
         response = ModelRoutingResponse()
 
         assert response.default == ModelRoutingEntry(model=None, reasoning_effort=None)
-        assert response.image_generation == ModelRoutingEntry(
-            model=None, reasoning_effort=None
-        )
+        assert response.image_generation == ModelRoutingEntry(model=None, reasoning_effort=None)
 
     def test_model_routing_preserves_nested_entry_shape(self) -> None:
         response = ModelRoutingResponse(

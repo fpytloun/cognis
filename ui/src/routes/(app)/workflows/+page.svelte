@@ -25,12 +25,14 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
     formStateToSystemWorkflowOverridePayload,
     formStateToWorkflowPayload,
     importWorkflowYaml,
+    STEP_PROFILE_CAPABILITIES,
+    STEP_PROFILE_OPTIONS,
     workflowThinkingEfforts,
     validateWorkflowForm,
     workflowToFormState,
     type WorkflowFormState
   } from '$lib/workflows';
-  import type { Agent, Workflow } from '$lib/types/api';
+  import type { Agent, ToolDefinitionSummary, Workflow } from '$lib/types/api';
 
   let loading = true;
   let saving = false;
@@ -38,6 +40,8 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
   let importText = '';
   let workflows: Workflow[] = [];
   let secondaryAgents: Agent[] = [];
+  let availableTools: ToolDefinitionSummary[] = [];
+  let availableToolCategories: string[] = [];
   let selectedWorkflow: Workflow | null = null;
   let form: WorkflowFormState = createEmptyWorkflowForm();
   let dragIndex = -1;
@@ -51,6 +55,16 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
     if (field === 'stepReasoning') return editable.has('steps.*.reasoning_effort');
     if (field === 'stepMaxAttempts') return editable.has('steps.*.completion.max_attempts');
     return false;
+  }
+
+  function canEditSystemProfileField(): boolean {
+    if (!selectedWorkflow?.is_system) return true;
+    const editable = new Set(selectedWorkflow.editable_fields ?? []);
+    return (
+      editable.has('steps.*.step_profile_id') ||
+      editable.has('steps.*.step_profile_mode') ||
+      editable.has('steps.*.step_profile')
+    );
   }
 
   function isDirty(): boolean {
@@ -79,10 +93,12 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
     loading = true;
     error = '';
     try {
-      [workflows, secondaryAgents] = await Promise.all([
+      [workflows, secondaryAgents, availableTools] = await Promise.all([
         api.workflows.listAll({ include_disabled: true, include_ephemeral: showEphemeral }),
         api.agents.listAll({ agent_type: 'secondary' }),
+        api.tools.list()
       ]);
+      availableToolCategories = [...new Set(availableTools.map((tool) => tool.category).filter(Boolean))].sort();
       const nextSelected = selectedId ? workflows.find((workflow) => workflow.workflow_id === selectedId) : selectedWorkflow ? workflows.find((workflow) => workflow.workflow_id === selectedWorkflow?.workflow_id) : workflows[0];
       if (nextSelected) {
         selectedWorkflow = nextSelected;
@@ -317,6 +333,49 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
     const [moved] = steps.splice(index, 1);
     steps.splice(target, 0, moved);
     form.steps = steps;
+  }
+
+  function toggleStepProfileCapability(index: number, category: string, capability: string): void {
+    const step = form.steps[index];
+    const matrix = [...step.stepProfileMatrix];
+    const existing = matrix.find((row) => row.category === category);
+    if (!existing) {
+      matrix.push({ category, capabilities: [capability] });
+    } else if (existing.capabilities.includes(capability)) {
+      existing.capabilities = existing.capabilities.filter((item) => item !== capability);
+      if (existing.capabilities.length === 0) {
+        step.stepProfileMatrix = matrix.filter((row) => row.category !== category);
+        return;
+      }
+    } else {
+      existing.capabilities = [...existing.capabilities, capability];
+    }
+    step.stepProfileMatrix = matrix;
+  }
+
+  function addProfileCategory(index: number, category: string): void {
+    const step = form.steps[index];
+    if (step.stepProfileMatrix.some((row) => row.category === category)) return;
+    step.stepProfileMatrix = [...step.stepProfileMatrix, { category, capabilities: ['read'] }];
+  }
+
+  function removeProfileCategory(index: number, category: string): void {
+    const step = form.steps[index];
+    step.stepProfileMatrix = step.stepProfileMatrix.filter((row) => row.category !== category);
+  }
+
+  function remainingProfileCategories(index: number): string[] {
+    const used = new Set(form.steps[index]?.stepProfileMatrix.map((row) => row.category) ?? []);
+    return availableToolCategories.filter((category) => !used.has(category));
+  }
+
+  function handleAddProfileCategory(index: number, event: Event): void {
+    const target = event.currentTarget;
+    if (!(target instanceof HTMLSelectElement)) return;
+    const category = target.value;
+    if (!category) return;
+    addProfileCategory(index, category);
+    target.value = '';
   }
 
   function downloadCurrentWorkflow(): void {
@@ -645,6 +704,100 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
                       {/each}
                     </select>
                   </label>
+
+                  <details class="mt-4" open={!!step.stepProfileId || step.stepProfileMatrix.length > 0 || !!step.stepProfileIncludeText || !!step.stepProfileExcludeText}>
+                    <summary class="cursor-pointer text-sm font-medium text-slate-300 hover:text-slate-100">
+                      Tool profile
+                      <Tooltip text="Profiles narrow the tool surface for this step. Soft mode changes default exposure only. Hard mode also restricts which tools search can discover.">
+                        <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-700 text-xs text-slate-400 hover:text-slate-200 focus-visible:border-slate-400 md:h-5 md:w-5">?</button>
+                      </Tooltip>
+                    </summary>
+                    <div class="mt-3 space-y-4">
+                      <div class="grid gap-4 md:grid-cols-3">
+                        <label class="space-y-2 text-sm font-medium text-slate-200">
+                          <span>Preset</span>
+                          <select bind:value={step.stepProfileId} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!canEditSystemProfileField()}>
+                            {#each STEP_PROFILE_OPTIONS as option}
+                              <option value={option.id}>{option.label}</option>
+                            {/each}
+                          </select>
+                        </label>
+                        <label class="space-y-2 text-sm font-medium text-slate-200">
+                          <span>Mode</span>
+                          <select bind:value={step.stepProfileMode} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!canEditSystemProfileField()}>
+                            <option value="soft">Soft</option>
+                            <option value="hard">Hard</option>
+                          </select>
+                        </label>
+                        <label class="flex items-center gap-3 rounded-xl border border-slate-800 bg-slate-950/60 px-3 py-2 text-sm text-slate-200">
+                          <input bind:checked={step.stepProfileAllowToolSearch} class="h-4 w-4 rounded border-slate-600 bg-slate-950" disabled={!canEditSystemProfileField()} type="checkbox" />
+                          <span>Allow tool search</span>
+                        </label>
+                      </div>
+
+                      <div class="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
+                        <div class="flex flex-wrap items-center justify-between gap-3">
+                          <div>
+                            <p class="text-sm font-medium text-slate-200">Capability matrix</p>
+                            <p class="mt-1 text-xs text-slate-400">Rows are tool groups. Columns decide which capabilities are exposed or allowed for this step.</p>
+                          </div>
+                          {#if remainingProfileCategories(index).length > 0}
+                            <select class="rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!canEditSystemProfileField()} onchange={(event) => handleAddProfileCategory(index, event)}>
+                              <option value="">Add group…</option>
+                              {#each remainingProfileCategories(index) as category}
+                                <option value={category}>{category}</option>
+                              {/each}
+                            </select>
+                          {/if}
+                        </div>
+                        <div class="mt-3 overflow-x-auto">
+                          <table class="min-w-full border-separate border-spacing-y-2 text-sm text-slate-200">
+                            <thead>
+                              <tr class="text-left text-xs uppercase tracking-[0.2em] text-slate-500">
+                                <th class="px-3 py-2">Group</th>
+                                {#each STEP_PROFILE_CAPABILITIES as capability}
+                                  <th class="px-3 py-2">{capability}</th>
+                                {/each}
+                                <th class="px-3 py-2"></th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {#each step.stepProfileMatrix as row}
+                                <tr class="rounded-xl border border-slate-800 bg-slate-950/70">
+                                  <td class="px-3 py-2 font-medium">{row.category}</td>
+                                  {#each STEP_PROFILE_CAPABILITIES as capability}
+                                    <td class="px-3 py-2">
+                                      <input
+                                        checked={row.capabilities.includes(capability)}
+                                        class="h-4 w-4 rounded border-slate-600 bg-slate-950"
+                                        disabled={!canEditSystemProfileField()}
+                                        type="checkbox"
+                                        onchange={() => toggleStepProfileCapability(index, row.category, capability)}
+                                      />
+                                    </td>
+                                  {/each}
+                                  <td class="px-3 py-2 text-right">
+                                    <button type="button" class="text-xs text-slate-400 hover:text-rose-300" onclick={() => removeProfileCategory(index, row.category)} disabled={!canEditSystemProfileField()}>Remove</button>
+                                  </td>
+                                </tr>
+                              {/each}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+
+                      <div class="grid gap-4 md:grid-cols-2">
+                        <label class="space-y-2 text-sm font-medium text-slate-200">
+                          <span>Explicit include</span>
+                          <Input bind:value={step.stepProfileIncludeText} disabled={!canEditSystemProfileField()} placeholder="tool_name, mcp_server__tool" />
+                        </label>
+                        <label class="space-y-2 text-sm font-medium text-slate-200">
+                          <span>Explicit exclude</span>
+                          <Input bind:value={step.stepProfileExcludeText} disabled={!canEditSystemProfileField()} placeholder="tool_name, mcp_server__tool" />
+                        </label>
+                      </div>
+                    </div>
+                  </details>
                 {/if}
 
                 <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">

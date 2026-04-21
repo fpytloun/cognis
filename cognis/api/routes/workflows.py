@@ -19,6 +19,7 @@ from cognis.core.workflow_management import (
     update_user_workflow,
 )
 from cognis.models.config import NORMALIZED_REASONING_LEVELS, normalize_reasoning_level
+from cognis.models.workflow import StepProfileConfig
 from cognis.store.queries import (
     delete_system_workflow_override,
     get_system_workflow_override,
@@ -188,6 +189,20 @@ async def _update_system_workflow_route(
             max_attempts = completion.get("max_attempts")
             if isinstance(max_attempts, int):
                 override["completion"] = {"max_attempts": max_attempts}
+        step_profile_id = step_payload.get("step_profile_id")
+        if isinstance(step_profile_id, str):
+            override["step_profile_id"] = step_profile_id
+        step_profile_mode = step_payload.get("step_profile_mode")
+        if isinstance(step_profile_mode, str) and step_profile_mode in {"soft", "hard"}:
+            override["step_profile_mode"] = step_profile_mode
+        step_profile = step_payload.get("step_profile")
+        if isinstance(step_profile, dict):
+            try:
+                override["step_profile"] = StepProfileConfig.model_validate(step_profile).model_dump(
+                    mode="json"
+                )
+            except Exception as exc:
+                raise api_exception(422, "invalid_step_profile", str(exc)) from exc
         if override:
             step_overrides[step_name] = override
 

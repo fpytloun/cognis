@@ -6,6 +6,21 @@ import { isRecord } from '$lib/utils';
 
 type OutcomeAction = 'none' | 'fail' | 'gate' | 'continue' | 'cancel' | 'revise';
 
+export const STEP_PROFILE_CAPABILITIES = ['read', 'write', 'privileged', 'destructive'] as const;
+export const STEP_PROFILE_OPTIONS = [
+  { id: '', label: 'Unrestricted' },
+  { id: 'system:direct-default', label: 'Direct default' },
+  { id: 'system:general-task', label: 'General task' },
+  { id: 'system:research', label: 'Research' },
+  { id: 'system:coding', label: 'Coding' },
+  { id: 'system:review', label: 'Review' }
+] as const;
+
+export interface WorkflowStepProfileRowFormState {
+  category: string;
+  capabilities: string[];
+}
+
 export interface WorkflowStepFormState {
   name: string;
   type: 'run' | 'gate';
@@ -13,6 +28,12 @@ export interface WorkflowStepFormState {
   agentOverride: string;
   reasoningEffort: string;
   requireDeliverable: boolean;
+  stepProfileId: string;
+  stepProfileMode: 'soft' | 'hard';
+  stepProfileAllowToolSearch: boolean;
+  stepProfileMatrix: WorkflowStepProfileRowFormState[];
+  stepProfileIncludeText: string;
+  stepProfileExcludeText: string;
   inputMode: 'auto' | 'null' | 'last' | 'full' | 'summary';
   inputText: string;
   allowQuestions: boolean;
@@ -64,6 +85,12 @@ export function createEmptyStep(): WorkflowStepFormState {
     agentOverride: '',
     reasoningEffort: '',
     requireDeliverable: true,
+    stepProfileId: '',
+    stepProfileMode: 'soft',
+    stepProfileAllowToolSearch: true,
+    stepProfileMatrix: [],
+    stepProfileIncludeText: '',
+    stepProfileExcludeText: '',
     inputMode: 'null',
     inputText: '',
     allowQuestions: false,
@@ -156,6 +183,53 @@ function formInputToPayload(
 
 function parseList(value: string): string[] {
   return value.split(',').map((item) => item.trim()).filter(Boolean);
+}
+
+function parseProfileMatrix(value: Workflow['steps'][number]['step_profile']): WorkflowStepProfileRowFormState[] {
+  const matrix = isRecord(value?.matrix) ? value.matrix : {};
+  return Object.entries(matrix).map(([category, capabilities]) => ({
+    category,
+    capabilities: Array.isArray(capabilities)
+      ? capabilities.filter((item): item is string => typeof item === 'string')
+      : []
+  }));
+}
+
+function profileOverrideList(
+  value: Workflow['steps'][number]['step_profile'],
+  key: 'include' | 'exclude'
+): string {
+  const overrides = isRecord(value?.tool_overrides) ? value.tool_overrides : null;
+  const items = Array.isArray(overrides?.[key])
+    ? overrides[key].filter((item): item is string => typeof item === 'string')
+    : [];
+  return items.join(', ');
+}
+
+function formProfileToPayload(step: WorkflowStepFormState): Workflow['steps'][number]['step_profile'] | undefined {
+  const matrix = Object.fromEntries(
+    step.stepProfileMatrix
+      .map((row) => [row.category.trim(), row.capabilities.filter(Boolean)])
+      .filter(([category, capabilities]) => category && capabilities.length > 0)
+  );
+  const include = parseList(step.stepProfileIncludeText);
+  const exclude = parseList(step.stepProfileExcludeText);
+  if (
+    Object.keys(matrix).length === 0 &&
+    include.length === 0 &&
+    exclude.length === 0 &&
+    step.stepProfileAllowToolSearch
+  ) {
+    return undefined;
+  }
+  return {
+    ...(Object.keys(matrix).length > 0 ? { matrix } : {}),
+    tool_overrides: {
+      include,
+      exclude
+    },
+    allow_tool_search: step.stepProfileAllowToolSearch
+  };
 }
 
 function parseGateOptions(value: string): Array<{ label: string; action: string }> {
@@ -259,6 +333,12 @@ export function workflowToFormState(workflow: Workflow): WorkflowFormState {
         agentOverride: step.agent_override ?? '',
         reasoningEffort: typeof step.reasoning_effort === 'string' ? step.reasoning_effort : '',
         requireDeliverable: step.require_deliverable !== false,
+        stepProfileId: typeof step.step_profile_id === 'string' ? step.step_profile_id : '',
+        stepProfileMode: step.step_profile_mode === 'hard' ? 'hard' : 'soft',
+        stepProfileAllowToolSearch: step.step_profile?.allow_tool_search !== false,
+        stepProfileMatrix: parseProfileMatrix(step.step_profile),
+        stepProfileIncludeText: profileOverrideList(step.step_profile, 'include'),
+        stepProfileExcludeText: profileOverrideList(step.step_profile, 'exclude'),
         inputMode: workflowInputMode(step.input),
         inputText: workflowInputSourceNames(step.input).join(', '),
         allowQuestions: step.allow_questions ?? false,
@@ -339,6 +419,9 @@ export function formStateToWorkflowPayload(form: WorkflowFormState): Record<stri
         agent_override: step.agentOverride || null,
         reasoning_effort: step.reasoningEffort || undefined,
         require_deliverable: step.requireDeliverable,
+        step_profile_id: step.stepProfileId.trim() || undefined,
+        step_profile_mode: step.stepProfileMode,
+        step_profile: formProfileToPayload(step),
         ...(inputPayload ? { input: inputPayload } : {}),
         allow_questions: step.allowQuestions,
         completion:
@@ -374,6 +457,9 @@ export function formStateToSystemWorkflowOverridePayload(form: WorkflowFormState
     steps: form.steps.map((step) => ({
       name: step.name,
       reasoning_effort: step.reasoningEffort || undefined,
+      step_profile_id: step.stepProfileId.trim() || undefined,
+      step_profile_mode: step.stepProfileMode,
+      step_profile: formProfileToPayload(step),
       completion: {
         max_attempts: Number(step.maxAttempts)
       }

@@ -21,7 +21,7 @@ Part of the Openclaw ecosystem: Cognis controller, [Intaris](https://github.com/
 - **Interactive chat with streaming** -- WebSocket-based chat with real-time token streaming, tool call indicators, and delegation status cards.
 - **Agent identity** -- Create agents with name, personality, behavioral rules, and skills. Personality bootstrapped to Mnemory and evolves through interactions.
 - **Sub-session delegation** -- Three modes: Agent (delegate to different agent), Worker (same agent, focused task), Fork (parallel exploration). Main chat stays responsive.
-- **Task queue + workflows** -- Durable kanban-style tasks with priorities, dependencies, portable workflow templates, step evaluation, and human-in-the-loop gates.
+- **Task queue + workflows** -- Durable kanban-style tasks with priorities, dependencies, portable workflow templates, per-step tool profiles, step evaluation, and human-in-the-loop gates.
 - **Controller-executor separation** -- The controller decides; executors do. Ships with in-process, subprocess, and remote WebSocket executors using JSON-RPC 2.0 over WebSocket. Remote executors can provide local LLM inference alongside tool execution, and executor-hosted channel adapters are already supported for integrations that need user-local services such as Signal via `signal-cli`.
 - **Memory integration** -- Persistent recall and remember through [Mnemory](https://github.com/fpytloun/mnemory). Agent identity, user facts, episodic memory, and artifacts.
 - **Guardrails integration** -- Every tool call evaluated by [Intaris](https://github.com/fpytloun/intaris). Escalation prompts with approve/deny. Session recording and behavioral analysis.

@@ -14,6 +14,8 @@ The tool registry lists available tools from multiple sources, including:
 
 Use the filters to narrow by category or source when you want to understand what is available before enabling it on an executor or agent.
 
+Tool categories also drive workflow step tool profiles. A step profile can reduce which categories and capabilities are exposed by default for a specific step without changing the agent's underlying capability boundary.
+
 ## Why the registry matters
 
 The registry is a reference view, not the final permission model.
@@ -119,6 +121,8 @@ Import security:
 ### Executable skill tools
 
 Skills can define tools with execution recipes. These tools appear as first-class tools in the agent's effective tool set. When called, the executor stages required assets into a temporary workspace, executes the recipe, and cleans up afterward.
+
+Skills can also carry reusable workflow step material, including step tool-profile data. That means a skill can ship both executable tools and the recommended tool surface for the steps it contributes to composed workflows.
 
 Skill assets are stored in Cognis itself (database metadata plus artifact storage) and are never managed as editable controller filesystem state. Executors only receive temporary staged copies for execution.
 
