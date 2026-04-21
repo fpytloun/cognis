@@ -669,7 +669,9 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
         <SkillDetailSheet
           open={skillDetailId !== null}
           skill={selectedSkillDetail}
+          mode="view"
           onClose={() => { skillDetailId = null; }}
+          allowManage={false}
         />
 
         <!-- Intaris MCP Servers -->

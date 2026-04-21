@@ -8,6 +8,7 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
 
   import { api, asApiError } from '$lib/api/client';
   import LoadingState from '$lib/components/LoadingState.svelte';
+  import { loadSkillWorkflowDraft, skillToWorkflowDraft } from '$lib/skills';
   import Button from '$lib/components/ui/Button.svelte';
   import Card from '$lib/components/ui/Card.svelte';
   import Input from '$lib/components/ui/Input.svelte';
@@ -126,25 +127,49 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
 
   async function loadDraftFromQuery(): Promise<void> {
     const workflowId = $page.url.searchParams.get('draftFrom');
-    if (!workflowId) return;
+    const skillId = $page.url.searchParams.get('draftFromSkill');
+    if (!workflowId && !skillId) return;
+    if (workflowId) {
+      try {
+        const source = await api.workflows.detail(workflowId);
+        const nextForm = workflowToFormState(source);
+        selectedWorkflow = null;
+        form = {
+          ...nextForm,
+          workflowId: '',
+          lifecycle: 'persistent',
+          name: source.name.endsWith(' Copy') ? source.name : `${source.name} Copy`,
+          lineage: {
+            ...(source.lineage ?? {}),
+            base_workflow_id: source.workflow_id,
+            composition_source: 'promoted'
+          }
+        };
+        error = '';
+        initialSnapshot = JSON.stringify(form);
+        addToast('Workflow draft loaded from task history.', 'success');
+      } catch (caughtError) {
+        error = asApiError(caughtError).message;
+        addToast(error, 'error', 4_000, 'Unable to load workflow draft');
+      }
+      return;
+    }
+
     try {
-      const source = await api.workflows.detail(workflowId);
-      const nextForm = workflowToFormState(source);
+      const stored = skillId ? loadSkillWorkflowDraft(skillId) : null;
+      const nextForm = stored
+        ? stored.form
+        : skillId
+          ? skillToWorkflowDraft(await api.skills.get(skillId))
+          : null;
+      if (!nextForm) {
+        return;
+      }
       selectedWorkflow = null;
-      form = {
-        ...nextForm,
-        workflowId: '',
-        lifecycle: 'persistent',
-        name: source.name.endsWith(' Copy') ? source.name : `${source.name} Copy`,
-        lineage: {
-          ...(source.lineage ?? {}),
-          base_workflow_id: source.workflow_id,
-          composition_source: 'promoted'
-        }
-      };
+      form = { ...nextForm, workflowId: '', lifecycle: 'persistent' };
       error = '';
       initialSnapshot = JSON.stringify(form);
-      addToast('Workflow draft loaded from task history.', 'success');
+      addToast('Workflow draft loaded from skill decomposition.', 'success');
     } catch (caughtError) {
       error = asApiError(caughtError).message;
       addToast(error, 'error', 4_000, 'Unable to load workflow draft');

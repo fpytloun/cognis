@@ -1,9 +1,8 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
-  import BrainCircuit from 'lucide-svelte/icons/brain-circuit';
+import { onMount } from 'svelte';
+import BrainCircuit from 'lucide-svelte/icons/brain-circuit';
 import ChevronDown from 'lucide-svelte/icons/chevron-down';
 import ChevronRight from 'lucide-svelte/icons/chevron-right';
-import Download from 'lucide-svelte/icons/download';
 import ExternalLink from 'lucide-svelte/icons/external-link';
 import GitBranch from 'lucide-svelte/icons/git-branch';
 import Import from 'lucide-svelte/icons/import';
@@ -13,23 +12,17 @@ import Plus from 'lucide-svelte/icons/plus';
 import Search from 'lucide-svelte/icons/search';
 import Settings from 'lucide-svelte/icons/settings';
 import ShieldCheck from 'lucide-svelte/icons/shield-check';
-import Trash2 from 'lucide-svelte/icons/trash-2';
-import Pencil from 'lucide-svelte/icons/pencil';
 import FileText from 'lucide-svelte/icons/file-text';
 import Terminal from 'lucide-svelte/icons/terminal';
 import Globe from 'lucide-svelte/icons/globe';
 import Wrench from 'lucide-svelte/icons/wrench';
 import Server from 'lucide-svelte/icons/server';
   import BookOpen from 'lucide-svelte/icons/book-open';
-  import Eye from 'lucide-svelte/icons/eye';
-  import Upload from 'lucide-svelte/icons/upload';
-  import X from 'lucide-svelte/icons/x';
 
   import { api } from '$lib/api/client';
   import SkillDetailSheet from '$lib/components/skills/SkillDetailSheet.svelte';
   import Badge from '$lib/components/ui/Badge.svelte';
   import Button from '$lib/components/ui/Button.svelte';
-  import { confirmAction } from '$lib/stores/confirm';
   import { addToast } from '$lib/stores/toasts';
   import {
     buildRegistryWarnings,
@@ -46,11 +39,10 @@ import Server from 'lucide-svelte/icons/server';
     isCachedObservedTool,
     mergeToolInventories
   } from '$lib/tools-registry';
-  import type { ExecutorConfig, MCPServerConfigResponse, IntarisMCPServer, Skill, SkillAssetInput, ToolDefinitionSummary, SystemDiagnostics } from '$lib/types/api';
+  import type { ExecutorConfig, MCPServerConfigResponse, IntarisMCPServer, Skill, ToolDefinitionSummary, SystemDiagnostics } from '$lib/types/api';
 
   type ToolsTab = 'builtin' | 'intaris_mcp' | 'executor_mcp' | 'skills';
   type SkillImportMode = 'url' | 'content' | 'package';
-  type SkillFormAsset = SkillAssetInput & { size_bytes?: number };
 
   let activeTab: ToolsTab = 'builtin';
   let staticTools: ToolDefinitionSummary[] = [];
@@ -71,6 +63,7 @@ import Server from 'lucide-svelte/icons/server';
 
   let expandedTools: Set<string> = new Set();
   let expandedGroups: Set<string> = new Set();
+  let skillsSearch = '';
 
   function toggleGroup(key: string) {
     if (expandedGroups.has(key)) {
@@ -81,23 +74,12 @@ import Server from 'lucide-svelte/icons/server';
     expandedGroups = expandedGroups;
   }
 
-  let showSkillForm = false;
   let showImportForm = false;
   let importMode: SkillImportMode = 'url';
+  let skillSheetOpen = false;
+  let skillSheetMode: 'view' | 'edit' | 'create' = 'view';
   let selectedSkillId: string | null = null;
   let selectedSkill: Skill | null = null;
-  let editingSkill: Skill | null = null;
-  let skillForm = {
-    name: '',
-    description: '',
-    instructions: '',
-    tags: '',
-    autoLoad: false,
-    toolsJson: '[]',
-    promptTemplatesJson: '{}',
-    secretPlaceholders: '',
-    assets: [] as SkillFormAsset[]
-  };
   let importForm = {
     url: '',
     content: '',
@@ -110,6 +92,21 @@ import Server from 'lucide-svelte/icons/server';
   };
 
   $: selectedSkill = skills.find((skill) => skill.skill_id === selectedSkillId) || null;
+  $: filteredSkills = skills
+    .filter((skill) => {
+      const query = skillsSearch.trim().toLowerCase();
+      if (!query) return true;
+      return [skill.name, skill.description || '', ...(skill.tags || [])]
+        .join(' ')
+        .toLowerCase()
+        .includes(query);
+    })
+    .sort((left, right) => {
+      const leftPinned = Number(Boolean(left.attach_to_all_agents ?? left.auto_load)) + Number(left.is_system);
+      const rightPinned = Number(Boolean(right.attach_to_all_agents ?? right.auto_load)) + Number(right.is_system);
+      if (leftPinned !== rightPinned) return rightPinned - leftPinned;
+      return left.name.localeCompare(right.name);
+    });
 
   onMount(async () => {
     await loadData();
@@ -210,42 +207,17 @@ import Server from 'lucide-svelte/icons/server';
     expandedTools = expandedTools;
   }
 
-  function openSkillForm(skill?: Skill) {
-    if (skill) {
-      editingSkill = skill;
-      const ver = skill.current_version;
-      skillForm = {
-        name: skill.name,
-        description: skill.description || '',
-        instructions: ver?.instructions || skill.instructions,
-        tags: (skill.tags || []).join(', '),
-        autoLoad: Boolean(skill.attach_to_all_agents ?? skill.auto_load),
-        toolsJson: JSON.stringify(ver?.tools || [], null, 2),
-        promptTemplatesJson: JSON.stringify(ver?.prompt_templates || {}, null, 2),
-        secretPlaceholders: (ver?.secret_placeholders || []).join(', '),
-        assets: (ver?.asset_manifest || []).map((asset) => ({
-          filename: asset.filename,
-          existing_asset_id: asset.asset_id,
-          content_type: asset.content_type,
-          size_bytes: asset.size_bytes
-        }))
-      };
-    } else {
-      editingSkill = null;
-      skillForm = {
-        name: '',
-        description: '',
-        instructions: '',
-        tags: '',
-        autoLoad: false,
-        toolsJson: '[]',
-        promptTemplatesJson: '{}',
-        secretPlaceholders: '',
-        assets: []
-      };
-    }
-    showSkillForm = true;
+  function openSkillSheet(skill?: Skill | null, mode: 'view' | 'edit' | 'create' = 'view') {
+    selectedSkillId = skill?.skill_id ?? null;
+    skillSheetMode = mode;
+    skillSheetOpen = true;
     showImportForm = false;
+  }
+
+  function closeSkillSheet() {
+    skillSheetOpen = false;
+    skillSheetMode = 'view';
+    selectedSkillId = null;
   }
 
   function openImportForm() {
@@ -261,43 +233,7 @@ import Server from 'lucide-svelte/icons/server';
       autoLoad: false
     };
     showImportForm = true;
-    showSkillForm = false;
-  }
-
-  function parseJsonField<T>(label: string, raw: string, fallback: T): T {
-    if (!raw.trim()) return fallback;
-    const parsed = JSON.parse(raw);
-    void label;
-    return parsed as T;
-  }
-
-  async function uploadSkillAssets(event: Event) {
-    const target = event.currentTarget as HTMLInputElement;
-    const files = Array.from(target.files || []);
-    if (files.length === 0) return;
-    try {
-      for (const file of files) {
-        const uploaded = await api.artifacts.upload(file, 'skill_asset');
-        skillForm.assets = [
-          ...skillForm.assets.filter((asset) => asset.filename !== uploaded.filename),
-          {
-            filename: uploaded.filename,
-            source_artifact_id: uploaded.artifact_id,
-            content_type: uploaded.mime_type,
-            size_bytes: uploaded.size_bytes
-          }
-        ];
-      }
-      addToast('Skill asset uploaded.', 'success');
-    } catch (error) {
-      addToast(error instanceof Error ? error.message : 'Failed to upload skill asset', 'error');
-    } finally {
-      target.value = '';
-    }
-  }
-
-  function removeSkillAsset(filename: string) {
-    skillForm.assets = skillForm.assets.filter((asset) => asset.filename !== filename);
+    skillSheetOpen = false;
   }
 
   async function loadPackageFile(event: Event) {
@@ -311,42 +247,6 @@ import Server from 'lucide-svelte/icons/server';
     }
     importForm.packageB64 = btoa(binary);
     importForm.packageName = file.name;
-  }
-
-  async function saveSkill() {
-    const tags = skillForm.tags.split(',').map(t => t.trim()).filter(Boolean);
-    try {
-      const tools = parseJsonField<Record<string, unknown>[]>('tools', skillForm.toolsJson, []);
-      const promptTemplates = parseJsonField<Record<string, unknown>>('prompt templates', skillForm.promptTemplatesJson, {});
-      const secretPlaceholders = skillForm.secretPlaceholders.split(',').map((item) => item.trim()).filter(Boolean);
-      const payload = {
-        name: skillForm.name,
-        description: skillForm.description || undefined,
-        instructions: skillForm.instructions,
-        tags: tags.length ? tags : undefined,
-        attach_to_all_agents: skillForm.autoLoad,
-        tools,
-        prompt_templates: promptTemplates,
-        secret_placeholders: secretPlaceholders,
-        assets: skillForm.assets.map((asset) => ({
-          filename: asset.filename,
-          existing_asset_id: asset.existing_asset_id,
-          source_artifact_id: asset.source_artifact_id,
-          content_type: asset.content_type
-        }))
-      };
-      if (editingSkill) {
-        await api.skills.update(editingSkill.skill_id, payload);
-        addToast('Skill updated', 'success');
-      } else {
-        await api.skills.create(payload);
-        addToast('Skill created', 'success');
-      }
-      showSkillForm = false;
-      await loadData();
-    } catch (err) {
-      addToast(err instanceof Error ? err.message : 'Failed to save skill', 'error');
-    }
   }
 
   async function importSkill() {
@@ -380,67 +280,6 @@ import Server from 'lucide-svelte/icons/server';
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Failed to import skill';
       addToast(msg, 'error');
-    }
-  }
-
-  async function exportSkill(skill: Skill, format: string = 'skill_md') {
-    try {
-      const result = await api.skills.export(skill.skill_id, format);
-      if (result.warnings.length > 0) {
-        addToast(result.warnings.join(' '), 'warning');
-      }
-      let blob: Blob;
-      if (result.content_b64) {
-        const bytes = Uint8Array.from(atob(result.content_b64), (char) => char.charCodeAt(0));
-        blob = new Blob([bytes], { type: result.content_type || 'application/octet-stream' });
-      } else {
-        blob = new Blob([result.content || ''], { type: result.content_type || 'text/plain' });
-      }
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = result.filename;
-      a.click();
-      URL.revokeObjectURL(url);
-      addToast('Skill exported', 'success');
-    } catch (err) {
-      addToast('Failed to export skill', 'error');
-    }
-  }
-
-  async function deleteSkill(skill: Skill) {
-    if (skill.is_system) {
-      addToast('System skills cannot be deleted', 'error');
-      return;
-    }
-    if (skill.source !== 'db' && skill.source !== 'imported') {
-      addToast('Cannot delete read-only skills', 'error');
-      return;
-    }
-    try {
-      await api.skills.delete(skill.skill_id);
-      addToast('Skill deleted', 'success');
-      await loadData();
-    } catch (err) {
-      addToast('Failed to delete skill', 'error');
-    }
-  }
-
-  async function resetSkill(skill: Skill) {
-    const confirmed = await confirmAction({
-      title: 'Reset system skill?',
-      message: `Reset ${skill.name} to the shipped default content? This creates a new skill version and discards local edits to the current content.`,
-      confirmLabel: 'Reset skill',
-      cancelLabel: 'Keep current version',
-      variant: 'danger'
-    });
-    if (!confirmed) return;
-    try {
-      await api.skills.reset(skill.skill_id);
-      addToast('Skill reset to default', 'success');
-      await loadData();
-    } catch (err) {
-      addToast('Failed to reset skill', 'error');
     }
   }
 </script>
@@ -681,8 +520,16 @@ import Server from 'lucide-svelte/icons/server';
         <p class="text-sm text-zinc-400">Skills are versioned instruction, tool, and asset bundles stored in Cognis and staged to executors only when needed.</p>
         <div class="flex flex-wrap gap-2">
           <Button variant="ghost" size="sm" onclick={openImportForm}><Import class="w-4 h-4 mr-1" /> Import</Button>
-          <Button variant="primary" size="sm" onclick={() => openSkillForm()}><Plus class="w-4 h-4 mr-1" /> New Skill</Button>
+          <Button variant="primary" size="sm" onclick={() => openSkillSheet(null, 'create')}><Plus class="w-4 h-4 mr-1" /> New Skill</Button>
         </div>
+      </div>
+
+      <div class="flex gap-3 items-center flex-wrap">
+        <div class="relative flex-1 max-w-md">
+          <Search class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-500" />
+          <input type="text" placeholder="Search skills..." bind:value={skillsSearch} class="w-full pl-10 pr-4 py-2 bg-zinc-800 border border-zinc-700 rounded-lg text-sm text-zinc-200 placeholder-zinc-500 focus:outline-none focus:border-blue-500" />
+        </div>
+        <span class="text-sm text-zinc-500">{filteredSkills.length} skills</span>
       </div>
 
       {#if showImportForm}
@@ -726,116 +573,62 @@ import Server from 'lucide-svelte/icons/server';
         </div>
       {/if}
 
-      {#if showSkillForm}
-        <div class="bg-zinc-800 border border-zinc-700 rounded-lg p-4 space-y-4">
-          <h3 class="text-lg font-medium text-zinc-100">{editingSkill ? 'Edit Skill' : 'New Skill'}</h3>
-          <div class="grid gap-4 md:grid-cols-2">
-            <label class="block text-sm text-zinc-400 space-y-1"><span>Name</span><input type="text" bind:value={skillForm.name} class="w-full px-3 py-2 bg-zinc-900 border border-zinc-700 rounded-lg text-sm text-zinc-200 focus:outline-none focus:border-blue-500" placeholder="e.g. git-release" /></label>
-            <label class="block text-sm text-zinc-400 space-y-1"><span>Tags (comma-separated)</span><input type="text" bind:value={skillForm.tags} class="w-full px-3 py-2 bg-zinc-900 border border-zinc-700 rounded-lg text-sm text-zinc-200 focus:outline-none focus:border-blue-500" placeholder="e.g. git, release, automation" /></label>
-          </div>
-          <label class="block text-sm text-zinc-400 space-y-1"><span>Description</span><input type="text" bind:value={skillForm.description} class="w-full px-3 py-2 bg-zinc-900 border border-zinc-700 rounded-lg text-sm text-zinc-200 focus:outline-none focus:border-blue-500" placeholder="Brief description of what this skill does" /></label>
-          <label class="block text-sm text-zinc-400 space-y-1"><span>Instructions (Markdown)</span><textarea bind:value={skillForm.instructions} rows="10" class="w-full px-3 py-2 bg-zinc-900 border border-zinc-700 rounded-lg text-sm text-zinc-200 font-mono focus:outline-none focus:border-blue-500" placeholder="# Skill Instructions&#10;&#10;Detailed instructions for the agent..."></textarea></label>
-          <div class="grid gap-4 xl:grid-cols-2">
-            <label class="block text-sm text-zinc-400 space-y-1"><span>Tools JSON</span><textarea bind:value={skillForm.toolsJson} rows="10" class="w-full px-3 py-2 bg-zinc-900 border border-zinc-700 rounded-lg text-sm text-zinc-200 font-mono focus:outline-none focus:border-blue-500" placeholder="[]"></textarea></label>
-            <label class="block text-sm text-zinc-400 space-y-1"><span>Prompt templates JSON</span><textarea bind:value={skillForm.promptTemplatesJson} rows="10" class="w-full px-3 py-2 bg-zinc-900 border border-zinc-700 rounded-lg text-sm text-zinc-200 font-mono focus:outline-none focus:border-blue-500" placeholder="object"></textarea></label>
-          </div>
-          <label class="block text-sm text-zinc-400 space-y-1"><span>Secret placeholders (comma-separated)</span><input type="text" bind:value={skillForm.secretPlaceholders} class="w-full px-3 py-2 bg-zinc-900 border border-zinc-700 rounded-lg text-sm text-zinc-200 focus:outline-none focus:border-blue-500" placeholder="API_KEY, ACCESS_TOKEN" /></label>
-          <div class="space-y-3 rounded-lg border border-zinc-700 bg-zinc-900/60 p-4">
-            <div class="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
-              <div>
-                <p class="text-sm font-medium text-zinc-100">Assets</p>
-                <p class="text-xs text-zinc-500">Upload files once, then Cognis versions and stages them on executors.</p>
-              </div>
-              <label class="inline-flex cursor-pointer items-center gap-2 rounded-lg border border-zinc-700 px-3 py-2 text-sm text-zinc-200 hover:border-zinc-600">
-                <Upload class="h-4 w-4" /> Add files
-                <input type="file" multiple class="hidden" onchange={uploadSkillAssets} />
-              </label>
-            </div>
-            {#if skillForm.assets.length > 0}
-              <div class="space-y-2">
-                {#each skillForm.assets as asset}
-                  <div class="flex flex-col gap-2 rounded-lg border border-zinc-700/70 bg-zinc-950/70 p-3 md:flex-row md:items-center md:justify-between">
-                    <div>
-                      <p class="font-mono text-xs text-zinc-100">{asset.filename}</p>
-                      <p class="mt-1 text-xs text-zinc-500">{asset.content_type || 'application/octet-stream'}{#if asset.size_bytes} · {asset.size_bytes} bytes{/if}</p>
-                    </div>
-                    <button class="inline-flex items-center gap-1 text-xs text-zinc-400 hover:text-red-300" type="button" onclick={() => removeSkillAsset(asset.filename)}>
-                      <X class="h-3.5 w-3.5" /> Remove
-                    </button>
-                  </div>
-                {/each}
-              </div>
-            {:else}
-              <p class="text-xs text-zinc-500">No assets attached.</p>
-            {/if}
-          </div>
-          <label class="flex items-center gap-2 text-sm text-zinc-400"><input type="checkbox" bind:checked={skillForm.autoLoad} class="rounded border-zinc-600" /> Attach to all agents</label>
-          <div class="flex gap-2 justify-end">
-            <Button variant="ghost" size="sm" onclick={() => showSkillForm = false}>Cancel</Button>
-            <Button variant="primary" size="sm" onclick={saveSkill} disabled={!skillForm.name || !skillForm.instructions}>{editingSkill ? 'Update' : 'Create'}</Button>
-          </div>
-        </div>
-      {/if}
-
-      {#if skills.length === 0 && !showSkillForm}
+      {#if filteredSkills.length === 0}
         <div class="text-center py-12 text-zinc-500">
           <BookOpen class="w-8 h-8 mx-auto mb-2 opacity-50" />
-          <p>No skills defined yet.</p>
-          <p class="text-sm mt-1">Create a skill to bundle instructions and tools for your agents.</p>
+          <p>{skillsSearch ? 'No skills match your search.' : 'No skills defined yet.'}</p>
+          <p class="text-sm mt-1">{skillsSearch ? 'Try a different search term.' : 'Create a skill to bundle instructions and tools for your agents.'}</p>
         </div>
       {:else}
         <div class="space-y-2">
-          {#each skills as skill}
-            <div class="bg-zinc-800/50 border border-zinc-700 rounded-lg p-4">
+          {#each filteredSkills as skill}
+            <button class="w-full rounded-lg border border-zinc-700 bg-zinc-800/50 p-4 text-left transition-colors hover:border-zinc-600 hover:bg-zinc-800/70" onclick={() => openSkillSheet(skill, 'view')}>
               <div class="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
-                <div class="flex-1">
-                  <div class="flex items-center gap-2">
+                <div class="flex-1 min-w-0">
+                  <div class="flex flex-wrap items-center gap-2">
                     <BookOpen class="w-4 h-4 text-zinc-400" />
                     <span class="font-medium text-zinc-100">{skill.name}</span>
                     <Badge>{skill.source}</Badge>
                     {#if skill.is_system}<Badge class="border-amber-500/30 bg-amber-500/10 text-amber-300">system</Badge>{/if}
                     {#if skill.attach_to_all_agents ?? skill.auto_load}<Badge class="border-blue-500/30 bg-blue-500/10 text-blue-300">attached to all agents</Badge>{/if}
+                    {#if skill.current_version?.steps && skill.current_version.steps.length > 0}<Badge class="border-emerald-500/30 bg-emerald-500/10 text-emerald-300">workflow-ready</Badge>{/if}
+                    {#if skill.current_version?.decomposition_stale}<Badge class="border-amber-500/30 bg-amber-500/10 text-amber-300">stale</Badge>{/if}
                   </div>
-                  {#if skill.description}<p class="text-sm text-zinc-400 mt-1">{skill.description}</p>{/if}
-                  {#if skill.tags && skill.tags.length > 0}<div class="flex gap-1 mt-2">{#each skill.tags as tag}<Badge>{tag}</Badge>{/each}</div>{/if}
+                  {#if skill.description}<p class="mt-1 text-sm text-zinc-400">{skill.description}</p>{/if}
+                  {#if skill.tags && skill.tags.length > 0}<div class="mt-2 flex flex-wrap gap-1">{#each skill.tags as tag}<Badge>{tag}</Badge>{/each}</div>{/if}
                 </div>
-                <div class="flex flex-wrap gap-1">
-                  <button class="p-1.5 text-zinc-400 hover:text-zinc-200 rounded" onclick={() => { selectedSkillId = skill.skill_id; }} title="View skill"><Eye class="w-4 h-4" /></button>
-                  <button class="p-1.5 text-zinc-400 hover:text-zinc-200 rounded" onclick={() => exportSkill(skill)} title="Export as SKILL.md"><Download class="w-4 h-4" /></button>
-                  <button class="p-1.5 text-zinc-400 hover:text-zinc-200 rounded" onclick={() => exportSkill(skill, 'cognis_package')} title="Export package"><FileText class="w-4 h-4" /></button>
-                  {#if skill.source === 'db' || skill.source === 'imported'}
-                    {#if skill.is_system}
-                      <button class="p-1.5 text-zinc-400 hover:text-amber-300 rounded" onclick={() => resetSkill(skill)} title="Reset to default"><ShieldCheck class="w-4 h-4" /></button>
-                      <Badge>read-only</Badge>
-                    {:else}
-                      <button class="p-1.5 text-zinc-400 hover:text-zinc-200 rounded" onclick={() => openSkillForm(skill)} title="Edit"><Pencil class="w-4 h-4" /></button>
-                      <button class="p-1.5 text-zinc-400 hover:text-red-400 rounded" onclick={() => deleteSkill(skill)} title="Delete"><Trash2 class="w-4 h-4" /></button>
-                    {/if}
-                  {:else}<Badge>read-only</Badge>{/if}
-                </div>
+                <div class="text-xs text-zinc-500">Open details</div>
               </div>
               {#if skill.current_version}
-                <div class="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-zinc-500">
+                <div class="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-xs text-zinc-500">
                   <span>Version: <span class="text-zinc-400">v{skill.current_version.version_number}</span></span>
                   <span>Hash: <span class="font-mono text-zinc-400">{skill.current_version.content_hash.slice(0, 8)}</span></span>
                   {#if skill.current_version.tools && skill.current_version.tools.length > 0}<span>Tools: <span class="text-zinc-400">{skill.current_version.tools.length}</span></span>{/if}
-                  {#if skill.current_version.source_url}<span>Imported from: <span class="text-zinc-400 truncate max-w-[200px] inline-block align-bottom" title={skill.current_version.source_url}>{skill.current_version.source_url}</span></span>{/if}
+                  {#if skill.current_version.steps && skill.current_version.steps.length > 0}<span>Workflow steps: <span class="text-zinc-400">{skill.current_version.steps.length}</span></span>{/if}
                   {#if skill.current_version.asset_manifest && skill.current_version.asset_manifest.length > 0}<span>Assets: <span class="text-zinc-400">{skill.current_version.asset_manifest.length}</span></span>{/if}
                   {#if skill.current_version.secret_placeholders && skill.current_version.secret_placeholders.length > 0}<span>Secrets: <span class="text-zinc-400">{skill.current_version.secret_placeholders.length}</span></span>{/if}
                 </div>
               {/if}
-            </div>
+            </button>
           {/each}
         </div>
       {/if}
 
       <SkillDetailSheet
-        open={selectedSkillId !== null}
+        open={skillSheetOpen}
         skill={selectedSkill}
-        onClose={() => { selectedSkillId = null; }}
-        allowRestore={Boolean(selectedSkill && !selectedSkill.is_system && (selectedSkill.source === 'db' || selectedSkill.source === 'imported'))}
-        onRestored={async () => {
+        mode={skillSheetMode}
+        onClose={closeSkillSheet}
+        allowManage={true}
+        onSaved={async (savedSkill) => {
           await loadData();
+          selectedSkillId = savedSkill.skill_id;
+          skillSheetMode = 'view';
+          skillSheetOpen = true;
+        }}
+        onDeleted={async () => {
+          await loadData();
+          closeSkillSheet();
         }}
       />
     </div>
