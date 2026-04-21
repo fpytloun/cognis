@@ -18,6 +18,71 @@ from cognis.models.workflow import Workflow
 logger = get_logger(__name__)
 
 
+def _split_json_generation_timeout(total_timeout: float) -> tuple[float, float]:
+    """Split a JSON task timeout between structured and plain fallbacks."""
+
+    if total_timeout <= 6.0:
+        structured_timeout = max(1.5, total_timeout * 0.5)
+        return structured_timeout, max(1.5, total_timeout - structured_timeout)
+    structured_timeout = min(12.0, max(4.0, total_timeout * 0.4))
+    return structured_timeout, max(2.0, total_timeout - structured_timeout)
+
+
+async def _generate_json_response(
+    *,
+    llm: Any,
+    messages: list[dict[str, Any]],
+    task_type: str,
+    label: str,
+    timeout_seconds: float,
+    logger_obj: Any,
+    warning_context: dict[str, Any] | None = None,
+    max_tokens: int,
+) -> dict[str, Any]:
+    """Generate JSON with a structured-first attempt and plain fallback."""
+
+    structured_timeout, plain_timeout = _split_json_generation_timeout(timeout_seconds)
+
+    async def _generate(generate_kwargs: dict[str, Any], *, call_timeout: float) -> dict[str, Any]:
+        return await asyncio.wait_for(
+            llm.generate(
+                messages,
+                task_type=task_type,
+                temperature=0,
+                max_retries=1,
+                max_tokens=max_tokens,
+                **generate_kwargs,
+            ),
+            timeout=call_timeout,
+        )
+
+    try:
+        response = await _generate(
+            {"response_format": {"type": "json_object"}},
+            call_timeout=structured_timeout,
+        )
+    except TimeoutError:
+        extra_data = {"label": label, "reason": "structured_timeout"}
+        if warning_context:
+            extra_data.update(warning_context)
+        logger_obj.warning(
+            "Structured JSON generation timed out, retrying plain-text JSON fallback",
+            extra={"extra_data": extra_data},
+        )
+        return await _generate({}, call_timeout=plain_timeout)
+
+    return await maybe_fallback_to_plain_json_response(
+        response,
+        generate_response=lambda generate_kwargs: _generate(
+            generate_kwargs,
+            call_timeout=plain_timeout,
+        ),
+        label=label,
+        logger_obj=logger_obj,
+        warning_context=warning_context,
+    )
+
+
 class SkillMaterial(BaseModel):
     """Resolved skill material used during workflow composition."""
 
@@ -101,7 +166,7 @@ async def decompose_skill_material(
                 f"Instructions:\n{instructions}\n\n"
                 f"Tools:\n{tools}\n\n"
                 f"Prompt templates:\n{prompt_templates}\n\n"
-                "Return JSON with keys 'rationale' and 'steps'. Each step must be a valid "
+                "Return JSON with keys 'rationale' and 'steps'. Keep the rationale short and return at most 8 steps. Each step must be a valid "
                 "Cognis StepDefinition object with name, type='run' or 'gate', prompt, and "
                 "any relevant completion/input/deliverable fields. Use require_deliverable=false "
                 "for obvious gather/inspect steps and true for synthesis/report/final steps."
@@ -109,28 +174,15 @@ async def decompose_skill_material(
         },
     ]
 
-    async def _generate(generate_kwargs: dict[str, Any]) -> dict[str, Any]:
-        return await asyncio.wait_for(
-            llm.generate(
-                messages,
-                task_type="classifier",
-                temperature=0,
-                **generate_kwargs,
-            ),
-            timeout=timeout_seconds,
-        )
-
-    response = await _generate({"response_format": {"type": "json_object"}})
-    # Layer 2 fallback: on an unusable structured-JSON reply (empty content
-    # or unparseable), retry once without response_format so providers with
-    # strict server-side JSON validators (Groq: json_validate_failed on
-    # truncated output) still give us something to extract.
-    response = await maybe_fallback_to_plain_json_response(
-        response,
-        generate_response=_generate,
+    response = await _generate_json_response(
+        llm=llm,
+        messages=messages,
+        task_type="classifier",
         label="skill_decomposer",
         logger_obj=logger,
         warning_context={"skill_id": skill_id},
+        timeout_seconds=timeout_seconds,
+        max_tokens=1400,
     )
     content = extract_text_from_response(response)
     payload = extract_json_object(content, label="skill_decomposer")
@@ -201,24 +253,16 @@ async def compose_workflow_plan(
         },
     ]
 
-    async def _generate(generate_kwargs: dict[str, Any]) -> dict[str, Any]:
-        return await asyncio.wait_for(
-            llm.generate(
-                messages,
-                task_type="classifier",
-                temperature=0,
-                **generate_kwargs,
-            ),
-            timeout=timeout_seconds,
-        )
 
-    response = await _generate({"response_format": {"type": "json_object"}})
-    response = await maybe_fallback_to_plain_json_response(
-        response,
-        generate_response=_generate,
+    response = await _generate_json_response(
+        llm=llm,
+        messages=messages,
+        task_type="classifier",
         label="workflow_composer",
         logger_obj=logger,
         warning_context={"intent_preview": intent[:80]},
+        timeout_seconds=timeout_seconds,
+        max_tokens=2600,
     )
     content = extract_text_from_response(response)
     payload = extract_json_object(content, label="workflow_composer")

@@ -42,6 +42,8 @@
 
   type SkillSheetMode = 'view' | 'edit' | 'create';
   type SkillExportFormat = 'skill_md' | 'cognis_yaml' | 'cognis_package';
+  const tooltipButtonClass =
+    'inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-700 text-xs text-slate-400 hover:text-slate-200 focus-visible:border-slate-400 md:h-5 md:w-5';
 
   let {
     open,
@@ -626,8 +628,8 @@
           <div class="flex items-center gap-2 text-slate-200">
             <Wrench class="h-4 w-4 text-slate-400" />
             <h3 class="font-medium">Tools</h3>
-            <Tooltip text="Optional executable tools bundled with this skill. Most skills only need instructions. Add tools when a skill should expose reusable commands on the executor.">
-              <button class="text-slate-500 hover:text-slate-300" type="button"><Info class="h-4 w-4" /></button>
+            <Tooltip placement="bottom" text="Optional executable tools bundled with this skill. Most skills only need instructions. Add tools when a skill should expose reusable commands on the executor.">
+              <button aria-label="Tools help" class={tooltipButtonClass} title="Tools help" type="button"><Info class="h-4 w-4" /></button>
             </Tooltip>
           </div>
           {#if currentVersion?.tools && currentVersion.tools.length > 0}
@@ -673,8 +675,8 @@
           <div>
             <div class="flex items-center gap-2">
               <p class="text-xs font-medium uppercase tracking-[0.2em] text-slate-400">Prompt templates</p>
-              <Tooltip text="Named text snippets stored on the skill. These help with reusable prompts or sub-prompts without cluttering the main instructions.">
-                <button class="text-slate-500 hover:text-slate-300" type="button"><Info class="h-4 w-4" /></button>
+              <Tooltip placement="bottom" text="Named text snippets stored on the skill. These help with reusable prompts or sub-prompts without cluttering the main instructions.">
+                <button aria-label="Prompt templates help" class={tooltipButtonClass} title="Prompt templates help" type="button"><Info class="h-4 w-4" /></button>
               </Tooltip>
             </div>
             {#if currentVersion?.prompt_templates && Object.keys(currentVersion.prompt_templates).length > 0}
@@ -694,8 +696,8 @@
           <div>
             <div class="flex items-center gap-2">
               <p class="text-xs font-medium uppercase tracking-[0.2em] text-slate-400">Secret placeholders</p>
-              <Tooltip text="Names of secrets that the executor may inject as environment variables when this skill's tool recipes run. These are placeholders only, never the secret values themselves.">
-                <button class="text-slate-500 hover:text-slate-300" type="button"><Info class="h-4 w-4" /></button>
+              <Tooltip placement="bottom" text="Names of secrets that the executor may inject as environment variables when this skill's tool recipes run. These are placeholders only, never the secret values themselves.">
+                <button aria-label="Secret placeholders help" class={tooltipButtonClass} title="Secret placeholders help" type="button"><Info class="h-4 w-4" /></button>
               </Tooltip>
             </div>
             {#if currentVersion?.secret_placeholders && currentVersion.secret_placeholders.length > 0}
@@ -744,8 +746,8 @@
           <div class="flex items-center gap-2 text-slate-200">
             <Layers class="h-4 w-4 text-slate-400" />
             <h3 class="font-medium">Prompt Templates</h3>
-            <Tooltip text="Optional named snippets stored with the skill. Useful for reusable prompts or canned sub-prompts.">
-              <button class="text-slate-500 hover:text-slate-300" type="button"><Info class="h-4 w-4" /></button>
+            <Tooltip placement="bottom" text="Optional named snippets stored with the skill. Useful for reusable prompts or canned sub-prompts.">
+              <button aria-label="Prompt templates help" class={tooltipButtonClass} title="Prompt templates help" type="button"><Info class="h-4 w-4" /></button>
             </Tooltip>
           </div>
           {#if form.promptTemplates.length === 0}
@@ -767,8 +769,8 @@
           <div class="flex items-center gap-2 text-slate-200">
             <FileText class="h-4 w-4 text-slate-400" />
             <h3 class="font-medium">Secret Placeholders</h3>
-            <Tooltip text="Names of secrets that the executor can inject as environment variables when the skill's tool recipes run. Put names like GITHUB_TOKEN here, never actual values.">
-              <button class="text-slate-500 hover:text-slate-300" type="button"><Info class="h-4 w-4" /></button>
+            <Tooltip placement="bottom" text="Names of secrets that the executor can inject as environment variables when the skill's tool recipes run. Put names like GITHUB_TOKEN here, never actual values.">
+              <button aria-label="Secret placeholders help" class={tooltipButtonClass} title="Secret placeholders help" type="button"><Info class="h-4 w-4" /></button>
             </Tooltip>
           </div>
           <div class="flex gap-2">
@@ -805,8 +807,8 @@
         <div class="flex items-center gap-2 text-slate-200">
           <Wrench class="h-4 w-4 text-slate-400" />
           <h3 class="font-medium">Skill Tools</h3>
-          <Tooltip text="Use skill tools only when the skill should expose reusable executor-side commands. This editor covers the common skill tool shape without making you write raw JSON.">
-            <button class="text-slate-500 hover:text-slate-300" type="button"><Info class="h-4 w-4" /></button>
+          <Tooltip placement="bottom" text="Use skill tools only when the skill should expose reusable executor-side commands. This editor covers the common skill tool shape without making you write raw JSON.">
+            <button aria-label="Skill tools help" class={tooltipButtonClass} title="Skill tools help" type="button"><Info class="h-4 w-4" /></button>
           </Tooltip>
         </div>
         {#if editableToolCards().length === 0}
@@ -889,8 +891,8 @@
             <div class="space-y-3 rounded-xl border border-slate-800 bg-slate-950/60 p-3">
               <div class="flex items-center gap-2">
                 <p class="text-sm font-medium text-slate-100">Execution recipe</p>
-                <Tooltip text="Recipes tell the executor how to run this tool. Leave this off if you are only drafting a tool shape for later.">
-                  <button class="text-slate-500 hover:text-slate-300" type="button"><Info class="h-4 w-4" /></button>
+                <Tooltip placement="bottom" text="Recipes tell the executor how to run this tool. Leave this off if you are only drafting a tool shape for later.">
+                  <button aria-label="Execution recipe help" class={tooltipButtonClass} title="Execution recipe help" type="button"><Info class="h-4 w-4" /></button>
                 </Tooltip>
               </div>
 
@@ -994,8 +996,8 @@
         <div class="flex flex-wrap items-center gap-2 text-slate-200">
           <GitBranch class="h-4 w-4 text-slate-400" />
           <h3 class="font-medium">Workflow Decomposition</h3>
-          <Tooltip text="Saved decomposition turns this skill into workflow material. The workflow composer can reuse these steps instead of guessing structure from the instructions each time.">
-            <button class="text-slate-500 hover:text-slate-300" type="button"><Info class="h-4 w-4" /></button>
+          <Tooltip placement="bottom" text="Saved decomposition turns this skill into workflow material. The workflow composer can reuse these steps instead of guessing structure from the instructions each time.">
+            <button aria-label="Workflow decomposition help" class={tooltipButtonClass} title="Workflow decomposition help" type="button"><Info class="h-4 w-4" /></button>
           </Tooltip>
           {#if currentVersion?.decomposition_stale}
             <Badge class="border-amber-500/30 bg-amber-500/10 text-amber-300">stale</Badge>

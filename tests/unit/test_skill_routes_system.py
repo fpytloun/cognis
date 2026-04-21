@@ -6,6 +6,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from cognis.api.app import create_app
+from cognis.core.workflow_composition import SkillDecompositionResult
 from cognis.store.queries import create_user
 
 
@@ -229,6 +230,37 @@ def test_skill_version_can_be_restored(monkeypatch: object, tmp_path: Path) -> N
         assert restored.status_code == 200
         assert restored.json()["current_version_id"] == first_version_id
         assert restored.json()["instructions"] == "one"
+
+
+def test_skill_decompose_preview_returns_gateway_timeout_on_timeout(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    async def _timeout(*args: object, **kwargs: object) -> SkillDecompositionResult:
+        raise TimeoutError()
+
+    monkeypatch.setattr(
+        "cognis.core.workflow_composition.decompose_skill_material",
+        _timeout,
+    )
+
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        asyncio.run(_seed_user(client.app))
+        headers = _auth_headers(client.app, email="user@example.com")
+
+        created = client.post(
+            "/api/v1/skills",
+            headers=headers,
+            json={"name": "Timeout Skill", "instructions": "hello"},
+        )
+        assert created.status_code == 201
+
+        response = client.post(
+            f"/api/v1/skills/{created.json()['skill_id']}/decompose-preview",
+            headers=headers,
+        )
+
+        assert response.status_code == 504
+        assert response.json()["error"]["code"] == "timeout"
 
 
 def test_skill_update_with_identical_content_does_not_create_new_version(
