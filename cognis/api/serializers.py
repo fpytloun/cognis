@@ -408,6 +408,7 @@ def tool_to_response(row: Any) -> ToolResponse:
         category=row.category,
         read_only=row.read_only,
         capabilities=[str(capability) for capability in getattr(row, "capabilities", []) or []],
+        classification_status=getattr(row, "classification_status", None),
         classification_source=getattr(row, "classification_source", None),
         classification_confidence=getattr(row, "classification_confidence", None),
         source=row.source.model_dump(mode="json")

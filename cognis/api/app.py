@@ -55,6 +55,7 @@ from cognis.core.session import SessionManager
 from cognis.core.session_cache import SessionCache
 from cognis.core.step_evaluator import StepEvaluator
 from cognis.core.task_queue import TaskQueue
+from cognis.core.tool_classification_queue import ToolClassificationQueue
 from cognis.core.tool_output_store import ToolOutputStore
 from cognis.core.tool_router import ToolRouter
 from cognis.core.workflow_engine import WorkflowEngine
@@ -155,6 +156,11 @@ def create_app() -> FastAPI:
             event_bus=event_bus,
         )
         await remember_queue.start()
+        tool_classification_queue = ToolClassificationQueue(
+            session_factory=session_factory,
+            llm_provider=providers.llm,
+        )
+        await tool_classification_queue.start()
         await _print_startup_status(config_runtime, providers, ui_build_dir)
 
         async with session_factory() as session:
@@ -324,6 +330,8 @@ def create_app() -> FastAPI:
             event_bus=event_bus,
             session_lock=session_lock,
             pause_waiter=pause_waiter,
+            session_factory=session_factory,
+            tool_classification_queue=tool_classification_queue,
             default_step_timeout_seconds=(
                 int(step_timeout_seconds) if isinstance(step_timeout_seconds, int) else 3600
             ),
@@ -471,6 +479,7 @@ def create_app() -> FastAPI:
         app.state.provider_test_results = {}
         app.state.provider_test_cooldowns = {}
         app.state.remember_queue = remember_queue
+        app.state.tool_classification_queue = tool_classification_queue
         app.state.artifact_store = artifact_store
         app.state.artifact_maintenance = artifact_maintenance
         app.state.serve_ui = config_runtime.serve_ui
@@ -596,6 +605,7 @@ def create_app() -> FastAPI:
         await task_queue.stop()
         await shared_runtime.cleanup()
         await remember_queue.stop()
+        await tool_classification_queue.stop()
         await providers.executor.cleanup()
         await session_cache.aclose()
         await providers.memory.client.aclose()

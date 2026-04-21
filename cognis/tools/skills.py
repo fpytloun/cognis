@@ -224,7 +224,7 @@ async def resolve_skills_for_agent(
                         secret_placeholders=version_row.secret_placeholders or [],
                         steps=[
                             item
-                            for item in ((getattr(version_row, "steps", None) or []))
+                            for item in (getattr(version_row, "steps", None) or [])
                             if isinstance(item, dict)
                         ],
                         decomposition_source_hash=getattr(
@@ -410,6 +410,42 @@ def discoverable_skill_tools_to_definitions(resolved: ResolvedSkillSet) -> list[
     """Convert all discoverable skill tools into executable definitions."""
 
     return skill_tools_to_definitions(resolved, include_unattached=True)
+
+
+def raw_skill_tools_to_definitions(
+    *,
+    skill_id: str,
+    version_id: str | None,
+    content_hash: str | None,
+    tools: list[dict[str, Any]] | None,
+) -> list[ToolDefinition]:
+    """Convert persisted raw skill tool specs to tool definitions."""
+
+    definitions: list[ToolDefinition] = []
+    for raw_tool in tools or []:
+        if not isinstance(raw_tool, dict):
+            continue
+        tool_spec = SkillToolSpec.model_validate(raw_tool)
+        definitions.append(
+            ToolDefinition(
+                name=_qualified_skill_tool_name(skill_id, tool_spec.name),
+                description=tool_spec.description,
+                parameters=tool_spec.parameters,
+                source=ToolSource(
+                    type="skill",
+                    skill_id=skill_id,
+                    skill_version_id=version_id,
+                    skill_content_hash=content_hash,
+                    raw_tool_name=tool_spec.name,
+                ),
+                category="skill",
+                read_only=tool_spec.read_only,
+                non_bypassable=tool_spec.non_bypassable,
+                timeout_seconds=tool_spec.timeout_seconds,
+                max_result_size=tool_spec.max_result_size,
+            )
+        )
+    return definitions
 
 
 def _qualified_skill_tool_name(skill_id: str, tool_name: str) -> str:

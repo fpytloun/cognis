@@ -224,6 +224,7 @@ export interface ToolDefinitionSummary {
   category: string;
   read_only: boolean;
   capabilities: string[];
+  classification_status?: string | null;
   classification_source?: string | null;
   classification_confidence?: number | null;
   source: ToolSource;
@@ -248,6 +249,7 @@ export interface EffectiveToolItem {
   category: string;
   read_only: boolean;
   capabilities: string[];
+  classification_status?: string | null;
   classification_source?: string | null;
   classification_confidence?: number | null;
   source: ToolSource;

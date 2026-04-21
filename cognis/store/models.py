@@ -607,6 +607,42 @@ class MCPServerRow(Base):
     __table_args__ = (UniqueConstraint("name", "owner_email", name="uq_mcp_server_name_owner"),)
 
 
+class ToolClassificationRow(Base):
+    """Persisted tool classification state and retry metadata."""
+
+    __tablename__ = "tool_classifications"
+
+    classification_id: Mapped[str] = mapped_column(String, primary_key=True)
+    scope_key: Mapped[str] = mapped_column(String, nullable=False)
+    owner_email: Mapped[str | None] = mapped_column(
+        String, ForeignKey("users.email", ondelete="CASCADE"), nullable=True
+    )
+    tool_id: Mapped[str] = mapped_column(String, nullable=False)
+    source_type: Mapped[str] = mapped_column(String, nullable=False)
+    fingerprint: Mapped[str] = mapped_column(String, nullable=False)
+    tool_payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False, default="pending")
+    category: Mapped[str | None] = mapped_column(String, nullable=True)
+    capabilities: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    classification_source: Mapped[str | None] = mapped_column(String, nullable=True)
+    classification_confidence: Mapped[float | None] = mapped_column(nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    next_retry_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__ = (
+        UniqueConstraint("scope_key", "tool_id", name="uq_tool_classifications_scope_tool"),
+        Index("ix_tool_classifications_status_next_retry", "status", "next_retry_at"),
+    )
+
+
 class SkillRow(Base):
     """DB-managed skill definitions (logical skill record).
 

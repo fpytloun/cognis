@@ -9,7 +9,7 @@ from typing import Any
 
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
-from cognis.models.tool import ExecutorCapabilities
+from cognis.models.tool import ExecutorCapabilities, ToolDefinition
 from cognis.store.queries import get_executor_row, update_executor_runtime_state
 from cognis.tools.skills import resolve_skills_for_agent
 
@@ -247,7 +247,7 @@ async def _persist_runtime_state(
     runtime_metadata: dict[str, Any],
 ) -> None:
     async with app.state.session_factory() as session:
-        await update_executor_runtime_state(
+        row = await update_executor_runtime_state(
             session,
             executor_id,
             applied_config_version=applied_config_version,
@@ -257,6 +257,22 @@ async def _persist_runtime_state(
             runtime_state=runtime_state,
         )
         await session.commit()
+    queue = getattr(app.state, "tool_classification_queue", None)
+    if queue is None or row is None or not observed_tools:
+        return
+    try:
+        tool_defs = [
+            ToolDefinition.model_validate(item)
+            for item in observed_tools
+            if isinstance(item, dict)
+        ]
+        await queue.enqueue_tools(tool_defs, owner_email=getattr(row, "owner_email", None))
+    except Exception:
+        _logger.warning(
+            "executor_runtime: failed to enqueue tool classifications",
+            extra={"extra_data": {"executor_id": executor_id, "observed_tools": len(observed_tools)}},
+            exc_info=True,
+        )
 
 
 async def _build_configure_payload(

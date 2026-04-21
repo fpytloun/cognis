@@ -282,11 +282,13 @@ def test_tool_response_round_trips_classification_fields() -> None:
         category="filesystem",
         read_only=True,
         capabilities=["read"],
+        classification_status="ready",
         classification_source="declared",
         classification_confidence=1.0,
     )
 
     assert response.capabilities == ["read"]
+    assert response.classification_status == "ready"
     assert response.classification_source == "declared"
     assert response.classification_confidence == 1.0
 
@@ -299,12 +301,14 @@ def test_effective_tool_item_round_trips_classification_fields() -> None:
         category="filesystem",
         read_only=True,
         capabilities=["read"],
+        classification_status="pending",
         classification_source="llm",
         classification_confidence=0.83,
         permission="allow",
     )
 
     assert response.capabilities == ["read"]
+    assert response.classification_status == "pending"
     assert response.classification_source == "llm"
     assert response.classification_confidence == pytest.approx(0.83)
 

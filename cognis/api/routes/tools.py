@@ -68,7 +68,7 @@ from cognis.store.queries import (
 from cognis.store.queries import (
     list_mcp_servers as list_global_mcp_servers,
 )
-from cognis.tools.classification import classify_tool_definitions
+from cognis.tools.classification import resolve_tool_classifications
 from cognis.tools.executor.definitions import executor_tool_definitions
 from cognis.tools.mcp import (
     MCPClient,
@@ -124,8 +124,11 @@ async def _discover_local_mcp_tools(
 @router.get("/api/v1/tools", response_model=list[ToolResponse])
 async def list_tools(request: Request) -> list[ToolResponse]:
     require_current_user(request)
-    tools = await classify_tool_definitions(
-        select_static_tools(), llm=request.app.state.providers.llm
+    tools = await resolve_tool_classifications(
+        select_static_tools(),
+        session_factory=request.app.state.session_factory,
+        owner_email=None,
+        queue=getattr(request.app.state, "tool_classification_queue", None),
     )
     return [tool_to_response(tool) for tool in tools]
 
@@ -150,7 +153,12 @@ async def list_observed_local_mcp_tools(request: Request) -> list[ToolResponse]:
             tool.name,
         ),
     )
-    ordered = await classify_tool_definitions(ordered, llm=request.app.state.providers.llm)
+    ordered = await resolve_tool_classifications(
+        ordered,
+        session_factory=request.app.state.session_factory,
+        owner_email=user.email,
+        queue=getattr(request.app.state, "tool_classification_queue", None),
+    )
     return [tool_to_response(tool) for tool in ordered]
 
 
@@ -158,8 +166,11 @@ async def list_observed_local_mcp_tools(request: Request) -> list[ToolResponse]:
 async def list_executor_tools(request: Request) -> list[ToolResponse]:
     """List executor-native tools with their definitions."""
     require_current_user(request)
-    tools = await classify_tool_definitions(
-        executor_tool_definitions(), llm=request.app.state.providers.llm
+    tools = await resolve_tool_classifications(
+        executor_tool_definitions(),
+        session_factory=request.app.state.session_factory,
+        owner_email=None,
+        queue=getattr(request.app.state, "tool_classification_queue", None),
     )
     return [tool_to_response(tool) for tool in tools]
 
@@ -392,9 +403,11 @@ async def _resolve_effective_tools_response(
     for warning in intaris_result.warnings:
         if warning not in warnings:
             warnings.append(warning)
-    configured_tools = await classify_tool_definitions(
+    configured_tools = await resolve_tool_classifications(
         configured_tools,
-        llm=request.app.state.providers.llm,
+        session_factory=request.app.state.session_factory,
+        owner_email=user_email,
+        queue=getattr(request.app.state, "tool_classification_queue", None),
     )
 
     configured_items = [
@@ -405,6 +418,7 @@ async def _resolve_effective_tools_response(
             category=tool.category,
             read_only=tool.read_only,
             capabilities=[str(capability) for capability in tool.capabilities],
+            classification_status=tool.classification_status,
             classification_source=tool.classification_source,
             classification_confidence=tool.classification_confidence,
             source=tool.source.model_dump(mode="json"),
@@ -441,9 +455,11 @@ async def _resolve_effective_tools_response(
             for warning in merged_result.warnings:
                 if warning not in warnings:
                     warnings.append(warning)
-            live_tools = await classify_tool_definitions(
+            live_tools = await resolve_tool_classifications(
                 merged_result.tools,
-                llm=request.app.state.providers.llm,
+                session_factory=request.app.state.session_factory,
+                owner_email=user_email,
+                queue=getattr(request.app.state, "tool_classification_queue", None),
             )
             for tool in live_tools:
                 live_items.append(
@@ -454,6 +470,7 @@ async def _resolve_effective_tools_response(
                         category=tool.category,
                         read_only=tool.read_only,
                         capabilities=[str(capability) for capability in tool.capabilities],
+                        classification_status=tool.classification_status,
                         classification_source=tool.classification_source,
                         classification_confidence=tool.classification_confidence,
                         source=tool.source.model_dump(mode="json"),
@@ -513,7 +530,7 @@ async def list_intaris_mcp_servers(request: Request) -> list[IntarisMCPServerRes
 @router.get("/api/v1/intaris/mcp/tools", response_model=list[ToolResponse])
 async def list_intaris_mcp_tools(request: Request) -> list[ToolResponse]:
     """List normalized Intaris MCP tools across all enabled servers."""
-    require_current_user(request)
+    user = require_current_user(request)
     guardrails = request.app.state.providers.guardrails
     aggregated = await guardrails.list_mcp_tools()
 
@@ -569,7 +586,12 @@ async def list_intaris_mcp_tools(request: Request) -> list[ToolResponse]:
             tool.name,
         ),
     )
-    ordered = await classify_tool_definitions(ordered, llm=request.app.state.providers.llm)
+    ordered = await resolve_tool_classifications(
+        ordered,
+        session_factory=request.app.state.session_factory,
+        owner_email=user.email,
+        queue=getattr(request.app.state, "tool_classification_queue", None),
+    )
     return [tool_to_response(tool) for tool in ordered]
 
 
@@ -580,8 +602,11 @@ async def list_agent_tools(request: Request, agent_id: str) -> list[ToolResponse
     if agent is None:
         raise api_exception(404, "not_found", "Agent not found")
     require_owner_or_admin(request, agent.owner_email)
-    classified_static = await classify_tool_definitions(
-        select_static_tools(agent), llm=request.app.state.providers.llm
+    classified_static = await resolve_tool_classifications(
+        select_static_tools(agent),
+        session_factory=request.app.state.session_factory,
+        owner_email=agent.owner_email,
+        queue=getattr(request.app.state, "tool_classification_queue", None),
     )
     tools = [tool_to_response(tool) for tool in classified_static]
     agent_definition = AgentDefinition.model_validate(agent_to_response(agent).model_dump())
@@ -589,7 +614,12 @@ async def list_agent_tools(request: Request, agent_id: str) -> list[ToolResponse
         discovered = await _discover_local_mcp_tools(request, agent_definition, agent.owner_email)
     except Exception:
         discovered = []
-    discovered = await classify_tool_definitions(discovered, llm=request.app.state.providers.llm)
+    discovered = await resolve_tool_classifications(
+        discovered,
+        session_factory=request.app.state.session_factory,
+        owner_email=agent.owner_email,
+        queue=getattr(request.app.state, "tool_classification_queue", None),
+    )
     tools.extend(
         ToolResponse.model_validate(tool_to_response(tool).model_dump()) for tool in discovered
     )

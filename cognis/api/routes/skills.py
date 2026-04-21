@@ -19,6 +19,7 @@ from cognis.api.models import (
     SkillVersionResponse,
 )
 from cognis.core.system_skills import get_system_skill_default
+from cognis.logging import get_logger
 from cognis.models.skill import ImportProvenance, SkillExportData
 from cognis.store.queries import (
     create_skill,
@@ -47,6 +48,9 @@ from cognis.tools.skill_service import (
     parse_cognis_package,
     resolve_current_skill_version,
 )
+from cognis.tools.skills import raw_skill_tools_to_definitions
+
+logger = get_logger(__name__)
 
 router = APIRouter(tags=["skills"])
 
@@ -149,6 +153,28 @@ async def _load_skill_response(request: Request, session: Any, row: Any) -> Skil
     if version_row is not None:
         asset_refs = await load_skill_asset_refs(session, version_row, artifact_store=artifact_store)
     return _skill_to_response(row, version_row=version_row, asset_refs=asset_refs)
+
+
+async def _enqueue_skill_tool_classifications(request: Request, row: Any, version_row: Any) -> None:
+    queue = getattr(request.app.state, "tool_classification_queue", None)
+    if queue is None:
+        return
+    tool_defs = raw_skill_tools_to_definitions(
+        skill_id=row.skill_id,
+        version_id=getattr(version_row, "version_id", None),
+        content_hash=getattr(version_row, "content_hash", None),
+        tools=getattr(version_row, "tools", None),
+    )
+    if not tool_defs:
+        return
+    try:
+        await queue.enqueue_tools(tool_defs, owner_email=row.owner_email)
+    except Exception:
+        logger.warning(
+            "Failed to enqueue skill tool classifications",
+            extra={"extra_data": {"skill_id": row.skill_id, "version_id": getattr(version_row, "version_id", None)}},
+            exc_info=True,
+        )
 
 
 def _provenance_from_payload(data: dict[str, Any], fallback_format: str | None = None) -> ImportProvenance | None:
@@ -268,6 +294,7 @@ async def create_skill_route(request: Request, body: SkillCreateRequest) -> Skil
         await set_current_version(session, row.skill_id, version_row.version_id)
         row.current_version_id = version_row.version_id
         await session.commit()
+        await _enqueue_skill_tool_classifications(request, row, version_row)
         return await _load_skill_response(request, session, row)
 
 
@@ -397,6 +424,7 @@ async def update_skill_route(
         if updated_row is None:
             raise api_exception(404, "not_found", "Skill not found")
 
+        version_row = None
         if content_changed:
             try:
                 version_row = await create_skill_version_with_assets(
@@ -431,6 +459,8 @@ async def update_skill_route(
             await set_current_version(session, skill_id, version_row.version_id)
             updated_row.current_version_id = version_row.version_id
         await session.commit()
+        if content_changed and version_row is not None:
+            await _enqueue_skill_tool_classifications(request, updated_row, version_row)
         return await _load_skill_response(request, session, updated_row)
 
 
@@ -540,6 +570,7 @@ async def reset_skill_route(request: Request, skill_id: str) -> SkillResponse:
         await set_current_version(session, row.skill_id, version_row.version_id)
         row.current_version_id = version_row.version_id
         await session.commit()
+        await _enqueue_skill_tool_classifications(request, row, version_row)
         return await _load_skill_response(request, session, row)
 
 
@@ -641,6 +672,7 @@ async def restore_skill_version_route(
         row.tools = version_row.tools
         row.prompt_templates = version_row.prompt_templates
         await session.commit()
+        await _enqueue_skill_tool_classifications(request, row, version_row)
         return await _load_skill_response(request, session, row)
 
 
@@ -732,6 +764,7 @@ async def import_skill_route(request: Request, body: SkillImportRequest) -> Skil
         await set_current_version(session, row.skill_id, version_row.version_id)
         row.current_version_id = version_row.version_id
         await session.commit()
+        await _enqueue_skill_tool_classifications(request, row, version_row)
         return await _load_skill_response(request, session, row)
 
 

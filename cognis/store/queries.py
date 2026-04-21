@@ -40,6 +40,7 @@ from cognis.store.models import (
     SystemWorkflowOverride,
     Task,
     TaskDependency,
+    ToolClassificationRow,
     User,
     WorkflowRow,
 )
@@ -50,6 +51,12 @@ def _utcnow() -> datetime:
 
 
 _UNSET = object()
+
+
+def tool_classification_scope(owner_email: str | None) -> str:
+    """Return the persistence scope for tool classifications."""
+
+    return owner_email or "__global__"
 
 
 # --- Users ---
@@ -2916,6 +2923,97 @@ async def update_executor_runtime_state(
         row.last_observed_at = last_observed_at
     if runtime_state is not None:
         row.runtime_state = runtime_state
+    await session.flush()
+    return row
+
+
+async def get_tool_classification_rows(
+    session: AsyncSession,
+    *,
+    scope_key: str,
+    tool_ids: list[str],
+) -> list[ToolClassificationRow]:
+    """Load persisted tool classifications for a scope and tool ids."""
+
+    if not tool_ids:
+        return []
+    result = await session.execute(
+        select(ToolClassificationRow).where(
+            ToolClassificationRow.scope_key == scope_key,
+            ToolClassificationRow.tool_id.in_(tool_ids),
+        )
+    )
+    return list(result.scalars().all())
+
+
+async def upsert_tool_classification(
+    session: AsyncSession,
+    *,
+    scope_key: str,
+    owner_email: str | None,
+    tool_id: str,
+    source_type: str,
+    fingerprint: str,
+    tool_payload: dict[str, Any],
+    category: str | None = None,
+    capabilities: list[str] | None = None,
+    classification_source: str | None = None,
+    classification_confidence: float | None = None,
+    status: str = "pending",
+    attempts: int | None = None,
+    next_retry_at: datetime | None = None,
+    last_attempt_at: datetime | None = None,
+    last_error: str | None = None,
+) -> ToolClassificationRow:
+    """Create or update persisted tool classification state."""
+
+    result = await session.execute(
+        select(ToolClassificationRow).where(
+            ToolClassificationRow.scope_key == scope_key,
+            ToolClassificationRow.tool_id == tool_id,
+        )
+    )
+    row = result.scalar_one_or_none()
+    if row is None:
+        row = ToolClassificationRow(
+            classification_id=f"tc_{uuid.uuid4().hex}",
+            scope_key=scope_key,
+            owner_email=owner_email,
+            tool_id=tool_id,
+            source_type=source_type,
+            fingerprint=fingerprint,
+            tool_payload=tool_payload,
+            status=status,
+            category=category,
+            capabilities=capabilities,
+            classification_source=classification_source,
+            classification_confidence=classification_confidence,
+            attempts=attempts or 0,
+            next_retry_at=next_retry_at,
+            last_attempt_at=last_attempt_at,
+            last_error=last_error,
+        )
+        session.add(row)
+        await session.flush()
+        return row
+
+    row.owner_email = owner_email
+    row.source_type = source_type
+    row.fingerprint = fingerprint
+    row.tool_payload = tool_payload
+    row.status = status
+    row.category = category
+    row.capabilities = capabilities
+    row.classification_source = classification_source
+    row.classification_confidence = classification_confidence
+    if attempts is not None:
+        row.attempts = attempts
+    if next_retry_at is not None or status == "ready":
+        row.next_retry_at = next_retry_at
+    if last_attempt_at is not None or status == "pending":
+        row.last_attempt_at = last_attempt_at
+    row.last_error = last_error
+    row.updated_at = _utcnow()
     await session.flush()
     return row
 

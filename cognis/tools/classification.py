@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from collections.abc import Callable
 from typing import Any
 
 from cognis.core.json_utils import extract_json_object, extract_text_from_response
 from cognis.logging import get_logger
-from cognis.models.tool import ToolCapability, ToolDefinition, tool_capabilities
+from cognis.models.tool import ToolCapability, ToolDefinition, stable_tool_id, tool_capabilities
+from cognis.store.queries import get_tool_classification_rows, tool_classification_scope
 
 logger = get_logger(__name__)
 
@@ -77,10 +79,17 @@ def classify_tool_definition(tool: ToolDefinition) -> ToolDefinition:
         update={
             "category": category,
             "capabilities": capabilities,
+            "classification_status": tool.classification_status or "ready",
             "classification_source": source,
             "classification_confidence": confidence,
         }
     )
+
+
+def classify_tool_definitions_sync(tools: list[ToolDefinition]) -> list[ToolDefinition]:
+    """Classify tools without calling the LLM."""
+
+    return [classify_tool_definition(tool) for tool in tools]
 
 
 async def classify_tool_definitions(
@@ -90,7 +99,7 @@ async def classify_tool_definitions(
 ) -> list[ToolDefinition]:
     """Classify tools, using the LLM for unresolved dynamic tools when needed."""
 
-    classified = [classify_tool_definition(tool) for tool in tools]
+    classified = classify_tool_definitions_sync(tools)
     unresolved = [
         tool
         for tool in classified
@@ -118,11 +127,85 @@ async def classify_tool_definitions(
             update={
                 "category": category,
                 "capabilities": capabilities,
+                "classification_status": "ready",
                 "classification_source": "llm",
                 "classification_confidence": float(payload.get("confidence") or 0.75),
             }
         )
     return [by_id[stable_id(tool)] for tool in classified]
+
+
+def requires_background_classification(tool: ToolDefinition) -> bool:
+    """Return whether a tool benefits from background LLM refinement."""
+
+    return tool.source.type in {"local_mcp", "intaris_mcp", "skill"}
+
+
+def apply_persisted_classifications(
+    tools: list[ToolDefinition], rows: list[Any]
+) -> list[ToolDefinition]:
+    """Overlay persisted classification state onto a tool list."""
+
+    row_by_id = {
+        str(getattr(row, "tool_id", "")): row
+        for row in rows
+        if getattr(row, "tool_id", None) is not None
+    }
+    overlaid: list[ToolDefinition] = []
+    for tool in classify_tool_definitions_sync(tools):
+        row = row_by_id.get(stable_tool_id(tool))
+        if row is None or getattr(row, "fingerprint", None) != tool_fingerprint(tool):
+            if requires_background_classification(tool):
+                overlaid.append(tool.model_copy(update={"classification_status": "pending"}))
+            else:
+                overlaid.append(tool)
+            continue
+        if str(getattr(row, "status", "")) != "ready":
+            overlaid.append(tool.model_copy(update={"classification_status": "pending"}))
+            continue
+        capabilities = _normalize_capabilities(getattr(row, "capabilities", None)) or tool.capabilities
+        if not capabilities:
+            capabilities = sorted(tool_capabilities(tool), key=str)
+        overlaid.append(
+            tool.model_copy(
+                update={
+                    "category": str(getattr(row, "category", None) or tool.category),
+                    "capabilities": capabilities,
+                    "classification_status": "ready",
+                    "classification_source": getattr(row, "classification_source", None)
+                    or tool.classification_source,
+                    "classification_confidence": getattr(row, "classification_confidence", None)
+                    if getattr(row, "classification_confidence", None) is not None
+                    else tool.classification_confidence,
+                }
+            )
+        )
+    return overlaid
+
+
+async def resolve_tool_classifications(
+    tools: list[ToolDefinition],
+    *,
+    session_factory: Callable[[], Any],
+    owner_email: str | None,
+    queue: Any | None = None,
+) -> list[ToolDefinition]:
+    """Resolve classifications without blocking on live LLM calls."""
+
+    classified = classify_tool_definitions_sync(tools)
+    dynamic_tools = [tool for tool in classified if requires_background_classification(tool)]
+    if not dynamic_tools:
+        return classified
+    scope_key = tool_classification_scope(owner_email)
+    async with session_factory() as session:
+        rows = await get_tool_classification_rows(
+            session,
+            scope_key=scope_key,
+            tool_ids=[stable_tool_id(tool) for tool in dynamic_tools],
+        )
+    if queue is not None:
+        await queue.enqueue_tools(dynamic_tools, owner_email=owner_email)
+    return apply_persisted_classifications(classified, rows)
 
 
 def _heuristic_category(tool: ToolDefinition) -> str:
@@ -291,11 +374,13 @@ def _tool_fingerprint(tool: ToolDefinition) -> str:
     payload = json.dumps(
         {
             "name": tool.name,
+            "source_type": tool.source.type,
             "raw_tool_name": tool.source.raw_tool_name,
             "description": tool.description,
             "parameters": tool.parameters,
             "read_only": tool.read_only,
-            "category": tool.category,
+            "non_bypassable": tool.non_bypassable,
+            "timeout_seconds": tool.timeout_seconds,
         },
         sort_keys=True,
         ensure_ascii=True,
@@ -303,13 +388,11 @@ def _tool_fingerprint(tool: ToolDefinition) -> str:
     return hashlib.sha1(payload.encode()).hexdigest()
 
 
+def tool_fingerprint(tool: ToolDefinition) -> str:
+    """Return a stable fingerprint for persisted tool classification rows."""
+
+    return _tool_fingerprint(tool)
+
+
 def stable_id(tool: ToolDefinition) -> str:
-    if tool.source.type in {"local_mcp", "intaris_mcp"}:
-        server = tool.source.server_id or tool.source.server_name or "unknown"
-        raw_name = tool.source.raw_tool_name or tool.name
-        return f"mcp:{server}:{raw_name}"
-    if tool.source.type == "skill":
-        skill_id = tool.source.skill_id or "unknown"
-        raw_name = tool.source.raw_tool_name or tool.name
-        return f"skill:{skill_id}:{raw_name}"
-    return f"builtin:{tool.name}"
+    return stable_tool_id(tool)

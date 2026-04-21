@@ -817,6 +817,7 @@ class ToolResponse(BaseModel):
     category: str = "general"
     read_only: bool = False
     capabilities: list[str] = Field(default_factory=list)
+    classification_status: str | None = None
     classification_source: str | None = None
     classification_confidence: float | None = None
     source: dict[str, Any] = Field(default_factory=dict)
@@ -831,6 +832,7 @@ class EffectiveToolItemResponse(BaseModel):
     category: str = "general"
     read_only: bool = False
     capabilities: list[str] = Field(default_factory=list)
+    classification_status: str | None = None
     classification_source: str | None = None
     classification_confidence: float | None = None
     source: dict[str, Any] = Field(default_factory=dict)

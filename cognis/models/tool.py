@@ -51,6 +51,7 @@ class ToolDefinition(BaseModel):
     category: str = "general"
     read_only: bool = False
     capabilities: list[ToolCapability] = Field(default_factory=list)
+    classification_status: str | None = None
     classification_source: str | None = None
     classification_confidence: float | None = None
     requires_secrets: list[str] = Field(default_factory=list)

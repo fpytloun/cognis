@@ -110,7 +110,7 @@ from cognis.tools.builtin.orchestration import (
     is_workflow_tool,
 )
 from cognis.tools.builtin.tool_search import SEARCH_TOOLS_TOOL, search_inventory
-from cognis.tools.classification import classify_tool_definitions
+from cognis.tools.classification import classify_tool_definitions_sync, resolve_tool_classifications
 
 logger = get_logger(__name__)
 
@@ -1236,6 +1236,8 @@ class AgentLoop:
         event_bus: EventBus,
         session_lock: SessionLock,
         pause_waiter: PauseWaiter,
+        session_factory: Any = None,
+        tool_classification_queue: Any = None,
         default_step_timeout_seconds: int = DEFAULT_STEP_TIMEOUT_SECONDS,
         tool_output_store: Any = None,
         step_context_assembler: Any = None,  # DEPRECATED — kept for backward compat
@@ -1251,6 +1253,8 @@ class AgentLoop:
         self.event_bus = event_bus
         self.session_lock = session_lock
         self.pause_waiter = pause_waiter
+        self._session_factory = session_factory
+        self._tool_classification_queue = tool_classification_queue
         self.default_step_timeout_seconds = max(1, int(default_step_timeout_seconds))
         self.tool_output_store = tool_output_store
         self.notification_service: Any = None
@@ -2143,9 +2147,15 @@ class AgentLoop:
             default_visible_tool_ids: set[str] = set()
             allow_tool_search = True
             if registry is not None:
-                classified_inventory = await classify_tool_definitions(
-                    registry.list_tools(), llm=self.providers.llm
-                )
+                if self._session_factory is not None:
+                    classified_inventory = await resolve_tool_classifications(
+                        registry.list_tools(),
+                        session_factory=self._session_factory,
+                        owner_email=ctx.agent.owner_email,
+                        queue=self._tool_classification_queue,
+                    )
+                else:
+                    classified_inventory = classify_tool_definitions_sync(registry.list_tools())
                 full_inventory_tools = _filter_model_inventory_tools(
                     ctx.agent,
                     classified_inventory,

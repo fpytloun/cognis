@@ -7,6 +7,7 @@ import ExternalLink from 'lucide-svelte/icons/external-link';
 import GitBranch from 'lucide-svelte/icons/git-branch';
 import Import from 'lucide-svelte/icons/import';
 import ListChecks from 'lucide-svelte/icons/list-checks';
+import LoaderCircle from 'lucide-svelte/icons/loader-circle';
 import Plug from 'lucide-svelte/icons/plug';
 import Plus from 'lucide-svelte/icons/plus';
 import Search from 'lucide-svelte/icons/search';
@@ -182,6 +183,10 @@ import Server from 'lucide-svelte/icons/server';
       case 'system': return 'System';
       default: return category.charAt(0).toUpperCase() + category.slice(1);
     }
+  }
+
+  function classificationPending(tool: ToolDefinitionSummary): boolean {
+    return (tool.classification_status || 'ready') !== 'ready';
   }
 
   $: filteredBuiltinTools = filterTools(staticTools, { searchQuery: builtinSearch, categoryFilter: builtinCategoryFilter });
@@ -643,6 +648,12 @@ import Server from 'lucide-svelte/icons/server';
       <span class="text-sm text-zinc-400 truncate flex-1">{tool.description}</span>
       <div class="flex items-center gap-2 shrink-0">
         {#if tool.read_only}<Badge>read-only</Badge>{/if}
+        {#if classificationPending(tool)}
+          <span class="inline-flex items-center gap-1 text-xs text-amber-300" title="Classification is being refined in the background.">
+            <LoaderCircle class="h-3.5 w-3.5 animate-spin" />
+            <span>classification pending</span>
+          </span>
+        {/if}
         {#if tool.non_bypassable}<span title="Non-bypassable (always evaluated by guardrails)"><ShieldCheck class="w-4 h-4 text-amber-400" /></span>{/if}
       </div>
     </button>
@@ -660,6 +671,12 @@ import Server from 'lucide-svelte/icons/server';
       <span class="text-sm text-zinc-400 truncate flex-1">{tool.description}</span>
       <div class="flex items-center gap-2 shrink-0">
         {#if tool.read_only}<Badge>read-only</Badge>{/if}
+        {#if classificationPending(tool)}
+          <span class="inline-flex items-center gap-1 text-xs text-amber-300" title="Classification is being refined in the background.">
+            <LoaderCircle class="h-3.5 w-3.5 animate-spin" />
+            <span>classification pending</span>
+          </span>
+        {/if}
         {#if tool.non_bypassable}<span title="Non-bypassable"><ShieldCheck class="w-4 h-4 text-amber-400" /></span>{/if}
       </div>
     </button>
@@ -727,6 +744,7 @@ import Server from 'lucide-svelte/icons/server';
     <div class="flex flex-wrap gap-x-6 gap-y-1 text-xs text-zinc-500">
       <span>Source: <span class="text-zinc-400">{getSourceLabel(getSourceType(tool))}</span></span>
       <span>Timeout: <span class="text-zinc-400">{tool.timeout_seconds}s</span></span>
+      <span>Classification: <span class="text-zinc-400">{tool.classification_status || 'ready'} ({tool.classification_source || 'heuristic'})</span></span>
       {#if tool.source.server_name}<span>Server: <span class="text-zinc-400">{tool.source.server_name}</span></span>{/if}
       {#if !tool.read_only}<span>Non-bypassable: <span class="text-zinc-400">{tool.non_bypassable ? 'Yes' : 'No'}</span></span>{/if}
     </div>
