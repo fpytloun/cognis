@@ -171,6 +171,107 @@ async def test_deliver_task_result_skips_silent_delivery(tmp_path: object) -> No
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "task_status, result_data",
+    [
+        (TaskStatus.FAILED, None),
+        (TaskStatus.FAILED, {}),
+        (TaskStatus.FAILED, {"attachments": [{"artifact_id": "a", "url": "u"}]}),
+        (TaskStatus.CANCELLED, None),
+    ],
+)
+async def test_deliver_task_result_handles_terminal_states_without_final_content(
+    tmp_path: object,
+    task_status: TaskStatus,
+    result_data: dict[str, object] | None,
+) -> None:
+    """Regression: terminal states other than COMPLETED leave result_data
+    without final_channel_content / final_content keys. The delivery path
+    must not crash with ``AttributeError: 'NoneType' object has no attribute
+    'strip'``.
+    """
+    engine, session_factory = await _runtime(tmp_path)
+    guardrails = _Guardrails()
+    event_bus = EventBus()
+    seen: list[EventType] = []
+
+    async def _capture(event: object) -> None:
+        seen.append(event.type)
+
+    event_bus.subscribe_all(_capture)
+
+    workflow_engine = WorkflowEngine(
+        session_factory=session_factory,
+        providers=SimpleNamespace(guardrails=guardrails),
+        agent_loop=SimpleNamespace(),
+        step_evaluator=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        event_bus=event_bus,
+        pause_waiter=SimpleNamespace(),
+    )
+
+    async with session_factory() as session:
+        await create_user(
+            session, email="user@example.com", name="User", password_hash="hash", role="user"
+        )
+        await create_agent(
+            session, agent_id="agent-1", owner_email="user@example.com", name="Agent"
+        )
+        conversation = await create_conversation(
+            session,
+            user_email="user@example.com",
+            agent_id="agent-1",
+            context_type="web",
+            title="Latest",
+        )
+        conversation.last_message_at = datetime.now(UTC)
+        root_session = await create_session(
+            session,
+            conversation_id=conversation.conversation_id,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        )
+        await set_session_intaris_session_id(session, root_session.session_id, "intaris-root")
+        await update_conversation_active_session(
+            session, conversation.conversation_id, root_session.session_id
+        )
+        await session.commit()
+
+    await workflow_engine._deliver_task_result(
+        TaskModel(
+            task_id="task-1",
+            title="Background task",
+            description="",
+            status=task_status,
+            priority=0,
+            created_by="user@example.com",
+            agent_id="agent-1",
+            source_type="api",
+            source_ref=None,
+            delivery=TaskDelivery(mode="latest_active_for_agent"),
+            workflow_id=None,
+            result_summary="Workflow failed",
+            result_data=result_data,
+        )
+    )
+
+    # Delivery landed on the latest active conversation without raising.
+    assert guardrails.recorded[0][0] == "intaris-root"
+    recorded_events = guardrails.recorded[0][1]
+    assert recorded_events, "expected at least one event recorded to Intaris"
+    event_payload = recorded_events[0]
+    data = getattr(event_payload, "data", event_payload)
+    if isinstance(data, dict):
+        expected_event = {
+            TaskStatus.FAILED: "task_failed",
+            TaskStatus.CANCELLED: "task_cancelled",
+        }[task_status]
+        assert data.get("event") == expected_event
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_deliver_task_result_direct_sends_channel_message_without_follow_up(
     tmp_path: object,
 ) -> None:

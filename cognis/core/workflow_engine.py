@@ -2015,9 +2015,9 @@ class WorkflowEngine:
         final_content = result_data.get("final_channel_content")
         if not final_content and result_data.get("final_format") != "html":
             final_content = result_data.get("final_content")
-        if not isinstance(final_content, str):
-            final_content = None
-        final_content = final_content.strip() or None
+        final_content = (
+            final_content.strip() or None if isinstance(final_content, str) else None
+        )
         final_deliverable_id = result_data.get("final_deliverable_id")
         if not isinstance(final_deliverable_id, str):
             final_deliverable_id = None
