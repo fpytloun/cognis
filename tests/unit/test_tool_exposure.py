@@ -241,6 +241,11 @@ def test_prepare_tool_exposure_uses_openai_tool_search_with_deferred_namespaces(
     assert namespace["name"] == "mcp_github"
     assert deferred_schema["defer_loading"] is True
     assert {tool["type"] for tool in result.tools} >= {"tool_search", "namespace"}
+    assert result.request_kwargs["tool_choice"]["type"] == "allowed_tools"
+    assert all(
+        tool["type"] == "function"
+        for tool in result.request_kwargs["tool_choice"]["tools"]
+    )
 
 
 def test_prepare_tool_exposure_sanitizes_skill_visible_names() -> None:
@@ -512,6 +517,11 @@ def test_prepare_tool_exposure_uses_flat_tool_search_responses_when_namespace_to
     )
     assert deferred_schema["function"]["defer_loading"] is True
     assert any(tool["type"] == "tool_search" for tool in result.tools)
+    assert result.request_kwargs["tool_choice"]["type"] == "allowed_tools"
+    assert all(
+        tool["type"] == "function"
+        for tool in result.request_kwargs["tool_choice"]["tools"]
+    )
 
 
 def test_prepare_tool_exposure_drops_defer_loading_without_native_tool_search() -> None:

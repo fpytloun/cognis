@@ -323,8 +323,7 @@ def _openai_allowed_tools_choice(visible_schemas: list[dict[str, Any]]) -> dict[
                 for schema in visible_schemas
                 if isinstance(schema.get("function"), dict)
                 and isinstance((function_name := schema["function"].get("name")), str)
-            ],
-            {"type": "tool_search"},
+            ]
         ],
     }
 
