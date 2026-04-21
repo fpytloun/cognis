@@ -78,7 +78,11 @@ _TOOL_GUIDANCE = """\
 - Keep Tavily `query` values focused on the actual subject or identifier rather \
   than transport syntax. For exact identifiers, prefer shorter queries and \
   enable `exact_match` when appropriate.
-- If a tool result says `middle truncated` or `Tool result cleared`, the \
+- Older tool outputs may be compacted out of the active prompt even though the \
+  full saved output still exists. Treat compacted placeholders as incomplete, \
+  not as evidence that the omitted content is irrelevant.
+- If a tool result says `middle truncated`, `Tool result cleared`, or `Older \
+  tool result compacted`, the \
   visible content is incomplete.
 - For structured saved outputs such as numbered search results, use the \
   list_tool_output_anchors tool first to discover anchors, then \

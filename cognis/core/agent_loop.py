@@ -33,6 +33,7 @@ from cognis.core.attachment_utils import (
 )
 from cognis.core.compaction import ROTATION_TOTAL
 from cognis.core.context import _native_attachment_blocks
+from cognis.core.context_projection import DEFAULT_COMPACTED_TOOL_GROUPS, project_messages
 from cognis.core.decision import build_routing_reminder
 from cognis.core.errors import ImmutablePrefixUnavailable
 from cognis.core.events import Event, EventBus, EventType
@@ -500,6 +501,9 @@ def _append_tool_result_event(
     duration_ms: int | None = None,
     tool_id: str | None = None,
     protect_from_pruning: bool = False,
+    recovery_call_id: str | None = None,
+    output_size: int | None = None,
+    has_full_output: bool = False,
 ) -> None:
     """Record a tool_result event to the Intaris event batch.
 
@@ -520,8 +524,9 @@ def _append_tool_result_event(
                 "is_error": is_error,
                 "duration_ms": duration_ms,
                 "result": truncated,
-                "output_size": len(output),
-                "has_full_output": False,
+                "output_size": output_size if output_size is not None else len(output),
+                "has_full_output": has_full_output,
+                "recovery_call_id": recovery_call_id,
                 "protect_from_pruning": protect_from_pruning,
             },
         )
@@ -1248,6 +1253,7 @@ class AgentLoop:
         pause_waiter: PauseWaiter,
         session_factory: Any = None,
         tool_classification_queue: Any = None,
+        step_profile_registry: Any = None,
         default_step_timeout_seconds: int = DEFAULT_STEP_TIMEOUT_SECONDS,
         tool_output_store: Any = None,
         step_context_assembler: Any = None,  # DEPRECATED — kept for backward compat
@@ -1265,6 +1271,7 @@ class AgentLoop:
         self.pause_waiter = pause_waiter
         self._session_factory = session_factory
         self._tool_classification_queue = tool_classification_queue
+        self._step_profile_registry = step_profile_registry
         self.default_step_timeout_seconds = max(1, int(default_step_timeout_seconds))
         self.tool_output_store = tool_output_store
         self.notification_service: Any = None
@@ -2079,17 +2086,12 @@ class AgentLoop:
         while True:
             self._raise_if_cancelled(ctx)
 
-            # Prune old tool outputs before each LLM call to keep the
-            # context window lean.  Uses tiktoken via the LLM provider for
-            # accurate token estimation.
             resolved_model = getattr(context_result, "resolved_model", "")
-            messages = prune_tool_outputs(
-                messages,
-                protect_tokens=min(40_000, max(4_000, context_result.max_context_tokens // 4)),
-                minimum_savings=min(20_000, max(2_000, context_result.max_context_tokens // 8)),
-                token_counter=lambda text, _m=resolved_model: self.providers.llm.count_tokens(
-                    text, _m
-                ),
+            model_messages = self._project_model_messages(
+                ctx,
+                messages=messages,
+                resolved_model=resolved_model,
+                max_context_tokens=context_result.max_context_tokens,
             )
 
             # Resolve model and reasoning effort for this turn.
@@ -2173,7 +2175,11 @@ class AgentLoop:
                     classified_inventory,
                     discovered_tool_ids,
                 )
-                resolved_profile = resolve_step_profile(ctx.step_definition)
+                resolved_profile = (
+                    self._step_profile_registry.resolve_step_profile(ctx.step_definition)
+                    if self._step_profile_registry is not None
+                    else resolve_step_profile(ctx.step_definition)
+                )
                 allow_tool_search = (
                     resolved_profile.config.allow_tool_search
                     if resolved_profile.config is not None
@@ -2212,7 +2218,7 @@ class AgentLoop:
             )
             pre_call_snapshot = self._context_pressure_snapshot(
                 ctx,
-                messages=messages,
+                messages=model_messages,
                 tool_schemas=exposure.tools,
                 max_context_tokens=context_result.max_context_tokens,
             )
@@ -2239,7 +2245,7 @@ class AgentLoop:
                 on_token=on_token,
             )
             async for chunk in self.providers.llm.stream_generate(
-                messages,
+                model_messages,
                 model=model_for_llm,
                 task_type="default",
                 provider_id=provider_for_llm,
@@ -4094,9 +4100,15 @@ class AgentLoop:
             ):
                 continue
 
-            post_tool_snapshot = self._context_pressure_snapshot(
+            post_tool_messages = self._project_model_messages(
                 ctx,
                 messages=messages,
+                resolved_model=resolved_model,
+                max_context_tokens=context_result.max_context_tokens,
+            )
+            post_tool_snapshot = self._context_pressure_snapshot(
+                ctx,
+                messages=post_tool_messages,
                 tool_schemas=exposure.tools,
                 max_context_tokens=context_result.max_context_tokens,
             )
@@ -5731,6 +5743,8 @@ class AgentLoop:
         counts: dict[str, int] = {}
         for event in events:
             event_type = str(event.get("type") or "event")
+            if event_type == "reasoning":
+                continue
             kind = _task_log_anchor_kind(event_type)
             counts[kind] = counts.get(kind, 0) + 1
             anchor = f"{kind}:{counts[kind]}"
@@ -7046,6 +7060,13 @@ class AgentLoop:
         original_size = result.metadata.get("original_size") if result.metadata else None
         eval_meta = result.metadata.get("evaluation") if result.metadata else None
         has_saved_output = bool(raw_output or stored_output)
+        recovery_call_id = None
+        if result.metadata:
+            candidate_recovery_call_id = result.metadata.get("recovery_call_id")
+            if isinstance(candidate_recovery_call_id, str) and candidate_recovery_call_id.strip():
+                recovery_call_id = candidate_recovery_call_id
+        if recovery_call_id is None and has_saved_output:
+            recovery_call_id = tc.call_id
         events_to_record.append(
             SessionEvent(
                 type="tool_result",
@@ -7061,6 +7082,7 @@ class AgentLoop:
                     "result": intaris_preview,
                     "output_size": original_size or len(result.output),
                     "has_full_output": has_saved_output,
+                    "recovery_call_id": recovery_call_id,
                     "evaluation": eval_meta,
                     "protect_from_pruning": bool(
                         result.metadata and result.metadata.get("protected_context")
@@ -7101,10 +7123,14 @@ class AgentLoop:
                 "_protected_tool_output": bool(
                     result.metadata and result.metadata.get("protected_context")
                 ),
+                "_has_full_output": has_saved_output,
+                "_recovery_call_id": recovery_call_id,
+                "_output_size": original_size or len(result.output),
             }
         )
         attachment_context = self._build_tool_attachment_context(ctx, tc, result.attachments)
         if attachment_context is not None:
+            attachment_context["_recovery_call_id"] = recovery_call_id
             messages.append(attachment_context)
         protected_context = result.metadata.get("protected_context") if result.metadata else None
         if isinstance(protected_context, str) and protected_context.strip():
@@ -7184,6 +7210,34 @@ class AgentLoop:
             "_tool_attachment_context": True,
             "_tool_call_id": tc.call_id,
         }
+
+    def _project_model_messages(
+        self,
+        ctx: StepContext,
+        *,
+        messages: list[dict[str, Any]],
+        resolved_model: str,
+        max_context_tokens: int,
+    ) -> list[dict[str, Any]]:
+        """Project rich working history into a compact model-facing transcript."""
+
+        projection = project_messages(
+            messages,
+            preserve_recent_completed_tool_groups=DEFAULT_COMPACTED_TOOL_GROUPS,
+        )
+        token_counter = None
+        if resolved_model:
+
+            def token_counter(text: str, _m: str = resolved_model) -> int:
+                return self.providers.llm.count_tokens(text, _m)
+
+        return prune_tool_outputs(
+            projection.messages,
+            protect_tokens=min(40_000, max(4_000, max_context_tokens // 4)),
+            minimum_savings=min(20_000, max(2_000, max_context_tokens // 8)),
+            min_index_to_modify=projection.mutable_start_index,
+            token_counter=token_counter,
+        )
 
     def _context_pressure_exceeded(
         self,

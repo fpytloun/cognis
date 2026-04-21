@@ -1310,6 +1310,77 @@ async def test_context_assembler_preserves_current_turn_native_attachments_when_
 
 
 @pytest.mark.asyncio
+async def test_context_assembler_projects_older_tool_groups_into_stable_placeholders() -> None:
+    events = [
+        {
+            "type": "tool_call",
+            "data": {"name": "bash", "call_id": "call-1", "arguments": {"command": "ls"}},
+        },
+        {
+            "type": "tool_result",
+            "data": {
+                "call_id": "call-1",
+                "name": "bash",
+                "result": "A" * 6_000,
+                "output_size": 6_000,
+                "recovery_call_id": "call-1",
+            },
+        },
+        {
+            "type": "tool_call",
+            "data": {"name": "read", "call_id": "call-2", "arguments": {"path": "a.py"}},
+        },
+        {
+            "type": "tool_result",
+            "data": {
+                "call_id": "call-2",
+                "name": "read",
+                "result": "recent-1",
+                "output_size": 8,
+                "recovery_call_id": "call-2",
+            },
+        },
+        {
+            "type": "tool_call",
+            "data": {"name": "grep", "call_id": "call-3", "arguments": {"pattern": "needle"}},
+        },
+        {
+            "type": "tool_result",
+            "data": {
+                "call_id": "call-3",
+                "name": "grep",
+                "result": "recent-2",
+                "output_size": 8,
+                "recovery_call_id": "call-3",
+            },
+        },
+    ]
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=_HistorySessionCache(events),
+        session_manager=_SessionManager(),
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+
+    result = await assembler.assemble(
+        session=_session(),
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="continue",
+        tool_definitions=[],
+    )
+
+    tool_messages = [message for message in result.messages if message.get("role") == "tool"]
+    assert "Older tool result compacted from prompt." in str(tool_messages[0]["content"])
+    assert "call_id 'call-1'" in str(tool_messages[0]["content"])
+    assert tool_messages[1]["content"] == "recent-1"
+    assert tool_messages[2]["content"] == "recent-2"
+
+
+@pytest.mark.asyncio
 async def test_context_assembler_keeps_routing_reminder_out_of_immutable_prefix() -> None:
     assembler = ContextAssembler(
         memory=_Memory(),

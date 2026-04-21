@@ -25,6 +25,7 @@ from cognis.core.attachment_utils import (
 from cognis.core.attachment_utils import (
     attachment_placeholder_text as _attachment_placeholder_text,
 )
+from cognis.core.context_projection import project_messages
 from cognis.core.errors import ImmutablePrefixUnavailable
 from cognis.core.followups import (
     FollowUpMetadata,
@@ -888,8 +889,9 @@ class ContextAssembler:
             if current_turn_attachments is not None:
                 messages.append(current_turn_attachments)
 
+        projection = project_messages(messages)
         messages = self._prune_messages(
-            messages=messages,
+            messages=projection.messages,
             resolved_model=resolved_model,
             max_prompt_tokens=max_prompt_tokens,
             tool_schema_tokens=tool_schema_tokens,
@@ -1207,8 +1209,9 @@ class ContextAssembler:
             if current_turn_attachments is not None:
                 messages.append(current_turn_attachments)
 
+        projection = project_messages(messages)
         messages = self._prune_messages(
-            messages=messages,
+            messages=projection.messages,
             resolved_model=resolved_model,
             max_prompt_tokens=max_prompt_tokens,
             tool_schema_tokens=tool_schema_tokens,
@@ -1872,6 +1875,9 @@ def events_to_messages(events: list[Any]) -> list[dict[str, Any]]:
                         "content": output,
                         "_tool_name": event_data.get("name"),
                         "_protected_tool_output": bool(event_data.get("protect_from_pruning")),
+                        "_has_full_output": bool(event_data.get("has_full_output")),
+                        "_recovery_call_id": event_data.get("recovery_call_id"),
+                        "_output_size": event_data.get("output_size"),
                     }
                 )
         elif event_type == "delegation":

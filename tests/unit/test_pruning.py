@@ -6,7 +6,14 @@ from cognis.core.pruning import prune_tool_outputs
 
 
 def _tool_result(call_id: str, content: str) -> dict:
-    return {"role": "tool", "tool_call_id": call_id, "content": content}
+    return {
+        "role": "tool",
+        "tool_call_id": call_id,
+        "content": content,
+        "_recovery_call_id": call_id,
+        "_tool_name": "tool",
+        "_output_size": len(content),
+    }
 
 
 def _assistant_with_tool_calls(calls: list[dict]) -> dict:

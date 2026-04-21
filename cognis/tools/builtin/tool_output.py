@@ -193,6 +193,15 @@ def is_tool_output_tool(name: str) -> bool:
     return name in TOOL_OUTPUT_TOOL_NAMES
 
 
+def _recovery_metadata(call_id: str, output: str) -> dict[str, Any]:
+    """Metadata that lets compacted helper results point back to the source output."""
+
+    return {
+        "recovery_call_id": call_id,
+        "original_size": len(output),
+    }
+
+
 async def handle_tool_output_tool(
     tool_name: str,
     arguments: dict[str, Any],
@@ -237,7 +246,8 @@ async def _handle_read(arguments: dict[str, Any], store: ToolOutputStore) -> Too
     else:
         lines.append(f"\n(Total: {result.total_lines} lines)")
 
-    return ToolResult(output="\n".join(lines))
+    output = "\n".join(lines)
+    return ToolResult(output=output, metadata=_recovery_metadata(call_id, output))
 
 
 async def _handle_search(arguments: dict[str, Any], store: ToolOutputStore) -> ToolResult:
@@ -259,7 +269,8 @@ async def _handle_search(arguments: dict[str, Any], store: ToolOutputStore) -> T
         )
 
     if not result.matches:
-        return ToolResult(output=f"No matches found for pattern '{pattern}'.")
+        output = f"No matches found for pattern '{pattern}'."
+        return ToolResult(output=output, metadata=_recovery_metadata(call_id, output))
 
     parts: list[str] = []
     for match in result.matches:
@@ -276,7 +287,8 @@ async def _handle_search(arguments: dict[str, Any], store: ToolOutputStore) -> T
         header += f" (showing first {len(result.matches)})"
     header += ":"
 
-    return ToolResult(output=header + "\n\n" + "\n---\n".join(parts))
+    output = header + "\n\n" + "\n---\n".join(parts)
+    return ToolResult(output=output, metadata=_recovery_metadata(call_id, output))
 
 
 async def _handle_list_anchors(arguments: dict[str, Any], store: ToolOutputStore) -> ToolResult:
@@ -291,7 +303,8 @@ async def _handle_list_anchors(arguments: dict[str, Any], store: ToolOutputStore
             is_error=True,
         )
     if not anchors:
-        return ToolResult(output=f"No anchors found for call_id '{call_id}'.")
+        output = f"No anchors found for call_id '{call_id}'."
+        return ToolResult(output=output, metadata=_recovery_metadata(call_id, output))
 
     lines = [f"Found {len(anchors)} anchor(s) for '{call_id}':", ""]
     for item in anchors:
@@ -299,7 +312,8 @@ async def _handle_list_anchors(arguments: dict[str, Any], store: ToolOutputStore
         lines.append(
             f"- {item.anchor} ({item.kind}, lines {item.start_line}-{item.end_line}){label_suffix}"
         )
-    return ToolResult(output="\n".join(lines))
+    output = "\n".join(lines)
+    return ToolResult(output=output, metadata=_recovery_metadata(call_id, output))
 
 
 async def _handle_read_anchor(arguments: dict[str, Any], store: ToolOutputStore) -> ToolResult:
@@ -338,4 +352,5 @@ async def _handle_read_anchor(arguments: dict[str, Any], store: ToolOutputStore)
     )
     if result.anchor.label:
         header += f" - {result.anchor.label}"
-    return ToolResult(output=header + "\n\n" + result.content)
+    output = header + "\n\n" + result.content
+    return ToolResult(output=output, metadata=_recovery_metadata(call_id, output))
