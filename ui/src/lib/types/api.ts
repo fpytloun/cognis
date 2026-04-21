@@ -857,6 +857,7 @@ export interface StepProfileDefinition {
   profile_id: string;
   name: string;
   mode: 'soft' | 'hard' | string;
+  has_override?: boolean;
   config: {
     matrix?: Record<string, string[]>;
     tool_overrides?: {

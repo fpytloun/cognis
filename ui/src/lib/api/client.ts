@@ -952,6 +952,23 @@ export const api = {
         method: 'PUT',
         body: JSON.stringify({ value })
       });
+    },
+
+    stepProfiles(): Promise<StepProfileDefinition[]> {
+      return request<StepProfileDefinition[]>('/api/v1/settings/step-profiles');
+    },
+
+    updateStepProfile(profileId: string, payload: Record<string, unknown>): Promise<StepProfileDefinition> {
+      return request<StepProfileDefinition>(`/api/v1/settings/step-profiles/${profileId}`, {
+        method: 'PUT',
+        body: JSON.stringify(payload)
+      });
+    },
+
+    resetStepProfile(profileId: string): Promise<StepProfileDefinition> {
+      return request<StepProfileDefinition>(`/api/v1/settings/step-profiles/${profileId}`, {
+        method: 'DELETE'
+      });
     }
   },
 

@@ -741,6 +741,13 @@ class StepProfileResponse(BaseModel):
     name: str
     mode: str = "soft"
     config: dict[str, Any] = Field(default_factory=dict)
+    has_override: bool = False
+
+
+class StepProfileUpdateRequest(BaseModel):
+    name: str | None = None
+    mode: str = "soft"
+    config: dict[str, Any] = Field(default_factory=dict)
 
 
 class WorkflowResponse(BaseModel):

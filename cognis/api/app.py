@@ -54,6 +54,7 @@ from cognis.core.scheduler import Scheduler
 from cognis.core.session import SessionManager
 from cognis.core.session_cache import SessionCache
 from cognis.core.step_evaluator import StepEvaluator
+from cognis.core.step_profiles import StepProfileRegistry
 from cognis.core.task_queue import TaskQueue
 from cognis.core.tool_classification_queue import ToolClassificationQueue
 from cognis.core.tool_output_store import ToolOutputStore
@@ -301,6 +302,7 @@ def create_app() -> FastAPI:
         )
         agent_registry = AgentRegistry(session_factory)
         workflow_registry = WorkflowRegistry(session_factory)
+        step_profile_registry = await StepProfileRegistry.from_session_factory(session_factory)
         step_evaluator = await StepEvaluator.from_session_factory(
             session_factory=session_factory,
             llm=providers.llm,
@@ -332,6 +334,7 @@ def create_app() -> FastAPI:
             pause_waiter=pause_waiter,
             session_factory=session_factory,
             tool_classification_queue=tool_classification_queue,
+            step_profile_registry=step_profile_registry,
             default_step_timeout_seconds=(
                 int(step_timeout_seconds) if isinstance(step_timeout_seconds, int) else 3600
             ),
@@ -497,6 +500,7 @@ def create_app() -> FastAPI:
         app.state.tool_router = tool_router
         app.state.agent_registry = agent_registry
         app.state.workflow_registry = workflow_registry
+        app.state.step_profile_registry = step_profile_registry
         app.state.step_evaluator = step_evaluator
         app.state.agent_loop = agent_loop
         app.state.workflow_engine = workflow_engine

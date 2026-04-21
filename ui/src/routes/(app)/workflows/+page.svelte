@@ -344,6 +344,10 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
     form.steps = steps;
   }
 
+  function touchWorkflowSteps(): void {
+    form.steps = [...form.steps];
+  }
+
   function toggleStepProfileCapability(index: number, category: string, capability: string): void {
     const step = form.steps[index];
     const matrix = [...step.stepProfileMatrix];
@@ -354,23 +358,27 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
       existing.capabilities = existing.capabilities.filter((item) => item !== capability);
       if (existing.capabilities.length === 0) {
         step.stepProfileMatrix = matrix.filter((row) => row.category !== category);
+        touchWorkflowSteps();
         return;
       }
     } else {
       existing.capabilities = [...existing.capabilities, capability];
     }
     step.stepProfileMatrix = matrix;
+    touchWorkflowSteps();
   }
 
   function addProfileCategory(index: number, category: string): void {
     const step = form.steps[index];
     if (step.stepProfileMatrix.some((row) => row.category === category)) return;
     step.stepProfileMatrix = [...step.stepProfileMatrix, { category, capabilities: ['read'] }].sort((a, b) => a.category.localeCompare(b.category));
+    touchWorkflowSteps();
   }
 
   function removeProfileCategory(index: number, category: string): void {
     const step = form.steps[index];
     step.stepProfileMatrix = step.stepProfileMatrix.filter((row) => row.category !== category);
+    touchWorkflowSteps();
   }
 
   function remainingProfileCategories(index: number): string[] {
@@ -412,6 +420,7 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
     step.stepProfileBaseExcludeText = baseExcludeText;
     step.stepProfileIncludeText = baseIncludeText;
     step.stepProfileExcludeText = baseExcludeText;
+    touchWorkflowSteps();
   }
 
   function stepProfileHasCustomizations(index: number): boolean {
@@ -433,6 +442,7 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
     step.stepProfileMode = step.stepProfileBaseMode;
     step.stepProfileIncludeText = step.stepProfileBaseIncludeText;
     step.stepProfileExcludeText = step.stepProfileBaseExcludeText;
+    touchWorkflowSteps();
   }
 
   function downloadCurrentWorkflow(): void {

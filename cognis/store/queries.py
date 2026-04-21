@@ -369,6 +369,14 @@ async def list_settings(session: AsyncSession) -> list[Setting]:
     return list(result.scalars().all())
 
 
+async def delete_setting(session: AsyncSession, key: str) -> bool:
+    """Delete a setting by key."""
+
+    result = await session.execute(delete(Setting).where(Setting.key == key))
+    await session.flush()
+    return int(getattr(result, "rowcount", 0) or 0) > 0
+
+
 # --- LLM Providers ---
 
 

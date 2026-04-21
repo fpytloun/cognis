@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from cognis.models.tool import (
     ToolCapability,
@@ -16,6 +17,8 @@ from cognis.models.workflow import (
     StepProfileMode,
     StepToolOverrides,
 )
+
+STEP_PROFILE_OVERRIDES_SETTING_KEY = "workflow.step_profile_overrides"
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,6 +146,67 @@ def list_step_profile_definitions() -> list[StepProfileDefinition]:
     return list(STEP_PROFILES.values())
 
 
+class StepProfileRegistry:
+    """Cached registry for seeded step profiles plus persisted overrides."""
+
+    def __init__(self, session_factory: Any) -> None:
+        self._session_factory = session_factory
+        self._overrides: dict[str, dict[str, Any]] = {}
+
+    @classmethod
+    async def from_session_factory(cls, session_factory: Any) -> StepProfileRegistry:
+        registry = cls(session_factory)
+        await registry.refresh()
+        return registry
+
+    async def refresh(self) -> None:
+        from cognis.store.queries import get_setting_value
+
+        async with self._session_factory() as session:
+            raw = await get_setting_value(session, STEP_PROFILE_OVERRIDES_SETTING_KEY, {})
+        if not isinstance(raw, dict):
+            self._overrides = {}
+            return
+        validated: dict[str, dict[str, Any]] = {}
+        for profile_id, payload in raw.items():
+            if not isinstance(profile_id, str) or profile_id not in STEP_PROFILES:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            validated[profile_id] = _normalize_override_payload(payload)
+        self._overrides = validated
+
+    def list_definitions(self) -> list[StepProfileDefinition]:
+        return [self.get_definition(profile_id) for profile_id in STEP_PROFILES]
+
+    def get_definition(self, profile_id: str) -> StepProfileDefinition | None:
+        base = STEP_PROFILES.get(profile_id)
+        if base is None:
+            return None
+        override = self._overrides.get(profile_id)
+        if override is None:
+            return base
+        return _apply_definition_override(base, override)
+
+    def has_override(self, profile_id: str) -> bool:
+        return profile_id in self._overrides
+
+    def current_overrides(self) -> dict[str, dict[str, Any]]:
+        return dict(self._overrides)
+
+    def resolve_step_profile(self, step: StepDefinition) -> ResolvedStepProfile:
+        base = self.get_definition(step.step_profile_id or "")
+        if base is None and step.step_profile is None:
+            return ResolvedStepProfile(profile_id=None, mode=step.step_profile_mode, config=None)
+        merged = _merge_profile_config(base.config if base is not None else None, step.step_profile)
+        mode = step.step_profile_mode or (base.mode if base is not None else StepProfileMode.SOFT)
+        return ResolvedStepProfile(
+            profile_id=step.step_profile_id if base is not None else None,
+            mode=mode,
+            config=merged,
+        )
+
+
 def resolve_step_profile(step: StepDefinition) -> ResolvedStepProfile:
     """Resolve the effective step profile for a step definition."""
 
@@ -156,6 +220,21 @@ def resolve_step_profile(step: StepDefinition) -> ResolvedStepProfile:
         mode=mode,
         config=merged,
     )
+
+
+def serialize_step_profile_override(
+    *,
+    name: str | None,
+    mode: StepProfileMode,
+    config: StepProfileConfig,
+) -> dict[str, Any]:
+    """Serialize an override payload for settings persistence."""
+
+    return {
+        "name": name,
+        "mode": str(mode),
+        "config": config.model_dump(mode="json"),
+    }
 
 
 def profile_matches_tool(tool: ToolDefinition, profile: ResolvedStepProfile) -> bool:
@@ -226,4 +305,29 @@ def _merge_profile_config(
             exclude=[*base.tool_overrides.exclude, *override.tool_overrides.exclude],
         ),
         allow_tool_search=override.allow_tool_search,
+    )
+
+
+def _normalize_override_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    mode = payload.get("mode")
+    raw_config = payload.get("config")
+    config = StepProfileConfig.model_validate(raw_config if isinstance(raw_config, dict) else {})
+    return {
+        "name": payload.get("name") if isinstance(payload.get("name"), str) else None,
+        "mode": str(StepProfileMode(mode)) if isinstance(mode, str) and mode else str(StepProfileMode.SOFT),
+        "config": config.model_dump(mode="json"),
+    }
+
+
+def _apply_definition_override(
+    base: StepProfileDefinition, override: dict[str, Any]
+) -> StepProfileDefinition:
+    config = StepProfileConfig.model_validate(override.get("config") or {})
+    mode = StepProfileMode(str(override.get("mode") or base.mode))
+    name = str(override.get("name") or base.name)
+    return StepProfileDefinition(
+        profile_id=base.profile_id,
+        name=name,
+        mode=mode,
+        config=config,
     )

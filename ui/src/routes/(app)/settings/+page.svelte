@@ -6,6 +6,7 @@
   import { api, asApiError } from '$lib/api/client';
   import { deriveGettingStartedSteps } from '$lib/getting-started';
   import { collectModelOptions, createProviderForm, deriveProviderId, presetHasBaseUrl, presetNeedsAuth, PRESET_LABELS, providerFormToPayload, type ProviderFormState, type ProviderPreset } from '$lib/providers';
+  import { STEP_PROFILE_CAPABILITIES } from '$lib/workflows';
   import { defaultModelEntry, type ModelEntry } from '$lib/types/api';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import ProviderStatusBadge from '$lib/components/ProviderStatusBadge.svelte';
@@ -46,6 +47,7 @@
     SettingsCategory,
     SystemDiagnostics,
     MCPServerConfigResponse,
+    StepProfileDefinition,
     ToolDefinitionSummary,
     UserDetail,
     UserRole,
@@ -197,6 +199,19 @@
     await current.inFlight;
   }
   let mcpServerConfigs = $state<MCPServerConfigResponse[]>([]);
+  type StepProfileMatrixRow = { category: string; capabilities: string[] };
+  type StepProfileFormState = {
+    profile_id: string;
+    name: string;
+    mode: 'soft' | 'hard';
+    has_override: boolean;
+    allowToolSearch: boolean;
+    matrix: StepProfileMatrixRow[];
+    includeText: string;
+    excludeText: string;
+  };
+  let stepProfileForms = $state<StepProfileFormState[]>([]);
+  let savingStepProfileIds = $state<string[]>([]);
   let showMcpForm = $state(false);
   let editingMcpServer = $state<MCPServerConfigResponse | null>(null);
   let mcpForm = $state({ name: '', transport: 'stdio', command: '', url: '', args: '', envVars: [] as MCPEnvVar[], headers: [] as MCPEnvVar[], timeout_seconds: 30, description: '' });
@@ -285,6 +300,7 @@
     return JSON.stringify({
       providerForm,
       routingForm,
+      stepProfileForms,
       secretForm,
       credentialForm,
       passwordForm,
@@ -715,6 +731,141 @@
 
   const presetOptions: ProviderPreset[] = ['openai', 'openai_compatible', 'anthropic', 'ollama', 'litellm_proxy'];
 
+  function toStepProfileForm(profile: StepProfileDefinition): StepProfileFormState {
+    const matrix = Object.entries(profile.config.matrix || {})
+      .map(([category, capabilities]) => ({ category, capabilities: [...capabilities].sort() }))
+      .sort((a, b) => a.category.localeCompare(b.category));
+    const include = Array.isArray(profile.config.tool_overrides?.include)
+      ? profile.config.tool_overrides?.include ?? []
+      : [];
+    const exclude = Array.isArray(profile.config.tool_overrides?.exclude)
+      ? profile.config.tool_overrides?.exclude ?? []
+      : [];
+    return {
+      profile_id: profile.profile_id,
+      name: profile.name,
+      mode: profile.mode === 'hard' ? 'hard' : 'soft',
+      has_override: profile.has_override === true,
+      allowToolSearch: profile.config.allow_tool_search !== false,
+      matrix,
+      includeText: include.join(', '),
+      excludeText: exclude.join(', ')
+    };
+  }
+
+  function availableStepProfileCategories(profile: StepProfileFormState): string[] {
+    const categories = new Set<string>([
+      ...executorTools.map((tool) => tool.category),
+      ...stepProfileForms.flatMap((item) => item.matrix.map((row) => row.category))
+    ]);
+    profile.matrix.forEach((row) => categories.add(row.category));
+    return [...categories]
+      .filter((category) => !profile.matrix.some((row) => row.category === category))
+      .sort();
+  }
+
+  function updateStepProfileForm(
+    profileId: string,
+    updater: (profile: StepProfileFormState) => StepProfileFormState
+  ): void {
+    stepProfileForms = stepProfileForms.map((profile) =>
+      profile.profile_id === profileId ? updater(profile) : profile
+    );
+  }
+
+  function toggleSettingsStepProfileCapability(profileId: string, category: string, capability: string): void {
+    updateStepProfileForm(profileId, (profile) => {
+      const matrix = profile.matrix.map((row) => ({ category: row.category, capabilities: [...row.capabilities] }));
+      const existing = matrix.find((row) => row.category === category);
+      if (!existing) {
+        matrix.push({ category, capabilities: [capability] });
+      } else if (existing.capabilities.includes(capability)) {
+        existing.capabilities = existing.capabilities.filter((item) => item !== capability);
+        if (existing.capabilities.length === 0) {
+          return { ...profile, matrix: matrix.filter((row) => row.category !== category) };
+        }
+      } else {
+        existing.capabilities = [...existing.capabilities, capability].sort();
+      }
+      return { ...profile, matrix: matrix.sort((a, b) => a.category.localeCompare(b.category)) };
+    });
+  }
+
+  function addSettingsStepProfileCategory(profileId: string, category: string): void {
+    updateStepProfileForm(profileId, (profile) => {
+      if (profile.matrix.some((row) => row.category === category)) return profile;
+      return {
+        ...profile,
+        matrix: [...profile.matrix, { category, capabilities: ['read'] }].sort((a, b) => a.category.localeCompare(b.category))
+      };
+    });
+  }
+
+  function removeSettingsStepProfileCategory(profileId: string, category: string): void {
+    updateStepProfileForm(profileId, (profile) => ({
+      ...profile,
+      matrix: profile.matrix.filter((row) => row.category !== category)
+    }));
+  }
+
+  function serializeStepProfileForm(profile: StepProfileFormState): Record<string, unknown> {
+    const matrix = Object.fromEntries(
+      profile.matrix
+        .map((row) => [row.category.trim(), [...new Set(row.capabilities.map((item) => item.trim()).filter(Boolean))].sort()])
+        .filter(([category, capabilities]) => category && capabilities.length > 0)
+    );
+    const include = profile.includeText.split(',').map((item) => item.trim()).filter(Boolean);
+    const exclude = profile.excludeText.split(',').map((item) => item.trim()).filter(Boolean);
+    return {
+      name: profile.name.trim(),
+      mode: profile.mode,
+      config: {
+        matrix,
+        tool_overrides: {
+          include,
+          exclude
+        },
+        allow_tool_search: profile.allowToolSearch
+      }
+    };
+  }
+
+  async function saveStepProfile(profileId: string): Promise<void> {
+    const profile = stepProfileForms.find((item) => item.profile_id === profileId);
+    if (!profile) return;
+    savingStepProfileIds = [...new Set([...savingStepProfileIds, profileId])];
+    error = '';
+    try {
+      await api.settings.updateStepProfile(profileId, serializeStepProfileForm(profile));
+      await refreshPageState();
+      addToast('Step profile saved.', 'success');
+    } catch (caughtError) {
+      error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to save step profile');
+    } finally {
+      savingStepProfileIds = savingStepProfileIds.filter((value) => value !== profileId);
+    }
+  }
+
+  async function resetStepProfilePreset(profileId: string): Promise<void> {
+    savingStepProfileIds = [...new Set([...savingStepProfileIds, profileId])];
+    error = '';
+    try {
+      await api.settings.resetStepProfile(profileId);
+      await refreshPageState();
+      addToast('Step profile reset to default.', 'success');
+    } catch (caughtError) {
+      error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to reset step profile');
+    } finally {
+      savingStepProfileIds = savingStepProfileIds.filter((value) => value !== profileId);
+    }
+  }
+
+  function isStepProfileSaving(profileId: string): boolean {
+    return savingStepProfileIds.includes(profileId);
+  }
+
   async function refreshPageState(): Promise<void> {
     isAdmin = auth.getSnapshot().user?.role === 'admin';
     [settings, modelRouting, secrets, credentials, health, apiKeys] = await Promise.all([
@@ -765,6 +916,7 @@
     accountNameDirty = false;
 
     if (isAdmin) {
+      const profileDefs = await api.settings.stepProfiles().catch(() => []);
       [providers, diagnostics, agents, executorConfigs, executorTools, mcpServerConfigs] = await Promise.all([
         api.llmProviders.list().then((page) => page.items),
         api.system.diagnostics(),
@@ -773,6 +925,7 @@
         api.tools.executorTools().catch(() => []),
         api.tools.listMcpServerConfigs().catch(() => []),
       ]);
+      stepProfileForms = profileDefs.map(toStepProfileForm);
       await loadUsers();
     } else {
       providers = [];
@@ -780,6 +933,7 @@
       agents = [];
       executorConfigs = [];
       executorTools = [];
+      stepProfileForms = [];
       userList = [];
     }
 
@@ -2771,6 +2925,160 @@
       </div>
     {:else if activeTab === 'tools'}
       <div class="space-y-5">
+        {#if isAdmin}
+          <Card class="p-5 space-y-4">
+            <div>
+              <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Step Profiles</p>
+              <h2 class="mt-1 text-lg font-semibold text-white">Preset management</h2>
+              <p class="mt-2 text-sm text-slate-400">
+                These presets are used by workflows and direct chat tool exposure. Edits here change the runtime defaults globally.
+              </p>
+            </div>
+
+            <div class="space-y-4">
+              {#each stepProfileForms as profile}
+                <div class="rounded-2xl border border-slate-800 bg-slate-950/60 p-4 space-y-4">
+                  <div class="flex flex-wrap items-start justify-between gap-3">
+                    <div>
+                      <div class="flex flex-wrap items-center gap-2">
+                        <p class="font-medium text-white">{profile.profile_id}</p>
+                        {#if profile.has_override}
+                          <span class="rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-xs text-amber-300">customized</span>
+                        {/if}
+                      </div>
+                      <p class="mt-1 text-xs text-slate-500">Seeded preset for workflow and direct-chat tool exposure.</p>
+                    </div>
+                    <div class="flex flex-wrap gap-2">
+                      {#if profile.has_override}
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          disabled={isStepProfileSaving(profile.profile_id)}
+                          onclick={() => resetStepProfilePreset(profile.profile_id)}
+                        >Reset to default</Button>
+                      {/if}
+                      <Button
+                        size="sm"
+                        variant="primary"
+                        disabled={isStepProfileSaving(profile.profile_id)}
+                        onclick={() => saveStepProfile(profile.profile_id)}
+                      >Save preset</Button>
+                    </div>
+                  </div>
+
+                  <div class="grid gap-4 md:grid-cols-3">
+                    <label class="space-y-1 text-sm text-slate-200">
+                      <span>Name</span>
+                      <Input
+                        value={profile.name}
+                        onchange={(event) => updateStepProfileForm(profile.profile_id, (current) => ({ ...current, name: event.currentTarget.value }))}
+                      />
+                    </label>
+                    <label class="space-y-1 text-sm text-slate-200">
+                      <span>Mode</span>
+                      <select
+                        class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+                        value={profile.mode}
+                        onchange={(event) => updateStepProfileForm(profile.profile_id, (current) => ({ ...current, mode: (event.currentTarget.value === 'hard' ? 'hard' : 'soft') }))}
+                      >
+                        <option value="soft">Soft</option>
+                        <option value="hard">Hard</option>
+                      </select>
+                    </label>
+                    <label class="flex items-center gap-3 rounded-xl border border-slate-800 bg-slate-950/60 px-3 py-2 text-sm text-slate-200">
+                      <input
+                        type="checkbox"
+                        checked={profile.allowToolSearch}
+                        class="h-4 w-4 rounded border-slate-600 bg-slate-950"
+                        onchange={(event) => updateStepProfileForm(profile.profile_id, (current) => ({ ...current, allowToolSearch: event.currentTarget.checked }))}
+                      />
+                      <span>Allow tool search</span>
+                    </label>
+                  </div>
+
+                  <div class="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
+                    <div class="flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        <p class="text-sm font-medium text-slate-200">Capability matrix</p>
+                        <p class="mt-1 text-xs text-slate-400">Rows are tool groups. Columns define the capabilities this preset exposes or allows.</p>
+                      </div>
+                      {#if availableStepProfileCategories(profile).length > 0}
+                        <select
+                          class="rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+                          onchange={(event) => {
+                            const target = event.currentTarget as HTMLSelectElement;
+                            const category = target.value;
+                            if (!category) return;
+                            addSettingsStepProfileCategory(profile.profile_id, category);
+                            target.value = '';
+                          }}
+                        >
+                          <option value="">Add group…</option>
+                          {#each availableStepProfileCategories(profile) as category}
+                            <option value={category}>{category}</option>
+                          {/each}
+                        </select>
+                      {/if}
+                    </div>
+                    <div class="mt-3 overflow-x-auto">
+                      <table class="min-w-full border-separate border-spacing-y-2 text-sm text-slate-200">
+                        <thead>
+                          <tr class="text-left text-xs uppercase tracking-[0.2em] text-slate-500">
+                            <th class="px-3 py-2">Group</th>
+                            {#each STEP_PROFILE_CAPABILITIES as capability}
+                              <th class="px-3 py-2">{capability}</th>
+                            {/each}
+                            <th class="px-3 py-2"></th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {#each profile.matrix as row}
+                            <tr class="rounded-xl border border-slate-800 bg-slate-950/70">
+                              <td class="px-3 py-2 font-medium">{row.category}</td>
+                              {#each STEP_PROFILE_CAPABILITIES as capability}
+                                <td class="px-3 py-2">
+                                  <input
+                                    type="checkbox"
+                                    checked={row.capabilities.includes(capability)}
+                                    class="h-4 w-4 rounded border-slate-600 bg-slate-950"
+                                    onchange={() => toggleSettingsStepProfileCapability(profile.profile_id, row.category, capability)}
+                                  />
+                                </td>
+                              {/each}
+                              <td class="px-3 py-2 text-right">
+                                <button type="button" class="text-xs text-slate-400 hover:text-rose-300" onclick={() => removeSettingsStepProfileCategory(profile.profile_id, row.category)}>Remove</button>
+                              </td>
+                            </tr>
+                          {/each}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+
+                  <div class="grid gap-4 md:grid-cols-2">
+                    <label class="space-y-1 text-sm text-slate-200">
+                      <span>Explicit include</span>
+                      <Input
+                        value={profile.includeText}
+                        placeholder="tool_name, mcp:server:tool"
+                        onchange={(event) => updateStepProfileForm(profile.profile_id, (current) => ({ ...current, includeText: event.currentTarget.value }))}
+                      />
+                    </label>
+                    <label class="space-y-1 text-sm text-slate-200">
+                      <span>Explicit exclude</span>
+                      <Input
+                        value={profile.excludeText}
+                        placeholder="tool_name, mcp:server:tool"
+                        onchange={(event) => updateStepProfileForm(profile.profile_id, (current) => ({ ...current, excludeText: event.currentTarget.value }))}
+                      />
+                    </label>
+                  </div>
+                </div>
+              {/each}
+            </div>
+          </Card>
+        {/if}
+
         <div class="flex items-center justify-between">
           <div>
             <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Tools</p>

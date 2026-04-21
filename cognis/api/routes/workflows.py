@@ -18,7 +18,6 @@ from cognis.api.models import (
     WorkflowUpdateRequest,
 )
 from cognis.api.serializers import workflow_to_response
-from cognis.core.step_profiles import list_step_profile_definitions
 from cognis.core.workflow_management import (
     create_user_workflow,
     delete_user_workflow,
@@ -39,14 +38,16 @@ router = APIRouter(prefix="/api/v1/workflows", tags=["workflows"])
 @router.get("/step-profiles", response_model=list[StepProfileResponse])
 async def workflow_step_profiles(request: Request) -> list[StepProfileResponse]:
     require_current_user(request)
+    registry = request.app.state.step_profile_registry
     return [
         StepProfileResponse(
             profile_id=definition.profile_id,
             name=definition.name,
             mode=str(definition.mode),
             config=definition.config.model_dump(mode="json"),
+            has_override=registry.has_override(definition.profile_id),
         )
-        for definition in list_step_profile_definitions()
+        for definition in registry.list_definitions()
     ]
 
 

@@ -318,6 +318,7 @@ def test_step_profile_response_round_trips_matrix_shape() -> None:
         profile_id="system:coding",
         name="Coding",
         mode="soft",
+        has_override=True,
         config={
             "matrix": {"filesystem": ["read", "write"], "shell": ["write", "privileged"]},
             "allow_tool_search": True,
@@ -325,6 +326,7 @@ def test_step_profile_response_round_trips_matrix_shape() -> None:
     )
 
     assert response.profile_id == "system:coding"
+    assert response.has_override is True
     assert response.config["matrix"]["filesystem"] == ["read", "write"]
 
 

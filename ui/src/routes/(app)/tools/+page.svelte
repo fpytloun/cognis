@@ -689,6 +689,19 @@ import Server from 'lucide-svelte/icons/server';
 {#snippet toolDetail(tool: ToolDefinitionSummary)}
   <div class="mt-2 ml-11 p-3 bg-zinc-900/50 rounded-lg text-sm space-y-3">
     <p class="text-zinc-300">{tool.description}</p>
+    <div class="flex flex-wrap items-center gap-2">
+      <Badge>{tool.category}</Badge>
+      {#each tool.capabilities || [] as capability}
+        <Badge class="border-sky-500/30 bg-sky-500/10 text-sky-300">{capability}</Badge>
+      {/each}
+      <Badge class="border-zinc-700 bg-zinc-800 text-zinc-300">{tool.classification_source || 'heuristic'}</Badge>
+      {#if tool.classification_confidence != null}
+        <Badge class="border-zinc-700 bg-zinc-800 text-zinc-300">{Math.round(tool.classification_confidence * 100)}%</Badge>
+      {/if}
+      {#if classificationPending(tool)}
+        <Badge class="border-amber-500/30 bg-amber-500/10 text-amber-300">pending refinement</Badge>
+      {/if}
+    </div>
     {#if tool.parameters?.properties && Object.keys(tool.parameters.properties).length > 0}
       <div>
         <span class="text-zinc-500 text-xs uppercase tracking-wider">Parameters</span>
@@ -744,7 +757,7 @@ import Server from 'lucide-svelte/icons/server';
     <div class="flex flex-wrap gap-x-6 gap-y-1 text-xs text-zinc-500">
       <span>Source: <span class="text-zinc-400">{getSourceLabel(getSourceType(tool))}</span></span>
       <span>Timeout: <span class="text-zinc-400">{tool.timeout_seconds}s</span></span>
-      <span>Classification: <span class="text-zinc-400">{tool.classification_status || 'ready'} ({tool.classification_source || 'heuristic'})</span></span>
+      <span>Classification: <span class="text-zinc-400">{tool.classification_status || 'ready'}</span></span>
       {#if tool.source.server_name}<span>Server: <span class="text-zinc-400">{tool.source.server_name}</span></span>{/if}
       {#if !tool.read_only}<span>Non-bypassable: <span class="text-zinc-400">{tool.non_bypassable ? 'Yes' : 'No'}</span></span>{/if}
     </div>
