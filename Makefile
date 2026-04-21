@@ -1,7 +1,7 @@
 .PHONY: dev serve test lint format typecheck build clean ui ui-dev help
 
 PYTHON ?= uv run python
-COGNIS ?= uv run cognis
+COGNIS ?= uv run cognis-controller
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \

@@ -20,6 +20,7 @@ function tool(overrides: Partial<ToolDefinitionSummary> & Pick<ToolDefinitionSum
     parameters: overrides.parameters || { type: 'object', properties: {} },
     category: overrides.category || 'mcp',
     read_only: overrides.read_only ?? true,
+    capabilities: overrides.capabilities ?? ['read'],
     source: overrides.source || { type: 'builtin' },
     timeout_seconds: overrides.timeout_seconds ?? 30,
     non_bypassable: overrides.non_bypassable ?? false

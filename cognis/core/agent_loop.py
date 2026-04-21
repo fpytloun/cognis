@@ -54,6 +54,11 @@ from cognis.core.harness_guards import (
 from cognis.core.prompts import PromptContext
 from cognis.core.pruning import prune_tool_outputs
 from cognis.core.runtime import ExecutorEnvironmentSnapshot, ResolvedStepRuntime
+from cognis.core.step_profiles import (
+    resolve_step_profile,
+    step_profile_allows_tool,
+    step_profile_visible_by_default,
+)
 from cognis.core.title_policy import sync_intaris_title
 from cognis.core.tool_arguments import ToolArgumentError, validate_tool_arguments
 from cognis.core.tool_exposure import prepare_tool_exposure
@@ -105,6 +110,7 @@ from cognis.tools.builtin.orchestration import (
     is_workflow_tool,
 )
 from cognis.tools.builtin.tool_search import SEARCH_TOOLS_TOOL, search_inventory
+from cognis.tools.classification import classify_tool_definitions
 
 logger = get_logger(__name__)
 
@@ -2133,17 +2139,42 @@ class AgentLoop:
             ctx.current_provider_id = current_provider_id
             ctx.current_model_info = model_info
             registry = self._get_tool_registry(ctx)
-            inventory_tools = (
-                _filter_model_inventory_tools(ctx.agent, registry.list_tools(), discovered_tool_ids)
-                if registry is not None
-                else []
-            )
+            searchable_inventory_tools: list[ToolDefinition] = []
+            default_visible_tool_ids: set[str] = set()
+            allow_tool_search = True
+            if registry is not None:
+                classified_inventory = await classify_tool_definitions(
+                    registry.list_tools(), llm=self.providers.llm
+                )
+                full_inventory_tools = _filter_model_inventory_tools(
+                    ctx.agent,
+                    classified_inventory,
+                    discovered_tool_ids,
+                )
+                resolved_profile = resolve_step_profile(ctx.step_definition)
+                allow_tool_search = (
+                    resolved_profile.config.allow_tool_search
+                    if resolved_profile.config is not None
+                    else True
+                )
+                searchable_inventory_tools = [
+                    tool
+                    for tool in full_inventory_tools
+                    if step_profile_allows_tool(tool, resolved_profile)
+                ]
+                default_visible_tool_ids = {
+                    stable_tool_id(tool)
+                    for tool in searchable_inventory_tools
+                    if step_profile_visible_by_default(tool, resolved_profile)
+                }
             exposure = prepare_tool_exposure(
-                inventory_tools=inventory_tools,
+                inventory_tools=searchable_inventory_tools,
                 controller_tool_schemas=controller_tool_schemas,
                 model=current_model,
                 model_info=model_info,
                 discovered_tool_ids=discovered_tool_ids,
+                default_visible_tool_ids=default_visible_tool_ids,
+                allow_tool_search=allow_tool_search,
             )
             logger.debug(
                 "Prepared tool exposure",
@@ -3774,7 +3805,7 @@ class AgentLoop:
                         )
                         continue
                     matches = search_inventory(
-                        inventory_tools,
+                        searchable_inventory_tools,
                         str(tc.arguments.get("query", "")),
                         category=(
                             str(tc.arguments.get("category"))

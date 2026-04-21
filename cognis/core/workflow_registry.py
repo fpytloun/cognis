@@ -13,6 +13,8 @@ from cognis.models.workflow import (
     OutcomeRoute,
     StepDefinition,
     StepInputConfig,
+    StepProfileConfig,
+    StepProfileMode,
     Workflow,
     WorkflowDefaults,
     resolve_effective_input,
@@ -61,6 +63,7 @@ DIRECT_WORKFLOW = Workflow(
             type="run",
             prompt="{user_message}",
             reasoning_effort="default",
+            step_profile_id="system:direct-default",
             input=StepInputConfig(type="null"),
             completion=CompletionConfig(evaluate=False),
             require_deliverable=False,
@@ -79,7 +82,13 @@ GENERAL_TASK_WORKFLOW = Workflow(
     defaults=WorkflowDefaults(evaluate=True),
     allow_user_override=True,
     allow_user_disable=True,
-    editable_fields=["steps.*.reasoning_effort", "steps.*.completion.max_attempts"],
+    editable_fields=[
+        "steps.*.reasoning_effort",
+        "steps.*.completion.max_attempts",
+        "steps.*.step_profile_id",
+        "steps.*.step_profile_mode",
+        "steps.*.step_profile",
+    ],
     steps=[
         StepDefinition(
             name="execute",
@@ -93,6 +102,7 @@ GENERAL_TASK_WORKFLOW = Workflow(
                 "result, not just the work you attempted."
             ),
             reasoning_effort="low",
+            step_profile_id="system:general-task",
             input=StepInputConfig(type="null"),
             completion=CompletionConfig(evaluate=True, max_attempts=3),
             outcome_routes=[OutcomeRoute(status="failed", action="gate")],
@@ -111,12 +121,19 @@ RESEARCH_WORKFLOW = Workflow(
     interaction=InteractionMode(mode="explicit_gates"),
     allow_user_override=True,
     allow_user_disable=True,
-    editable_fields=["steps.*.reasoning_effort", "steps.*.completion.max_attempts"],
+    editable_fields=[
+        "steps.*.reasoning_effort",
+        "steps.*.completion.max_attempts",
+        "steps.*.step_profile_id",
+        "steps.*.step_profile_mode",
+        "steps.*.step_profile",
+    ],
     steps=[
         StepDefinition(
             name="plan",
             type="run",
             reasoning_effort="medium",
+            step_profile_id="system:research",
             prompt=(
                 "Create a research plan for this task. Identify:\n"
                 "- Key questions to answer\n"
@@ -138,6 +155,7 @@ RESEARCH_WORKFLOW = Workflow(
             type="run",
             agent_override="system:research",
             reasoning_effort="low",
+            step_profile_id="system:research",
             prompt=(
                 "Execute the research plan. Gather information from available "
                 "sources. Cross-reference findings for accuracy. Note any gaps "
@@ -153,6 +171,7 @@ RESEARCH_WORKFLOW = Workflow(
             name="synthesize",
             type="run",
             reasoning_effort="medium",
+            step_profile_id="system:research",
             prompt=(
                 "Synthesize the research findings into a coherent report with:\n"
                 "- Key findings and insights\n"
@@ -178,12 +197,19 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
     interaction=InteractionMode(mode="explicit_gates"),
     allow_user_override=True,
     allow_user_disable=True,
-    editable_fields=["steps.*.reasoning_effort", "steps.*.completion.max_attempts"],
+    editable_fields=[
+        "steps.*.reasoning_effort",
+        "steps.*.completion.max_attempts",
+        "steps.*.step_profile_id",
+        "steps.*.step_profile_mode",
+        "steps.*.step_profile",
+    ],
     steps=[
         StepDefinition(
             name="plan",
             type="run",
             reasoning_effort="medium",
+            step_profile_id="system:research",
             prompt=(
                 "Explore the codebase only as needed to understand the relevant "
                 "areas. Use focused exploration first, and parallelize only when "
@@ -211,6 +237,7 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
             type="run",
             agent_override="system:architect",
             reasoning_effort="medium",
+            step_profile_id="system:review",
             prompt=(
                 "Review this implementation plan as a proportional architecture and "
                 "risk check. Focus on missing security, reliability, testability, "
@@ -241,6 +268,7 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
             type="run",
             agent_override="system:implement",
             reasoning_effort="medium",
+            step_profile_id="system:coding",
             prompt=(
                 "Implement the approved plan. Follow the plan step by step. "
                 "After implementation, run relevant tests and linters to "
@@ -257,6 +285,7 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
             type="run",
             agent_override="system:implement",
             reasoning_effort="low",
+            step_profile_id="system:coding",
             prompt=(
                 "Update only the documentation directly affected by the changes, "
                 "such as README sections, guides, specs, API docs, configuration "
@@ -274,6 +303,7 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
             type="run",
             agent_override="system:code-review",
             reasoning_effort="medium",
+            step_profile_id="system:review",
             prompt=(
                 "Review all changes made during implementation. If the review is complete "
                 "and the changes are acceptable, complete the step normally with success. "
@@ -304,6 +334,7 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
             type="run",
             agent_override="system:committer",
             reasoning_effort="low",
+            step_profile_id="system:coding",
             prompt=(
                 "Create a conventional commit for all changes. If the commit cannot be "
                 "created due to an operational problem such as missing git identity or a "
@@ -319,6 +350,7 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
             name="remember",
             type="run",
             reasoning_effort="low",
+            step_profile_id="system:direct-default",
             prompt=(
                 "Store key findings, decisions, and implementation details "
                 "as memories for future reference. Attach a detailed summary "
@@ -337,6 +369,7 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
             name="final_summary",
             type="run",
             reasoning_effort="medium",
+            step_profile_id="system:research",
             prompt=(
                 "Produce the final user-facing implementation report for this workflow. "
                 "Synthesize the approved plan, implementation summary, documentation status, "
@@ -373,12 +406,19 @@ CREATIVE_WORKFLOW = Workflow(
     interaction=InteractionMode(mode="explicit_gates"),
     allow_user_override=True,
     allow_user_disable=True,
-    editable_fields=["steps.*.reasoning_effort", "steps.*.completion.max_attempts"],
+    editable_fields=[
+        "steps.*.reasoning_effort",
+        "steps.*.completion.max_attempts",
+        "steps.*.step_profile_id",
+        "steps.*.step_profile_mode",
+        "steps.*.step_profile",
+    ],
     steps=[
         StepDefinition(
             name="generate",
             type="run",
             reasoning_effort="low",
+            step_profile_id="system:general-task",
             prompt=(
                 "Create the requested content. Focus on quality, originality, and meeting the stated requirements. "
                 "Write the content itself as the deliverable for this step."
@@ -539,6 +579,15 @@ class WorkflowRegistry:
                     normalized_effort = None
                 if normalized_effort is not None:
                     step.reasoning_effort = normalized_effort
+            step_profile_id = raw_override.get("step_profile_id")
+            if isinstance(step_profile_id, str):
+                step.step_profile_id = step_profile_id or None
+            step_profile_mode = raw_override.get("step_profile_mode")
+            if isinstance(step_profile_mode, str) and step_profile_mode:
+                step.step_profile_mode = StepProfileMode(step_profile_mode)
+            step_profile = raw_override.get("step_profile")
+            if isinstance(step_profile, dict):
+                step.step_profile = StepProfileConfig.model_validate(step_profile)
             completion_override = raw_override.get("completion")
             if isinstance(completion_override, dict):
                 if step.completion is None:

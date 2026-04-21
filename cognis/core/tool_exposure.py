@@ -35,6 +35,8 @@ def prepare_tool_exposure(
     model: str,
     model_info: ModelInfo,
     discovered_tool_ids: set[str],
+    default_visible_tool_ids: set[str] | None = None,
+    allow_tool_search: bool = True,
 ) -> ToolExposureResult:
     """Prepare provider-specific model-facing tool schemas."""
 
@@ -43,15 +45,13 @@ def prepare_tool_exposure(
         model_info=model_info,
         rollout_mode=os.getenv("COGNIS_OPENAI_RESPONSES_MODE", "auto").strip().lower(),
     )
-    filtered_controller_tool_schemas = (
-        [
+    filtered_controller_tool_schemas = list(controller_tool_schemas)
+    if not allow_tool_search or use_openai_responses:
+        filtered_controller_tool_schemas = [
             schema
-            for schema in controller_tool_schemas
+            for schema in filtered_controller_tool_schemas
             if schema.get("function", {}).get("name") != SEARCH_TOOLS_TOOL.name
         ]
-        if use_openai_responses
-        else list(controller_tool_schemas)
-    )
 
     alias_map = {
         schema.get("function", {}).get("name", ""): schema.get("function", {}).get("name", "")
@@ -61,8 +61,15 @@ def prepare_tool_exposure(
     request_kwargs: dict[str, Any] = {}
     controller_count = len(filtered_controller_tool_schemas)
     sorted_inventory = sorted(inventory_tools, key=_tool_sort_key)
-    core_tools = [tool for tool in sorted_inventory if not _is_deferred_tool(tool)]
-    deferred_tools = [tool for tool in sorted_inventory if _is_deferred_tool(tool)]
+    visible_defaults = (
+        default_visible_tool_ids
+        if default_visible_tool_ids is not None
+        else {stable_tool_id(tool) for tool in sorted_inventory if not _is_deferred_tool(tool)}
+    )
+    core_tools = [tool for tool in sorted_inventory if stable_tool_id(tool) in visible_defaults]
+    deferred_tools = [
+        tool for tool in sorted_inventory if stable_tool_id(tool) not in visible_defaults
+    ]
     search_tool = next((tool for tool in core_tools if tool.name == SEARCH_TOOLS_TOOL.name), None)
     core_without_search = [tool for tool in core_tools if tool.name != SEARCH_TOOLS_TOOL.name]
     discovered_visible = [
@@ -73,12 +80,14 @@ def prepare_tool_exposure(
     use_anthropic_defer = bool(model_info.supports_defer_loading)
     use_openai_native_tool_search = bool(
         use_openai_responses
+        and allow_tool_search
         and model_info.supports_tool_search
         and model_info.supports_openai_namespace_tools
         and deferred_tools
     )
     use_openai_flat_tool_search = bool(
         use_openai_responses
+        and allow_tool_search
         and model_info.supports_tool_search
         and not model_info.supports_openai_namespace_tools
         and deferred_tools
@@ -110,24 +119,38 @@ def prepare_tool_exposure(
     elif use_openai_native_tool_search:
         strategy = "openai_responses_tool_search"
         visible_tools = core_without_search + deferred_tools
+        core_schemas = _build_inventory_schemas(core_without_search, alias_map)
         tool_schemas = [
-            *_build_inventory_schemas(core_without_search, alias_map),
+            *core_schemas,
             *_build_openai_deferred_namespaces(deferred_tools, alias_map),
             {"type": "tool_search"},
         ]
-        request_kwargs = {"tool_choice": "auto", "parallel_tool_calls": True}
+        request_kwargs = {
+            "tool_choice": _openai_allowed_tools_choice(core_schemas),
+            "parallel_tool_calls": True,
+        }
     elif use_openai_flat_tool_search:
         strategy = "openai_responses_flat_tool_search"
         visible_tools = core_without_search + deferred_tools
+        visible_schemas = _build_inventory_schemas(
+            visible_tools,
+            alias_map,
+            deferred_tool_ids={stable_tool_id(tool) for tool in deferred_tools},
+        )
         tool_schemas = [
-            *_build_inventory_schemas(
-                visible_tools,
-                alias_map,
-                deferred_tool_ids={stable_tool_id(tool) for tool in deferred_tools},
-            ),
+            *visible_schemas,
             {"type": "tool_search"},
         ]
-        request_kwargs = {"tool_choice": "auto", "parallel_tool_calls": True}
+        request_kwargs = {
+            "tool_choice": _openai_allowed_tools_choice(
+                [
+                    schema
+                    for schema in visible_schemas
+                    if schema.get("function", {}).get("defer_loading") is None
+                ]
+            ),
+            "parallel_tool_calls": True,
+        }
     elif use_openai_responses and deferred_tools:
         strategy = "openai_responses_full_inventory_no_defer"
         visible_tools = core_without_search + deferred_tools
@@ -288,6 +311,22 @@ def _build_openai_deferred_namespaces(
             }
         )
     return namespaces
+
+
+def _openai_allowed_tools_choice(visible_schemas: list[dict[str, Any]]) -> dict[str, Any] | str:
+    return {
+        "type": "allowed_tools",
+        "mode": "auto",
+        "tools": [
+            *[
+                {"type": "function", "name": function_name}
+                for schema in visible_schemas
+                if isinstance(schema.get("function"), dict)
+                and isinstance((function_name := schema["function"].get("name")), str)
+            ],
+            {"type": "tool_search"},
+        ],
+    }
 
 
 def _openai_namespace_key(tool: ToolDefinition) -> str:

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  buildStepProfileMap,
   createEmptyWorkflowForm,
   formStateToWorkflowPayload,
   importWorkflowYaml,
@@ -172,6 +173,54 @@ describe('workflowToFormState', () => {
     expect(form.steps[1].outcomeSuccessTarget).toBe('plan');
     expect(form.steps[1].outcomeSuccessMaxLoops).toBe(2);
   });
+
+  it('hydrates effective step profile matrix from selected preset', () => {
+    const profileMap = buildStepProfileMap([
+      {
+        profile_id: 'system:coding',
+        name: 'Coding',
+        mode: 'soft',
+        config: {
+          matrix: {
+            filesystem: ['read', 'write'],
+            shell: ['write', 'privileged']
+          },
+          allow_tool_search: true
+        }
+      }
+    ]);
+
+    const form = workflowToFormState(
+      {
+        workflow_id: 'wf:test',
+        name: 'Test',
+        description: '',
+        version: 1,
+        criteria: '',
+        tags: [],
+        interaction: { mode: 'explicit_gates' },
+        defaults: { evaluate: true, max_attempts: 3, on_exhausted: 'gate' },
+        steps: [{ name: 'implement', type: 'run', step_profile_id: 'system:coding' }],
+        is_system: false,
+        owner_email: null,
+        lifecycle: 'persistent',
+        archived_at: null,
+        lineage: null,
+        editable_fields: [],
+        has_overrides: false,
+        disabled: false,
+        disableable: false,
+        override_warnings: []
+      },
+      profileMap
+    );
+
+    expect(form.steps[0].stepProfileMatrix).toEqual([
+      { category: 'filesystem', capabilities: ['read', 'write'] },
+      { category: 'shell', capabilities: ['privileged', 'write'] }
+    ]);
+    expect(form.steps[0].stepProfileBaseMatrix).toEqual(form.steps[0].stepProfileMatrix);
+  });
 });
 
 describe('formStateToWorkflowPayload', () => {
@@ -250,6 +299,107 @@ describe('formStateToWorkflowPayload', () => {
     form.steps = [{ ...form.steps[0], name: 'new_step' }];
 
     expect(validateWorkflowForm(form)).toEqual([]);
+  });
+
+  it('omits inline step profile payload when step matches preset defaults', () => {
+    const form = createEmptyWorkflowForm();
+    form.steps = [
+      {
+        ...form.steps[0],
+        name: 'implement',
+        stepProfileId: 'system:coding',
+        stepProfileMode: 'soft',
+        stepProfileBaseMode: 'soft',
+        stepProfileAllowToolSearch: true,
+        stepProfileBaseAllowToolSearch: true,
+        stepProfileMatrix: [
+          { category: 'filesystem', capabilities: ['read', 'write'] },
+          { category: 'shell', capabilities: ['write', 'privileged'] }
+        ],
+        stepProfileBaseMatrix: [
+          { category: 'filesystem', capabilities: ['read', 'write'] },
+          { category: 'shell', capabilities: ['write', 'privileged'] }
+        ]
+      }
+    ];
+
+    const payload = formStateToWorkflowPayload(form);
+    const step = (payload.steps as Array<Record<string, unknown>>)[0];
+
+    expect(step.step_profile_id).toBe('system:coding');
+    expect(step.step_profile).toBeUndefined();
+  });
+
+  it('serializes only step profile deltas against the preset', () => {
+    const form = createEmptyWorkflowForm();
+    form.steps = [
+      {
+        ...form.steps[0],
+        name: 'implement',
+        stepProfileId: 'system:coding',
+        stepProfileMode: 'soft',
+        stepProfileBaseMode: 'soft',
+        stepProfileAllowToolSearch: false,
+        stepProfileBaseAllowToolSearch: true,
+        stepProfileMatrix: [
+          { category: 'filesystem', capabilities: ['read', 'write'] },
+          { category: 'shell', capabilities: ['privileged', 'write'] },
+          { category: 'web', capabilities: ['read'] }
+        ],
+        stepProfileBaseMatrix: [
+          { category: 'filesystem', capabilities: ['read', 'write'] },
+          { category: 'shell', capabilities: ['privileged', 'write'] }
+        ]
+      }
+    ];
+
+    const payload = formStateToWorkflowPayload(form);
+    const step = (payload.steps as Array<Record<string, unknown>>)[0];
+
+    expect(step.step_profile).toEqual({
+      matrix: {
+        web: ['read']
+      },
+      tool_overrides: {
+        include: [],
+        exclude: []
+      },
+      allow_tool_search: false
+    });
+  });
+
+  it('serializes removed preset categories as empty capability rows', () => {
+    const form = createEmptyWorkflowForm();
+    form.steps = [
+      {
+        ...form.steps[0],
+        name: 'review',
+        stepProfileId: 'system:review',
+        stepProfileMode: 'soft',
+        stepProfileBaseMode: 'soft',
+        stepProfileAllowToolSearch: true,
+        stepProfileBaseAllowToolSearch: true,
+        stepProfileMatrix: [{ category: 'filesystem', capabilities: ['read'] }],
+        stepProfileBaseMatrix: [
+          { category: 'filesystem', capabilities: ['read'] },
+          { category: 'web', capabilities: ['read'] }
+        ]
+      }
+    ];
+
+    const payload = formStateToWorkflowPayload(form);
+    const step = (payload.steps as Array<Record<string, unknown>>)[0];
+
+    expect(step.step_profile).toEqual({
+      matrix: {
+        web: []
+      },
+      tool_overrides: {
+        include: [],
+        exclude: []
+      },
+      allow_tool_search: true
+    });
   });
 
   it('serializes success routes when configured', () => {

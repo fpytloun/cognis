@@ -9,6 +9,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from cognis.models.config import NORMALIZED_REASONING_LEVELS, normalize_reasoning_level
+from cognis.models.tool import ToolCapability
 
 
 class InteractionMode(BaseModel):
@@ -196,6 +197,28 @@ class StepInputConfig(BaseModel):
         return self.source[0] if self.source else None
 
 
+class StepProfileMode(StrEnum):
+    """How a step profile constrains the tool inventory."""
+
+    SOFT = "soft"
+    HARD = "hard"
+
+
+class StepToolOverrides(BaseModel):
+    """Explicit per-tool includes/excludes on top of profile rules."""
+
+    include: list[str] = Field(default_factory=list)
+    exclude: list[str] = Field(default_factory=list)
+
+
+class StepProfileConfig(BaseModel):
+    """Inline profile matrix and tool overrides for a step."""
+
+    matrix: dict[str, list[ToolCapability]] = Field(default_factory=dict)
+    tool_overrides: StepToolOverrides = Field(default_factory=StepToolOverrides)
+    allow_tool_search: bool = True
+
+
 class StepDefinition(BaseModel):
     """A single step within a workflow."""
 
@@ -208,6 +231,9 @@ class StepDefinition(BaseModel):
     input: StepInputConfig | None = None
     completion: CompletionConfig | None = None
     allow_questions: bool = False
+    step_profile_id: str | None = None
+    step_profile_mode: StepProfileMode = StepProfileMode.SOFT
+    step_profile: StepProfileConfig | None = None
     gate: GateConfig | None = None
     on_reject: OnRejectConfig | None = None
     outcome_routes: list[OutcomeRoute] = Field(default_factory=list)

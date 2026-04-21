@@ -10,8 +10,15 @@ from cognis.api.common import (
     paginate_items,
     require_current_user,
 )
-from cognis.api.models import CursorPage, WorkflowRequest, WorkflowResponse, WorkflowUpdateRequest
+from cognis.api.models import (
+    CursorPage,
+    StepProfileResponse,
+    WorkflowRequest,
+    WorkflowResponse,
+    WorkflowUpdateRequest,
+)
 from cognis.api.serializers import workflow_to_response
+from cognis.core.step_profiles import list_step_profile_definitions
 from cognis.core.workflow_management import (
     create_user_workflow,
     delete_user_workflow,
@@ -19,6 +26,7 @@ from cognis.core.workflow_management import (
     update_user_workflow,
 )
 from cognis.models.config import NORMALIZED_REASONING_LEVELS, normalize_reasoning_level
+from cognis.models.workflow import StepProfileConfig
 from cognis.store.queries import (
     delete_system_workflow_override,
     get_system_workflow_override,
@@ -26,6 +34,20 @@ from cognis.store.queries import (
 )
 
 router = APIRouter(prefix="/api/v1/workflows", tags=["workflows"])
+
+
+@router.get("/step-profiles", response_model=list[StepProfileResponse])
+async def workflow_step_profiles(request: Request) -> list[StepProfileResponse]:
+    require_current_user(request)
+    return [
+        StepProfileResponse(
+            profile_id=definition.profile_id,
+            name=definition.name,
+            mode=str(definition.mode),
+            config=definition.config.model_dump(mode="json"),
+        )
+        for definition in list_step_profile_definitions()
+    ]
 
 
 def _validate_workflow_payload(definition: dict[str, object]) -> None:
@@ -188,6 +210,20 @@ async def _update_system_workflow_route(
             max_attempts = completion.get("max_attempts")
             if isinstance(max_attempts, int):
                 override["completion"] = {"max_attempts": max_attempts}
+        step_profile_id = step_payload.get("step_profile_id")
+        if isinstance(step_profile_id, str):
+            override["step_profile_id"] = step_profile_id
+        step_profile_mode = step_payload.get("step_profile_mode")
+        if isinstance(step_profile_mode, str) and step_profile_mode in {"soft", "hard"}:
+            override["step_profile_mode"] = step_profile_mode
+        step_profile = step_payload.get("step_profile")
+        if isinstance(step_profile, dict):
+            try:
+                override["step_profile"] = StepProfileConfig.model_validate(step_profile).model_dump(
+                    mode="json"
+                )
+            except Exception as exc:
+                raise api_exception(422, "invalid_step_profile", str(exc)) from exc
         if override:
             step_overrides[step_name] = override
 

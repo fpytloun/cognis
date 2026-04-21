@@ -1,10 +1,17 @@
 import YAML from 'yaml';
 
 import { GENERIC_THINKING_EFFORTS } from '$lib/thinking';
-import type { Workflow } from '$lib/types/api';
+import type { StepProfileDefinition, Workflow } from '$lib/types/api';
 import { isRecord } from '$lib/utils';
 
 type OutcomeAction = 'none' | 'fail' | 'gate' | 'continue' | 'cancel' | 'revise';
+
+export const STEP_PROFILE_CAPABILITIES = ['read', 'write', 'privileged', 'destructive'] as const;
+
+export interface WorkflowStepProfileRowFormState {
+  category: string;
+  capabilities: string[];
+}
 
 export interface WorkflowStepFormState {
   name: string;
@@ -13,6 +20,17 @@ export interface WorkflowStepFormState {
   agentOverride: string;
   reasoningEffort: string;
   requireDeliverable: boolean;
+  stepProfileId: string;
+  stepProfileMode: 'soft' | 'hard';
+  stepProfileBaseMode: 'soft' | 'hard';
+  stepProfileAllowToolSearch: boolean;
+  stepProfileBaseAllowToolSearch: boolean;
+  stepProfileMatrix: WorkflowStepProfileRowFormState[];
+  stepProfileBaseMatrix: WorkflowStepProfileRowFormState[];
+  stepProfileIncludeText: string;
+  stepProfileExcludeText: string;
+  stepProfileBaseIncludeText: string;
+  stepProfileBaseExcludeText: string;
   inputMode: 'auto' | 'null' | 'last' | 'full' | 'summary';
   inputText: string;
   allowQuestions: boolean;
@@ -64,6 +82,17 @@ export function createEmptyStep(): WorkflowStepFormState {
     agentOverride: '',
     reasoningEffort: '',
     requireDeliverable: true,
+    stepProfileId: '',
+    stepProfileMode: 'soft',
+    stepProfileBaseMode: 'soft',
+    stepProfileAllowToolSearch: true,
+    stepProfileBaseAllowToolSearch: true,
+    stepProfileMatrix: [],
+    stepProfileBaseMatrix: [],
+    stepProfileIncludeText: '',
+    stepProfileExcludeText: '',
+    stepProfileBaseIncludeText: '',
+    stepProfileBaseExcludeText: '',
     inputMode: 'null',
     inputText: '',
     allowQuestions: false,
@@ -88,6 +117,12 @@ export function createEmptyStep(): WorkflowStepFormState {
     outcomeFailedMaxLoops: 2,
     outcomeFailedOnExhausted: 'gate'
   };
+}
+
+export function buildStepProfileMap(
+  profiles: readonly StepProfileDefinition[]
+): Record<string, StepProfileDefinition> {
+  return Object.fromEntries(profiles.map((profile) => [profile.profile_id, profile]));
 }
 
 export function createEmptyWorkflowForm(): WorkflowFormState {
@@ -156,6 +191,131 @@ function formInputToPayload(
 
 function parseList(value: string): string[] {
   return value.split(',').map((item) => item.trim()).filter(Boolean);
+}
+
+function parseProfileMatrix(value: Workflow['steps'][number]['step_profile']): WorkflowStepProfileRowFormState[] {
+  const matrix = isRecord(value?.matrix) ? value.matrix : {};
+  return Object.entries(matrix).map(([category, capabilities]) => ({
+    category,
+    capabilities: Array.isArray(capabilities)
+      ? capabilities.filter((item): item is string => typeof item === 'string')
+      : []
+  }));
+}
+
+function cloneProfileRows(rows: WorkflowStepProfileRowFormState[]): WorkflowStepProfileRowFormState[] {
+  return rows.map((row) => ({ category: row.category, capabilities: [...row.capabilities] }));
+}
+
+function mergeProfileRows(
+  baseRows: WorkflowStepProfileRowFormState[],
+  overrideRows: WorkflowStepProfileRowFormState[]
+): WorkflowStepProfileRowFormState[] {
+  const merged = new Map(baseRows.map((row) => [row.category, [...row.capabilities]]));
+  overrideRows.forEach((row) => {
+    merged.set(row.category, [...row.capabilities]);
+  });
+  return [...merged.entries()]
+    .map(([category, capabilities]) => ({ category, capabilities }))
+    .sort((a, b) => a.category.localeCompare(b.category));
+}
+
+function normalizeProfileRows(rows: WorkflowStepProfileRowFormState[]): WorkflowStepProfileRowFormState[] {
+  return cloneProfileRows(rows)
+    .map((row) => ({
+      category: row.category.trim(),
+      capabilities: [...new Set(row.capabilities.map((item) => item.trim()).filter(Boolean))].sort()
+    }))
+    .filter((row) => row.category && row.capabilities.length > 0)
+    .sort((a, b) => a.category.localeCompare(b.category));
+}
+
+function rowsEqual(a: WorkflowStepProfileRowFormState[], b: WorkflowStepProfileRowFormState[]): boolean {
+  const left = JSON.stringify(normalizeProfileRows(a));
+  const right = JSON.stringify(normalizeProfileRows(b));
+  return left === right;
+}
+
+function profileOverrideList(
+  value: Workflow['steps'][number]['step_profile'],
+  key: 'include' | 'exclude'
+): string {
+  const overrides = isRecord(value?.tool_overrides) ? value.tool_overrides : null;
+  const items = Array.isArray(overrides?.[key])
+    ? overrides[key].filter((item): item is string => typeof item === 'string')
+    : [];
+  return items.join(', ');
+}
+
+function resolveStepProfilePreset(
+  step: Workflow['steps'][number],
+  profileMap: Record<string, StepProfileDefinition>
+): {
+  baseRows: WorkflowStepProfileRowFormState[];
+  effectiveRows: WorkflowStepProfileRowFormState[];
+  baseAllowToolSearch: boolean;
+  effectiveAllowToolSearch: boolean;
+  baseMode: 'soft' | 'hard';
+  effectiveMode: 'soft' | 'hard';
+} {
+  const preset = typeof step.step_profile_id === 'string' ? profileMap[step.step_profile_id] : undefined;
+  const presetRows = parseProfileMatrix(preset?.config);
+  const overrideRows = parseProfileMatrix(step.step_profile);
+  const baseAllowToolSearch = preset?.config?.allow_tool_search !== false;
+  const effectiveAllowToolSearch = step.step_profile?.allow_tool_search ?? baseAllowToolSearch;
+  const baseMode = preset?.mode === 'hard' ? 'hard' : 'soft';
+  const effectiveMode = step.step_profile_mode === 'hard' ? 'hard' : baseMode;
+  return {
+    baseRows: normalizeProfileRows(presetRows),
+    effectiveRows: normalizeProfileRows(mergeProfileRows(presetRows, overrideRows)),
+    baseAllowToolSearch,
+    effectiveAllowToolSearch,
+    baseMode,
+    effectiveMode
+  };
+}
+
+function formProfileToPayload(step: WorkflowStepFormState): Workflow['steps'][number]['step_profile'] | undefined {
+  const normalizedCurrent = normalizeProfileRows(step.stepProfileMatrix);
+  const normalizedBase = normalizeProfileRows(step.stepProfileBaseMatrix);
+  const baseByCategory = new Map(normalizedBase.map((row) => [row.category, row.capabilities]));
+  const deltaEntries: Array<[string, string[]]> = [];
+  normalizedCurrent.forEach((row) => {
+    const baseCapabilities = baseByCategory.get(row.category);
+    if (JSON.stringify(baseCapabilities ?? []) !== JSON.stringify(row.capabilities)) {
+      deltaEntries.push([row.category, row.capabilities]);
+    }
+  });
+  normalizedBase.forEach((row) => {
+    if (!normalizedCurrent.some((candidate) => candidate.category === row.category)) {
+      deltaEntries.push([row.category, []]);
+    }
+  });
+  const matrix = Object.fromEntries(deltaEntries);
+  const include = parseList(step.stepProfileIncludeText);
+  const exclude = parseList(step.stepProfileExcludeText);
+  const baseInclude = parseList(step.stepProfileBaseIncludeText);
+  const baseExclude = parseList(step.stepProfileBaseExcludeText);
+  const sameMatrix = rowsEqual(normalizedCurrent, normalizedBase);
+  const sameInclude = JSON.stringify(include) === JSON.stringify(baseInclude);
+  const sameExclude = JSON.stringify(exclude) === JSON.stringify(baseExclude);
+  const sameSearch = step.stepProfileAllowToolSearch === step.stepProfileBaseAllowToolSearch;
+  if (
+    sameMatrix &&
+    sameInclude &&
+    sameExclude &&
+    sameSearch
+  ) {
+    return undefined;
+  }
+  return {
+    ...(deltaEntries.length > 0 ? { matrix } : {}),
+    tool_overrides: {
+      include,
+      exclude
+    },
+    allow_tool_search: step.stepProfileAllowToolSearch
+  };
 }
 
 function parseGateOptions(value: string): Array<{ label: string; action: string }> {
@@ -230,7 +390,10 @@ function pushOutcomeRoute(
   routes.push({ status, action });
 }
 
-export function workflowToFormState(workflow: Workflow): WorkflowFormState {
+export function workflowToFormState(
+  workflow: Workflow,
+  profileMap: Record<string, StepProfileDefinition> = {}
+): WorkflowFormState {
   const deliveryDefaults = isRecord(workflow.defaults.delivery) ? workflow.defaults.delivery : null;
   return {
     workflowId: workflow.workflow_id,
@@ -252,6 +415,7 @@ export function workflowToFormState(workflow: Workflow): WorkflowFormState {
       const successRoute = outcomeRouteForStatus(step, 'success');
       const rejectedRoute = outcomeRouteForStatus(step, 'rejected');
       const failedRoute = outcomeRouteForStatus(step, 'failed');
+      const stepProfile = resolveStepProfilePreset(step, profileMap);
       return {
         name: step.name,
         type: (step.type as 'run' | 'gate') ?? 'run',
@@ -259,6 +423,17 @@ export function workflowToFormState(workflow: Workflow): WorkflowFormState {
         agentOverride: step.agent_override ?? '',
         reasoningEffort: typeof step.reasoning_effort === 'string' ? step.reasoning_effort : '',
         requireDeliverable: step.require_deliverable !== false,
+        stepProfileId: typeof step.step_profile_id === 'string' ? step.step_profile_id : '',
+        stepProfileMode: stepProfile.effectiveMode,
+        stepProfileBaseMode: stepProfile.baseMode,
+        stepProfileAllowToolSearch: stepProfile.effectiveAllowToolSearch,
+        stepProfileBaseAllowToolSearch: stepProfile.baseAllowToolSearch,
+        stepProfileMatrix: stepProfile.effectiveRows,
+        stepProfileBaseMatrix: stepProfile.baseRows,
+        stepProfileIncludeText: profileOverrideList(step.step_profile, 'include'),
+        stepProfileExcludeText: profileOverrideList(step.step_profile, 'exclude'),
+        stepProfileBaseIncludeText: profileOverrideList(profileMap[step.step_profile_id ?? '']?.config, 'include'),
+        stepProfileBaseExcludeText: profileOverrideList(profileMap[step.step_profile_id ?? '']?.config, 'exclude'),
         inputMode: workflowInputMode(step.input),
         inputText: workflowInputSourceNames(step.input).join(', '),
         allowQuestions: step.allow_questions ?? false,
@@ -339,6 +514,9 @@ export function formStateToWorkflowPayload(form: WorkflowFormState): Record<stri
         agent_override: step.agentOverride || null,
         reasoning_effort: step.reasoningEffort || undefined,
         require_deliverable: step.requireDeliverable,
+        step_profile_id: step.stepProfileId.trim() || undefined,
+        step_profile_mode: step.stepProfileMode,
+        step_profile: formProfileToPayload(step),
         ...(inputPayload ? { input: inputPayload } : {}),
         allow_questions: step.allowQuestions,
         completion:
@@ -374,6 +552,9 @@ export function formStateToSystemWorkflowOverridePayload(form: WorkflowFormState
     steps: form.steps.map((step) => ({
       name: step.name,
       reasoning_effort: step.reasoningEffort || undefined,
+      step_profile_id: step.stepProfileId.trim() || undefined,
+      step_profile_mode: step.stepProfileMode,
+      step_profile: formProfileToPayload(step),
       completion: {
         max_attempts: Number(step.maxAttempts)
       }
@@ -468,6 +649,13 @@ export function exportWorkflowYaml(form: WorkflowFormState): string {
 }
 
 export function importWorkflowYaml(raw: string): WorkflowFormState {
+  return importWorkflowYamlWithProfiles(raw, {});
+}
+
+export function importWorkflowYamlWithProfiles(
+  raw: string,
+  profileMap: Record<string, StepProfileDefinition>
+): WorkflowFormState {
   if (raw.length > 100_000) {
     throw new Error('Workflow import is limited to 100KB.');
   }
@@ -479,7 +667,7 @@ export function importWorkflowYaml(raw: string): WorkflowFormState {
   if (parsed.steps.some((step) => !isRecord(step) || typeof step.name !== 'string' || typeof step.type !== 'string')) {
     throw new Error('Invalid workflow YAML format. Each step must provide string name and type fields.');
   }
-  const form = workflowToFormState(parsed as unknown as Workflow);
+  const form = workflowToFormState(parsed as unknown as Workflow, profileMap);
   form.lifecycle = 'persistent';
   return form;
 }
