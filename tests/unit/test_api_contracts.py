@@ -280,6 +280,7 @@ def test_tool_response_round_trips_classification_fields() -> None:
         name="read",
         description="Read a file",
         category="filesystem",
+        profile_group="filesystem",
         read_only=True,
         capabilities=["read"],
         classification_status="ready",
@@ -288,6 +289,7 @@ def test_tool_response_round_trips_classification_fields() -> None:
     )
 
     assert response.capabilities == ["read"]
+    assert response.profile_group == "filesystem"
     assert response.classification_status == "ready"
     assert response.classification_source == "declared"
     assert response.classification_confidence == 1.0
@@ -299,6 +301,7 @@ def test_effective_tool_item_round_trips_classification_fields() -> None:
         name="read",
         description="Read a file",
         category="filesystem",
+        profile_group="filesystem",
         read_only=True,
         capabilities=["read"],
         classification_status="pending",
@@ -308,6 +311,7 @@ def test_effective_tool_item_round_trips_classification_fields() -> None:
     )
 
     assert response.capabilities == ["read"]
+    assert response.profile_group == "filesystem"
     assert response.classification_status == "pending"
     assert response.classification_source == "llm"
     assert response.classification_confidence == pytest.approx(0.83)
@@ -319,6 +323,7 @@ def test_step_profile_response_round_trips_matrix_shape() -> None:
         name="Coding",
         mode="soft",
         has_override=True,
+        is_custom=False,
         config={
             "matrix": {"filesystem": ["read", "write"], "shell": ["write", "privileged"]},
             "allow_tool_search": True,
@@ -327,6 +332,7 @@ def test_step_profile_response_round_trips_matrix_shape() -> None:
 
     assert response.profile_id == "system:coding"
     assert response.has_override is True
+    assert response.is_custom is False
     assert response.config["matrix"]["filesystem"] == ["read", "write"]
 
 

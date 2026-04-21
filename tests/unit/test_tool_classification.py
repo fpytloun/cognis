@@ -11,7 +11,11 @@ from cognis.models.tool import ToolDefinition, ToolSource, stable_tool_id
 from cognis.store.database import create_engine, create_session_factory
 from cognis.store.models import ToolClassificationRow
 from cognis.store.queries import upsert_tool_classification
-from cognis.tools.classification import resolve_tool_classifications, tool_fingerprint
+from cognis.tools.classification import (
+    classify_tool_definitions,
+    resolve_tool_classifications,
+    tool_fingerprint,
+)
 
 
 def _dynamic_tool() -> ToolDefinition:
@@ -62,6 +66,7 @@ async def test_resolve_tool_classifications_marks_dynamic_tools_pending_and_enqu
 
     assert resolved[0].classification_status == "pending"
     assert resolved[0].classification_source == "heuristic"
+    assert resolved[0].profile_group == "development"
     assert queue.calls == [(["mcp:github:search/issues"], None)]
 
     await engine.dispose()
@@ -98,7 +103,7 @@ async def test_resolve_tool_classifications_overlays_ready_persisted_state(tmp_p
     )
 
     assert resolved[0].classification_status == "ready"
-    assert resolved[0].category == "web"
+    assert resolved[0].profile_group == "web"
     assert resolved[0].classification_source == "llm"
 
     await engine.dispose()
@@ -172,3 +177,35 @@ async def test_tool_classification_queue_does_not_reset_running_rows_on_reenqueu
         assert row.attempts == 3
 
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_invalid_llm_group_is_rejected_back_to_heuristic() -> None:
+    tool = ToolDefinition(
+        name="mcp_unknown__sequentialthinking",
+        description="Structured reasoning helper",
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(
+            type="intaris_mcp", server_name="unknown", raw_tool_name="sequentialthinking"
+        ),
+        category="mcp",
+        read_only=True,
+    )
+
+    class _BadLLM:
+        async def generate(self, *_args, **_kwargs):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"tools":[{"tool_id":"mcp:unknown:sequentialthinking","profile_group":"mcp","capabilities":["read"],"confidence":0.95}]}'
+                        }
+                    }
+                ]
+            }
+
+    classified = await classify_tool_definitions([tool], llm=_BadLLM())
+
+    assert classified[0].classification_source == "heuristic"
+    assert classified[0].classification_status == "ready"
+    assert classified[0].profile_group == "development"

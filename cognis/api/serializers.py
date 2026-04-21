@@ -406,6 +406,7 @@ def tool_to_response(row: Any) -> ToolResponse:
         description=row.description,
         parameters=row.parameters if isinstance(row.parameters, dict) else {},
         category=row.category,
+        profile_group=getattr(row, "profile_group", None),
         read_only=row.read_only,
         capabilities=[str(capability) for capability in getattr(row, "capabilities", []) or []],
         classification_status=getattr(row, "classification_status", None),

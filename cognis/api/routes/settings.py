@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 from time import monotonic
 from typing import Any
 
 from fastapi import APIRouter, Request
+from sqlalchemy import select
 
 from cognis.api.common import api_exception, require_admin, require_current_user
 from cognis.api.models import (
@@ -22,6 +24,7 @@ from cognis.api.models import (
     SettingResponse,
     SettingsCategoryResponse,
     SettingUpdateRequest,
+    StepProfileCreateRequest,
     StepProfileResponse,
     StepProfileUpdateRequest,
     WebConfigStatusResponse,
@@ -29,19 +32,21 @@ from cognis.api.models import (
 from cognis.api.serializers import llm_provider_to_response, setting_to_response
 from cognis.core.executor_policy import load_executor_policy
 from cognis.core.step_profiles import (
+    STEP_PROFILE_CUSTOM_SETTING_KEY,
     STEP_PROFILE_OVERRIDES_SETTING_KEY,
-    STEP_PROFILES,
+    StepProfileDefinition,
     StepProfileMode,
     serialize_step_profile_override,
 )
 from cognis.models.config import normalize_reasoning_level
 from cognis.models.workflow import StepProfileConfig
 from cognis.settings_schema import setting_category, validate_setting_value
+from cognis.store.models import SystemWorkflowOverride, WorkflowRow
 from cognis.store.queries import (
     create_llm_provider,
-    delete_setting,
     delete_llm_provider,
     delete_model_routing,
+    delete_setting,
     get_llm_provider,
     get_setting,
     list_llm_providers,
@@ -64,6 +69,54 @@ _ROUTING_TASK_TYPES: tuple[str, ...] = (
     "attachment_analysis",
 )
 _TEXT_ROUTING_TASK_TYPES = frozenset({"default", "classifier", "compaction", "evaluator"})
+_STEP_PROFILE_ID_PATTERN = re.compile(r"^[a-zA-Z0-9:_-]{1,80}$")
+
+
+def _step_profile_response(registry: Any, definition: StepProfileDefinition) -> StepProfileResponse:
+    return StepProfileResponse(
+        profile_id=definition.profile_id,
+        name=definition.name,
+        mode=str(definition.mode),
+        config=definition.config.model_dump(mode="json"),
+        has_override=registry.has_override(definition.profile_id),
+        is_custom=registry.is_custom(definition.profile_id),
+    )
+
+
+def _profile_id_in_definition(definition: Any, profile_id: str) -> bool:
+    if not isinstance(definition, dict):
+        return False
+    steps = definition.get("steps")
+    if not isinstance(steps, list):
+        return False
+    return any(
+        isinstance(step, dict) and step.get("step_profile_id") == profile_id
+        for step in steps
+    )
+
+
+def _profile_id_in_step_overrides(step_overrides: Any, profile_id: str) -> bool:
+    if not isinstance(step_overrides, dict):
+        return False
+    return any(
+        isinstance(payload, dict) and payload.get("step_profile_id") == profile_id
+        for payload in step_overrides.values()
+    )
+
+
+async def _ensure_step_profile_not_in_use(session: Any, profile_id: str) -> None:
+    workflow_rows = (await session.execute(select(WorkflowRow.definition))).scalars().all()
+    if any(_profile_id_in_definition(definition, profile_id) for definition in workflow_rows):
+        raise api_exception(409, "conflict", "Step profile is still used by a workflow")
+    override_rows = (
+        await session.execute(select(SystemWorkflowOverride.step_overrides))
+    ).scalars().all()
+    if any(_profile_id_in_step_overrides(step_overrides, profile_id) for step_overrides in override_rows):
+        raise api_exception(
+            409,
+            "conflict",
+            "Step profile is still used by a system workflow override",
+        )
 
 
 def _looks_like_transcription_model(model_name: str) -> bool:
@@ -121,7 +174,7 @@ async def settings_list(request: Request) -> list[SettingsCategoryResponse]:
         rows = await list_settings(session)
     grouped: dict[str, list[SettingResponse]] = defaultdict(list)
     for row in rows:
-        if row.key == STEP_PROFILE_OVERRIDES_SETTING_KEY:
+        if row.key in {STEP_PROFILE_OVERRIDES_SETTING_KEY, STEP_PROFILE_CUSTOM_SETTING_KEY}:
             continue
         grouped[row.category].append(setting_to_response(row))
     return [
@@ -134,16 +187,48 @@ async def settings_list(request: Request) -> list[SettingsCategoryResponse]:
 async def settings_step_profiles(request: Request) -> list[StepProfileResponse]:
     require_current_user(request)
     registry = request.app.state.step_profile_registry
-    return [
-        StepProfileResponse(
-            profile_id=definition.profile_id,
-            name=definition.name,
-            mode=str(definition.mode),
-            config=definition.config.model_dump(mode="json"),
-            has_override=registry.has_override(definition.profile_id),
+    return [_step_profile_response(registry, definition) for definition in registry.list_definitions()]
+
+
+@router.post("/api/v1/settings/step-profiles", response_model=StepProfileResponse)
+async def settings_step_profile_create(
+    request: Request,
+    payload: StepProfileCreateRequest,
+) -> StepProfileResponse:
+    user = require_admin(request)
+    registry = request.app.state.step_profile_registry
+    profile_id = payload.profile_id.strip()
+    if not profile_id:
+        raise api_exception(400, "validation_error", "profile_id is required")
+    if not _STEP_PROFILE_ID_PATTERN.fullmatch(profile_id):
+        raise api_exception(400, "validation_error", "profile_id must match ^[a-zA-Z0-9:_-]{1,80}$")
+    if registry.get_definition(profile_id) is not None:
+        raise api_exception(409, "conflict", "Step profile already exists")
+    try:
+        mode = StepProfileMode(payload.mode)
+        config = StepProfileConfig.model_validate(payload.config)
+    except Exception as exc:
+        raise api_exception(400, "validation_error", str(exc)) from exc
+    async with request.app.state.session_factory() as session:
+        raw = await get_setting(session, STEP_PROFILE_CUSTOM_SETTING_KEY)
+        custom_profiles = dict(raw.value) if raw is not None and isinstance(raw.value, dict) else {}
+        custom_profiles[profile_id] = serialize_step_profile_override(
+            name=payload.name or profile_id,
+            mode=mode,
+            config=config,
         )
-        for definition in registry.list_definitions()
-    ]
+        await upsert_setting(
+            session,
+            key=STEP_PROFILE_CUSTOM_SETTING_KEY,
+            value=custom_profiles,
+            category="workflow",
+            updated_by=user.email,
+        )
+        await session.commit()
+    await registry.refresh()
+    definition = registry.get_definition(profile_id)
+    assert definition is not None
+    return _step_profile_response(registry, definition)
 
 
 @router.put("/api/v1/settings/step-profiles/{profile_id}", response_model=StepProfileResponse)
@@ -153,9 +238,12 @@ async def settings_step_profile_update(
     payload: StepProfileUpdateRequest,
 ) -> StepProfileResponse:
     user = require_admin(request)
-    base = STEP_PROFILES.get(profile_id)
-    if base is None:
+    registry = request.app.state.step_profile_registry
+    existing = registry.get_definition(profile_id)
+    if existing is None:
         raise api_exception(404, "not_found", "Step profile not found")
+    if not _STEP_PROFILE_ID_PATTERN.fullmatch(profile_id):
+        raise api_exception(400, "validation_error", "invalid profile_id")
     try:
         mode = StepProfileMode(payload.mode)
         config = StepProfileConfig.model_validate(payload.config)
@@ -163,44 +251,29 @@ async def settings_step_profile_update(
         raise api_exception(400, "validation_error", str(exc)) from exc
 
     async with request.app.state.session_factory() as session:
-        raw = await get_setting(session, STEP_PROFILE_OVERRIDES_SETTING_KEY)
-        overrides = dict(raw.value) if raw is not None and isinstance(raw.value, dict) else {}
-        overrides[profile_id] = serialize_step_profile_override(
-            name=payload.name,
-            mode=mode,
-            config=config,
-        )
-        await upsert_setting(
-            session,
-            key=STEP_PROFILE_OVERRIDES_SETTING_KEY,
-            value=overrides,
-            category="workflow",
-            updated_by=user.email,
-        )
-        await session.commit()
-    await request.app.state.step_profile_registry.refresh()
-    definition = request.app.state.step_profile_registry.get_definition(profile_id)
-    assert definition is not None
-    return StepProfileResponse(
-        profile_id=definition.profile_id,
-        name=definition.name,
-        mode=str(definition.mode),
-        config=definition.config.model_dump(mode="json"),
-        has_override=True,
-    )
-
-
-@router.delete("/api/v1/settings/step-profiles/{profile_id}", response_model=StepProfileResponse)
-async def settings_step_profile_reset(request: Request, profile_id: str) -> StepProfileResponse:
-    user = require_admin(request)
-    base = STEP_PROFILES.get(profile_id)
-    if base is None:
-        raise api_exception(404, "not_found", "Step profile not found")
-    async with request.app.state.session_factory() as session:
-        raw = await get_setting(session, STEP_PROFILE_OVERRIDES_SETTING_KEY)
-        overrides = dict(raw.value) if raw is not None and isinstance(raw.value, dict) else {}
-        overrides.pop(profile_id, None)
-        if overrides:
+        if registry.is_custom(profile_id):
+            raw = await get_setting(session, STEP_PROFILE_CUSTOM_SETTING_KEY)
+            custom_profiles = dict(raw.value) if raw is not None and isinstance(raw.value, dict) else {}
+            custom_profiles[profile_id] = serialize_step_profile_override(
+                name=payload.name or existing.name,
+                mode=mode,
+                config=config,
+            )
+            await upsert_setting(
+                session,
+                key=STEP_PROFILE_CUSTOM_SETTING_KEY,
+                value=custom_profiles,
+                category="workflow",
+                updated_by=user.email,
+            )
+        else:
+            raw = await get_setting(session, STEP_PROFILE_OVERRIDES_SETTING_KEY)
+            overrides = dict(raw.value) if raw is not None and isinstance(raw.value, dict) else {}
+            overrides[profile_id] = serialize_step_profile_override(
+                name=payload.name,
+                mode=mode,
+                config=config,
+            )
             await upsert_setting(
                 session,
                 key=STEP_PROFILE_OVERRIDES_SETTING_KEY,
@@ -208,19 +281,65 @@ async def settings_step_profile_reset(request: Request, profile_id: str) -> Step
                 category="workflow",
                 updated_by=user.email,
             )
-        else:
-            await delete_setting(session, STEP_PROFILE_OVERRIDES_SETTING_KEY)
         await session.commit()
-    await request.app.state.step_profile_registry.refresh()
-    definition = request.app.state.step_profile_registry.get_definition(profile_id)
+    await registry.refresh()
+    definition = registry.get_definition(profile_id)
     assert definition is not None
-    return StepProfileResponse(
-        profile_id=definition.profile_id,
-        name=definition.name,
-        mode=str(definition.mode),
-        config=definition.config.model_dump(mode="json"),
-        has_override=False,
-    )
+    return _step_profile_response(registry, definition)
+
+
+@router.delete("/api/v1/settings/step-profiles/{profile_id}", response_model=StepProfileResponse)
+async def settings_step_profile_reset(request: Request, profile_id: str) -> StepProfileResponse:
+    user = require_admin(request)
+    registry = request.app.state.step_profile_registry
+    existing = registry.get_definition(profile_id)
+    if existing is None:
+        raise api_exception(404, "not_found", "Step profile not found")
+    was_custom = registry.is_custom(profile_id)
+    async with request.app.state.session_factory() as session:
+        if was_custom:
+            await _ensure_step_profile_not_in_use(session, profile_id)
+            raw = await get_setting(session, STEP_PROFILE_CUSTOM_SETTING_KEY)
+            custom_profiles = dict(raw.value) if raw is not None and isinstance(raw.value, dict) else {}
+            custom_profiles.pop(profile_id, None)
+            if custom_profiles:
+                await upsert_setting(
+                    session,
+                    key=STEP_PROFILE_CUSTOM_SETTING_KEY,
+                    value=custom_profiles,
+                    category="workflow",
+                    updated_by=user.email,
+                )
+            else:
+                await delete_setting(session, STEP_PROFILE_CUSTOM_SETTING_KEY)
+        else:
+            raw = await get_setting(session, STEP_PROFILE_OVERRIDES_SETTING_KEY)
+            overrides = dict(raw.value) if raw is not None and isinstance(raw.value, dict) else {}
+            overrides.pop(profile_id, None)
+            if overrides:
+                await upsert_setting(
+                    session,
+                    key=STEP_PROFILE_OVERRIDES_SETTING_KEY,
+                    value=overrides,
+                    category="workflow",
+                    updated_by=user.email,
+                )
+            else:
+                await delete_setting(session, STEP_PROFILE_OVERRIDES_SETTING_KEY)
+        await session.commit()
+    await registry.refresh()
+    if was_custom:
+        return StepProfileResponse(
+            profile_id=existing.profile_id,
+            name=existing.name,
+            mode=str(existing.mode),
+            config=existing.config.model_dump(mode="json"),
+            has_override=False,
+            is_custom=True,
+        )
+    definition = registry.get_definition(profile_id)
+    assert definition is not None
+    return _step_profile_response(registry, definition)
 
 
 @router.get("/api/v1/settings/{key}", response_model=SettingResponse)
@@ -268,7 +387,7 @@ async def setting_update(
         request.app.state.agent_loop.default_step_timeout_seconds = max(1, int(payload.value))
     elif key == "evaluator.timeout_ms":
         request.app.state.step_evaluator.evaluator_timeout_seconds = max(1, int(payload.value)) / 1000
-    elif key == STEP_PROFILE_OVERRIDES_SETTING_KEY:
+    elif key in {STEP_PROFILE_OVERRIDES_SETTING_KEY, STEP_PROFILE_CUSTOM_SETTING_KEY}:
         await request.app.state.step_profile_registry.refresh()
     return setting_to_response(row)
 

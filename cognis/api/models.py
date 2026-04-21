@@ -742,12 +742,17 @@ class StepProfileResponse(BaseModel):
     mode: str = "soft"
     config: dict[str, Any] = Field(default_factory=dict)
     has_override: bool = False
+    is_custom: bool = False
 
 
 class StepProfileUpdateRequest(BaseModel):
     name: str | None = None
     mode: str = "soft"
     config: dict[str, Any] = Field(default_factory=dict)
+
+
+class StepProfileCreateRequest(StepProfileUpdateRequest):
+    profile_id: str
 
 
 class WorkflowResponse(BaseModel):
@@ -822,6 +827,7 @@ class ToolResponse(BaseModel):
     description: str
     parameters: dict[str, Any] = Field(default_factory=dict)
     category: str = "general"
+    profile_group: str | None = None
     read_only: bool = False
     capabilities: list[str] = Field(default_factory=list)
     classification_status: str | None = None
@@ -837,6 +843,7 @@ class EffectiveToolItemResponse(BaseModel):
     name: str
     description: str
     category: str = "general"
+    profile_group: str | None = None
     read_only: bool = False
     capabilities: list[str] = Field(default_factory=list)
     classification_status: str | None = None

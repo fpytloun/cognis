@@ -12,10 +12,16 @@ from typing import Any
 import sqlalchemy as sa
 
 from cognis.logging import get_logger
-from cognis.models.tool import ToolDefinition, stable_tool_id
+from cognis.models.tool import (
+    AUTO_PROFILE_GROUPS,
+    ToolDefinition,
+    stable_tool_id,
+    tool_profile_group,
+)
 from cognis.store.models import ToolClassificationRow
 from cognis.store.queries import tool_classification_scope, upsert_tool_classification
 from cognis.tools.classification import (
+    _validate_profile_group,
     classify_tool_definitions,
     requires_background_classification,
     tool_fingerprint,
@@ -97,8 +103,14 @@ class ToolClassificationQueue:
                     row is not None
                     and row.fingerprint == fingerprint
                     and row.status == "ready"
-                    and row.category
+                    and row.category in AUTO_PROFILE_GROUPS
                     and row.capabilities
+                    and _validate_profile_group(
+                        tool,
+                        str(row.category),
+                        [str(capability) for capability in row.capabilities],
+                    )
+                    is None
                 ):
                     continue
                 if row is not None and row.fingerprint == fingerprint and row.status in {
@@ -245,7 +257,7 @@ class ToolClassificationQueue:
                     if row is None:
                         return
                     row.status = "ready"
-                    row.category = resolved.category
+                    row.category = tool_profile_group(resolved)
                     row.capabilities = [str(capability) for capability in resolved.capabilities]
                     row.classification_source = resolved.classification_source
                     row.classification_confidence = resolved.classification_confidence

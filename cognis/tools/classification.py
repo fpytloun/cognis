@@ -10,7 +10,15 @@ from typing import Any
 
 from cognis.core.json_utils import extract_json_object, extract_text_from_response
 from cognis.logging import get_logger
-from cognis.models.tool import ToolCapability, ToolDefinition, stable_tool_id, tool_capabilities
+from cognis.models.tool import (
+    AUTO_PROFILE_GROUPS,
+    RESERVED_PROFILE_GROUPS,
+    ToolCapability,
+    ToolDefinition,
+    stable_tool_id,
+    tool_capabilities,
+    tool_profile_group,
+)
 from cognis.store.queries import get_tool_classification_rows, tool_classification_scope
 
 logger = get_logger(__name__)
@@ -59,13 +67,99 @@ _DESTRUCTIVE_PREFIXES = (
     "wipe_",
 )
 
+_BROWSER_HINTS = (
+    "browser",
+    "page",
+    "click",
+    "screenshot",
+    "dom",
+    "tab",
+    "navigate",
+    "playwright",
+    "devtools",
+)
+_COMMUNICATION_HINTS = (
+    "slack",
+    "email",
+    "mail",
+    "message",
+    "channel",
+    "thread",
+    "discord",
+    "telegram",
+    "signal",
+    "whatsapp",
+    "twitter",
+    "facebook",
+    "tweet",
+    "inbox",
+)
+_OFFICE_HINTS = (
+    "calendar",
+    "meeting",
+    "event",
+    "sheet",
+    "spreadsheet",
+    "doc",
+    "document",
+    "drive",
+    "slides",
+    "workspace",
+    "todo",
+    "task",
+)
+_PERSONAL_HINTS = (
+    "order",
+    "shopping",
+    "delivery",
+    "oura",
+    "sleep",
+    "health",
+    "fitness",
+    "workout",
+    "homeassistant",
+    "home assistant",
+    "vacuum",
+    "light",
+    "climate",
+    "garage",
+    "lock",
+)
+_DEVELOPMENT_HINTS = (
+    "github",
+    "gitlab",
+    "supabase",
+    "next.js",
+    "nextjs",
+    "xcode",
+    "build",
+    "test",
+    "repo",
+    "repository",
+    "context7",
+    "sequentialthinking",
+    "sequential thinking",
+    "library",
+    "framework",
+)
+_WEB_HINTS = (
+    "http",
+    "url",
+    "crawl",
+    "extract",
+    "web",
+    "search",
+    "fetch",
+    "api",
+)
+
 
 def classify_tool_definition(tool: ToolDefinition) -> ToolDefinition:
     """Apply deterministic classification to a tool definition."""
 
-    if tool.classification_source and tool.capabilities:
+    if tool.classification_source and tool.capabilities and tool.profile_group:
         return tool
-    category = _heuristic_category(tool)
+    profile_group = _heuristic_profile_group(tool)
     capabilities = sorted(_heuristic_capabilities(tool), key=str)
     source = tool.classification_source or (
         "declared"
@@ -77,7 +171,8 @@ def classify_tool_definition(tool: ToolDefinition) -> ToolDefinition:
         confidence = 1.0 if source == "declared" else 0.6
     return tool.model_copy(
         update={
-            "category": category,
+            "category": tool.category,
+            "profile_group": profile_group,
             "capabilities": capabilities,
             "classification_status": tool.classification_status or "ready",
             "classification_source": source,
@@ -105,7 +200,7 @@ async def classify_tool_definitions(
         for tool in classified
         if tool.source.type in {"local_mcp", "intaris_mcp", "skill"}
         and (
-            tool.category in {"mcp", "skill", "general"}
+            tool_profile_group(tool) not in AUTO_PROFILE_GROUPS
             or not tool.capabilities
             or tool.classification_source == "heuristic"
         )
@@ -119,13 +214,26 @@ async def classify_tool_definitions(
         current = by_id.get(tool_id)
         if current is None:
             continue
-        category = str(payload.get("category") or current.category).strip() or current.category
+        profile_group = str(payload.get("profile_group") or tool_profile_group(current)).strip() or tool_profile_group(current)
         capabilities = _normalize_capabilities(payload.get("capabilities")) or current.capabilities
         if not capabilities:
             capabilities = sorted(tool_capabilities(current), key=str)
+        error = _validate_profile_group(current, profile_group, capabilities)
+        if error is not None:
+            logger.warning(
+                "Rejected LLM tool classification",
+                extra={
+                    "extra_data": {
+                        "tool_id": tool_id,
+                        "proposed_profile_group": profile_group,
+                        "reason": error,
+                    }
+                },
+            )
+            continue
         by_id[tool_id] = current.model_copy(
             update={
-                "category": category,
+                "profile_group": profile_group,
                 "capabilities": capabilities,
                 "classification_status": "ready",
                 "classification_source": "llm",
@@ -160,16 +268,17 @@ def apply_persisted_classifications(
             else:
                 overlaid.append(tool)
             continue
-        if str(getattr(row, "status", "")) != "ready":
-            overlaid.append(tool.model_copy(update={"classification_status": "pending"}))
-            continue
+        stored_profile_group = str(getattr(row, "category", None) or "").strip()
         capabilities = _normalize_capabilities(getattr(row, "capabilities", None)) or tool.capabilities
         if not capabilities:
             capabilities = sorted(tool_capabilities(tool), key=str)
+        if str(getattr(row, "status", "")) != "ready" or _validate_profile_group(tool, stored_profile_group, capabilities) is not None:
+            overlaid.append(tool.model_copy(update={"classification_status": "pending"}))
+            continue
         overlaid.append(
             tool.model_copy(
                 update={
-                    "category": str(getattr(row, "category", None) or tool.category),
+                    "profile_group": stored_profile_group,
                     "capabilities": capabilities,
                     "classification_status": "ready",
                     "classification_source": getattr(row, "classification_source", None)
@@ -208,9 +317,9 @@ async def resolve_tool_classifications(
     return apply_persisted_classifications(classified, rows)
 
 
-def _heuristic_category(tool: ToolDefinition) -> str:
-    if tool.category not in {"skill", "mcp", "general"}:
-        return tool.category
+def _heuristic_profile_group(tool: ToolDefinition) -> str:
+    if tool.source.type in {"builtin", "executor"}:
+        return tool_profile_group(tool)
     haystack = " ".join(
         part
         for part in (
@@ -220,21 +329,23 @@ def _heuristic_category(tool: ToolDefinition) -> str:
         )
         if part
     ).lower()
-    if any(token in haystack for token in ("browser", "page", "click", "screenshot", "dom")):
+    if _contains_any(haystack, _BROWSER_HINTS):
         return "browser"
-    if any(token in haystack for token in ("http", "url", "crawl", "extract", "web", "search")):
-        return "web"
+    if _contains_any(haystack, _COMMUNICATION_HINTS):
+        return "communication"
+    if _contains_any(haystack, _OFFICE_HINTS):
+        return "office"
+    if _contains_any(haystack, _PERSONAL_HINTS):
+        return "personal"
     if any(token in haystack for token in ("file", "filesystem", "path", "repo", "glob", "grep")):
         return "filesystem"
     if any(token in haystack for token in ("bash", "shell", "command", "terminal", "process")):
         return "shell"
-    if any(token in haystack for token in ("memory", "remember", "recall", "knowledge")):
-        return "memory"
-    if any(token in haystack for token in ("calendar", "time", "date", "timezone")):
-        return "datetime"
-    if any(token in haystack for token in ("git", "diff", "commit", "pull request", "github")):
-        return "orchestration"
-    return tool.category if tool.category != "general" else "mcp"
+    if _contains_any(haystack, _DEVELOPMENT_HINTS):
+        return "development"
+    if _contains_any(haystack, _WEB_HINTS):
+        return "web"
+    return "development"
 
 
 def _heuristic_capabilities(tool: ToolDefinition) -> set[ToolCapability]:
@@ -260,7 +371,7 @@ def _heuristic_capabilities(tool: ToolDefinition) -> set[ToolCapability]:
         caps = {ToolCapability.READ}
     elif any(haystack.startswith(prefix) for prefix in _WRITE_PREFIXES):
         caps = {ToolCapability.WRITE}
-    if tool.category in {"shell", "browser", "orchestration", "skill"} or tool.non_bypassable:
+    if tool_profile_group(tool) in {"shell", "browser", "development"} or tool.non_bypassable:
         caps.add(ToolCapability.PRIVILEGED)
     return caps
 
@@ -275,8 +386,14 @@ async def _classify_with_llm(tools: list[ToolDefinition], *, llm: Any) -> dict[s
             cache_key = f"{tool_id}:{fingerprint}"
             cached = _CLASSIFICATION_CACHE.get(cache_key)
             if cached is not None:
-                cached_results[tool_id] = cached
-                continue
+                error = _validate_profile_group(
+                    tool,
+                    str(cached.get("profile_group") or cached.get("category") or ""),
+                    _normalize_capabilities(cached.get("capabilities")),
+                )
+                if error is None:
+                    cached_results[tool_id] = cached
+                    continue
             uncached.append((tool_id, tool, cache_key))
     if not uncached:
         return cached_results
@@ -286,9 +403,10 @@ async def _classify_with_llm(tools: list[ToolDefinition], *, llm: Any) -> dict[s
             "role": "system",
             "content": (
                 "Classify tools for an agent runtime. Return JSON object with a top-level 'tools' array. "
-                "Each item must include 'tool_id', 'category', 'capabilities', and 'confidence'. "
+                "Each item must include 'tool_id', 'profile_group', 'capabilities', and 'confidence'. "
                 "Capabilities must be a subset of ['read','write','privileged','destructive']. "
-                "Prefer existing categories when plausible: filesystem, shell, web, browser, memory, datetime, orchestration, lsp, system, workflow, image, schedule, mcp, skill."
+                "Choose profile_group only from: filesystem, shell, web, browser, development, office, personal, communication. "
+                "Never return memory, system, mcp, skill, or general."
             ),
         },
         {
@@ -340,10 +458,21 @@ async def _classify_with_llm(tools: list[ToolDefinition], *, llm: Any) -> dict[s
         if not isinstance(tool_id, str):
             continue
         normalized = {
-            "category": str(item.get("category") or "mcp").strip() or "mcp",
+            "profile_group": str(item.get("profile_group") or item.get("category") or "development").strip() or "development",
             "capabilities": _normalize_capabilities(item.get("capabilities")),
             "confidence": float(item.get("confidence") or 0.75),
         }
+        error = _validate_profile_group(
+            next((tool for candidate_id, tool, _key in uncached if candidate_id == tool_id), None),
+            str(normalized["profile_group"]),
+            normalized["capabilities"],
+        )
+        if error is not None:
+            logger.warning(
+                "Rejected cached LLM tool classification",
+                extra={"extra_data": {"tool_id": tool_id, "reason": error}},
+            )
+            continue
         results_by_id[tool_id] = normalized
         cache_key = next(
             (key for candidate_id, _tool, key in uncached if candidate_id == tool_id), None
@@ -368,6 +497,63 @@ def _normalize_capabilities(value: Any) -> list[ToolCapability]:
         if capability not in normalized:
             normalized.append(capability)
     return normalized
+
+
+def _validate_profile_group(
+    tool: ToolDefinition | None,
+    profile_group: str,
+    capabilities: list[ToolCapability],
+) -> str | None:
+    normalized_group = profile_group.strip().lower()
+    if normalized_group not in AUTO_PROFILE_GROUPS:
+        if normalized_group in RESERVED_PROFILE_GROUPS:
+            return "reserved_profile_group"
+        if normalized_group in {"mcp", "skill", "general", "workflow", "orchestration", "lsp", "datetime", "context", "artifact", "schedule", "deliverable"}:
+            return "non_profile_group_category"
+        return "unknown_profile_group"
+    if not capabilities:
+        return "missing_capabilities"
+    if tool is None:
+        return None
+    haystack = _tool_haystack(tool)
+    is_browser = _contains_any(haystack, _BROWSER_HINTS)
+    is_communication = _contains_any(haystack, _COMMUNICATION_HINTS)
+    is_office = _contains_any(haystack, _OFFICE_HINTS)
+    is_personal = _contains_any(haystack, _PERSONAL_HINTS)
+    is_web = _contains_any(haystack, _WEB_HINTS)
+    if is_browser and normalized_group != "browser":
+        return "browser_tool_misclassified"
+    if normalized_group == "browser" and not is_browser:
+        return "browser_group_without_browser_signal"
+    if normalized_group == "web" and is_browser:
+        return "web_group_for_browser_tool"
+    if is_communication and normalized_group != "communication":
+        return "communication_tool_misclassified"
+    if is_office and normalized_group not in {"office", "communication"}:
+        return "office_tool_misclassified"
+    if is_personal and normalized_group != "personal":
+        return "personal_tool_misclassified"
+    if normalized_group == "web" and not (is_web or tool.read_only):
+        return "web_group_without_web_signal"
+    return None
+
+
+def _tool_haystack(tool: ToolDefinition) -> str:
+    return " ".join(
+        part
+        for part in (
+            tool.name,
+            tool.source.raw_tool_name or "",
+            tool.description,
+            tool.source.server_name or "",
+            tool.source.server_id or "",
+        )
+        if part
+    ).lower()
+
+
+def _contains_any(haystack: str, tokens: tuple[str, ...]) -> bool:
+    return any(token in haystack for token in tokens)
 
 
 def _tool_fingerprint(tool: ToolDefinition) -> str:

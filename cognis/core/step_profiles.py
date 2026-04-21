@@ -6,10 +6,12 @@ from dataclasses import dataclass
 from typing import Any
 
 from cognis.models.tool import (
+    ALL_PROFILE_GROUPS,
     ToolCapability,
     ToolDefinition,
     tool_capabilities,
     tool_matches_identifier,
+    tool_profile_group,
 )
 from cognis.models.workflow import (
     StepDefinition,
@@ -19,6 +21,18 @@ from cognis.models.workflow import (
 )
 
 STEP_PROFILE_OVERRIDES_SETTING_KEY = "workflow.step_profile_overrides"
+STEP_PROFILE_CUSTOM_SETTING_KEY = "workflow.step_profiles_custom"
+LEGACY_PROFILE_GROUP_MAP: dict[str, str] = {
+    "lsp": "filesystem",
+    "orchestration": "system",
+    "workflow": "system",
+    "tool_output": "system",
+    "context": "system",
+    "deliverable": "system",
+    "artifact": "system",
+    "schedule": "system",
+    "datetime": "system",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,11 +68,9 @@ STEP_PROFILES: dict[str, StepProfileDefinition] = {
                 "datetime": _caps(ToolCapability.READ),
                 "filesystem": _caps(ToolCapability.READ),
                 "memory": _caps(ToolCapability.READ, ToolCapability.WRITE),
-                "orchestration": _caps(ToolCapability.READ, ToolCapability.WRITE),
                 "system": _caps(ToolCapability.READ),
-                "tool_output": _caps(ToolCapability.READ),
                 "web": _caps(ToolCapability.READ),
-                "workflow": _caps(ToolCapability.READ, ToolCapability.WRITE),
+                "development": _caps(ToolCapability.READ),
             }
         ),
     ),
@@ -71,12 +83,13 @@ STEP_PROFILES: dict[str, StepProfileDefinition] = {
                 "datetime": _caps(ToolCapability.READ),
                 "filesystem": _caps(ToolCapability.READ, ToolCapability.WRITE),
                 "memory": _caps(ToolCapability.READ, ToolCapability.WRITE),
-                "orchestration": _caps(ToolCapability.READ, ToolCapability.WRITE),
                 "shell": _caps(ToolCapability.WRITE, ToolCapability.PRIVILEGED),
                 "system": _caps(ToolCapability.READ),
-                "tool_output": _caps(ToolCapability.READ),
                 "web": _caps(ToolCapability.READ),
-                "workflow": _caps(ToolCapability.READ, ToolCapability.WRITE),
+                "development": _caps(ToolCapability.READ, ToolCapability.WRITE),
+                "communication": _caps(ToolCapability.READ, ToolCapability.WRITE),
+                "office": _caps(ToolCapability.READ, ToolCapability.WRITE),
+                "personal": _caps(ToolCapability.READ, ToolCapability.WRITE),
             }
         ),
     ),
@@ -89,11 +102,12 @@ STEP_PROFILES: dict[str, StepProfileDefinition] = {
                 "datetime": _caps(ToolCapability.READ),
                 "filesystem": _caps(ToolCapability.READ),
                 "memory": _caps(ToolCapability.READ, ToolCapability.WRITE),
-                "orchestration": _caps(ToolCapability.READ, ToolCapability.WRITE),
                 "system": _caps(ToolCapability.READ),
-                "tool_output": _caps(ToolCapability.READ),
                 "web": _caps(ToolCapability.READ),
-                "workflow": _caps(ToolCapability.READ, ToolCapability.WRITE),
+                "development": _caps(ToolCapability.READ),
+                "office": _caps(ToolCapability.READ),
+                "communication": _caps(ToolCapability.READ),
+                "personal": _caps(ToolCapability.READ),
             }
         ),
     ),
@@ -106,16 +120,12 @@ STEP_PROFILES: dict[str, StepProfileDefinition] = {
                 "browser": _caps(
                     ToolCapability.READ, ToolCapability.WRITE, ToolCapability.PRIVILEGED
                 ),
-                "datetime": _caps(ToolCapability.READ),
                 "filesystem": _caps(ToolCapability.READ, ToolCapability.WRITE),
-                "lsp": _caps(ToolCapability.READ, ToolCapability.WRITE),
                 "memory": _caps(ToolCapability.READ, ToolCapability.WRITE),
-                "orchestration": _caps(ToolCapability.READ, ToolCapability.WRITE),
                 "shell": _caps(ToolCapability.WRITE, ToolCapability.PRIVILEGED),
                 "system": _caps(ToolCapability.READ),
-                "tool_output": _caps(ToolCapability.READ),
                 "web": _caps(ToolCapability.READ),
-                "workflow": _caps(ToolCapability.READ, ToolCapability.WRITE),
+                "development": _caps(ToolCapability.READ, ToolCapability.WRITE, ToolCapability.PRIVILEGED),
             }
         ),
     ),
@@ -125,15 +135,11 @@ STEP_PROFILES: dict[str, StepProfileDefinition] = {
         mode=StepProfileMode.SOFT,
         config=StepProfileConfig(
             matrix={
-                "datetime": _caps(ToolCapability.READ),
                 "filesystem": _caps(ToolCapability.READ),
-                "lsp": _caps(ToolCapability.READ),
                 "memory": _caps(ToolCapability.READ, ToolCapability.WRITE),
-                "orchestration": _caps(ToolCapability.READ, ToolCapability.WRITE),
                 "system": _caps(ToolCapability.READ),
-                "tool_output": _caps(ToolCapability.READ),
                 "web": _caps(ToolCapability.READ),
-                "workflow": _caps(ToolCapability.READ, ToolCapability.WRITE),
+                "development": _caps(ToolCapability.READ),
             }
         ),
     ),
@@ -152,6 +158,7 @@ class StepProfileRegistry:
     def __init__(self, session_factory: Any) -> None:
         self._session_factory = session_factory
         self._overrides: dict[str, dict[str, Any]] = {}
+        self._custom: dict[str, StepProfileDefinition] = {}
 
     @classmethod
     async def from_session_factory(cls, session_factory: Any) -> StepProfileRegistry:
@@ -164,9 +171,9 @@ class StepProfileRegistry:
 
         async with self._session_factory() as session:
             raw = await get_setting_value(session, STEP_PROFILE_OVERRIDES_SETTING_KEY, {})
+            raw_custom = await get_setting_value(session, STEP_PROFILE_CUSTOM_SETTING_KEY, {})
         if not isinstance(raw, dict):
-            self._overrides = {}
-            return
+            raw = {}
         validated: dict[str, dict[str, Any]] = {}
         for profile_id, payload in raw.items():
             if not isinstance(profile_id, str) or profile_id not in STEP_PROFILES:
@@ -175,11 +182,16 @@ class StepProfileRegistry:
                 continue
             validated[profile_id] = _normalize_override_payload(payload)
         self._overrides = validated
+        self._custom = _normalize_custom_profiles(raw_custom)
 
     def list_definitions(self) -> list[StepProfileDefinition]:
-        return [self.get_definition(profile_id) for profile_id in STEP_PROFILES]
+        seeded = [self.get_definition(profile_id) for profile_id in STEP_PROFILES]
+        return [*seeded, *[self._custom[key] for key in sorted(self._custom)]]
 
     def get_definition(self, profile_id: str) -> StepProfileDefinition | None:
+        custom = self._custom.get(profile_id)
+        if custom is not None:
+            return custom
         base = STEP_PROFILES.get(profile_id)
         if base is None:
             return None
@@ -190,6 +202,9 @@ class StepProfileRegistry:
 
     def has_override(self, profile_id: str) -> bool:
         return profile_id in self._overrides
+
+    def is_custom(self, profile_id: str) -> bool:
+        return profile_id in self._custom
 
     def current_overrides(self) -> dict[str, dict[str, Any]]:
         return dict(self._overrides)
@@ -242,7 +257,7 @@ def profile_matches_tool(tool: ToolDefinition, profile: ResolvedStepProfile) -> 
 
     if profile.config is None:
         return True
-    allowed = profile.config.matrix.get(tool.category)
+    allowed = profile.config.matrix.get(tool_profile_group(tool))
     if not allowed:
         return False
     return bool(tool_capabilities(tool) & set(allowed))
@@ -315,7 +330,7 @@ def _normalize_override_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "name": payload.get("name") if isinstance(payload.get("name"), str) else None,
         "mode": str(StepProfileMode(mode)) if isinstance(mode, str) and mode else str(StepProfileMode.SOFT),
-        "config": config.model_dump(mode="json"),
+        "config": _normalize_profile_config(config).model_dump(mode="json"),
     }
 
 
@@ -329,5 +344,46 @@ def _apply_definition_override(
         profile_id=base.profile_id,
         name=name,
         mode=mode,
-        config=config,
+        config=_normalize_profile_config(config),
+    )
+
+
+def _normalize_custom_profiles(raw: Any) -> dict[str, StepProfileDefinition]:
+    if not isinstance(raw, dict):
+        return {}
+    normalized: dict[str, StepProfileDefinition] = {}
+    for profile_id, payload in raw.items():
+        if not isinstance(profile_id, str) or not profile_id:
+            continue
+        if profile_id in STEP_PROFILES or not isinstance(payload, dict):
+            continue
+        try:
+            name = str(payload.get("name") or profile_id)
+            mode = StepProfileMode(str(payload.get("mode") or StepProfileMode.SOFT))
+            config = _normalize_profile_config(
+                StepProfileConfig.model_validate(payload.get("config") or {})
+            )
+        except Exception:
+            continue
+        normalized[profile_id] = StepProfileDefinition(
+            profile_id=profile_id,
+            name=name,
+            mode=mode,
+            config=config,
+        )
+    return normalized
+
+
+def _normalize_profile_config(config: StepProfileConfig) -> StepProfileConfig:
+    merged: dict[str, list[ToolCapability]] = {}
+    for key, capabilities in config.matrix.items():
+        normalized_key = LEGACY_PROFILE_GROUP_MAP.get(key, key)
+        if normalized_key not in ALL_PROFILE_GROUPS or not capabilities:
+            continue
+        existing = merged.get(normalized_key, [])
+        merged[normalized_key] = [*existing, *[cap for cap in capabilities if cap not in existing]]
+    return StepProfileConfig(
+        matrix=merged,
+        tool_overrides=config.tool_overrides,
+        allow_tool_search=config.allow_tool_search,
     )

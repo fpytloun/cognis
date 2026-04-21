@@ -958,6 +958,13 @@ export const api = {
       return request<StepProfileDefinition[]>('/api/v1/settings/step-profiles');
     },
 
+    createStepProfile(payload: Record<string, unknown>): Promise<StepProfileDefinition> {
+      return request<StepProfileDefinition>('/api/v1/settings/step-profiles', {
+        method: 'POST',
+        body: JSON.stringify(payload)
+      });
+    },
+
     updateStepProfile(profileId: string, payload: Record<string, unknown>): Promise<StepProfileDefinition> {
       return request<StepProfileDefinition>(`/api/v1/settings/step-profiles/${profileId}`, {
         method: 'PUT',

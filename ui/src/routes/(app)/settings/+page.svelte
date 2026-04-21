@@ -6,7 +6,7 @@
   import { api, asApiError } from '$lib/api/client';
   import { deriveGettingStartedSteps } from '$lib/getting-started';
   import { collectModelOptions, createProviderForm, deriveProviderId, presetHasBaseUrl, presetNeedsAuth, PRESET_LABELS, providerFormToPayload, type ProviderFormState, type ProviderPreset } from '$lib/providers';
-  import { STEP_PROFILE_CAPABILITIES } from '$lib/workflows';
+  import { STEP_PROFILE_CAPABILITIES, STEP_PROFILE_GROUPS } from '$lib/workflows';
   import { defaultModelEntry, type ModelEntry } from '$lib/types/api';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import ProviderStatusBadge from '$lib/components/ProviderStatusBadge.svelte';
@@ -205,6 +205,7 @@
     name: string;
     mode: 'soft' | 'hard';
     has_override: boolean;
+    is_custom: boolean;
     allowToolSearch: boolean;
     matrix: StepProfileMatrixRow[];
     includeText: string;
@@ -212,6 +213,9 @@
   };
   let stepProfileForms = $state<StepProfileFormState[]>([]);
   let savingStepProfileIds = $state<string[]>([]);
+  let openStepProfileIds = $state<string[]>([]);
+  let creatingStepProfile = $state(false);
+  let newStepProfileForm = $state({ profile_id: '', name: '', mode: 'soft' as 'soft' | 'hard' });
   let showMcpForm = $state(false);
   let editingMcpServer = $state<MCPServerConfigResponse | null>(null);
   let mcpForm = $state({ name: '', transport: 'stdio', command: '', url: '', args: '', envVars: [] as MCPEnvVar[], headers: [] as MCPEnvVar[], timeout_seconds: 30, description: '' });
@@ -746,6 +750,7 @@
       name: profile.name,
       mode: profile.mode === 'hard' ? 'hard' : 'soft',
       has_override: profile.has_override === true,
+      is_custom: profile.is_custom === true,
       allowToolSearch: profile.config.allow_tool_search !== false,
       matrix,
       includeText: include.join(', '),
@@ -754,14 +759,15 @@
   }
 
   function availableStepProfileCategories(profile: StepProfileFormState): string[] {
-    const categories = new Set<string>([
-      ...executorTools.map((tool) => tool.category),
-      ...stepProfileForms.flatMap((item) => item.matrix.map((row) => row.category))
-    ]);
-    profile.matrix.forEach((row) => categories.add(row.category));
-    return [...categories]
+    return [...STEP_PROFILE_GROUPS]
       .filter((category) => !profile.matrix.some((row) => row.category === category))
       .sort();
+  }
+
+  function toggleStepProfileOpen(profileId: string): void {
+    openStepProfileIds = openStepProfileIds.includes(profileId)
+      ? openStepProfileIds.filter((value) => value !== profileId)
+      : [...openStepProfileIds, profileId];
   }
 
   function updateStepProfileForm(
@@ -864,6 +870,32 @@
 
   function isStepProfileSaving(profileId: string): boolean {
     return savingStepProfileIds.includes(profileId);
+  }
+
+  async function createStepProfile(): Promise<void> {
+    savingStepProfileIds = [...new Set([...savingStepProfileIds, '__new__'])];
+    error = '';
+    try {
+      await api.settings.createStepProfile({
+        profile_id: newStepProfileForm.profile_id.trim(),
+        name: newStepProfileForm.name.trim() || newStepProfileForm.profile_id.trim(),
+        mode: newStepProfileForm.mode,
+        config: {
+          matrix: {},
+          tool_overrides: { include: [], exclude: [] },
+          allow_tool_search: true
+        }
+      });
+      creatingStepProfile = false;
+      newStepProfileForm = { profile_id: '', name: '', mode: 'soft' };
+      await refreshPageState();
+      addToast('Step profile created.', 'success');
+    } catch (caughtError) {
+      error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to create step profile');
+    } finally {
+      savingStepProfileIds = savingStepProfileIds.filter((value) => value !== '__new__');
+    }
   }
 
   async function refreshPageState(): Promise<void> {
@@ -2935,28 +2967,76 @@
               </p>
             </div>
 
+            <div class="flex flex-wrap items-center justify-between gap-3">
+              <p class="text-sm text-slate-400">Seeded profiles can be overridden and reset. Custom profiles can be created for new workflow shapes.</p>
+              <Button variant="secondary" size="sm" onclick={() => { creatingStepProfile = !creatingStepProfile; }}>New preset</Button>
+            </div>
+
+            {#if creatingStepProfile}
+              <div class="rounded-2xl border border-slate-800 bg-slate-950/60 p-4 space-y-4">
+                <div class="grid gap-4 md:grid-cols-3">
+                  <label class="space-y-1 text-sm text-slate-200">
+                    <span>ID</span>
+                    <Input bind:value={newStepProfileForm.profile_id} placeholder="custom:office-lite" />
+                  </label>
+                  <label class="space-y-1 text-sm text-slate-200">
+                    <span>Name</span>
+                    <Input bind:value={newStepProfileForm.name} placeholder="Office Lite" />
+                  </label>
+                  <label class="space-y-1 text-sm text-slate-200">
+                    <span>Mode</span>
+                    <select class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" bind:value={newStepProfileForm.mode}>
+                      <option value="soft">Soft</option>
+                      <option value="hard">Hard</option>
+                    </select>
+                  </label>
+                </div>
+                <div class="flex items-center gap-2">
+                  <Button variant="primary" size="sm" disabled={isStepProfileSaving('__new__')} onclick={createStepProfile}>Create preset</Button>
+                  <Button variant="ghost" size="sm" onclick={() => { creatingStepProfile = false; newStepProfileForm = { profile_id: '', name: '', mode: 'soft' }; }}>Cancel</Button>
+                </div>
+              </div>
+            {/if}
+
             <div class="space-y-4">
               {#each stepProfileForms as profile}
-                <div class="rounded-2xl border border-slate-800 bg-slate-950/60 p-4 space-y-4">
-                  <div class="flex flex-wrap items-start justify-between gap-3">
-                    <div>
-                      <div class="flex flex-wrap items-center gap-2">
-                        <p class="font-medium text-white">{profile.profile_id}</p>
-                        {#if profile.has_override}
-                          <span class="rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-xs text-amber-300">customized</span>
-                        {/if}
+                <details
+                  class="rounded-2xl border border-slate-800 bg-slate-950/60 p-4"
+                  open={openStepProfileIds.includes(profile.profile_id)}
+                  ontoggle={(event) => {
+                    const target = event.currentTarget as HTMLDetailsElement;
+                    const isOpen = target.open;
+                    openStepProfileIds = isOpen
+                      ? [...new Set([...openStepProfileIds, profile.profile_id])]
+                      : openStepProfileIds.filter((value) => value !== profile.profile_id);
+                  }}
+                >
+                  <summary class="cursor-pointer list-none">
+                    <div class="flex flex-wrap items-start justify-between gap-3">
+                      <div>
+                        <div class="flex flex-wrap items-center gap-2">
+                          <p class="font-medium text-white">{profile.name}</p>
+                          <span class="rounded-full border border-slate-700 bg-slate-900 px-2 py-0.5 text-xs text-slate-300">{profile.mode}</span>
+                          <span class="rounded-full border border-slate-700 bg-slate-900 px-2 py-0.5 text-xs text-slate-300">{profile.matrix.length} groups</span>
+                          {#if profile.is_custom}
+                            <span class="rounded-full border border-sky-500/30 bg-sky-500/10 px-2 py-0.5 text-xs text-sky-300">custom</span>
+                          {:else if profile.has_override}
+                            <span class="rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-xs text-amber-300">customized</span>
+                          {/if}
+                        </div>
+                        <p class="mt-1 text-xs text-slate-500">{profile.profile_id}</p>
                       </div>
-                      <p class="mt-1 text-xs text-slate-500">Seeded preset for workflow and direct-chat tool exposure.</p>
                     </div>
-                    <div class="flex flex-wrap gap-2">
-                      {#if profile.has_override}
-                        <Button
-                          size="sm"
-                          variant="secondary"
-                          disabled={isStepProfileSaving(profile.profile_id)}
-                          onclick={() => resetStepProfilePreset(profile.profile_id)}
-                        >Reset to default</Button>
-                      {/if}
+                  </summary>
+
+                  <div class="mt-4 space-y-4">
+                    <div class="flex flex-wrap gap-2 justify-end">
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        disabled={isStepProfileSaving(profile.profile_id)}
+                        onclick={() => resetStepProfilePreset(profile.profile_id)}
+                      >{profile.is_custom ? 'Delete preset' : 'Reset to default'}</Button>
                       <Button
                         size="sm"
                         variant="primary"
@@ -2964,9 +3044,8 @@
                         onclick={() => saveStepProfile(profile.profile_id)}
                       >Save preset</Button>
                     </div>
-                  </div>
 
-                  <div class="grid gap-4 md:grid-cols-3">
+                    <div class="grid gap-4 md:grid-cols-3">
                     <label class="space-y-1 text-sm text-slate-200">
                       <span>Name</span>
                       <Input
@@ -2994,9 +3073,9 @@
                       />
                       <span>Allow tool search</span>
                     </label>
-                  </div>
+                    </div>
 
-                  <div class="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
+                    <div class="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
                     <div class="flex flex-wrap items-center justify-between gap-3">
                       <div>
                         <p class="text-sm font-medium text-slate-200">Capability matrix</p>
@@ -3053,9 +3132,9 @@
                         </tbody>
                       </table>
                     </div>
-                  </div>
+                    </div>
 
-                  <div class="grid gap-4 md:grid-cols-2">
+                    <div class="grid gap-4 md:grid-cols-2">
                     <label class="space-y-1 text-sm text-slate-200">
                       <span>Explicit include</span>
                       <Input
@@ -3072,8 +3151,9 @@
                         onchange={(event) => updateStepProfileForm(profile.profile_id, (current) => ({ ...current, excludeText: event.currentTarget.value }))}
                       />
                     </label>
+                    </div>
                   </div>
-                </div>
+                </details>
               {/each}
             </div>
           </Card>

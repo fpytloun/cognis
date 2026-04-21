@@ -49,6 +49,7 @@ class ToolDefinition(BaseModel):
     parameters: dict[str, Any] = Field(default_factory=dict)
     source: ToolSource
     category: str = "general"
+    profile_group: str | None = None
     read_only: bool = False
     capabilities: list[ToolCapability] = Field(default_factory=list)
     classification_status: str | None = None
@@ -70,6 +71,54 @@ def tool_capabilities(tool: ToolDefinition) -> set[ToolCapability]:
     if tool.capabilities:
         return {ToolCapability(capability) for capability in tool.capabilities}
     return {ToolCapability.READ} if tool.read_only else {ToolCapability.WRITE}
+
+
+AUTO_PROFILE_GROUPS: tuple[str, ...] = (
+    "filesystem",
+    "shell",
+    "web",
+    "browser",
+    "development",
+    "office",
+    "personal",
+    "communication",
+)
+
+RESERVED_PROFILE_GROUPS: tuple[str, ...] = ("memory", "system")
+
+ALL_PROFILE_GROUPS: tuple[str, ...] = (*AUTO_PROFILE_GROUPS, *RESERVED_PROFILE_GROUPS)
+
+
+def tool_profile_group(tool: ToolDefinition) -> str:
+    """Return the effective profile group for a tool."""
+
+    if tool.profile_group:
+        return tool.profile_group
+    if tool.category in {"filesystem", "lsp"}:
+        return "filesystem"
+    if tool.category == "shell":
+        return "shell"
+    if tool.category == "web":
+        return "web"
+    if tool.category == "browser":
+        return "browser"
+    if tool.category == "memory":
+        return "memory"
+    if tool.category in {
+        "system",
+        "context",
+        "workflow",
+        "orchestration",
+        "deliverable",
+        "schedule",
+        "artifact",
+        "datetime",
+        "skill",
+        "mcp",
+        "general",
+    }:
+        return "system"
+    return "development"
 
 
 def stable_tool_id(tool: ToolDefinition) -> str:

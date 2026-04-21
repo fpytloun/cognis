@@ -7,6 +7,18 @@ import { isRecord } from '$lib/utils';
 type OutcomeAction = 'none' | 'fail' | 'gate' | 'continue' | 'cancel' | 'revise';
 
 export const STEP_PROFILE_CAPABILITIES = ['read', 'write', 'privileged', 'destructive'] as const;
+export const STEP_PROFILE_GROUPS = [
+  'filesystem',
+  'shell',
+  'web',
+  'browser',
+  'development',
+  'office',
+  'personal',
+  'communication',
+  'memory',
+  'system'
+] as const;
 
 export interface WorkflowStepProfileRowFormState {
   category: string;

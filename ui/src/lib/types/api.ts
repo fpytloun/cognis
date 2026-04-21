@@ -222,6 +222,7 @@ export interface ToolDefinitionSummary {
   description: string;
   parameters: ToolParameters;
   category: string;
+  profile_group?: string | null;
   read_only: boolean;
   capabilities: string[];
   classification_status?: string | null;
@@ -247,6 +248,7 @@ export interface EffectiveToolItem {
   name: string;
   description: string;
   category: string;
+  profile_group?: string | null;
   read_only: boolean;
   capabilities: string[];
   classification_status?: string | null;
@@ -858,6 +860,7 @@ export interface StepProfileDefinition {
   name: string;
   mode: 'soft' | 'hard' | string;
   has_override?: boolean;
+  is_custom?: boolean;
   config: {
     matrix?: Record<string, string[]>;
     tool_overrides?: {

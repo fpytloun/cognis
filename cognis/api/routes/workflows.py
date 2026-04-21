@@ -46,6 +46,7 @@ async def workflow_step_profiles(request: Request) -> list[StepProfileResponse]:
             mode=str(definition.mode),
             config=definition.config.model_dump(mode="json"),
             has_override=registry.has_override(definition.profile_id),
+            is_custom=registry.is_custom(definition.profile_id),
         )
         for definition in registry.list_definitions()
     ]

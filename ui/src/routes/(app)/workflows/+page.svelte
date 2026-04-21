@@ -26,13 +26,14 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
     formStateToWorkflowPayload,
     importWorkflowYamlWithProfiles,
     STEP_PROFILE_CAPABILITIES,
+    STEP_PROFILE_GROUPS,
     buildStepProfileMap,
     workflowThinkingEfforts,
     validateWorkflowForm,
     workflowToFormState,
     type WorkflowFormState
   } from '$lib/workflows';
-  import type { Agent, StepProfileDefinition, ToolDefinitionSummary, Workflow } from '$lib/types/api';
+  import type { Agent, StepProfileDefinition, Workflow } from '$lib/types/api';
 
   let loading = true;
   let saving = false;
@@ -42,8 +43,6 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
   let secondaryAgents: Agent[] = [];
   let stepProfiles: StepProfileDefinition[] = [];
   let stepProfileMap: Record<string, StepProfileDefinition> = {};
-  let availableTools: ToolDefinitionSummary[] = [];
-  let availableToolCategories: string[] = [];
   let stepProfileOptions: Array<{ id: string; label: string }> = [{ id: '', label: 'Unrestricted' }];
   let selectedWorkflow: Workflow | null = null;
   let form: WorkflowFormState = createEmptyWorkflowForm();
@@ -96,10 +95,9 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
     loading = true;
     error = '';
     try {
-      [workflows, secondaryAgents, availableTools, stepProfiles] = await Promise.all([
+      [workflows, secondaryAgents, stepProfiles] = await Promise.all([
         api.workflows.listAll({ include_disabled: true, include_ephemeral: showEphemeral }),
         api.agents.listAll({ agent_type: 'secondary' }),
-        api.tools.list(),
         api.workflows.stepProfiles()
       ]);
       stepProfileMap = buildStepProfileMap(stepProfiles);
@@ -107,7 +105,6 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
         { id: '', label: 'Unrestricted' },
         ...stepProfiles.map((profile) => ({ id: profile.profile_id, label: profile.name }))
       ];
-      availableToolCategories = [...new Set(availableTools.map((tool) => tool.category).filter(Boolean))].sort();
       const nextSelected = selectedId ? workflows.find((workflow) => workflow.workflow_id === selectedId) : selectedWorkflow ? workflows.find((workflow) => workflow.workflow_id === selectedWorkflow?.workflow_id) : workflows[0];
       if (nextSelected) {
         selectedWorkflow = nextSelected;
@@ -383,7 +380,7 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
 
   function remainingProfileCategories(index: number): string[] {
     const used = new Set(form.steps[index]?.stepProfileMatrix.map((row) => row.category) ?? []);
-    return availableToolCategories.filter((category) => !used.has(category));
+    return [...STEP_PROFILE_GROUPS].filter((category) => !used.has(category));
   }
 
   function handleAddProfileCategory(index: number, event: Event): void {
