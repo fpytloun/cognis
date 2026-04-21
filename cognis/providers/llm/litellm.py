@@ -91,6 +91,16 @@ LLM_MAX_TOKENS_TRANSLATED_TOTAL = Counter(
     "cognis_llm_max_tokens_translated_total",
     "Count of max_tokens to max_completion_tokens translations.",
 )
+LLM_MAX_TOKENS_AUTOFILLED_TOTAL = Counter(
+    "cognis_llm_max_tokens_autofilled_total",
+    "Count of requests where max_tokens was auto-filled from model metadata.",
+    labelnames=("provider_id", "model"),
+)
+LLM_JSON_MODE_TRANSPORT_FLIP_TOTAL = Counter(
+    "cognis_llm_json_mode_transport_flip_total",
+    "JSON-mode transport fallbacks (Responses API empty / BadRequest / cached-broken).",
+    labelnames=("provider_id", "model", "reason"),
+)
 LLM_CACHE_CONTROL_APPLIED_TOTAL = Counter(
     "cognis_llm_cache_control_applied_total",
     "Anthropic-style cache_control hints applied to immutable prompt prefix.",
@@ -104,6 +114,72 @@ LLM_TOKENIZER_USED_TOTAL = Counter(
 
 
 _GEMINI_MODEL_PATTERNS = re.compile(r"(gemini|vertex_ai|google)", re.IGNORECASE)
+
+# Auto-fill "auto" max_tokens: when no explicit output cap is requested, we set
+# max_tokens = model_info.max_output_tokens so providers that require it
+# (Anthropic) or truncate with strict JSON validators (Groq) see a sensible
+# ceiling. Matches the pattern used by Claude Code, Codex, aider, etc.
+JSON_MODE_AUTOFILL_FALLBACK_MAX_TOKENS = 16384
+
+# Substring matches (case-insensitive) that indicate the provider's server-side
+# JSON validator rejected the generation because the model produced invalid or
+# truncated JSON. We treat these as a signal that response_format doesn't work
+# reliably on this (provider, model) and fall back to plain chat-completions
+# without response_format for the same call.
+_JSON_VALIDATOR_BAD_REQUEST_SIGNATURES: tuple[str, ...] = (
+    "json_validate_failed",
+    "failed to generate json",
+    "invalid json response",
+    "response is not valid json",
+    "json_validator_failed",
+)
+
+
+def _is_json_validator_bad_request(exc: BaseException) -> bool:
+    """Return True for BadRequestError messages that look like a JSON validator rejection.
+
+    We match by class name (avoids hard import on litellm error types that may
+    move across versions) and by case-insensitive substring against a strict
+    allow-list. Any other BadRequestError propagates unchanged.
+    """
+
+    if type(exc).__name__ != "BadRequestError":
+        return False
+    message = str(exc).lower()
+    return any(sig in message for sig in _JSON_VALIDATOR_BAD_REQUEST_SIGNATURES)
+
+
+def _is_empty_json_mode_response(response_dict: dict[str, Any]) -> bool:
+    """Return True when a JSON-mode response has no usable content.
+
+    Used to detect the "Responses API returned empty output" failure mode that
+    some providers (notably OpenAI Responses via litellm_proxy / codex) exhibit
+    for structured JSON calls. Refusals, tool calls, length-capped, and
+    content-filtered outputs are treated as non-empty because they are valid
+    terminal outcomes that we must not silently retry.
+    """
+
+    from cognis.core.json_utils import extract_text_from_response
+
+    choices = response_dict.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return True
+    first = choices[0]
+    if not isinstance(first, dict):
+        return True
+    finish_reason = str(first.get("finish_reason") or "stop")
+    if finish_reason in {"length", "content_filter"}:
+        return False
+    message = first.get("message")
+    if not isinstance(message, dict):
+        return True
+    tool_calls = message.get("tool_calls")
+    if isinstance(tool_calls, list) and tool_calls:
+        return False
+    refusal = message.get("refusal")
+    if isinstance(refusal, str) and refusal.strip():
+        return False
+    return not extract_text_from_response(response_dict).strip()
 
 
 def _supports_image_response_format(model: str) -> bool:
@@ -310,6 +386,13 @@ class LiteLLMProvider:
         self._model_provider_cache: dict[str, tuple[str | None, float]] = {}
         self._proxy_model_info_cache: dict[str, tuple[dict[str, dict[str, Any]], float]] = {}
         self._tokenizer_backend_cache: dict[str, tuple[str, str]] = {}
+        # In-process cache of (provider_id, resolved_model) pairs for which
+        # response_format-style structured JSON has been observed to break
+        # (either via empty Responses API reply or a JSON-validator
+        # BadRequestError). Only consulted when response_format is present in
+        # the outgoing kwargs; non-JSON calls are unaffected. Cleared on
+        # provider config update via invalidate_json_mode_cache_for_provider.
+        self._json_mode_broken_keys: set[tuple[str, str]] = set()
 
     @staticmethod
     def _tokenizer_family(model: str) -> str:
@@ -853,15 +936,169 @@ class LiteLLMProvider:
         return "auto"
 
     def _should_use_responses_api(
-        self, model_id: str, model_info: ModelInfo, provider: LLMProviderRow | None
+        self,
+        model_id: str,
+        model_info: ModelInfo,
+        provider: LLMProviderRow | None,
+        *,
+        is_json_mode_request: bool = False,
     ) -> bool:
         if provider is not None and dict(provider.config).get("use_responses_api") is False:
+            return False
+        if (
+            is_json_mode_request
+            and provider is not None
+            and (provider.provider_id, model_id) in self._json_mode_broken_keys
+        ):
+            LLM_JSON_MODE_TRANSPORT_FLIP_TOTAL.labels(
+                provider_id=provider.provider_id,
+                model=model_id,
+                reason="cached_broken",
+            ).inc()
             return False
         return should_use_openai_responses(
             model=self._apply_model_prefix(model_id, provider),
             model_info=model_info,
             rollout_mode=self._responses_rollout_mode(),
         )
+
+    def invalidate_json_mode_cache_for_provider(self, provider_id: str) -> None:
+        """Clear any JSON-mode broken-key entries matching the given provider.
+
+        Called after a provider config update so that admins can force a
+        re-probe without restarting the controller (e.g. after fixing a proxy
+        endpoint or flipping use_responses_api).
+        """
+
+        self._json_mode_broken_keys = {
+            key for key in self._json_mode_broken_keys if key[0] != provider_id
+        }
+
+    def _mark_json_mode_broken(
+        self,
+        provider: LLMProviderRow | None,
+        resolved_model: str,
+        *,
+        reason: str,
+    ) -> None:
+        if provider is None:
+            return
+        key = (provider.provider_id, resolved_model)
+        newly_marked = key not in self._json_mode_broken_keys
+        self._json_mode_broken_keys.add(key)
+        LLM_JSON_MODE_TRANSPORT_FLIP_TOTAL.labels(
+            provider_id=provider.provider_id,
+            model=resolved_model,
+            reason=reason,
+        ).inc()
+        if newly_marked:
+            logger.warning(
+                "Marking model as broken for JSON mode (response_format); "
+                "future JSON-mode calls will bypass Responses API / response_format",
+                extra={
+                    "extra_data": {
+                        "provider_id": provider.provider_id,
+                        "model": resolved_model,
+                        "reason": reason,
+                    }
+                },
+            )
+
+    def _autofill_max_tokens(
+        self,
+        request_kwargs: dict[str, Any],
+        *,
+        model_info: ModelInfo,
+        provider: LLMProviderRow | None,
+        resolved_model: str,
+    ) -> None:
+        """Fill request_kwargs["max_tokens"] with the model's max output budget
+        when the caller hasn't specified any output cap.
+
+        This matches the pattern used by Claude Code / Codex / aider: "use the
+        model's full advertised output budget by default". For providers that
+        require max_tokens (Anthropic) or strictly validate JSON output (Groq),
+        this avoids truncation and unhelpful provider defaults. Models stop
+        generating when they're done, so raising the ceiling does not increase
+        token cost.
+
+        Respects caller overrides (max_tokens / max_completion_tokens /
+        max_output_tokens) and the optional per-provider config.max_tokens_ceiling
+        override for tier-capped endpoints.
+        """
+
+        if (
+            "max_tokens" in request_kwargs
+            or "max_completion_tokens" in request_kwargs
+            or "max_output_tokens" in request_kwargs
+        ):
+            return
+        learned_max = int(model_info.max_output_tokens or 0)
+        if learned_max > DEFAULT_MODEL_INFO.max_output_tokens:
+            auto_max = learned_max
+        else:
+            auto_max = JSON_MODE_AUTOFILL_FALLBACK_MAX_TOKENS
+        if provider is not None:
+            raw_ceiling = dict(provider.config).get("max_tokens_ceiling")
+            if isinstance(raw_ceiling, int) and raw_ceiling > 0:
+                auto_max = min(auto_max, raw_ceiling)
+            elif isinstance(raw_ceiling, str):
+                try:
+                    parsed_ceiling = int(raw_ceiling)
+                except ValueError:
+                    parsed_ceiling = 0
+                if parsed_ceiling > 0:
+                    auto_max = min(auto_max, parsed_ceiling)
+        if auto_max <= 0:
+            return
+        request_kwargs["max_tokens"] = auto_max
+        LLM_MAX_TOKENS_AUTOFILLED_TOTAL.labels(
+            provider_id=provider.provider_id if provider is not None else "unknown",
+            model=resolved_model,
+        ).inc()
+
+    async def _json_mode_fallback_chat_completions(
+        self,
+        *,
+        prefixed_model: str,
+        prepared_messages: list[dict[str, Any]],
+        request_kwargs: dict[str, Any],
+        retry_count: int,
+        provider: LLMProviderRow | None,
+        resolved_model: str,
+        reason: str,
+        strip_response_format: bool,
+    ) -> dict[str, Any]:
+        """Retry a failed JSON-mode call via ``litellm.acompletion``.
+
+        Called from ``generate()`` when either the Responses API returned an
+        empty payload (``strip_response_format=False`` — keep JSON mode but
+        switch transport) or a provider JSON validator rejected the generation
+        with a 400 (``strip_response_format=True`` — drop response_format so
+        the server stops validating server-side JSON).
+
+        Always marks the (provider, model) pair as broken for JSON mode so
+        subsequent calls route directly to chat-completions without the first
+        wasted Responses attempt.
+        """
+
+        from cognis.providers.llm.retry import with_llm_retry
+
+        self._mark_json_mode_broken(provider, resolved_model, reason=reason)
+        fallback_kwargs = dict(request_kwargs)
+        fallback_kwargs.pop("cognis_llm_api", None)
+        if strip_response_format:
+            fallback_kwargs.pop("response_format", None)
+        response = await with_llm_retry(
+            litellm.acompletion,
+            model=prefixed_model,
+            messages=prepared_messages,
+            stream=False,
+            max_retries=retry_count,
+            operation=f"generate.json_fallback({prefixed_model})",
+            **fallback_kwargs,
+        )
+        return cast(dict[str, Any], response.model_dump())
 
     def _record_reasoning_metrics(self, prepared: PreparedReasoningConfig) -> None:
         if prepared.effective_effort:
@@ -940,6 +1177,14 @@ class LiteLLMProvider:
         retry_count = request_kwargs.pop("max_retries", None)
         if retry_count is None:
             retry_count = request_kwargs.pop("num_retries", None)
+        # Auto-fill max_tokens before reasoning translation so that reasoning
+        # models pick up the translated max_completion_tokens.
+        self._autofill_max_tokens(
+            request_kwargs,
+            model_info=model_info,
+            provider=provider,
+            resolved_model=resolved_model,
+        )
         request_kwargs = self._prepare_generation_request_kwargs(
             request_kwargs,
             model_id=resolved_model,
@@ -949,7 +1194,13 @@ class LiteLLMProvider:
         prepared_messages = _apply_message_cache_hints(
             messages, resolved_model, model_info, cache_breakpoint_index
         )
-        use_responses_api = self._should_use_responses_api(resolved_model, model_info, provider)
+        is_json_mode_request = "response_format" in request_kwargs
+        use_responses_api = self._should_use_responses_api(
+            resolved_model,
+            model_info,
+            provider,
+            is_json_mode_request=is_json_mode_request,
+        )
         if use_responses_api:
             request_kwargs = dict(request_kwargs)
             request_kwargs["cognis_llm_api"] = "responses"
@@ -974,26 +1225,67 @@ class LiteLLMProvider:
                 }
             },
         )
+        retry_count_int = int(retry_count) if isinstance(retry_count, int) else 3
         if use_responses_api:
+            try:
+                response = await with_llm_retry(
+                    litellm.aresponses,
+                    model=prefixed_model,
+                    input=messages_to_responses_input(prepared_messages),
+                    stream=False,
+                    max_retries=retry_count_int,
+                    operation=f"generate.responses({prefixed_model})",
+                    **responses_request_kwargs(request_kwargs),
+                )
+            except Exception as exc:
+                if is_json_mode_request and _is_json_validator_bad_request(exc):
+                    return await self._json_mode_fallback_chat_completions(
+                        prefixed_model=prefixed_model,
+                        prepared_messages=prepared_messages,
+                        request_kwargs=request_kwargs,
+                        retry_count=retry_count_int,
+                        provider=provider,
+                        resolved_model=resolved_model,
+                        reason="bad_request_json_validator",
+                        strip_response_format=True,
+                    )
+                raise
+            response_dict = responses_to_chat_response(_model_dump(response))
+            if is_json_mode_request and _is_empty_json_mode_response(response_dict):
+                return await self._json_mode_fallback_chat_completions(
+                    prefixed_model=prefixed_model,
+                    prepared_messages=prepared_messages,
+                    request_kwargs=request_kwargs,
+                    retry_count=retry_count_int,
+                    provider=provider,
+                    resolved_model=resolved_model,
+                    reason="empty_responses_detected",
+                    strip_response_format=False,
+                )
+            return response_dict
+        try:
             response = await with_llm_retry(
-                litellm.aresponses,
+                litellm.acompletion,
                 model=prefixed_model,
-                input=messages_to_responses_input(prepared_messages),
+                messages=prepared_messages,
                 stream=False,
-                max_retries=int(retry_count) if isinstance(retry_count, int) else 3,
-                operation=f"generate.responses({prefixed_model})",
-                **responses_request_kwargs(request_kwargs),
+                max_retries=retry_count_int,
+                operation=f"generate({prefixed_model})",
+                **request_kwargs,
             )
-            return responses_to_chat_response(_model_dump(response))
-        response = await with_llm_retry(
-            litellm.acompletion,
-            model=prefixed_model,
-            messages=prepared_messages,
-            stream=False,
-            max_retries=int(retry_count) if isinstance(retry_count, int) else 3,
-            operation=f"generate({prefixed_model})",
-            **request_kwargs,
-        )
+        except Exception as exc:
+            if is_json_mode_request and _is_json_validator_bad_request(exc):
+                return await self._json_mode_fallback_chat_completions(
+                    prefixed_model=prefixed_model,
+                    prepared_messages=prepared_messages,
+                    request_kwargs=request_kwargs,
+                    retry_count=retry_count_int,
+                    provider=provider,
+                    resolved_model=resolved_model,
+                    reason="bad_request_json_validator",
+                    strip_response_format=True,
+                )
+            raise
         response_dict = response.model_dump()
 
         # Diagnostic: log response structure for debugging reasoning model issues
@@ -1065,6 +1357,12 @@ class LiteLLMProvider:
         retry_count = request_kwargs.pop("max_retries", None)
         if retry_count is None:
             retry_count = request_kwargs.pop("num_retries", None)
+        self._autofill_max_tokens(
+            request_kwargs,
+            model_info=model_info,
+            provider=provider,
+            resolved_model=resolved_model,
+        )
         request_kwargs = self._prepare_generation_request_kwargs(
             request_kwargs,
             model_id=resolved_model,
@@ -1074,7 +1372,13 @@ class LiteLLMProvider:
         prepared_messages = _apply_message_cache_hints(
             messages, resolved_model, model_info, cache_breakpoint_index
         )
-        use_responses_api = self._should_use_responses_api(resolved_model, model_info, provider)
+        is_json_mode_request = "response_format" in request_kwargs
+        use_responses_api = self._should_use_responses_api(
+            resolved_model,
+            model_info,
+            provider,
+            is_json_mode_request=is_json_mode_request,
+        )
         if use_responses_api:
             request_kwargs = dict(request_kwargs)
             request_kwargs["cognis_llm_api"] = "responses"

@@ -266,6 +266,14 @@ async def llm_provider_update(
         await session.commit()
     if row is None:
         raise api_exception(404, "not_found", "LLM provider not found")
+    # Admin edits may fix the very issue (e.g. a tier cap, a different
+    # endpoint, toggling use_responses_api) that caused a model to be marked
+    # as broken for JSON mode. Clear the provider's broken-model cache so the
+    # next JSON-mode call re-probes instead of staying on chat-completions.
+    llm_provider_impl = getattr(request.app.state.providers, "llm", None)
+    invalidate = getattr(llm_provider_impl, "invalidate_json_mode_cache_for_provider", None)
+    if callable(invalidate):
+        invalidate(provider_id)
     return _apply_last_test_metadata(request, llm_provider_to_response(row))
 
 

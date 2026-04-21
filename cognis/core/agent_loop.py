@@ -2047,6 +2047,13 @@ class AgentLoop:
                     llm_kwargs["temperature"] = ctx.agent.llm_config.temperature
                 if ctx.agent.llm_config.top_p is not None:
                     llm_kwargs["top_p"] = ctx.agent.llm_config.top_p
+                if ctx.agent.llm_config.max_tokens is not None:
+                    # Forward the agent's explicit max_tokens override so the
+                    # provider call matches what context.py reserved for the
+                    # output budget. Without this, generate() auto-fills with
+                    # model_info.max_output_tokens, which can exceed what the
+                    # agent was configured for.
+                    llm_kwargs["max_tokens"] = ctx.agent.llm_config.max_tokens
 
             current_model = model_for_llm or resolved_model
             current_provider_id: str | None = None

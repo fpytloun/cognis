@@ -724,10 +724,13 @@ def test_reasoning_efforts_for_openai_alias_use_display_name_when_available() ->
 
 
 def test_remap_reasoning_effort_to_available_prefers_closest_supported_level() -> None:
-    assert remap_reasoning_effort_to_available(
-        "max",
-        available_efforts=["default", "none", "low", "medium", "high", "xhigh"],
-    ) == "xhigh"
+    assert (
+        remap_reasoning_effort_to_available(
+            "max",
+            available_efforts=["default", "none", "low", "medium", "high", "xhigh"],
+        )
+        == "xhigh"
+    )
 
 
 def test_reasoning_efforts_respect_explicit_false() -> None:
@@ -1629,7 +1632,17 @@ async def test_litellm_provider_responses_bridge_maps_response_format_to_text_fo
 
     class _Response:
         def model_dump(self) -> dict[str, object]:
-            return {"status": "completed", "output": []}
+            return {
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [
+                            {"type": "output_text", "text": '{"ok": true}'},
+                        ],
+                    }
+                ],
+            }
 
     async def _fake_aresponses(**kwargs: object) -> object:
         captured.update(kwargs)
@@ -2575,4 +2588,459 @@ async def test_get_model_info_with_missing_provider_id_does_not_fall_back(tmp_pa
     model_info = await provider.get_model_info("shared-model", provider_id="missing-provider")
 
     assert model_info == DEFAULT_MODEL_INFO
+    await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# "auto" max_tokens auto-fill
+# ---------------------------------------------------------------------------
+
+
+async def _groq_provider_session(
+    tmp_path: object,
+    *,
+    config_extra: dict[str, object] | None = None,
+    model_info_extra: dict[str, object] | None = None,
+) -> tuple[object, object]:
+    """Seed a Groq-like litellm_proxy provider with known model metadata."""
+
+    engine, session_factory = await _session_factory(tmp_path)
+    model_info: dict[str, object] = {
+        "model_id": "llama-3.3-70b-versatile",
+        "max_output_tokens": 32768,
+        "context_window": 131072,
+    }
+    if model_info_extra:
+        model_info.update(model_info_extra)
+    config: dict[str, object] = {
+        "preset": "litellm_proxy",
+        "default_model": "llama-3.3-70b-versatile",
+        "models": [model_info],
+    }
+    if config_extra:
+        config.update(config_extra)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="groq",
+                display_name="Groq",
+                location="controller",
+                backend="litellm",
+                config=config,
+                is_default=True,
+                status="active",
+            )
+        )
+        await session.commit()
+    return engine, session_factory
+
+
+class _CallCaptureResponse:
+    def __init__(self, payload: dict[str, object]) -> None:
+        self._payload = payload
+
+    def model_dump(self) -> dict[str, object]:
+        return self._payload
+
+
+@pytest.mark.asyncio
+async def test_autofill_max_tokens_when_caller_does_not_set_it(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, session_factory = await _groq_provider_session(tmp_path)
+    captured: dict[str, object] = {}
+
+    async def _fake_acompletion(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return _CallCaptureResponse(
+            {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}
+        )
+
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.acompletion", _fake_acompletion)
+    provider = LiteLLMProvider(session_factory)
+    await provider.generate(messages=[{"role": "user", "content": "hi"}])
+
+    assert captured.get("max_tokens") == 32768
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_autofill_max_tokens_respects_caller_override(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, session_factory = await _groq_provider_session(tmp_path)
+    captured: dict[str, object] = {}
+
+    async def _fake_acompletion(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return _CallCaptureResponse(
+            {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}
+        )
+
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.acompletion", _fake_acompletion)
+    provider = LiteLLMProvider(session_factory)
+    await provider.generate(messages=[{"role": "user", "content": "hi"}], max_tokens=2048)
+
+    assert captured.get("max_tokens") == 2048
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_autofill_max_tokens_respects_max_completion_tokens_override(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, session_factory = await _groq_provider_session(tmp_path)
+    captured: dict[str, object] = {}
+
+    async def _fake_acompletion(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return _CallCaptureResponse(
+            {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}
+        )
+
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.acompletion", _fake_acompletion)
+    provider = LiteLLMProvider(session_factory)
+    await provider.generate(
+        messages=[{"role": "user", "content": "hi"}], max_completion_tokens=1024
+    )
+
+    assert "max_tokens" not in captured
+    assert captured.get("max_completion_tokens") == 1024
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_autofill_max_tokens_honors_provider_ceiling(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, session_factory = await _groq_provider_session(
+        tmp_path, config_extra={"max_tokens_ceiling": 8192}
+    )
+    captured: dict[str, object] = {}
+
+    async def _fake_acompletion(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return _CallCaptureResponse(
+            {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}
+        )
+
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.acompletion", _fake_acompletion)
+    provider = LiteLLMProvider(session_factory)
+    await provider.generate(messages=[{"role": "user", "content": "hi"}])
+
+    assert captured.get("max_tokens") == 8192
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_autofill_max_tokens_uses_safe_fallback_for_unknown_model(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        # Provider without any model metadata — get_model_info returns the
+        # DEFAULT_MODEL_INFO (max_output_tokens=4096) which we deem "unknown"
+        # and replace with the safe fallback of 16384.
+        session.add(
+            LLMProvider(
+                provider_id="unknown",
+                display_name="Unknown",
+                location="controller",
+                backend="litellm",
+                config={"preset": "litellm_proxy", "default_model": "mystery-model"},
+                is_default=True,
+                status="active",
+            )
+        )
+        await session.commit()
+
+    captured: dict[str, object] = {}
+
+    async def _fake_acompletion(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return _CallCaptureResponse(
+            {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}
+        )
+
+    # Stub out litellm.get_model_info so the live lookup doesn't leak real
+    # token limits into the test.
+    monkeypatch.setattr(
+        "cognis.providers.llm.litellm.litellm.get_model_info",
+        lambda model: {"max_tokens": 0, "max_output_tokens": 0},
+    )
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.acompletion", _fake_acompletion)
+    provider = LiteLLMProvider(session_factory)
+    await provider.generate(messages=[{"role": "user", "content": "hi"}])
+
+    assert captured.get("max_tokens") == 16384
+    await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# JSON-mode transport fallback (empty Responses reply / BadRequest validator)
+# ---------------------------------------------------------------------------
+
+
+class _FakeBadRequestError(Exception):
+    """Stand-in for litellm.BadRequestError (matched by class name)."""
+
+
+# Rename so _is_json_validator_bad_request matches by class name.
+_FakeBadRequestError.__name__ = "BadRequestError"
+
+
+@pytest.mark.asyncio
+async def test_json_mode_fallback_when_responses_api_returns_empty(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="proxy",
+                display_name="LiteLLM Proxy",
+                location="controller",
+                backend="litellm",
+                config={"preset": "litellm_proxy", "default_model": "gpt-5.4"},
+                status="active",
+            )
+        )
+        await session.commit()
+
+    # Responses API returns a completed-but-empty payload.
+    class _EmptyResponse:
+        def model_dump(self) -> dict[str, object]:
+            return {"status": "completed", "output": []}
+
+    acompletion_kwargs: dict[str, object] = {}
+
+    async def _fake_aresponses(**_: object) -> object:
+        return _EmptyResponse()
+
+    async def _fake_acompletion(**kwargs: object) -> object:
+        acompletion_kwargs.update(kwargs)
+        return _CallCaptureResponse(
+            {
+                "choices": [
+                    {
+                        "message": {"content": '{"decision":"approved"}'},
+                        "finish_reason": "stop",
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setenv("COGNIS_OPENAI_RESPONSES_MODE", "on")
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.aresponses", _fake_aresponses)
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.acompletion", _fake_acompletion)
+
+    provider = LiteLLMProvider(session_factory)
+    result = await provider.generate(
+        messages=[{"role": "user", "content": "hi"}],
+        model="gpt-5.4",
+        response_format={"type": "json_object"},
+    )
+
+    # Fallback kicked in and we got the chat-completions JSON payload.
+    assert result["choices"][0]["message"]["content"] == '{"decision":"approved"}'
+    # response_format was preserved on the fallback call.
+    assert acompletion_kwargs.get("response_format") == {"type": "json_object"}
+    # The (provider, model) pair is now cached as broken for JSON mode.
+    assert ("proxy", "gpt-5.4") in provider._json_mode_broken_keys
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_json_mode_cached_broken_routes_directly_to_chat_completions(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="proxy",
+                display_name="LiteLLM Proxy",
+                location="controller",
+                backend="litellm",
+                config={"preset": "litellm_proxy", "default_model": "gpt-5.4"},
+                status="active",
+            )
+        )
+        await session.commit()
+
+    aresponses_calls = 0
+
+    async def _fake_aresponses(**_: object) -> object:
+        nonlocal aresponses_calls
+        aresponses_calls += 1
+        raise AssertionError("aresponses must not be called when cache marks model broken")
+
+    async def _fake_acompletion(**_: object) -> object:
+        return _CallCaptureResponse(
+            {
+                "choices": [
+                    {
+                        "message": {"content": '{"ok":true}'},
+                        "finish_reason": "stop",
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setenv("COGNIS_OPENAI_RESPONSES_MODE", "on")
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.aresponses", _fake_aresponses)
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.acompletion", _fake_acompletion)
+
+    provider = LiteLLMProvider(session_factory)
+    provider._json_mode_broken_keys.add(("proxy", "gpt-5.4"))
+
+    result = await provider.generate(
+        messages=[{"role": "user", "content": "hi"}],
+        model="gpt-5.4",
+        response_format={"type": "json_object"},
+    )
+
+    assert aresponses_calls == 0
+    assert result["choices"][0]["message"]["content"] == '{"ok":true}'
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_non_json_call_still_uses_responses_api_on_cached_broken_model(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="proxy",
+                display_name="LiteLLM Proxy",
+                location="controller",
+                backend="litellm",
+                config={"preset": "litellm_proxy", "default_model": "gpt-5.4"},
+                status="active",
+            )
+        )
+        await session.commit()
+
+    aresponses_called = {"flag": False}
+
+    class _Response:
+        def model_dump(self) -> dict[str, object]:
+            return {
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "hello"}],
+                    }
+                ],
+            }
+
+    async def _fake_aresponses(**_: object) -> object:
+        aresponses_called["flag"] = True
+        return _Response()
+
+    async def _fake_acompletion(**_: object) -> object:
+        raise AssertionError("acompletion must not be called for non-JSON requests")
+
+    monkeypatch.setenv("COGNIS_OPENAI_RESPONSES_MODE", "on")
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.aresponses", _fake_aresponses)
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.acompletion", _fake_acompletion)
+
+    provider = LiteLLMProvider(session_factory)
+    provider._json_mode_broken_keys.add(("proxy", "gpt-5.4"))
+
+    result = await provider.generate(
+        messages=[{"role": "user", "content": "hi"}],
+        model="gpt-5.4",
+    )
+
+    assert aresponses_called["flag"] is True
+    assert result["choices"][0]["message"]["content"] == "hello"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_json_mode_fallback_on_json_validator_bad_request(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, session_factory = await _groq_provider_session(tmp_path)
+    acompletion_call_count = {"count": 0}
+    acompletion_kwargs_history: list[dict[str, object]] = []
+
+    async def _fake_acompletion(**kwargs: object) -> object:
+        acompletion_call_count["count"] += 1
+        acompletion_kwargs_history.append(dict(kwargs))
+        if acompletion_call_count["count"] == 1:
+            # First call: JSON validator rejects truncated output.
+            raise _FakeBadRequestError(
+                "GroqException - Failed to generate JSON. "
+                "See 'failed_generation' for more details. code=json_validate_failed"
+            )
+        return _CallCaptureResponse(
+            {
+                "choices": [
+                    {
+                        "message": {"content": '{"rationale":"ok","steps":[]}'},
+                        "finish_reason": "stop",
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.acompletion", _fake_acompletion)
+
+    provider = LiteLLMProvider(session_factory)
+    result = await provider.generate(
+        messages=[{"role": "user", "content": "hi"}],
+        response_format={"type": "json_object"},
+    )
+
+    assert acompletion_call_count["count"] == 2
+    # First call carried response_format; second (fallback) dropped it.
+    assert acompletion_kwargs_history[0].get("response_format") == {"type": "json_object"}
+    assert "response_format" not in acompletion_kwargs_history[1]
+    assert result["choices"][0]["message"]["content"] == '{"rationale":"ok","steps":[]}'
+    assert ("groq", "llama-3.3-70b-versatile") in provider._json_mode_broken_keys
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_other_bad_request_errors_propagate_unchanged(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, session_factory = await _groq_provider_session(tmp_path)
+
+    async def _fake_acompletion(**_: object) -> object:
+        raise _FakeBadRequestError("model_not_found: unknown_model")
+
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.acompletion", _fake_acompletion)
+
+    provider = LiteLLMProvider(session_factory)
+    with pytest.raises(_FakeBadRequestError, match="model_not_found"):
+        await provider.generate(
+            messages=[{"role": "user", "content": "hi"}],
+            response_format={"type": "json_object"},
+        )
+
+    # Non-JSON-validator BadRequestErrors must not populate the cache.
+    assert ("groq", "llama-3.3-70b-versatile") not in provider._json_mode_broken_keys
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_invalidate_json_mode_cache_clears_matching_provider(
+    tmp_path: object,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    provider = LiteLLMProvider(session_factory)
+    provider._json_mode_broken_keys.add(("proxy-a", "model-1"))
+    provider._json_mode_broken_keys.add(("proxy-a", "model-2"))
+    provider._json_mode_broken_keys.add(("proxy-b", "model-1"))
+
+    provider.invalidate_json_mode_cache_for_provider("proxy-a")
+
+    assert provider._json_mode_broken_keys == {("proxy-b", "model-1")}
     await engine.dispose()
