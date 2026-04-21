@@ -422,14 +422,9 @@ import X from 'lucide-svelte/icons/x';
     return [];
   });
   let activeChatTodos = $derived.by(() => chatTodos.filter((todo) => !terminalTodoStatuses.has(todo.status)));
-  // Show the drawer whenever the latest step still has open todos.
-  // Previously the drawer was gated on an active turn / pending
-  // question, which meant a page refresh hid the drawer even though
-  // the underlying todos hadn't changed. Active todos themselves are
-  // the right signal — if the agent left work pending, the user
-  // should see what's still open without having to wait for the next
-  // turn to start.
-  let shouldShowChatTodoDrawer = $derived(activeChatTodos.length > 0);
+  // Keep the latest todo snapshot visible even after everything is
+  // completed so the user can still inspect what just finished.
+  let shouldShowChatTodoDrawer = $derived(chatTodos.length > 0);
   let chatTodoCounts = $derived.by(() => ({
     inProgress: activeChatTodos.filter((todo) => todo.status === 'in_progress').length,
     pending: activeChatTodos.filter((todo) => todo.status === 'pending').length,
@@ -2975,7 +2970,7 @@ import X from 'lucide-svelte/icons/x';
               </button>
               {#if chatTodoDrawerOpen}
                 <ul class="divide-y divide-slate-800/40 border-t border-slate-800/60">
-                  {#each activeChatTodos as todo}
+                  {#each chatTodos as todo}
                     <li class="flex items-center gap-2 px-3 py-1.5 text-sm text-slate-200">
                       <span
                         class={`inline-block h-2 w-2 shrink-0 rounded-full ${todoStatusDot(todo.status)}`}

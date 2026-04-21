@@ -133,7 +133,7 @@
 
   let sessionTodos = $derived.by(() => latestSessionTodos(timeline));
   let activeSessionTodos = $derived.by(() => sessionTodos.filter((todo) => !terminalTodoStatuses.has(todo.status)));
-  let shouldShowTodoDrawer = $derived(activeSessionTodos.length > 0);
+  let shouldShowTodoDrawer = $derived(sessionTodos.length > 0);
   let todoCounts = $derived.by(() => ({
     inProgress: activeSessionTodos.filter((todo) => todo.status === 'in_progress').length,
     pending: activeSessionTodos.filter((todo) => todo.status === 'pending').length,
@@ -442,7 +442,7 @@
           </button>
           {#if chatTodoDrawerOpen}
             <ul class="divide-y divide-slate-800/40 border-t border-slate-800/60">
-              {#each activeSessionTodos as todo}
+              {#each sessionTodos as todo}
                 <li class="flex items-center gap-2 px-3 py-1.5 text-sm text-slate-200">
                   <span
                     class={`inline-block h-2 w-2 shrink-0 rounded-full ${todoStatusDot(todo.status)}`}
