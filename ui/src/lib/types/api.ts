@@ -1147,6 +1147,13 @@ export interface WebSocketMessageCompleteEvent {
   attachments?: AttachmentRef[];
 }
 
+export interface WebSocketTurnStartedEvent {
+  type: 'turn_started';
+  conversation_id?: string;
+  session_id?: string;
+  message_id?: string;
+}
+
 export interface WebSocketToolCallEvent {
   type: 'tool_call';
   conversation_id?: string;
@@ -1420,6 +1427,7 @@ export type CognisWebSocketEvent =
   | WebSocketAuthenticatedEvent
   | WebSocketChunkEvent
   | WebSocketChunkGapEvent
+  | WebSocketTurnStartedEvent
   | WebSocketMessageCompleteEvent
   | WebSocketToolCallEvent
   | WebSocketToolResultEvent

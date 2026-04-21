@@ -1587,7 +1587,6 @@ import X from 'lucide-svelte/icons/x';
     if (!isSlashCommand) {
       lastSubmittedMessage = content;
       lastRecoverableMessage = '';
-      turnInProgress = true;
       awaitingAssistantStart = true;
       patchConversationInList(currentConversation.conversation_id, { has_unread: false }, {
         touchUpdatedAt: true,
@@ -1860,6 +1859,10 @@ import X from 'lucide-svelte/icons/x';
       queuedCount = event.queued_count;
     }
 
+    if (event.type === 'turn_started' || event.type === 'queued') {
+      turnInProgress = true;
+    }
+
     if (event.type === 'error') {
       const nextError = socketErrorMessage(event);
       if (shouldSuppressPreSessionSocketError({
@@ -1908,6 +1911,7 @@ import X from 'lucide-svelte/icons/x';
 
     if (event.type === 'chunk' || event.type === 'tool_call' || event.type === 'delegation_started' || event.type === 'reasoning') {
       awaitingAssistantStart = false;
+      turnInProgress = true;
     }
 
     if (
@@ -2003,6 +2007,8 @@ import X from 'lucide-svelte/icons/x';
 
     // Handle session_reset: clear timeline for new session
     if (event.type === 'session_reset') {
+      awaitingAssistantStart = false;
+      turnInProgress = false;
       timeline = applyWebSocketEvent([], {
         type: 'system_message',
         conversation_id: event.conversation_id,
@@ -2015,6 +2021,11 @@ import X from 'lucide-svelte/icons/x';
         api.conversations.sessions(currentConversation.conversation_id).then((s) => { sessions = s; }).catch(() => {});
       }
       return;
+    }
+
+    if (event.type === 'reconnected') {
+      awaitingAssistantStart = false;
+      turnInProgress = false;
     }
 
     // Handle conversation_created: navigate to new conversation

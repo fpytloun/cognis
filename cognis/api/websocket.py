@@ -395,9 +395,9 @@ class WebSocketConnectionManager:
         # FOLLOW_UP_TURN_REQUESTED is handled by TurnScheduler
         if event.type == EventType.FOLLOW_UP_TURN_REQUESTED:
             return
-        # TURN_* events are handled by the TurnObserver bridge
+        # TURN_COMPLETED / TURN_ERROR are handled by the TurnObserver bridge.
+        # TURN_STARTED is event-bus-only, so let it flow through _event_to_payload.
         if event.type in (
-            EventType.TURN_STARTED,
             EventType.TURN_COMPLETED,
             EventType.TURN_ERROR,
         ):
@@ -1485,6 +1485,13 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
             "status": "started",
             "arguments": event.data.get("arguments"),
             "timestamp": event.timestamp.isoformat() if event.timestamp else None,
+        }
+    if event.type == EventType.TURN_STARTED:
+        return {
+            "type": "turn_started",
+            "conversation_id": conversation_id,
+            "session_id": event.data.get("session_id"),
+            "message_id": event.data.get("message_id"),
         }
     if event.type == EventType.TASK_STARTED:
         return {

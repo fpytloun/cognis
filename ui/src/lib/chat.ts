@@ -812,7 +812,6 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
   }
 
   if (event.type === 'tool_call') {
-    next = finalizeInFlightAssistantItems(next);
     // Orchestration tools are displayed as delegation cards, not tool blocks
     if (['delegate', 'fork'].includes(event.tool_name)) return next;
     const itemId = `tool:${event.call_id}`;
@@ -845,7 +844,6 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
   }
 
   if (event.type === 'tool_result') {
-    next = finalizeInFlightAssistantItems(next);
     const itemId = `tool:${event.call_id}`;
     const evaluation = event.evaluation ?? undefined;
     const index = next.findIndex((item) => item.id === itemId && item.kind === 'tool_call');

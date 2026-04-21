@@ -6,7 +6,7 @@
   import NewChatModal from '$lib/components/NewChatModal.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import { api } from '$lib/api/client';
-  import { CHAT_STORAGE_KEYS, isRestorableChatConversation } from '$lib/chat-page';
+import { CHAT_STORAGE_KEYS } from '$lib/chat-page';
   import type { Agent, HealthResponse } from '$lib/types/api';
 
   let loading = true;
@@ -32,19 +32,6 @@
       const storedAgentId = window.localStorage.getItem(CHAT_STORAGE_KEYS.selectedAgent);
       if (storedAgentId && primary.some((agent) => agent.agent_id === storedAgentId)) {
         return storedAgentId;
-      }
-
-      const lastOpenedConversationId = window.localStorage.getItem(CHAT_STORAGE_KEYS.lastOpenedConversation);
-      if (lastOpenedConversationId) {
-        try {
-          const conversation = await api.conversations.detail(lastOpenedConversationId);
-          if (isRestorableChatConversation(conversation) && primary.some((agent) => agent.agent_id === conversation.agent_id)) {
-            return conversation.agent_id;
-          }
-          window.localStorage.removeItem(CHAT_STORAGE_KEYS.lastOpenedConversation);
-        } catch {
-          window.localStorage.removeItem(CHAT_STORAGE_KEYS.lastOpenedConversation);
-        }
       }
     }
 
@@ -117,7 +104,7 @@
     {agents}
     bind:selectedAgentId
     title="Start a new chat"
-    description="Pick the primary agent for this new web conversation. The current filter or your last opened conversation is preselected when possible."
+    description="Pick the primary agent for this new web conversation. The current filter or your saved agent preference is preselected when possible."
     confirmLabel="Create conversation"
     busy={creating}
     {error}

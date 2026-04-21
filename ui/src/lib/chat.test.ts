@@ -239,7 +239,7 @@ describe('chat timeline helpers', () => {
     });
   });
 
-  it('settles the stale assistant stream state once tool activity starts', () => {
+  it('keeps the assistant draft trailing behind live tool calls until completion', () => {
     const streaming = applyWebSocketEvent([], {
       type: 'chunk',
       conversation_id: 'conv_1',
@@ -259,8 +259,44 @@ describe('chat timeline helpers', () => {
       arguments: { command: 'pwd' }
     });
 
-    expect(withTool[0]).toMatchObject({ kind: 'message', role: 'assistant', streaming: false });
-    expect(withTool[1]).toMatchObject({ kind: 'tool_call', callId: 'call_live_1' });
+    const withResult = applyWebSocketEvent(withTool, {
+      type: 'tool_result',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      call_id: 'call_live_1',
+      tool_name: 'bash',
+      result: 'done',
+      is_error: false,
+      duration_ms: 25,
+    });
+
+    const withSecondTool = applyWebSocketEvent(withResult, {
+      type: 'tool_call',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      call_id: 'call_live_2',
+      tool_name: 'grep',
+      status: 'started',
+      arguments: { pattern: 'foo' }
+    });
+
+    const continued = applyWebSocketEvent(withSecondTool, {
+      type: 'chunk',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      message_id: 'msg_live',
+      content: ' and done',
+      index: 1
+    });
+
+    expect(continued[0]).toMatchObject({ kind: 'tool_call', callId: 'call_live_1', status: 'completed' });
+    expect(continued[1]).toMatchObject({ kind: 'tool_call', callId: 'call_live_2', status: 'started' });
+    expect(continued[2]).toMatchObject({
+      kind: 'message',
+      role: 'assistant',
+      streaming: true,
+      content: 'Working on it and done',
+    });
   });
 
   it('turns history gaps into visible warning notices', () => {
