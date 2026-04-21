@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
+import mimetypes
 import os
 import re
 import shutil
@@ -25,6 +27,7 @@ logger = get_logger(__name__)
 
 _MAX_READ_LINES = 2000
 _MAX_LINE_LENGTH = 2000
+_MAX_INLINE_BINARY_READ_BYTES = 10 * 1024 * 1024
 
 
 def _resolve_path(raw: str, context: ToolExecutionContext) -> Path:
@@ -298,9 +301,16 @@ async def handle_read(arguments: dict[str, Any], context: ToolExecutionContext) 
         return _read_directory(path)
 
     try:
-        content = path.read_text(encoding="utf-8", errors="replace")
+        raw_content = path.read_bytes()
     except (OSError, PermissionError) as exc:
         return ToolResult(output=f"Cannot read file: {exc}", is_error=True)
+
+    mime_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    if _should_route_binary_read(path, raw_content, mime_type):
+        await _record_read(context, path)
+        return _binary_read_result(path, raw_content, mime_type)
+
+    content = raw_content.decode("utf-8", errors="replace")
 
     lines = content.splitlines(keepends=True)
     total = len(lines)
@@ -323,6 +333,48 @@ async def handle_read(arguments: dict[str, Any], context: ToolExecutionContext) 
         _warm_lsp(context, str(path))
 
     return ToolResult(output=result, metadata={"files_read": [str(path)]})
+
+
+def _should_route_binary_read(path: Path, content: bytes, mime_type: str) -> bool:
+    normalized_mime = mime_type.lower()
+    if normalized_mime.startswith(("image/", "audio/", "video/")):
+        return True
+    if normalized_mime == "application/pdf":
+        return True
+    if b"\x00" in content:
+        return True
+    suffix = path.suffix.lower()
+    return suffix in {".pdf", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff", ".mp3", ".wav", ".ogg", ".m4a", ".mp4", ".mov", ".webm"}
+
+
+def _binary_read_result(path: Path, content: bytes, mime_type: str) -> ToolResult:
+    if len(content) > _MAX_INLINE_BINARY_READ_BYTES:
+        return ToolResult(
+            output=(
+                f"Binary file is too large to read inline ({len(content)} bytes). "
+                "Use artifact_publish first if you need to inspect it."
+            ),
+            is_error=True,
+            metadata={"files_read": [str(path)]},
+        )
+    return ToolResult(
+        output=(
+            f"Prepared binary file '{path.name}' for attachment analysis. "
+            "The controller will inspect it with the current model when possible, "
+            "and fall back to the attachment_analysis route when needed."
+        ),
+        metadata={
+            "files_read": [str(path)],
+            "attachment_analysis_request": {"source": "read", "path": str(path)},
+        },
+        attachments=[
+            {
+                "filename": path.name,
+                "mime_type": mime_type,
+                "content_b64": base64.b64encode(content).decode("ascii"),
+            }
+        ],
+    )
 
 
 def _read_directory(path: Path) -> ToolResult:
@@ -467,6 +519,9 @@ async def handle_patch(arguments: dict[str, Any], context: ToolExecutionContext)
     touched_paths = _operation_lock_paths(operations)
     try:
         async with _with_file_locks(context, touched_paths):
+            staged = await _stage_patch_operations(operations, context)
+            # Re-stage once more immediately before apply so we catch files
+            # that changed after the initial read but before the write phase.
             staged = await _stage_patch_operations(operations, context)
             summary_lines, diagnostic_paths = await _apply_staged_patch_operations(staged, context)
     except (

@@ -22,6 +22,7 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from cognis.channels.delivery import _append_attachment_fallback, prepare_media_attachments
 from cognis.channels.protocol import CHANNEL_OUTBOUND_TOTAL, BaseChannelAdapter
 from cognis.logging import get_logger
 from cognis.models.artifact import ArtifactKind, AttachmentRef
@@ -891,8 +892,6 @@ class ChannelTurnObserver:
 
     async def on_turn_complete(self, result: Any) -> None:
         """Send the accumulated response to the channel."""
-        # Extract outbound attachments from the turn result
-        outbound_media: list[MediaAttachment] = []
         raw_result_attachments: list[dict[str, Any]] = []
         if result is not None:
             result_attachments = getattr(result, "attachments", None)
@@ -900,11 +899,16 @@ class ChannelTurnObserver:
                 for att in result_attachments:
                     if isinstance(att, dict):
                         raw_result_attachments.append(att)
-                        outbound_media.append(
-                            await _materialize_turn_attachment(att, self._channel_manager_ref())
-                        )
+        manager = self._channel_manager_ref()
+        outbound_media, attachment_fallback_lines, _had_attachment_failures = (
+            await prepare_media_attachments(
+                raw_result_attachments,
+                session_factory=(getattr(manager, "_session_factory", None) if manager is not None else None),
+                artifact_store=(getattr(manager, "_artifact_store", None) if manager is not None else None),
+            )
+        )
 
-        if not self._turn_active and not outbound_media:
+        if not self._turn_active and not outbound_media and not attachment_fallback_lines:
             # This observer was registered for a queued message that hasn't
             # started yet. Keep it alive for the next turn.
             return
@@ -915,7 +919,7 @@ class ChannelTurnObserver:
         if adapter is None:
             return
 
-        content = self._accumulated_text
+        content = _append_attachment_fallback(self._accumulated_text, attachment_fallback_lines)
         self._accumulated_text = ""
         if not content and not outbound_media:
             return
@@ -1157,41 +1161,6 @@ class ChannelTurnObserver:
         the next inbound message starts with a clean list.
         """
         self._turn_scheduler.remove_observer(self._conversation_id, self)
-
-
-async def _materialize_turn_attachment(att: dict[str, Any], manager: Any) -> MediaAttachment:
-    content_b64 = att.get("content_b64") if isinstance(att.get("content_b64"), str) else None
-    if content_b64 is None and manager is not None:
-        artifact_id = att.get("artifact_id")
-        if isinstance(artifact_id, str) and artifact_id:
-            import base64
-
-            from cognis.store.queries import get_artifact_record
-
-            try:
-                async with manager._session_factory() as session:  # noqa: SLF001
-                    row = await get_artifact_record(session, artifact_id)
-                if row is not None and row.status != "deleted":
-                    content, _ct = await manager._artifact_store.async_load(  # noqa: SLF001
-                        row.namespace,
-                        row.object_id,
-                        row.filename,
-                    )
-                    content_b64 = base64.b64encode(content).decode("ascii")
-            except Exception:
-                logger.warning(
-                    "channel observer: failed to materialize turn attachment",
-                    exc_info=True,
-                )
-    return MediaAttachment(
-        url=att.get("url"),
-        mime_type=att.get("mime_type"),
-        filename=att.get("filename"),
-        size_bytes=att.get("size_bytes"),
-        content_b64=content_b64,
-    )
-
-
 def _signal_image_preview_payload(attachments: list[dict[str, Any]]) -> dict[str, str] | None:
     for attachment in attachments:
         mime_type = attachment.get("mime_type")

@@ -58,7 +58,10 @@ _EXECUTOR_SOURCE = ToolSource(type="executor")
 
 READ_TOOL = ToolDefinition(
     name="read",
-    description="Read a file or directory from the filesystem. Returns line-numbered content.",
+    description=(
+        "Read a file or directory from the filesystem. Text files return line-numbered "
+        "content; supported binary files are routed through attachment analysis."
+    ),
     parameters={
         "type": "object",
         "properties": {

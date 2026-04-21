@@ -1044,11 +1044,15 @@ class TurnScheduler:
         for attachment in attachments:
             if attachment.kind == ArtifactKind.IMAGE and model_info.supports_vision:
                 continue
-            if attachment.kind == ArtifactKind.PDF and model_info.supports_pdf_input:
+            if attachment.kind == ArtifactKind.PDF and (
+                model_info.supports_pdf_input or model_info.supports_file_input
+            ):
                 continue
-            if attachment.kind == ArtifactKind.AUDIO and model_info.supports_audio_input:
+            if attachment.kind == ArtifactKind.AUDIO and (
+                model_info.supports_audio_input or model_info.supports_file_input
+            ):
                 continue
-            if attachment.kind == ArtifactKind.FILE and model_info.supports_file_input:
+            if attachment.kind in {ArtifactKind.FILE, ArtifactKind.VIDEO} and model_info.supports_file_input:
                 continue
             if attachment.kind == ArtifactKind.PDF:
                 extracted = await self._extract_pdf_text(attachment)
@@ -1063,8 +1067,10 @@ class TurnScheduler:
             joined = ", ".join(unsupported)
             notice = (
                 f"The current model ({resolved_model}) cannot read some attachments natively: {joined}. "
-                "If extracted fallback text is available, use it carefully and mention any uncertainty. "
-                "For the remaining unsupported files, explicitly refuse to analyze them and ask the user to switch to a compatible model if needed."
+                "Use artifact_read with the attachment artifact_id to inspect those files. "
+                "artifact_read keeps the current model when it already supports the file and falls back to "
+                "the attachment_analysis route only when needed. If extracted fallback text is available, use it "
+                "carefully and mention any uncertainty."
             )
         if not pdf_fallbacks:
             return notice, None

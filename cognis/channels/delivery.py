@@ -50,6 +50,106 @@ def _attachment_fallback_text(raw: dict[str, Any]) -> str | None:
     return url or filename
 
 
+async def prepare_media_attachments(
+    media: list[dict[str, Any]],
+    *,
+    session_factory: async_sessionmaker[Any] | None,
+    artifact_store: Any | None,
+) -> tuple[list[MediaAttachment], list[str], bool]:
+    prepared: list[MediaAttachment] = []
+    fallback_lines: list[str] = []
+    had_failures = False
+    for item in media:
+        attachment, fallback_line, materialized = await _materialize_media_attachment(
+            item,
+            session_factory=session_factory,
+            artifact_store=artifact_store,
+        )
+        if attachment is not None:
+            prepared.append(attachment)
+        if fallback_line:
+            fallback_lines.append(fallback_line)
+        if not materialized:
+            had_failures = True
+    return prepared, fallback_lines, had_failures
+
+
+async def _materialize_media_attachment(
+    raw: dict[str, Any],
+    *,
+    session_factory: async_sessionmaker[Any] | None,
+    artifact_store: Any | None,
+) -> tuple[MediaAttachment | None, str | None, bool]:
+    content_b64 = raw.get("content_b64") if isinstance(raw.get("content_b64"), str) else None
+    artifact_id = raw.get("artifact_id")
+    if content_b64 is None and isinstance(artifact_id, str) and artifact_id:
+        from cognis.store.queries import get_artifact_record
+
+        try:
+            if session_factory is not None and artifact_store is not None:
+                async with session_factory() as session:
+                    row = await get_artifact_record(session, artifact_id)
+                if row is not None and row.status != "deleted":
+                    content, _ct = await artifact_store.async_load(
+                        row.namespace,
+                        row.object_id,
+                        row.filename,
+                    )
+                    return (
+                        MediaAttachment(
+                            url=raw.get("url") if isinstance(raw.get("url"), str) else None,
+                            mime_type=(
+                                raw.get("mime_type")
+                                if isinstance(raw.get("mime_type"), str)
+                                else None
+                            )
+                            or getattr(row, "mime_type", None),
+                            filename=(
+                                raw.get("filename")
+                                if isinstance(raw.get("filename"), str)
+                                else None
+                            )
+                            or row.filename,
+                            size_bytes=(
+                                raw.get("size_bytes")
+                                if isinstance(raw.get("size_bytes"), int)
+                                else None
+                            )
+                            or len(content),
+                            content_b64=base64.b64encode(content).decode("ascii"),
+                        ),
+                        None,
+                        True,
+                    )
+        except Exception:
+            logger.warning("channel delivery: failed to materialize attachment", exc_info=True)
+            if isinstance(raw.get("url"), str):
+                return (
+                    MediaAttachment(
+                        url=raw["url"],
+                        mime_type=raw.get("mime_type") if isinstance(raw.get("mime_type"), str) else None,
+                        filename=raw.get("filename") if isinstance(raw.get("filename"), str) else None,
+                        size_bytes=raw.get("size_bytes") if isinstance(raw.get("size_bytes"), int) else None,
+                    ),
+                    None,
+                    True,
+                )
+            return None, _attachment_fallback_text(raw), False
+    if content_b64 is None and not isinstance(raw.get("url"), str):
+        return None, _attachment_fallback_text(raw), False
+    return (
+        MediaAttachment(
+            url=raw.get("url") if isinstance(raw.get("url"), str) else None,
+            mime_type=raw.get("mime_type") if isinstance(raw.get("mime_type"), str) else None,
+            filename=raw.get("filename") if isinstance(raw.get("filename"), str) else None,
+            size_bytes=raw.get("size_bytes") if isinstance(raw.get("size_bytes"), int) else None,
+            content_b64=content_b64,
+        ),
+        None,
+        True,
+    )
+
+
 class ChannelDeliveryService:
     """Delivers async notifications to channels via EventBus.
 
@@ -252,103 +352,21 @@ class ChannelDeliveryService:
     async def _prepare_media_attachments(
         self, media: list[dict[str, Any]]
     ) -> tuple[list[MediaAttachment], list[str], bool]:
-        prepared: list[MediaAttachment] = []
-        fallback_lines: list[str] = []
-        had_failures = False
-        for item in media:
-            attachment, fallback_line, materialized = await self._materialize_media_attachment(item)
-            if attachment is not None:
-                prepared.append(attachment)
-            if fallback_line:
-                fallback_lines.append(fallback_line)
-            if not materialized:
-                had_failures = True
-        return prepared, fallback_lines, had_failures
+        manager = self._channel_manager_ref()
+        return await prepare_media_attachments(
+            media,
+            session_factory=self._session_factory,
+            artifact_store=getattr(manager, "_artifact_store", None) if manager is not None else None,
+        )
 
     async def _materialize_media_attachment(
         self, raw: dict[str, Any]
     ) -> tuple[MediaAttachment | None, str | None, bool]:
-        content_b64 = raw.get("content_b64") if isinstance(raw.get("content_b64"), str) else None
-        artifact_id = raw.get("artifact_id")
-        if content_b64 is None and isinstance(artifact_id, str) and artifact_id:
-            from cognis.store.queries import get_artifact_record
-
-            try:
-                async with self._session_factory() as session:
-                    row = await get_artifact_record(session, artifact_id)
-                manager = self._channel_manager_ref()
-                if manager is not None and row is not None and row.status != "deleted":
-                    content, _ct = await manager._artifact_store.async_load(  # noqa: SLF001
-                        row.namespace,
-                        row.object_id,
-                        row.filename,
-                    )
-                    return (
-                        MediaAttachment(
-                            url=raw.get("url") if isinstance(raw.get("url"), str) else None,
-                            mime_type=(
-                                raw.get("mime_type")
-                                if isinstance(raw.get("mime_type"), str)
-                                else None
-                            )
-                            or getattr(row, "mime_type", None),
-                            filename=(
-                                raw.get("filename")
-                                if isinstance(raw.get("filename"), str)
-                                else None
-                            )
-                            or row.filename,
-                            size_bytes=(
-                                raw.get("size_bytes")
-                                if isinstance(raw.get("size_bytes"), int)
-                                else None
-                            )
-                            or len(content),
-                            content_b64=base64.b64encode(content).decode("ascii"),
-                        ),
-                        None,
-                        True,
-                    )
-            except Exception:
-                logger.warning("channel delivery: failed to materialize attachment", exc_info=True)
-                if isinstance(raw.get("url"), str):
-                    return (
-                        MediaAttachment(
-                            url=raw["url"],
-                            mime_type=(
-                                raw.get("mime_type")
-                                if isinstance(raw.get("mime_type"), str)
-                                else None
-                            ),
-                            filename=(
-                                raw.get("filename")
-                                if isinstance(raw.get("filename"), str)
-                                else None
-                            ),
-                            size_bytes=(
-                                raw.get("size_bytes")
-                                if isinstance(raw.get("size_bytes"), int)
-                                else None
-                            ),
-                        ),
-                        None,
-                        True,
-                    )
-                return None, _attachment_fallback_text(raw), False
-        if content_b64 is None and not isinstance(raw.get("url"), str):
-            return None, _attachment_fallback_text(raw), False
-        return (
-            MediaAttachment(
-                url=raw.get("url") if isinstance(raw.get("url"), str) else None,
-                mime_type=raw.get("mime_type") if isinstance(raw.get("mime_type"), str) else None,
-                filename=raw.get("filename") if isinstance(raw.get("filename"), str) else None,
-                size_bytes=raw.get("size_bytes")
-                if isinstance(raw.get("size_bytes"), int)
-                else None,
-                content_b64=content_b64,
-            ),
-            None,
-            True,
+        manager = self._channel_manager_ref()
+        return await _materialize_media_attachment(
+            raw,
+            session_factory=self._session_factory,
+            artifact_store=getattr(manager, "_artifact_store", None) if manager is not None else None,
         )
 
     # ------------------------------------------------------------------

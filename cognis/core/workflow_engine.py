@@ -2744,15 +2744,22 @@ class WorkflowEngine:
                         "markdown",
                     )
 
-        attachments: list[dict[str, Any]] = []
-        for raw in state.step_outputs.values():
-            if not isinstance(raw, dict):
-                continue
-            try:
-                step_output = StepOutput.model_validate(raw)
-            except Exception:
-                continue
-            attachments.extend(step_output.attachments)
+        attachment_source: StepOutput | None = None
+        if task.status == TaskStatus.COMPLETED and "final_deliverable_id" in result:
+            final_deliverable_id = str(result["final_deliverable_id"])
+            for raw in reversed(list(state.step_outputs.values())):
+                if not isinstance(raw, dict):
+                    continue
+                if raw.get("deliverable_id") != final_deliverable_id:
+                    continue
+                try:
+                    attachment_source = StepOutput.model_validate(raw)
+                except Exception:
+                    continue
+                break
+        if attachment_source is None:
+            attachment_source = self._last_step_output(state)
+        attachments = list(attachment_source.attachments) if attachment_source is not None else []
         if not attachments:
             return result or None
         deduped: list[dict[str, Any]] = []

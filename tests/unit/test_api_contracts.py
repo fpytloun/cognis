@@ -256,6 +256,9 @@ class TestModelRoutingContracts:
         assert response.image_generation == ModelRoutingEntry(
             model=None, reasoning_effort=None
         )
+        assert response.attachment_analysis == ModelRoutingEntry(
+            model=None, reasoning_effort=None
+        )
 
     def test_model_routing_preserves_nested_entry_shape(self) -> None:
         response = ModelRoutingResponse(

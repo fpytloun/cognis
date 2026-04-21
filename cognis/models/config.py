@@ -110,6 +110,7 @@ class ModelRoutingPolicy(BaseModel):
     evaluator: dict[str, str | None] = Field(default_factory=dict)
     speech_to_text: dict[str, str | None] = Field(default_factory=dict)
     image_generation: dict[str, str | None] = Field(default_factory=dict)
+    attachment_analysis: dict[str, str | None] = Field(default_factory=dict)
 
 
 class ProviderHealth(BaseModel):

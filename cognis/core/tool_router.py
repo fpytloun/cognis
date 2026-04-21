@@ -20,12 +20,17 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from cognis.core.truncation import middle_truncate
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
-from cognis.models.artifact import ArtifactKind
+from cognis.models.artifact import ArtifactKind, AttachmentRef
 from cognis.models.credential import CredentialAccessError, CredentialResolution
 from cognis.models.session import SessionModel
 from cognis.models.tool import ExecutorHandle, Permission, ToolCall, ToolResult, stable_tool_id
 from cognis.store.queries import create_artifact_record, get_artifact_record, get_setting_value
 from cognis.tools.argument_normalization import strip_empty_optional_values
+from cognis.tools.builtin.artifact_tools import (
+    analyze_attachment_ref,
+    handle_artifact_tool,
+    is_artifact_tool,
+)
 from cognis.tools.builtin.image import handle_image_tool, is_image_tool
 from cognis.tools.builtin.memory import handle_memory_tool, is_memory_tool
 from cognis.tools.builtin.orchestration import handle_delegate_tool_call, is_orchestration_tool
@@ -72,6 +77,7 @@ class ToolRoute(StrEnum):
     ORCHESTRATION = "orchestration"
     MEMORY = "memory"
     TOOL_OUTPUT = "tool_output"
+    ARTIFACT = "artifact"
     IMAGE = "image"
     SKILL_MANAGEMENT = "skill_management"
     SCHEDULE = "schedule"
@@ -158,6 +164,8 @@ class ToolRouter:
             return ToolRoute.MEMORY
         if is_tool_output_tool(tool_name):
             return ToolRoute.TOOL_OUTPUT
+        if is_artifact_tool(tool_name):
+            return ToolRoute.ARTIFACT
         if is_image_tool(tool_name):
             return ToolRoute.IMAGE
         if is_skill_management_tool(tool_name):
@@ -397,6 +405,34 @@ class ToolRouter:
                 tool_call.name,
                 result,
                 50_000,
+                call_id=cid,
+                runtime_metadata=tool_call.runtime_metadata,
+            )
+        if route is ToolRoute.ARTIFACT:
+            result = await handle_artifact_tool(
+                tool_name=tool_call.name,
+                arguments=dict(tool_call.arguments),
+                llm=self.llm,
+                artifact_store=self.artifact_store,
+                session_factory=self._session_factory,
+                user_email=session.user_email,
+                current_model=(
+                    str(tool_call.runtime_metadata.get("resolved_model"))
+                    if isinstance(tool_call.runtime_metadata.get("resolved_model"), str)
+                    else None
+                ),
+                current_provider_id=(
+                    str(tool_call.runtime_metadata.get("resolved_provider_id"))
+                    if isinstance(tool_call.runtime_metadata.get("resolved_provider_id"), str)
+                    else None
+                ),
+            )
+            outcome = "success" if not result.is_error else "failure"
+            TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome=outcome).inc()
+            return self._sanitize_result(
+                tool_call.name,
+                result,
+                100_000,
                 call_id=cid,
                 runtime_metadata=tool_call.runtime_metadata,
             )
@@ -642,6 +678,7 @@ class ToolRouter:
             except CredentialAccessError as exc:
                 result = self._credential_error_result(exc)
             result = await self._materialize_inline_attachments(result, session, tool_call.name)
+            result = await self._postprocess_tool_result(result, scoped_tool_call, session)
             if result.metadata is None:
                 result = result.model_copy(update={"metadata": {"evaluation": eval_meta}})
             else:
@@ -667,6 +704,7 @@ class ToolRouter:
             )
             result = await self._persist_browser_auth_state_if_needed(result, session, agent)
             result = await self._materialize_inline_attachments(result, session, tool_call.name)
+            result = await self._postprocess_tool_result(result, scoped_tool_call, session)
         except CredentialAccessError as exc:
             result = self._credential_error_result(exc)
         except TimeoutError:
@@ -697,6 +735,77 @@ class ToolRouter:
             call_id=cid,
             runtime_metadata=tool_call.runtime_metadata,
         )
+
+    async def _postprocess_tool_result(
+        self,
+        result: ToolResult,
+        tool_call: ToolCall,
+        session: SessionModel,
+    ) -> ToolResult:
+        metadata = result.metadata if isinstance(result.metadata, dict) else None
+        if tool_call.name != "read" or metadata is None:
+            return result
+        request = metadata.get("attachment_analysis_request")
+        if not isinstance(request, dict):
+            return result
+        attachments = result.attachments or []
+        if not attachments:
+            return ToolResult(
+                output="Binary file was prepared for analysis, but no attachment was persisted.",
+                is_error=True,
+                metadata={k: v for k, v in metadata.items() if k != "attachment_analysis_request"},
+            )
+        first = attachments[0]
+        try:
+            attachment = AttachmentRef(
+                artifact_id=str(first.get("artifact_id") or ""),
+                kind=ArtifactKind(str(first.get("kind") or ArtifactKind.FILE.value)),
+                mime_type=str(first.get("mime_type") or "application/octet-stream"),
+                filename=str(first.get("filename") or "attachment"),
+                size_bytes=int(first.get("size_bytes") or 0),
+                url=str(first.get("url")) if isinstance(first.get("url"), str) else None,
+            )
+        except Exception as exc:
+            return ToolResult(
+                output=f"Binary file analysis setup failed: {exc}",
+                is_error=True,
+                metadata={k: v for k, v in metadata.items() if k != "attachment_analysis_request"},
+            )
+        try:
+            content, _content_type, _filename = await self._load_binary_artifact(
+                attachment.artifact_id,
+                session.user_email,
+            )
+        except Exception as exc:
+            return ToolResult(
+                output=f"Failed to load binary artifact for analysis: {exc}",
+                is_error=True,
+                metadata={k: v for k, v in metadata.items() if k != "attachment_analysis_request"},
+            )
+        analysis = await analyze_attachment_ref(
+            attachment=attachment,
+            content=content,
+            prompt=(str(request.get("prompt")) if isinstance(request.get("prompt"), str) else None),
+            llm=self.llm,
+            artifact_store=self.artifact_store,
+            session_factory=self._session_factory,
+            current_model=(
+                str(tool_call.runtime_metadata.get("resolved_model"))
+                if isinstance(tool_call.runtime_metadata.get("resolved_model"), str)
+                else None
+            ),
+            current_provider_id=(
+                str(tool_call.runtime_metadata.get("resolved_provider_id"))
+                if isinstance(tool_call.runtime_metadata.get("resolved_provider_id"), str)
+                else None
+            ),
+        )
+        next_metadata = {
+            k: v for k, v in metadata.items() if k != "attachment_analysis_request"
+        }
+        if analysis.metadata:
+            next_metadata.update(analysis.metadata)
+        return analysis.model_copy(update={"metadata": next_metadata, "attachments": None})
 
     async def _execute_local_handler(
         self,

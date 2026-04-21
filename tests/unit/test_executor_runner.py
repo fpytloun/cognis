@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import os
 import sys
@@ -271,7 +270,7 @@ async def test_handle_tool_execute_allows_degraded_runtime() -> None:
 
     async def _handler(_: dict[str, object], context: object) -> ToolResult:
         del context
-        return ToolResult(output="ok", is_error=False)
+        return ToolResult(output="ok", is_error=False, metadata={"analysis": "ok"})
 
     runner._tool_handlers["read"] = _handler
     ws.sent.clear()
@@ -284,6 +283,7 @@ async def test_handle_tool_execute_allows_degraded_runtime() -> None:
 
     assert ws.sent[-1]["result"]["is_error"] is False
     assert ws.sent[-1]["result"]["output"] == "ok"
+    assert ws.sent[-1]["result"]["metadata"] == {"analysis": "ok"}
 
 
 @pytest.mark.asyncio
@@ -480,10 +480,6 @@ def test_executor_main_suppresses_cancelled_error(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setenv("COGNIS_CONTROLLER_URL", "ws://localhost:8080/api/executor/ws")
     monkeypatch.setenv("COGNIS_EXECUTOR_TOKEN", "token")
     monkeypatch.setattr(sys, "argv", ["cognis-executor"])
-    monkeypatch.setattr(sys, "stdin", open(os.devnull))
-
-    try:
+    with open(os.devnull) as devnull:
+        monkeypatch.setattr(sys, "stdin", devnull)
         executor_main.main()
-    finally:
-        with contextlib.suppress(Exception):
-            sys.stdin.close()

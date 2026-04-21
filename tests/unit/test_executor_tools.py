@@ -158,6 +158,19 @@ class TestReadTool:
         assert result.is_error
         assert "escapes workspace root" in result.output
 
+    @pytest.mark.asyncio()
+    async def test_read_binary_file_returns_attachment_analysis_request(self, tmp_path: Path) -> None:
+        target = tmp_path / "photo.png"
+        target.write_bytes(b"\x89PNG\r\n\x1a\n\x00binary")
+
+        result = await handle_read({"file_path": str(target)}, _context())
+
+        assert not result.is_error
+        assert result.attachments is not None
+        assert result.attachments[0]["filename"] == "photo.png"
+        assert result.metadata is not None
+        assert "attachment_analysis_request" in result.metadata
+
 
 class TestWriteTool:
     """Test the write filesystem tool."""

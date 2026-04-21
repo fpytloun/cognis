@@ -710,14 +710,15 @@ class ExecutorRunner:
         await self._send_rpc_result(
             ws,
             msg_id,
-            {
-                "call_id": call_id,
-                "output": result.output,
-                "is_error": result.is_error,
-                "duration_ms": result.duration_ms,
-                "attachments": result.attachments,
-            },
-        )
+                {
+                    "call_id": call_id,
+                    "output": result.output,
+                    "is_error": result.is_error,
+                    "duration_ms": result.duration_ms,
+                    "metadata": result.metadata,
+                    "attachments": result.attachments,
+                },
+            )
 
     async def _handle_llm_complete(
         self, ws: Any, msg_id: str | None, params: dict[str, Any]

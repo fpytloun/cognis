@@ -100,6 +100,7 @@ async def test_tool_execute_returns_tool_result() -> None:
                     "output": "hello world",
                     "is_error": False,
                     "duration_ms": 42,
+                    "metadata": {"analysis": "ok"},
                 },
                 "id": request["id"],
             }
@@ -113,6 +114,7 @@ async def test_tool_execute_returns_tool_result() -> None:
     assert result.output == "hello world"
     assert result.is_error is False
     assert result.duration_ms == 42
+    assert result.metadata == {"analysis": "ok"}
     await conn.close()
 
 

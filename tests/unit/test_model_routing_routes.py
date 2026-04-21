@@ -66,6 +66,11 @@ def test_model_routing_put_round_trips_nested_entries_and_deletes_legacy_rows(
                                 "supports_reasoning": False,
                                 "supports_image_generation": True,
                             },
+                            {
+                                "model_id": "gpt-4o",
+                                "supports_vision": True,
+                                "supports_file_input": True,
+                            },
                         ],
                     },
                     status="active",
@@ -87,6 +92,7 @@ def test_model_routing_put_round_trips_nested_entries_and_deletes_legacy_rows(
                 "evaluator": {"model": "gpt-5.4", "reasoning_effort": "high"},
                 "speech_to_text": {"model": "gpt-4o-transcribe", "reasoning_effort": None},
                 "image_generation": {"model": "gpt-image-1", "reasoning_effort": None},
+                "attachment_analysis": {"model": "gpt-4o", "reasoning_effort": None},
             },
         )
 
@@ -95,6 +101,10 @@ def test_model_routing_put_round_trips_nested_entries_and_deletes_legacy_rows(
         assert payload["default"] == {"model": "gpt-5.4", "reasoning_effort": "xhigh"}
         assert payload["speech_to_text"] == {
             "model": "gpt-4o-transcribe",
+            "reasoning_effort": None,
+        }
+        assert payload["attachment_analysis"] == {
+            "model": "gpt-4o",
             "reasoning_effort": None,
         }
         assert "simple_inline" not in payload
@@ -255,6 +265,7 @@ def test_model_routing_put_rejects_non_image_model_for_image_generation(
                         "models": [
                             {"model_id": "gpt-5.4", "supports_reasoning": True},
                             {"model_id": "gpt-image-1", "supports_image_generation": True},
+                            {"model_id": "gpt-4o", "supports_vision": True},
                         ],
                     },
                     status="active",
@@ -268,6 +279,52 @@ def test_model_routing_put_rejects_non_image_model_for_image_generation(
             "/api/v1/model-routing",
             headers=headers,
             json={"image_generation": {"model": "gpt-5.4", "reasoning_effort": None}},
+        )
+
+        assert response.status_code == 422
+        assert "not eligible" in response.json()["error"]["message"]
+
+
+def test_model_routing_put_rejects_non_multimodal_model_for_attachment_analysis(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> None:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="admin@example.com",
+                    name="Admin",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="admin",
+                )
+                await create_llm_provider(
+                    session,
+                    provider_id="openai",
+                    display_name="OpenAI",
+                    location="controller",
+                    backend="litellm",
+                    config={
+                        "preset": "openai",
+                        "default_model": "text-only-model",
+                        "models": [
+                            {"model_id": "text-only-model", "supports_reasoning": True},
+                            {"model_id": "gpt-4o", "supports_vision": True},
+                        ],
+                    },
+                    status="active",
+                )
+                await session.commit()
+
+        asyncio.run(_seed())
+
+        headers = _auth_headers(app, email="admin@example.com", role="admin")
+        response = client.put(
+            "/api/v1/model-routing",
+            headers=headers,
+            json={"attachment_analysis": {"model": "text-only-model", "reasoning_effort": None}},
         )
 
         assert response.status_code == 422

@@ -1179,6 +1179,7 @@ class StepContext:
     pending_events: list[SessionEvent] | None = None
     pending_tool_calls: dict[str, PendingToolCallState] = field(default_factory=dict)
     current_model: str | None = None
+    current_provider_id: str | None = None
     current_model_info: Any = None
     remember_user_event_seq: int | None = None
     current_deliverable_id: str | None = None
@@ -2049,6 +2050,7 @@ class AgentLoop:
         saved_partial_tool_calls: dict[int, dict[str, Any]] | None = None
         discovered_tool_ids = self._get_initial_discovered_tool_ids(ctx)
         collected_attachments: list[dict[str, Any]] = []
+        pending_assistant_attachments: list[dict[str, Any]] = []
         continued_assistant_content = ""
         continuation_message_index: int | None = None
         continuation_reminder_index: int | None = None
@@ -2128,6 +2130,7 @@ class AgentLoop:
             else:
                 model_info = await self.providers.llm.get_model_info(current_model)
             ctx.current_model = current_model
+            ctx.current_provider_id = current_provider_id
             ctx.current_model_info = model_info
             registry = self._get_tool_registry(ctx)
             inventory_tools = (
@@ -2342,13 +2345,15 @@ class AgentLoop:
             current_assistant_message_index: int | None = None
 
             # Record assistant message
-            if content or collected_attachments:
+            if content or pending_assistant_attachments:
                 events_to_record.append(
                     SessionEvent(
                         type="assistant_message",
                         data={
                             "content": content,
-                            "attachments": strip_attachment_payload_bytes(collected_attachments),
+                            "attachments": strip_attachment_payload_bytes(
+                                pending_assistant_attachments
+                            ),
                         },
                     )
                 )
@@ -2368,7 +2373,7 @@ class AgentLoop:
                     continuation_message_index = None
                 memory_text = merge_content_and_attachment_note(
                     content,
-                    strip_attachment_payload_bytes(collected_attachments),
+                    strip_attachment_payload_bytes(pending_assistant_attachments),
                 )
                 if memory_text.strip():
                     assistant_memory_parts.append(memory_text)
@@ -2378,6 +2383,7 @@ class AgentLoop:
                     reason="assistant_message",
                     on_token=on_token,
                 )
+                pending_assistant_attachments.clear()
 
             # No tool calls — check if step is complete
             if not tool_calls:
@@ -2543,6 +2549,7 @@ class AgentLoop:
                             events_to_record=events_to_record,
                             messages=messages,
                             collected_attachments=collected_attachments,
+                            pending_assistant_attachments=pending_assistant_attachments,
                             discovered_tool_ids=discovered_tool_ids,
                             on_token=on_token,
                             on_tool_result=on_tool_result,
@@ -2584,6 +2591,7 @@ class AgentLoop:
                                 events_to_record=events_to_record,
                                 messages=messages,
                                 collected_attachments=collected_attachments,
+                                pending_assistant_attachments=pending_assistant_attachments,
                                 discovered_tool_ids=discovered_tool_ids,
                                 on_token=on_token,
                                 on_tool_result=on_tool_result,
@@ -2633,6 +2641,7 @@ class AgentLoop:
                         events_to_record=events_to_record,
                         messages=messages,
                         collected_attachments=collected_attachments,
+                        pending_assistant_attachments=pending_assistant_attachments,
                         discovered_tool_ids=discovered_tool_ids,
                         on_token=on_token,
                         on_tool_result=on_tool_result,
@@ -3873,6 +3882,7 @@ class AgentLoop:
                             events_to_record=events_to_record,
                             messages=messages,
                             collected_attachments=collected_attachments,
+                            pending_assistant_attachments=pending_assistant_attachments,
                             discovered_tool_ids=discovered_tool_ids,
                             on_token=on_token,
                             on_tool_result=on_tool_result,
@@ -3884,6 +3894,7 @@ class AgentLoop:
                         events_to_record=events_to_record,
                         messages=messages,
                         collected_attachments=collected_attachments,
+                        pending_assistant_attachments=pending_assistant_attachments,
                         discovered_tool_ids=discovered_tool_ids,
                         on_token=on_token,
                         on_tool_result=on_tool_result,
@@ -3896,6 +3907,7 @@ class AgentLoop:
                     events_to_record=events_to_record,
                     messages=messages,
                     collected_attachments=collected_attachments,
+                    pending_assistant_attachments=pending_assistant_attachments,
                     discovered_tool_ids=discovered_tool_ids,
                     on_token=on_token,
                     on_tool_result=on_tool_result,
@@ -6834,6 +6846,7 @@ class AgentLoop:
         events_to_record: list[SessionEvent],
         messages: list[dict[str, Any]],
         collected_attachments: list[dict[str, Any]],
+        pending_assistant_attachments: list[dict[str, Any]],
         discovered_tool_ids: set[str],
         on_token: TokenCallback | None,
         on_tool_result: ToolResultCallback | None,
@@ -6902,7 +6915,9 @@ class AgentLoop:
                 eval_meta,
             )
         if result.attachments:
-            collected_attachments.extend(normalize_attachment_refs(result.attachments))
+            normalized_attachments = normalize_attachment_refs(result.attachments)
+            collected_attachments.extend(normalized_attachments)
+            pending_assistant_attachments.extend(normalized_attachments)
         if result.metadata:
             self._merge_discovered_tool_ids(discovered_tool_ids, result.metadata)
             self._apply_skill_attachment_metadata(ctx, result.metadata)
@@ -7134,6 +7149,7 @@ class AgentLoop:
         events_to_record: list[SessionEvent],
         messages: list[dict[str, Any]],
         collected_attachments: list[dict[str, Any]],
+        pending_assistant_attachments: list[dict[str, Any]],
         discovered_tool_ids: set[str],
         on_token: TokenCallback | None,
         on_tool_result: ToolResultCallback | None,
@@ -7195,6 +7211,7 @@ class AgentLoop:
                 events_to_record=events_to_record,
                 messages=messages,
                 collected_attachments=collected_attachments,
+                pending_assistant_attachments=pending_assistant_attachments,
                 discovered_tool_ids=discovered_tool_ids,
                 on_token=on_token,
                 on_tool_result=on_tool_result,
@@ -7679,6 +7696,8 @@ class AgentLoop:
             metadata["working_directory"] = ctx.working_directory
         if ctx.current_model:
             metadata["resolved_model"] = ctx.current_model
+        if ctx.current_provider_id:
+            metadata["resolved_provider_id"] = ctx.current_provider_id
         return metadata
 
     def _record_execution_evidence(

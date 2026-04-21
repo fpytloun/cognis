@@ -51,6 +51,7 @@ _ROUTING_TASK_TYPES: tuple[str, ...] = (
     "evaluator",
     "speech_to_text",
     "image_generation",
+    "attachment_analysis",
 )
 _TEXT_ROUTING_TASK_TYPES = frozenset({"default", "classifier", "compaction", "evaluator"})
 
@@ -73,6 +74,13 @@ def _route_model_is_eligible(
         )
     if task_type == "image_generation":
         return bool(getattr(model_info, "supports_image_generation", False))
+    if task_type == "attachment_analysis":
+        return bool(
+            getattr(model_info, "supports_vision", False)
+            or getattr(model_info, "supports_pdf_input", False)
+            or getattr(model_info, "supports_audio_input", False)
+            or getattr(model_info, "supports_file_input", False)
+        )
     return True
 
 
@@ -456,6 +464,9 @@ async def model_routing_get(request: Request) -> ModelRoutingResponse:
         ),
         image_generation=_routing_entry_from_row(
             "image_generation", route_by_task.get("image_generation")
+        ),
+        attachment_analysis=_routing_entry_from_row(
+            "attachment_analysis", route_by_task.get("attachment_analysis")
         ),
     )
 

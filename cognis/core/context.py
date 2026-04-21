@@ -18,6 +18,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cognis.core.attachment_utils import (
     attachment_label as _attachment_label,
+)
+from cognis.core.attachment_utils import (
     attachment_note as _attachment_note,
 )
 from cognis.core.errors import ImmutablePrefixUnavailable
@@ -143,13 +145,21 @@ def _native_attachment_blocks(
         if kind == ArtifactKind.IMAGE.value and getattr(model_info, "supports_vision", False):
             blocks.append({"type": "image_url", "image_url": {"url": url}})
             continue
-        if kind == ArtifactKind.PDF.value and getattr(model_info, "supports_pdf_input", False):
+        if kind == ArtifactKind.PDF.value and (
+            getattr(model_info, "supports_pdf_input", False)
+            or getattr(model_info, "supports_file_input", False)
+        ):
             blocks.append({"type": "file", "file": {"file_url": url, "filename": filename}})
             continue
-        if kind == ArtifactKind.AUDIO.value and getattr(model_info, "supports_audio_input", False):
+        if kind == ArtifactKind.AUDIO.value and (
+            getattr(model_info, "supports_audio_input", False)
+            or getattr(model_info, "supports_file_input", False)
+        ):
             blocks.append({"type": "file", "file": {"file_url": url, "filename": filename}})
             continue
-        if kind == ArtifactKind.FILE.value and getattr(model_info, "supports_file_input", False):
+        if kind in {ArtifactKind.FILE.value, ArtifactKind.VIDEO.value} and getattr(
+            model_info, "supports_file_input", False
+        ):
             blocks.append({"type": "file", "file": {"file_url": url, "filename": filename}})
             continue
         unsupported.append(filename)

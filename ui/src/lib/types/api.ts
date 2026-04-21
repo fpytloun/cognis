@@ -984,6 +984,7 @@ export interface ModelRouting {
   evaluator: ModelRoutingEntry;
   speech_to_text: ModelRoutingEntry;
   image_generation: ModelRoutingEntry;
+  attachment_analysis: ModelRoutingEntry;
 }
 
 export interface SecretMetadata {

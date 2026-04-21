@@ -396,6 +396,7 @@ class ModelRoutingResponse(BaseModel):
     evaluator: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
     speech_to_text: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
     image_generation: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
+    attachment_analysis: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
 
 
 class ModelRoutingUpdateRequest(BaseModel):
@@ -405,6 +406,7 @@ class ModelRoutingUpdateRequest(BaseModel):
     evaluator: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
     speech_to_text: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
     image_generation: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
+    attachment_analysis: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
 
 
 class EnrichModelsRequest(BaseModel):

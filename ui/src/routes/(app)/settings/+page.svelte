@@ -86,7 +86,7 @@
     system: 'system',
     account: 'account'
   };
-  const ROUTING_KEYS = ['default', 'classifier', 'compaction', 'evaluator', 'speech_to_text', 'image_generation'] as const;
+  const ROUTING_KEYS = ['default', 'classifier', 'compaction', 'evaluator', 'speech_to_text', 'image_generation', 'attachment_analysis'] as const;
   const TEXT_ROUTING_KEYS = ['default', 'classifier', 'compaction', 'evaluator'] as const;
   type RoutingKey = (typeof ROUTING_KEYS)[number];
   type RoutingFormEntry = { model: string; reasoningEffort: string };
@@ -101,7 +101,8 @@
     { key: 'compaction', label: 'compaction', description: 'Context compaction summaries.', supportsThinking: true },
     { key: 'evaluator', label: 'evaluator', description: 'Workflow step evaluation. Falls back to default if not set.', supportsThinking: true },
     { key: 'speech_to_text', label: 'speech_to_text', description: 'Voice-note transcription. Use models like gpt-4o-transcribe, gpt-4o-mini-transcribe, or whisper.', supportsThinking: false },
-    { key: 'image_generation', label: 'image_generation', description: 'Image-capable model for avatars and tools. Must support image generation.', supportsThinking: false }
+    { key: 'image_generation', label: 'image_generation', description: 'Image-capable model for avatars and tools. Must support image generation.', supportsThinking: false },
+    { key: 'attachment_analysis', label: 'attachment_analysis', description: 'Fallback model for artifact_read and binary read analysis when the main chat model lacks image/PDF/file capabilities.', supportsThinking: false }
   ];
 
   function emptyRoutingEntry(): RoutingFormEntry {
@@ -115,7 +116,8 @@
       compaction: { model: null, reasoning_effort: null },
       evaluator: { model: null, reasoning_effort: null },
       speech_to_text: { model: null, reasoning_effort: null },
-      image_generation: { model: null, reasoning_effort: null }
+      image_generation: { model: null, reasoning_effort: null },
+      attachment_analysis: { model: null, reasoning_effort: null }
     };
   }
 
@@ -126,7 +128,8 @@
       compaction: emptyRoutingEntry(),
       evaluator: emptyRoutingEntry(),
       speech_to_text: emptyRoutingEntry(),
-      image_generation: emptyRoutingEntry()
+      image_generation: emptyRoutingEntry(),
+      attachment_analysis: emptyRoutingEntry()
     };
   }
 
@@ -415,6 +418,17 @@
     const options = modelOptions();
     if (routeKey === 'image_generation') {
       return options.filter((option) => findModelEntry(option.value)?.supports_image_generation);
+    }
+    if (routeKey === 'attachment_analysis') {
+      return options.filter((option) => {
+        const entry = findModelEntry(option.value);
+        return Boolean(
+          entry?.supports_vision ||
+          entry?.supports_pdf_input ||
+          entry?.supports_audio_input ||
+          entry?.supports_file_input
+        );
+      });
     }
     if (routeKey === 'speech_to_text') {
       return options.filter((option) => {
@@ -736,6 +750,10 @@
       image_generation: {
         model: modelRouting.image_generation.model ?? '',
         reasoningEffort: ''
+      },
+      attachment_analysis: {
+        model: modelRouting.attachment_analysis.model ?? '',
+        reasoningEffort: ''
       }
     };
 
@@ -902,6 +920,10 @@
         },
         image_generation: {
           model: routingForm.image_generation.model || null,
+          reasoning_effort: null
+        },
+        attachment_analysis: {
+          model: routingForm.attachment_analysis.model || null,
           reasoning_effort: null
         }
       });

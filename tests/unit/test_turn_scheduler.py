@@ -256,6 +256,7 @@ async def test_build_attachment_notice_uses_pdf_text_fallback() -> None:
 
     assert notice is not None
     assert "using extracted text fallback" in notice
+    assert "artifact_read" in notice
     assert "Extracted text from spec.pdf" not in notice
 
     context = await scheduler._build_attachment_context(

@@ -33,6 +33,7 @@ from cognis.models.tool import (
 )
 from cognis.providers.executor.in_process import InProcessExecutorConnection
 from cognis.runtime_context import current_effective_working_directory, current_workspace_root
+from cognis.tools.builtin.artifact_tools import artifact_tools
 from cognis.tools.builtin.datetime_tools import build_datetime_tool_handlers, datetime_tools
 from cognis.tools.builtin.image import image_tools
 from cognis.tools.builtin.memory import memory_tools
@@ -118,6 +119,7 @@ def static_tool_definitions() -> list[ToolDefinition]:
 
     return [
         *system_tools(),
+        *artifact_tools(),
         *datetime_tools(),
         *orchestration_tools(),
         *workflow_tools(),
