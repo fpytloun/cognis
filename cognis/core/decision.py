@@ -91,6 +91,22 @@ _ROUTING_REMINDER_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
 )
 
+_WORKFLOW_HEURISTIC_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "system:research",
+        (
+            "research",
+            "best ",
+            "latest ",
+            "compare",
+            "look up",
+            "investigate",
+            "which mcp server",
+            "best mcp server",
+        ),
+    ),
+)
+
 
 class DecisionResult(BaseModel):
     """Normalized decision-engine output."""
@@ -370,6 +386,19 @@ async def select_workflow(
             source="default",
         )
 
+    lowered_description = task_description.strip().lower()
+    valid_ids = {w["workflow_id"] for w in available_workflows}
+    for workflow_id, patterns in _WORKFLOW_HEURISTIC_PATTERNS:
+        if workflow_id not in valid_ids:
+            continue
+        if any(pattern in lowered_description for pattern in patterns):
+            return WorkflowSelectionResult(
+                workflow_id=workflow_id,
+                confidence=0.95,
+                reason="Deterministic workflow heuristic",
+                source="default",
+            )
+
     # Build classifier prompt from system agent
     from cognis.core.agent_registry import SYSTEM_AGENTS
 
@@ -423,7 +452,6 @@ async def select_workflow(
         workflow_id = str(payload.get("workflow_id", ""))
 
         # Validate the selected workflow exists
-        valid_ids = {w["workflow_id"] for w in available_workflows}
         if workflow_id not in valid_ids:
             workflow_id = default_workflow_id or "system:general-task"
 

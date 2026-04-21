@@ -245,3 +245,28 @@ async def test_select_workflow_classifier_falls_back_to_plain_json_text() -> Non
 
     assert llm.calls == 2
     assert result.workflow_id == "system:software-development"
+
+
+@pytest.mark.asyncio
+async def test_select_workflow_uses_research_heuristic_before_classifier() -> None:
+    llm = _LLM()
+
+    result = await select_workflow(
+        llm=llm,
+        task_description="Research best MCP server for Twitter/X",
+        available_workflows=[
+            {
+                "workflow_id": "system:general-task",
+                "name": "General Task",
+                "criteria": "Generic execution",
+            },
+            {
+                "workflow_id": "system:research",
+                "name": "Research",
+                "criteria": "Research and investigation",
+            },
+        ],
+        default_workflow_id="system:general-task",
+    )
+
+    assert result.workflow_id == "system:research"

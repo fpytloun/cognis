@@ -833,6 +833,11 @@ class LiteLLMProvider:
                             merged,
                             "supports_openai_namespace_tools",
                         ),
+                        "supports_openai_allowed_tools": _merge_live_bool(
+                            live,
+                            merged,
+                            "supports_openai_allowed_tools",
+                        ),
                         "supported_openai_params": list(live.get("supported_openai_params") or []),
                         "max_tools": live.get("max_tools") or merged.get("max_tools"),
                     }
@@ -925,6 +930,7 @@ class LiteLLMProvider:
             "supports_responses_api": supports_responses_api,
             "supports_extended_thinking": False,
             "supports_openai_namespace_tools": False,
+            "supports_openai_allowed_tools": False,
             "supports_image_generation": supports_image_generation,
             "max_tools": 128 if is_openai_like else None,
         }

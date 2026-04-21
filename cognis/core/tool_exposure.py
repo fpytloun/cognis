@@ -45,21 +45,14 @@ def prepare_tool_exposure(
         model_info=model_info,
         rollout_mode=os.getenv("COGNIS_OPENAI_RESPONSES_MODE", "auto").strip().lower(),
     )
-    filtered_controller_tool_schemas = list(controller_tool_schemas)
-    if not allow_tool_search or use_openai_responses:
-        filtered_controller_tool_schemas = [
-            schema
-            for schema in filtered_controller_tool_schemas
-            if schema.get("function", {}).get("name") != SEARCH_TOOLS_TOOL.name
-        ]
-
-    alias_map = {
-        schema.get("function", {}).get("name", ""): schema.get("function", {}).get("name", "")
-        for schema in filtered_controller_tool_schemas
-        if isinstance(schema.get("function", {}).get("name"), str)
-    }
+    controller_tool_schemas_with_search = list(controller_tool_schemas)
+    controller_tool_schemas_without_search = [
+        schema
+        for schema in controller_tool_schemas_with_search
+        if schema.get("function", {}).get("name") != SEARCH_TOOLS_TOOL.name
+    ]
+    supports_openai_allowed_tools = bool(model_info.supports_openai_allowed_tools)
     request_kwargs: dict[str, Any] = {}
-    controller_count = len(filtered_controller_tool_schemas)
     sorted_inventory = sorted(inventory_tools, key=_tool_sort_key)
     visible_defaults = (
         default_visible_tool_ids
@@ -76,10 +69,10 @@ def prepare_tool_exposure(
         tool for tool in deferred_tools if stable_tool_id(tool) in discovered_tool_ids
     ]
     max_tools = model_info.max_tools
-    available_slots = None if max_tools is None else max(0, max_tools - controller_count)
     use_anthropic_defer = bool(model_info.supports_defer_loading)
     use_openai_native_tool_search = bool(
         use_openai_responses
+        and supports_openai_allowed_tools
         and allow_tool_search
         and model_info.supports_tool_search
         and model_info.supports_openai_namespace_tools
@@ -87,11 +80,36 @@ def prepare_tool_exposure(
     )
     use_openai_flat_tool_search = bool(
         use_openai_responses
+        and supports_openai_allowed_tools
         and allow_tool_search
         and model_info.supports_tool_search
         and not model_info.supports_openai_namespace_tools
         and deferred_tools
     )
+    use_openai_controller_search_fallback = bool(
+        use_openai_responses
+        and allow_tool_search
+        and not supports_openai_allowed_tools
+        and any(
+            schema.get("function", {}).get("name") == SEARCH_TOOLS_TOOL.name
+            for schema in controller_tool_schemas_with_search
+        )
+        and deferred_tools
+    )
+    if not allow_tool_search:
+        filtered_controller_tool_schemas = controller_tool_schemas_without_search
+    elif not use_openai_responses or use_openai_controller_search_fallback:
+        filtered_controller_tool_schemas = controller_tool_schemas_with_search
+    else:
+        filtered_controller_tool_schemas = controller_tool_schemas_without_search
+
+    alias_map = {
+        schema.get("function", {}).get("name", ""): schema.get("function", {}).get("name", "")
+        for schema in filtered_controller_tool_schemas
+        if isinstance(schema.get("function", {}).get("name"), str)
+    }
+    controller_count = len(filtered_controller_tool_schemas)
+    available_slots = None if max_tools is None else max(0, max_tools - controller_count)
     if use_openai_native_tool_search:
         alias_map = {
             schema.get("function", {}).get("name", ""): schema.get("function", {}).get("name", "")
@@ -151,6 +169,20 @@ def prepare_tool_exposure(
             ),
             "parallel_tool_calls": True,
         }
+    elif use_openai_controller_search_fallback:
+        strategy = "openai_responses_controller_search_fallback"
+        base_tools, overflowed = _select_generic_visible_tools(
+            core_tools=core_without_search,
+            discovered_tools=discovered_visible,
+            search_tool=search_tool,
+            available_slots=available_slots,
+            deferred_present=bool(deferred_tools),
+        )
+        visible_tools = base_tools
+        tool_schemas = _build_inventory_schemas(visible_tools, alias_map)
+        request_kwargs = {"tool_choice": "auto", "parallel_tool_calls": True}
+        if overflowed and tool_schemas and max_tools is not None:
+            tool_schemas = tool_schemas[:available_slots]
     elif use_openai_responses and deferred_tools:
         strategy = "openai_responses_full_inventory_no_defer"
         visible_tools = core_without_search + deferred_tools

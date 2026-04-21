@@ -131,6 +131,7 @@ def test_prepare_tool_exposure_uses_openai_responses_full_inventory() -> None:
             supports_tool_search=True,
             supports_responses_api=True,
             supports_openai_namespace_tools=True,
+            supports_openai_allowed_tools=True,
             max_tools=128,
         ),
         discovered_tool_ids=set(),
@@ -193,6 +194,7 @@ def test_prepare_tool_exposure_marks_skill_tools_deferred_for_responses() -> Non
             supports_tool_search=True,
             supports_responses_api=True,
             supports_openai_namespace_tools=True,
+            supports_openai_allowed_tools=True,
             max_tools=128,
         ),
         discovered_tool_ids=set(),
@@ -226,6 +228,7 @@ def test_prepare_tool_exposure_uses_openai_tool_search_with_deferred_namespaces(
             supports_tool_search=True,
             supports_responses_api=True,
             supports_openai_namespace_tools=True,
+            supports_openai_allowed_tools=True,
             max_tools=128,
         ),
         discovered_tool_ids=set(),
@@ -249,6 +252,44 @@ def test_prepare_tool_exposure_uses_openai_tool_search_with_deferred_namespaces(
     )
 
 
+def test_prepare_tool_exposure_uses_controller_search_fallback_when_allowed_tools_unsupported() -> None:
+    mcp_tool = ToolDefinition(
+        name=sanitize_mcp_tool_name("github", "search/issues"),
+        description="search",
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(type="intaris_mcp", server_name="github", raw_tool_name="search/issues"),
+        category="mcp",
+    )
+    controller_search_schema = {
+        "type": "function",
+        "function": {
+            "name": SEARCH_TOOLS_TOOL.name,
+            "description": SEARCH_TOOLS_TOOL.description,
+            "parameters": SEARCH_TOOLS_TOOL.parameters,
+        },
+    }
+
+    result = prepare_tool_exposure(
+        inventory_tools=[_tool("read", source_type="executor", category="filesystem"), mcp_tool],
+        controller_tool_schemas=[controller_search_schema],
+        model="gpt-5.4",
+        model_info=ModelInfo(
+            model_id="gpt-5.4",
+            supports_tool_search=True,
+            supports_responses_api=True,
+            supports_openai_namespace_tools=True,
+            supports_openai_allowed_tools=False,
+            max_tools=128,
+        ),
+        discovered_tool_ids=set(),
+    )
+
+    assert result.debug_metadata["strategy"] == "openai_responses_controller_search_fallback"
+    assert result.request_kwargs["tool_choice"] == "auto"
+    assert any(tool.get("function", {}).get("name") == SEARCH_TOOLS_TOOL.name for tool in result.tools)
+    assert all(tool["type"] != "namespace" for tool in result.tools)
+
+
 def test_prepare_tool_exposure_sanitizes_skill_visible_names() -> None:
     skill_tool = ToolDefinition(
         name="skill_git-release__run_release",
@@ -267,6 +308,7 @@ def test_prepare_tool_exposure_sanitizes_skill_visible_names() -> None:
             supports_tool_search=True,
             supports_responses_api=True,
             supports_openai_namespace_tools=True,
+            supports_openai_allowed_tools=True,
             max_tools=128,
         ),
         discovered_tool_ids=set(),
@@ -302,6 +344,7 @@ def test_prepare_tool_exposure_openai_tool_search_updates_alias_map_for_namespac
             supports_tool_search=True,
             supports_responses_api=True,
             supports_openai_namespace_tools=True,
+            supports_openai_allowed_tools=True,
             max_tools=128,
         ),
         discovered_tool_ids=set(),
@@ -374,6 +417,7 @@ def test_prepare_tool_exposure_strips_controller_search_tool_for_responses() -> 
             supports_tool_search=True,
             supports_responses_api=True,
             supports_openai_namespace_tools=True,
+            supports_openai_allowed_tools=True,
             max_tools=128,
         ),
         discovered_tool_ids=set(),
@@ -504,6 +548,7 @@ def test_prepare_tool_exposure_uses_flat_tool_search_responses_when_namespace_to
             supports_tool_search=True,
             supports_responses_api=True,
             supports_openai_namespace_tools=False,
+            supports_openai_allowed_tools=True,
             max_tools=128,
         ),
         discovered_tool_ids=set(),
