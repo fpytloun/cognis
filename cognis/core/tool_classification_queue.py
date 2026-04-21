@@ -16,13 +16,16 @@ from cognis.models.tool import (
     AUTO_PROFILE_GROUPS,
     ToolDefinition,
     stable_tool_id,
-    tool_profile_group,
 )
 from cognis.store.models import ToolClassificationRow
-from cognis.store.queries import tool_classification_scope, upsert_tool_classification
+from cognis.store.queries import (
+    get_tool_classification_override_rows,
+    tool_classification_scope,
+    upsert_tool_classification,
+)
 from cognis.tools.classification import (
     _validate_profile_group,
-    classify_tool_definitions,
+    llm_classification_outcomes,
     requires_background_classification,
     tool_fingerprint,
 )
@@ -37,6 +40,7 @@ def _utcnow() -> datetime:
 @dataclass(slots=True)
 class _ClaimedClassification:
     classification_id: str
+    scope_key: str
     tool_id: str
     attempts: int
     tool_payload: dict[str, Any]
@@ -54,6 +58,7 @@ class ToolClassificationQueue:
         poll_interval_seconds: float = 0.5,
         lease_seconds: int = 300,
         backoff_max_seconds: float = 3600.0,
+        max_batch_size: int = 50,
     ) -> None:
         self._session_factory = session_factory
         self._llm_provider = llm_provider
@@ -61,6 +66,7 @@ class ToolClassificationQueue:
         self._poll_interval = poll_interval_seconds
         self._lease_seconds = lease_seconds
         self._backoff_max = backoff_max_seconds
+        self._max_batch_size = max_batch_size
         self._stop_event = asyncio.Event()
         self._wake_event = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
@@ -95,13 +101,19 @@ class ToolClassificationQueue:
                 row.tool_id: row
                 for row in result.scalars().all()
             }
+            override_rows = await get_tool_classification_override_rows(
+                session,
+                scope_key=scope_key,
+                tool_ids=[stable_tool_id(tool) for tool in dynamic_tools],
+            )
+            overridden_ids = {row.tool_id for row in override_rows}
             for tool in dynamic_tools:
                 tool_id = stable_tool_id(tool)
-                fingerprint = tool_fingerprint(tool)
+                if tool_id in overridden_ids:
+                    continue
                 row = existing.get(tool_id)
                 if (
                     row is not None
-                    and row.fingerprint == fingerprint
                     and row.status == "ready"
                     and row.category in AUTO_PROFILE_GROUPS
                     and row.capabilities
@@ -113,25 +125,22 @@ class ToolClassificationQueue:
                     is None
                 ):
                     continue
-                if row is not None and row.fingerprint == fingerprint and row.status in {
-                    "pending",
-                    "running",
-                }:
+                if row is not None and row.status in {"pending", "running"}:
                     continue
-                attempts = row.attempts if row is not None and row.fingerprint == fingerprint else 0
-                next_retry_at = row.next_retry_at if row is not None and row.fingerprint == fingerprint else now
+                attempts = row.attempts if row is not None else 0
+                next_retry_at = row.next_retry_at if row is not None else now
                 await upsert_tool_classification(
                     session,
                     scope_key=scope_key,
                     owner_email=owner_email,
                     tool_id=tool_id,
                     source_type=tool.source.type,
-                    fingerprint=fingerprint,
+                    fingerprint=tool_fingerprint(tool),
                     tool_payload=tool.model_dump(mode="json"),
                     status="pending",
                     attempts=attempts,
                     next_retry_at=next_retry_at,
-                    last_error=(row.last_error if row is not None and row.fingerprint == fingerprint else None),
+                    last_error=(row.last_error if row is not None else None),
                 )
             await session.commit()
         self._wake_event.set()
@@ -141,13 +150,14 @@ class ToolClassificationQueue:
         while True:
             if self._stop_event.is_set() and not await self._has_pending_work():
                 break
-            claimed = await self._claim_due_items(self._max_concurrent)
+            claimed = await self._claim_due_items(self._max_batch_size * self._max_concurrent)
             if not claimed:
                 self._wake_event.clear()
                 with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(self._wake_event.wait(), timeout=self._poll_interval)
                 continue
-            await asyncio.gather(*(self._process_item(item, semaphore) for item in claimed))
+            batches = self._group_claimed_items(claimed)
+            await asyncio.gather(*(self._process_batch(batch, semaphore) for batch in batches))
 
     async def _has_pending_work(self) -> bool:
         async with self._session_factory() as session:
@@ -232,6 +242,7 @@ class ToolClassificationQueue:
                 claimed.append(
                     _ClaimedClassification(
                         classification_id=row.classification_id,
+                        scope_key=row.scope_key,
                         tool_id=row.tool_id,
                         attempts=row.attempts,
                         tool_payload=dict(row.tool_payload or {}),
@@ -242,53 +253,94 @@ class ToolClassificationQueue:
             await session.commit()
         return claimed
 
-    async def _process_item(
-        self, item: _ClaimedClassification, semaphore: asyncio.Semaphore
+    def _group_claimed_items(
+        self, claimed: list[_ClaimedClassification]
+    ) -> list[list[_ClaimedClassification]]:
+        grouped: dict[tuple[str, str, str], list[_ClaimedClassification]] = {}
+        for item in claimed:
+            payload = item.tool_payload
+            source = str(payload.get("source", {}).get("type") or payload.get("source_type") or "unknown")
+            server = str(
+                payload.get("source", {}).get("server_name")
+                or payload.get("source", {}).get("server_id")
+                or ""
+            )
+            grouped.setdefault((item.scope_key, source, server), []).append(item)
+        batches: list[list[_ClaimedClassification]] = []
+        for items in grouped.values():
+            for index in range(0, len(items), self._max_batch_size):
+                batches.append(items[index : index + self._max_batch_size])
+        return batches
+
+    async def _process_batch(
+        self, items: list[_ClaimedClassification], semaphore: asyncio.Semaphore
     ) -> None:
         async with semaphore:
             try:
-                tool = ToolDefinition.model_validate(item.tool_payload)
-                classified = await classify_tool_definitions([tool], llm=self._llm_provider)
-                resolved = classified[0]
-                if resolved.classification_source != "llm":
-                    raise RuntimeError("classification did not produce an LLM-backed result")
+                tools = [ToolDefinition.model_validate(item.tool_payload) for item in items]
+                {stable_tool_id(tool): tool for tool in tools}
+                updates, rejected = await llm_classification_outcomes(tools, llm=self._llm_provider)
                 async with self._session_factory() as session:
-                    row = await session.get(ToolClassificationRow, item.classification_id)
-                    if row is None:
-                        return
-                    row.status = "ready"
-                    row.category = tool_profile_group(resolved)
-                    row.capabilities = [str(capability) for capability in resolved.capabilities]
-                    row.classification_source = resolved.classification_source
-                    row.classification_confidence = resolved.classification_confidence
-                    row.last_error = None
-                    row.next_retry_at = None
-                    row.updated_at = _utcnow()
+                    for item in items:
+                        row = await session.get(ToolClassificationRow, item.classification_id)
+                        if row is None:
+                            continue
+                        update = updates.get(item.tool_id)
+                        if update is not None:
+                            row.status = "ready"
+                            row.category = str(update.get("profile_group") or "development")
+                            row.capabilities = [
+                                str(capability) for capability in update.get("capabilities", [])
+                            ]
+                            row.classification_source = "llm"
+                            row.classification_confidence = float(update.get("confidence") or 0.75)
+                            row.last_error = None
+                            row.next_retry_at = None
+                            row.updated_at = _utcnow()
+                            continue
+                        attempts = item.attempts + 1
+                        backoff_seconds = min(2**attempts, self._backoff_max)
+                        row.status = "pending"
+                        row.attempts = attempts
+                        row.last_error = rejected.get(item.tool_id, "no_classification_result")
+                        row.next_retry_at = _utcnow() + timedelta(seconds=backoff_seconds)
+                        row.updated_at = _utcnow()
                     await session.commit()
+                if rejected:
+                    logger.warning(
+                        "Tool classification batch completed with retries scheduled",
+                        extra={
+                            "extra_data": {
+                                "batch_size": len(items),
+                                "tool_ids": [item.tool_id for item in items],
+                                "rejected": rejected,
+                            }
+                        },
+                    )
             except Exception as exc:
-                attempts = item.attempts + 1
-                backoff_seconds = min(2**attempts, self._backoff_max)
-                next_retry_at = _utcnow() + timedelta(seconds=backoff_seconds)
                 error_text = str(exc)[:1000]
                 logger.warning(
-                    "Tool classification retry scheduled",
+                    "Tool classification batch failed",
                     extra={
                         "extra_data": {
-                            "tool_id": item.tool_id,
-                            "attempts": attempts,
-                            "next_retry_at": next_retry_at.isoformat(),
+                            "batch_size": len(items),
+                            "tool_ids": [item.tool_id for item in items],
                             "error": error_text,
                         }
                     },
                     exc_info=True,
                 )
                 async with self._session_factory() as session:
-                    row = await session.get(ToolClassificationRow, item.classification_id)
-                    if row is None:
-                        return
-                    row.status = "pending"
-                    row.attempts = attempts
-                    row.last_error = error_text
-                    row.next_retry_at = next_retry_at
-                    row.updated_at = _utcnow()
+                    for item in items:
+                        row = await session.get(ToolClassificationRow, item.classification_id)
+                        if row is None:
+                            continue
+                        attempts = item.attempts + 1
+                        backoff_seconds = min(2**attempts, self._backoff_max)
+                        next_retry_at = _utcnow() + timedelta(seconds=backoff_seconds)
+                        row.status = "pending"
+                        row.attempts = attempts
+                        row.last_error = error_text
+                        row.next_retry_at = next_retry_at
+                        row.updated_at = _utcnow()
                     await session.commit()

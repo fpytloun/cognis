@@ -199,6 +199,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_system_agent_override_skill_columns)
         await conn.run_sync(_ensure_harness_recovery_tables)
         await conn.run_sync(_ensure_tool_classification_table)
+        await conn.run_sync(_ensure_tool_classification_override_table)
 
 
 def _ensure_session_lifecycle_columns(sync_conn: object) -> None:
@@ -252,6 +253,14 @@ def _ensure_tool_classification_table(sync_conn: object) -> None:
     from cognis.store.models import ToolClassificationRow
 
     ToolClassificationRow.__table__.create(bind=sync_conn, checkfirst=True)
+
+
+def _ensure_tool_classification_override_table(sync_conn: object) -> None:
+    """Create the durable tool classification override table."""
+
+    from cognis.store.models import ToolClassificationOverrideRow
+
+    ToolClassificationOverrideRow.__table__.create(bind=sync_conn, checkfirst=True)
 
 
 def _ensure_agent_sync_metadata_column(sync_conn: object) -> None:

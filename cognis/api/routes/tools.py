@@ -65,13 +65,15 @@ from cognis.store.models import ToolClassificationRow
 from cognis.store.queries import (
     create_mcp_server,
     delete_mcp_server,
+    delete_tool_classification_override,
     get_agent,
     get_mcp_server,
+    get_tool_classification_override_rows,
     list_agents,
     list_executors,
     mcp_server_referenced_by_executors,
     update_mcp_server,
-    upsert_tool_classification,
+    upsert_tool_classification_override,
 )
 from cognis.store.queries import (
     list_mcp_servers as list_global_mcp_servers,
@@ -269,6 +271,21 @@ async def _get_classification_row_for_tool(
                 )
             )
         ).scalars().first()
+
+
+async def _get_classification_override_for_tool(
+    request: Request,
+    *,
+    user_email: str,
+    tool_id: str,
+) -> Any | None:
+    async with request.app.state.session_factory() as session:
+        rows = await get_tool_classification_override_rows(
+            session,
+            scope_key=user_email,
+            tool_ids=[tool_id],
+        )
+    return rows[0] if rows else None
 
 
 async def _discover_temp_mcp_tools(
@@ -1006,11 +1023,6 @@ async def override_tool_classification(
     payload: ToolClassificationOverrideRequest,
 ) -> ToolClassificationActionResponse:
     user = require_current_user(request)
-    row = await _get_classification_row_for_tool(
-        request, user_email=user.email, tool_id=payload.tool_id
-    )
-    if row is None:
-        raise api_exception(404, "not_found", "Tool classification not found")
     if payload.profile_group not in AUTO_PROFILE_GROUPS:
         raise api_exception(400, "validation_error", "Invalid profile_group")
     try:
@@ -1020,25 +1032,13 @@ async def override_tool_classification(
     if not capabilities:
         raise api_exception(400, "validation_error", "At least one capability is required")
     async with request.app.state.session_factory() as session:
-        fresh = await session.get(ToolClassificationRow, row.classification_id)
-        assert fresh is not None
-        await upsert_tool_classification(
+        await upsert_tool_classification_override(
             session,
-            scope_key=fresh.scope_key,
-            owner_email=fresh.owner_email,
-            tool_id=fresh.tool_id,
-            source_type=fresh.source_type,
-            fingerprint=fresh.fingerprint,
-            tool_payload=dict(fresh.tool_payload or {}),
-            status="ready",
-            category=payload.profile_group,
+            scope_key=user.email,
+            owner_email=user.email,
+            tool_id=payload.tool_id,
+            profile_group=payload.profile_group,
             capabilities=capabilities,
-            classification_source="override",
-            classification_confidence=1.0,
-            attempts=fresh.attempts,
-            next_retry_at=None,
-            last_attempt_at=fresh.last_attempt_at,
-            last_error=None,
         )
         await session.commit()
     return ToolClassificationActionResponse(updated=1, status="override_saved")
@@ -1055,24 +1055,31 @@ async def reset_tool_classification_override(
     user = require_current_user(request)
     if not payload.tool_id:
         raise api_exception(400, "validation_error", "tool_id is required")
-    row = await _get_classification_row_for_tool(
+    row = await _get_classification_override_for_tool(
         request, user_email=user.email, tool_id=payload.tool_id
     )
     if row is None:
         raise api_exception(404, "not_found", "Tool classification not found")
     async with request.app.state.session_factory() as session:
-        fresh = await session.get(ToolClassificationRow, row.classification_id)
-        assert fresh is not None
-        fresh.status = "pending"
-        fresh.attempts = 0
-        fresh.next_retry_at = _utcnow()
-        fresh.last_error = None
-        fresh.category = None
-        fresh.capabilities = None
-        fresh.classification_source = None
-        fresh.classification_confidence = None
+        await delete_tool_classification_override(
+            session,
+            scope_key=user.email,
+            tool_id=payload.tool_id,
+        )
         await session.commit()
-    request.app.state.tool_classification_queue._wake_event.set()
+    auto_row = await _get_classification_row_for_tool(
+        request, user_email=user.email, tool_id=payload.tool_id
+    )
+    if auto_row is not None:
+        async with request.app.state.session_factory() as session:
+            fresh = await session.get(ToolClassificationRow, auto_row.classification_id)
+            assert fresh is not None
+            fresh.status = "pending"
+            fresh.attempts = 0
+            fresh.next_retry_at = _utcnow()
+            fresh.last_error = None
+            await session.commit()
+        request.app.state.tool_classification_queue._wake_event.set()
     return ToolClassificationActionResponse(updated=1, status="override_reset")
 
 

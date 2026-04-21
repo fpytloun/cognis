@@ -643,6 +643,28 @@ class ToolClassificationRow(Base):
     )
 
 
+class ToolClassificationOverrideRow(Base):
+    """Manual tool classification overrides with highest precedence."""
+
+    __tablename__ = "tool_classification_overrides"
+
+    override_id: Mapped[str] = mapped_column(String, primary_key=True)
+    scope_key: Mapped[str] = mapped_column(String, nullable=False)
+    owner_email: Mapped[str | None] = mapped_column(
+        String, ForeignKey("users.email", ondelete="CASCADE"), nullable=True
+    )
+    tool_id: Mapped[str] = mapped_column(String, nullable=False)
+    profile_group: Mapped[str] = mapped_column(String, nullable=False)
+    capabilities: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__ = (
+        UniqueConstraint("scope_key", "tool_id", name="uq_tool_classification_overrides_scope_tool"),
+    )
+
+
 class SkillRow(Base):
     """DB-managed skill definitions (logical skill record).
 

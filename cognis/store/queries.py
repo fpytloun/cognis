@@ -40,6 +40,7 @@ from cognis.store.models import (
     SystemWorkflowOverride,
     Task,
     TaskDependency,
+    ToolClassificationOverrideRow,
     ToolClassificationRow,
     User,
     WorkflowRow,
@@ -2997,6 +2998,25 @@ async def get_tool_classification_rows(
     return list(result.scalars().all())
 
 
+async def get_tool_classification_override_rows(
+    session: AsyncSession,
+    *,
+    scope_key: str,
+    tool_ids: list[str],
+) -> list[ToolClassificationOverrideRow]:
+    """Load manual tool classification overrides for a scope and tool ids."""
+
+    if not tool_ids:
+        return []
+    result = await session.execute(
+        select(ToolClassificationOverrideRow).where(
+            ToolClassificationOverrideRow.scope_key == scope_key,
+            ToolClassificationOverrideRow.tool_id.in_(tool_ids),
+        )
+    )
+    return list(result.scalars().all())
+
+
 async def upsert_tool_classification(
     session: AsyncSession,
     *,
@@ -3067,6 +3087,62 @@ async def upsert_tool_classification(
     row.updated_at = _utcnow()
     await session.flush()
     return row
+
+
+async def upsert_tool_classification_override(
+    session: AsyncSession,
+    *,
+    scope_key: str,
+    owner_email: str | None,
+    tool_id: str,
+    profile_group: str,
+    capabilities: list[str],
+) -> ToolClassificationOverrideRow:
+    """Create or update a manual tool classification override."""
+
+    result = await session.execute(
+        select(ToolClassificationOverrideRow).where(
+            ToolClassificationOverrideRow.scope_key == scope_key,
+            ToolClassificationOverrideRow.tool_id == tool_id,
+        )
+    )
+    row = result.scalar_one_or_none()
+    if row is None:
+        row = ToolClassificationOverrideRow(
+            override_id=f"tco_{uuid.uuid4().hex}",
+            scope_key=scope_key,
+            owner_email=owner_email,
+            tool_id=tool_id,
+            profile_group=profile_group,
+            capabilities=capabilities,
+        )
+        session.add(row)
+        await session.flush()
+        return row
+    row.owner_email = owner_email
+    row.profile_group = profile_group
+    row.capabilities = capabilities
+    row.updated_at = _utcnow()
+    await session.flush()
+    return row
+
+
+async def delete_tool_classification_override(
+    session: AsyncSession,
+    *,
+    scope_key: str,
+    tool_id: str,
+) -> bool:
+    """Delete a manual tool classification override."""
+
+    result = await session.execute(
+        delete(ToolClassificationOverrideRow).where(
+            ToolClassificationOverrideRow.scope_key == scope_key,
+            ToolClassificationOverrideRow.tool_id == tool_id,
+        )
+    )
+    await session.flush()
+    return int(getattr(result, "rowcount", 0) or 0) > 0
 
 
 async def ensure_default_executor(session: AsyncSession) -> ExecutorRow:

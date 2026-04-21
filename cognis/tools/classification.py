@@ -19,7 +19,11 @@ from cognis.models.tool import (
     tool_capabilities,
     tool_profile_group,
 )
-from cognis.store.queries import get_tool_classification_rows, tool_classification_scope
+from cognis.store.queries import (
+    get_tool_classification_override_rows,
+    get_tool_classification_rows,
+    tool_classification_scope,
+)
 
 logger = get_logger(__name__)
 
@@ -208,7 +212,7 @@ async def classify_tool_definitions(
     if not unresolved or llm is None:
         return classified
 
-    updates = await _classify_with_llm(unresolved, llm=llm)
+    updates, _rejected = await _classify_with_llm(unresolved, llm=llm)
     by_id = {stable_id(tool): tool for tool in classified}
     for tool_id, payload in updates.items():
         current = by_id.get(tool_id)
@@ -250,7 +254,7 @@ def requires_background_classification(tool: ToolDefinition) -> bool:
 
 
 def apply_persisted_classifications(
-    tools: list[ToolDefinition], rows: list[Any]
+    tools: list[ToolDefinition], rows: list[Any], override_rows: list[Any] | None = None
 ) -> list[ToolDefinition]:
     """Overlay persisted classification state onto a tool list."""
 
@@ -259,10 +263,32 @@ def apply_persisted_classifications(
         for row in rows
         if getattr(row, "tool_id", None) is not None
     }
+    override_by_id = {
+        str(getattr(row, "tool_id", "")): row
+        for row in (override_rows or [])
+        if getattr(row, "tool_id", None) is not None
+    }
     overlaid: list[ToolDefinition] = []
     for tool in classify_tool_definitions_sync(tools):
+        override = override_by_id.get(stable_tool_id(tool))
+        if override is not None:
+            capabilities = _normalize_capabilities(getattr(override, "capabilities", None)) or [
+                ToolCapability.READ
+            ]
+            overlaid.append(
+                tool.model_copy(
+                    update={
+                        "profile_group": str(getattr(override, "profile_group", None) or tool_profile_group(tool)),
+                        "capabilities": capabilities,
+                        "classification_status": "ready",
+                        "classification_source": "override",
+                        "classification_confidence": 1.0,
+                    }
+                )
+            )
+            continue
         row = row_by_id.get(stable_tool_id(tool))
-        if row is None or getattr(row, "fingerprint", None) != tool_fingerprint(tool):
+        if row is None:
             if requires_background_classification(tool):
                 overlaid.append(tool.model_copy(update={"classification_status": "pending"}))
             else:
@@ -312,9 +338,26 @@ async def resolve_tool_classifications(
             scope_key=scope_key,
             tool_ids=[stable_tool_id(tool) for tool in dynamic_tools],
         )
+        override_rows = await get_tool_classification_override_rows(
+            session,
+            scope_key=scope_key,
+            tool_ids=[stable_tool_id(tool) for tool in dynamic_tools],
+        )
     if queue is not None:
-        await queue.enqueue_tools(dynamic_tools, owner_email=owner_email)
-    return apply_persisted_classifications(classified, rows)
+        overridden_ids = {str(getattr(row, "tool_id", "")) for row in override_rows}
+        await queue.enqueue_tools(
+            [tool for tool in dynamic_tools if stable_tool_id(tool) not in overridden_ids],
+            owner_email=owner_email,
+        )
+    return apply_persisted_classifications(classified, rows, override_rows)
+
+
+async def llm_classification_outcomes(
+    tools: list[ToolDefinition], *, llm: Any
+) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
+    """Return accepted tool classifications and per-tool rejection reasons."""
+
+    return await _classify_with_llm(tools, llm=llm)
 
 
 def _heuristic_profile_group(tool: ToolDefinition) -> str:
@@ -376,9 +419,12 @@ def _heuristic_capabilities(tool: ToolDefinition) -> set[ToolCapability]:
     return caps
 
 
-async def _classify_with_llm(tools: list[ToolDefinition], *, llm: Any) -> dict[str, dict[str, Any]]:
+async def _classify_with_llm(
+    tools: list[ToolDefinition], *, llm: Any
+) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
     uncached: list[tuple[str, ToolDefinition, str]] = []
     cached_results: dict[str, dict[str, Any]] = {}
+    rejected: dict[str, str] = {}
     async with _CACHE_LOCK:
         for tool in tools:
             tool_id = stable_id(tool)
@@ -396,7 +442,7 @@ async def _classify_with_llm(tools: list[ToolDefinition], *, llm: Any) -> dict[s
                     continue
             uncached.append((tool_id, tool, cache_key))
     if not uncached:
-        return cached_results
+        return cached_results, rejected
 
     messages = [
         {
@@ -443,20 +489,28 @@ async def _classify_with_llm(tools: list[ToolDefinition], *, llm: Any) -> dict[s
         payload = extract_json_object(extract_text_from_response(response), label="tool_classifier")
     except Exception:
         logger.warning("Tool LLM classification failed", exc_info=True)
-        return cached_results
+        return cached_results, {
+            **rejected,
+            **{tool_id: "llm_generate_failed" for tool_id, _tool, _cache_key in uncached},
+        }
 
     results_by_id: dict[str, dict[str, Any]] = dict(cached_results)
     tool_payloads = payload.get("tools") if isinstance(payload, dict) else None
     if not isinstance(tool_payloads, list):
-        return results_by_id
+        return results_by_id, {
+            **rejected,
+            **{tool_id: "invalid_classifier_payload" for tool_id, _tool, _cache_key in uncached},
+        }
 
     to_cache: dict[str, dict[str, Any]] = {}
+    seen_ids: set[str] = set()
     for item in tool_payloads:
         if not isinstance(item, dict):
             continue
         tool_id = item.get("tool_id")
         if not isinstance(tool_id, str):
             continue
+        seen_ids.add(tool_id)
         normalized = {
             "profile_group": str(item.get("profile_group") or item.get("category") or "development").strip() or "development",
             "capabilities": _normalize_capabilities(item.get("capabilities")),
@@ -472,6 +526,7 @@ async def _classify_with_llm(tools: list[ToolDefinition], *, llm: Any) -> dict[s
                 "Rejected cached LLM tool classification",
                 extra={"extra_data": {"tool_id": tool_id, "reason": error}},
             )
+            rejected[tool_id] = error
             continue
         results_by_id[tool_id] = normalized
         cache_key = next(
@@ -482,7 +537,10 @@ async def _classify_with_llm(tools: list[ToolDefinition], *, llm: Any) -> dict[s
     if to_cache:
         async with _CACHE_LOCK:
             _CLASSIFICATION_CACHE.update(to_cache)
-    return results_by_id
+    for tool_id, _tool, _cache_key in uncached:
+        if tool_id not in results_by_id and tool_id not in rejected:
+            rejected[tool_id] = "no_classification_result"
+    return results_by_id, rejected
 
 
 def _normalize_capabilities(value: Any) -> list[ToolCapability]:
