@@ -22,6 +22,9 @@ from cognis.core.attachment_utils import (
 from cognis.core.attachment_utils import (
     attachment_note as _attachment_note,
 )
+from cognis.core.attachment_utils import (
+    attachment_placeholder_text as _attachment_placeholder_text,
+)
 from cognis.core.errors import ImmutablePrefixUnavailable
 from cognis.core.followups import (
     FollowUpMetadata,
@@ -164,6 +167,63 @@ def _native_attachment_blocks(
             continue
         unsupported.append(filename)
     return blocks, unsupported
+
+
+def _current_turn_attachment_message(
+    *,
+    user_message: str,
+    user_message_role: str,
+    user_attachments: list[dict[str, Any]] | None,
+    model_info: Any,
+    include_user_message: bool,
+) -> dict[str, Any] | None:
+    attachments = user_attachments or []
+    if not attachments:
+        if not include_user_message:
+            return None
+        if user_message or user_message_role != "system":
+            return {"role": user_message_role, "content": user_message}
+        return None
+
+    attachment_blocks, unsupported = _native_attachment_blocks(attachments, model_info)
+    if attachment_blocks:
+        blocks: list[dict[str, Any]] = []
+        if include_user_message:
+            intro = user_message
+            note = _attachment_note(attachments)
+            intro = f"{user_message}\n\n{note}" if user_message.strip() else note
+        else:
+            intro = _attachment_note(attachments)
+        if intro:
+            blocks.append({"type": "text", "text": intro})
+        else:
+            blocks.append(
+                {
+                    "type": "text",
+                    "text": _attachment_placeholder_text(
+                        str(attachment.get("kind") or ArtifactKind.FILE.value)
+                        for attachment in attachments
+                    ),
+                }
+            )
+        blocks.extend(attachment_blocks)
+        if unsupported:
+            blocks.append(
+                {
+                    "type": "text",
+                    "text": _attachment_note(
+                        _filter_attachments_by_names(attachments, unsupported)
+                    ),
+                }
+            )
+        return {"role": user_message_role, "content": blocks}
+
+    if include_user_message:
+        note = _attachment_note(attachments)
+        content = f"{user_message}\n\n{note}" if user_message.strip() else note
+        if content or user_message_role != "system":
+            return {"role": user_message_role, "content": content}
+    return None
 
 
 def _build_environment_info(
@@ -776,37 +836,15 @@ class ContextAssembler:
                         "_audit_role": "user",
                     }
                 )
-            attachment_blocks, unsupported = _native_attachment_blocks(
-                user_attachments or [], model_info
+            current_turn_message = _current_turn_attachment_message(
+                user_message=user_message,
+                user_message_role=user_message_role,
+                user_attachments=user_attachments,
+                model_info=model_info,
+                include_user_message=True,
             )
-            if attachment_blocks:
-                blocks: list[dict[str, Any]] = []
-                intro = user_message
-                if user_attachments:
-                    note = _attachment_note(user_attachments)
-                    intro = f"{user_message}\n\n{note}" if user_message.strip() else note
-                if intro:
-                    blocks.append({"type": "text", "text": intro})
-                elif attachment_blocks:
-                    blocks.append({"type": "text", "text": "User attached files."})
-                blocks.extend(attachment_blocks)
-                if unsupported:
-                    blocks.append(
-                        {
-                            "type": "text",
-                            "text": _attachment_note(
-                                _filter_attachments_by_names(user_attachments or [], unsupported)
-                            ),
-                        }
-                    )
-                messages.append({"role": user_message_role, "content": blocks})
-            else:
-                content = user_message
-                if user_attachments:
-                    note = _attachment_note(user_attachments)
-                    content = f"{user_message}\n\n{note}" if user_message.strip() else note
-                if content or user_message_role != "system":
-                    messages.append({"role": user_message_role, "content": content})
+            if current_turn_message is not None:
+                messages.append(current_turn_message)
         elif already_in_history:
             # Prompt already recorded in history; still surface any
             # turn-local signals that were meant to accompany it. The
@@ -843,6 +881,15 @@ class ContextAssembler:
                         "_audit_role": "user",
                     }
                 )
+            current_turn_attachments = _current_turn_attachment_message(
+                user_message=user_message,
+                user_message_role=user_message_role,
+                user_attachments=user_attachments,
+                model_info=model_info,
+                include_user_message=False,
+            )
+            if current_turn_attachments is not None:
+                messages.append(current_turn_attachments)
 
         messages = self._prune_messages(
             messages=messages,
@@ -1117,37 +1164,15 @@ class ContextAssembler:
                         "_audit_role": "user",
                     }
                 )
-            attachment_blocks, unsupported = _native_attachment_blocks(
-                user_attachments or [], model_info
+            current_turn_message = _current_turn_attachment_message(
+                user_message=user_message,
+                user_message_role=user_message_role,
+                user_attachments=user_attachments,
+                model_info=model_info,
+                include_user_message=True,
             )
-            if attachment_blocks:
-                blocks: list[dict[str, Any]] = []
-                intro = user_message
-                if user_attachments:
-                    note = _attachment_note(user_attachments)
-                    intro = f"{user_message}\n\n{note}" if user_message.strip() else note
-                if intro:
-                    blocks.append({"type": "text", "text": intro})
-                else:
-                    blocks.append({"type": "text", "text": "User attached files."})
-                blocks.extend(attachment_blocks)
-                if unsupported:
-                    blocks.append(
-                        {
-                            "type": "text",
-                            "text": _attachment_note(
-                                _filter_attachments_by_names(user_attachments or [], unsupported)
-                            ),
-                        }
-                    )
-                messages.append({"role": user_message_role, "content": blocks})
-            else:
-                content = user_message
-                if user_attachments:
-                    note = _attachment_note(user_attachments)
-                    content = f"{user_message}\n\n{note}" if user_message.strip() else note
-                if content or user_message_role != "system":
-                    messages.append({"role": user_message_role, "content": content})
+            if current_turn_message is not None:
+                messages.append(current_turn_message)
         elif already_in_history:
             if routing_reminder:
                 messages.append(
@@ -1177,6 +1202,15 @@ class ContextAssembler:
                         "_audit_role": "user",
                     }
                 )
+            current_turn_attachments = _current_turn_attachment_message(
+                user_message=user_message,
+                user_message_role=user_message_role,
+                user_attachments=user_attachments,
+                model_info=model_info,
+                include_user_message=False,
+            )
+            if current_turn_attachments is not None:
+                messages.append(current_turn_attachments)
 
         messages = self._prune_messages(
             messages=messages,

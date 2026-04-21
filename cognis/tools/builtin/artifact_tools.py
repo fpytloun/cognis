@@ -6,12 +6,14 @@ from io import BytesIO
 from typing import Any
 
 from cognis.core.json_utils import extract_text_from_response
+from cognis.logging import get_logger
 from cognis.models.artifact import ArtifactKind, AttachmentRef
 from cognis.models.tool import ToolDefinition, ToolResult, ToolSource
 from cognis.store.models import ModelRouting
 from cognis.store.queries import get_artifact_record
 
 _SOURCE = ToolSource(type="builtin")
+logger = get_logger(__name__)
 
 _TEXT_MIME_TYPES = {
     "application/json",
@@ -271,7 +273,23 @@ async def analyze_attachment_ref(
     )
     output = extract_text_from_response(response).strip()
     if not output:
-        return ToolResult(output="Attachment analysis returned no content.", is_error=True)
+        diagnostics = _analysis_response_diagnostics(
+            response,
+            attachment=attachment,
+            analysis_model=selected_model,
+            analysis_provider_id=selected_provider_id,
+            analysis_task_type=selected_task_type,
+            used_attachment_analysis_route=used_fallback_route,
+        )
+        logger.warning(
+            "Attachment analysis returned empty response",
+            extra={"extra_data": diagnostics},
+        )
+        return ToolResult(
+            output="Attachment analysis returned no content.",
+            is_error=True,
+            metadata=diagnostics,
+        )
     return ToolResult(
         output=output,
         metadata={
@@ -336,6 +354,50 @@ def _default_analysis_prompt(attachment: AttachmentRef) -> str:
         "Describe the important content faithfully. Include any visible or embedded text when "
         "present, and clearly mention uncertainty when the content is ambiguous."
     )
+
+
+def _analysis_response_diagnostics(
+    response: dict[str, Any],
+    *,
+    attachment: AttachmentRef,
+    analysis_model: str | None,
+    analysis_provider_id: str | None,
+    analysis_task_type: str,
+    used_attachment_analysis_route: bool,
+) -> dict[str, Any]:
+    choices = response.get("choices")
+    first_choice = choices[0] if isinstance(choices, list) and choices else {}
+    message = first_choice.get("message") if isinstance(first_choice, dict) else {}
+    if not isinstance(message, dict):
+        message = {}
+    content = message.get("content")
+    content_part_types: list[str] = []
+    if isinstance(content, list):
+        content_part_types = [
+            str(part.get("type") or "")
+            for part in content
+            if isinstance(part, dict) and str(part.get("type") or "")
+        ]
+    tool_calls = message.get("tool_calls")
+    return {
+        "artifact_id": attachment.artifact_id,
+        "filename": attachment.filename,
+        "mime_type": attachment.mime_type,
+        "kind": attachment.kind.value,
+        "analysis_model": analysis_model,
+        "analysis_provider_id": analysis_provider_id,
+        "analysis_task_type": analysis_task_type,
+        "used_attachment_analysis_route": used_attachment_analysis_route,
+        "response_status": response.get("response_status"),
+        "finish_reason": first_choice.get("finish_reason") if isinstance(first_choice, dict) else None,
+        "message_content_type": type(content).__name__ if content is not None else None,
+        "content_part_types": content_part_types,
+        "has_content": bool(extract_text_from_response(response).strip()),
+        "has_reasoning_content": bool(str(message.get("reasoning_content") or "").strip()),
+        "has_reasoning_summary": bool(str(message.get("reasoning") or "").strip()),
+        "has_refusal": bool(str(message.get("refusal") or "").strip()),
+        "tool_call_count": len(tool_calls) if isinstance(tool_calls, list) else 0,
+    }
 
 
 def _extract_pdf_text(content: bytes, filename: str) -> str | None:

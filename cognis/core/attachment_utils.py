@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Iterable
 from typing import Any
 
@@ -10,7 +11,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from cognis.models.artifact import ArtifactKind
 from cognis.store.models import ArtifactRecordRow
-
 
 _CANONICAL_ATTACHMENT_KEYS = {
     "artifact_id",
@@ -208,6 +208,24 @@ def attachment_note(attachments: list[dict[str, Any]]) -> str:
     for attachment in attachments:
         parts.append(attachment_label(attachment))
     return "Attachments: " + ", ".join(parts)
+
+
+def attachment_placeholder_text(kinds: Iterable[ArtifactKind | str]) -> str:
+    normalized: list[ArtifactKind] = []
+    for kind in kinds:
+        if isinstance(kind, ArtifactKind):
+            normalized.append(kind)
+            continue
+        if isinstance(kind, str) and kind:
+            with contextlib.suppress(ValueError):
+                normalized.append(ArtifactKind(kind))
+    if not normalized:
+        return "User attached files."
+    if len(normalized) != 1:
+        return "User attached files."
+    kind = normalized[0]
+    article = "an" if kind in {ArtifactKind.AUDIO, ArtifactKind.IMAGE} else "a"
+    return f"User attached {article} {kind.value} file."
 
 
 def merge_content_and_attachment_note(content: str, attachments: list[dict[str, Any]]) -> str:

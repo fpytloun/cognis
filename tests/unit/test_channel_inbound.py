@@ -268,6 +268,14 @@ def test_fallback_attachment_content_uses_raw_media_when_normalization_fails() -
         )
         == "User attached an audio file."
     )
+    assert (
+        _fallback_attachment_content(
+            "",
+            [],
+            [MediaAttachment(mime_type="image/png", filename="photo.png")],
+        )
+        == "User attached an image file."
+    )
 
 
 def test_filter_turn_attachments_for_voice_input_removes_audio() -> None:

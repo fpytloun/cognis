@@ -24,6 +24,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from cognis.channels.delivery import _append_attachment_fallback, prepare_media_attachments
 from cognis.channels.protocol import CHANNEL_OUTBOUND_TOTAL, BaseChannelAdapter
+from cognis.core.attachment_utils import attachment_placeholder_text
 from cognis.logging import get_logger
 from cognis.models.artifact import ArtifactKind, AttachmentRef
 from cognis.models.channel import (
@@ -69,24 +70,22 @@ def _fallback_attachment_content(
     if content.strip():
         return content
     if attachments:
-        kinds = {attachment.kind for attachment in attachments}
-        if kinds == {ArtifactKind.AUDIO} and len(attachments) == 1:
-            return "User attached an audio file."
-        if len(attachments) == 1:
-            kind = next(iter(kinds))
-            return f"User attached a {kind.value} file."
-        return "User attached files."
+        return attachment_placeholder_text(attachment.kind for attachment in attachments)
     if media:
-        audio_media = [item for item in media if str(item.mime_type or "").startswith("audio/")]
-        if len(media) == 1 and len(audio_media) == 1:
-            return "User attached an audio file."
-        if len(media) == 1:
-            mime_type = str(media[0].mime_type or "")
+        kinds: list[ArtifactKind] = []
+        for item in media:
+            mime_type = str(item.mime_type or "")
             if mime_type.startswith("image/"):
-                return "User attached an image file."
-            if mime_type.startswith("video/"):
-                return "User attached a video file."
-        return "User attached files."
+                kinds.append(ArtifactKind.IMAGE)
+            elif mime_type.startswith("audio/"):
+                kinds.append(ArtifactKind.AUDIO)
+            elif mime_type.startswith("video/"):
+                kinds.append(ArtifactKind.VIDEO)
+            elif mime_type == "application/pdf":
+                kinds.append(ArtifactKind.PDF)
+            else:
+                kinds.append(ArtifactKind.FILE)
+        return attachment_placeholder_text(kinds)
     return content
 
 

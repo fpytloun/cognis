@@ -1059,6 +1059,21 @@ def test_effective_user_content_describes_audio_only_turns() -> None:
         )
         == "User attached an audio file."
     )
+    assert (
+        _effective_user_content(
+            "",
+            [
+                AttachmentRef(
+                    artifact_id="att-2",
+                    kind=ArtifactKind.IMAGE,
+                    mime_type="image/png",
+                    filename="photo.png",
+                    size_bytes=10,
+                )
+            ],
+        )
+        == "User attached an image file."
+    )
 
 
 @pytest.mark.asyncio

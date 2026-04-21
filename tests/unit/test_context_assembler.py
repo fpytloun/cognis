@@ -137,6 +137,16 @@ class _SessionCache:
         pass
 
 
+class _HistorySessionCache(_SessionCache):
+    def __init__(self, events: list[dict[str, object]]) -> None:
+        super().__init__()
+        self._events = list(events)
+
+    def get_events_since_compaction(self, session_id: str, types: list[str] | None = None) -> list:
+        del session_id, types
+        return list(self._events)
+
+
 class _Memory:
     def __init__(self, fail: bool = False) -> None:
         self.fail = fail
@@ -1206,6 +1216,65 @@ async def test_context_assembler_injects_routing_reminder_before_attachment_noti
     user_index = contents.index("Implement auth")
 
     assert reminder_index < attachment_index < user_index
+
+
+@pytest.mark.asyncio
+async def test_context_assembler_preserves_current_turn_native_attachments_when_message_is_in_history() -> None:
+    attachment = {
+        "artifact_id": "att-1",
+        "kind": "image",
+        "mime_type": "image/png",
+        "filename": "muchi.png",
+        "size_bytes": 12,
+        "url": "https://example.com/muchi.png",
+    }
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=_VisionLLM(),
+        session_cache=_HistorySessionCache(
+            [
+                {
+                    "type": "user_message",
+                    "data": {
+                        "content": "User attached an image file.",
+                        "attachments": [attachment],
+                    },
+                }
+            ]
+        ),
+        session_manager=_SessionManager(),
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+
+    result = await assembler.assemble(
+        session=_session(),
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="User attached an image file.",
+        user_attachments=[attachment],
+        tool_definitions=[],
+    )
+
+    image_messages = [
+        message
+        for message in result.messages
+        if message.get("role") == "user"
+        and isinstance(message.get("content"), list)
+        and any(
+            isinstance(part, dict) and part.get("type") == "image_url"
+            for part in message.get("content", [])
+        )
+    ]
+
+    assert image_messages
+    text_parts = [
+        str(part.get("text") or "")
+        for part in image_messages[0]["content"]
+        if isinstance(part, dict) and part.get("type") == "text"
+    ]
+    assert any("artifact_id=att-1" in text for text in text_parts)
 
 
 @pytest.mark.asyncio

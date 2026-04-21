@@ -37,7 +37,11 @@ from sqlalchemy import delete, update
 from sqlalchemy.exc import IntegrityError
 
 from cognis.api.error_sanitizer import sanitize_client_error_detail
-from cognis.core.attachment_utils import normalize_attachment_refs, strip_attachment_payload_bytes
+from cognis.core.attachment_utils import (
+    attachment_placeholder_text,
+    normalize_attachment_refs,
+    strip_attachment_payload_bytes,
+)
 from cognis.core.compaction import ROTATION_TOTAL
 from cognis.core.errors import ImmutablePrefixUnavailable
 from cognis.core.events import Event, EventBus, EventType
@@ -117,13 +121,7 @@ def _effective_user_content(content: str, attachments: list[AttachmentRef]) -> s
         return content
     if not attachments:
         return content
-    kinds = {attachment.kind for attachment in attachments}
-    if kinds == {ArtifactKind.AUDIO} and len(attachments) == 1:
-        return "User attached an audio file."
-    if len(attachments) == 1:
-        kind = next(iter(kinds))
-        return f"User attached a {kind.value} file."
-    return "User attached files."
+    return attachment_placeholder_text(attachment.kind for attachment in attachments)
 
 
 # ---------------------------------------------------------------------------

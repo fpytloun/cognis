@@ -803,6 +803,86 @@ async def test_tool_router_handles_artifact_read_with_current_model(
 
 
 @pytest.mark.asyncio
+async def test_tool_router_reports_attachment_analysis_diagnostics_on_empty_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Store(_ArtifactStore):
+        async def async_load(self, namespace: str, object_id: str, filename: str) -> tuple[bytes, str]:
+            del namespace, object_id, filename
+            return b"png-bytes", "image/png"
+
+    class _Llm:
+        async def get_model_info(self, model_id: str, provider_id: str | None = None) -> object:
+            del model_id, provider_id
+            return SimpleNamespace(
+                supports_vision=True,
+                supports_pdf_input=False,
+                supports_audio_input=False,
+                supports_file_input=False,
+            )
+
+        async def generate(self, messages: list[dict[str, object]], **kwargs: object) -> dict[str, object]:
+            del messages, kwargs
+            return {
+                "choices": [{"message": {"content": None}, "finish_reason": "stop"}],
+                "response_status": "completed",
+            }
+
+    class _Session:
+        async def get(self, model: object, key: str) -> object | None:
+            del model, key
+            return None
+
+    @asynccontextmanager
+    async def session_factory() -> object:
+        yield _Session()
+
+    monkeypatch.setattr(
+        "cognis.tools.builtin.artifact_tools.get_artifact_record",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                artifact_id="img_1",
+                status="attached",
+                owner_email="user@example.com",
+                namespace="images",
+                object_id="img_1",
+                filename="image.png",
+                mime_type="image/png",
+                kind="image",
+                size_bytes=8,
+            )
+        ),
+    )
+
+    router = ToolRouter(
+        guardrails=_Guardrails(),
+        llm=_Llm(),
+        artifact_store=_Store(),
+        session_factory=session_factory,
+    )
+
+    result = await router.execute(
+        ToolCall(
+            call_id="art-empty",
+            name="artifact_read",
+            arguments={"artifact_id": "img_1"},
+            runtime_metadata={"resolved_model": "gpt-4o-mini"},
+        ),
+        _session(),
+        _agent(),
+        ToolRegistry(),
+        None,
+    )
+
+    assert result.is_error is True
+    assert result.metadata is not None
+    assert result.metadata["response_status"] == "completed"
+    assert result.metadata["finish_reason"] == "stop"
+    assert result.metadata["has_content"] is False
+    assert result.metadata["analysis_model"] == "gpt-4o-mini"
+
+
+@pytest.mark.asyncio
 async def test_tool_router_postprocesses_binary_read_with_attachment_analysis_route(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
