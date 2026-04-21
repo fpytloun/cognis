@@ -14,7 +14,7 @@
   import { addToast } from '$lib/stores/toasts';
   import { workspaceHealth } from '$lib/system';
   import { TASK_BOARD_COLUMNS, boardColumnForStatus, matchesTaskFilters, sortTasks, type TaskFilterState, type TaskBoardColumnId } from '$lib/tasks';
-  import type { Agent, Conversation, Task, Workflow } from '$lib/types/api';
+  import type { Agent, Conversation, Skill, Task, Workflow } from '$lib/types/api';
 
   // ---------------------------------------------------------------------------
   // Reactive state
@@ -27,6 +27,7 @@
   let tasks = $state<Task[]>([]);
   let agents = $state<Agent[]>([]);
   let workflows = $state<Workflow[]>([]);
+  let skills = $state<Skill[]>([]);
   let conversations = $state<Conversation[]>([]);
   let showCreateModal = $state(false);
 
@@ -127,16 +128,18 @@
       }
     }, TASK_BOARD_LOAD_TIMEOUT_MS);
     try {
-      const [nextTasks, nextAgents, nextWorkflows, nextConversations] = await Promise.all([
+      const [nextTasks, nextAgents, nextWorkflows, nextSkills, nextConversations] = await Promise.all([
         api.tasks.listAll(),
         api.agents.listAll(),
         api.workflows.listAll(),
+        api.skills.list(),
         api.conversations.listAll()
       ]);
       if (requestId !== boardLoadRequestId) return;
       tasks = nextTasks;
       agents = nextAgents;
       workflows = nextWorkflows;
+      skills = nextSkills;
       conversations = nextConversations;
     } catch (caughtError) {
       if (requestId !== boardLoadRequestId) return;
@@ -181,7 +184,7 @@
     try {
       await api.tasks.create(form);
       showCreateModal = false;
-      await refreshTasksOnly();
+      await loadBoardData();
       addToast('Draft task created.', 'success');
     } catch (caughtError) {
       error = asApiError(caughtError).message;
@@ -606,6 +609,7 @@
     <CreateTaskModal
       {agents}
       {workflows}
+      {skills}
       {conversations}
       {creating}
       onclose={() => (showCreateModal = false)}

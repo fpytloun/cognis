@@ -1,11 +1,13 @@
 <script lang="ts">
   import Button from '$lib/components/ui/Button.svelte';
   import Input from '$lib/components/ui/Input.svelte';
-  import type { Agent, Conversation, Workflow } from '$lib/types/api';
+  import { buildWorkflowSourceOptions, decodeWorkflowSourceValue } from '$lib/workflow-sources';
+  import type { Agent, Conversation, Skill, Workflow } from '$lib/types/api';
 
   let {
     agents,
     workflows,
+    skills,
     conversations,
     creating = false,
     onclose,
@@ -13,6 +15,7 @@
   } = $props<{
     agents: Agent[];
     workflows: Workflow[];
+    skills: Skill[];
     conversations: Conversation[];
     creating?: boolean;
     onclose: () => void;
@@ -21,6 +24,7 @@
       description: string;
       agent_id: string;
       workflow_id: string | null;
+      skill_id: string | null;
       priority: number;
       expected_output: string | null;
       delivery_mode: string;
@@ -33,12 +37,16 @@
 
   const primaryAgents = agents.filter((a: Agent) => a.agent_type === 'primary');
   const defaultAgentId = primaryAgents.find((a: Agent) => a.status === 'active')?.agent_id ?? primaryAgents[0]?.agent_id ?? '';
+  const selectedAgent = $derived(
+    primaryAgents.find((agent: Agent) => agent.agent_id === form.agent_id) ?? null
+  );
+  const workflowSourceOptions = $derived(buildWorkflowSourceOptions(workflows, skills, selectedAgent));
 
   let form = $state({
     title: '',
     description: '',
     agent_id: defaultAgentId,
-    workflow_id: '',
+    workflow_source: '',
     expected_output: '',
     priority: 0,
     delivery_mode: 'same_conversation',
@@ -49,12 +57,14 @@
 
   function handleSubmit(): void {
     if (!form.title.trim() || !form.agent_id) return;
+    const workflowSource = decodeWorkflowSourceValue(form.workflow_source);
     oncreate({
       agent_id: form.agent_id,
       title: form.title,
       description: form.description,
       expected_output: form.expected_output || null,
-      workflow_id: form.workflow_id || null,
+      workflow_id: workflowSource.workflow_id,
+      skill_id: workflowSource.skill_id,
       priority: Number(form.priority),
       delivery_mode: form.delivery_mode,
       delivery_target: form.delivery_mode === 'specific_conversation' ? form.delivery_target : null,
@@ -125,10 +135,10 @@
 
         <div class="space-y-1">
           <label for="task-workflow" class="text-xs font-medium uppercase tracking-widest text-slate-400">Workflow</label>
-          <select id="task-workflow" bind:value={form.workflow_id} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+          <select id="task-workflow" bind:value={form.workflow_source} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
             <option value="">Auto</option>
-            {#each workflows as workflow}
-              <option value={workflow.workflow_id}>{workflow.name}</option>
+            {#each workflowSourceOptions as option}
+              <option value={option.value}>{option.label}</option>
             {/each}
           </select>
         </div>

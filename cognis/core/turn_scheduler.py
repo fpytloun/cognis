@@ -45,6 +45,12 @@ from cognis.core.followups import (
     FollowUpMetadata,
     parse_follow_up_metadata,
 )
+from cognis.core.workflow_management import (
+    decode_skill_workflow_candidate_id,
+    encode_skill_workflow_candidate_id,
+    materialize_skill_workflow,
+    skill_workflow_criteria,
+)
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.artifact import ArtifactKind, AttachmentRef
@@ -52,6 +58,7 @@ from cognis.models.session import BLOCKED_STATES, ConversationModel, SessionMode
 from cognis.models.task import TaskDelivery
 from cognis.runtime_context import current_agent_id, current_user_email
 from cognis.store.models import FollowUpDedupeRow
+from cognis.tools.skills import resolve_skills_for_agent
 
 logger = get_logger(__name__)
 
@@ -1803,7 +1810,31 @@ class TurnScheduler:
             available_workflows = [
                 w for w in available_workflows if w.workflow_id in set(available_ids)
             ]
-        if not available_workflows:
+        workflow_candidates = [
+            {
+                "workflow_id": workflow.workflow_id,
+                "name": workflow.name,
+                "criteria": workflow.criteria,
+            }
+            for workflow in available_workflows
+        ]
+        async with self._session_factory() as session:
+            resolved_skills = await resolve_skills_for_agent(
+                session,
+                agent,
+                owner_email=agent.owner_email,
+            )
+        for skill in resolved_skills.skills:
+            if not skill.attached or not skill.steps:
+                continue
+            workflow_candidates.append(
+                {
+                    "workflow_id": encode_skill_workflow_candidate_id(skill.skill_id),
+                    "name": f"Skill: {skill.name}",
+                    "criteria": skill_workflow_criteria(skill),
+                }
+            )
+        if not workflow_candidates:
             default_workflow_id = execution.get("default_workflow_id")
             if isinstance(default_workflow_id, str):
                 resolved_default = await self._workflow_registry.get(
@@ -1817,18 +1848,25 @@ class TurnScheduler:
         selection = await select_workflow(
             llm=self._providers.llm,
             task_description=task_description,
-            available_workflows=[
-                {
-                    "workflow_id": workflow.workflow_id,
-                    "name": workflow.name,
-                    "criteria": workflow.criteria,
-                }
-                for workflow in available_workflows
-            ],
+            available_workflows=workflow_candidates,
             default_workflow_id=execution.get("default_workflow_id", "system:general-task"),
             selection_mode=execution.get("workflow_selection_mode", "automatic"),
         )
-        return selection.workflow_id
+        selected_skill_id = decode_skill_workflow_candidate_id(selection.workflow_id)
+        if selected_skill_id is None:
+            return selection.workflow_id
+        try:
+            created_workflow = await materialize_skill_workflow(
+                session_factory=self._session_factory,
+                owner_email=agent.owner_email,
+                skill_id=selected_skill_id,
+                lifecycle="ephemeral",
+                composition_source="agent_composed",
+                composition_intent=task_description,
+            )
+        except ValueError:
+            return execution.get("default_workflow_id", "system:general-task")
+        return created_workflow.workflow_id
 
     # ------------------------------------------------------------------
     # Error classification

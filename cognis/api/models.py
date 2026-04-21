@@ -443,6 +443,7 @@ class TaskCreateRequest(BaseModel):
     expected_output: str | None = None
     priority: int = 0
     workflow_id: str | None = None
+    skill_id: str | None = None
     delivery_mode: str = "same_conversation"
     delivery_target: str | None = None
     completion_mode_family: str | None = None
@@ -461,6 +462,7 @@ class TaskUpdateRequest(BaseModel):
     priority: int | None = None
     agent_id: str | None = None
     workflow_id: str | None = None
+    skill_id: str | None = None
     delivery_mode: str | None = None
     delivery_target: str | None = None
     completion_mode_family: str | None = None
@@ -620,6 +622,7 @@ class CreateScheduleRequest(BaseModel):
     timezone: str = "UTC"
     agent_id: str
     workflow_id: str | None = None
+    skill_id: str | None = None
     task_template: dict[str, Any] = Field(default_factory=dict)
     enabled: bool = True
     max_concurrent_runs: int = 1
@@ -654,6 +657,7 @@ class UpdateScheduleRequest(BaseModel):
     timezone: str | None = None
     agent_id: str | None = None
     workflow_id: str | None = None
+    skill_id: str | None = None
     task_template: dict[str, Any] | None = None
     enabled: bool | None = None
     max_concurrent_runs: int | None = None

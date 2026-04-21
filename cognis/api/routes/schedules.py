@@ -17,6 +17,11 @@ from cognis.api.models import (
     ScheduleResponse,
     UpdateScheduleRequest,
 )
+from cognis.core.workflow_management import (
+    delete_materialized_workflow,
+    get_attached_skill_workflow_source,
+    materialize_skill_workflow,
+)
 from cognis.models.schedule import ScheduleModel as _ScheduleModel
 from cognis.models.schedule import describe_schedule
 from cognis.models.workflow import CompletionDeliveryPolicy
@@ -186,12 +191,55 @@ async def create_schedule_route(
     """Create a new schedule."""
     user = require_current_user(request)
     forbid_mutation_for_viewer(request)
+    if body.workflow_id is not None and body.skill_id is not None:
+        raise api_exception(
+            400,
+            "validation_error",
+            "Specify either workflow_id or skill_id, not both",
+        )
 
     # Validate agent exists and belongs to user
     async with request.app.state.session_factory() as db:
         agent = await get_agent(db, body.agent_id)
         if agent is None or agent.owner_email != user.email:
             raise api_exception(404, "agent_not_found", "Agent not found")
+
+    if body.workflow_id is not None:
+        workflow = await request.app.state.workflow_registry.get(
+            body.workflow_id,
+            owner_email=user.email,
+        )
+        if workflow is None:
+            raise api_exception(404, "not_found", "Workflow not found")
+
+    resolved_workflow_id = body.workflow_id
+    created_workflow_id: str | None = None
+    if body.skill_id is not None:
+        agent = await request.app.state.agent_registry.get(body.agent_id, owner_email=user.email)
+        if agent is None:
+            raise api_exception(404, "agent_not_found", "Agent not found")
+        try:
+            source = await get_attached_skill_workflow_source(
+                session_factory=request.app.state.session_factory,
+                owner_email=user.email,
+                agent=agent,
+                skill_id=body.skill_id,
+            )
+            created_workflow = await materialize_skill_workflow(
+                session_factory=request.app.state.session_factory,
+                owner_email=user.email,
+                skill_id=body.skill_id,
+                lifecycle="persistent",
+                composition_source="manual",
+                composition_intent=body.description or body.name,
+                source=source,
+            )
+        except ValueError as exc:
+            message = str(exc)
+            status_code = 404 if message == "Skill not found" else 400
+            raise api_exception(status_code, "validation_error", message) from exc
+        resolved_workflow_id = created_workflow.workflow_id
+        created_workflow_id = created_workflow.workflow_id
 
     # Validate cron expression
     if body.schedule_type == "cron" and body.cron_expr:
@@ -226,30 +274,38 @@ async def create_schedule_route(
         allow_silent_completion=body.allow_silent_completion,
     )
 
-    async with request.app.state.session_factory() as db:
-        row = await create_schedule(
-            db,
-            name=body.name,
-            description=body.description,
-            schedule_type=body.schedule_type,
-            cron_expr=body.cron_expr,
-            interval_seconds=body.interval_seconds,
-            one_shot_at=body.one_shot_at,
-            timezone=body.timezone,
-            agent_id=body.agent_id,
-            workflow_id=body.workflow_id,
-            task_template=body.task_template,
-            enabled=body.enabled,
-            max_concurrent_runs=body.max_concurrent_runs,
-            delete_after_run=body.delete_after_run,
-            completion_mode_family=body.completion_mode_family,
-            allow_silent_completion=body.allow_silent_completion,
-            next_fire_at=next_fire,
-            created_by=user.email,
-        )
-        await db.commit()
-        # Re-read to get all defaults
-        row = await get_schedule(db, row.schedule_id)
+    try:
+        async with request.app.state.session_factory() as db:
+            row = await create_schedule(
+                db,
+                name=body.name,
+                description=body.description,
+                schedule_type=body.schedule_type,
+                cron_expr=body.cron_expr,
+                interval_seconds=body.interval_seconds,
+                one_shot_at=body.one_shot_at,
+                timezone=body.timezone,
+                agent_id=body.agent_id,
+                workflow_id=resolved_workflow_id,
+                task_template=body.task_template,
+                enabled=body.enabled,
+                max_concurrent_runs=body.max_concurrent_runs,
+                delete_after_run=body.delete_after_run,
+                completion_mode_family=body.completion_mode_family,
+                allow_silent_completion=body.allow_silent_completion,
+                next_fire_at=next_fire,
+                created_by=user.email,
+            )
+            await db.commit()
+            # Re-read to get all defaults
+            row = await get_schedule(db, row.schedule_id)
+    except Exception:
+        if created_workflow_id is not None:
+            await delete_materialized_workflow(
+                session_factory=request.app.state.session_factory,
+                workflow_id=created_workflow_id,
+            )
+        raise
 
     # Notify scheduler
     scheduler = getattr(request.app.state, "scheduler", None)
@@ -290,6 +346,12 @@ async def update_schedule_route(
     """Update a schedule."""
     user = require_current_user(request)
     forbid_mutation_for_viewer(request)
+    if body.workflow_id is not None and body.skill_id is not None:
+        raise api_exception(
+            400,
+            "validation_error",
+            "Specify either workflow_id or skill_id, not both",
+        )
 
     async with request.app.state.session_factory() as db:
         existing = await get_schedule(db, schedule_id)
@@ -301,6 +363,13 @@ async def update_schedule_route(
             agent = await get_agent(db, body.agent_id)
             if agent is None or agent.owner_email != user.email:
                 raise api_exception(404, "agent_not_found", "Agent not found")
+        if body.workflow_id is not None:
+            workflow = await request.app.state.workflow_registry.get(
+                body.workflow_id,
+                owner_email=user.email,
+            )
+            if workflow is None:
+                raise api_exception(404, "not_found", "Workflow not found")
 
         # Validate cron expression if changing
         if body.cron_expr is not None:
@@ -312,6 +381,35 @@ async def update_schedule_route(
                 raise api_exception(400, "invalid_cron", f"Invalid cron expression: {exc}") from exc
 
         fields = body.model_dump(exclude_unset=True)
+        fields.pop("skill_id", None)
+        created_workflow_id: str | None = None
+        if body.skill_id is not None:
+            agent_id = body.agent_id or existing.agent_id
+            agent = await request.app.state.agent_registry.get(agent_id, owner_email=user.email)
+            if agent is None:
+                raise api_exception(404, "agent_not_found", "Agent not found")
+            try:
+                source = await get_attached_skill_workflow_source(
+                    session_factory=request.app.state.session_factory,
+                    owner_email=user.email,
+                    agent=agent,
+                    skill_id=body.skill_id,
+                )
+                created_workflow = await materialize_skill_workflow(
+                    session_factory=request.app.state.session_factory,
+                    owner_email=user.email,
+                    skill_id=body.skill_id,
+                    lifecycle="persistent",
+                    composition_source="manual",
+                    composition_intent=body.description or body.name or existing.name,
+                    source=source,
+                )
+            except ValueError as exc:
+                message = str(exc)
+                status_code = 404 if message == "Skill not found" else 400
+                raise api_exception(status_code, "validation_error", message) from exc
+            fields["workflow_id"] = created_workflow.workflow_id
+            created_workflow_id = created_workflow.workflow_id
         if "completion_mode_family" in fields or "allow_silent_completion" in fields:
             CompletionDeliveryPolicy(
                 completion_mode_family=fields.get(
@@ -328,8 +426,16 @@ async def update_schedule_route(
                 await _load_latest_task_run(request, schedule_id, created_by=user.email),
             )
 
-        row = await update_schedule(db, schedule_id, **fields)
-        await db.commit()
+        try:
+            row = await update_schedule(db, schedule_id, **fields)
+            await db.commit()
+        except Exception:
+            if created_workflow_id is not None:
+                await delete_materialized_workflow(
+                    session_factory=request.app.state.session_factory,
+                    workflow_id=created_workflow_id,
+                )
+            raise
 
     # Notify scheduler to recompute next_fire_at
     scheduler = getattr(request.app.state, "scheduler", None)

@@ -7,11 +7,16 @@ from types import SimpleNamespace
 
 import pytest
 
+from cognis.core.agent_registry import AgentRegistry
 from cognis.store.database import create_engine, create_session_factory
 from cognis.core.task_queue import TaskQueue
+from cognis.core.workflow_registry import WorkflowRegistry
+from cognis.models.task import TaskModel
 from cognis.store.models import Agent, Base, User
 from cognis.store.queries import (
     add_task_dependency,
+    create_skill,
+    create_skill_version,
     create_step_run,
     create_task,
     fail_orphaned_running_step_runs,
@@ -20,6 +25,7 @@ from cognis.store.queries import (
     get_task,
     list_tasks_by_status,
     pick_ready_task,
+    set_current_version,
     update_step_run,
     update_task_status,
     update_task_workflow_state,
@@ -69,6 +75,96 @@ async def test_create_and_get_task(tmp_path: object) -> None:
             assert task is not None
             assert task.title == "Test Task"
             assert task.status == "draft"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_select_workflow_for_task_can_materialize_attached_skill(tmp_path: object) -> None:
+    engine, factory = await _bootstrap_db(tmp_path)
+
+    class _LLM:
+        async def generate(self, _messages: list[dict[str, object]], **_kwargs: object) -> dict[str, object]:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"workflow_id":"skill:skill_release","confidence":0.9,"reason":"Attached release skill fits"}'
+                        }
+                    }
+                ]
+            }
+
+    try:
+        async with factory() as session:
+            agent = await session.get(Agent, "agent-1")
+            assert agent is not None
+            agent.skills = {"items": [{"skill_id": "skill_release", "enabled": True}]}
+            skill = await create_skill(
+                session,
+                skill_id="skill_release",
+                name="Release Helper",
+                description="Release workflow material.",
+                instructions="Gather notes and publish the release.",
+                owner_email="user@test.com",
+            )
+            version = await create_skill_version(
+                session,
+                skill_id=skill.skill_id,
+                version_number=1,
+                content_hash="a" * 64,
+                instructions="Gather notes and publish the release.",
+                steps=[
+                    {
+                        "name": "gather_notes",
+                        "type": "run",
+                        "prompt": "Gather the release notes.",
+                        "require_deliverable": False,
+                    },
+                    {
+                        "name": "publish_release",
+                        "type": "run",
+                        "prompt": "Publish the release.",
+                        "require_deliverable": True,
+                    },
+                ],
+                decomposition_source_hash="b" * 64,
+            )
+            await set_current_version(session, skill.skill_id, version.version_id)
+            task_row = await create_task(
+                session,
+                created_by="user@test.com",
+                agent_id="agent-1",
+                title="Ship release",
+                description="Use the attached release skill.",
+                status="draft",
+            )
+            await session.commit()
+
+        queue = TaskQueue(
+            session_factory=factory,
+            workflow_engine=SimpleNamespace(),
+            workflow_registry=WorkflowRegistry(factory),
+            event_bus=SimpleNamespace(publish=lambda *_args, **_kwargs: None),
+            agent_registry=AgentRegistry(factory),
+            llm_provider=_LLM(),
+        )
+
+        workflow_id = await queue._select_workflow_for_task(  # noqa: SLF001
+            TaskModel(
+                task_id=task_row.task_id,
+                title=task_row.title,
+                description=task_row.description or "",
+                created_by=task_row.created_by,
+                agent_id=task_row.agent_id,
+            )
+        )
+
+        assert workflow_id.startswith("wf_")
+        async with factory() as session:
+            persisted_task = await get_task(session, task_row.task_id)
+            assert persisted_task is not None
+            assert persisted_task.workflow_id == workflow_id
     finally:
         await engine.dispose()
 

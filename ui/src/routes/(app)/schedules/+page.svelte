@@ -3,6 +3,10 @@
   import { onMount } from 'svelte';
 
   import { api, asApiError } from '$lib/api/client';
+  import {
+    buildWorkflowSourceOptions,
+    decodeWorkflowSourceValue
+  } from '$lib/workflow-sources';
   import AgentSelect from '$lib/components/AgentSelect.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import Badge from '$lib/components/ui/Badge.svelte';
@@ -12,7 +16,7 @@
   import Tooltip from '$lib/components/ui/Tooltip.svelte';
   import { confirmAction } from '$lib/stores/confirm';
   import { addToast } from '$lib/stores/toasts';
-  import type { Agent, Conversation, Schedule, Workflow } from '$lib/types/api';
+  import type { Agent, Conversation, Schedule, Skill, Workflow } from '$lib/types/api';
   import AlertTriangle from 'lucide-svelte/icons/alert-triangle';
 import Calendar from 'lucide-svelte/icons/calendar';
 import Clock from 'lucide-svelte/icons/clock';
@@ -29,6 +33,7 @@ import Zap from 'lucide-svelte/icons/zap';
   let schedules = $state<Schedule[]>([]);
   let agents = $state<Agent[]>([]);
   let workflows = $state<Workflow[]>([]);
+  let skills = $state<Skill[]>([]);
   let conversations = $state<Conversation[]>([]);
   let search = $state('');
   let filterType = $state<string>('');
@@ -70,7 +75,7 @@ import Zap from 'lucide-svelte/icons/zap';
     one_shot_at: '',
     timezone: localTimezone,
     agent_id: '',
-    workflow_id: '',
+    workflow_source: '',
     task_title: '',
     task_description: '',
     priority: 0,
@@ -115,14 +120,18 @@ import Zap from 'lucide-svelte/icons/zap';
     })
   );
 
+  let selectedAgent = $derived(agents.find((agent) => agent.agent_id === form.agent_id) ?? null);
+  let workflowSourceOptions = $derived(buildWorkflowSourceOptions(workflows, skills, selectedAgent));
+
   async function loadData(): Promise<void> {
     loading = true;
     error = '';
     try {
-      [schedules, agents, workflows, conversations] = await Promise.all([
+      [schedules, agents, workflows, skills, conversations] = await Promise.all([
         api.schedules.list(),
         api.agents.listAll({ agent_type: 'primary' }),
         api.workflows.listAll(),
+        api.skills.list(),
         api.conversations.listAll()
       ]);
       if (!form.agent_id && agents.length > 0) {
@@ -150,6 +159,7 @@ import Zap from 'lucide-svelte/icons/zap';
         }
       };
       if (form.expected_output) taskTemplate.expected_output = form.expected_output;
+      const workflowSource = decodeWorkflowSourceValue(form.workflow_source);
       await api.schedules.create({
         name: form.name,
         description: form.description || null,
@@ -159,7 +169,8 @@ import Zap from 'lucide-svelte/icons/zap';
         one_shot_at: form.schedule_type === 'one_shot' ? form.one_shot_at : null,
         timezone: form.timezone,
         agent_id: form.agent_id,
-        workflow_id: form.workflow_id || null,
+        workflow_id: workflowSource.workflow_id,
+        skill_id: workflowSource.skill_id,
         task_template: taskTemplate,
         completion_mode_family: form.completion_mode_family,
         allow_silent_completion: form.allow_silent_completion
@@ -185,7 +196,7 @@ import Zap from 'lucide-svelte/icons/zap';
       one_shot_at: '',
       timezone: localTimezone,
       agent_id: agents.find((a) => a.status === 'active')?.agent_id ?? agents[0]?.agent_id ?? '',
-      workflow_id: '',
+      workflow_source: '',
       task_title: '',
       task_description: '',
       priority: 0,
@@ -380,14 +391,14 @@ import Zap from 'lucide-svelte/icons/zap';
       <div class="space-y-3">
         {#each filtered as schedule (schedule.schedule_id)}
           {@const TypeIcon = typeIcons[schedule.schedule_type] ?? Clock}
-          <Card class="group relative overflow-hidden transition-colors hover:border-slate-600">
-            <button
-              class="w-full p-4 text-left"
-              onclick={() => goto(`/schedules/${schedule.schedule_id}`)}
-            >
-              <div class="flex items-start justify-between gap-4">
+          <Card class="group overflow-hidden transition-colors hover:border-slate-600">
+            <div class="flex flex-col gap-3 p-4 sm:flex-row sm:items-start sm:justify-between">
+              <button
+                class="min-w-0 flex-1 text-left"
+                onclick={() => goto(`/schedules/${schedule.schedule_id}`)}
+              >
                 <div class="min-w-0 flex-1">
-                  <div class="flex items-center gap-2">
+                  <div class="flex flex-wrap items-center gap-2">
                     <TypeIcon class="h-4 w-4 shrink-0 text-slate-400" />
                     <h3 class="truncate font-medium text-white">{schedule.name}</h3>
                     {#if !schedule.enabled}
@@ -415,57 +426,56 @@ import Zap from 'lucide-svelte/icons/zap';
                     <p class="mt-1 truncate text-xs text-slate-500">{schedule.description}</p>
                   {/if}
                 </div>
+              </button>
 
-                <div class="flex shrink-0 items-center gap-3 text-right">
-                  <div class="text-xs text-slate-500">
-                    {#if schedule.last_run_status}
-                      <span class={`inline-block rounded-full px-2 py-0.5 text-xs ${statusColors[schedule.last_run_status] ?? 'bg-slate-700/50 text-slate-400'}`}>
-                        {schedule.last_run_status}
-                      </span>
-                    {/if}
-                    {#if schedule.next_fire_at && schedule.enabled}
-                      <div class="mt-1">Next: {formatNextFire(schedule.next_fire_at)}</div>
-                    {/if}
-                  </div>
+              <div class="flex shrink-0 flex-col gap-3 sm:items-end">
+                <div class="text-xs text-slate-500 sm:text-right">
+                  {#if schedule.last_run_status}
+                    <span class={`inline-block rounded-full px-2 py-0.5 text-xs ${statusColors[schedule.last_run_status] ?? 'bg-slate-700/50 text-slate-400'}`}>
+                      {schedule.last_run_status}
+                    </span>
+                  {/if}
+                  {#if schedule.next_fire_at && schedule.enabled}
+                    <div class="mt-1">Next: {formatNextFire(schedule.next_fire_at)}</div>
+                  {/if}
+                </div>
+
+                <!-- Quick actions stay in normal flow so they cannot overlap
+                     the status badges or next-run summary. -->
+                <div class="flex gap-1 opacity-100 transition-opacity lg:opacity-60 lg:group-hover:opacity-100">
+                  <Tooltip text={schedule.enabled ? 'Disable' : 'Enable'}>
+                    <button
+                      class="inline-flex h-10 w-10 items-center justify-center rounded-xl text-slate-300 hover:bg-slate-800 hover:text-white md:h-8 md:w-8"
+                      aria-label={schedule.enabled ? 'Disable schedule' : 'Enable schedule'}
+                      onclick={(e: MouseEvent) => { e.stopPropagation(); toggleEnabled(schedule); }}
+                    >
+                      {#if schedule.enabled}
+                        <Pause class="h-4 w-4" />
+                      {:else}
+                        <Play class="h-4 w-4" />
+                      {/if}
+                    </button>
+                  </Tooltip>
+                  <Tooltip text="Trigger now">
+                    <button
+                      class="inline-flex h-10 w-10 items-center justify-center rounded-xl text-slate-300 hover:bg-slate-800 hover:text-white md:h-8 md:w-8"
+                      aria-label="Trigger schedule now"
+                      onclick={(e: MouseEvent) => { e.stopPropagation(); triggerNow(schedule); }}
+                    >
+                      <Zap class="h-4 w-4" />
+                    </button>
+                  </Tooltip>
+                  <Tooltip text="Delete">
+                    <button
+                      class="inline-flex h-10 w-10 items-center justify-center rounded-xl text-slate-300 hover:bg-red-900/50 hover:text-red-400 md:h-8 md:w-8"
+                      aria-label="Delete schedule"
+                      onclick={(e: MouseEvent) => { e.stopPropagation(); deleteSchedule(schedule); }}
+                    >
+                      <Trash2 class="h-4 w-4" />
+                    </button>
+                  </Tooltip>
                 </div>
               </div>
-            </button>
-
-            <!-- Quick actions. Always visible on touch (previously used
-                 opacity-0 group-hover which is unreachable on touch devices);
-                 dimmed at rest on desktop and brightened on hover. -->
-            <div class="absolute right-2 top-2 flex gap-1 opacity-100 transition-opacity lg:opacity-60 lg:group-hover:opacity-100">
-              <Tooltip text={schedule.enabled ? 'Disable' : 'Enable'}>
-                <button
-                  class="inline-flex h-10 w-10 items-center justify-center rounded-xl text-slate-300 hover:bg-slate-800 hover:text-white md:h-8 md:w-8"
-                  aria-label={schedule.enabled ? 'Disable schedule' : 'Enable schedule'}
-                  onclick={(e: MouseEvent) => { e.stopPropagation(); toggleEnabled(schedule); }}
-                >
-                  {#if schedule.enabled}
-                    <Pause class="h-4 w-4" />
-                  {:else}
-                    <Play class="h-4 w-4" />
-                  {/if}
-                </button>
-              </Tooltip>
-              <Tooltip text="Trigger now">
-                <button
-                  class="inline-flex h-10 w-10 items-center justify-center rounded-xl text-slate-300 hover:bg-slate-800 hover:text-white md:h-8 md:w-8"
-                  aria-label="Trigger schedule now"
-                  onclick={(e: MouseEvent) => { e.stopPropagation(); triggerNow(schedule); }}
-                >
-                  <Zap class="h-4 w-4" />
-                </button>
-              </Tooltip>
-              <Tooltip text="Delete">
-                <button
-                  class="inline-flex h-10 w-10 items-center justify-center rounded-xl text-slate-300 hover:bg-red-900/50 hover:text-red-400 md:h-8 md:w-8"
-                  aria-label="Delete schedule"
-                  onclick={(e: MouseEvent) => { e.stopPropagation(); deleteSchedule(schedule); }}
-                >
-                  <Trash2 class="h-4 w-4" />
-                </button>
-              </Tooltip>
             </div>
           </Card>
         {/each}
@@ -589,10 +599,10 @@ import Zap from 'lucide-svelte/icons/zap';
           </div>
           <div class="space-y-1">
             <label for="sched-workflow" class="text-xs font-medium uppercase tracking-widest text-slate-400">Workflow</label>
-            <select id="sched-workflow" bind:value={form.workflow_id} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+            <select id="sched-workflow" bind:value={form.workflow_source} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
               <option value="">Auto</option>
-              {#each workflows as workflow}
-                <option value={workflow.workflow_id}>{workflow.name}</option>
+              {#each workflowSourceOptions as option}
+                <option value={option.value}>{option.label}</option>
               {/each}
             </select>
           </div>

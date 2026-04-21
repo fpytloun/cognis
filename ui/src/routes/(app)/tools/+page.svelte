@@ -591,7 +591,7 @@ import Server from 'lucide-svelte/icons/server';
                     <Badge>{skill.source}</Badge>
                     {#if skill.is_system}<Badge class="border-amber-500/30 bg-amber-500/10 text-amber-300">system</Badge>{/if}
                     {#if skill.attach_to_all_agents ?? skill.auto_load}<Badge class="border-blue-500/30 bg-blue-500/10 text-blue-300">attached to all agents</Badge>{/if}
-                    {#if skill.current_version?.steps && skill.current_version.steps.length > 0}<Badge class="border-emerald-500/30 bg-emerald-500/10 text-emerald-300">workflow-ready</Badge>{/if}
+                    {#if skill.current_version?.steps && skill.current_version.steps.length > 0}<Badge class="border-emerald-500/30 bg-emerald-500/10 text-emerald-300">workflow</Badge>{/if}
                     {#if skill.current_version?.decomposition_stale}<Badge class="border-amber-500/30 bg-amber-500/10 text-amber-300">stale</Badge>{/if}
                   </div>
                   {#if skill.description}<p class="mt-1 text-sm text-zinc-400">{skill.description}</p>{/if}

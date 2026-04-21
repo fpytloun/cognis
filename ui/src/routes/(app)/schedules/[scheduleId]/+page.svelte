@@ -4,6 +4,11 @@
   import { onMount } from 'svelte';
 
   import { api, asApiError } from '$lib/api/client';
+  import {
+    buildWorkflowSourceOptions,
+    decodeWorkflowSourceValue,
+    workflowSourceValueForWorkflow
+  } from '$lib/workflow-sources';
   import AgentSelect from '$lib/components/AgentSelect.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import Badge from '$lib/components/ui/Badge.svelte';
@@ -22,7 +27,7 @@
   import Tooltip from '$lib/components/ui/Tooltip.svelte';
   import { confirmAction } from '$lib/stores/confirm';
   import { addToast } from '$lib/stores/toasts';
-  import type { Agent, Conversation, Schedule, ScheduleRun, Workflow } from '$lib/types/api';
+  import type { Agent, Conversation, Schedule, ScheduleRun, Skill, Workflow } from '$lib/types/api';
   import AlertTriangle from 'lucide-svelte/icons/alert-triangle';
 import ArrowLeft from 'lucide-svelte/icons/arrow-left';
 import Calendar from 'lucide-svelte/icons/calendar';
@@ -43,6 +48,7 @@ import Zap from 'lucide-svelte/icons/zap';
   let runs = $state<ScheduleRun[]>([]);
   let agents = $state<Agent[]>([]);
   let workflows = $state<Workflow[]>([]);
+  let skills = $state<Skill[]>([]);
   let conversations = $state<Conversation[]>([]);
 
   let form = $state({
@@ -54,7 +60,7 @@ import Zap from 'lucide-svelte/icons/zap';
     one_shot_at: '',
     timezone: 'UTC',
     agent_id: '',
-    workflow_id: '',
+    workflow_source: '',
     task_title: '',
     task_description: '',
     priority: 0,
@@ -78,6 +84,9 @@ import Zap from 'lucide-svelte/icons/zap';
     cancelled: 'bg-slate-500/20 text-slate-400'
   };
 
+  let selectedAgent = $derived(agents.find((agent) => agent.agent_id === form.agent_id) ?? null);
+  let workflowSourceOptions = $derived(buildWorkflowSourceOptions(workflows, skills, selectedAgent));
+
   function scheduleId(): string {
     return $page.params.scheduleId ?? '';
   }
@@ -86,16 +95,18 @@ import Zap from 'lucide-svelte/icons/zap';
     loading = true;
     error = '';
     try {
-      const [sched, agentList, workflowList, runList, convList] = await Promise.all([
+      const [sched, agentList, workflowList, skillList, runList, convList] = await Promise.all([
         api.schedules.detail(scheduleId()),
         api.agents.listAll({ agent_type: 'primary' }),
         api.workflows.listAll(),
+        api.skills.list(),
         api.schedules.runs(scheduleId()),
         api.conversations.listAll()
       ]);
       schedule = sched;
       agents = agentList;
       workflows = workflowList;
+      skills = skillList;
       runs = runList;
       conversations = convList;
       populateForm(sched);
@@ -127,7 +138,7 @@ import Zap from 'lucide-svelte/icons/zap';
       one_shot_at: s.one_shot_at ?? '',
       timezone: s.timezone,
       agent_id: s.agent_id,
-      workflow_id: s.workflow_id ?? '',
+      workflow_source: workflowSourceValueForWorkflow(s.workflow_id),
       task_title: (tmpl.title as string) ?? '',
       task_description: (tmpl.description as string) ?? '',
       priority: (tmpl.priority as number) ?? 0,
@@ -159,6 +170,7 @@ import Zap from 'lucide-svelte/icons/zap';
       } else {
         delete taskTemplate.expected_output;
       }
+      const workflowSource = decodeWorkflowSourceValue(form.workflow_source);
       const updated = await api.schedules.update(schedule.schedule_id, {
         name: form.name,
         description: form.description || null,
@@ -168,13 +180,14 @@ import Zap from 'lucide-svelte/icons/zap';
         one_shot_at: form.schedule_type === 'one_shot' ? form.one_shot_at : null,
         timezone: form.timezone,
         agent_id: form.agent_id,
-        workflow_id: form.workflow_id || null,
+        workflow_id: workflowSource.workflow_id,
+        skill_id: workflowSource.skill_id,
         task_template: taskTemplate,
         completion_mode_family: form.completion_mode_family,
         allow_silent_completion: form.allow_silent_completion,
         max_concurrent_runs: form.max_concurrent_runs
       });
-      schedule = updated;
+      await loadData();
       addToast('Schedule saved', 'success');
     } catch (e) {
       addToast(asApiError(e).message, 'error');
@@ -396,10 +409,10 @@ import Zap from 'lucide-svelte/icons/zap';
         <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
           <div class="space-y-1">
             <label for="edit-workflow" class="text-xs font-medium uppercase tracking-widest text-slate-400">Workflow</label>
-            <select id="edit-workflow" bind:value={form.workflow_id} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+            <select id="edit-workflow" bind:value={form.workflow_source} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
               <option value="">Auto</option>
-              {#each workflows as workflow}
-                <option value={workflow.workflow_id}>{workflow.name}</option>
+              {#each workflowSourceOptions as option}
+                <option value={option.value}>{option.label}</option>
               {/each}
             </select>
           </div>

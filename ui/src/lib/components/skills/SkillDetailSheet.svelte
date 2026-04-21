@@ -383,8 +383,17 @@
         steps: decompositionPreview,
         decomposition_source_hash: decompositionSourceHash ?? undefined
       });
+      decompositionPreview = null;
+      decompositionRationale = '';
+      decompositionSourceHash = null;
+      versions = await api.skills.versions(saved.skill_id);
       await onSaved(saved, 'updated');
-      addToast('Saved decomposition onto the skill.', 'success');
+      addToast(
+        saved.current_version
+          ? `Saved decomposition as ${versionLabel(saved.current_version)}.`
+          : 'Saved decomposition onto the skill.',
+        'success'
+      );
     } catch (error) {
       addToast(toErrorMessage(error, 'Failed to save decomposition'), 'error');
     } finally {
@@ -550,7 +559,7 @@
               <Badge class="border-blue-500/30 bg-blue-500/10 text-blue-300">attached to all agents</Badge>
             {/if}
             {#if savedSteps.length > 0}
-              <Badge class="border-emerald-500/30 bg-emerald-500/10 text-emerald-300">workflow-ready</Badge>
+              <Badge class="border-emerald-500/30 bg-emerald-500/10 text-emerald-300">workflow</Badge>
             {/if}
             {#if currentVersion?.decomposition_stale}
               <Badge class="border-amber-500/30 bg-amber-500/10 text-amber-300">decomposition stale</Badge>

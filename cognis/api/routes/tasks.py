@@ -47,6 +47,11 @@ from cognis.core.management import (
     task_pending_pause_response,
     task_workflow_run_response,
 )
+from cognis.core.workflow_management import (
+    delete_materialized_workflow,
+    get_attached_skill_workflow_source,
+    materialize_skill_workflow,
+)
 from cognis.models.task import TaskDelivery, TaskModel
 from cognis.models.workflow import CompletionDeliveryPolicy, WorkflowState
 from cognis.store.models import Task
@@ -142,6 +147,12 @@ async def task_list(
 async def task_create(request: Request, payload: TaskCreateRequest) -> TaskResponse:
     forbid_mutation_for_viewer(request)
     user = require_current_user(request)
+    if payload.workflow_id is not None and payload.skill_id is not None:
+        raise api_exception(
+            400,
+            "validation_error",
+            "Specify either workflow_id or skill_id, not both",
+        )
     if payload.source_type == "chat" and payload.source_ref is None:
         raise api_exception(
             400,
@@ -161,48 +172,84 @@ async def task_create(request: Request, payload: TaskCreateRequest) -> TaskRespo
     if payload.delivery_target is not None:
         await _validate_conversation_access(request, payload.delivery_target)
     _validate_execution_paths(payload.workspace_root, payload.working_directory)
+    resolved_workflow_id = payload.workflow_id
+    created_workflow_id: str | None = None
+    if payload.skill_id is not None:
+        agent = await request.app.state.agent_registry.get(payload.agent_id, owner_email=user.email)
+        if agent is None:
+            raise api_exception(404, "not_found", "Agent not found")
+        try:
+            source = await get_attached_skill_workflow_source(
+                session_factory=request.app.state.session_factory,
+                owner_email=user.email,
+                agent=agent,
+                skill_id=payload.skill_id,
+            )
+            created_workflow = await materialize_skill_workflow(
+                session_factory=request.app.state.session_factory,
+                owner_email=user.email,
+                skill_id=payload.skill_id,
+                lifecycle="ephemeral",
+                composition_source="manual",
+                composition_intent=payload.description or payload.title,
+                source=source,
+            )
+        except ValueError as exc:
+            message = str(exc)
+            status_code = 404 if message == "Skill not found" else 400
+            raise api_exception(status_code, "validation_error", message) from exc
+        resolved_workflow_id = created_workflow.workflow_id
+        created_workflow_id = created_workflow.workflow_id
     queue = request.app.state.task_queue
     delivery = TaskDelivery(mode=payload.delivery_mode, target=payload.delivery_target)
     completion_delivery = await _resolve_completion_delivery(
         request,
-        workflow_id=payload.workflow_id,
+        workflow_id=resolved_workflow_id,
         owner_email=user.email,
         completion_mode_family=payload.completion_mode_family,
         allow_silent_completion=payload.allow_silent_completion,
     )
-    if payload.status == "draft":
-        task = await queue.create_draft(
-            created_by=user.email,
-            agent_id=payload.agent_id,
-            title=payload.title,
-            description=payload.description,
-            expected_output=payload.expected_output,
-            priority=payload.priority,
-            delivery=delivery,
-            completion_delivery=completion_delivery,
-            workflow_id=payload.workflow_id,
-            workspace_root=payload.workspace_root,
-            working_directory=payload.working_directory,
-            source_type=payload.source_type,
-            source_ref=payload.source_ref,
-        )
-    else:
-        task = await queue.submit(
-            created_by=user.email,
-            agent_id=payload.agent_id,
-            title=payload.title,
-            description=payload.description,
-            expected_output=payload.expected_output,
-            priority=payload.priority,
-            source_type=payload.source_type,
-            source_ref=payload.source_ref,
-            delivery=delivery,
-            completion_delivery=completion_delivery,
-            workflow_id=payload.workflow_id,
-            workspace_root=payload.workspace_root,
-            working_directory=payload.working_directory,
-            status=payload.status,
-        )
+    try:
+        if payload.status == "draft":
+            task = await queue.create_draft(
+                created_by=user.email,
+                agent_id=payload.agent_id,
+                title=payload.title,
+                description=payload.description,
+                expected_output=payload.expected_output,
+                priority=payload.priority,
+                delivery=delivery,
+                completion_delivery=completion_delivery,
+                workflow_id=resolved_workflow_id,
+                workspace_root=payload.workspace_root,
+                working_directory=payload.working_directory,
+                source_type=payload.source_type,
+                source_ref=payload.source_ref,
+            )
+        else:
+            task = await queue.submit(
+                created_by=user.email,
+                agent_id=payload.agent_id,
+                title=payload.title,
+                description=payload.description,
+                expected_output=payload.expected_output,
+                priority=payload.priority,
+                source_type=payload.source_type,
+                source_ref=payload.source_ref,
+                delivery=delivery,
+                completion_delivery=completion_delivery,
+                workflow_id=resolved_workflow_id,
+                workspace_root=payload.workspace_root,
+                working_directory=payload.working_directory,
+                status=payload.status,
+            )
+    except Exception:
+        if created_workflow_id is not None:
+            await delete_materialized_workflow(
+                session_factory=request.app.state.session_factory,
+                workflow_id=created_workflow_id,
+            )
+        raise
     return task_to_response(task)
 
 
@@ -243,10 +290,48 @@ async def task_update(request: Request, task_id: str, payload: TaskUpdateRequest
             raise api_exception(404, "not_found", "Task not found")
     if payload.agent_id is not None:
         await _validate_agent_access(request, payload.agent_id)
+    if payload.workflow_id is not None and payload.skill_id is not None:
+        raise api_exception(
+            400,
+            "validation_error",
+            "Specify either workflow_id or skill_id, not both",
+        )
+    resolved_workflow_id = payload.workflow_id
+    created_workflow_id: str | None = None
     if payload.workflow_id is not None:
         await _validate_workflow_access(
             request, payload.workflow_id, owner_email=existing_row.created_by
         )
+    elif payload.skill_id is not None:
+        agent_id = payload.agent_id or existing_row.agent_id
+        agent = await request.app.state.agent_registry.get(
+            agent_id,
+            owner_email=existing_row.created_by,
+        )
+        if agent is None:
+            raise api_exception(404, "not_found", "Agent not found")
+        try:
+            source = await get_attached_skill_workflow_source(
+                session_factory=request.app.state.session_factory,
+                owner_email=existing_row.created_by,
+                agent=agent,
+                skill_id=payload.skill_id,
+            )
+            created_workflow = await materialize_skill_workflow(
+                session_factory=request.app.state.session_factory,
+                owner_email=existing_row.created_by,
+                skill_id=payload.skill_id,
+                lifecycle="ephemeral",
+                composition_source="manual",
+                composition_intent=payload.description or payload.title or existing_row.title,
+                source=source,
+            )
+        except ValueError as exc:
+            message = str(exc)
+            status_code = 404 if message == "Skill not found" else 400
+            raise api_exception(status_code, "validation_error", message) from exc
+        resolved_workflow_id = created_workflow.workflow_id
+        created_workflow_id = created_workflow.workflow_id
     effective_delivery_mode = payload.delivery_mode or existing_row.delivery_mode
     effective_delivery_target = payload.delivery_target or existing_row.delivery_target
     effective_completion_mode_family = payload.completion_mode_family or getattr(
@@ -280,42 +365,53 @@ async def task_update(request: Request, task_id: str, payload: TaskUpdateRequest
         completion_mode_family=effective_completion_mode_family,
         allow_silent_completion=effective_allow_silent_completion,
     )
-    async with request.app.state.session_factory() as session:
-        row = await get_task(session, task_id)
-        if row is None:
-            raise api_exception(404, "not_found", "Task not found")
-        if row.status in _TERMINAL_STATUSES:
-            raise api_exception(
-                409,
-                "conflict",
-                f"Cannot update task in '{row.status}' status.",
+    try:
+        async with request.app.state.session_factory() as session:
+            row = await get_task(session, task_id)
+            if row is None:
+                raise api_exception(404, "not_found", "Task not found")
+            if row.status in _TERMINAL_STATUSES:
+                raise api_exception(
+                    409,
+                    "conflict",
+                    f"Cannot update task in '{row.status}' status.",
+                )
+            updates = payload.model_dump(exclude_none=True)
+            updates.pop("skill_id", None)
+            if payload.skill_id is not None:
+                updates["workflow_id"] = resolved_workflow_id
+            if "delivery_mode" in updates:
+                row.delivery_mode = updates.pop("delivery_mode")
+            if "delivery_target" in updates:
+                row.delivery_target = updates.pop("delivery_target")
+            if "completion_mode_family" in updates:
+                row.completion_mode_family = updates.pop("completion_mode_family")
+            if "allow_silent_completion" in updates:
+                row.allow_silent_completion = updates.pop("allow_silent_completion")
+            if (
+                payload.working_directory is not None
+                and payload.workspace_root is None
+                and row.workspace_root is None
+            ):
+                row.workspace_root = payload.working_directory
+            if (
+                payload.workspace_root is not None
+                and payload.working_directory is None
+                and row.working_directory is None
+            ):
+                row.working_directory = payload.workspace_root
+            for field_name, value in updates.items():
+                setattr(row, field_name, value)
+            row.updated_at = datetime.now(UTC)
+            await session.commit()
+            await session.refresh(row)
+    except Exception:
+        if created_workflow_id is not None:
+            await delete_materialized_workflow(
+                session_factory=request.app.state.session_factory,
+                workflow_id=created_workflow_id,
             )
-        updates = payload.model_dump(exclude_none=True)
-        if "delivery_mode" in updates:
-            row.delivery_mode = updates.pop("delivery_mode")
-        if "delivery_target" in updates:
-            row.delivery_target = updates.pop("delivery_target")
-        if "completion_mode_family" in updates:
-            row.completion_mode_family = updates.pop("completion_mode_family")
-        if "allow_silent_completion" in updates:
-            row.allow_silent_completion = updates.pop("allow_silent_completion")
-        if (
-            payload.working_directory is not None
-            and payload.workspace_root is None
-            and row.workspace_root is None
-        ):
-            row.workspace_root = payload.working_directory
-        if (
-            payload.workspace_root is not None
-            and payload.working_directory is None
-            and row.working_directory is None
-        ):
-            row.working_directory = payload.workspace_root
-        for field_name, value in updates.items():
-            setattr(row, field_name, value)
-        row.updated_at = datetime.now(UTC)
-        await session.commit()
-        await session.refresh(row)
+        raise
     return task_to_response(_row_to_task(row))
 
 

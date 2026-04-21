@@ -349,6 +349,7 @@ def create_app() -> FastAPI:
             workflow_engine=workflow_engine,
             workflow_registry=workflow_registry,
             event_bus=event_bus,
+            agent_registry=agent_registry,
             llm_provider=providers.llm,
         )
         agent_loop.set_task_queue(task_queue)

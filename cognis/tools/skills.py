@@ -222,6 +222,14 @@ async def resolve_skills_for_agent(
                         tools=tools,
                         prompt_templates=version_row.prompt_templates or {},
                         secret_placeholders=version_row.secret_placeholders or [],
+                        steps=[
+                            item
+                            for item in ((getattr(version_row, "steps", None) or []))
+                            if isinstance(item, dict)
+                        ],
+                        decomposition_source_hash=getattr(
+                            version_row, "decomposition_source_hash", None
+                        ),
                         asset_manifest=asset_manifest,
                         auto_load=skill_row.auto_load,
                         attached=attached,
@@ -243,6 +251,7 @@ async def resolve_skills_for_agent(
                 instructions=skill_row.instructions,
                 tools=tools,
                 prompt_templates=skill_row.prompt_templates or {},
+                steps=[item for item in (getattr(skill_row, "steps", None) or []) if isinstance(item, dict)],
                 auto_load=skill_row.auto_load,
                 attached=attached,
             )

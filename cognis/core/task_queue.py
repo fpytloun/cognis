@@ -17,12 +17,19 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cognis.core.agent_loop import PauseResolution
 from cognis.core.events import Event, EventBus, EventType
+from cognis.core.workflow_management import (
+    decode_skill_workflow_candidate_id,
+    encode_skill_workflow_candidate_id,
+    materialize_skill_workflow,
+    skill_workflow_criteria,
+)
 from cognis.core.workflow_engine import WorkflowEngine
 from cognis.core.workflow_registry import WorkflowRegistry
 from cognis.logging import get_logger
 from cognis.models.task import TaskDelivery, TaskModel, TaskStatus
 from cognis.models.workflow import CompletionDeliveryPolicy, WorkflowState
 from cognis.runtime_context import scoped_runtime_context
+from cognis.tools.skills import resolve_skills_for_agent
 from cognis.store.queries import (
     count_active_steps,
     create_task,
@@ -99,6 +106,7 @@ class TaskQueue:
         workflow_engine: WorkflowEngine,
         workflow_registry: WorkflowRegistry,
         event_bus: EventBus,
+        agent_registry: Any = None,
         llm_provider: Any = None,
         max_active_steps_global: int = DEFAULT_MAX_ACTIVE_STEPS_GLOBAL,
         max_active_steps_per_agent: int = DEFAULT_MAX_ACTIVE_STEPS_PER_AGENT,
@@ -108,6 +116,7 @@ class TaskQueue:
         self._workflow_engine = workflow_engine
         self._workflow_registry = workflow_registry
         self._event_bus = event_bus
+        self._agent_registry = agent_registry
         self._llm_provider = llm_provider
         self._max_active_global = max_active_steps_global
         self._max_active_per_agent = max_active_steps_per_agent
@@ -128,6 +137,7 @@ class TaskQueue:
         workflow_engine: WorkflowEngine,
         workflow_registry: WorkflowRegistry,
         event_bus: EventBus,
+        agent_registry: Any = None,
         llm_provider: Any = None,
     ) -> TaskQueue:
         """Create a TaskQueue with DB-backed settings."""
@@ -147,6 +157,7 @@ class TaskQueue:
             workflow_engine=workflow_engine,
             workflow_registry=workflow_registry,
             event_bus=event_bus,
+            agent_registry=agent_registry,
             llm_provider=llm_provider,
             max_active_steps_global=int(max_global)
             if isinstance(max_global, int)
@@ -853,23 +864,54 @@ class TaskQueue:
 
         try:
             available = await self._workflow_registry.list_all(owner_email=task.created_by)
-            if not available:
+            workflow_candidates = [
+                {
+                    "workflow_id": workflow.workflow_id,
+                    "name": workflow.name,
+                    "criteria": workflow.criteria,
+                }
+                for workflow in available
+            ]
+            if self._agent_registry is not None:
+                agent = await self._agent_registry.get(task.agent_id, owner_email=task.created_by)
+                if agent is not None:
+                    async with self._session_factory() as session:
+                        resolved_skills = await resolve_skills_for_agent(
+                            session,
+                            agent,
+                            owner_email=task.created_by,
+                        )
+                    for skill in resolved_skills.skills:
+                        if not skill.attached or not skill.steps:
+                            continue
+                        workflow_candidates.append(
+                            {
+                                "workflow_id": encode_skill_workflow_candidate_id(skill.skill_id),
+                                "name": f"Skill: {skill.name}",
+                                "criteria": skill_workflow_criteria(skill),
+                            }
+                        )
+            if not workflow_candidates:
                 return "system:general-task"
 
             selection = await select_workflow(
                 llm=self._llm_provider,
                 task_description=task.description or task.title,
-                available_workflows=[
-                    {
-                        "workflow_id": w.workflow_id,
-                        "name": w.name,
-                        "criteria": w.criteria,
-                    }
-                    for w in available
-                ],
+                available_workflows=workflow_candidates,
                 default_workflow_id="system:general-task",
             )
             workflow_id = selection.workflow_id
+            selected_skill_id = decode_skill_workflow_candidate_id(workflow_id)
+            if selected_skill_id is not None:
+                created_workflow = await materialize_skill_workflow(
+                    session_factory=self._session_factory,
+                    owner_email=task.created_by,
+                    skill_id=selected_skill_id,
+                    lifecycle="ephemeral",
+                    composition_source="agent_composed",
+                    composition_intent=task.description or task.title,
+                )
+                workflow_id = created_workflow.workflow_id
             logger.info(
                 "Auto-selected workflow for task",
                 extra={
