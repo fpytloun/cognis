@@ -60,6 +60,7 @@ async def test_run_direct_turn_enables_questions() -> None:
     ctx = captured["ctx"]
     assert ctx.interaction_mode == "step_requests"
     assert ctx.step_definition.allow_questions is True
+    assert ctx.step_definition.step_profile_id == "system:direct-default"
 
 
 @pytest.mark.asyncio

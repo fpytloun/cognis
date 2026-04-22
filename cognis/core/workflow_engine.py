@@ -190,6 +190,8 @@ class WorkflowEngine:
             type="run",
             prompt=user_message,
             allow_questions=True,
+            # Keep the inline hot path, but apply the shipped direct-chat profile.
+            step_profile_id="system:direct-default",
         )
         ctx = StepContext(
             step_definition=direct_step,
