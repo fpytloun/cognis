@@ -33,6 +33,7 @@ from cognis.core.attachment_utils import (
 )
 from cognis.core.compaction import ROTATION_TOTAL
 from cognis.core.context import _native_attachment_blocks
+from cognis.core.context_budget import resolve_context_budget
 from cognis.core.context_projection import DEFAULT_COMPACTED_TOOL_GROUPS, project_messages
 from cognis.core.decision import build_routing_reminder
 from cognis.core.errors import ImmutablePrefixUnavailable
@@ -2704,9 +2705,7 @@ class AgentLoop:
                         tc=tc,
                     )
                     if loaded_project_context is not None:
-                        HARNESS_GUARD_TRIPS.labels(
-                            guard="project_context", tool_name=tool_id
-                        ).inc()
+                        HARNESS_GUARD_TRIPS.labels(guard="project_context", tool_name=tool_id).inc()
                         _append_tool_call_event(events_to_record, tc, tool_id)
                         rejection_payload = json.dumps(
                             {
@@ -2766,7 +2765,9 @@ class AgentLoop:
                                     trailing_call.call_id,
                                     trailing_call.arguments,
                                 )
-                            _append_tool_call_event(events_to_record, trailing_call, trailing_tool_id)
+                            _append_tool_call_event(
+                                events_to_record, trailing_call, trailing_tool_id
+                            )
                             messages.append(
                                 {
                                     "role": "tool",
@@ -6447,8 +6448,8 @@ class AgentLoop:
             SessionEvent(
                 type="lifecycle",
                 data={
-                    "workflow_id": persisted_workflow_id,
                     "event": "workflow_composed",
+                    "workflow_id": persisted_workflow_id,
                     "workflow_name": workflow.name,
                     "lifecycle": str(workflow.lifecycle),
                     "steps": preview["steps"],
@@ -7269,17 +7270,11 @@ class AgentLoop:
     ) -> ContextPressureSnapshot | None:
         if not ctx.current_model or max_context_tokens <= 0:
             return None
-        reserve_output_tokens = (
-            ctx.agent.llm_config.max_tokens
-            if ctx.agent.llm_config and ctx.agent.llm_config.max_tokens is not None
-            else getattr(ctx.current_model_info, "max_output_tokens", 0)
+        budget = resolve_context_budget(
+            max_context_tokens=max_context_tokens,
+            agent_max_tokens=(ctx.agent.llm_config.max_tokens if ctx.agent.llm_config else None),
+            model_max_output_tokens=getattr(ctx.current_model_info, "max_output_tokens", 0),
         )
-        reserve_output_tokens = max(0, int(reserve_output_tokens or 0))
-        effective_reserve_output_tokens = reserve_output_tokens
-        reserve_clamped = False
-        if reserve_output_tokens >= max_context_tokens:
-            effective_reserve_output_tokens = max(1, max_context_tokens // 4)
-            reserve_clamped = effective_reserve_output_tokens != reserve_output_tokens
         try:
             prompt_tokens = self.providers.llm.count_messages_tokens(messages, ctx.current_model)
             if tool_schemas:
@@ -7289,30 +7284,30 @@ class AgentLoop:
                 )
         except Exception:
             return None
-        available_prompt_tokens = max(0, max_context_tokens - effective_reserve_output_tokens)
+        available_prompt_tokens = budget.available_prompt_tokens
         if available_prompt_tokens <= 0:
             return ContextPressureSnapshot(
                 prompt_tokens=prompt_tokens,
                 max_context_tokens=max_context_tokens,
-                reserve_output_tokens=reserve_output_tokens,
-                effective_reserve_output_tokens=effective_reserve_output_tokens,
+                reserve_output_tokens=budget.reserve_output_tokens,
+                effective_reserve_output_tokens=budget.effective_reserve_output_tokens,
                 available_prompt_tokens=available_prompt_tokens,
                 threshold_prompt_tokens=0,
                 exceeded=True,
                 reason="no_budget",
-                reserve_clamped=reserve_clamped,
+                reserve_clamped=budget.reserve_clamped,
             )
         threshold_prompt_tokens = int(available_prompt_tokens * 0.95)
         return ContextPressureSnapshot(
             prompt_tokens=prompt_tokens,
             max_context_tokens=max_context_tokens,
-            reserve_output_tokens=reserve_output_tokens,
-            effective_reserve_output_tokens=effective_reserve_output_tokens,
+            reserve_output_tokens=budget.reserve_output_tokens,
+            effective_reserve_output_tokens=budget.effective_reserve_output_tokens,
             available_prompt_tokens=available_prompt_tokens,
             threshold_prompt_tokens=threshold_prompt_tokens,
             exceeded=prompt_tokens >= threshold_prompt_tokens,
             reason="over_threshold",
-            reserve_clamped=reserve_clamped,
+            reserve_clamped=budget.reserve_clamped,
         )
 
     def _store_context_usage_snapshot(
@@ -7356,7 +7351,7 @@ class AgentLoop:
         if not should_log:
             return
         logger.warning(
-            "Output reservation exceeds model context window; clamping loop budget",
+            "Controller prompt reserve reduced below requested output ceiling",
             extra={
                 "extra_data": {
                     "session_id": ctx.session.session_id,
@@ -7961,14 +7956,24 @@ class AgentLoop:
         path_kind = "directory"
         explicit_path = False
         if tc.name in {"read", "write", "edit", "multiedit"}:
-            raw_path = tc.arguments.get("file_path") if isinstance(tc.arguments.get("file_path"), str) else None
+            raw_path = (
+                tc.arguments.get("file_path")
+                if isinstance(tc.arguments.get("file_path"), str)
+                else None
+            )
             path_kind = "file"
             explicit_path = raw_path is not None
         elif tc.name in {"list_directory", "glob", "grep"}:
-            raw_path = tc.arguments.get("path") if isinstance(tc.arguments.get("path"), str) else None
+            raw_path = (
+                tc.arguments.get("path") if isinstance(tc.arguments.get("path"), str) else None
+            )
             explicit_path = raw_path is not None
         elif tc.name == "bash":
-            raw_path = tc.arguments.get("workdir") if isinstance(tc.arguments.get("workdir"), str) else None
+            raw_path = (
+                tc.arguments.get("workdir")
+                if isinstance(tc.arguments.get("workdir"), str)
+                else None
+            )
             explicit_path = raw_path is not None
             if raw_path is None:
                 raw_path = ctx.working_directory or ctx.workspace_root
@@ -8168,7 +8173,9 @@ class AgentLoop:
                 else:
                     from cognis.store.queries import update_conversation_context_data
 
-                    platform_data = dict(getattr(ctx.conversation.context, "platform_data", {}) or {})
+                    platform_data = dict(
+                        getattr(ctx.conversation.context, "platform_data", {}) or {}
+                    )
                     platform_data["workspace_root"] = workspace_root
                     platform_data["working_directory"] = working_directory
                     await update_conversation_context_data(

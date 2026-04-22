@@ -38,8 +38,8 @@ from cognis.models.session import ConversationContext
 from cognis.store.queries import (
     get_agent,
     get_conversation,
-    get_latest_root_session_for_conversation,
     get_latest_active_conversation_for_agent,
+    get_latest_root_session_for_conversation,
     get_root_session_chain,
     get_session_row,
     list_conversation_sessions,
@@ -616,7 +616,8 @@ async def _try_command_dispatch(
     session_model = _to_session_model(session_row)
 
     turn_scheduler = getattr(request.app.state, "turn_scheduler", None)
-    has_active = turn_scheduler.has_active_turn(conversation_id) if turn_scheduler else False
+    has_active = turn_scheduler.has_running_turn(conversation_id) if turn_scheduler else False
+    has_busy = turn_scheduler.has_active_turn(conversation_id) if turn_scheduler else False
 
     cmd_result = await command_dispatcher.dispatch(
         content,
@@ -625,6 +626,7 @@ async def _try_command_dispatch(
         agent=agent_model,
         user_email=user.email,
         has_active_turn=has_active,
+        has_busy_turn=has_busy,
     )
     if cmd_result is None:
         return None

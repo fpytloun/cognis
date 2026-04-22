@@ -25,6 +25,7 @@ from cognis.core.attachment_utils import (
 from cognis.core.attachment_utils import (
     attachment_placeholder_text as _attachment_placeholder_text,
 )
+from cognis.core.context_budget import resolve_context_budget
 from cognis.core.context_projection import project_messages
 from cognis.core.errors import ImmutablePrefixUnavailable
 from cognis.core.followups import (
@@ -370,7 +371,7 @@ class ContextAssembler:
         llm: Any,
         session_cache: Any,
         session_manager: Any,
-        max_context_tokens: int,
+        max_context_tokens: int | None = None,
         compaction_threshold: float,
         session_factory: async_sessionmaker[AsyncSession] | None = None,
     ) -> None:
@@ -379,7 +380,7 @@ class ContextAssembler:
         self.llm = llm
         self.session_cache = session_cache
         self.session_manager = session_manager
-        self.max_context_tokens = max_context_tokens
+        del max_context_tokens
         self.compaction_threshold = compaction_threshold
         self.session_factory = session_factory
 
@@ -397,9 +398,6 @@ class ContextAssembler:
         """Create a context assembler with DB-backed settings."""
 
         async with session_factory() as db_session:
-            max_context_tokens = await get_setting_value(
-                db_session, "session.max_context_tokens", 250000
-            )
             compaction_threshold = await get_setting_value(
                 db_session, "session.compaction_threshold", 0.85
             )
@@ -409,9 +407,6 @@ class ContextAssembler:
             llm=llm,
             session_cache=session_cache,
             session_manager=session_manager,
-            max_context_tokens=int(max_context_tokens)
-            if isinstance(max_context_tokens, int)
-            else 250000,
             compaction_threshold=float(compaction_threshold)
             if isinstance(compaction_threshold, (int, float))
             else 0.85,
@@ -672,12 +667,13 @@ class ContextAssembler:
         if model_info.model_id == "unknown":
             degraded_sources.append("model_info")
 
-        max_context_tokens = min(self.max_context_tokens, model_info.context_window)
-        reserve_output_tokens = (
-            agent.llm_config.max_tokens
-            if agent.llm_config and agent.llm_config.max_tokens is not None
-            else model_info.max_output_tokens
+        budget = resolve_context_budget(
+            max_context_tokens=model_info.context_window,
+            agent_max_tokens=(agent.llm_config.max_tokens if agent.llm_config else None),
+            model_max_output_tokens=model_info.max_output_tokens,
         )
+        max_context_tokens = budget.max_context_tokens
+        reserve_output_tokens = budget.effective_reserve_output_tokens
         immutable_prefix = self._compose_immutable_prefix(
             agent=agent,
             prompt_context=prompt_context,
@@ -916,8 +912,8 @@ class ContextAssembler:
             self.llm.count_messages_tokens(messages, resolved_model) + tool_schema_tokens
         )
         recommend_compaction = (
-            max_context_tokens > 0
-            and (prompt_tokens / max_context_tokens) >= self.compaction_threshold
+            budget.available_prompt_tokens > 0
+            and (prompt_tokens / budget.available_prompt_tokens) >= self.compaction_threshold
         )
         logger.info(
             "context: assembly completed",
@@ -1025,12 +1021,13 @@ class ContextAssembler:
         if model_info.model_id == "unknown":
             degraded_sources.append("model_info")
 
-        max_context_tokens = min(self.max_context_tokens, model_info.context_window)
-        reserve_output_tokens = (
-            agent.llm_config.max_tokens
-            if agent.llm_config and agent.llm_config.max_tokens is not None
-            else model_info.max_output_tokens
+        budget = resolve_context_budget(
+            max_context_tokens=model_info.context_window,
+            agent_max_tokens=(agent.llm_config.max_tokens if agent.llm_config else None),
+            model_max_output_tokens=model_info.max_output_tokens,
         )
+        max_context_tokens = budget.max_context_tokens
+        reserve_output_tokens = budget.effective_reserve_output_tokens
         prefix_entries = await self._ensure_immutable_prefix(
             session=session,
             agent=agent,
@@ -1232,8 +1229,8 @@ class ContextAssembler:
             self.llm.count_messages_tokens(messages, resolved_model) + tool_schema_tokens
         )
         recommend_compaction = (
-            max_context_tokens > 0
-            and (prompt_tokens / max_context_tokens) >= self.compaction_threshold
+            budget.available_prompt_tokens > 0
+            and (prompt_tokens / budget.available_prompt_tokens) >= self.compaction_threshold
         )
         logger.info(
             "context: assembly completed (skip_memory)",

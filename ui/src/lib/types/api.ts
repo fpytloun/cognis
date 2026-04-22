@@ -1171,6 +1171,14 @@ export interface WebSocketTurnStartedEvent {
   message_id?: string;
 }
 
+export interface WebSocketTurnSettledEvent {
+  type: 'turn_settled';
+  conversation_id?: string;
+  session_id?: string;
+  message_id?: string;
+  queued_count?: number;
+}
+
 export interface WebSocketToolCallEvent {
   type: 'tool_call';
   conversation_id?: string;
@@ -1445,6 +1453,7 @@ export type CognisWebSocketEvent =
   | WebSocketChunkEvent
   | WebSocketChunkGapEvent
   | WebSocketTurnStartedEvent
+  | WebSocketTurnSettledEvent
   | WebSocketMessageCompleteEvent
   | WebSocketToolCallEvent
   | WebSocketToolResultEvent

@@ -1,8 +1,7 @@
 """Integration test: compaction triggers on long conversations.
 
-Lowers the compaction threshold and max_context_tokens settings so that
-a modest number of turns (5-8) crosses the threshold, then verifies
-compaction events appear in the event stream.
+Lowers the compaction threshold so that a modest number of turns can cross
+the threshold, then verifies compaction events appear in the event stream.
 """
 
 from __future__ import annotations
@@ -26,11 +25,6 @@ def test_compaction_triggers_after_threshold_crossed(live_stack: LiveStack, run_
     live = live_stack
 
     # Step 1: Lower settings to trigger compaction sooner
-    # Set max_context_tokens very low so 5-8 turns fill the window
-    live.put(
-        "/api/v1/settings/session.max_context_tokens",
-        json={"value": 2000},
-    )
     live.put(
         "/api/v1/settings/session.compaction_threshold",
         json={"value": 0.3},
@@ -105,10 +99,6 @@ def test_compaction_triggers_after_threshold_crossed(live_stack: LiveStack, run_
         )
 
     # Step 5: Restore settings
-    live.put(
-        "/api/v1/settings/session.max_context_tokens",
-        json={"value": 250000},
-    )
     live.put(
         "/api/v1/settings/session.compaction_threshold",
         json={"value": 0.85},

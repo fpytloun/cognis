@@ -637,7 +637,8 @@ class InboundPipeline:
         agent_model = AgentDefinition.model_validate(agent_to_response(agent_row).model_dump())
         conversation_model = _to_conversation_model(conversation_row)
         session_model = _to_session_model(session_row)
-        has_active = self._turn_scheduler.has_active_turn(conversation_id)
+        has_active = self._turn_scheduler.has_running_turn(conversation_id)
+        has_busy = self._turn_scheduler.has_active_turn(conversation_id)
 
         return await self._command_dispatcher.dispatch(
             content,
@@ -646,6 +647,7 @@ class InboundPipeline:
             agent=agent_model,
             user_email=user_email,
             has_active_turn=has_active,
+            has_busy_turn=has_busy,
         )
 
     async def _try_resolve_pending_question(

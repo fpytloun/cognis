@@ -121,16 +121,18 @@ class CommandDispatcher:
         agent: AgentDefinition,
         user_email: str,
         has_active_turn: bool = False,
+        has_busy_turn: bool | None = None,
     ) -> CommandResult | None:
         """Dispatch a slash command. Returns None if not a command."""
         stripped = command.strip()
         if not stripped.startswith("/"):
             return None
         stripped = f"/{stripped[1:].lstrip()}"
+        has_busy_turn = has_active_turn if has_busy_turn is None else has_busy_turn
 
         # /compact or /summarize
         if stripped in ("/compact", "/summarize"):
-            if has_active_turn:
+            if has_busy_turn:
                 return CommandResult(
                     type="error",
                     text="Cannot compact while a turn is active. Wait for it to finish or cancel it.",
@@ -140,7 +142,7 @@ class CommandDispatcher:
 
         # /new, /reset, /clear
         if stripped in ("/new", "/reset", "/clear"):
-            if has_active_turn:
+            if has_busy_turn:
                 return CommandResult(
                     type="error",
                     text="Cannot reset while a turn is active. Wait for it to finish or cancel it.",
@@ -154,7 +156,11 @@ class CommandDispatcher:
 
         # /info
         if stripped == "/info":
-            return await self._handle_info(session, has_active_turn=has_active_turn)
+            return await self._handle_info(
+                session,
+                has_active_turn=has_active_turn,
+                has_busy_turn=has_busy_turn,
+            )
 
         # /model [name]
         if stripped == "/model" or stripped.startswith("/model "):
@@ -344,7 +350,11 @@ class CommandDispatcher:
         return CommandResult(type="system_message", text="\n".join(lines))
 
     async def _handle_info(
-        self, session: SessionModel, *, has_active_turn: bool = False
+        self,
+        session: SessionModel,
+        *,
+        has_active_turn: bool = False,
+        has_busy_turn: bool | None = None,
     ) -> CommandResult:
         """Handle /info — display session details and statistics."""
         from cognis.core.session import _to_session_model
@@ -362,7 +372,12 @@ class CommandDispatcher:
 
         lines: list[str] = []
 
-        display_status = "running" if has_active_turn else current_session.status
+        if has_active_turn:
+            display_status = "running"
+        elif has_busy_turn:
+            display_status = "settling"
+        else:
+            display_status = current_session.status
         lines.append(f"Session: {current_session.session_id}")
         lines.append(f"Agent: {current_session.agent_id}")
         lines.append(f"Status: {display_status}")
@@ -435,9 +450,9 @@ class CommandDispatcher:
     def _append_context_usage_lines(self, lines: list[str], usage: dict[str, Any]) -> None:
         """Append cached context-usage diagnostics to a command response."""
 
-        lines.append(f"Session configured cap: {usage['max_context_tokens']:,} tokens")
+        lines.append(f"Effective context window: {usage['max_context_tokens']:,} tokens")
         lines.append(
-            f"Current usage: {usage['prompt_tokens']:,} tokens ({usage['percentage']}% of session cap)"
+            f"Current usage: {usage['prompt_tokens']:,} tokens ({usage['percentage']}% of model window)"
         )
 
         reserve_output_tokens = usage.get("reserve_output_tokens")
@@ -450,12 +465,12 @@ class CommandDispatcher:
                 and effective_reserve_output_tokens != reserve_output_tokens
             ):
                 lines.append(
-                    "Reserved output tokens: "
-                    f"{reserve_output_tokens:,} (clamped to "
-                    f"{effective_reserve_output_tokens:,} for loop pressure checks)"
+                    "Requested output tokens: "
+                    f"{reserve_output_tokens:,} (controller reserve: "
+                    f"{effective_reserve_output_tokens:,} for prompt budgeting)"
                 )
             else:
-                lines.append(f"Reserved output tokens: {reserve_output_tokens:,}")
+                lines.append(f"Requested output tokens: {reserve_output_tokens:,}")
 
         effective_prompt_budget = usage.get("effective_prompt_budget")
         if isinstance(effective_prompt_budget, int):

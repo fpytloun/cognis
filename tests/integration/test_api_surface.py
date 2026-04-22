@@ -33,7 +33,7 @@ def test_settings_list_returns_seeded_defaults(
         for item in cat["items"]:
             all_keys.add(item["key"])
 
-    assert "session.max_context_tokens" in all_keys
+    assert "session.max_context_tokens" not in all_keys
     assert "session.step_timeout_seconds" in all_keys
     assert "session.escalation_timeout_seconds" in all_keys
     assert "evaluator.timeout_ms" in all_keys

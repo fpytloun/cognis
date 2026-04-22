@@ -1852,8 +1852,8 @@ import X from 'lucide-svelte/icons/x';
       }
     }
 
-    if (event.type === 'queued' || event.type === 'message_complete') {
-      queuedCount = event.queued_count;
+    if (event.type === 'queued' || event.type === 'message_complete' || event.type === 'turn_settled') {
+      queuedCount = event.queued_count ?? 0;
     }
 
     if (event.type === 'turn_started' || event.type === 'queued') {
@@ -1916,6 +1916,12 @@ import X from 'lucide-svelte/icons/x';
       && shouldAdoptConversationSessionId(currentConversation?.active_session_id, event.type, event.session_id)
     ) {
       syncConversationActiveSession(event.session_id);
+    }
+
+    if (event.type === 'turn_settled') {
+      awaitingAssistantStart = false;
+      turnInProgress = false;
+      directQuestionSubmitting = false;
     }
 
     if (event.type === 'message_complete' || event.type === 'workflow_completed' || event.type === 'workflow_failed' || event.type === 'workflow_cancelled') {

@@ -715,15 +715,15 @@ async def test_context_reports_effective_prompt_budget() -> None:
         session_cache=_SessionCache(
             {
                 "prompt_tokens": 29_000,
-                "max_context_tokens": 250_000,
-                "percentage": 11.6,
+                "max_context_tokens": 1_048_576,
+                "percentage": 2.8,
                 "model": "gpt-5.4",
                 "provider_id": "proxy",
                 "reasoning_effort": None,
                 "reserve_output_tokens": 500_000,
-                "effective_reserve_output_tokens": 62_500,
-                "effective_prompt_budget": 187_500,
-                "loop_pressure_threshold": 178_125,
+                "effective_reserve_output_tokens": 32_768,
+                "effective_prompt_budget": 1_015_808,
+                "loop_pressure_threshold": 965_017,
                 "last_llm_usage": {
                     "prompt_tokens": 12_345,
                     "completion_tokens": 678,
@@ -754,12 +754,13 @@ async def test_context_reports_effective_prompt_budget() -> None:
     assert result is not None
     assert result.text is not None
     assert "Model context window: 1,048,576 tokens" in result.text
+    assert "Effective context window: 1,048,576 tokens" in result.text
     assert (
-        "Reserved output tokens: 500,000 (clamped to 62,500 for loop pressure checks)"
+        "Requested output tokens: 500,000 (controller reserve: 32,768 for prompt budgeting)"
         in result.text
     )
-    assert "Effective prompt budget: 187,500 tokens" in result.text
-    assert "Loop pressure threshold: 178,125 tokens" in result.text
+    assert "Effective prompt budget: 1,015,808 tokens" in result.text
+    assert "Loop pressure threshold: 965,017 tokens" in result.text
     assert "Last LLM call tokens: 12,345 prompt, 678 completion, 13,023 total" in result.text
     assert "Last LLM call cache read tokens: 7,277" in result.text
     assert "Last LLM call cache write tokens: 248" in result.text
@@ -904,6 +905,36 @@ async def test_info_renders_runtime_intaris_and_subsession_metadata(
     assert "Task summary: Research the root cause" in result.text
     assert "Result summary: Prepared the investigation summary" in result.text
     assert "Completion reason: completed" in result.text
+
+
+@pytest.mark.asyncio
+async def test_info_reports_settling_when_turn_is_busy_but_not_running() -> None:
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=None,
+        session_cache=_SessionCache(),
+        compaction_strategy=None,
+        providers=SimpleNamespace(
+            guardrails=_GuardrailsProvider(),
+            llm=SimpleNamespace(get_model_info=None),
+        ),
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+    )
+
+    result = await dispatcher.dispatch(
+        "/info",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+        has_active_turn=False,
+        has_busy_turn=True,
+    )
+
+    assert result is not None
+    assert result.text is not None
+    assert "Status: settling" in result.text
 
 
 @pytest.mark.asyncio

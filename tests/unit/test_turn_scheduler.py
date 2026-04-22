@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -79,6 +80,42 @@ class _RecordingObserver:
 
     async def on_queued(self, conversation_id: str, queued_count: int) -> None:
         self.queued.append(queued_count)
+
+
+@pytest.mark.asyncio
+async def test_has_running_turn_hides_settled_cleanup_state() -> None:
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+    task = asyncio.create_task(asyncio.sleep(60))
+    try:
+        scheduler._active_turns["conv-1"] = task
+        scheduler._turn_controls["conv-1"] = _TurnControl()
+
+        assert scheduler.has_active_turn("conv-1") is True
+        assert scheduler.has_running_turn("conv-1") is True
+
+        scheduler._turn_controls["conv-1"].settled = True
+
+        assert scheduler.has_active_turn("conv-1") is True
+        assert scheduler.has_running_turn("conv-1") is False
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
 
 @pytest.mark.asyncio

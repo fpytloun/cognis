@@ -35,7 +35,6 @@ from cognis.tools.skill_parser import compute_content_hash
 logger = get_logger(__name__)
 
 DEFAULT_SETTINGS: Final[dict[str, tuple[str, object]]] = {
-    "session.max_context_tokens": ("session", 250000),
     "session.compaction_threshold": ("session", 0.85),
     "session.compaction_preserve_turns": ("session", 10),
     "session.step_timeout_seconds": ("session", 3600),
@@ -762,11 +761,6 @@ async def seed_default_settings(session: AsyncSession) -> None:
         if existing is None:
             await upsert_setting(session, key=key, value=value, category=category)
             continue
-
-        # Upgrade the legacy default context cap from 128k to 250k while
-        # preserving any user-customised value.
-        if key == "session.max_context_tokens" and existing.value == 128000 and value == 250000:
-            await upsert_setting(session, key=key, value=value, category=category)
 
 
 async def seed_builtin_management_skills(session: AsyncSession) -> None:

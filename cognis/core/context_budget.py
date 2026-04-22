@@ -1,0 +1,69 @@
+"""Shared context-budget helpers for prompt assembly and loop pressure."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+_RESERVE_FLOOR_TOKENS = 2_048
+_RESERVE_CEILING_TOKENS = 32_768
+_RESERVE_SHARE_DIVISOR = 8
+
+
+@dataclass(frozen=True, slots=True)
+class ContextBudget:
+    """Resolved prompt budget for one model/context window."""
+
+    max_context_tokens: int
+    reserve_output_tokens: int
+    effective_reserve_output_tokens: int
+    available_prompt_tokens: int
+    reserve_clamped: bool
+
+
+def requested_output_tokens(
+    agent_max_tokens: int | None,
+    model_max_output_tokens: int | None,
+) -> int:
+    """Return the requested LLM output ceiling before controller-side adjustment."""
+
+    if isinstance(agent_max_tokens, int) and agent_max_tokens > 0:
+        return agent_max_tokens
+    if isinstance(model_max_output_tokens, int) and model_max_output_tokens > 0:
+        return model_max_output_tokens
+    return 0
+
+
+def resolve_context_budget(
+    *,
+    max_context_tokens: int,
+    agent_max_tokens: int | None,
+    model_max_output_tokens: int | None,
+) -> ContextBudget:
+    """Resolve model window, requested output ceiling, and prompt reserve.
+
+    The provider may still receive the full requested output ceiling. This
+    helper only decides how much prompt headroom the controller reserves when
+    assembling context and enforcing tool-loop pressure checks.
+    """
+
+    max_context_tokens = max(0, int(max_context_tokens or 0))
+    reserve_output_tokens = requested_output_tokens(agent_max_tokens, model_max_output_tokens)
+    effective_reserve_output_tokens = reserve_output_tokens
+    reserve_clamped = False
+
+    if max_context_tokens > 0 and reserve_output_tokens > 0:
+        target_reserve = min(_RESERVE_CEILING_TOKENS, max_context_tokens // _RESERVE_SHARE_DIVISOR)
+        target_reserve = max(_RESERVE_FLOOR_TOKENS, target_reserve)
+        effective_reserve_output_tokens = min(reserve_output_tokens, target_reserve)
+        if effective_reserve_output_tokens >= max_context_tokens:
+            effective_reserve_output_tokens = max(1, max_context_tokens // 4)
+        reserve_clamped = effective_reserve_output_tokens != reserve_output_tokens
+
+    available_prompt_tokens = max(0, max_context_tokens - effective_reserve_output_tokens)
+    return ContextBudget(
+        max_context_tokens=max_context_tokens,
+        reserve_output_tokens=reserve_output_tokens,
+        effective_reserve_output_tokens=effective_reserve_output_tokens,
+        available_prompt_tokens=available_prompt_tokens,
+        reserve_clamped=reserve_clamped,
+    )

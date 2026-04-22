@@ -2338,9 +2338,9 @@ def test_context_pressure_snapshot_clamps_oversized_output_reserve() -> None:
     assert snapshot is not None
     assert snapshot.reserve_clamped is True
     assert snapshot.reserve_output_tokens == 500_000
-    assert snapshot.effective_reserve_output_tokens == 62_500
-    assert snapshot.available_prompt_tokens == 187_500
-    assert snapshot.threshold_prompt_tokens == 178_125
+    assert snapshot.effective_reserve_output_tokens == 31_250
+    assert snapshot.available_prompt_tokens == 218_750
+    assert snapshot.threshold_prompt_tokens == 207_812
     assert snapshot.exceeded is False
 
 

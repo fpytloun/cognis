@@ -189,6 +189,7 @@ class _TurnControl:
     """Mutable state for one active conversation turn."""
 
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
+    settled: bool = False
     turn_observers: list[TurnObserver] = field(default_factory=list)
     absorbed_follow_up_ids: set[str] = field(default_factory=set)
     absorbed_outbound_attachments: list[dict[str, Any]] = field(default_factory=list)
@@ -620,6 +621,19 @@ class TurnScheduler:
         """Check if a turn is currently active for a conversation."""
         active = self._active_turns.get(conversation_id)
         return active is not None and not active.done()
+
+    def has_running_turn(self, conversation_id: str) -> bool:
+        """Check if a turn is still visibly running for the user.
+
+        A turn may remain internally busy for cleanup and queue draining after
+        the user-visible work has settled.
+        """
+
+        active = self._active_turns.get(conversation_id)
+        if active is None or active.done():
+            return False
+        control = self._turn_controls.get(conversation_id)
+        return not bool(control and control.settled)
 
     def queued_count(self, conversation_id: str) -> int:
         """Return the number of queued messages for a conversation."""
@@ -1231,7 +1245,8 @@ class TurnScheduler:
         try:
             current_user_email.set(user_email)
             current_agent_id.set(agent.agent_id)
-            platform_data = conversation.context.platform_data or {}
+            conversation_context = getattr(conversation, "context", None)
+            platform_data = getattr(conversation_context, "platform_data", None) or {}
             current_workspace_root.set(platform_data.get("workspace_root"))
             current_effective_working_directory.set(platform_data.get("working_directory"))
 
@@ -1333,6 +1348,7 @@ class TurnScheduler:
                     delivery_fallback_text=delivery_fallback_text,
                     attachments=normalize_attachment_refs(outbound_attachments or []),
                 )
+                turn_control.settled = True
                 await self._publish_turn_completed(result, turn_observers=turn_observers)
                 TURNS_TOTAL.labels(outcome="delegated").inc()
                 turn_succeeded = True
@@ -1423,6 +1439,7 @@ class TurnScheduler:
                     or None
                 ),
             )
+            turn_control.settled = True
             await self._publish_turn_completed(result, turn_observers=turn_observers)
             TURNS_TOTAL.labels(outcome="completed").inc()
             turn_succeeded = True
@@ -1439,6 +1456,7 @@ class TurnScheduler:
             )
 
         except asyncio.CancelledError:
+            turn_control.settled = True
             error = TurnError(
                 code="turn_cancelled",
                 message="The current turn was cancelled.",
@@ -1465,6 +1483,7 @@ class TurnScheduler:
                 "turn_scheduler: turn failed",
                 extra={"extra_data": {"conversation_id": conversation_id}},
             )
+            turn_control.settled = True
             error = await self._classify_turn_error(exc)
             await self._publish_turn_error(
                 conversation_id,

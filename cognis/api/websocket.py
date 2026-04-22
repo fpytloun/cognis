@@ -911,9 +911,8 @@ async def _handle_message(
 
         # Try command dispatch
         if session_model is not None:
-            has_active = (
-                turn_scheduler.has_active_turn(conversation_id) if turn_scheduler else False
-            )
+            has_active = turn_scheduler.has_running_turn(conversation_id) if turn_scheduler else False
+            has_busy = turn_scheduler.has_active_turn(conversation_id) if turn_scheduler else False
             cmd_result = await command_dispatcher.dispatch(
                 content,
                 conversation=conversation_model,
@@ -921,6 +920,7 @@ async def _handle_message(
                 agent=agent_model,
                 user_email=connection.user_email,
                 has_active_turn=has_active,
+                has_busy_turn=has_busy,
             )
             if cmd_result is not None:
                 await _render_command_result(manager, conversation_id, cmd_result)
@@ -1475,6 +1475,14 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
             "conversation_id": conversation_id,
             "session_id": event.data.get("session_id"),
             "message_id": event.data.get("message_id"),
+        }
+    if event.type == EventType.TURN_COMPLETED:
+        return {
+            "type": "turn_settled",
+            "conversation_id": conversation_id,
+            "session_id": event.data.get("session_id"),
+            "message_id": event.data.get("message_id"),
+            "queued_count": event.data.get("queued_count", 0),
         }
     if event.type == EventType.TASK_STARTED:
         return {

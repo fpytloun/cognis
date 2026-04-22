@@ -694,10 +694,15 @@ async def test_context_assembler_raises_on_cold_cache_event_failure() -> None:
 
 @pytest.mark.asyncio
 async def test_context_assembler_accounts_for_tool_schema_budget() -> None:
+    class _SmallWindowLLM(_LLM):
+        async def get_model_info(self, model_id: str) -> ModelInfo:
+            del model_id
+            return ModelInfo(model_id="test-model", context_window=400, max_output_tokens=128)
+
     assembler = ContextAssembler(
         memory=_Memory(),
         guardrails=_Guardrails(),
-        llm=_LLM(),
+        llm=_SmallWindowLLM(),
         session_cache=_SessionCache(),
         session_manager=_SessionManager(),
         max_context_tokens=400,
