@@ -8,6 +8,7 @@ from cognis.providers.llm.responses_bridge import (
     responses_request_kwargs,
     responses_stream_to_chat_chunks,
     responses_to_chat_response,
+    split_messages_for_responses,
 )
 
 
@@ -60,6 +61,90 @@ def test_messages_to_responses_input_preserves_system_role() -> None:
     result = messages_to_responses_input(messages)
 
     assert result == [{"role": "system", "content": "Follow system instructions."}]
+
+
+def test_split_messages_for_responses_extracts_prefix_into_instructions() -> None:
+    messages = [
+        {"role": "system", "content": "Immutable persona block.", "_immutable_prefix": True},
+        {"role": "system", "content": "Project AGENTS.md"},
+        {"role": "user", "content": "Hello"},
+    ]
+
+    instructions, tail = split_messages_for_responses(messages, cache_breakpoint_index=0)
+
+    assert instructions == "Immutable persona block."
+    assert tail == [
+        {"role": "system", "content": "Project AGENTS.md"},
+        {"role": "user", "content": "Hello"},
+    ]
+
+
+def test_split_messages_for_responses_joins_multiple_prefix_messages() -> None:
+    messages = [
+        {"role": "system", "content": "Block A"},
+        {"role": "system", "content": "Block B"},
+        {"role": "user", "content": "Hello"},
+    ]
+
+    instructions, tail = split_messages_for_responses(messages, cache_breakpoint_index=1)
+
+    assert instructions == "Block A\n\nBlock B"
+    assert tail == [{"role": "user", "content": "Hello"}]
+
+
+def test_split_messages_for_responses_handles_content_blocks() -> None:
+    messages = [
+        {
+            "role": "system",
+            "content": [
+                {"type": "text", "text": "Block A"},
+                {"type": "text", "text": "Block B"},
+            ],
+        },
+        {"role": "user", "content": "Hello"},
+    ]
+
+    instructions, tail = split_messages_for_responses(messages, cache_breakpoint_index=0)
+
+    assert instructions == "Block A\n\nBlock B"
+    assert tail == [{"role": "user", "content": "Hello"}]
+
+
+def test_split_messages_for_responses_returns_none_without_breakpoint() -> None:
+    messages = [
+        {"role": "system", "content": "Hello"},
+        {"role": "user", "content": "Hi"},
+    ]
+
+    instructions, tail = split_messages_for_responses(messages, cache_breakpoint_index=None)
+
+    assert instructions is None
+    assert tail == messages
+
+
+def test_split_messages_for_responses_refuses_non_system_prefix() -> None:
+    messages = [
+        {"role": "system", "content": "Persona"},
+        {"role": "user", "content": "Mixed"},
+        {"role": "user", "content": "Tail"},
+    ]
+
+    instructions, tail = split_messages_for_responses(messages, cache_breakpoint_index=1)
+
+    assert instructions is None
+    assert tail == messages
+
+
+def test_split_messages_for_responses_returns_none_for_empty_prefix() -> None:
+    messages = [
+        {"role": "system", "content": ""},
+        {"role": "user", "content": "Hi"},
+    ]
+
+    instructions, tail = split_messages_for_responses(messages, cache_breakpoint_index=0)
+
+    assert instructions is None
+    assert tail == messages
 
 
 def test_responses_to_chat_response_preserves_reasoning_only_payload() -> None:

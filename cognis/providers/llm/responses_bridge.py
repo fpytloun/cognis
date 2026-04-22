@@ -61,6 +61,68 @@ def normalize_openai_model_name(model_name: str) -> str:
     return lowered
 
 
+def split_messages_for_responses(
+    messages: list[dict[str, Any]],
+    cache_breakpoint_index: int | None,
+) -> tuple[str | None, list[dict[str, Any]]]:
+    """Split canonical messages into (instructions, remaining_tail).
+
+    For the OpenAI Responses API, the immutable prompt prefix is carried in
+    the top-level ``instructions`` field rather than embedded in ``input``.
+    That keeps the immutable prefix authoritative server-side (hosted
+    personas like the Codex CLI system prompt cannot override it), keeps the
+    ``input`` array stable to maximize auto-prefix cache hits, and shrinks
+    per-turn payload size.
+
+    Returns ``(None, messages)`` when no valid breakpoint is available so
+    callers can fall back to the legacy input-only shape.
+    """
+
+    if cache_breakpoint_index is None or cache_breakpoint_index < 0:
+        return None, messages
+    if cache_breakpoint_index >= len(messages):
+        return None, messages
+
+    prefix_slice = messages[: cache_breakpoint_index + 1]
+    tail_slice = messages[cache_breakpoint_index + 1 :]
+
+    instructions_parts: list[str] = []
+    for entry in prefix_slice:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("role") != "system":
+            # Non-system messages inside the prefix window cannot be projected
+            # into `instructions`; fall back to legacy shape for safety.
+            return None, messages
+        content = entry.get("content")
+        text = _extract_text_content(content)
+        if text:
+            instructions_parts.append(text)
+
+    if not instructions_parts:
+        return None, messages
+
+    instructions = "\n\n".join(instructions_parts)
+    return instructions, tail_slice
+
+
+def _extract_text_content(content: Any) -> str:
+    """Extract plain text from a message content field (string or blocks)."""
+
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        collected: list[str] = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            text = block.get("text")
+            if isinstance(text, str) and text.strip():
+                collected.append(text.strip())
+        return "\n\n".join(collected)
+    return ""
+
+
 def messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Translate canonical Cognis/OpenAI-chat messages into Responses input."""
 
@@ -685,9 +747,9 @@ def _extract_usage(payload: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(usage)
     normalized.update(
         {
-        "prompt_tokens": usage.get("input_tokens", usage.get("prompt_tokens", 0)),
-        "completion_tokens": usage.get("output_tokens", usage.get("completion_tokens", 0)),
-        "total_tokens": usage.get("total_tokens", 0),
+            "prompt_tokens": usage.get("input_tokens", usage.get("prompt_tokens", 0)),
+            "completion_tokens": usage.get("output_tokens", usage.get("completion_tokens", 0)),
+            "total_tokens": usage.get("total_tokens", 0),
         }
     )
     input_details = usage.get("input_tokens_details")

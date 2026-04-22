@@ -43,6 +43,7 @@ from cognis.providers.llm.responses_bridge import (
     responses_stream_to_chat_chunks,
     responses_to_chat_response,
     should_use_openai_responses,
+    split_messages_for_responses,
 )
 from cognis.store.models import LLMProvider as LLMProviderRow
 from cognis.store.models import ModelRouting
@@ -1373,15 +1374,21 @@ class LiteLLMProvider:
         )
         retry_count_int = int(retry_count) if isinstance(retry_count, int) else 3
         if use_responses_api:
+            responses_instructions, responses_input_messages = split_messages_for_responses(
+                prepared_messages, cache_breakpoint_index
+            )
+            responses_kwargs = responses_request_kwargs(request_kwargs)
+            if responses_instructions is not None:
+                responses_kwargs["instructions"] = responses_instructions
             try:
                 response = await with_llm_retry(
                     litellm.aresponses,
                     model=prefixed_model,
-                    input=messages_to_responses_input(prepared_messages),
+                    input=messages_to_responses_input(responses_input_messages),
                     stream=False,
                     max_retries=retry_count_int,
                     operation=f"generate.responses({prefixed_model})",
-                    **responses_request_kwargs(request_kwargs),
+                    **responses_kwargs,
                 )
             except Exception as exc:
                 openai_tool_search_reason = _openai_tool_search_bad_request_reason(
@@ -1561,15 +1568,21 @@ class LiteLLMProvider:
             },
         )
         if use_responses_api:
+            responses_instructions, responses_input_messages = split_messages_for_responses(
+                prepared_messages, cache_breakpoint_index
+            )
+            responses_kwargs = responses_request_kwargs(request_kwargs)
+            if responses_instructions is not None:
+                responses_kwargs["instructions"] = responses_instructions
             try:
                 stream = await with_llm_retry(
                     litellm.aresponses,
                     model=prefixed_model,
-                    input=messages_to_responses_input(prepared_messages),
+                    input=messages_to_responses_input(responses_input_messages),
                     stream=True,
                     max_retries=int(retry_count) if isinstance(retry_count, int) else 3,
                     operation=f"stream_generate.responses({prefixed_model})",
-                    **responses_request_kwargs(request_kwargs),
+                    **responses_kwargs,
                 )
             except Exception as exc:
                 openai_tool_search_reason = _openai_tool_search_bad_request_reason(
