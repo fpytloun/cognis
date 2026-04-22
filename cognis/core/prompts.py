@@ -70,6 +70,8 @@ _TOOL_GUIDANCE = """\
 - Some tools may be discoverable without being visible by default. When a \
   needed capability is not present in your current visible tool set and \
   `search_tools` is available, call it before assuming the tool is unavailable.
+- If the task explicitly names a skill shown in `<available_skills>`, call \
+  `skill_load` for that skill before generic searches or unrelated tools.
 - Loading a relevant skill with `skill_load` can expose additional skill-defined \
   tools for later model calls in the same turn.
 - When a tool call fails, analyze the error before retrying. Do not retry \

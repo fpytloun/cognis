@@ -291,6 +291,62 @@ def test_prepare_tool_exposure_uses_controller_search_fallback_when_allowed_tool
     assert all(tool["type"] != "namespace" for tool in result.tools)
 
 
+def test_prepare_tool_exposure_keeps_skill_and_tool_output_helpers_visible_under_fallback_cap() -> (
+    None
+):
+    controller_search_schema = {
+        "type": "function",
+        "function": {
+            "name": SEARCH_TOOLS_TOOL.name,
+            "description": SEARCH_TOOLS_TOOL.description,
+            "parameters": SEARCH_TOOLS_TOOL.parameters,
+        },
+    }
+    deferred_mcp = ToolDefinition(
+        name=sanitize_mcp_tool_name("todoist", "find/tasks"),
+        description="Find tasks",
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(type="intaris_mcp", server_name="todoist", raw_tool_name="find/tasks"),
+        category="mcp",
+    )
+    inventory = [
+        _tool("skill_load", category="skill"),
+        _tool("read_tool_output", category="context"),
+        _tool("search_tool_output", category="context"),
+        _tool("list_tool_output_anchors", category="context"),
+        _tool("read_tool_output_anchor", category="context"),
+        _tool("bash", source_type="executor", category="shell"),
+        _tool("web_search", category="web"),
+        deferred_mcp,
+    ]
+
+    result = prepare_tool_exposure(
+        inventory_tools=inventory,
+        controller_tool_schemas=[controller_search_schema],
+        model="gpt-5.4",
+        model_info=ModelInfo(
+            model_id="gpt-5.4",
+            supports_tool_search=True,
+            supports_responses_api=True,
+            supports_openai_namespace_tools=True,
+            supports_openai_allowed_tools=False,
+            max_tools=6,
+        ),
+        discovered_tool_ids=set(),
+    )
+
+    tool_names = [tool["function"]["name"] for tool in result.tools]
+    assert result.debug_metadata["strategy"] == "openai_responses_controller_search_fallback"
+    assert tool_names[0] == "search_tools"
+    assert set(tool_names[1:]) == {
+        "skill_load",
+        "read_tool_output",
+        "search_tool_output",
+        "list_tool_output_anchors",
+        "read_tool_output_anchor",
+    }
+
+
 def test_prepare_tool_exposure_sanitizes_skill_visible_names() -> None:
     skill_tool = ToolDefinition(
         name="skill_git-release__run_release",

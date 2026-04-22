@@ -9,12 +9,21 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from cognis.models.config import ModelInfo
-from cognis.models.tool import ToolDefinition, stable_tool_id
+from cognis.models.tool import ToolDefinition, stable_tool_id, tool_profile_group
 from cognis.providers.llm.responses_bridge import should_use_openai_responses
 from cognis.tools.builtin.tool_search import SEARCH_TOOLS_TOOL
 
 _VISIBLE_TOOL_NAME_PATTERN = re.compile(r"[^a-zA-Z0-9_-]+")
 _MAX_VISIBLE_TOOL_NAME_LENGTH = 64
+_CRITICAL_GENERIC_TOOL_NAMES = frozenset(
+    {
+        "skill_load",
+        "read_tool_output",
+        "search_tool_output",
+        "list_tool_output_anchors",
+        "read_tool_output_anchor",
+    }
+)
 
 
 @dataclass(slots=True)
@@ -392,10 +401,12 @@ def _select_generic_visible_tools(
 
     visible: list[ToolDefinition] = []
     overflowed = False
+    critical_core = [tool for tool in core_tools if _is_critical_generic_tool(tool)]
+    regular_core = [tool for tool in core_tools if not _is_critical_generic_tool(tool)]
     must_include_search = (
         deferred_present or len(core_tools) + len(discovered_tools) > available_slots
     )
-    for tool in discovered_tools:
+    for tool in critical_core:
         if len(visible) >= available_slots:
             overflowed = True
             break
@@ -405,20 +416,21 @@ def _select_generic_visible_tools(
         1 if must_include_search and search_tool is not None and remaining_slots > 0 else 0
     )
     core_budget = max(0, remaining_slots - reserved_for_search)
-    for added_core, tool in enumerate(core_tools, start=1):
-        if added_core > core_budget:
+    noncritical_used = 0
+    for tool in discovered_tools:
+        if noncritical_used >= core_budget:
             overflowed = True
             break
         visible.append(tool)
+        noncritical_used += 1
+    for tool in regular_core:
+        if noncritical_used >= core_budget:
+            overflowed = True
+            break
+        visible.append(tool)
+        noncritical_used += 1
     if reserved_for_search and search_tool is not None:
         visible.append(search_tool)
-    remaining = max(0, available_slots - len(visible))
-    for tool in discovered_tools:
-        if remaining <= 0:
-            overflowed = True
-            break
-        visible.append(tool)
-        remaining -= 1
     if len(core_tools) + len(discovered_tools) > len(visible):
         overflowed = True
     return _unique_tools(visible), overflowed
@@ -468,19 +480,35 @@ def _sanitize_visible_name(name: str) -> str:
     return f"{trimmed}_{suffix}"
 
 
-def _tool_sort_key(tool: ToolDefinition) -> tuple[int, int, str]:
+def _tool_sort_key(tool: ToolDefinition) -> tuple[int, int, int, int, str]:
+    profile_group_priority = {
+        "system": 0,
+        "memory": 1,
+        "filesystem": 2,
+        "shell": 3,
+        "web": 4,
+        "browser": 5,
+        "office": 6,
+        "personal": 7,
+        "communication": 8,
+        "development": 9,
+    }
     category_priority = {
         "system": 0,
-        "datetime": 1,
-        "workflow": 2,
-        "memory": 3,
-        "tool_output": 4,
-        "image": 5,
-        "filesystem": 6,
-        "search": 7,
-        "shell": 8,
-        "web": 9,
-        "mcp": 10,
+        "context": 1,
+        "skill": 2,
+        "datetime": 3,
+        "workflow": 4,
+        "tool_output": 5,
+        "artifact": 6,
+        "schedule": 7,
+        "memory": 8,
+        "image": 9,
+        "filesystem": 10,
+        "search": 11,
+        "shell": 12,
+        "web": 13,
+        "mcp": 14,
     }
     source_priority = {
         "builtin": 0,
@@ -490,7 +518,13 @@ def _tool_sort_key(tool: ToolDefinition) -> tuple[int, int, str]:
         "intaris_mcp": 4,
     }
     return (
+        0 if _is_critical_generic_tool(tool) else 1,
+        profile_group_priority.get(tool_profile_group(tool), 50),
         category_priority.get(tool.category, 50),
         source_priority.get(tool.source.type, 50),
         stable_tool_id(tool),
     )
+
+
+def _is_critical_generic_tool(tool: ToolDefinition) -> bool:
+    return tool.name in _CRITICAL_GENERIC_TOOL_NAMES

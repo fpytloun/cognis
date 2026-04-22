@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from cognis.models.tool import ToolDefinition, ToolSource, stable_tool_id
+from cognis.models.tool import ToolDefinition, ToolSource, stable_tool_id, tool_profile_group
 
 SEARCH_TOOLS_TOOL = ToolDefinition(
     name="search_tools",
@@ -21,7 +21,10 @@ SEARCH_TOOLS_TOOL = ToolDefinition(
             },
             "category": {
                 "type": "string",
-                "description": "Optional category filter such as mcp, filesystem, or system.",
+                "description": (
+                    "Optional category or profile-group filter such as mcp, "
+                    "filesystem, skill, context, or system."
+                ),
             },
             "limit": {
                 "type": "integer",
@@ -50,26 +53,33 @@ def search_inventory(
     normalized_query = query.strip().lower()
     if not normalized_query:
         return []
+    normalized_category = category.strip().lower() if isinstance(category, str) else None
     limit = max(1, min(limit, 20))
     query_terms = [term for term in normalized_query.split() if term]
     matches: list[tuple[int, dict[str, Any]]] = []
     for tool in tools:
         if tool.name == SEARCH_TOOLS_TOOL.name:
             continue
-        if category and tool.category != category:
+        profile_group = tool_profile_group(tool)
+        if normalized_category and normalized_category not in {
+            tool.category.lower(),
+            profile_group.lower(),
+        }:
             continue
         display_name = (
             tool.source.raw_tool_name
             if tool.source.type == "skill" and tool.source.raw_tool_name
             else tool.name
         )
-        haystack = f"{display_name} {tool.description} {tool.category}".lower()
+        haystack = f"{display_name} {tool.description} {tool.category} {profile_group}".lower()
         score = 0
         if normalized_query in display_name.lower():
             score += 50
         if normalized_query in tool.description.lower():
             score += 25
         if normalized_query in tool.category.lower():
+            score += 10
+        if normalized_query in profile_group.lower():
             score += 10
         score += sum(5 for term in query_terms if term in haystack)
         if score <= 0:
@@ -82,6 +92,7 @@ def search_inventory(
                     "name": display_name,
                     "description": tool.description,
                     "category": tool.category,
+                    "profile_group": profile_group,
                     "source": tool.source.model_dump(mode="json"),
                 },
             )
