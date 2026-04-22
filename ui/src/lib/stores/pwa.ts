@@ -142,38 +142,20 @@ export function isIosSafari(): boolean {
 /**
  * Service worker registration.
  *
- * A waiting worker is left to activate on its own after all tabs close
- * (the browser default). We no longer raise an "Update available" banner
- * because it could not be distinguished reliably from the normal fresh
- * registration after a hard reset and ended up nagging on every load.
+ * A waiting worker is left to activate on a future navigation / when all
+ * old tabs close (the browser default). We intentionally avoid any boot-time
+ * cache reset or forced reload here because installed PWAs, especially on
+ * iOS, can get trapped in reload loops if startup eagerly tears down and
+ * re-registers the worker.
  */
 export async function registerServiceWorker(): Promise<void> {
   if (typeof window === 'undefined') return;
   if (!('serviceWorker' in navigator)) return;
 
   try {
-    const registration = await navigator.serviceWorker.register('/service-worker.js', {
+    await navigator.serviceWorker.register('/service-worker.js', {
       type: 'module',
       scope: '/'
-    });
-
-    // We intentionally have no "update available" banner anymore. When a
-    // waiting worker exists while the current page is already controlled, the
-    // safest behavior is to hard-reset caches and reload immediately so the
-    // browser cannot stay stranded on an incompatible old shell.
-    if (navigator.serviceWorker.controller && registration.waiting) {
-      await applyUpdate();
-      return;
-    }
-
-    registration.addEventListener('updatefound', () => {
-      const worker = registration.installing;
-      if (!worker) return;
-      worker.addEventListener('statechange', () => {
-        if (worker.state === 'installed' && navigator.serviceWorker.controller) {
-          void applyUpdate();
-        }
-      });
     });
   } catch (error) {
     // Service worker registration failures are non-fatal.

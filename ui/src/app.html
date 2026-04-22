@@ -41,7 +41,6 @@
     <script>
       (() => {
         const RECOVERY_KEY = 'cognis-startup-recovery-attempted';
-        const RECOVERY_PARAM = '__cognis_recover';
         const CHUNK_ERROR_RE = /Failed to fetch dynamically imported module|Importing a module script failed|ChunkLoadError|error loading dynamically imported module/i;
 
         function extractMessage(value) {
@@ -87,9 +86,7 @@
             document.body.appendChild(wrapper);
             wrapper.querySelector('#cognis-recovery-reload')?.addEventListener('click', async () => {
               await clearCognisCaches().catch(() => {});
-              const url = new URL(window.location.href);
-              url.searchParams.delete(RECOVERY_PARAM);
-              window.location.replace(url.toString());
+              window.location.reload();
             });
           };
 
@@ -101,26 +98,12 @@
         }
 
         async function recoverFromChunkFailure(message) {
-          if (sessionStorage.getItem(RECOVERY_KEY) === '1') {
-            renderRecoveryScreen(message);
-            return;
-          }
-
           sessionStorage.setItem(RECOVERY_KEY, '1');
-          await clearCognisCaches().catch(() => {});
-
-          const url = new URL(window.location.href);
-          url.searchParams.set(RECOVERY_PARAM, '1');
-          window.location.replace(url.toString());
+          renderRecoveryScreen(message);
         }
 
         window.__cognisStartupRecoverySuccess = () => {
           sessionStorage.removeItem(RECOVERY_KEY);
-          const url = new URL(window.location.href);
-          if (url.searchParams.has(RECOVERY_PARAM)) {
-            url.searchParams.delete(RECOVERY_PARAM);
-            window.history.replaceState(window.history.state, '', url.toString());
-          }
         };
 
         window.addEventListener('vite:preloadError', (event) => {
