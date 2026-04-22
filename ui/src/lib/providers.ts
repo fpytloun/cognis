@@ -65,6 +65,7 @@ const MODEL_ENTRY_KEYS: Array<keyof ModelEntry> = [
   'supports_tools', 'supports_streaming', 'supports_vision', 'supports_audio_input',
   'supports_pdf_input', 'supports_file_input', 'supports_reasoning', 'reasoning_efforts',
   'supports_prompt_caching', 'supports_tool_search', 'supports_defer_loading',
+  'supports_openai_namespace_tools', 'supports_openai_allowed_tools',
   'supports_responses_api', 'supports_extended_thinking', 'supports_image_generation',
   'supported_openai_params', 'max_tools', 'input_cost_per_mtok', 'output_cost_per_mtok', 'tier'
 ];

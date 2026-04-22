@@ -6272,7 +6272,10 @@ class AgentLoop:
                             },
                         }
                     )
-                    workflow = validate_composed_workflow(workflow_payload)
+                    workflow = validate_composed_workflow(
+                        workflow_payload,
+                        skill_materials=skill_materials,
+                    )
                 break
             except Exception as exc:
                 validation_feedback = str(exc)

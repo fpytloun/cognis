@@ -174,6 +174,9 @@ describe('provider presets', () => {
       max_output_tokens: 65536,
       supports_vision: true,
       supports_reasoning: true,
+      supports_tool_search: true,
+      supports_openai_namespace_tools: true,
+      supports_openai_allowed_tools: true,
       input_cost_per_mtok: 2.5,
       output_cost_per_mtok: 10.0
     };
@@ -197,6 +200,8 @@ describe('provider presets', () => {
     const form = createProviderForm(richProvider);
     expect(form.models[0].context_window).toBe(1048576);
     expect(form.models[0].supports_vision).toBe(true);
+    expect(form.models[0].supports_openai_namespace_tools).toBe(true);
+    expect(form.models[0].supports_openai_allowed_tools).toBe(true);
     expect(form.models[0].input_cost_per_mtok).toBe(2.5);
 
     // Save and verify properties are preserved
@@ -206,6 +211,9 @@ describe('provider presets', () => {
     expect(models[0].context_window).toBe(1048576);
     expect(models[0].max_output_tokens).toBe(65536);
     expect(models[0].supports_vision).toBe(true);
+    expect(models[0].supports_tool_search).toBe(true);
+    expect(models[0].supports_openai_namespace_tools).toBe(true);
+    expect(models[0].supports_openai_allowed_tools).toBe(true);
     expect(models[0].input_cost_per_mtok).toBe(2.5);
   });
 

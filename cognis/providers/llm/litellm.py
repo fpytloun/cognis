@@ -292,6 +292,20 @@ def _looks_like_image_generation_model(model_name: str) -> bool:
     )
 
 
+def _supports_openai_tool_search_model(model_name: str) -> bool:
+    """Return whether a normalized OpenAI-family model supports Responses tool search."""
+
+    normalized = model_name.strip().lower()
+    if normalized.startswith(("gpt-5-mini", "gpt-5-nano")):
+        return False
+    match = re.match(r"^gpt-(\d+)(?:\.(\d+))?(?:$|[-._])", normalized)
+    if match is None:
+        return False
+    major = int(match.group(1))
+    minor = int(match.group(2) or 0)
+    return (major, minor) >= (5, 4)
+
+
 def _normalize_proxy_model_info(info: dict[str, Any]) -> dict[str, Any]:
     """Convert litellm proxy ``model_info`` fields to Cognis ``ModelInfo`` fields.
 
@@ -922,15 +936,18 @@ class LiteLLMProvider:
                 or model_name.startswith("openai/gpt-4o")
             )
         )
+        supports_openai_tool_search = bool(
+            supports_responses_api and _supports_openai_tool_search_model(model_name)
+        )
         supports_image_generation = _looks_like_image_generation_model(model_name)
         return {
             "supports_defer_loading": is_anthropic,
             "supports_prompt_caching": is_anthropic,
-            "supports_tool_search": supports_responses_api,
+            "supports_tool_search": supports_openai_tool_search,
             "supports_responses_api": supports_responses_api,
             "supports_extended_thinking": False,
-            "supports_openai_namespace_tools": False,
-            "supports_openai_allowed_tools": False,
+            "supports_openai_namespace_tools": supports_openai_tool_search,
+            "supports_openai_allowed_tools": supports_openai_tool_search,
             "supports_image_generation": supports_image_generation,
             "max_tools": 128 if is_openai_like else None,
         }

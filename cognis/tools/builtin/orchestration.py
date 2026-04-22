@@ -591,7 +591,11 @@ CREATE_WORKFLOW_TOOL = ToolDefinition(
             "steps": {
                 "type": "array",
                 "items": {"type": "object"},
-                "description": "Workflow step definitions.",
+                "description": (
+                    "Workflow step definitions. Run steps should usually include step_profile_id, "
+                    "may set step_profile_mode, and may include inline step_profile with tool_overrides "
+                    "and allow_tool_search."
+                ),
             },
         },
         "required": ["name", "steps"],
@@ -615,7 +619,15 @@ UPDATE_WORKFLOW_TOOL = ToolDefinition(
             "tags": {"type": "array", "items": {"type": "string"}},
             "interaction": {"type": "object"},
             "defaults": {"type": "object"},
-            "steps": {"type": "array", "items": {"type": "object"}},
+            "steps": {
+                "type": "array",
+                "items": {"type": "object"},
+                "description": (
+                    "Workflow step definitions. Run steps should usually include step_profile_id, "
+                    "may set step_profile_mode, and may include inline step_profile with tool_overrides "
+                    "and allow_tool_search."
+                ),
+            },
         },
         "required": ["workflow_id"],
     },
@@ -673,12 +685,18 @@ COMPOSE_AND_RUN_WORKFLOW_TOOL = ToolDefinition(
         "type": "object",
         "properties": {
             "intent": {"type": "string", "description": "Distilled statement of the user's goal."},
-            "context": {"type": "string", "description": "Relevant conversation and memory context."},
+            "context": {
+                "type": "string",
+                "description": "Relevant conversation and memory context.",
+            },
             "title": {"type": "string", "description": "Optional task or schedule title override."},
             "expected_output": {"type": "string", "description": "Expected final result shape."},
             "skill_hints": {"type": "array", "items": {"type": "string"}},
             "template_hints": {"type": "array", "items": {"type": "string"}},
-            "base_workflow_id": {"type": "string", "description": "Explicit base workflow to reuse or adapt."},
+            "base_workflow_id": {
+                "type": "string",
+                "description": "Explicit base workflow to reuse or adapt.",
+            },
             "decompose_skills": {
                 "type": "string",
                 "enum": ["auto", "always", "never"],
@@ -711,7 +729,10 @@ COMPOSE_AND_RUN_WORKFLOW_TOOL = ToolDefinition(
                 },
             },
             "persist": {"type": "boolean", "default": False},
-            "agent_id": {"type": "string", "description": "Optional agent override. Omit to use the current agent."},
+            "agent_id": {
+                "type": "string",
+                "description": "Optional agent override. Omit to use the current agent.",
+            },
             "priority": {"type": "integer", "default": 0},
         },
         "required": ["intent"],
@@ -773,7 +794,12 @@ def orchestration_tools(mode: OrchestrationMode = OrchestrationMode.FULL) -> lis
     if mode == OrchestrationMode.DELEGATE_SYNC_ONLY:
         return [_DELEGATE_SYNC_TOOL]
     # FULL mode
-    return _ALL_SUBSESSION_TOOLS + _ALL_TASK_TOOLS + _ALL_WORKFLOW_TOOLS + [COMPOSE_AND_RUN_WORKFLOW_TOOL]
+    return (
+        _ALL_SUBSESSION_TOOLS
+        + _ALL_TASK_TOOLS
+        + _ALL_WORKFLOW_TOOLS
+        + [COMPOSE_AND_RUN_WORKFLOW_TOOL]
+    )
 
 
 def is_orchestration_tool(tool_name: str) -> bool:

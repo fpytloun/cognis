@@ -1643,7 +1643,8 @@ class ContextAssembler:
                 "Review the list above and use skill_load to load any "
                 "skills relevant to the current task. Skills marked as "
                 "attached are preferred defaults for this agent. Follow "
-                "loaded skill instructions carefully. You can also create "
+                "loaded skill instructions carefully. Loading a skill can also "
+                "expose that skill's deferred tools for later model calls. You can also create "
                 "new skills with skill_write to remember procedures for future use.",
             )
             if tagged_skills_guidance:

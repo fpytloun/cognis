@@ -791,7 +791,36 @@ async def test_litellm_provider_infers_openai_responses_capabilities_for_proxy_m
 
     assert model_info.supports_responses_api is True
     assert model_info.supports_tool_search is True
+    assert model_info.supports_openai_namespace_tools is True
+    assert model_info.supports_openai_allowed_tools is True
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_litellm_provider_does_not_infer_tool_search_for_gpt5_mini(
+    tmp_path: object,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="openai",
+                display_name="OpenAI",
+                location="controller",
+                backend="litellm",
+                config={"preset": "openai", "default_model": "gpt-5-mini"},
+                status="active",
+            )
+        )
+        await session.commit()
+
+    provider = LiteLLMProvider(session_factory)
+    model_info = await provider.get_model_info("gpt-5-mini", provider_id="openai")
+
+    assert model_info.supports_responses_api is True
+    assert model_info.supports_tool_search is False
     assert model_info.supports_openai_namespace_tools is False
+    assert model_info.supports_openai_allowed_tools is False
     await engine.dispose()
 
 

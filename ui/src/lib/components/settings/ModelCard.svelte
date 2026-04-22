@@ -28,6 +28,9 @@
     { key: 'supports_reasoning', label: 'reasoning' },
     { key: 'supports_prompt_caching', label: 'prompt-caching' },
     { key: 'supports_responses_api', label: 'responses-api' },
+    { key: 'supports_tool_search', label: 'tool-search' },
+    { key: 'supports_openai_namespace_tools', label: 'namespace-tools' },
+    { key: 'supports_openai_allowed_tools', label: 'allowed-tools' },
     { key: 'supports_image_generation', label: 'image-gen' }
   ];
 

@@ -37,6 +37,8 @@
     { key: 'supports_responses_api', label: 'Responses API' },
     { key: 'supports_tool_search', label: 'Tool search' },
     { key: 'supports_defer_loading', label: 'Defer loading' },
+    { key: 'supports_openai_namespace_tools', label: 'Namespace tools' },
+    { key: 'supports_openai_allowed_tools', label: 'Allowed tools' },
     { key: 'supports_image_generation', label: 'Image generation' }
   ];
 

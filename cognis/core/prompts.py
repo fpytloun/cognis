@@ -67,6 +67,11 @@ _TOOL_GUIDANCE = """\
 - Do not emulate filesystem operations by reading and rewriting file \
   contents when a direct `bash` operation is more appropriate.
 - Prefer the fewest correct tool calls.
+- Some tools may be discoverable without being visible by default. When a \
+  needed capability is not present in your current visible tool set and \
+  `search_tools` is available, call it before assuming the tool is unavailable.
+- Loading a relevant skill with `skill_load` can expose additional skill-defined \
+  tools for later model calls in the same turn.
 - When a tool call fails, analyze the error before retrying. Do not retry \
   blindly.
 - Make independent tool calls in parallel when possible for efficiency.

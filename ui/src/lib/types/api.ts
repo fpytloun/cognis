@@ -969,6 +969,8 @@ export interface ModelEntry {
   supports_prompt_caching: boolean;
   supports_tool_search: boolean;
   supports_defer_loading: boolean;
+  supports_openai_namespace_tools: boolean;
+  supports_openai_allowed_tools: boolean;
   supports_responses_api: boolean;
   supports_extended_thinking: boolean;
   supports_image_generation: boolean;
@@ -995,6 +997,8 @@ export function defaultModelEntry(modelId: string): ModelEntry {
     supports_prompt_caching: false,
     supports_tool_search: false,
     supports_defer_loading: false,
+    supports_openai_namespace_tools: false,
+    supports_openai_allowed_tools: false,
     supports_responses_api: false,
     supports_extended_thinking: false,
     supports_image_generation: false,

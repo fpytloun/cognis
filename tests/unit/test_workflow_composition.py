@@ -4,6 +4,7 @@ import asyncio
 import json
 
 from cognis.core.workflow_composition import (
+    SkillMaterial,
     compose_workflow_plan,
     decompose_skill_material,
     validate_composed_workflow,
@@ -16,7 +17,9 @@ class _FallbackLLM:
         self.payload = payload
         self.calls: list[dict[str, object]] = []
 
-    async def generate(self, messages: list[dict[str, object]], **kwargs: object) -> dict[str, object]:
+    async def generate(
+        self, messages: list[dict[str, object]], **kwargs: object
+    ) -> dict[str, object]:
         self.calls.append({"messages": messages, **kwargs})
         if "response_format" in kwargs:
             raise TimeoutError()
@@ -125,6 +128,44 @@ def test_decompose_skill_material_retries_without_response_format_after_timeout(
     assert "max_tokens" not in llm.calls[1]
 
 
+def test_decompose_skill_material_assigns_step_profiles_for_skill_tools() -> None:
+    llm = _FallbackLLM(
+        {
+            "rationale": "Run the skill tool and summarize the result.",
+            "steps": [
+                {
+                    "name": "execute",
+                    "type": "run",
+                    "prompt": "Run the release helper.",
+                    "require_deliverable": False,
+                }
+            ],
+        }
+    )
+
+    result = asyncio.run(
+        decompose_skill_material(
+            llm=llm,
+            skill_id="skill_release",
+            name="Release",
+            description="Run the release automation.",
+            instructions="Use the release helper and summarize the result.",
+            tools=[
+                {
+                    "name": "run_release",
+                    "description": "Execute the release workflow.",
+                }
+            ],
+            prompt_templates={},
+            timeout_seconds=6.0,
+        )
+    )
+
+    assert result.steps[0]["step_profile_id"] == "system:general-task"
+    assert result.steps[0]["step_profile_mode"] == "hard"
+    assert result.steps[0]["step_profile"]["tool_overrides"]["include"] == ["run_release"]
+
+
 def test_compose_workflow_plan_retries_without_response_format_after_timeout() -> None:
     llm = _FallbackLLM(
         {
@@ -156,3 +197,44 @@ def test_compose_workflow_plan_retries_without_response_format_after_timeout() -
     assert len(llm.calls) == 2
     assert "max_tokens" not in llm.calls[0]
     assert "max_tokens" not in llm.calls[1]
+
+
+def test_validate_composed_workflow_normalizes_missing_step_profiles_from_skill_materials() -> None:
+    workflow = validate_composed_workflow(
+        {
+            "workflow_id": "wf_preview",
+            "name": "Skill Workflow",
+            "steps": [
+                {
+                    "name": "execute",
+                    "type": "run",
+                    "prompt": "Run the skill tool.",
+                },
+                {
+                    "name": "summarize",
+                    "type": "run",
+                    "agent_override": "system:implement",
+                    "prompt": "Summarize the result.",
+                },
+            ],
+        },
+        skill_materials=[
+            SkillMaterial(
+                skill_id="skill_release",
+                name="Release",
+                instructions="Run release automation.",
+                tools=[
+                    {
+                        "name": "run_release",
+                        "description": "Execute the release workflow.",
+                    }
+                ],
+            )
+        ],
+    )
+
+    assert workflow.steps[0].step_profile_id == "system:general-task"
+    assert str(workflow.steps[0].step_profile_mode) == "hard"
+    assert workflow.steps[0].step_profile is not None
+    assert workflow.steps[0].step_profile.tool_overrides.include == ["run_release"]
+    assert workflow.steps[1].step_profile_id == "system:coding"
