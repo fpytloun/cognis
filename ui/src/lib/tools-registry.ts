@@ -149,7 +149,7 @@ export function formatMcpCommand(command: string | null, args: string[]): string
 
 export function buildRegistryWarnings(state: RegistryLoadState): string[] {
   const warnings: string[] = [];
-  if (!state.staticTools) warnings.push('Static tool registry failed to load.');
+  if (!state.staticTools) warnings.push('Native tool registry failed to load.');
   if (!state.intarisMcpTools) warnings.push('Intaris MCP tools are unavailable right now.');
   if (!state.observedLocalMcpTools) warnings.push('Cached local MCP tool inventory is unavailable right now.');
   if (!state.skills) warnings.push('Skills failed to load.');

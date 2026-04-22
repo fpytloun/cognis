@@ -421,7 +421,7 @@ import Server from 'lucide-svelte/icons/server';
 
   <div class="flex gap-1 mb-6 border-b border-zinc-700 overflow-x-auto">
     <button class="px-4 py-2 text-sm font-medium transition-colors whitespace-nowrap {activeTab === 'builtin' ? 'text-blue-400 border-b-2 border-blue-400' : 'text-zinc-400 hover:text-zinc-200'}" onclick={() => activeTab = 'builtin'}>
-      Built-in Tools ({staticTools.length})
+      Native Tools ({staticTools.length})
     </button>
     <button class="px-4 py-2 text-sm font-medium transition-colors whitespace-nowrap {activeTab === 'intaris_mcp' ? 'text-blue-400 border-b-2 border-blue-400' : 'text-zinc-400 hover:text-zinc-200'}" onclick={() => activeTab = 'intaris_mcp'}>
       Intaris MCP ({intarisMcpTools.length})
@@ -440,7 +440,7 @@ import Server from 'lucide-svelte/icons/server';
   {:else if activeTab === 'builtin'}
     <div class="space-y-4">
       {#if registryWarnings.some(w => w.includes('Static'))}
-        <div class="rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-2 text-sm text-amber-200">Static tool registry failed to load.</div>
+        <div class="rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-2 text-sm text-amber-200">Native tool registry failed to load.</div>
       {/if}
 
       <div class="flex gap-3 items-center flex-wrap">
