@@ -20,13 +20,13 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 def resolve_ui_build_dir() -> Path | None:
     """Return the preferred built UI directory if bundled assets exist."""
 
-    package_dir = Path(__file__).resolve().parent / "ui_dist"
-    if (package_dir / "index.html").exists():
-        return package_dir
-
     repo_dir = Path(__file__).resolve().parents[1] / "ui" / "build"
     if (repo_dir / "index.html").exists():
         return repo_dir
+
+    package_dir = Path(__file__).resolve().parent / "ui_dist"
+    if (package_dir / "index.html").exists():
+        return package_dir
 
     return None
 

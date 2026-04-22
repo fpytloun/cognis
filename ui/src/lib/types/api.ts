@@ -39,6 +39,9 @@ export interface TokenResponse {
 export interface AuthSessionResponse {
   user: UserSummary;
   expires_at: string;
+  token?: string | null;
+  refresh_token?: string | null;
+  expires_in?: number | null;
 }
 
 export interface ExchangeTokenResponse {

@@ -96,10 +96,26 @@ def _browser_session_max_age(request: Request) -> int:
     return max(60, ttl)
 
 
-def _auth_session_body(*, email: str, name: str | None, role: str, expires_at: datetime) -> AuthSessionResponse:
+def _legacy_token_ttl(request: Request) -> int:
+    return int(getattr(request.app.state.auth_provider, "token_ttl_seconds", 3600) or 3600)
+
+
+def _auth_session_body(
+    request: Request,
+    *,
+    email: str,
+    name: str | None,
+    role: str,
+    expires_at: datetime,
+) -> AuthSessionResponse:
+    access_token = request.app.state.auth_provider.sign_access_token(email, name, role)
+    refresh_token = request.app.state.auth_provider.sign_refresh_token(email)
     return AuthSessionResponse(
         user={"email": email, "name": name, "role": role},
         expires_at=expires_at,
+        token=access_token,
+        refresh_token=refresh_token,
+        expires_in=_legacy_token_ttl(request),
     )
 
 
@@ -174,6 +190,7 @@ async def login(request: Request, payload: LoginRequest) -> AuthSessionResponse:
         )
         await session.commit()
         body = _auth_session_body(
+            request,
             email=user.email,
             name=user.name,
             role=user.role,
@@ -186,32 +203,50 @@ async def login(request: Request, payload: LoginRequest) -> AuthSessionResponse:
 
 @router.post("/api/auth/refresh", response_model=AuthSessionResponse)
 async def refresh(request: Request, payload: RefreshRequest | None = None) -> AuthSessionResponse:
-    del payload
     raw_token = request.cookies.get(COOKIE_NAME)
-    if not raw_token:
-        raise HTTPException(status_code=401, detail="No active browser session")
 
     app_state = request.app.state
     async with app_state.session_factory() as session:
-        browser_session = await get_browser_session_by_token(session, raw_token)
-        if browser_session is None or browser_session.revoked_at is not None:
-            raise HTTPException(status_code=401, detail="Invalid browser session")
-        if browser_session.expires_at <= datetime.now(UTC):
-            raise HTTPException(status_code=401, detail="Browser session expired")
-        user = await get_user(session, browser_session.user_email)
+        user = None
+        browser_session = None
+
+        if raw_token:
+            browser_session = await get_browser_session_by_token(session, raw_token)
+            if browser_session is None or browser_session.revoked_at is not None:
+                raise HTTPException(status_code=401, detail="Invalid browser session")
+            if browser_session.expires_at <= datetime.now(UTC):
+                raise HTTPException(status_code=401, detail="Browser session expired")
+            user = await get_user(session, browser_session.user_email)
+        elif payload and payload.refresh_token:
+            try:
+                claims = app_state.auth_provider.verify_jwt(payload.refresh_token, audience=["cognis"])
+            except Exception as exc:
+                raise HTTPException(status_code=401, detail="Invalid refresh token") from exc
+            if claims.get("typ") != "refresh":
+                raise HTTPException(status_code=401, detail="Invalid refresh token")
+            user = await get_user(session, str(claims["sub"]))
+            if user is not None:
+                browser_session, raw_token = await create_browser_session(
+                    session,
+                    user_email=user.email,
+                    expires_at=_browser_session_expiry(request),
+                    user_agent=request.headers.get("user-agent"),
+                )
+        else:
+            raise HTTPException(status_code=401, detail="No active browser session")
+
         if user is None:
             raise HTTPException(status_code=401, detail="Unknown user")
         if not user.is_active:
             raise HTTPException(status_code=403, detail="Account disabled")
 
         refreshed_expiry = _browser_session_expiry(request)
-        browser_session = await touch_browser_session(
-            session,
-            browser_session,
-            expires_at=refreshed_expiry,
-        )
+        if browser_session is None:
+            raise HTTPException(status_code=401, detail="No active browser session")
+        browser_session = await touch_browser_session(session, browser_session, expires_at=refreshed_expiry)
         await session.commit()
         body = _auth_session_body(
+            request,
             email=user.email,
             name=user.name,
             role=user.role,

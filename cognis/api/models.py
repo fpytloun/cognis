@@ -60,6 +60,9 @@ class TokenResponse(BaseModel):
 class AuthSessionResponse(BaseModel):
     user: dict[str, Any]
     expires_at: datetime
+    token: str | None = None
+    refresh_token: str | None = None
+    expires_in: int | None = None
 
 
 class ExchangeTokenResponse(BaseModel):

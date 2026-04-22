@@ -152,9 +152,28 @@ export async function registerServiceWorker(): Promise<void> {
   if (!('serviceWorker' in navigator)) return;
 
   try {
-    await navigator.serviceWorker.register('/service-worker.js', {
+    const registration = await navigator.serviceWorker.register('/service-worker.js', {
       type: 'module',
       scope: '/'
+    });
+
+    // We intentionally have no "update available" banner anymore. When a
+    // waiting worker exists while the current page is already controlled, the
+    // safest behavior is to hard-reset caches and reload immediately so the
+    // browser cannot stay stranded on an incompatible old shell.
+    if (navigator.serviceWorker.controller && registration.waiting) {
+      await applyUpdate();
+      return;
+    }
+
+    registration.addEventListener('updatefound', () => {
+      const worker = registration.installing;
+      if (!worker) return;
+      worker.addEventListener('statechange', () => {
+        if (worker.state === 'installed' && navigator.serviceWorker.controller) {
+          void applyUpdate();
+        }
+      });
     });
   } catch (error) {
     // Service worker registration failures are non-fatal.
