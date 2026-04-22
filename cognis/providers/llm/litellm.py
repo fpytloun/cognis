@@ -18,6 +18,7 @@ from prometheus_client import Counter
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from cognis.core.tool_exposure import LLMApiMode, ToolDiscoveryMode, ToolExposureContract
 from cognis.logging import get_logger
 from cognis.models.config import (
     DEFAULT_MODEL_INFO,
@@ -1038,6 +1039,39 @@ class LiteLLMProvider:
             model_info=model_info,
             rollout_mode=self._responses_rollout_mode(),
         )
+
+    async def resolve_tool_exposure_contract(
+        self,
+        *,
+        model_id: str,
+        model_info: ModelInfo,
+        provider_id: str | None,
+        allow_tool_search: bool,
+    ) -> ToolExposureContract:
+        """Resolve the runtime transport + discovery contract for one turn."""
+
+        provider: LLMProviderRow | None = None
+        if provider_id is not None:
+            async with self._session_factory() as session:
+                provider = await session.get(LLMProviderRow, provider_id)
+
+        use_responses_api = self._should_use_responses_api(
+            model_id,
+            model_info,
+            provider,
+            is_json_mode_request=False,
+        )
+        llm_api = LLMApiMode.RESPONSES if use_responses_api else LLMApiMode.CHAT_COMPLETIONS
+
+        # Cognis uses controller-managed `search_tools` as the canonical
+        # model-facing discovery interface. Native provider discovery may still
+        # exist internally in the future, but it should not change the tool name
+        # or prompt contract presented to the model.
+        discovery_mode = (
+            ToolDiscoveryMode.CONTROLLER_SEARCH if allow_tool_search else ToolDiscoveryMode.NONE
+        )
+
+        return ToolExposureContract(llm_api=llm_api, discovery_mode=discovery_mode)
 
     def invalidate_json_mode_cache_for_provider(self, provider_id: str) -> None:
         """Clear any JSON-mode broken-key entries matching the given provider.

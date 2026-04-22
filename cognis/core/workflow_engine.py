@@ -866,6 +866,8 @@ class WorkflowEngine:
             completion_delivery=task.completion_delivery,
             workspace_root=task.workspace_root,
             working_directory=task.working_directory,
+            workspace_root_explicit=bool(task.workspace_root),
+            working_directory_explicit=bool(task.working_directory),
             step_run_id=step_run_id,
             policy=step_policy,
             is_retry=is_retry,

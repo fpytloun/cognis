@@ -419,6 +419,12 @@ class CommandDispatcher:
             strategy = tool_runtime.get("strategy")
             if isinstance(strategy, str) and strategy:
                 lines.append(f"Tool exposure mode: {strategy}")
+            llm_api = tool_runtime.get("llm_api")
+            if isinstance(llm_api, str) and llm_api:
+                lines.append(f"LLM API: {llm_api}")
+            discovery_mode = tool_runtime.get("discovery_mode")
+            if isinstance(discovery_mode, str) and discovery_mode:
+                lines.append(f"Tool discovery: {discovery_mode}")
             step_profile_id = tool_runtime.get("step_profile_id")
             step_profile_mode = tool_runtime.get("step_profile_mode")
             if isinstance(step_profile_id, str) and step_profile_id:

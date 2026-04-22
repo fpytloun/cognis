@@ -84,8 +84,6 @@ _PINNED_DEFAULT_VISIBLE_TOOL_IDENTIFIERS = (
     "read_tool_output_anchor",
     "get_current_datetime",
     "convert_timezone",
-    "list_agents",
-    "get_status",
 )
 
 STEP_PROFILE_OVERRIDES_SETTING_KEY = "workflow.step_profile_overrides"

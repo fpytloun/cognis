@@ -435,6 +435,7 @@ class ContextAssembler:
         executor_environment: ExecutorEnvironmentSnapshot | None = None,
         workspace_root: str | None = None,
         effective_working_directory: str | None = None,
+        include_project_context: bool = True,
     ) -> ContextAssemblyResult:
         """Build the LLM message list for a single turn.
 
@@ -708,7 +709,8 @@ class ContextAssembler:
                 {"role": "system", "content": immutable_prefix, "_immutable_prefix": True}
             )
 
-        messages.extend(self._project_context_messages(session.session_id))
+        if include_project_context:
+            messages.extend(self._project_context_messages(session.session_id))
 
         # ----- Mutable suffix -----
 

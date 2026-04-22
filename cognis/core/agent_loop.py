@@ -69,7 +69,12 @@ from cognis.core.step_profiles import (
 )
 from cognis.core.title_policy import sync_intaris_title
 from cognis.core.tool_arguments import ToolArgumentError, validate_tool_arguments
-from cognis.core.tool_exposure import prepare_tool_exposure
+from cognis.core.tool_exposure import (
+    LLMApiMode,
+    ToolDiscoveryMode,
+    ToolExposureContract,
+    prepare_tool_exposure,
+)
 from cognis.core.truncation import middle_truncate
 from cognis.json_stream import merge_incremental_json_fragment, recover_trailing_json_object
 from cognis.logging import get_logger
@@ -1168,6 +1173,8 @@ class StepContext:
     completion_delivery: CompletionDeliveryPolicy = field(default_factory=CompletionDeliveryPolicy)
     workspace_root: str | None = None
     working_directory: str | None = None
+    workspace_root_explicit: bool = False
+    working_directory_explicit: bool = False
     step_run_id: str | None = None
     deliverable_step_run_id: str | None = None
     policy: ExecutionPolicy = field(default_factory=lambda: CHAT_POLICY)
@@ -2036,6 +2043,9 @@ class AgentLoop:
                 executor_environment=ctx.executor_environment,
                 workspace_root=ctx.workspace_root,
                 effective_working_directory=ctx.working_directory,
+                include_project_context=(
+                    ctx.workspace_root_explicit or ctx.working_directory_explicit
+                ),
             )
         except ImmutablePrefixUnavailable:
             await self._record_system_notice_audit(
@@ -2082,6 +2092,7 @@ class AgentLoop:
         _MAX_OPENAI_TOOL_SEARCH_RETRIES = 1
         saved_partial_tool_calls: dict[int, dict[str, Any]] | None = None
         discovered_tool_ids = self._get_initial_discovered_tool_ids(ctx)
+        queued_discovery_guidance_mode: ToolDiscoveryMode | None = None
         collected_attachments: list[dict[str, Any]] = []
         pending_assistant_attachments: list[dict[str, Any]] = []
         continued_assistant_content = ""
@@ -2184,6 +2195,26 @@ class AgentLoop:
                 if resolved_profile.config is not None
                 else True
             )
+            exposure_contract = ToolExposureContract(
+                llm_api=LLMApiMode.CHAT_COMPLETIONS,
+                discovery_mode=(
+                    ToolDiscoveryMode.CONTROLLER_SEARCH
+                    if allow_tool_search
+                    else ToolDiscoveryMode.NONE
+                ),
+            )
+            resolve_tool_exposure_contract = getattr(
+                self.providers.llm,
+                "resolve_tool_exposure_contract",
+                None,
+            )
+            if callable(resolve_tool_exposure_contract):
+                exposure_contract = await resolve_tool_exposure_contract(
+                    model_id=current_model,
+                    model_info=model_info,
+                    provider_id=current_provider_id,
+                    allow_tool_search=allow_tool_search,
+                )
             if registry is not None:
                 if self._session_factory is not None:
                     classified_inventory = await resolve_tool_classifications(
@@ -2212,8 +2243,8 @@ class AgentLoop:
             exposure = prepare_tool_exposure(
                 inventory_tools=searchable_inventory_tools,
                 controller_tool_schemas=controller_tool_schemas,
-                model=current_model,
                 model_info=model_info,
+                contract=exposure_contract,
                 discovered_tool_ids=discovered_tool_ids,
                 default_visible_tool_ids=default_visible_tool_ids,
                 allow_tool_search=allow_tool_search,
@@ -2235,6 +2266,16 @@ class AgentLoop:
                             else None
                         ),
                         "allow_tool_search": allow_tool_search,
+                        "llm_api": str(exposure_contract.llm_api),
+                        "discovery_mode": (
+                            str(ToolDiscoveryMode.CONTROLLER_SEARCH)
+                            if any(
+                                tool.get("function", {}).get("name") == SEARCH_TOOLS_TOOL.name
+                                for tool in exposure.tools
+                                if isinstance(tool, dict)
+                            )
+                            else str(ToolDiscoveryMode.NONE)
+                        ),
                         "inventory_tool_count": exposure.debug_metadata.get("inventory_tool_count"),
                         "visible_tool_count": exposure.debug_metadata.get("visible_tool_count"),
                         "deferred_tool_count": exposure.debug_metadata.get("deferred_tool_count"),
@@ -2243,6 +2284,36 @@ class AgentLoop:
                         ),
                     },
                 )
+            search_tools_visible = any(
+                tool.get("function", {}).get("name") == SEARCH_TOOLS_TOOL.name
+                for tool in exposure.tools
+                if isinstance(tool, dict)
+            )
+            effective_discovery_mode = (
+                ToolDiscoveryMode.CONTROLLER_SEARCH
+                if search_tools_visible
+                else ToolDiscoveryMode.NONE
+            )
+            if queued_discovery_guidance_mode != effective_discovery_mode:
+                if effective_discovery_mode == ToolDiscoveryMode.CONTROLLER_SEARCH:
+                    _queue_audit_message(
+                        role="system",
+                        source="tool_discovery_guidance",
+                        content=(
+                            "Additional tools may be available but hidden by the current step profile. "
+                            "Use search_tools when you need a capability not currently visible."
+                        ),
+                    )
+                else:
+                    _queue_audit_message(
+                        role="system",
+                        source="tool_discovery_guidance",
+                        content=(
+                            "Only the currently visible tools are available for this turn. "
+                            "Do not assume hidden tools can be searched or loaded."
+                        ),
+                    )
+                queued_discovery_guidance_mode = effective_discovery_mode
             logger.debug(
                 "Prepared tool exposure",
                 extra={
@@ -7968,6 +8039,8 @@ class AgentLoop:
         return str(response)
 
     async def _ensure_known_project_context_loaded(self, ctx: StepContext) -> None:
+        if not (ctx.workspace_root_explicit or ctx.working_directory_explicit):
+            return
         known_root = normalize_project_path(ctx.workspace_root)
         known_cwd = normalize_project_path(ctx.working_directory)
         if known_root is None and known_cwd is None:
@@ -7995,6 +8068,8 @@ class AgentLoop:
         if probe_arguments is None:
             return None
         if not probe_arguments.get("explicit_path"):
+            if not (ctx.workspace_root_explicit or ctx.working_directory_explicit):
+                return None
             root_hint = normalize_project_path(ctx.workspace_root)
             if root_hint is not None and self._session_project_context(ctx, root_hint) is not None:
                 return None

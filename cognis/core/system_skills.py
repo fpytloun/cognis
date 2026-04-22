@@ -7,7 +7,6 @@ from typing import Final
 SYSTEM_SKILL_DEFAULTS: Final[dict[str, dict[str, object]]] = {
     "cognis-orchestrator": {
         "skill_id": "cognis-orchestrator",
-        "auto_load": True,
         "content": """---
 name: Cognis Orchestrator
 description: Guidance for deciding when to answer inline, when to use general-task, and when to compose a workflow.

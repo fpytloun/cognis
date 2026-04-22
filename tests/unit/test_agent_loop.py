@@ -1222,7 +1222,7 @@ class _ProjectContextLLM:
                                     "id": "call_list_project",
                                     "function": {
                                         "name": "list_directory",
-                                        "arguments": '{"path":"/workspace/cognis"}',
+                                        "arguments": "{}",
                                     },
                                 }
                             ]
@@ -1232,17 +1232,12 @@ class _ProjectContextLLM:
             }
             return
 
-        assert any(
-            message.get("role") == "system"
-            and "Instructions for project at /workspace/cognis" in str(message.get("content"))
-            for message in messages
-        )
-        assert any(
+        assert not any(
             message.get("role") == "tool"
             and "project_instructions_loaded" in str(message.get("content"))
             for message in messages
         )
-        yield {"choices": [{"delta": {"content": "Done after reading instructions."}}]}
+        yield {"choices": [{"delta": {"content": "Done without implicit project context."}}]}
         return
 
 
@@ -1287,6 +1282,23 @@ class _CrossProjectLLM:
             for message in messages
         )
         yield {"choices": [{"delta": {"content": "Cross-project instructions loaded."}}]}
+
+
+class _ExplicitProjectContextLLM:
+    def __init__(self) -> None:
+        self.calls: list[list[dict[str, object]]] = []
+
+    def count_tokens(self, text: str, model: str | None = None) -> int:
+        del model
+        return len(text)
+
+    async def get_model_info(self, model: str | None) -> SimpleNamespace:
+        del model
+        return _test_model_info()
+
+    async def stream_generate(self, messages: list[dict[str, object]], **_: object):
+        self.calls.append([dict(message) for message in messages])
+        yield {"choices": [{"delta": {"content": "Done with explicit project context."}}]}
         return
 
 
@@ -1355,8 +1367,9 @@ async def _run_reminder_capture(ctx: object) -> list[list[dict[str, object]]]:
 
 
 @pytest.mark.asyncio
-async def test_project_context_is_loaded_before_project_touching_tool_runs() -> None:
+async def test_project_context_is_not_loaded_from_ambient_workdir_only() -> None:
     fake_llm = _ProjectContextLLM()
+    fake_context = _FakeContextAssembler()
     registry = ToolRegistry()
     registry.register(
         RegisteredTool(
@@ -1374,9 +1387,9 @@ async def test_project_context_is_loaded_before_project_touching_tool_runs() -> 
         providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
         session_manager=_NoopSessionManager(),
         session_cache=_NoopSessionCache(),
-        context_assembler=_FakeContextAssembler(),
+        context_assembler=fake_context,
         compaction_strategy=SimpleNamespace(),
-        tool_router=SimpleNamespace(),
+        tool_router=SimpleNamespace(_is_non_bypassable=lambda _name, non_bypassable: non_bypassable),
         remember_queue=_NoopRememberQueue(),
         event_bus=_NoopEventBus(),
         session_lock=SessionLock(),
@@ -1412,8 +1425,9 @@ async def test_project_context_is_loaded_before_project_touching_tool_runs() -> 
     output = await agent_loop.run_step(ctx)
 
     assert output is not None
-    assert output.content == "Done after reading instructions."
+    assert output.content == "Done without implicit project context."
     assert len(fake_llm.calls) == 2
+    assert fake_context.calls[0]["include_project_context"] is False
 
 
 @pytest.mark.asyncio
@@ -1480,6 +1494,58 @@ async def test_explicit_cross_project_path_still_triggers_project_probe() -> Non
     assert output.content == "Cross-project instructions loaded."
     assert len(probe_executor.probes) == 1
     assert probe_executor.probes[0]["path"] == "/workspace/obsidian"
+
+
+@pytest.mark.asyncio
+async def test_explicit_task_workdir_keeps_project_context_autoload() -> None:
+    fake_llm = _ExplicitProjectContextLLM()
+    fake_context = _FakeContextAssembler()
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_ExistingProjectSessionCache(),
+        context_assembler=fake_context,
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(_is_non_bypassable=lambda _name, non_bypassable: non_bypassable),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="task", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-explicit-project",
+            conversation_id="conv-explicit-project",
+            intaris_session_id="sess-explicit-project",
+            mnemory_session_id="mem-explicit-project",
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(
+            conversation_id="conv-explicit-project",
+            context=SimpleNamespace(platform_data={}),
+        ),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+        user_message="Inspect the explicitly configured project",
+        executor_environment=build_local_executor_environment(
+            executor_id="exec-explicit-project",
+            executor_type="in_process",
+            source="test",
+        ),
+        workspace_root="/workspace/current",
+        working_directory="/workspace/current",
+        workspace_root_explicit=True,
+        working_directory_explicit=True,
+        orchestration_mode=OrchestrationMode.FULL,
+    )
+
+    output = await agent_loop.run_step(ctx)
+
+    assert output is not None
+    assert output.content == "Done with explicit project context."
+    assert fake_context.calls[0]["include_project_context"] is True
 
 
 @pytest.mark.asyncio
@@ -1967,12 +2033,10 @@ async def test_user_message_is_persisted_before_reasoning_and_tool_execution() -
     output = await agent_loop.run_step(ctx)
 
     assert output is not None
-    assert order[:4] == [
-        "record:user_message",
-        "reasoning",
-        "record:tool_call",
-        "execute",
-    ]
+    assert order[0] == "record:user_message"
+    assert order[1] == "reasoning"
+    assert "record:system_message" in order
+    assert order.index("record:tool_call") < order.index("execute")
     assert "record:tool_result" in order
     assert "record:assistant_message" in order
 
@@ -2131,14 +2195,13 @@ async def test_agent_loop_retries_with_cached_openai_tool_search_fallback() -> N
     assert output is not None
     assert output.content == "done"
     assert fake_llm.calls == 2
-    assert "tool_search" in fake_llm.tool_sets[0]
-    assert all(name != "search_tools" for name in fake_llm.tool_sets[0])
+    assert "search_tools" in fake_llm.tool_sets[0]
+    assert all(name != "tool_search" for name in fake_llm.tool_sets[0])
     assert "search_tools" in fake_llm.tool_sets[1]
+    assert all(name != "tool_search" for name in fake_llm.tool_sets[1])
     assert all(not name.startswith("mcp_") for name in fake_llm.tool_sets[1])
     assert session_cache.tool_runtime_info is not None
-    assert (
-        session_cache.tool_runtime_info["strategy"] == "openai_responses_controller_search_fallback"
-    )
+    assert session_cache.tool_runtime_info["strategy"] == "generic_search_tools"
 
 
 @pytest.mark.asyncio

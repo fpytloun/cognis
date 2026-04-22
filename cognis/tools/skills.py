@@ -30,6 +30,8 @@ from cognis.store.queries import list_skill_assets
 
 logger = get_logger(__name__)
 
+_SCOPED_SYSTEM_SKILL_IDS = frozenset({"cognis-orchestrator"})
+
 _SAFE_SKILL_TOOL_SEGMENT = re.compile(r"[^a-zA-Z0-9_-]+")
 _MAX_SKILL_TOOL_NAME_LENGTH = 64
 
@@ -118,6 +120,7 @@ async def resolve_skills_for_agent(
     agent: AgentDefinition,
     *,
     owner_email: str | None = None,
+    include_scoped_system_skills: bool = False,
 ) -> ResolvedSkillSet:
     """Resolve discoverable skills for an agent from DB.
 
@@ -147,7 +150,11 @@ async def resolve_skills_for_agent(
             sa.or_(SkillRow.owner_email == owner_email, SkillRow.owner_email.is_(None))
         )
     result = await session.execute(stmt)
-    all_skills = {row.skill_id: row for row in result.scalars().all()}
+    all_skills = {
+        row.skill_id: row
+        for row in result.scalars().all()
+        if include_scoped_system_skills or row.skill_id not in _SCOPED_SYSTEM_SKILL_IDS
+    }
 
     # Build ordered list: attached first, then globally attached, then discoverable.
     seen: set[str] = set()
@@ -159,7 +166,11 @@ async def resolve_skills_for_agent(
             seen.add(skill_id)
 
     globally_attached = sorted(
-        (row for row in all_skills.values() if row.auto_load),
+        (
+            row
+            for row in all_skills.values()
+            if row.auto_load and row.skill_id not in _SCOPED_SYSTEM_SKILL_IDS
+        ),
         key=lambda row: (row.name.lower(), row.skill_id),
     )
     for row in globally_attached:
@@ -182,7 +193,9 @@ async def resolve_skills_for_agent(
 
     for skill_id in ordered_skill_ids:
         skill_row = all_skills[skill_id]
-        attached = skill_id in enabled_ids or bool(skill_row.auto_load)
+        attached = skill_id in enabled_ids or bool(
+            skill_row.auto_load and skill_id not in _SCOPED_SYSTEM_SKILL_IDS
+        )
         version_id = skill_row.current_version_id
 
         if version_id:
@@ -251,7 +264,11 @@ async def resolve_skills_for_agent(
                 instructions=skill_row.instructions,
                 tools=tools,
                 prompt_templates=skill_row.prompt_templates or {},
-                steps=[item for item in (getattr(skill_row, "steps", None) or []) if isinstance(item, dict)],
+                steps=[
+                    item
+                    for item in (getattr(skill_row, "steps", None) or [])
+                    if isinstance(item, dict)
+                ],
                 auto_load=skill_row.auto_load,
                 attached=attached,
             )
