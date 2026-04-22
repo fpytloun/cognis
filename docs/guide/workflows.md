@@ -49,7 +49,7 @@ Profiles are expressed as a matrix:
 
 You can start from a shipped preset such as `Direct default`, `General task`, `Research`, `Coding`, or `Review`, then add an inline matrix and explicit include/exclude overrides for the specific step.
 
-Direct chat uses the same mechanism under the hood through the shipped `system:direct` workflow.
+Direct chat uses the same step-profile mechanism under the hood through the shipped `system:direct-default` preset, even though the execution path stays inline instead of materializing a full workflow run.
 
 ## Creating a workflow
 

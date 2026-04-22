@@ -395,6 +395,34 @@ class CommandDispatcher:
         reasoning = self._session_cache.get_reasoning_effort_override(current_session.session_id)
         if reasoning:
             lines.append(f"Thinking effort: {reasoning}")
+        tool_runtime = self._session_cache.get_tool_runtime_info(current_session.session_id)
+        if tool_runtime:
+            strategy = tool_runtime.get("strategy")
+            if isinstance(strategy, str) and strategy:
+                lines.append(f"Tool exposure mode: {strategy}")
+            step_profile_id = tool_runtime.get("step_profile_id")
+            step_profile_mode = tool_runtime.get("step_profile_mode")
+            if isinstance(step_profile_id, str) and step_profile_id:
+                if isinstance(step_profile_mode, str) and step_profile_mode:
+                    lines.append(f"Step profile: {step_profile_id} ({step_profile_mode})")
+                else:
+                    lines.append(f"Step profile: {step_profile_id}")
+            elif isinstance(step_profile_mode, str) and step_profile_mode:
+                lines.append(f"Step profile mode: {step_profile_mode}")
+            allow_tool_search = tool_runtime.get("allow_tool_search")
+            if isinstance(allow_tool_search, bool):
+                lines.append(f"Tool search: {'enabled' if allow_tool_search else 'disabled'}")
+            inventory_tool_count = tool_runtime.get("inventory_tool_count")
+            visible_tool_count = tool_runtime.get("visible_tool_count")
+            deferred_tool_count = tool_runtime.get("deferred_tool_count")
+            discovered_tool_count = tool_runtime.get("discovered_tool_count")
+            if isinstance(visible_tool_count, int) and isinstance(inventory_tool_count, int):
+                tool_summary = [f"{visible_tool_count} visible", f"{inventory_tool_count} eligible"]
+                if isinstance(deferred_tool_count, int):
+                    tool_summary.append(f"{deferred_tool_count} deferred")
+                if isinstance(discovered_tool_count, int):
+                    tool_summary.append(f"{discovered_tool_count} discovered")
+                lines.append(f"Tools: {', '.join(tool_summary)}")
 
         # Intaris session stats
         intaris_sid = current_session.intaris_session_id or current_session.session_id
@@ -486,9 +514,7 @@ class CommandDispatcher:
 
         self._append_last_llm_usage_lines(lines, usage.get("last_llm_usage"))
 
-    def _append_last_llm_usage_lines(
-        self, lines: list[str], usage: dict[str, Any] | None
-    ) -> None:
+    def _append_last_llm_usage_lines(self, lines: list[str], usage: dict[str, Any] | None) -> None:
         """Append provider-reported last-call token usage when available."""
 
         if not isinstance(usage, dict) or not usage:
@@ -497,7 +523,9 @@ class CommandDispatcher:
         prompt_tokens = usage.get("prompt_tokens")
         completion_tokens = usage.get("completion_tokens")
         total_tokens = usage.get("total_tokens")
-        if all(isinstance(value, int) for value in (prompt_tokens, completion_tokens, total_tokens)):
+        if all(
+            isinstance(value, int) for value in (prompt_tokens, completion_tokens, total_tokens)
+        ):
             lines.append(
                 "Last LLM call tokens: "
                 f"{prompt_tokens:,} prompt, {completion_tokens:,} completion, {total_tokens:,} total"

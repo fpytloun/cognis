@@ -57,8 +57,13 @@ class _TurnScheduler:
 
 
 class _SessionCache:
-    def __init__(self, usage: dict[str, object] | None = None) -> None:
+    def __init__(
+        self,
+        usage: dict[str, object] | None = None,
+        tool_runtime_info: dict[str, object] | None = None,
+    ) -> None:
         self.usage = usage
+        self.tool_runtime_info = tool_runtime_info
         self.reasoning_effort_override: str | None = None
 
     def get_context_usage(self, _: str) -> dict[str, object] | None:
@@ -69,6 +74,9 @@ class _SessionCache:
 
     def get_reasoning_effort_override(self, _: str) -> str | None:
         return self.reasoning_effort_override
+
+    def get_tool_runtime_info(self, _: str) -> dict[str, object] | None:
+        return self.tool_runtime_info
 
     def set_reasoning_effort_override(self, _: str, effort: str | None) -> None:
         self.reasoning_effort_override = effort
@@ -831,7 +839,10 @@ async def test_thinking_command_remaps_generic_level_to_current_model() -> None:
     )
 
     assert result is not None
-    assert result.text == "Thinking effort set to: xhigh (mapped from max)\nTakes effect on next message."
+    assert (
+        result.text
+        == "Thinking effort set to: xhigh (mapped from max)\nTakes effect on next message."
+    )
     assert cache.reasoning_effort_override == "xhigh"
 
 
@@ -873,7 +884,18 @@ async def test_info_renders_runtime_intaris_and_subsession_metadata(
     dispatcher = CommandDispatcher(
         session_factory=_SessionFactory(),
         session_manager=None,
-        session_cache=_SessionCache(),
+        session_cache=_SessionCache(
+            tool_runtime_info={
+                "strategy": "openai_responses_controller_search_fallback",
+                "step_profile_id": "system:direct-default",
+                "step_profile_mode": "soft",
+                "allow_tool_search": True,
+                "inventory_tool_count": 12,
+                "visible_tool_count": 4,
+                "deferred_tool_count": 8,
+                "discovered_tool_count": 1,
+            }
+        ),
         compaction_strategy=None,
         providers=SimpleNamespace(
             guardrails=_GuardrailsProvider(),
@@ -905,6 +927,10 @@ async def test_info_renders_runtime_intaris_and_subsession_metadata(
     assert "Task summary: Research the root cause" in result.text
     assert "Result summary: Prepared the investigation summary" in result.text
     assert "Completion reason: completed" in result.text
+    assert "Tool exposure mode: openai_responses_controller_search_fallback" in result.text
+    assert "Step profile: system:direct-default (soft)" in result.text
+    assert "Tool search: enabled" in result.text
+    assert "Tools: 4 visible, 12 eligible, 8 deferred, 1 discovered" in result.text
 
 
 @pytest.mark.asyncio

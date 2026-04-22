@@ -101,6 +101,11 @@ LLM_JSON_MODE_TRANSPORT_FLIP_TOTAL = Counter(
     "JSON-mode transport fallbacks (Responses API empty / BadRequest / cached-broken).",
     labelnames=("provider_id", "model", "reason"),
 )
+LLM_OPENAI_TOOL_SEARCH_FALLBACK_TOTAL = Counter(
+    "cognis_llm_openai_tool_search_fallback_total",
+    "Cached downgrades from native OpenAI Responses tool search to controller fallback.",
+    labelnames=("provider_id", "model", "reason"),
+)
 LLM_CACHE_CONTROL_APPLIED_TOTAL = Counter(
     "cognis_llm_cache_control_applied_total",
     "Anthropic-style cache_control hints applied to immutable prompt prefix.",
@@ -135,6 +140,19 @@ _JSON_VALIDATOR_BAD_REQUEST_SIGNATURES: tuple[str, ...] = (
 )
 
 
+class OpenAIToolSearchFallbackRequired(RuntimeError):
+    """Signal that native OpenAI Responses tool search must be downgraded."""
+
+    def __init__(self, *, provider_id: str, model_id: str, reason: str) -> None:
+        self.provider_id = provider_id
+        self.model_id = model_id
+        self.reason = reason
+        super().__init__(
+            "native OpenAI Responses tool search is unsupported for "
+            f"provider={provider_id!r}, model={model_id!r}; reason={reason}"
+        )
+
+
 def _is_json_validator_bad_request(exc: BaseException) -> bool:
     """Return True for BadRequestError messages that look like a JSON validator rejection.
 
@@ -147,6 +165,30 @@ def _is_json_validator_bad_request(exc: BaseException) -> bool:
         return False
     message = str(exc).lower()
     return any(sig in message for sig in _JSON_VALIDATOR_BAD_REQUEST_SIGNATURES)
+
+
+def _openai_tool_search_bad_request_reason(
+    exc: BaseException, request_kwargs: dict[str, Any]
+) -> str | None:
+    """Return a stable reason code when native OpenAI tool search is rejected."""
+
+    if type(exc).__name__ != "BadRequestError":
+        return None
+    tool_choice = request_kwargs.get("tool_choice")
+    if not isinstance(tool_choice, dict) or tool_choice.get("type") != "allowed_tools":
+        return None
+    message = str(exc).lower()
+    if "unknown parameter" in message and "tool_choice.tools" in message:
+        return "tool_choice_tools_unknown"
+    if "unknown parameter" in message and "tool_choice.mode" in message:
+        return "tool_choice_mode_unknown"
+    if "unknown parameter" in message and "tool_choice" in message:
+        return "tool_choice_unknown"
+    if "allowed_tools" in message and any(token in message for token in ("unsupported", "invalid")):
+        return "allowed_tools_unsupported"
+    if "tool_search" in message and any(token in message for token in ("unsupported", "invalid")):
+        return "tool_search_unsupported"
+    return None
 
 
 def _is_empty_json_mode_response(response_dict: dict[str, Any]) -> bool:
@@ -407,6 +449,12 @@ class LiteLLMProvider:
         # the outgoing kwargs; non-JSON calls are unaffected. Cleared on
         # provider config update via invalidate_json_mode_cache_for_provider.
         self._json_mode_broken_keys: set[tuple[str, str]] = set()
+        # In-process cache of (provider_id, resolved_model) pairs for which
+        # native OpenAI Responses tool_search/allowed_tools handling was
+        # observed to fail. These calls should keep using Responses transport
+        # but downgrade exposure to controller-managed search for the rest of
+        # the process lifetime (or until provider config changes).
+        self._openai_tool_search_broken_keys: set[tuple[str, str]] = set()
 
     @staticmethod
     def _tokenizer_family(model: str) -> str:
@@ -997,6 +1045,81 @@ class LiteLLMProvider:
             key for key in self._json_mode_broken_keys if key[0] != provider_id
         }
 
+    def apply_tool_exposure_runtime_fallbacks(
+        self,
+        model_info: ModelInfo,
+        *,
+        provider_id: str | None,
+        model_id: str,
+    ) -> ModelInfo:
+        """Mask native OpenAI tool-search capabilities for cached-broken models."""
+
+        if (
+            provider_id is None
+            or (provider_id, model_id) not in self._openai_tool_search_broken_keys
+        ):
+            return model_info
+        if not model_info.supports_openai_allowed_tools:
+            return model_info
+        logger.debug(
+            "Using cached controller fallback for OpenAI Responses tool discovery",
+            extra={
+                "extra_data": {
+                    "provider_id": provider_id,
+                    "model": model_id,
+                }
+            },
+        )
+        return model_info.model_copy(
+            update={
+                "supports_openai_allowed_tools": False,
+                "supports_openai_namespace_tools": False,
+            }
+        )
+
+    def invalidate_openai_tool_search_cache_for_provider(self, provider_id: str) -> None:
+        """Clear any cached native-tool-search downgrade entries for a provider."""
+
+        self._openai_tool_search_broken_keys = {
+            key for key in self._openai_tool_search_broken_keys if key[0] != provider_id
+        }
+
+    def invalidate_runtime_capability_cache_for_provider(self, provider_id: str) -> None:
+        """Clear cached per-provider runtime capability downgrades."""
+
+        self.invalidate_json_mode_cache_for_provider(provider_id)
+        self.invalidate_openai_tool_search_cache_for_provider(provider_id)
+
+    def _mark_openai_tool_search_broken(
+        self,
+        provider: LLMProviderRow | None,
+        resolved_model: str,
+        *,
+        reason: str,
+    ) -> None:
+        if provider is None:
+            return
+        key = (provider.provider_id, resolved_model)
+        newly_marked = key not in self._openai_tool_search_broken_keys
+        self._openai_tool_search_broken_keys.add(key)
+        LLM_OPENAI_TOOL_SEARCH_FALLBACK_TOTAL.labels(
+            provider_id=provider.provider_id,
+            model=resolved_model,
+            reason=reason,
+        ).inc()
+        if newly_marked:
+            logger.warning(
+                "Marking model as broken for native OpenAI Responses tool search; "
+                "future requests will use controller fallback until provider config changes",
+                extra={
+                    "extra_data": {
+                        "provider_id": provider.provider_id,
+                        "model": resolved_model,
+                        "reason": reason,
+                    }
+                },
+            )
+
     def _mark_json_mode_broken(
         self,
         provider: LLMProviderRow | None,
@@ -1261,6 +1384,15 @@ class LiteLLMProvider:
                     **responses_request_kwargs(request_kwargs),
                 )
             except Exception as exc:
+                openai_tool_search_reason = _openai_tool_search_bad_request_reason(
+                    exc, request_kwargs
+                )
+                if openai_tool_search_reason is not None:
+                    self._mark_openai_tool_search_broken(
+                        provider,
+                        resolved_model,
+                        reason=openai_tool_search_reason,
+                    )
                 if is_json_mode_request and _is_json_validator_bad_request(exc):
                     return await self._json_mode_fallback_chat_completions(
                         prefixed_model=prefixed_model,
@@ -1429,15 +1561,32 @@ class LiteLLMProvider:
             },
         )
         if use_responses_api:
-            stream = await with_llm_retry(
-                litellm.aresponses,
-                model=prefixed_model,
-                input=messages_to_responses_input(prepared_messages),
-                stream=True,
-                max_retries=int(retry_count) if isinstance(retry_count, int) else 3,
-                operation=f"stream_generate.responses({prefixed_model})",
-                **responses_request_kwargs(request_kwargs),
-            )
+            try:
+                stream = await with_llm_retry(
+                    litellm.aresponses,
+                    model=prefixed_model,
+                    input=messages_to_responses_input(prepared_messages),
+                    stream=True,
+                    max_retries=int(retry_count) if isinstance(retry_count, int) else 3,
+                    operation=f"stream_generate.responses({prefixed_model})",
+                    **responses_request_kwargs(request_kwargs),
+                )
+            except Exception as exc:
+                openai_tool_search_reason = _openai_tool_search_bad_request_reason(
+                    exc, request_kwargs
+                )
+                if openai_tool_search_reason is not None:
+                    self._mark_openai_tool_search_broken(
+                        provider,
+                        resolved_model,
+                        reason=openai_tool_search_reason,
+                    )
+                    raise OpenAIToolSearchFallbackRequired(
+                        provider_id=provider.provider_id if provider is not None else "unknown",
+                        model_id=resolved_model,
+                        reason=openai_tool_search_reason,
+                    ) from exc
+                raise
             try:
                 async for chunk in responses_stream_to_chat_chunks(stream):
                     yield chunk

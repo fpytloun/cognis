@@ -90,6 +90,7 @@ class CachedSessionState:
     # Per-session overrides (ephemeral, set via /model and /thinking commands)
     model_override: str | None = None
     reasoning_effort_override: str | None = None
+    last_tool_runtime_info: dict[str, Any] = field(default_factory=dict)
     project_contexts: dict[str, ProjectContextEntry] = field(default_factory=dict)
 
 
@@ -620,6 +621,22 @@ class SessionCache:
             return
         entry.last_llm_usage = dict(usage or {})
 
+    def update_tool_runtime_info(self, session_id: str, info: dict[str, Any] | None) -> None:
+        """Store the latest tool-exposure runtime metadata for a session."""
+
+        entry = self._entries.get(session_id)
+        if entry is None:
+            return
+        entry.last_tool_runtime_info = dict(info or {})
+
+    def get_tool_runtime_info(self, session_id: str) -> dict[str, Any] | None:
+        """Return the latest tool-exposure runtime metadata for a session."""
+
+        entry = self.get_entry(session_id)
+        if entry is None or not entry.last_tool_runtime_info:
+            return None
+        return dict(entry.last_tool_runtime_info)
+
     def note_context_reserve_clamp(self, session_id: str) -> bool:
         """Return ``True`` the first time a session clamps output reserve."""
 
@@ -671,7 +688,9 @@ class SessionCache:
         entry = self.get_entry(session_id)
         if entry is None:
             return []
-        return sorted(entry.project_contexts.values(), key=lambda item: (item.seq, item.project_root))
+        return sorted(
+            entry.project_contexts.values(), key=lambda item: (item.seq, item.project_root)
+        )
 
     def get_project_context(
         self, session_id: str, project_root: str | None

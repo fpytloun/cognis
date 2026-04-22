@@ -875,6 +875,46 @@ tools into the next turn's ``tools`` array.
 not execute arbitrary tools itself; it only reveals the already effective,
 permission-filtered inventory for the current step.
 
+### Discovery Strategy Matrix
+
+Step profiles narrow the effective inventory **before** Cognis chooses a
+provider-specific discovery strategy.  The profile decides two things:
+
+- which tools remain eligible for the current step
+- which of those eligible tools are visible by default
+
+Mode semantics:
+
+- `soft` narrows default visibility but keeps the searchable inventory broad
+  (except explicit excludes)
+- `hard` narrows the searchable inventory too, so discovery cannot escape the
+  hard-approved subset
+- agent/executor/runtime tool assignment remains the outer hard boundary in all
+  cases
+
+Deferred tools are tools Cognis keeps out of the default visible surface until
+the model searches for them or explicitly loads a skill that exposes them.
+Typical deferred candidates are MCP tools, Intaris MCP tools, and skill-defined
+tools that are not attached by default.
+
+| Provider / Setup | Strategy | Hidden tool discovery | Implications | Preferred |
+|---|---|---|---|---|
+| Anthropic with `supports_defer_loading=true` | `anthropic_defer_loading` | Deferred tools stay in the tool array with `defer_loading=true`; controller `search_tools` may still be available | Best Anthropic path; compact default surface and cache-friendly | Yes |
+| OpenAI Responses with native namespaces + allowed-tools support | `openai_responses_tool_search` | Native `tool_search` plus namespace-deferred tools; core tools restricted with `allowed_tools` | Best intended OpenAI path; smallest advertised surface and strongest cache stability | Yes |
+| OpenAI Responses without namespace tools but with allowed-tools support | `openai_responses_flat_tool_search` | Native `tool_search` plus flat deferred tools with `defer_loading=true` | Similar to the preferred OpenAI path, just less structured | Yes |
+| OpenAI Responses downgraded from native tool search | `openai_responses_controller_search_fallback` | Controller `search_tools` discovers deferred tools from the step-filtered inventory | Keeps Responses transport but discovery becomes controller-managed; slightly worse cache stability and first-search UX | Fallback |
+| OpenAI Responses with no deferred/search path left | `openai_responses_full_inventory` or `openai_responses_full_inventory_no_defer` | No discovery; everything is visible up front | Works, but increases tool-surface clutter and model confusion for large inventories | Avoid for large inventories |
+| Generic chat-completions / Responses-disabled providers | `generic_search_tools` | Controller `search_tools` builtin only | Universal compatibility path; weaker than native deferred search but still respects step profiles | Fallback |
+| Gemini and other providers without native deferred tools | `generic_search_tools` | Controller `search_tools` builtin only | Best available path; no provider-native defer/search support | Fallback |
+
+#### Native OpenAI downgrade cache
+
+When a provider/model rejects native OpenAI Responses `allowed_tools` /
+`tool_search` parameters, Cognis marks that `(provider_id, model)` pair as
+broken for native tool search and uses the controller fallback strategy for the
+rest of the process lifetime.  The cache is cleared on restart or when the
+provider configuration is updated.
+
 ### Tool Exposure Flow
 
 ```
@@ -884,23 +924,27 @@ permission-filtered inventory for the current step.
    - Core: builtin, executor-native, web → always loaded
    - Deferred: MCP, Intaris MCP, overflow → loaded on demand
 
-3. Detect provider capabilities:
-   - OpenAI gpt-5.4+: use Responses API tool_search
-   - Anthropic: use defer_loading + Tool Search Tool
-   - OpenAI older: use allowed_tools + generic fallback
-   - Other: use generic search_tools fallback
+3. Resolve the step profile:
+   - Filter the eligible inventory (`hard` narrows search, `soft` usually does not)
+   - Compute the default-visible subset for the step
 
-4. Build model-facing tool set:
+4. Detect provider capabilities:
+   - OpenAI gpt-5.4+: prefer Responses API native tool_search
+   - Anthropic: use defer_loading + optional controller `search_tools`
+   - OpenAI downgraded / unsupported: use Responses controller fallback
+   - Other: use generic controller `search_tools` fallback
+
+5. Build model-facing tool set:
    - Sanitize all names for provider compatibility
    - Apply provider-specific deferred loading flags
    - Build alias map (model-visible name → internal identity)
    - Apply cache hints (tool-level cache_control for Anthropic)
 
-5. On tool call from model:
+6. On tool call from model:
    - Reverse-map model-visible name to internal identity
    - Dispatch via ToolRouter using internal identity + source metadata
 
-6. On search_tools call:
+7. On search_tools call:
    - Search full effective permission-filtered inventory
    - Return matching tool schemas
    - Inject discovered tools into next turn

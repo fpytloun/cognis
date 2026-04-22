@@ -94,6 +94,7 @@ from cognis.models.workflow import (
     Workflow,
     WorkflowState,
 )
+from cognis.providers.llm.litellm import OpenAIToolSearchFallbackRequired
 from cognis.providers.retry import is_retryable_http_error
 from cognis.runtime_context import (  # noqa: F401 — used in delegation
     current_effective_working_directory,
@@ -2077,6 +2078,8 @@ class AgentLoop:
         step_reprompt_count = 0
         mid_stream_retries = 0
         _MAX_MID_STREAM_RETRIES = 2
+        openai_tool_search_retries = 0
+        _MAX_OPENAI_TOOL_SEARCH_RETRIES = 1
         saved_partial_tool_calls: dict[int, dict[str, Any]] | None = None
         discovered_tool_ids = self._get_initial_discovered_tool_ids(ctx)
         collected_attachments: list[dict[str, Any]] = []
@@ -2154,13 +2157,33 @@ class AgentLoop:
                     model_info = await self.providers.llm.get_model_info(current_model)
             else:
                 model_info = await self.providers.llm.get_model_info(current_model)
+            apply_runtime_tool_fallbacks = getattr(
+                self.providers.llm,
+                "apply_tool_exposure_runtime_fallbacks",
+                None,
+            )
+            if callable(apply_runtime_tool_fallbacks):
+                model_info = apply_runtime_tool_fallbacks(
+                    model_info,
+                    provider_id=current_provider_id,
+                    model_id=current_model,
+                )
             ctx.current_model = current_model
             ctx.current_provider_id = current_provider_id
             ctx.current_model_info = model_info
             registry = self._get_tool_registry(ctx)
             searchable_inventory_tools: list[ToolDefinition] = []
             default_visible_tool_ids: set[str] = set()
-            allow_tool_search = True
+            resolved_profile = (
+                self._step_profile_registry.resolve_step_profile(ctx.step_definition)
+                if self._step_profile_registry is not None
+                else resolve_step_profile(ctx.step_definition)
+            )
+            allow_tool_search = (
+                resolved_profile.config.allow_tool_search
+                if resolved_profile.config is not None
+                else True
+            )
             if registry is not None:
                 if self._session_factory is not None:
                     classified_inventory = await resolve_tool_classifications(
@@ -2175,16 +2198,6 @@ class AgentLoop:
                     ctx.agent,
                     classified_inventory,
                     discovered_tool_ids,
-                )
-                resolved_profile = (
-                    self._step_profile_registry.resolve_step_profile(ctx.step_definition)
-                    if self._step_profile_registry is not None
-                    else resolve_step_profile(ctx.step_definition)
-                )
-                allow_tool_search = (
-                    resolved_profile.config.allow_tool_search
-                    if resolved_profile.config is not None
-                    else True
                 )
                 searchable_inventory_tools = [
                     tool
@@ -2205,6 +2218,31 @@ class AgentLoop:
                 default_visible_tool_ids=default_visible_tool_ids,
                 allow_tool_search=allow_tool_search,
             )
+            update_tool_runtime_info = getattr(
+                self.session_cache,
+                "update_tool_runtime_info",
+                None,
+            )
+            if callable(update_tool_runtime_info):
+                update_tool_runtime_info(
+                    ctx.session.session_id,
+                    {
+                        "strategy": exposure.debug_metadata.get("strategy"),
+                        "step_profile_id": resolved_profile.profile_id,
+                        "step_profile_mode": (
+                            str(resolved_profile.mode)
+                            if resolved_profile.mode is not None
+                            else None
+                        ),
+                        "allow_tool_search": allow_tool_search,
+                        "inventory_tool_count": exposure.debug_metadata.get("inventory_tool_count"),
+                        "visible_tool_count": exposure.debug_metadata.get("visible_tool_count"),
+                        "deferred_tool_count": exposure.debug_metadata.get("deferred_tool_count"),
+                        "discovered_tool_count": exposure.debug_metadata.get(
+                            "discovered_tool_count"
+                        ),
+                    },
+                )
             logger.debug(
                 "Prepared tool exposure",
                 extra={
@@ -2245,21 +2283,38 @@ class AgentLoop:
                 pending_audit_messages,
                 on_token=on_token,
             )
-            async for chunk in self.providers.llm.stream_generate(
-                model_messages,
-                model=model_for_llm,
-                task_type="default",
-                provider_id=provider_for_llm,
-                tools=exposure.tools,
-                cache_breakpoint_index=cache_breakpoint,
-                **llm_kwargs,
-            ):
-                if chunk.get("mid_stream_failure"):
-                    mid_stream_error = chunk.get("error", "LLM stream failed mid-generation")
-                    break
-                text_delta = accumulator.feed(chunk)
-                if text_delta and on_token:
-                    await on_token(text_delta)
+            try:
+                async for chunk in self.providers.llm.stream_generate(
+                    model_messages,
+                    model=model_for_llm,
+                    task_type="default",
+                    provider_id=provider_for_llm,
+                    tools=exposure.tools,
+                    cache_breakpoint_index=cache_breakpoint,
+                    **llm_kwargs,
+                ):
+                    if chunk.get("mid_stream_failure"):
+                        mid_stream_error = chunk.get("error", "LLM stream failed mid-generation")
+                        break
+                    text_delta = accumulator.feed(chunk)
+                    if text_delta and on_token:
+                        await on_token(text_delta)
+            except OpenAIToolSearchFallbackRequired as exc:
+                if openai_tool_search_retries >= _MAX_OPENAI_TOOL_SEARCH_RETRIES:
+                    raise
+                openai_tool_search_retries += 1
+                logger.warning(
+                    "agent: native OpenAI Responses tool search failed; retrying with cached controller fallback",
+                    extra={
+                        "extra_data": {
+                            "session_id": ctx.session.session_id,
+                            "provider_id": exc.provider_id,
+                            "model": exc.model_id,
+                            "reason": exc.reason,
+                        }
+                    },
+                )
+                continue
 
             if mid_stream_error:
                 if mid_stream_retries < _MAX_MID_STREAM_RETRIES:

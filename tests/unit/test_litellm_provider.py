@@ -4,8 +4,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from cognis.models.config import DEFAULT_MODEL_INFO
-from cognis.providers.llm.litellm import LiteLLMProvider, _normalize_proxy_model_info
+from cognis.models.config import DEFAULT_MODEL_INFO, ModelInfo
+from cognis.providers.llm.litellm import (
+    LiteLLMProvider,
+    OpenAIToolSearchFallbackRequired,
+    _normalize_proxy_model_info,
+)
 from cognis.providers.llm.reasoning import (
     apply_reasoning_config,
     reasoning_efforts_for_model,
@@ -3072,4 +3076,104 @@ async def test_invalidate_json_mode_cache_clears_matching_provider(
     provider.invalidate_json_mode_cache_for_provider("proxy-a")
 
     assert provider._json_mode_broken_keys == {("proxy-b", "model-1")}
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_stream_generate_marks_native_openai_tool_search_broken_and_raises_retry_signal(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="proxy",
+                display_name="LiteLLM Proxy",
+                location="controller",
+                backend="litellm",
+                config={"preset": "litellm_proxy", "default_model": "gpt-5.4"},
+                status="active",
+            )
+        )
+        await session.commit()
+
+    async def _fake_aresponses(**_: object) -> object:
+        raise _FakeBadRequestError("Unknown parameter: 'tool_choice.tools'.")
+
+    monkeypatch.setenv("COGNIS_OPENAI_RESPONSES_MODE", "on")
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.aresponses", _fake_aresponses)
+
+    provider = LiteLLMProvider(session_factory)
+
+    with pytest.raises(
+        OpenAIToolSearchFallbackRequired, match="native OpenAI Responses tool search"
+    ):
+        async for _ in provider.stream_generate(
+            messages=[{"role": "user", "content": "hi"}],
+            model="gpt-5.4",
+            provider_id="proxy",
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "description": "Read",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                },
+                {"type": "tool_search"},
+            ],
+            tool_choice={
+                "type": "allowed_tools",
+                "mode": "auto",
+                "tools": [{"type": "function", "name": "read"}],
+            },
+        ):
+            pass
+
+    assert ("proxy", "gpt-5.4") in provider._openai_tool_search_broken_keys
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_apply_tool_exposure_runtime_fallbacks_masks_cached_native_openai_tool_search(
+    tmp_path: object,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    provider = LiteLLMProvider(session_factory)
+    provider._openai_tool_search_broken_keys.add(("proxy", "gpt-5.4"))
+
+    adjusted = provider.apply_tool_exposure_runtime_fallbacks(
+        ModelInfo(
+            model_id="gpt-5.4",
+            supports_tool_search=True,
+            supports_responses_api=True,
+            supports_openai_namespace_tools=True,
+            supports_openai_allowed_tools=True,
+        ),
+        provider_id="proxy",
+        model_id="gpt-5.4",
+    )
+
+    assert adjusted.supports_openai_allowed_tools is False
+    assert adjusted.supports_openai_namespace_tools is False
+    assert adjusted.supports_tool_search is True
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_invalidate_runtime_capability_cache_clears_json_and_tool_search_entries(
+    tmp_path: object,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    provider = LiteLLMProvider(session_factory)
+    provider._json_mode_broken_keys.add(("proxy-a", "model-1"))
+    provider._openai_tool_search_broken_keys.add(("proxy-a", "model-2"))
+    provider._json_mode_broken_keys.add(("proxy-b", "model-1"))
+    provider._openai_tool_search_broken_keys.add(("proxy-b", "model-2"))
+
+    provider.invalidate_runtime_capability_cache_for_provider("proxy-a")
+
+    assert provider._json_mode_broken_keys == {("proxy-b", "model-1")}
+    assert provider._openai_tool_search_broken_keys == {("proxy-b", "model-2")}
     await engine.dispose()

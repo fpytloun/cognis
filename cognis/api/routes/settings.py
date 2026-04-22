@@ -90,8 +90,7 @@ def _profile_id_in_definition(definition: Any, profile_id: str) -> bool:
     if not isinstance(steps, list):
         return False
     return any(
-        isinstance(step, dict) and step.get("step_profile_id") == profile_id
-        for step in steps
+        isinstance(step, dict) and step.get("step_profile_id") == profile_id for step in steps
     )
 
 
@@ -109,9 +108,12 @@ async def _ensure_step_profile_not_in_use(session: Any, profile_id: str) -> None
     if any(_profile_id_in_definition(definition, profile_id) for definition in workflow_rows):
         raise api_exception(409, "conflict", "Step profile is still used by a workflow")
     override_rows = (
-        await session.execute(select(SystemWorkflowOverride.step_overrides))
-    ).scalars().all()
-    if any(_profile_id_in_step_overrides(step_overrides, profile_id) for step_overrides in override_rows):
+        (await session.execute(select(SystemWorkflowOverride.step_overrides))).scalars().all()
+    )
+    if any(
+        _profile_id_in_step_overrides(step_overrides, profile_id)
+        for step_overrides in override_rows
+    ):
         raise api_exception(
             409,
             "conflict",
@@ -187,7 +189,9 @@ async def settings_list(request: Request) -> list[SettingsCategoryResponse]:
 async def settings_step_profiles(request: Request) -> list[StepProfileResponse]:
     require_current_user(request)
     registry = request.app.state.step_profile_registry
-    return [_step_profile_response(registry, definition) for definition in registry.list_definitions()]
+    return [
+        _step_profile_response(registry, definition) for definition in registry.list_definitions()
+    ]
 
 
 @router.post("/api/v1/settings/step-profiles", response_model=StepProfileResponse)
@@ -253,7 +257,9 @@ async def settings_step_profile_update(
     async with request.app.state.session_factory() as session:
         if registry.is_custom(profile_id):
             raw = await get_setting(session, STEP_PROFILE_CUSTOM_SETTING_KEY)
-            custom_profiles = dict(raw.value) if raw is not None and isinstance(raw.value, dict) else {}
+            custom_profiles = (
+                dict(raw.value) if raw is not None and isinstance(raw.value, dict) else {}
+            )
             custom_profiles[profile_id] = serialize_step_profile_override(
                 name=payload.name or existing.name,
                 mode=mode,
@@ -300,7 +306,9 @@ async def settings_step_profile_reset(request: Request, profile_id: str) -> Step
         if was_custom:
             await _ensure_step_profile_not_in_use(session, profile_id)
             raw = await get_setting(session, STEP_PROFILE_CUSTOM_SETTING_KEY)
-            custom_profiles = dict(raw.value) if raw is not None and isinstance(raw.value, dict) else {}
+            custom_profiles = (
+                dict(raw.value) if raw is not None and isinstance(raw.value, dict) else {}
+            )
             custom_profiles.pop(profile_id, None)
             if custom_profiles:
                 await upsert_setting(
@@ -386,7 +394,9 @@ async def setting_update(
     elif key == "session.step_timeout_seconds":
         request.app.state.agent_loop.default_step_timeout_seconds = max(1, int(payload.value))
     elif key == "evaluator.timeout_ms":
-        request.app.state.step_evaluator.evaluator_timeout_seconds = max(1, int(payload.value)) / 1000
+        request.app.state.step_evaluator.evaluator_timeout_seconds = (
+            max(1, int(payload.value)) / 1000
+        )
     elif key in {STEP_PROFILE_OVERRIDES_SETTING_KEY, STEP_PROFILE_CUSTOM_SETTING_KEY}:
         await request.app.state.step_profile_registry.refresh()
     return setting_to_response(row)
@@ -502,10 +512,16 @@ async def llm_provider_update(
         raise api_exception(404, "not_found", "LLM provider not found")
     # Admin edits may fix the very issue (e.g. a tier cap, a different
     # endpoint, toggling use_responses_api) that caused a model to be marked
-    # as broken for JSON mode. Clear the provider's broken-model cache so the
-    # next JSON-mode call re-probes instead of staying on chat-completions.
+    # as broken for JSON mode or native OpenAI tool search. Clear the
+    # provider's cached runtime downgrades so the next call re-probes.
     llm_provider_impl = getattr(request.app.state.providers, "llm", None)
-    invalidate = getattr(llm_provider_impl, "invalidate_json_mode_cache_for_provider", None)
+    invalidate = getattr(
+        llm_provider_impl,
+        "invalidate_runtime_capability_cache_for_provider",
+        None,
+    )
+    if not callable(invalidate):
+        invalidate = getattr(llm_provider_impl, "invalidate_json_mode_cache_for_provider", None)
     if callable(invalidate):
         invalidate(provider_id)
     return _apply_last_test_metadata(request, llm_provider_to_response(row))

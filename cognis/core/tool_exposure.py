@@ -348,6 +348,7 @@ def _build_openai_deferred_namespaces(
 def _openai_allowed_tools_choice(visible_schemas: list[dict[str, Any]]) -> dict[str, Any] | str:
     return {
         "type": "allowed_tools",
+        "mode": "auto",
         "tools": [
             *[
                 {"type": "function", "name": function_name}

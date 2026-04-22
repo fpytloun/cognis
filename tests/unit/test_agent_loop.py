@@ -45,6 +45,7 @@ from cognis.models.workflow import (
     StepOutput,
     WorkflowState,
 )
+from cognis.providers.llm.litellm import OpenAIToolSearchFallbackRequired
 from cognis.tools.builtin.orchestration import OrchestrationMode
 from cognis.tools.builtin.tool_search import SEARCH_TOOLS_TOOL
 from cognis.tools.registry import RegisteredTool, ToolRegistry
@@ -1110,6 +1111,9 @@ class _NoopSessionManager:
 
 
 class _NoopSessionCache:
+    def __init__(self) -> None:
+        self.tool_runtime_info: dict[str, object] | None = None
+
     def get_model_override(self, _: str) -> None:
         return None
 
@@ -1122,6 +1126,12 @@ class _NoopSessionCache:
     def note_context_reserve_clamp(self, _: str) -> bool:
         return True
 
+    def update_tool_runtime_info(self, _: str, info: dict[str, object] | None) -> None:
+        self.tool_runtime_info = info
+
+    def get_tool_runtime_info(self, _: str) -> dict[str, object] | None:
+        return self.tool_runtime_info
+
     async def append_recorded_events(self, *_: object, **__: object) -> None:
         return None
 
@@ -1130,7 +1140,9 @@ class _NoopSessionCache:
 
 
 class _ProjectContextProbeExecutor:
-    async def tool_execute(self, tool_call: ToolCall, timeout_seconds: int | None = None) -> ToolResult:
+    async def tool_execute(
+        self, tool_call: ToolCall, timeout_seconds: int | None = None
+    ) -> ToolResult:
         del timeout_seconds
         if tool_call.name != "_project_context_probe":
             return ToolResult(output="unexpected tool", is_error=True)
@@ -1158,7 +1170,9 @@ class _CrossProjectProbeExecutor:
     def __init__(self) -> None:
         self.probes: list[dict[str, object]] = []
 
-    async def tool_execute(self, tool_call: ToolCall, timeout_seconds: int | None = None) -> ToolResult:
+    async def tool_execute(
+        self, tool_call: ToolCall, timeout_seconds: int | None = None
+    ) -> ToolResult:
         del timeout_seconds
         if tool_call.name != "_project_context_probe":
             return ToolResult(output="unexpected tool", is_error=True)
@@ -1288,7 +1302,9 @@ class _ExistingProjectSessionCache(_NoopSessionCache):
             )
         }
 
-    def get_project_context(self, session_id: str, project_root: str | None) -> ProjectContextEntry | None:
+    def get_project_context(
+        self, session_id: str, project_root: str | None
+    ) -> ProjectContextEntry | None:
         del session_id
         return None if project_root is None else self.project_contexts.get(project_root)
 
@@ -1959,6 +1975,170 @@ async def test_user_message_is_persisted_before_reasoning_and_tool_execution() -
     ]
     assert "record:tool_result" in order
     assert "record:assistant_message" in order
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_retries_with_cached_openai_tool_search_fallback() -> None:
+    class _FallbackLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.native_tool_search_broken = False
+            self.tool_sets: list[list[str]] = []
+
+        async def resolve_model_target(
+            self,
+            *,
+            explicit_model: str | None,
+            task_type: str,
+            explicit_provider_id: str | None = None,
+        ) -> tuple[str, str]:
+            del explicit_model, task_type, explicit_provider_id
+            return ("gpt-5.4", "proxy")
+
+        async def get_model_info(
+            self, model: str | None, provider_id: str | None = None
+        ) -> SimpleNamespace:
+            del model, provider_id
+            return SimpleNamespace(
+                max_tools=128,
+                supports_parallel_tool_calls=True,
+                supports_tool_choice=True,
+                supports_cache_control=False,
+                supports_defer_loading=False,
+                supports_openai_allowed_tools=True,
+                supports_openai_namespace_tools=True,
+                supports_tool_search=True,
+                supports_responses_api=True,
+                provider="test",
+            )
+
+        def apply_tool_exposure_runtime_fallbacks(
+            self,
+            model_info: SimpleNamespace,
+            *,
+            provider_id: str | None,
+            model_id: str,
+        ) -> SimpleNamespace:
+            del provider_id, model_id
+            if not self.native_tool_search_broken:
+                return model_info
+            adjusted = SimpleNamespace(**model_info.__dict__)
+            adjusted.supports_openai_allowed_tools = False
+            adjusted.supports_openai_namespace_tools = False
+            return adjusted
+
+        def count_tokens(self, text: str, model: str | None = None) -> int:
+            del model
+            return len(text)
+
+        async def stream_generate(self, messages: list[dict[str, object]], **kwargs: object):
+            del messages
+            self.calls += 1
+            tool_names: list[str] = []
+            for schema in kwargs.get("tools", []):
+                if not isinstance(schema, dict):
+                    continue
+                if schema.get("type") == "namespace":
+                    tool_names.append(str(schema.get("name") or "namespace"))
+                elif schema.get("type") == "tool_search":
+                    tool_names.append("tool_search")
+                else:
+                    function = schema.get("function")
+                    if isinstance(function, dict) and isinstance(function.get("name"), str):
+                        tool_names.append(function["name"])
+            self.tool_sets.append(tool_names)
+            if self.calls == 1:
+                self.native_tool_search_broken = True
+                raise OpenAIToolSearchFallbackRequired(
+                    provider_id="proxy",
+                    model_id="gpt-5.4",
+                    reason="tool_choice_tools_unknown",
+                )
+            yield {"choices": [{"delta": {"content": "done"}}]}
+
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="read",
+                description="Read",
+                parameters={"type": "object", "properties": {}},
+                source=ToolSource(type="executor"),
+                category="filesystem",
+                read_only=True,
+            ),
+            handler=None,
+        )
+    )
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="mcp_github__search_issues",
+                description="Search issues",
+                parameters={"type": "object", "properties": {}},
+                source=ToolSource(
+                    type="intaris_mcp",
+                    server_name="github",
+                    raw_tool_name="search/issues",
+                ),
+                category="mcp",
+            ),
+            handler=None,
+        )
+    )
+    fake_llm = _FallbackLLM()
+    session_cache = _NoopSessionCache()
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=session_cache,
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(
+            name="direct",
+            type="run",
+            prompt="",
+            step_profile_id="system:direct-default",
+        ),
+        session=SimpleNamespace(
+            session_id="sess-fallback",
+            conversation_id="conv-fallback",
+            intaris_session_id="sess-fallback",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(
+            conversation_id="conv-fallback",
+            context=SimpleNamespace(platform_data={}),
+        ),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+        user_message="Inspect the repo",
+        tool_registry=registry,
+        system_initiated=False,
+    )
+
+    output = await agent_loop.run_step(ctx)
+
+    assert output is not None
+    assert output.content == "done"
+    assert fake_llm.calls == 2
+    assert "tool_search" in fake_llm.tool_sets[0]
+    assert all(name != "search_tools" for name in fake_llm.tool_sets[0])
+    assert "search_tools" in fake_llm.tool_sets[1]
+    assert all(not name.startswith("mcp_") for name in fake_llm.tool_sets[1])
+    assert session_cache.tool_runtime_info is not None
+    assert (
+        session_cache.tool_runtime_info["strategy"] == "openai_responses_controller_search_fallback"
+    )
 
 
 @pytest.mark.asyncio
