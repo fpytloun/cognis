@@ -269,7 +269,6 @@ async def analyze_attachment_ref(
         model=selected_model,
         task_type=selected_task_type,
         provider_id=selected_provider_id,
-        max_tokens=1200,
     )
     output = extract_text_from_response(response).strip()
     if not output:

@@ -37,7 +37,6 @@ async def _generate_json_response(
     timeout_seconds: float,
     logger_obj: Any,
     warning_context: dict[str, Any] | None = None,
-    max_tokens: int,
 ) -> dict[str, Any]:
     """Generate JSON with a structured-first attempt and plain fallback."""
 
@@ -50,7 +49,6 @@ async def _generate_json_response(
                 task_type=task_type,
                 temperature=0,
                 max_retries=1,
-                max_tokens=max_tokens,
                 **generate_kwargs,
             ),
             timeout=call_timeout,
@@ -182,7 +180,6 @@ async def decompose_skill_material(
         logger_obj=logger,
         warning_context={"skill_id": skill_id},
         timeout_seconds=timeout_seconds,
-        max_tokens=1400,
     )
     content = extract_text_from_response(response)
     payload = extract_json_object(content, label="skill_decomposer")
@@ -262,7 +259,6 @@ async def compose_workflow_plan(
         logger_obj=logger,
         warning_context={"intent_preview": intent[:80]},
         timeout_seconds=timeout_seconds,
-        max_tokens=2600,
     )
     content = extract_text_from_response(response)
     payload = extract_json_object(content, label="workflow_composer")

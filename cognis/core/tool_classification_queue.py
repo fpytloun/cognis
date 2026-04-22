@@ -58,7 +58,7 @@ class ToolClassificationQueue:
         poll_interval_seconds: float = 0.5,
         lease_seconds: int = 300,
         backoff_max_seconds: float = 3600.0,
-        max_batch_size: int = 50,
+        max_batch_size: int = 10,
     ) -> None:
         self._session_factory = session_factory
         self._llm_provider = llm_provider

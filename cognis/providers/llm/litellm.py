@@ -1684,9 +1684,11 @@ class LiteLLMProvider:
             if isinstance(configured_timeout, int)
             else timeout_seconds
         )
-        base_max_tokens = 1024 if model_info.supports_reasoning else 256
-        request_kwargs["max_tokens"] = max(
-            base_max_tokens, int(request_kwargs.get("max_tokens", 0) or 0)
+        self._autofill_max_tokens(
+            request_kwargs,
+            model_info=model_info,
+            provider=provider,
+            resolved_model=default_model,
         )
         if model_info.supports_reasoning:
             auxiliary_effort = auxiliary_reasoning_effort_for_model(

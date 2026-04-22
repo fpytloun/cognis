@@ -84,6 +84,37 @@ class _CountingLLM:
         return {"choices": [{"message": {"content": json.dumps({"tools": tools})}}]}
 
 
+class _FallbackClassifierLLM:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    async def generate(self, messages, **kwargs):
+        self.calls.append({"messages": messages, **kwargs})
+        if "response_format" in kwargs:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {"confidence": 0.2, "reason": "missing tools array"}
+                            )
+                        }
+                    }
+                ]
+            }
+        tool_payload = json.loads(messages[1]["content"])
+        tools = [
+            {
+                "tool_id": tool["tool_id"],
+                "profile_group": "web",
+                "capabilities": ["read"],
+                "confidence": 0.9,
+            }
+            for tool in tool_payload["tools"]
+        ]
+        return {"choices": [{"message": {"content": json.dumps({"tools": tools})}}]}
+
+
 @pytest.mark.asyncio
 async def test_resolve_tool_classifications_marks_dynamic_tools_pending_and_enqueues(tmp_path):
     engine = create_engine(f"sqlite+aiosqlite:///{tmp_path}/classifications.db")
@@ -320,3 +351,21 @@ async def test_invalid_llm_group_is_rejected_back_to_heuristic() -> None:
     assert classified[0].classification_source == "heuristic"
     assert classified[0].classification_status == "ready"
     assert classified[0].profile_group == "development"
+
+
+@pytest.mark.asyncio
+async def test_tool_classification_retries_plain_json_on_invalid_payload_shape() -> None:
+    tool = _dynamic_tool_named("mcp_github__shape_retry", "shape/retry")
+    llm = _FallbackClassifierLLM()
+
+    classified = await classify_tool_definitions([tool], llm=llm)
+
+    assert classified[0].classification_source == "llm"
+    assert classified[0].profile_group == "web"
+    assert len(llm.calls) == 2
+    assert "response_format" in llm.calls[0]
+    assert "response_format" not in llm.calls[1]
+    assert "max_tokens" not in llm.calls[0]
+    assert "max_tokens" not in llm.calls[1]
+    tool_payload = json.loads(llm.calls[0]["messages"][1]["content"])
+    assert "parameters" not in tool_payload["tools"][0]

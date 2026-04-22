@@ -8,7 +8,11 @@ import json
 from collections.abc import Callable
 from typing import Any
 
-from cognis.core.json_utils import extract_json_object, extract_text_from_response
+from cognis.core.json_utils import (
+    extract_json_object,
+    extract_text_from_response,
+    maybe_fallback_to_plain_json_response,
+)
 from cognis.logging import get_logger
 from cognis.models.tool import (
     AUTO_PROFILE_GROUPS,
@@ -468,7 +472,6 @@ async def _classify_with_llm(
                             "source_type": tool.source.type,
                             "current_category": tool.category,
                             "read_only": tool.read_only,
-                            "parameters": tool.parameters,
                         }
                         for tool_id, tool, _cache_key in uncached
                     ]
@@ -478,15 +481,34 @@ async def _classify_with_llm(
         },
     ]
     try:
-        response = await llm.generate(
-            messages,
-            task_type="classifier",
-            temperature=0,
-            max_retries=1,
-            max_tokens=1200,
-            response_format={"type": "json_object"},
+        async def _generate(generate_kwargs: dict[str, Any]) -> dict[str, Any]:
+            return await llm.generate(
+                messages,
+                task_type="classifier",
+                temperature=0,
+                max_retries=1,
+                **generate_kwargs,
+            )
+
+        response = await _generate({"response_format": {"type": "json_object"}})
+        response = await maybe_fallback_to_plain_json_response(
+            response,
+            generate_response=_generate,
+            label="tool_classifier",
+            logger_obj=logger,
         )
         payload = extract_json_object(extract_text_from_response(response), label="tool_classifier")
+        tool_payloads = payload.get("tools") if isinstance(payload, dict) else None
+        if not isinstance(tool_payloads, list):
+            logger.warning(
+                "Tool classifier returned invalid payload shape, retrying plain-text JSON fallback",
+                extra={"extra_data": {"tool_count": len(uncached)}},
+            )
+            response = await _generate({})
+            payload = extract_json_object(
+                extract_text_from_response(response),
+                label="tool_classifier",
+            )
     except Exception:
         logger.warning("Tool LLM classification failed", exc_info=True)
         return cached_results, {

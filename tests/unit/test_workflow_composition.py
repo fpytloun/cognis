@@ -121,6 +121,8 @@ def test_decompose_skill_material_retries_without_response_format_after_timeout(
     assert len(llm.calls) == 2
     assert "response_format" in llm.calls[0]
     assert "response_format" not in llm.calls[1]
+    assert "max_tokens" not in llm.calls[0]
+    assert "max_tokens" not in llm.calls[1]
 
 
 def test_compose_workflow_plan_retries_without_response_format_after_timeout() -> None:
@@ -152,3 +154,5 @@ def test_compose_workflow_plan_retries_without_response_format_after_timeout() -
     assert result.action == "reuse_existing"
     assert result.workflow_id == "system:software-development"
     assert len(llm.calls) == 2
+    assert "max_tokens" not in llm.calls[0]
+    assert "max_tokens" not in llm.calls[1]

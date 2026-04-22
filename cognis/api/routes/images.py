@@ -211,7 +211,6 @@ async def generate_avatar_prompt(request: Request, payload: AvatarPromptRequest)
             ],
             task_type="default",
             temperature=1.0,
-            max_tokens=300,
         )
         choices = response.get("choices", [])
         if choices:
