@@ -1,4 +1,5 @@
 <script lang="ts">
+  import BlockingDialog from '$lib/components/ui/BlockingDialog.svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import { api } from '$lib/api/client';
 
@@ -62,10 +63,6 @@
     }
   }
 
-  function handleKeydown(e: KeyboardEvent) {
-    if (e.key === 'Escape') onClose();
-  }
-
   // Auto-generate prompt on mount
   $effect(() => {
     if (!prompt && name) {
@@ -73,25 +70,18 @@
     }
   });
 </script>
-
-<svelte:window onkeydown={handleKeydown} />
-
-<!-- Overlay -->
-<!-- svelte-ignore a11y_click_events_have_key_events -->
-<!-- svelte-ignore a11y_no_static_element_interactions -->
-<div class="app-viewport-overlay z-50 flex items-center justify-center overflow-y-auto overscroll-contain bg-black/60 px-4 py-4 backdrop-blur-sm" onclick={onClose}>
-  <!-- Dialog -->
-  <!-- svelte-ignore a11y_click_events_have_key_events -->
-  <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div class="max-h-full w-full max-w-lg overflow-y-auto rounded-3xl border border-slate-700 bg-slate-900 p-6 shadow-2xl overscroll-contain" onclick={(e) => e.stopPropagation()}>
-    <!-- Header -->
-    <div class="mb-4 flex items-center justify-between">
-      <h3 class="text-lg font-semibold text-slate-100">Generate Avatar</h3>
+<BlockingDialog label="Generate avatar" onClose={onClose} titleId="avatar-generate-title">
+  {#snippet header()}
+    <div class="flex items-center justify-between gap-3">
+      <h3 class="text-lg font-semibold text-slate-100" id="avatar-generate-title">Generate Avatar</h3>
       <button type="button" class="text-slate-400 hover:text-slate-200" onclick={onClose}>&times;</button>
     </div>
+  {/snippet}
 
-    <!-- Prompt section -->
-    <div class="mb-4">
+  {#snippet children()}
+    <div>
+      <!-- Prompt section -->
+      <div class="mb-4">
       <div class="mb-2 flex items-center justify-between">
         <label class="text-sm font-medium text-slate-200" for="avatar-prompt">Prompt</label>
         <button
@@ -115,8 +105,8 @@
       ></textarea>
     </div>
 
-    <!-- Preview section -->
-    <div class="mb-4">
+      <!-- Preview section -->
+      <div class="mb-4">
       <p class="mb-2 text-sm font-medium text-slate-200">Preview</p>
       <div class="flex h-48 items-center justify-center rounded-2xl border border-slate-700 bg-slate-950/80">
         {#if generatingImage}
@@ -136,12 +126,14 @@
       </div>
     </div>
 
-    <!-- Error -->
-    {#if error}
-      <p class="mb-4 text-sm text-rose-300">{error}</p>
-    {/if}
+      <!-- Error -->
+      {#if error}
+        <p class="mb-4 text-sm text-rose-300">{error}</p>
+      {/if}
+    </div>
+  {/snippet}
 
-    <!-- Actions -->
+  {#snippet footer()}
     <div class="flex items-center justify-end gap-3">
       <Button variant="secondary" onclick={onClose}>Cancel</Button>
       <Button
@@ -155,5 +147,5 @@
         <Button variant="primary" onclick={handleAccept}>Use this avatar</Button>
       {/if}
     </div>
-  </div>
-</div>
+  {/snippet}
+</BlockingDialog>

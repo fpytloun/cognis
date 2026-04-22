@@ -10,6 +10,7 @@
   import AgentSelect from '$lib/components/AgentSelect.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import Badge from '$lib/components/ui/Badge.svelte';
+  import BlockingDialog from '$lib/components/ui/BlockingDialog.svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import Card from '$lib/components/ui/Card.svelte';
   import Input from '$lib/components/ui/Input.svelte';
@@ -287,14 +288,6 @@ import Zap from 'lucide-svelte/icons/zap';
     return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
   }
 
-  function handleBackdropClick(event: MouseEvent): void {
-    if (event.target === event.currentTarget) showCreateModal = false;
-  }
-
-  function handleKeydown(event: KeyboardEvent): void {
-    if (event.key === 'Escape') showCreateModal = false;
-  }
-
   // Cron presets for the UI
   const cronPresets = [
     { label: 'Every minute', value: '* * * * *' },
@@ -484,19 +477,12 @@ import Zap from 'lucide-svelte/icons/zap';
   </div>
 {/if}
 
-<svelte:window onkeydown={handleKeydown} />
-
 <!-- Create schedule modal -->
 {#if showCreateModal}
-  <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-  <div
-    class="app-viewport-overlay z-50 flex items-center justify-center overflow-y-auto overscroll-contain bg-black/60 px-4 py-4 backdrop-blur-sm"
-    onclick={handleBackdropClick}
-    role="presentation"
-  >
-    <div class="max-h-full w-full max-w-lg overflow-y-auto rounded-3xl border border-slate-700 bg-slate-900 p-6 shadow-2xl overscroll-contain" role="dialog" aria-modal="true" aria-label="Create schedule">
-      <div class="mb-5 flex items-center justify-between">
-        <h2 class="text-lg font-semibold text-white">Create schedule</h2>
+  <BlockingDialog label="Create schedule" onClose={() => (showCreateModal = false)} titleId="create-schedule-title">
+    {#snippet header()}
+      <div class="flex items-center justify-between gap-3">
+        <h2 class="text-lg font-semibold text-white" id="create-schedule-title">Create schedule</h2>
         <button
           class="inline-flex h-11 w-11 items-center justify-center rounded-xl text-slate-400 hover:bg-slate-800 hover:text-white"
           onclick={() => (showCreateModal = false)}
@@ -504,7 +490,9 @@ import Zap from 'lucide-svelte/icons/zap';
           type="button"
         >&times;</button>
       </div>
+    {/snippet}
 
+    {#snippet children()}
       <div class="space-y-4">
         <!-- Name -->
         <div class="space-y-1">
@@ -525,7 +513,7 @@ import Zap from 'lucide-svelte/icons/zap';
 
         <!-- Schedule type -->
         <div class="space-y-1">
-          <label class="text-xs font-medium uppercase tracking-widest text-slate-400">Schedule type</label>
+          <p class="text-xs font-medium uppercase tracking-widest text-slate-400">Schedule type</p>
           <div class="flex gap-2">
             {#each [['cron', 'Cron'], ['interval', 'Interval'], ['one_shot', 'One-shot']] as [value, label]}
               <button
@@ -565,7 +553,7 @@ import Zap from 'lucide-svelte/icons/zap';
           </div>
         {:else if form.schedule_type === 'interval'}
           <div class="space-y-1">
-            <label class="text-xs font-medium uppercase tracking-widest text-slate-400">Interval</label>
+            <p class="text-xs font-medium uppercase tracking-widest text-slate-400">Interval</p>
             <div class="flex flex-wrap gap-2">
               {#each intervalPresets as preset}
                 <button
@@ -675,13 +663,15 @@ import Zap from 'lucide-svelte/icons/zap';
           <p class="text-xs text-slate-500">Default delivery uses the normal conversation flow. Direct channel delivery sends the final result straight to the resolved target channel.</p>
         </div>
       </div>
+    {/snippet}
 
-      <div class="mt-6 flex justify-end gap-3">
+    {#snippet footer()}
+      <div class="flex justify-end gap-3">
         <Button variant="secondary" onclick={() => (showCreateModal = false)}>Cancel</Button>
         <Button disabled={!form.name.trim() || !form.agent_id || creating} onclick={handleCreate}>
           {creating ? 'Creating...' : 'Create schedule'}
         </Button>
       </div>
-    </div>
-  </div>
+    {/snippet}
+  </BlockingDialog>
 {/if}

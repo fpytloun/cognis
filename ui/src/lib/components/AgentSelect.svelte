@@ -142,7 +142,7 @@
       {/if}
 
       {#if agents.length === 0 && !allowAll}
-        <li class="px-2 py-2 text-sm text-slate-400" role="option" aria-disabled="true">{emptyLabel}</li>
+        <li class="px-2 py-2 text-sm text-slate-400" role="option" aria-disabled="true" aria-selected="false">{emptyLabel}</li>
       {/if}
 
       {#each agents as agent (agent.agent_id)}

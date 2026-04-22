@@ -35,16 +35,6 @@ class CognisWebSocketClient {
 
   readonly state = writable<WebSocketState>(initialState);
 
-  private async resolveAccessToken(): Promise<string | null> {
-    const state = auth.getSnapshot();
-    const expiresAt = state.expiresAt ?? 0;
-    const expiringSoon = expiresAt > 0 && Date.now() >= expiresAt - 30_000;
-    if (!state.accessToken || expiringSoon) {
-      return auth.refreshSession();
-    }
-    return state.accessToken;
-  }
-
   subscribe(listener: EventListener): () => void {
     this.listeners.add(listener);
     return () => {
@@ -61,8 +51,8 @@ class CognisWebSocketClient {
       return;
     }
 
-    const token = await this.resolveAccessToken();
-    if (!token) {
+    const authState = auth.getSnapshot();
+    if (authState.status !== 'authenticated') {
       this.state.set({ status: 'stalled', attempts: this.reconnectAttempts, lastError: 'Authentication required' });
       return;
     }
@@ -83,9 +73,7 @@ class CognisWebSocketClient {
     }));
 
     this.socket = new WebSocket(getWebSocketUrl());
-    this.socket.onopen = () => {
-      this.sendRaw({ type: 'auth', token });
-    };
+    this.socket.onopen = () => {};
     this.socket.onmessage = (event) => {
       this.handleMessage(event.data);
     };
@@ -100,16 +88,11 @@ class CognisWebSocketClient {
         return;
       }
       if (event.code === 4401) {
-        void auth.refreshSession().then((refreshedToken) => {
-          if (!refreshedToken) {
-            this.state.set({
-              status: 'stalled',
-              attempts: this.reconnectAttempts,
-              lastError: 'Session expired. Please log in again.'
-            });
-            return;
-          }
-          this.scheduleReconnect();
+        auth.clear('Session expired. Please log in again.');
+        this.state.set({
+          status: 'stalled',
+          attempts: this.reconnectAttempts,
+          lastError: 'Session expired. Please log in again.'
         });
         return;
       }
@@ -197,7 +180,7 @@ class CognisWebSocketClient {
     if (
       !this.socket ||
       this.socket.readyState !== WebSocket.OPEN ||
-      (!this.authenticated && payload.type !== 'auth')
+      !this.authenticated
     ) {
       this.queuedMessages.push(serialized);
       this.connect();

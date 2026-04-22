@@ -6,8 +6,8 @@ vi.mock('$lib/config', () => ({
 
 vi.mock('$lib/stores/auth', () => ({
   auth: {
-    getSnapshot: () => ({ accessToken: 'token-1', expiresAt: Date.now() + 60_000 }),
-    refreshSession: vi.fn(async () => 'token-1')
+    getSnapshot: () => ({ status: 'authenticated', initialized: true, user: { email: 'user@example.com' } }),
+    clear: vi.fn()
   }
 }));
 

@@ -54,13 +54,19 @@ def require_current_user(request: Request) -> AuthenticatedUser:
     return user
 
 
-def require_jwt_user(request: Request) -> AuthenticatedUser:
-    """Require a user authenticated with a JWT/session token."""
+def require_session_user(request: Request) -> AuthenticatedUser:
+    """Require a human interactive session authenticated by cookie or bearer."""
 
     user = require_current_user(request)
-    if user.auth_type != "jwt":
+    if user.auth_type not in {"jwt", "session"}:
         raise api_exception(403, "forbidden", "This endpoint requires session authentication")
     return user
+
+
+def require_jwt_user(request: Request) -> AuthenticatedUser:
+    """Backward-compatible alias for interactive session auth."""
+
+    return require_session_user(request)
 
 
 def require_admin(request: Request) -> AuthenticatedUser:

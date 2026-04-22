@@ -29,6 +29,7 @@ import Target from 'lucide-svelte/icons/target';
   import Tooltip from '$lib/components/ui/Tooltip.svelte';
   import WorkflowDiagram from '$lib/components/workflows/WorkflowDiagram.svelte';
   import { confirmAction } from '$lib/stores/confirm';
+  import { registerOverlay } from '$lib/stores/overlays';
   import { addToast } from '$lib/stores/toasts';
   import {
     isTaskRerunnable,
@@ -57,6 +58,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
   let selectedStepName = $state('');
   let mobileStepDetailOpen = $state(false);
   let configModalOpen = $state(false);
+  let configModalOverlayCleanup: (() => void) | null = null;
   let outputModalStepRun = $state<StepRun | null>(null);
   let taskEscalations = $state<Escalation[]>([]);
   let taskEscalationBusyCallId = $state<string | null>(null);
@@ -110,6 +112,20 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
   let isEditable = $derived(task != null && !TERMINAL_STATUSES.includes(task.status));
   let isCancellable = $derived(task != null && CANCELLABLE_STATUSES.includes(task.status));
   let isRerunnable = $derived(isTaskRerunnable(task));
+
+  $effect(() => {
+    if (configModalOpen) {
+      const handle = registerOverlay({ kind: 'blocking', blocksChrome: true });
+      configModalOverlayCleanup = handle.unregister;
+      return () => {
+        handle.unregister();
+        configModalOverlayCleanup = null;
+      };
+    }
+
+    configModalOverlayCleanup?.();
+    configModalOverlayCleanup = null;
+  });
 
   // ---------------------------------------------------------------------------
   // Helpers

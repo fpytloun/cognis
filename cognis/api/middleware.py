@@ -14,7 +14,12 @@ from starlette.responses import Response
 from cognis.api.models import ErrorBody, ErrorResponse
 from cognis.runtime_context import current_user_email
 from cognis.security import parse_api_key, verify_api_key
-from cognis.store.queries import get_api_key, get_user, touch_api_key_last_used
+from cognis.store.queries import (
+    get_api_key,
+    get_browser_session_by_token,
+    get_user,
+    touch_api_key_last_used,
+)
 
 PUBLIC_ROUTES = {
     ("GET", "/api/bootstrap-status"),
@@ -177,20 +182,28 @@ class AuthenticationMiddleware(BaseHTTPMiddleware):
                 finally:
                     current_user_email.reset(context_token)
 
-        # Fallback: check cognis_session cookie (cross-service SSO)
+        # Fallback: check opaque browser session cookie.
         if cookie_token:
-            try:
-                claims = auth_provider.verify_jwt(cookie_token, audience=["cognis"])
-            except Exception:
-                return JSONResponse(
-                    status_code=401,
-                    content=ErrorResponse(
-                        error=ErrorBody(code="unauthorized", message="Invalid session cookie")
-                    ).model_dump(),
-                )
-            # Check if user is disabled
             async with session_factory() as session:
-                user_row = await get_user(session, str(claims["sub"]))
+                browser_session = await get_browser_session_by_token(session, cookie_token)
+                if browser_session is None or browser_session.revoked_at is not None:
+                    return JSONResponse(
+                        status_code=401,
+                        content=ErrorResponse(
+                            error=ErrorBody(code="unauthorized", message="Invalid session cookie")
+                        ).model_dump(),
+                    )
+                expires_at = browser_session.expires_at
+                if expires_at.tzinfo is None:
+                    expires_at = expires_at.replace(tzinfo=UTC)
+                if expires_at < datetime.now(UTC):
+                    return JSONResponse(
+                        status_code=401,
+                        content=ErrorResponse(
+                            error=ErrorBody(code="unauthorized", message="Session expired")
+                        ).model_dump(),
+                    )
+                user_row = await get_user(session, browser_session.user_email)
                 if user_row is not None and not user_row.is_active:
                     return JSONResponse(
                         status_code=403,
@@ -198,16 +211,23 @@ class AuthenticationMiddleware(BaseHTTPMiddleware):
                             error=ErrorBody(code="account_disabled", message="Account disabled")
                         ).model_dump(),
                     )
-            context_token = current_user_email.set(str(claims["sub"]))
+                if user_row is None:
+                    return JSONResponse(
+                        status_code=401,
+                        content=ErrorResponse(
+                            error=ErrorBody(code="unauthorized", message="Unknown session owner")
+                        ).model_dump(),
+                    )
+            context_token = current_user_email.set(user_row.email)
             request.state.user = AuthenticatedUser(
-                email=str(claims["sub"]),
-                role=str(claims.get("role", "user")),
-                name=claims.get("name"),
-                auth_type="cookie",
+                email=user_row.email,
+                role=user_row.role,
+                name=user_row.name,
+                auth_type="session",
             )
-            request.state.claims = claims
+            request.state.browser_session_id = browser_session.session_id
             if api_rate_limiter is not None and not await api_rate_limiter.allow(
-                user_key=str(claims["sub"]),
+                user_key=user_row.email,
                 path=request.url.path,
                 method=request.method,
             ):

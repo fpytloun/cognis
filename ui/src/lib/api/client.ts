@@ -86,7 +86,6 @@ export class ApiError extends Error {
 
 type RequestOptions = RequestInit & {
   auth?: boolean;
-  retryOnUnauthorized?: boolean;
 };
 
 async function readError(response: Response): Promise<ApiError> {
@@ -122,38 +121,27 @@ async function readError(response: Response): Promise<ApiError> {
 }
 
 async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
-  const { auth: requiresAuth = true, retryOnUnauthorized = true, headers, body, ...rest } = options;
+  const { auth: requiresAuth = true, headers, body, ...rest } = options;
   const nextHeaders = new Headers(headers ?? {});
 
   if (body && !nextHeaders.has('Content-Type') && !(body instanceof FormData)) {
     nextHeaders.set('Content-Type', 'application/json');
   }
 
-  if (requiresAuth) {
-    const token = auth.getAccessToken();
-    if (!token) {
-      throw new ApiError('Authentication required', { code: 'unauthorized', status: 401 });
-    }
-
-    nextHeaders.set('Authorization', `Bearer ${token}`);
-  }
-
   const response = await fetch(apiUrl(path), {
     ...rest,
+    credentials: 'include',
     headers: nextHeaders,
     body
   });
 
-  if (response.status === 401 && requiresAuth && retryOnUnauthorized) {
-    const refreshedToken = await auth.refreshSession();
-    if (!refreshedToken) {
-      throw new ApiError('Your session has expired. Please log in again.', {
-        code: 'unauthorized',
-        status: 401
-      });
-    }
-
-    return request<T>(path, { ...options, retryOnUnauthorized: false });
+  if (response.status === 401 && requiresAuth) {
+    const message = 'Your session has expired. Please log in again.';
+    auth.clear(message);
+    throw new ApiError(message, {
+      code: 'unauthorized',
+      status: 401
+    });
   }
 
   if (!response.ok) {

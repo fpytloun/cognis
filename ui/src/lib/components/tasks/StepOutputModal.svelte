@@ -3,6 +3,7 @@
 
   import type { StepRun } from '$lib/types/api';
   import { renderMarkdown, sanitizeHtml } from '$lib/markdown';
+  import { isTopOverlay, registerOverlay } from '$lib/stores/overlays';
   import AgentAvatar from '$lib/components/AgentAvatar.svelte';
   import Button from '$lib/components/ui/Button.svelte';
 
@@ -22,6 +23,7 @@
 
   let container: HTMLDivElement | null = null;
   let previousFocus: HTMLElement | null = null;
+  let overlayId = $state<string | null>(null);
 
   function stepOutputSummary(stepRun: StepRun): string {
     const val = stepRun.output?.summary;
@@ -92,6 +94,7 @@
   }
 
   function trapFocus(event: KeyboardEvent): void {
+    if (!isTopOverlay(overlayId)) return;
     if (event.key === 'Escape') {
       event.preventDefault();
       onclose();
@@ -123,12 +126,16 @@
   const feedback = $derived(stepEvalFeedback(stepRun));
 
   onMount(() => {
+    const handle = registerOverlay({ kind: 'blocking', blocksChrome: true });
+    overlayId = handle.id;
     previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     queueMicrotask(() => {
       focusableElements()[0]?.focus();
     });
     document.addEventListener('keydown', trapFocus);
     return () => {
+      handle.unregister();
+      overlayId = null;
       document.removeEventListener('keydown', trapFocus);
       queueMicrotask(() => previousFocus?.focus());
     };

@@ -23,4 +23,6 @@
 
 <a class="skip-link" href="#main">Skip to content</a>
 <PwaBanner />
-{@render children()}
+<div id="main">
+  {@render children()}
+</div>

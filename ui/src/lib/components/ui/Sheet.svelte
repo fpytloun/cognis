@@ -3,6 +3,7 @@
   import { onMount } from 'svelte';
   import { fade } from 'svelte/transition';
 
+  import { isTopOverlay, registerOverlay } from '$lib/stores/overlays';
   import { cn } from '$lib/utils';
 
   /**
@@ -55,6 +56,8 @@
   let dragStartY = 0;
   let dragOffsetY = $state(0);
   let dragging = $state(false);
+  let overlayId = $state<string | null>(null);
+  let unregisterOverlay: (() => void) | null = null;
 
   function focusPanel(): void {
     if (!panelEl) return;
@@ -68,49 +71,17 @@
     }
   }
 
-  /**
-   * iOS Safari (including PWAs) does not reliably honour
-   * ``document.body.style.overflow = 'hidden'`` — rubber-band scroll
-   * still bubbles to the page behind the sheet, making the background
-   * feel like it takes precedence when the user scrolls inside the
-   * sheet. The proven workaround is to pin the body at the current
-   * scroll offset with ``position: fixed`` and restore the offset on
-   * close.
-   */
-  let savedScrollY = 0;
-
-  function lockBodyScroll(): void {
-    if (typeof document === 'undefined') return;
-    savedScrollY = window.scrollY || document.documentElement.scrollTop || 0;
-    document.body.style.position = 'fixed';
-    document.body.style.top = `-${savedScrollY}px`;
-    document.body.style.left = '0';
-    document.body.style.right = '0';
-    document.body.style.width = '100%';
-    document.body.style.overflow = 'hidden';
-  }
-
-  function unlockBodyScroll(): void {
-    if (typeof document === 'undefined') return;
-    document.body.style.position = '';
-    document.body.style.top = '';
-    document.body.style.left = '';
-    document.body.style.right = '';
-    document.body.style.width = '';
-    document.body.style.overflow = '';
-    if (savedScrollY > 0) {
-      window.scrollTo(0, savedScrollY);
-      savedScrollY = 0;
-    }
-  }
-
   $effect(() => {
     if (open) {
       previouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-      lockBodyScroll();
+      const handle = registerOverlay({ kind: 'sheet', blocksChrome: false });
+      overlayId = handle.id;
+      unregisterOverlay = handle.unregister;
       requestAnimationFrame(() => focusPanel());
     } else {
-      unlockBodyScroll();
+      unregisterOverlay?.();
+      unregisterOverlay = null;
+      overlayId = null;
       previouslyFocused?.focus();
       previouslyFocused = null;
       dragOffsetY = 0;
@@ -120,12 +91,12 @@
 
   onMount(() => {
     return () => {
-      unlockBodyScroll();
+      unregisterOverlay?.();
     };
   });
 
   function handleKeydown(event: KeyboardEvent): void {
-    if (!open) return;
+    if (!open || !isTopOverlay(overlayId)) return;
     if (event.key === 'Escape' && dismissible) {
       event.preventDefault();
       onClose();

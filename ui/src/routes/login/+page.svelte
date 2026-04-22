@@ -40,7 +40,7 @@
   <title>Sign In · Cognis</title>
 </svelte:head>
 
-<div class="flex min-h-screen items-center justify-center px-4">
+<div class="flex min-h-[100dvh] items-center justify-center overflow-y-auto px-4 py-6" style="padding-left: max(1rem, env(safe-area-inset-left)); padding-right: max(1rem, env(safe-area-inset-right)); padding-top: calc(env(safe-area-inset-top) + 1.5rem); padding-bottom: calc(env(safe-area-inset-bottom) + 1.5rem);">
   <Card class="w-full max-w-sm p-8 sm:p-10">
     <div class="space-y-6">
       <div class="space-y-1 text-center">

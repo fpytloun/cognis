@@ -42,7 +42,7 @@ class LoginRequest(BaseModel):
 
 
 class RefreshRequest(BaseModel):
-    refresh_token: str
+    refresh_token: str | None = None
 
 
 class LogoutRequest(BaseModel):
@@ -55,6 +55,11 @@ class TokenResponse(BaseModel):
     refresh_token: str | None = None
     expires_in: int
     user: dict[str, Any]
+
+
+class AuthSessionResponse(BaseModel):
+    user: dict[str, Any]
+    expires_at: datetime
 
 
 class ExchangeTokenResponse(BaseModel):

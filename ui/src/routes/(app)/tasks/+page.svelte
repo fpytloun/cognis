@@ -720,6 +720,7 @@
                 {#each tasksForColumn(column.id) as task (task.task_id)}
                   <div
                     draggable={!filtersActive}
+                    role="listitem"
                     ondragstart={() => (dragState = { taskId: task.task_id, column: column.id })}
                     ondragend={() => { dragState = null; dropTargetColumn = null; }}
                     ondragover={(event: DragEvent) => event.preventDefault()}

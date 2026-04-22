@@ -3,8 +3,9 @@
   import { page } from '$app/stores';
   import Bot from 'lucide-svelte/icons/bot';
 import ListTodo from 'lucide-svelte/icons/list-todo';
-import MessageSquareText from 'lucide-svelte/icons/message-square-text';
-import Settings from 'lucide-svelte/icons/settings';
+  import MessageSquareText from 'lucide-svelte/icons/message-square-text';
+  import Settings from 'lucide-svelte/icons/settings';
+  import { blockingOverlayActive } from '$lib/stores/overlays';
 
   /**
    * Mobile bottom tab bar. Shown only below `lg` breakpoint (matches `isMobile`
@@ -39,13 +40,14 @@ import Settings from 'lucide-svelte/icons/settings';
 
   function syncBottomOffset(): void {
     if (typeof window === 'undefined') return;
-    const shouldReserve = !hidden && window.innerWidth < 1024;
+    const shouldReserve = !hidden && !$blockingOverlayActive && window.innerWidth < 1024;
     setBottomOffset(shouldReserve ? navEl?.offsetHeight ?? 0 : 0);
   }
 
   $effect(() => {
     if (typeof window === 'undefined') return;
     void hidden;
+    void $blockingOverlayActive;
     void navEl;
     const rafId = window.requestAnimationFrame(syncBottomOffset);
     return () => window.cancelAnimationFrame(rafId);
@@ -73,11 +75,11 @@ import Settings from 'lucide-svelte/icons/settings';
   });
 </script>
 
-{#if !hidden}
+{#if !hidden && !$blockingOverlayActive}
   <nav
     bind:this={navEl}
     class="fixed inset-x-0 bottom-0 z-[60] border-t border-slate-800/80 bg-slate-950/95 backdrop-blur lg:hidden"
-    style="padding-bottom: env(safe-area-inset-bottom, 0);"
+    style="padding-bottom: env(safe-area-inset-bottom, 0); padding-left: env(safe-area-inset-left, 0); padding-right: env(safe-area-inset-right, 0);"
     aria-label="Primary"
   >
     <ul class="grid grid-cols-4">

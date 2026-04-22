@@ -53,6 +53,7 @@ import X from 'lucide-svelte/icons/x';
   } from '$lib/chat-page';
   import { confirmAction } from '$lib/stores/confirm';
   import { requestOpenMobileNav } from '$lib/stores/mobileNav';
+  import { registerOverlay } from '$lib/stores/overlays';
   import { addToast } from '$lib/stores/toasts';
   import { onCancelActiveTurnRequest, onChatComposerFocusRequest } from '$lib/shortcuts';
   import { isSupported as notificationsSupported, isGranted as notificationsGranted, requestPermission, notifyIfHidden, hasAskedPermission } from '$lib/notifications';
@@ -95,6 +96,7 @@ import X from 'lucide-svelte/icons/x';
   let archivingConversation = $state(false);
   let deletingConversation = $state(false);
   let mobileListOpen = $state(false);
+  let mobileListOverlayCleanup: (() => void) | null = null;
   let mobileFilterOpen = $state(false);
   // Unified flag for the expanded header info panel. Replaces the older
   // pair of `sessionInfoOpen` (desktop popover) + `mobileHeaderDetailsOpen`
@@ -951,12 +953,10 @@ import X from 'lucide-svelte/icons/x';
   function openMobileList(): void {
     mobileDrawerPreviouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     mobileListOpen = true;
-    document.body.style.overflow = 'hidden';
   }
 
   function closeMobileList(): void {
     mobileListOpen = false;
-    document.body.style.overflow = '';
     mobileDrawerPreviouslyFocused?.focus();
     mobileDrawerPreviouslyFocused = null;
   }
@@ -1186,7 +1186,6 @@ import X from 'lucide-svelte/icons/x';
     escalationResolutionPending = null;
     headerInfoOpen = false;
     mobileListOpen = false;
-    document.body.style.overflow = '';
 
     if (previousConversationId) {
       wsClient.unsubscribeConversation(previousConversationId);
@@ -2211,6 +2210,20 @@ import X from 'lucide-svelte/icons/x';
   });
 
   $effect(() => {
+    if (mobileListOpen) {
+      const handle = registerOverlay({ kind: 'sheet', blocksChrome: false });
+      mobileListOverlayCleanup = handle.unregister;
+      return () => {
+        handle.unregister();
+        mobileListOverlayCleanup = null;
+      };
+    }
+
+    mobileListOverlayCleanup?.();
+    mobileListOverlayCleanup = null;
+  });
+
+  $effect(() => {
     if (!mobileListOpen) {
       return;
     }
@@ -2244,9 +2257,6 @@ import X from 'lucide-svelte/icons/x';
     restoreSelectedChannel();
     restoreChatSidebarState();
     mobileListOpen = !conversationIdFromRoute();
-    if (mobileListOpen) {
-      document.body.style.overflow = 'hidden';
-    }
     unsubscribeWs = wsClient.subscribe(handleSocketEvent);
     unsubscribeComposerFocus = onChatComposerFocusRequest(() => {
       composerElement?.focus();
@@ -2268,7 +2278,8 @@ import X from 'lucide-svelte/icons/x';
     void initialize();
 
     return () => {
-      document.body.style.overflow = '';
+      mobileListOverlayCleanup?.();
+      mobileListOverlayCleanup = null;
       stopInitialLoadTimeout();
       unsubscribeWs?.();
       unsubscribeComposerFocus?.();
@@ -2817,12 +2828,11 @@ import X from 'lucide-svelte/icons/x';
         {/if}
 
         <!-- Timeline -->
-        <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
         <div
           class="relative min-h-0 flex-1 overflow-y-auto px-2.5 py-1.5 sm:p-4"
           bind:this={timelineEl}
           onscroll={handleTimelineScroll}
-          onclick={closeHeaderInfo}
+          onpointerdown={closeHeaderInfo}
         >
           <div bind:this={timelineContentEl} class="space-y-3">
             {#if visibleStartIndex > 0}

@@ -199,6 +199,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_harness_recovery_tables)
         await conn.run_sync(_ensure_tool_classification_table)
         await conn.run_sync(_ensure_tool_classification_override_table)
+        await conn.run_sync(_ensure_browser_sessions_table)
 
 
 def _ensure_session_lifecycle_columns(sync_conn: object) -> None:
@@ -260,6 +261,14 @@ def _ensure_tool_classification_override_table(sync_conn: object) -> None:
     from cognis.store.models import ToolClassificationOverrideRow
 
     ToolClassificationOverrideRow.__table__.create(bind=sync_conn, checkfirst=True)
+
+
+def _ensure_browser_sessions_table(sync_conn: object) -> None:
+    """Create the durable browser session table."""
+
+    from cognis.store.models import BrowserSession
+
+    BrowserSession.__table__.create(bind=sync_conn, checkfirst=True)
 
 
 def _ensure_agent_sync_metadata_column(sync_conn: object) -> None:

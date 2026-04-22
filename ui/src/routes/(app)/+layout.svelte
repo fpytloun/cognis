@@ -1,6 +1,7 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
   import { page } from '$app/stores';
+  import type { Snippet } from 'svelte';
   import { onMount } from 'svelte';
   import Bot from 'lucide-svelte/icons/bot';
 import BookOpen from 'lucide-svelte/icons/book-open';
@@ -31,12 +32,15 @@ import X from 'lucide-svelte/icons/x';
   import { sidebarTooltip } from '$lib/actions/sidebarTooltip';
   import BottomTabBar from '$lib/components/BottomTabBar.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
-  import { closeShortcutHelp, openShortcutHelp, requestCancelActiveTurn, requestChatComposerFocus, shortcutHelpOpen } from '$lib/shortcuts';
+  import { openShortcutHelp, requestCancelActiveTurn, requestChatComposerFocus } from '$lib/shortcuts';
   import { auth } from '$lib/stores/auth';
   import { mobileNavOpenSignal } from '$lib/stores/mobileNav';
+  import { blockingOverlayActive, resetOverlayState } from '$lib/stores/overlays';
   import { workspaceHealth } from '$lib/system';
   import type { SystemDiagnostics } from '$lib/types/api';
   import { wsClient, wsState } from '$lib/ws/client';
+
+  let { children }: { children: Snippet } = $props();
 
   const navigationItems = [
     { href: '/chat', label: 'Chat', icon: MessageSquareText },
@@ -55,6 +59,7 @@ import X from 'lucide-svelte/icons/x';
   let mobileNavOpen = $state(false);
   let sidebarCollapsed = $state(false);
   let mobileHeaderEl = $state<HTMLElement | null>(null);
+  let workspaceRunning = false;
 
   function openMobileNav(): void {
     mobileNavOpen = true;
@@ -190,13 +195,11 @@ import X from 'lucide-svelte/icons/x';
   }
 
   function handleGlobalShortcuts(event: KeyboardEvent): void {
+    if ($blockingOverlayActive) {
+      return;
+    }
     const activeTagIsInput = isTextInputTarget(event.target);
     if (event.key === 'Escape') {
-      if ($shortcutHelpOpen) {
-        event.preventDefault();
-        closeShortcutHelp();
-        return;
-      }
       requestCancelActiveTurn();
       if (activeTagIsInput && document.activeElement instanceof HTMLElement) {
         document.activeElement.blur();
@@ -292,6 +295,32 @@ import X from 'lucide-svelte/icons/x';
     return () => window.cancelAnimationFrame(rafId);
   });
 
+  $effect(() => {
+    if (typeof ResizeObserver === 'undefined') return;
+    const element = mobileHeaderEl;
+    if (!element) {
+      syncMobileHeaderOffset();
+      return;
+    }
+    const observer = new ResizeObserver(syncMobileHeaderOffset);
+    observer.observe(element);
+    return () => observer.disconnect();
+  });
+
+  function startWorkspace(): void {
+    if (workspaceRunning) return;
+    workspaceRunning = true;
+    wsClient.connect();
+    workspaceHealth.start();
+  }
+
+  function stopWorkspace(): void {
+    if (!workspaceRunning) return;
+    workspaceRunning = false;
+    wsClient.disconnect();
+    workspaceHealth.stop();
+  }
+
   function websocketStatusLabel(): string {
     if ($wsState.status === 'connected') return 'Connected';
     if ($wsState.status === 'stalled') return 'Disconnected';
@@ -308,15 +337,8 @@ import X from 'lucide-svelte/icons/x';
 
   onMount(() => {
     restoreSidebarState();
-    void auth.bootstrap().then(async () => {
+    void auth.bootstrap().finally(() => {
       bootstrapped = true;
-      if (auth.getSnapshot().status !== 'authenticated') {
-        await goto('/login', { replaceState: true });
-        return;
-      }
-      await loadDiagnosticsIfNeeded();
-      wsClient.connect();
-      workspaceHealth.start();
     });
 
     window.addEventListener('keydown', handleGlobalShortcuts);
@@ -334,14 +356,28 @@ import X from 'lucide-svelte/icons/x';
     });
 
     return () => {
-      document.body.style.overflow = '';
+      resetOverlayState();
       window.removeEventListener('keydown', handleGlobalShortcuts);
       window.removeEventListener('resize', syncMobileHeaderOffset);
       setShellOffsetVariable('--app-shell-top-offset', 0);
       unsubscribeMobileNav();
-      wsClient.disconnect();
-      workspaceHealth.stop();
+      stopWorkspace();
     };
+  });
+
+  $effect(() => {
+    if (!bootstrapped) {
+      return;
+    }
+
+    if ($auth.status === 'authenticated') {
+      startWorkspace();
+      void loadDiagnosticsIfNeeded();
+      return;
+    }
+
+    stopWorkspace();
+    void goto('/login', { replaceState: true });
   });
 
   async function handleLogout(): Promise<void> {
@@ -356,7 +392,7 @@ import X from 'lucide-svelte/icons/x';
 </svelte:head>
 
 {#if !bootstrapped || $auth.status === 'loading'}
-  <div class="mx-auto flex min-h-screen max-w-5xl items-center justify-center px-6 py-16">
+  <div class="mx-auto flex min-h-[100dvh] max-w-5xl items-center justify-center px-6 py-16">
     <LoadingState label="Loading workspace" description="Restoring your Cognis session and preparing the UI shell." />
   </div>
 {:else}
@@ -398,7 +434,7 @@ import X from 'lucide-svelte/icons/x';
                   class={`flex items-center rounded-2xl text-sm transition ${$page.url.pathname.startsWith(item.href) ? 'bg-sky-500/20 text-white' : 'text-slate-300 hover:bg-slate-800 hover:text-white'} gap-3 px-4 py-3`}
                   href={item.href}
                 >
-                  <svelte:component this={item.icon} class="h-4 w-4 shrink-0" />
+                  <item.icon class="h-4 w-4 shrink-0" />
                   <span>{item.label}</span>
                 </a>
               {:else}
@@ -408,7 +444,7 @@ import X from 'lucide-svelte/icons/x';
                   class={`flex items-center justify-center rounded-2xl px-2 py-3 text-sm transition ${$page.url.pathname.startsWith(item.href) ? 'bg-sky-500/20 text-white' : 'text-slate-300 hover:bg-slate-800 hover:text-white'}`}
                   href={item.href}
                 >
-                  <svelte:component this={item.icon} class="h-4 w-4 shrink-0" />
+                  <item.icon class="h-4 w-4 shrink-0" />
                 </a>
               {/if}
             {/each}
@@ -525,7 +561,7 @@ import X from 'lucide-svelte/icons/x';
           top by `env(safe-area-inset-top)` so the hamburger + title sit
           below the camera cutout instead of being obscured by it.
         -->
-        <header bind:this={mobileHeaderEl} class="fixed inset-x-0 top-0 z-[70] flex shrink-0 items-center justify-between gap-2 border-b border-slate-800/80 bg-slate-950/95 px-3 pt-[calc(0.625rem+env(safe-area-inset-top))] pb-2.5 backdrop-blur sm:gap-3 sm:px-4 sm:pt-[calc(0.625rem+env(safe-area-inset-top))] sm:pb-2.5 lg:hidden">
+        <header bind:this={mobileHeaderEl} class="fixed inset-x-0 top-0 z-[70] flex shrink-0 items-center justify-between gap-2 border-b border-slate-800/80 bg-slate-950/95 px-3 pt-[calc(0.625rem+env(safe-area-inset-top))] pb-2.5 backdrop-blur sm:gap-3 sm:px-4 sm:pt-[calc(0.625rem+env(safe-area-inset-top))] sm:pb-2.5 lg:hidden" style="padding-left: max(0.75rem, env(safe-area-inset-left)); padding-right: max(0.75rem, env(safe-area-inset-right));">
           <div class="flex min-w-0 flex-1 items-center gap-2 lg:hidden">
             <Button aria-label="Open navigation" class="h-11 w-11 lg:hidden md:h-9 md:w-9" size="icon" variant="secondary" onclick={openMobileNav}>
               <Menu class="h-5 w-5" />
@@ -573,7 +609,7 @@ import X from 'lucide-svelte/icons/x';
               <div class={`rounded-2xl border px-4 py-4 text-sm ${banner.variant === 'warning' ? 'border-amber-500/30 bg-amber-500/10 text-amber-100' : 'border-rose-500/30 bg-rose-500/10 text-rose-100'}`}>
                 <div class="flex flex-wrap items-center justify-between gap-3">
                   <div class="flex min-w-0 items-start gap-3">
-                    <svelte:component this={banner.icon} class="mt-0.5 h-5 w-5 shrink-0" />
+                     <banner.icon class="mt-0.5 h-5 w-5 shrink-0" />
                     <div>
                       <p class="font-medium">{banner.title}</p>
                       <p class="mt-1 opacity-90">{banner.description}</p>
@@ -616,12 +652,13 @@ import X from 'lucide-svelte/icons/x';
         -->
         <div
           class={contentShellClass}
+          role="presentation"
           onpointerdown={isChatDetailRoute ? undefined : onLeftEdgePointerDown}
           onpointermove={isChatDetailRoute ? undefined : onLeftEdgePointerMove}
           onpointerup={isChatDetailRoute ? undefined : onLeftEdgePointerReset}
           onpointercancel={isChatDetailRoute ? undefined : onLeftEdgePointerReset}
         >
-            <slot />
+            {@render children()}
         </div>
       </main>
     </div>
@@ -655,7 +692,7 @@ import X from 'lucide-svelte/icons/x';
           href={item.href}
           onclick={closeMobileNav}
         >
-          <svelte:component this={item.icon} class="h-5 w-5" />
+           <item.icon class="h-5 w-5" />
           <span>{item.label}</span>
         </a>
       {/each}

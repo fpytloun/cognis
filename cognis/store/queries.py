@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
+import secrets
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -17,6 +19,7 @@ from cognis.store.models import (
     AgentSecondaryBinding,
     ApiKey,
     ArtifactRecordRow,
+    BrowserSession,
     ChannelAccountRow,
     ChannelContact,
     ChannelDeliveryOutboxRow,
@@ -237,6 +240,7 @@ async def delete_user_cascade(session: AsyncSession, email: str) -> bool:
     await session.execute(delete(Conversation).where(Conversation.user_email == email))
     await session.execute(delete(Agent).where(Agent.owner_email == email))
     await session.execute(delete(ApiKey).where(ApiKey.user_email == email))
+    await session.execute(delete(BrowserSession).where(BrowserSession.user_email == email))
     await session.execute(delete(Secret).where(Secret.user_email == email))
     await session.execute(delete(WorkflowRow).where(WorkflowRow.owner_email == email))
     await session.execute(delete(ExecutorRow).where(ExecutorRow.owner_email == email))
@@ -324,6 +328,83 @@ async def touch_api_key_last_used(
     record.last_used_at = when or _utcnow()
     await session.flush()
     return True
+
+
+def hash_browser_session_token(token: str) -> str:
+    """Hash an opaque browser session token before persisting it."""
+
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+async def create_browser_session(
+    session: AsyncSession,
+    *,
+    user_email: str,
+    expires_at: datetime,
+    user_agent: str | None = None,
+) -> tuple[BrowserSession, str]:
+    """Create a new opaque browser session and return the raw token once."""
+
+    raw_token = secrets.token_urlsafe(32)
+    row = BrowserSession(
+        session_id=f"bs_{uuid.uuid4().hex}",
+        user_email=user_email,
+        token_hash=hash_browser_session_token(raw_token),
+        user_agent=user_agent,
+        expires_at=expires_at,
+    )
+    session.add(row)
+    await session.flush()
+    return row, raw_token
+
+
+async def get_browser_session_by_token(
+    session: AsyncSession, token: str
+) -> BrowserSession | None:
+    """Look up a browser session from an opaque session token."""
+
+    token_hash = hash_browser_session_token(token)
+    result = await session.execute(
+        select(BrowserSession).where(BrowserSession.token_hash == token_hash)
+    )
+    return result.scalar_one_or_none()
+
+
+async def revoke_browser_session(session: AsyncSession, session_id: str) -> bool:
+    """Revoke one browser session by ID."""
+
+    row = await session.get(BrowserSession, session_id)
+    if row is None or row.revoked_at is not None:
+        return False
+    row.revoked_at = _utcnow()
+    row.updated_at = _utcnow()
+    await session.flush()
+    return True
+
+
+async def revoke_browser_session_by_token(session: AsyncSession, token: str) -> bool:
+    """Revoke one browser session by opaque token."""
+
+    row = await get_browser_session_by_token(session, token)
+    if row is None:
+        return False
+    return await revoke_browser_session(session, row.session_id)
+
+
+async def touch_browser_session(
+    session: AsyncSession,
+    session_row: BrowserSession,
+    *,
+    expires_at: datetime | None = None,
+) -> BrowserSession:
+    """Update last-used metadata for a browser session."""
+
+    session_row.last_used_at = _utcnow()
+    session_row.updated_at = _utcnow()
+    if expires_at is not None:
+        session_row.expires_at = expires_at
+    await session.flush()
+    return session_row
 
 
 # --- Settings ---

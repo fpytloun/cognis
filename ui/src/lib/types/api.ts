@@ -36,6 +36,11 @@ export interface TokenResponse {
   user: UserSummary;
 }
 
+export interface AuthSessionResponse {
+  user: UserSummary;
+  expires_at: string;
+}
+
 export interface ExchangeTokenResponse {
   token: string;
   target: string;

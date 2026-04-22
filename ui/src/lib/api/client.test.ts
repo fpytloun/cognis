@@ -5,11 +5,10 @@ import { auth } from '$lib/stores/auth';
 
 const jsonHeaders = { 'Content-Type': 'application/json' };
 
-describe('api client auth retry', () => {
+describe('api client session handling', () => {
   const originalFetch = global.fetch;
 
   beforeEach(() => {
-    window.localStorage?.clear?.();
     auth.clear();
   });
 
@@ -18,15 +17,13 @@ describe('api client auth retry', () => {
     vi.restoreAllMocks();
   });
 
-  it('refreshes once and retries the protected request', async () => {
+  it('clears auth state when a protected request returns 401', async () => {
     const fetchMock = vi.fn<typeof fetch>()
       .mockResolvedValueOnce(
         new Response(
           JSON.stringify({
-            token: 'access-1',
-            refresh_token: 'refresh-1',
-            expires_in: 3600,
-            user: { email: 'user@example.com', name: 'User', role: 'user' }
+            user: { email: 'user@example.com', name: 'User', role: 'user' },
+            expires_at: new Date(Date.now() + 3_600_000).toISOString()
           }),
           { status: 200, headers: jsonHeaders }
         )
@@ -36,33 +33,13 @@ describe('api client auth retry', () => {
           status: 401,
           headers: jsonHeaders
         })
-      )
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
-            token: 'access-2',
-            refresh_token: 'refresh-2',
-            expires_in: 3600,
-            user: { email: 'user@example.com', name: 'User', role: 'user' }
-          }),
-          { status: 200, headers: jsonHeaders }
-        )
-      )
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({ email: 'user@example.com', name: 'User', role: 'user' }),
-          { status: 200, headers: jsonHeaders }
-        )
       );
 
     global.fetch = fetchMock;
 
     await auth.login('user@example.com', 'password123');
-    const me = await api.auth.me();
-
-    expect(me.email).toBe('user@example.com');
-    expect(fetchMock).toHaveBeenCalledTimes(4);
-    expect(String(fetchMock.mock.calls[2]?.[0])).toContain('/api/auth/refresh');
-    expect(String(fetchMock.mock.calls[3]?.[0])).toContain('/api/auth/me');
+    await expect(api.auth.me()).rejects.toMatchObject({ status: 401, code: 'unauthorized' });
+    expect(auth.getSnapshot().status).toBe('anonymous');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });

@@ -17,6 +17,7 @@
   import LoadingState from '$lib/components/LoadingState.svelte';
   import Card from '$lib/components/ui/Card.svelte';
   import { confirmAction } from '$lib/stores/confirm';
+  import { registerOverlay } from '$lib/stores/overlays';
   import { addToast } from '$lib/stores/toasts';
   import type { Agent, ChannelAccount, ChannelContact, ChannelMeta, ExecutorConfig, PairingRequest } from '$lib/types/api';
 
@@ -57,6 +58,7 @@
   let initialDraftSnapshot = $state('');
   let mobileEditorOpen = $state(false);
   let editorPreviouslyFocused = $state<HTMLElement | null>(null);
+  let mobileEditorOverlayCleanup: (() => void) | null = null;
 
   let webhookInfo = $state<{ url: string; secret: string | null; channelType: string } | null>(null);
   let webhookInfoDismissed = $state(false);
@@ -114,9 +116,6 @@
   function openEditor(): void {
     editorPreviouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     mobileEditorOpen = usesMobileEditorOverlay();
-    if (mobileEditorOpen) {
-      document.body.style.overflow = 'hidden';
-    }
   }
 
   function closeEditor(): void {
@@ -127,10 +126,23 @@
     credentialOverrides = {};
     mobileEditorOpen = false;
     initialDraftSnapshot = '';
-    document.body.style.overflow = '';
     editorPreviouslyFocused?.focus();
     editorPreviouslyFocused = null;
   }
+
+  $effect(() => {
+    if (mobileEditorOpen) {
+      const handle = registerOverlay({ kind: 'sheet', blocksChrome: false });
+      mobileEditorOverlayCleanup = handle.unregister;
+      return () => {
+        handle.unregister();
+        mobileEditorOverlayCleanup = null;
+      };
+    }
+
+    mobileEditorOverlayCleanup?.();
+    mobileEditorOverlayCleanup = null;
+  });
 
   function handleTabChange(tab: ChannelsTab): void {
     activeTab = tab;
@@ -505,7 +517,8 @@
       }
     }, 10_000);
     return () => {
-      document.body.style.overflow = '';
+      mobileEditorOverlayCleanup?.();
+      mobileEditorOverlayCleanup = null;
       window.clearInterval(interval);
     };
   });

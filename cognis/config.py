@@ -48,6 +48,11 @@ class CognisConfig:
     # CORS
     cors_origins: list[str]
 
+    # Browser session cookies
+    browser_session_ttl_seconds: int
+    session_cookie_domain: str
+    session_cookie_samesite: str
+
     # LSP diagnostics
     lsp_enabled: bool
     lsp_auto_install: bool
@@ -138,6 +143,13 @@ def load_config() -> CognisConfig:
         log_format=os.environ.get("COGNIS_LOG_FORMAT", "json"),
         serve_ui=serve_ui,
         cors_origins=cors_origins,
+        browser_session_ttl_seconds=int(
+            os.environ.get("COGNIS_BROWSER_SESSION_TTL_SECONDS", str(30 * 24 * 60 * 60))
+        ),
+        session_cookie_domain=os.environ.get("COGNIS_SESSION_COOKIE_DOMAIN", "").strip(),
+        session_cookie_samesite=os.environ.get("COGNIS_SESSION_COOKIE_SAMESITE", "lax")
+        .strip()
+        .lower(),
         lsp_enabled=lsp_enabled_raw not in {"0", "false", "no", "off"},
         lsp_auto_install=lsp_auto_install_raw not in {"0", "false", "no", "off"},
         lsp_diagnostics_timeout_ms=int(
@@ -214,6 +226,11 @@ ENV_TEMPLATE = """\
 
 # CORS
 # COGNIS_CORS_ORIGINS=http://localhost:5173
+
+# Browser session cookies
+# COGNIS_BROWSER_SESSION_TTL_SECONDS=2592000
+# COGNIS_SESSION_COOKIE_DOMAIN=
+# COGNIS_SESSION_COOKIE_SAMESITE=lax
 
 # LSP diagnostics (auto-detect language servers for edit feedback)
 # COGNIS_LSP_ENABLED=true

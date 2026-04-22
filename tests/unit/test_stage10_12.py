@@ -125,10 +125,9 @@ def test_api_key_cannot_manage_api_keys(monkeypatch: object, tmp_path: Path) -> 
                 "/api/auth/login",
                 json={"email": "user@example.com", "password": "password123"},
             )
-            bearer = {"Authorization": f"Bearer {login.json()['token']}"}
+            assert login.status_code == 200
             created = client.post(
                 "/api/v1/auth/api-keys",
-                headers=bearer,
                 json={"name": "primary-key"},
             )
             return created.json()["api_key"]

@@ -1,6 +1,7 @@
 <script lang="ts">
   import Button from '$lib/components/ui/Button.svelte';
   import Input from '$lib/components/ui/Input.svelte';
+  import BlockingDialog from '$lib/components/ui/BlockingDialog.svelte';
   import { buildWorkflowSourceOptions, decodeWorkflowSourceValue } from '$lib/workflow-sources';
   import type { Agent, Conversation, Skill, Workflow } from '$lib/types/api';
 
@@ -35,8 +36,10 @@
     }) => void;
   }>();
 
-  const primaryAgents = agents.filter((a: Agent) => a.agent_type === 'primary');
-  const defaultAgentId = primaryAgents.find((a: Agent) => a.status === 'active')?.agent_id ?? primaryAgents[0]?.agent_id ?? '';
+  const primaryAgents = $derived(agents.filter((a: Agent) => a.agent_type === 'primary'));
+  const defaultAgentId = $derived(
+    primaryAgents.find((a: Agent) => a.status === 'active')?.agent_id ?? primaryAgents[0]?.agent_id ?? ''
+  );
   const selectedAgent = $derived(
     primaryAgents.find((agent: Agent) => agent.agent_id === form.agent_id) ?? null
   );
@@ -45,7 +48,7 @@
   let form = $state({
     title: '',
     description: '',
-    agent_id: defaultAgentId,
+    agent_id: '',
     workflow_source: '',
     expected_output: '',
     priority: 0,
@@ -74,29 +77,21 @@
     });
   }
 
-  function handleBackdropClick(event: MouseEvent): void {
-    if (event.target === event.currentTarget) onclose();
-  }
-
-  function handleKeydown(event: KeyboardEvent): void {
-    if (event.key === 'Escape') onclose();
-  }
+  $effect(() => {
+    if (!form.agent_id && defaultAgentId) {
+      form.agent_id = defaultAgentId;
+    }
+  });
 </script>
-
-<svelte:window onkeydown={handleKeydown} />
-
-<!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-<div
-  class="app-viewport-overlay z-50 flex items-center justify-center overflow-y-auto overscroll-contain bg-black/60 px-4 py-4 backdrop-blur-sm"
-  onclick={handleBackdropClick}
-  role="presentation"
->
-  <div class="max-h-full w-full max-w-lg overflow-y-auto rounded-3xl border border-slate-700 bg-slate-900 p-6 shadow-2xl overscroll-contain" role="dialog" aria-modal="true" aria-label="Create task">
-    <div class="mb-5 flex items-center justify-between">
-      <h2 class="text-lg font-semibold text-white">Create task</h2>
-      <button class="text-slate-400 hover:text-white" onclick={onclose} aria-label="Close">&times;</button>
+<BlockingDialog label="Create task" onClose={onclose} titleId="create-task-title">
+  {#snippet header()}
+    <div class="flex items-center justify-between gap-3">
+      <h2 class="text-lg font-semibold text-white" id="create-task-title">Create task</h2>
+      <button class="text-slate-400 hover:text-white" onclick={onclose} aria-label="Close" type="button">&times;</button>
     </div>
+  {/snippet}
 
+  {#snippet children()}
     <div class="space-y-4">
       <div class="space-y-1">
         <label for="task-title" class="text-xs font-medium uppercase tracking-widest text-slate-400">Title</label>
@@ -189,11 +184,14 @@
       </div>
     </div>
 
-    <div class="mt-6 flex justify-end gap-3">
+  {/snippet}
+
+  {#snippet footer()}
+    <div class="flex justify-end gap-3">
       <Button variant="secondary" onclick={onclose}>Cancel</Button>
       <Button disabled={!form.title.trim() || !form.agent_id || creating} onclick={handleSubmit}>
         {creating ? 'Creating...' : 'Create draft'}
       </Button>
     </div>
-  </div>
-</div>
+  {/snippet}
+</BlockingDialog>

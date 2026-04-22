@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 
 from cognis.api.app import create_app
 from cognis.security import generate_api_key_material
-from cognis.store.queries import create_agent, create_api_key, create_user
+from cognis.store.queries import create_agent, create_api_key, create_browser_session, create_user
 
 
 def _create_test_client(monkeypatch: object, tmp_path: Path) -> TestClient:
@@ -50,6 +51,37 @@ def test_middleware_rejects_wrong_audience_token(monkeypatch: object, tmp_path: 
         )
         response = client.get("/api/auth/me", headers={"Authorization": f"Bearer {token}"})
         assert response.status_code == 401
+
+
+def test_middleware_authenticates_browser_session_cookie(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> str:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                _, raw_token = await create_browser_session(
+                    session,
+                    user_email="user@example.com",
+                    expires_at=datetime.now(UTC) + timedelta(days=1),
+                    user_agent="pytest",
+                )
+                await session.commit()
+                return raw_token
+
+        raw_token = asyncio.run(_seed())
+        client.cookies.set("cognis_session", raw_token)
+        response = client.get("/api/auth/me")
+        assert response.status_code == 200
+        assert response.json()["email"] == "user@example.com"
 
 
 def test_middleware_rate_limits_jwt_requests(monkeypatch: object, tmp_path: Path) -> None:

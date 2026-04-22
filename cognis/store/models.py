@@ -80,6 +80,33 @@ class ApiKey(Base):
     )
 
 
+class BrowserSession(Base):
+    """Opaque browser session for the bundled web UI."""
+
+    __tablename__ = "browser_sessions"
+    __table_args__ = (
+        Index("ix_browser_sessions_user_email", "user_email"),
+        Index("ix_browser_sessions_expires_at", "expires_at"),
+        UniqueConstraint("token_hash", name="uq_browser_sessions_token_hash"),
+    )
+
+    session_id: Mapped[str] = mapped_column(String, primary_key=True)
+    user_email: Mapped[str] = mapped_column(String, ForeignKey("users.email"), nullable=False)
+    token_hash: Mapped[str] = mapped_column(String, nullable=False)
+    user_agent: Mapped[str | None] = mapped_column(Text, nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    last_used_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+
 class Agent(Base):
     """Agent definitions."""
 

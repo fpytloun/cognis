@@ -46,7 +46,12 @@ from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.runtime_context import current_user_email
 from cognis.store.models import Task
-from cognis.store.queries import get_task, mark_artifacts_attached
+from cognis.store.queries import (
+    get_browser_session_by_token,
+    get_task,
+    get_user,
+    mark_artifacts_attached,
+)
 
 logger = get_logger(__name__)
 
@@ -71,6 +76,7 @@ WS_CHUNK_GAP_FRAMES_TOTAL = Counter(
 DEFAULT_INBOUND_RATE_LIMIT = 10
 DEFAULT_OUTBOUND_BUFFER = 100
 DEFAULT_REPLAY_LIMIT = 200
+COOKIE_NAME = "cognis_session"
 
 
 def _workflow_composed_payload(conversation_id: str, data: dict[str, Any]) -> dict[str, Any]:
@@ -726,29 +732,91 @@ class WebSocketConnectionManager:
 # ---------------------------------------------------------------------------
 
 
-async def handle_websocket(websocket: WebSocket) -> None:
-    """Main WebSocket handler — auth, message loop, dispatch."""
-    await websocket.accept()
+def _allowed_websocket_origins(websocket: WebSocket) -> set[str]:
+    config = getattr(websocket.app.state, "config", None)
+    allowed: set[str] = set()
+    for origin in getattr(config, "cors_origins", []) or []:
+        if origin:
+            allowed.add(str(origin).rstrip("/"))
+    public_base_url = str(getattr(config, "public_base_url", "") or "").rstrip("/")
+    if public_base_url:
+        allowed.add(public_base_url)
+    host = websocket.headers.get("host", "").strip()
+    if host:
+        forwarded = websocket.headers.get("x-forwarded-proto", "").split(",", 1)[0].strip().lower()
+        scheme = forwarded or ("https" if websocket.url.scheme == "wss" else "http")
+        allowed.add(f"{scheme}://{host}".rstrip("/"))
+    return allowed
+
+
+def _origin_allowed(websocket: WebSocket, origin: str) -> bool:
+    return origin.rstrip("/") in _allowed_websocket_origins(websocket)
+
+
+async def _authenticate_browser_session(websocket: WebSocket) -> dict[str, Any] | None:
+    raw_token = websocket.cookies.get(COOKIE_NAME)
+    if not raw_token:
+        return None
+
+    origin = websocket.headers.get("origin")
+    if origin and not _origin_allowed(websocket, origin):
+        await websocket.close(code=4403, reason="Origin not allowed")
+        return None
+
+    async with websocket.app.state.session_factory() as session:
+        browser_session = await get_browser_session_by_token(session, raw_token)
+        if browser_session is None or browser_session.revoked_at is not None:
+            await websocket.close(code=4401, reason="Invalid session")
+            return None
+        expires_at = browser_session.expires_at
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=UTC)
+        if expires_at < datetime.now(UTC):
+            await websocket.close(code=4401, reason="Session expired")
+            return None
+        user = await get_user(session, browser_session.user_email)
+        if user is None:
+            await websocket.close(code=4401, reason="Unknown session owner")
+            return None
+        if not user.is_active:
+            await websocket.close(code=4403, reason="Account disabled")
+            return None
+        return {"sub": user.email, "role": user.role, "name": user.name, "typ": "session"}
+
+
+async def _authenticate_websocket(websocket: WebSocket) -> dict[str, Any] | None:
+    browser_claims = await _authenticate_browser_session(websocket)
+    if browser_claims is not None:
+        return browser_claims
+
     timeout_seconds = getattr(websocket.app.state, "ws_auth_timeout_seconds", 10)
     try:
         first_message = await asyncio.wait_for(websocket.receive_json(), timeout=timeout_seconds)
     except TimeoutError:
         await websocket.close(code=4401, reason="Authentication timeout")
-        return
+        return None
     except WebSocketDisconnect:
-        return
+        return None
 
     if first_message.get("type") != "auth" or not isinstance(first_message.get("token"), str):
         await websocket.close(code=4401, reason="Authentication required")
-        return
+        return None
 
     try:
-        claims = websocket.app.state.auth_provider.verify_jwt(
+        return websocket.app.state.auth_provider.verify_jwt(
             first_message["token"],
             audience=["cognis"],
         )
     except Exception:
         await websocket.close(code=4401, reason="Invalid token")
+        return None
+
+
+async def handle_websocket(websocket: WebSocket) -> None:
+    """Main WebSocket handler — auth, message loop, dispatch."""
+    await websocket.accept()
+    claims = await _authenticate_websocket(websocket)
+    if claims is None:
         return
 
     manager = getattr(websocket.app.state, "ws_manager", None)

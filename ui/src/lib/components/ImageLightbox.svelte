@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
 
+  import { isTopOverlay, registerOverlay } from '$lib/stores/overlays';
   import Download from 'lucide-svelte/icons/download';
   import X from 'lucide-svelte/icons/x';
 
@@ -28,39 +29,21 @@
     onClose: () => void;
   }>();
 
-  let savedScrollY = 0;
-
-  function lockBodyScroll(): void {
-    if (typeof document === 'undefined') return;
-    savedScrollY = window.scrollY || document.documentElement.scrollTop || 0;
-    document.body.style.position = 'fixed';
-    document.body.style.top = `-${savedScrollY}px`;
-    document.body.style.left = '0';
-    document.body.style.right = '0';
-    document.body.style.width = '100%';
-    document.body.style.overflow = 'hidden';
-  }
-
-  function unlockBodyScroll(): void {
-    if (typeof document === 'undefined') return;
-    document.body.style.position = '';
-    document.body.style.top = '';
-    document.body.style.left = '';
-    document.body.style.right = '';
-    document.body.style.width = '';
-    document.body.style.overflow = '';
-    if (savedScrollY > 0) {
-      window.scrollTo(0, savedScrollY);
-      savedScrollY = 0;
-    }
-  }
+  let overlayId = $state<string | null>(null);
 
   onMount(() => {
-    lockBodyScroll();
-    return () => unlockBodyScroll();
+    const handle = registerOverlay({ kind: 'fullscreen', blocksChrome: true });
+    overlayId = handle.id;
+    return () => {
+      handle.unregister();
+      overlayId = null;
+    };
   });
 
   function handleKeydown(event: KeyboardEvent): void {
+    if (!isTopOverlay(overlayId)) {
+      return;
+    }
     if (event.key === 'Escape') {
       event.preventDefault();
       onClose();

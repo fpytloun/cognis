@@ -7,11 +7,12 @@ from datetime import UTC, datetime, timedelta
 from fastapi import APIRouter, HTTPException, Request
 from starlette.responses import JSONResponse, Response
 
-from cognis.api.common import api_exception, require_current_user, require_jwt_user
+from cognis.api.common import api_exception, require_current_user, require_session_user
 from cognis.api.models import (
     ApiKeyCreateRequest,
     ApiKeyCreateResponse,
     ApiKeyResponse,
+    AuthSessionResponse,
     BootstrapStatusResponse,
     ExchangeTokenResponse,
     LoginRequest,
@@ -20,17 +21,19 @@ from cognis.api.models import (
     ProfileUpdateRequest,
     RefreshRequest,
     SetupRequest,
-    TokenResponse,
 )
 from cognis.security import generate_api_key_material
 from cognis.store.queries import (
     count_users,
     create_api_key,
+    create_browser_session,
     create_user,
     delete_api_key,
-    get_setting_value,
+    get_browser_session_by_token,
     get_user,
     list_api_keys,
+    revoke_browser_session,
+    touch_browser_session,
     update_user,
     update_user_last_login,
     update_user_password,
@@ -41,26 +44,63 @@ router = APIRouter()
 COOKIE_NAME = "cognis_session"
 
 
-def _as_int(value: object, default: int) -> int:
-    return value if isinstance(value, int) else default
+def _cookie_samesite(request: Request) -> str:
+    raw = str(getattr(request.app.state.config, "session_cookie_samesite", "lax") or "lax").lower()
+    if raw not in {"lax", "strict", "none"}:
+        return "lax"
+    return raw
 
 
-def _set_session_cookie(response: Response, token: str, max_age: int) -> None:
-    """Set the cross-service session cookie on a response."""
+def _cookie_secure(request: Request) -> bool:
+    forwarded = request.headers.get("x-forwarded-proto", "").split(",", 1)[0].strip().lower()
+    scheme = forwarded or request.url.scheme.lower()
+    return scheme == "https"
+
+
+def _set_session_cookie(response: Response, request: Request, token: str, max_age: int) -> None:
+    """Set the opaque browser session cookie on a response."""
+
+    cookie_domain = getattr(request.app.state.config, "session_cookie_domain", "") or None
     response.set_cookie(
         key=COOKIE_NAME,
         value=token,
         max_age=max_age,
         path="/",
+        domain=cookie_domain,
         httponly=True,
-        samesite="lax",
-        secure=False,  # localhost dev; production behind TLS termination
+        samesite=_cookie_samesite(request),
+        secure=_cookie_secure(request),
     )
 
 
-def _clear_session_cookie(response: Response) -> None:
-    """Clear the cross-service session cookie."""
-    response.delete_cookie(key=COOKIE_NAME, path="/", samesite="lax")
+def _clear_session_cookie(response: Response, request: Request) -> None:
+    """Clear the opaque browser session cookie."""
+
+    cookie_domain = getattr(request.app.state.config, "session_cookie_domain", "") or None
+    response.delete_cookie(
+        key=COOKIE_NAME,
+        path="/",
+        domain=cookie_domain,
+        samesite=_cookie_samesite(request),
+        secure=_cookie_secure(request),
+    )
+
+
+def _browser_session_expiry(request: Request) -> datetime:
+    ttl = int(getattr(request.app.state.config, "browser_session_ttl_seconds", 30 * 24 * 60 * 60))
+    return datetime.now(UTC) + timedelta(seconds=max(60, ttl))
+
+
+def _browser_session_max_age(request: Request) -> int:
+    ttl = int(getattr(request.app.state.config, "browser_session_ttl_seconds", 30 * 24 * 60 * 60))
+    return max(60, ttl)
+
+
+def _auth_session_body(*, email: str, name: str | None, role: str, expires_at: datetime) -> AuthSessionResponse:
+    return AuthSessionResponse(
+        user={"email": email, "name": name, "role": role},
+        expires_at=expires_at,
+    )
 
 
 def _api_key_prefix(key_id: str) -> str:
@@ -106,8 +146,8 @@ async def setup_admin(request: Request, payload: SetupRequest) -> dict[str, bool
     return {"ok": True}
 
 
-@router.post("/api/auth/login", response_model=TokenResponse)
-async def login(request: Request, payload: LoginRequest) -> TokenResponse:
+@router.post("/api/auth/login", response_model=AuthSessionResponse)
+async def login(request: Request, payload: LoginRequest) -> AuthSessionResponse:
     app_state = request.app.state
     if app_state.login_rate_limiter.is_limited(payload.email):
         raise HTTPException(status_code=429, detail="Too many failed login attempts")
@@ -125,57 +165,70 @@ async def login(request: Request, payload: LoginRequest) -> TokenResponse:
             raise HTTPException(status_code=401, detail="Invalid credentials") from None
         app_state.login_rate_limiter.clear(payload.email)
         await update_user_last_login(session, user.email)
-        await session.commit()
-        ttl = _as_int(await get_setting_value(session, "security.token_ttl_seconds", 3600), 3600)
-        token = app_state.auth_provider.sign_access_token(user.email, user.name, user.role)
-        refresh_token = app_state.auth_provider.sign_refresh_token(user.email)
-        body = TokenResponse(
-            token=token,
-            refresh_token=refresh_token,
-            expires_in=ttl,
-            user={"email": user.email, "name": user.name, "role": user.role},
+        expires_at = _browser_session_expiry(request)
+        browser_session, raw_token = await create_browser_session(
+            session,
+            user_email=user.email,
+            expires_at=expires_at,
+            user_agent=request.headers.get("user-agent"),
         )
-        response = JSONResponse(content=body.model_dump())
-        _set_session_cookie(response, token, ttl)
+        await session.commit()
+        body = _auth_session_body(
+            email=user.email,
+            name=user.name,
+            role=user.role,
+            expires_at=browser_session.expires_at,
+        )
+        response = JSONResponse(content=body.model_dump(mode="json"))
+        _set_session_cookie(response, request, raw_token, _browser_session_max_age(request))
         return response  # type: ignore[return-value]
 
 
-@router.post("/api/auth/refresh", response_model=TokenResponse)
-async def refresh(request: Request, payload: RefreshRequest) -> TokenResponse:
+@router.post("/api/auth/refresh", response_model=AuthSessionResponse)
+async def refresh(request: Request, payload: RefreshRequest | None = None) -> AuthSessionResponse:
+    del payload
+    raw_token = request.cookies.get(COOKIE_NAME)
+    if not raw_token:
+        raise HTTPException(status_code=401, detail="No active browser session")
+
     app_state = request.app.state
-    try:
-        claims = app_state.auth_provider.verify_jwt(payload.refresh_token, audience=["cognis"])
-    except Exception as exc:
-        raise HTTPException(status_code=401, detail="Invalid refresh token") from exc
-    if claims.get("typ") != "refresh":
-        raise HTTPException(status_code=401, detail="Invalid refresh token")
     async with app_state.session_factory() as session:
-        user = await get_user(session, str(claims["sub"]))
+        browser_session = await get_browser_session_by_token(session, raw_token)
+        if browser_session is None or browser_session.revoked_at is not None:
+            raise HTTPException(status_code=401, detail="Invalid browser session")
+        if browser_session.expires_at <= datetime.now(UTC):
+            raise HTTPException(status_code=401, detail="Browser session expired")
+        user = await get_user(session, browser_session.user_email)
         if user is None:
             raise HTTPException(status_code=401, detail="Unknown user")
         if not user.is_active:
             raise HTTPException(status_code=403, detail="Account disabled")
-        ttl = _as_int(await get_setting_value(session, "security.token_ttl_seconds", 3600), 3600)
-        token = app_state.auth_provider.sign_access_token(user.email, user.name, user.role)
-        refresh_token = app_state.auth_provider.sign_refresh_token(user.email)
-        body = TokenResponse(
-            token=token,
-            refresh_token=refresh_token,
-            expires_in=ttl,
-            user={"email": user.email, "name": user.name, "role": user.role},
+
+        refreshed_expiry = _browser_session_expiry(request)
+        browser_session = await touch_browser_session(
+            session,
+            browser_session,
+            expires_at=refreshed_expiry,
         )
-        response = JSONResponse(content=body.model_dump())
-        _set_session_cookie(response, token, ttl)
+        await session.commit()
+        body = _auth_session_body(
+            email=user.email,
+            name=user.name,
+            role=user.role,
+            expires_at=browser_session.expires_at,
+        )
+        response = JSONResponse(content=body.model_dump(mode="json"))
+        _set_session_cookie(response, request, raw_token, _browser_session_max_age(request))
         return response  # type: ignore[return-value]
 
 
 @router.post("/api/auth/logout")
-async def logout(request: Request, payload: LogoutRequest) -> Response:
+async def logout(request: Request, payload: LogoutRequest | None = None) -> Response:
     claims = getattr(request.state, "claims", None)
     auth_provider = request.app.state.auth_provider
     if claims is not None and (jti := claims.get("jti")) is not None:
         auth_provider.revoke_token(str(jti))
-    if payload.refresh_token:
+    if payload and payload.refresh_token:
         try:
             refresh_claims = auth_provider.verify_jwt(payload.refresh_token, audience=["cognis"])
         except Exception as exc:
@@ -183,8 +236,16 @@ async def logout(request: Request, payload: LogoutRequest) -> Response:
         jti = refresh_claims.get("jti")
         if jti is not None:
             auth_provider.revoke_token(str(jti))
+
+    raw_token = request.cookies.get(COOKIE_NAME)
+    if raw_token:
+        async with request.app.state.session_factory() as session:
+            browser_session = await get_browser_session_by_token(session, raw_token)
+            if browser_session is not None:
+                await revoke_browser_session(session, browser_session.session_id)
+                await session.commit()
     response = JSONResponse(content={"ok": True})
-    _clear_session_cookie(response)
+    _clear_session_cookie(response, request)
     return response
 
 
@@ -208,7 +269,7 @@ async def update_profile(request: Request, payload: ProfileUpdateRequest) -> dic
 
 @router.post("/api/auth/change-password", response_model=dict[str, bool])
 async def change_password(request: Request, payload: PasswordChangeRequest) -> dict[str, bool]:
-    user = require_jwt_user(request)
+    user = require_session_user(request)
     app_state = request.app.state
     limiter_key = f"password-change:{user.email}"
     if app_state.login_rate_limiter.is_limited(limiter_key):
@@ -234,7 +295,7 @@ async def change_password(request: Request, payload: PasswordChangeRequest) -> d
 
 @router.get("/api/v1/auth/api-keys", response_model=list[ApiKeyResponse])
 async def api_key_list(request: Request) -> list[ApiKeyResponse]:
-    user = require_jwt_user(request)
+    user = require_session_user(request)
     async with request.app.state.session_factory() as session:
         records = await list_api_keys(session, user.email)
     return [_api_key_response(record) for record in records]
@@ -242,7 +303,7 @@ async def api_key_list(request: Request) -> list[ApiKeyResponse]:
 
 @router.post("/api/v1/auth/api-keys", response_model=ApiKeyCreateResponse)
 async def api_key_create(request: Request, payload: ApiKeyCreateRequest) -> ApiKeyCreateResponse:
-    user = require_jwt_user(request)
+    user = require_session_user(request)
     app_state = request.app.state
     key_id, api_key = generate_api_key_material()
     expires_at = None
@@ -267,7 +328,7 @@ async def api_key_create(request: Request, payload: ApiKeyCreateRequest) -> ApiK
 
 @router.delete("/api/v1/auth/api-keys/{key_id}", response_model=dict[str, bool])
 async def api_key_delete(request: Request, key_id: str) -> dict[str, bool]:
-    user = require_jwt_user(request)
+    user = require_session_user(request)
     async with request.app.state.session_factory() as session:
         ok = await delete_api_key(session, key_id, user.email)
         await session.commit()
