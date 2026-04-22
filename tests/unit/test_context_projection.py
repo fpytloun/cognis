@@ -76,6 +76,30 @@ def test_project_messages_uses_original_recovery_call_id_for_helper_results() ->
     assert "call_id 'helper-call'" not in str(result.messages[1]["content"])
 
 
+def test_project_messages_preserves_recent_groups_until_byte_budget_is_hit() -> None:
+    messages = [
+        {"role": "user", "content": "start"},
+        _assistant_tool_call("call-1", "bash", {"command": "one"}),
+        _tool_result("call-1", "A" * 8_000, tool_name="bash", recovery_call_id="call-1"),
+        _assistant_tool_call("call-2", "read", {"path": "a.py"}),
+        _tool_result("call-2", "B" * 8_000, tool_name="read", recovery_call_id="call-2"),
+        _assistant_tool_call("call-3", "grep", {"pattern": "needle"}),
+        _tool_result("call-3", "C" * 200, tool_name="grep", recovery_call_id="call-3"),
+    ]
+
+    result = project_messages(
+        messages,
+        preserve_recent_completed_tool_groups=3,
+        preserve_recent_completed_tool_bytes=4_000,
+    )
+
+    # The oldest preserved groups are dropped until the preserved tail fits the
+    # byte budget, but the newest group is always retained in full.
+    assert "Older tool result compacted from prompt." in str(result.messages[2]["content"])
+    assert "Older tool result compacted from prompt." in str(result.messages[4]["content"])
+    assert result.messages[6]["content"] == "C" * 200
+
+
 def test_prune_tool_outputs_only_modifies_mutable_tail() -> None:
     messages = [
         _assistant_tool_call("stable-call", "bash", {"command": "ls"}),

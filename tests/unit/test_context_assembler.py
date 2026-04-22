@@ -1337,8 +1337,8 @@ async def test_context_assembler_projects_older_tool_groups_into_stable_placehol
             "data": {
                 "call_id": "call-1",
                 "name": "bash",
-                "result": "A" * 6_000,
-                "output_size": 6_000,
+                "result": "A" * 240_000,
+                "output_size": 240_000,
                 "recovery_call_id": "call-1",
             },
         },
@@ -1527,4 +1527,61 @@ def test_general_task_profile_uses_pinned_helpers_and_core_tools_only() -> None:
     assert not step_profile_visible_by_default(
         _profile_tool("mcp_googleworkspace__search_messages", category="mcp", read_only=True),
         profile,
+    )
+
+
+@pytest.mark.asyncio
+async def test_immutable_prefix_stays_identical_across_turns_when_recall_changes() -> None:
+    class _VaryingMemory(_Memory):
+        def __init__(self) -> None:
+            super().__init__()
+            self._recall_count = 0
+
+        async def recall(self, **kwargs: object) -> dict[str, object]:
+            self._recall_count += 1
+            base = await super().recall(**kwargs)
+            return {
+                **base,
+                "search_results": [
+                    {
+                        "memory": f"Dynamic recalled memory {self._recall_count}",
+                        "score": 0.9,
+                    }
+                ],
+            }
+
+    assembler = ContextAssembler(
+        memory=_VaryingMemory(),
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=_SessionCache(),
+        session_manager=_SessionManager(),
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+
+    first = await assembler.assemble(
+        session=_session(),
+        conversation=_conversation(),
+        agent=_agent_with_skills(),
+        user_message="hello",
+        tool_definitions=[],
+        prompt_context=PromptContext.CHAT,
+    )
+    second = await assembler.assemble(
+        session=_session(),
+        conversation=_conversation(),
+        agent=_agent_with_skills(),
+        user_message="hello again",
+        tool_definitions=[],
+        prompt_context=PromptContext.CHAT,
+    )
+
+    assert first.messages[0]["content"] == second.messages[0]["content"]
+    assert any(
+        "Dynamic recalled memory 1" in str(message.get("content", "")) for message in first.messages
+    )
+    assert any(
+        "Dynamic recalled memory 2" in str(message.get("content", ""))
+        for message in second.messages
     )

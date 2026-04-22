@@ -12,7 +12,10 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-DEFAULT_COMPACTED_TOOL_GROUPS = 2
+DEFAULT_PRESERVED_TOOL_GROUPS = 10
+DEFAULT_PRESERVED_TOOL_BYTES = 200_000
+# Backward-compatible alias used by existing call sites.
+DEFAULT_COMPACTED_TOOL_GROUPS = DEFAULT_PRESERVED_TOOL_GROUPS
 _ARG_CLEAR_THRESHOLD = 1_000
 
 
@@ -128,7 +131,8 @@ class _ToolGroup:
 def project_messages(
     messages: list[dict[str, Any]],
     *,
-    preserve_recent_completed_tool_groups: int = DEFAULT_COMPACTED_TOOL_GROUPS,
+    preserve_recent_completed_tool_groups: int = DEFAULT_PRESERVED_TOOL_GROUPS,
+    preserve_recent_completed_tool_bytes: int = DEFAULT_PRESERVED_TOOL_BYTES,
     arg_clear_threshold: int = _ARG_CLEAR_THRESHOLD,
 ) -> ProjectionResult:
     """Project a rich transcript into a compact model-facing view."""
@@ -144,11 +148,21 @@ def project_messages(
         if preserve_recent_completed_tool_groups > 0
         else []
     )
+    preserve_recent_completed_tool_bytes = max(0, int(preserve_recent_completed_tool_bytes))
+    while (
+        preserve_recent_completed_tool_bytes > 0
+        and len(preserved_slice) > 1
+        and sum(_estimated_group_bytes(messages, group) for group in preserved_slice)
+        > preserve_recent_completed_tool_bytes
+    ):
+        preserved_slice = preserved_slice[1:]
     preserved_assistant_indices = {group.assistant_index for group in preserved_slice}
     compacted_groups = [
         group
         for group in groups
-        if group.completed and not group.protected and group.assistant_index not in preserved_assistant_indices
+        if group.completed
+        and not group.protected
+        and group.assistant_index not in preserved_assistant_indices
     ]
     if not compacted_groups:
         return ProjectionResult(messages=list(messages), mutable_start_index=0)
@@ -188,12 +202,25 @@ def project_messages(
         projected.append(dict(message))
 
     mutable_start_index = min(
-        (group.assistant_index for group in groups if group.assistant_index not in compacted_assistant_indices),
+        (
+            group.assistant_index
+            for group in groups
+            if group.assistant_index not in compacted_assistant_indices
+        ),
         default=len(projected),
     )
     if mutable_start_index >= len(projected):
         mutable_start_index = len(projected)
     return ProjectionResult(messages=projected, mutable_start_index=mutable_start_index)
+
+
+def _estimated_group_bytes(messages: list[dict[str, Any]], group: _ToolGroup) -> int:
+    total = 0
+    for index in group.message_indices:
+        if index < 0 or index >= len(messages):
+            continue
+        total += len(json.dumps(messages[index], default=str))
+    return total
 
 
 def prune_projected_messages(
@@ -236,7 +263,9 @@ def prune_projected_messages(
         if message.get("role") != "assistant" or not isinstance(message.get("tool_calls"), list):
             continue
         tool_calls = message["tool_calls"]
-        if not any(isinstance(tc, dict) and tc.get("id") in pruneable_call_ids for tc in tool_calls):
+        if not any(
+            isinstance(tc, dict) and tc.get("id") in pruneable_call_ids for tc in tool_calls
+        ):
             continue
         total_arg_size = sum(
             len(

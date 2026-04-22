@@ -391,6 +391,25 @@ class CommandDispatcher:
             model_info = await self._get_context_usage_model_info(usage)
             if model_info is not None:
                 lines.append(f"Model context window: {model_info.context_window:,} tokens")
+            provider_id = usage.get("provider_id")
+            llm_provider = getattr(self._providers, "llm", None)
+            has_drift = getattr(llm_provider, "has_hosted_instruction_drift", None)
+            drift_reason_getter = getattr(llm_provider, "hosted_instruction_drift_reason", None)
+            if (
+                isinstance(provider_id, str)
+                and provider_id
+                and callable(has_drift)
+                and has_drift(provider_id, usage["model"])
+            ):
+                drift_reason = (
+                    drift_reason_getter(provider_id, usage["model"])
+                    if callable(drift_reason_getter)
+                    else None
+                )
+                detail = (
+                    f" ({drift_reason})" if isinstance(drift_reason, str) and drift_reason else ""
+                )
+                lines.append(f"LLM diagnostics: provider reported hosted instruction drift{detail}")
             self._append_context_usage_lines(lines, usage)
         reasoning = self._session_cache.get_reasoning_effort_override(current_session.session_id)
         if reasoning:

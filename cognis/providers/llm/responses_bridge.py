@@ -357,6 +357,7 @@ async def responses_stream_to_chat_chunks(
                     ],
                     "usage": _extract_usage(response_payload),
                     "response_status": str(response_payload.get("status") or "completed"),
+                    "response_instructions": response_payload.get("instructions"),
                 }
                 continue
             if event_type == "response.failed":

@@ -57,3 +57,32 @@ def test_search_inventory_accepts_profile_group_alias_categories() -> None:
     assert [match["name"] for match in output_matches] == ["read_tool_output"]
     assert skill_matches[0]["profile_group"] == "system"
     assert output_matches[0]["profile_group"] == "system"
+
+
+def test_search_inventory_uses_bm25_for_multi_term_mcp_queries() -> None:
+    tools = [
+        _tool(
+            "mcp_googleworkspace__search_messages",
+            "Search Gmail messages and calendar events in Google Workspace",
+            "mcp",
+        ),
+        _tool(
+            "mcp_rohlik__fetch_orders",
+            "Retrieve delivered and upcoming grocery orders",
+            "mcp",
+        ),
+        _tool(
+            "mcp_todoist__find_tasks",
+            "Find Todoist tasks by text and date",
+            "mcp",
+        ),
+    ]
+
+    matches = search_inventory(
+        tools,
+        "Google Workspace tools for calendar events and Gmail search content retrieval",
+        category="mcp",
+        limit=5,
+    )
+
+    assert matches[0]["name"] == "mcp_googleworkspace__search_messages"

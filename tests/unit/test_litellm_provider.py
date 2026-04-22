@@ -3177,3 +3177,40 @@ async def test_invalidate_runtime_capability_cache_clears_json_and_tool_search_e
     assert provider._json_mode_broken_keys == {("proxy-b", "model-1")}
     assert provider._openai_tool_search_broken_keys == {("proxy-b", "model-2")}
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_hosted_instruction_drift_is_cached_per_provider_model(
+    tmp_path: object,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    provider = LiteLLMProvider(session_factory)
+
+    provider._maybe_note_hosted_instruction_drift(
+        SimpleNamespace(provider_id="proxy"),
+        "gpt-5.4",
+        sent_instructions="You are an executive assistant.",
+        response_instructions="You are Codex, based on GPT-5.",
+    )
+
+    assert provider.has_hosted_instruction_drift("proxy", "gpt-5.4") is True
+    assert (
+        provider.hosted_instruction_drift_reason("proxy", "gpt-5.4")
+        == "server_returned_different_instructions"
+    )
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_invalidate_runtime_capability_cache_clears_hosted_instruction_drift(
+    tmp_path: object,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    provider = LiteLLMProvider(session_factory)
+    provider._hosted_instruction_drift_keys[("proxy-a", "model-1")] = "reason-a"
+    provider._hosted_instruction_drift_keys[("proxy-b", "model-2")] = "reason-b"
+
+    provider.invalidate_runtime_capability_cache_for_provider("proxy-a")
+
+    assert provider._hosted_instruction_drift_keys == {("proxy-b", "model-2"): "reason-b"}
+    await engine.dispose()

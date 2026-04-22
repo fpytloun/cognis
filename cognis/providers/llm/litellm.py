@@ -456,6 +456,11 @@ class LiteLLMProvider:
         # but downgrade exposure to controller-managed search for the rest of
         # the process lifetime (or until provider config changes).
         self._openai_tool_search_broken_keys: set[tuple[str, str]] = set()
+        # In-process cache of (provider_id, resolved_model) pairs for which the
+        # Responses API reported hosted/server-side instructions that differed
+        # from the instructions Cognis supplied. This is diagnostic only and is
+        # surfaced via /info so operators can spot proxy/endpoint drift.
+        self._hosted_instruction_drift_keys: dict[tuple[str, str], str] = {}
 
     @staticmethod
     def _tokenizer_family(model: str) -> str:
@@ -1090,6 +1095,62 @@ class LiteLLMProvider:
 
         self.invalidate_json_mode_cache_for_provider(provider_id)
         self.invalidate_openai_tool_search_cache_for_provider(provider_id)
+        self.invalidate_hosted_instruction_drift_cache_for_provider(provider_id)
+
+    def invalidate_hosted_instruction_drift_cache_for_provider(self, provider_id: str) -> None:
+        """Clear cached hosted-instruction drift diagnostics for a provider."""
+
+        self._hosted_instruction_drift_keys = {
+            key: value
+            for key, value in self._hosted_instruction_drift_keys.items()
+            if key[0] != provider_id
+        }
+
+    def has_hosted_instruction_drift(self, provider_id: str, model_id: str) -> bool:
+        """Return whether a provider/model has reported hosted instruction drift."""
+
+        return (provider_id, model_id) in self._hosted_instruction_drift_keys
+
+    def hosted_instruction_drift_reason(self, provider_id: str, model_id: str) -> str | None:
+        """Return the cached hosted-instruction drift reason when present."""
+
+        return self._hosted_instruction_drift_keys.get((provider_id, model_id))
+
+    def _maybe_note_hosted_instruction_drift(
+        self,
+        provider: LLMProviderRow | None,
+        resolved_model: str,
+        *,
+        sent_instructions: str | None,
+        response_instructions: Any,
+    ) -> None:
+        if provider is None or not isinstance(response_instructions, str):
+            return
+        normalized_response = response_instructions.strip()
+        if not normalized_response:
+            return
+        normalized_sent = sent_instructions.strip() if isinstance(sent_instructions, str) else None
+        reason: str | None = None
+        if normalized_sent is not None and normalized_response != normalized_sent:
+            reason = "server_returned_different_instructions"
+        elif normalized_sent is None and "codex" in normalized_response.lower():
+            reason = "server_injected_hosted_instructions"
+        if reason is None:
+            return
+        key = (provider.provider_id, resolved_model)
+        if key in self._hosted_instruction_drift_keys:
+            return
+        self._hosted_instruction_drift_keys[key] = reason
+        logger.warning(
+            "Responses API reported hosted instructions that differ from Cognis instructions",
+            extra={
+                "extra_data": {
+                    "provider_id": provider.provider_id,
+                    "model": resolved_model,
+                    "reason": reason,
+                }
+            },
+        )
 
     def _mark_openai_tool_search_broken(
         self,
@@ -1412,7 +1473,14 @@ class LiteLLMProvider:
                         strip_response_format=True,
                     )
                 raise
-            response_dict = responses_to_chat_response(_model_dump(response))
+            raw_response_dict = _model_dump(response)
+            self._maybe_note_hosted_instruction_drift(
+                provider,
+                resolved_model,
+                sent_instructions=responses_instructions,
+                response_instructions=raw_response_dict.get("instructions"),
+            )
+            response_dict = responses_to_chat_response(raw_response_dict)
             if is_json_mode_request and _is_empty_json_mode_response(response_dict):
                 return await self._json_mode_fallback_chat_completions(
                     prefixed_model=prefixed_model,
@@ -1602,6 +1670,13 @@ class LiteLLMProvider:
                 raise
             try:
                 async for chunk in responses_stream_to_chat_chunks(stream):
+                    if "response_instructions" in chunk:
+                        self._maybe_note_hosted_instruction_drift(
+                            provider,
+                            resolved_model,
+                            sent_instructions=responses_instructions,
+                            response_instructions=chunk.pop("response_instructions", None),
+                        )
                     yield chunk
             except Exception as exc:
                 logger.warning(

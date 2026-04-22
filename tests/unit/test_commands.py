@@ -885,6 +885,14 @@ async def test_info_renders_runtime_intaris_and_subsession_metadata(
         session_factory=_SessionFactory(),
         session_manager=None,
         session_cache=_SessionCache(
+            usage={
+                "prompt_tokens": 29_000,
+                "max_context_tokens": 1_048_576,
+                "percentage": 2.8,
+                "model": "gpt-5.4",
+                "provider_id": "proxy",
+                "last_llm_usage": {},
+            },
             tool_runtime_info={
                 "strategy": "openai_responses_controller_search_fallback",
                 "step_profile_id": "system:direct-default",
@@ -894,12 +902,26 @@ async def test_info_renders_runtime_intaris_and_subsession_metadata(
                 "visible_tool_count": 4,
                 "deferred_tool_count": 8,
                 "discovered_tool_count": 1,
-            }
+            },
         ),
         compaction_strategy=None,
         providers=SimpleNamespace(
             guardrails=_GuardrailsProvider(),
-            llm=SimpleNamespace(get_model_info=None),
+            llm=SimpleNamespace(
+                get_model_info=AsyncMock(return_value=SimpleNamespace(context_window=1_048_576)),
+                has_hosted_instruction_drift=lambda provider_id, model_id: (
+                    (
+                        provider_id,
+                        model_id,
+                    )
+                    == ("proxy", "gpt-5.4")
+                ),
+                hosted_instruction_drift_reason=lambda provider_id, model_id: (
+                    "server_returned_different_instructions"
+                    if (provider_id, model_id) == ("proxy", "gpt-5.4")
+                    else None
+                ),
+            ),
         ),
         pause_waiter=PauseWaiter(),
         notification_service=_NotificationService(),
@@ -917,6 +939,12 @@ async def test_info_renders_runtime_intaris_and_subsession_metadata(
     assert result is not None
     assert result.type == "system_message"
     assert result.text is not None
+    assert "Model: gpt-5.4" in result.text
+    assert "Model context window: 1,048,576 tokens" in result.text
+    assert (
+        "LLM diagnostics: provider reported hosted instruction drift "
+        "(server_returned_different_instructions)" in result.text
+    )
     assert "Status: running" in result.text
     assert "Session lifecycle: idle" in result.text
     assert "Previous session: sess-0" in result.text
