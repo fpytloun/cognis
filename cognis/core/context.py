@@ -39,7 +39,7 @@ from cognis.core.immutable_prefix import (
     build_prefix_message_events,
     sort_prefix_entries,
 )
-from cognis.core.prompts import PromptContext, build_system_instructions
+from cognis.core.prompts import PromptContext, build_critical_rules, build_system_instructions
 from cognis.core.runtime import ExecutorEnvironmentSnapshot, build_local_executor_environment
 from cognis.core.title_policy import sync_intaris_title
 from cognis.logging import get_logger
@@ -1603,6 +1603,12 @@ class ContextAssembler:
             if tagged_identity:
                 sections.append(tagged_identity)
 
+        critical_rules = build_critical_rules(agent_id=agent.agent_id)
+        if critical_rules:
+            tagged_rules = _tagged_section("critical_rules", critical_rules)
+            if tagged_rules:
+                sections.append(tagged_rules)
+
         include_work_routing = True
         if agent.permissions is not None:
             include_work_routing = (
@@ -1636,14 +1642,12 @@ class ContextAssembler:
             sections.append(skill_metadata)
             tagged_skills_guidance = _tagged_section(
                 "skills_guidance",
-                "You have skills that extend your capabilities. "
-                "Review the list above and use skill_load to load any "
-                "skills relevant to the current task. Skills marked as "
-                "attached are preferred defaults for this agent. Follow "
-                "If the task explicitly names one of the skills above, load that skill first before generic searches or unrelated tools. "
-                "loaded skill instructions carefully. Loading a skill can also "
-                "expose that skill's deferred tools for later model calls. You can also create "
-                "new skills with skill_write to remember procedures for future use.",
+                "You have skills that extend your capabilities. Review the "
+                "list above and use skill_load to load any skills relevant "
+                "to the current task. Skills marked as attached are preferred "
+                "defaults for this agent. Follow loaded skill instructions "
+                "carefully. You can also create new skills with skill_write "
+                "to remember procedures for future use.",
             )
             if tagged_skills_guidance:
                 sections.append(tagged_skills_guidance)

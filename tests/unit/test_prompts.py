@@ -61,21 +61,29 @@ def test_chat_prompt_prefers_dedicated_edit_tools_for_coding() -> None:
     assert "Avoid using `bash` to run Python, Perl, Ruby" in instructions
 
 
-def test_chat_prompt_explains_truncated_output_recovery() -> None:
+def test_critical_rules_cover_truncated_output_recovery_and_placeholder_bleed() -> None:
+    # Placeholder and tool-output recovery rules are now carried in
+    # build_critical_rules() so they land at the very top of the prompt,
+    # right after <identity>.
+    from cognis.core.prompts import build_critical_rules
+
+    rules = build_critical_rules()
+    assert rules is not None
+    assert "cleared from context" in rules
+    assert "compacted" in rules
+    assert "read_tool_output" in rules
+    assert "list_tool_output_anchors" in rules
+    assert "read_tool_output_anchor" in rules
+    assert "search_tool_output" in rules
+    # Placeholder guardrail.
+    assert '"dummy"' in rules
+    assert '"noop"' in rules
+    # Pointer-style guidance in the operational instructions can now be
+    # minimal; only the anchored-recovery hint stays there.
     instructions = build_system_instructions(PromptContext.CHAT)
     assert instructions is not None
-    assert "middle truncated" in instructions
-    assert "Tool result cleared" in instructions
-    # The tools are referenced by name; placeholder-style example syntax
-    # like ``list_tool_output_anchors(call_id=...)`` has been removed to
-    # prevent the model from copying placeholder literals into real tool
-    # calls (e.g. call_id="dummy" observed on gpt-5.4 low reasoning).
     assert "list_tool_output_anchors" in instructions
     assert "read_tool_output_anchor" in instructions
-    assert "search_tool_output" in instructions
-    assert "read_tool_output" in instructions
-    # Explicit guardrail against placeholder bleed.
-    assert 'placeholder values such as "dummy"' in instructions
 
 
 def test_chat_prompt_guides_tavily_query_shape() -> None:

@@ -38,6 +38,34 @@ class PromptContext(Enum):
 # Instruction sections
 # ---------------------------------------------------------------------------
 
+_CRITICAL_RULES = """\
+- IMPORTANT: If the task names a skill shown in <available_skills>, call \
+skill_load for that skill before any other discovery or tool exploration.
+- IMPORTANT: Never invent placeholder identifiers. Values like "noop", \
+"dummy", "invalid", "example", "...", or bare URLs where an ID is expected \
+are always wrong. Use real IDs returned by prior tool calls, or discover \
+them with a list or search tool first.
+- IMPORTANT: If you need the current date, time, or timezone, call \
+get_current_datetime. Do not infer them from memory, environment, or \
+prior messages.
+- IMPORTANT: Use step_todo_write for any multi-step work. Plan first, keep \
+it current as you make progress, mark items completed or cancelled as \
+soon as their status changes, and keep exactly one item in_progress at a \
+time.
+- IMPORTANT: Tool results marked "cleared from context" or "compacted" are \
+incomplete. Do not assume omitted content is irrelevant. Recover it with \
+read_tool_output, list_tool_output_anchors, read_tool_output_anchor, or \
+search_tool_output using the real call_id from the placeholder.
+- IMPORTANT: In workflow steps that require a deliverable, call \
+write_deliverable with the canonical user-facing artifact before calling \
+step_complete. Free-text assistant messages during a step are reasoning \
+and progress, not the final artifact.
+- IMPORTANT: When referencing code, include file paths and line numbers \
+(for example src/main.py:42).
+- IMPORTANT: Use the user's language for conversational prose. Keep all \
+code, comments, identifiers, and commit messages in English."""
+
+
 _CORE_BEHAVIOR = """\
 ## Behavior
 
@@ -70,43 +98,21 @@ _TOOL_GUIDANCE = """\
 - Some tools may be discoverable without being visible by default. When a \
   needed capability is not present in your current visible tool set and \
   `search_tools` is available, call it before assuming the tool is unavailable.
-- If the task explicitly names a skill shown in `<available_skills>`, call \
-  `skill_load` for that skill before generic searches or unrelated tools.
-- Loading a relevant skill with `skill_load` can expose additional skill-defined \
+- Loading a relevant skill with `skill_load` exposes that skill's deferred \
   tools for later model calls in the same turn.
 - When a tool call fails, analyze the error before retrying. Do not retry \
   blindly.
 - Make independent tool calls in parallel when possible for efficiency.
 - Large outputs are automatically truncated. Use offset/limit parameters \
   or search tools to navigate large files.
-- When using Tavily-backed web search, prefer structured parameters over query \
-  syntax hacks: use `include_domains` and `exclude_domains` instead of `site:` \
-  operators whenever possible.
-- Keep Tavily `query` values focused on the actual subject or identifier rather \
-  than transport syntax. For exact identifiers, prefer shorter queries and \
-  enable `exact_match` when appropriate.
-- Older tool outputs may be compacted out of the active prompt even though the \
-  full saved output still exists. Treat compacted placeholders as incomplete, \
-  not as evidence that the omitted content is irrelevant.
-- If a tool result says `middle truncated`, `Tool result cleared`, or `Older \
-  tool result compacted`, the \
-  visible content is incomplete.
-- For structured saved outputs such as numbered search results, use the \
-  list_tool_output_anchors tool first to discover anchors, then \
-  read_tool_output_anchor to load one section without reloading the full \
-  output. Always pass a real call_id from a prior tool_call event. Never \
-  invent call_ids or pass placeholder values such as "dummy", "example", \
-  "...", or the empty string.
-- When a truncated tool result includes a call_id, use the \
-  search_tool_output tool first when you need a specific error, URL, \
-  symbol, heading, date, or keyword. Pass the exact call_id from the \
-  truncation notice; if no real call_id is available, do not call the \
-  tool at all.
-- Use the read_tool_output tool when you need to inspect a saved output \
-  sequentially or after search has located the relevant region. Again, \
-  pass a real call_id from a prior tool_call; never use placeholders.
-- Do not assume omitted portions of a truncated tool result are irrelevant; \
-  recover them when the missing content could affect the answer or next step."""
+- When using Tavily-backed web search, prefer structured parameters over query syntax hacks: \
+use `include_domains` and `exclude_domains` instead of `site:` operators whenever possible.
+- Keep Tavily `query` values focused on the actual subject or identifier \
+rather than transport syntax. For exact identifiers, prefer shorter \
+queries and enable `exact_match` when appropriate.
+- For structured saved outputs such as numbered search results, prefer \
+list_tool_output_anchors then read_tool_output_anchor over reloading the \
+entire output."""
 
 _EXECUTION_BIAS = """\
 ## Execution bias
@@ -327,6 +333,19 @@ _SKIP_SYSTEM_INSTRUCTIONS: frozenset[str] = frozenset(
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
+
+def build_critical_rules(agent_id: str | None = None) -> str | None:
+    """Return the hard-priority rules block rendered just below ``<identity>``.
+
+    Hidden system agents (evaluator, classifier, compaction) do not receive
+    the critical rules block because their output format requirements are
+    strictly specified elsewhere and extra rules would interfere.
+    """
+
+    if agent_id and agent_id in _SKIP_SYSTEM_INSTRUCTIONS:
+        return None
+    return _CRITICAL_RULES
 
 
 def build_system_instructions(

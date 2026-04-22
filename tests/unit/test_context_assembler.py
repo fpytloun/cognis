@@ -1008,7 +1008,8 @@ async def test_context_assembler_consolidates_immutable_prefix_into_first_messag
     assert "<available_skills>" in content
     assert "Release Helper" in content
     assert "<skills_guidance>" in content
-    assert "If the task explicitly names one of the skills above" in content
+    assert "<critical_rules>" in content
+    assert "IMPORTANT: If the task names a skill" in content
     assert "This is a continuation from a previous session." in content
     assert "<continuation_summary>" in content
     assert "Mutable recalled memory" not in content
@@ -1058,7 +1059,8 @@ async def test_context_assembler_skip_memory_path_uses_consolidated_immutable_pr
     assert "<available_skills>" in content
     assert "Release Helper" in content
     assert "<skills_guidance>" in content
-    assert "If the task explicitly names one of the skills above" in content
+    assert "<critical_rules>" in content
+    assert "IMPORTANT: If the task names a skill" in content
     assert "This is a continuation from a previous session." in content
     assert "<continuation_summary>" in content
     assert "<memory_instructions>" not in content
