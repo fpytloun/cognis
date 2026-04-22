@@ -6442,9 +6442,10 @@ class AgentLoop:
         preview = workflow_preview_payload(workflow)
         events_to_record.append(
             SessionEvent(
-                type="workflow_composed",
+                type="lifecycle",
                 data={
                     "workflow_id": persisted_workflow_id,
+                    "event": "workflow_composed",
                     "workflow_name": workflow.name,
                     "lifecycle": str(workflow.lifecycle),
                     "steps": preview["steps"],

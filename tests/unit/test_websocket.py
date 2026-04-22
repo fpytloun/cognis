@@ -16,7 +16,11 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
-from cognis.api.websocket import AuthenticatedWebSocket, WebSocketTurnObserver
+from cognis.api.websocket import (
+    AuthenticatedWebSocket,
+    WebSocketTurnObserver,
+    _workflow_composed_payload,
+)
 from cognis.core.turn_scheduler import (
     SessionCreationFailedError,
     TurnResult,
@@ -297,6 +301,31 @@ async def test_turn_observer_strips_attachment_payload_bytes() -> None:
             "size_bytes": 3,
         }
     ]
+
+
+def test_workflow_composed_payload_supports_lifecycle_backed_replay() -> None:
+    payload = _workflow_composed_payload(
+        "conv-1",
+        {
+            "event": "workflow_composed",
+            "workflow_id": "wf-1",
+            "workflow_name": "Evening Summary Deterministic Workflow",
+            "lifecycle": "persistent",
+            "steps": ["collect_gmail", "synthesize_summary"],
+            "task_id": "task-1",
+        },
+    )
+
+    assert payload == {
+        "type": "workflow_composed",
+        "conversation_id": "conv-1",
+        "task_id": "task-1",
+        "schedule_id": None,
+        "workflow_id": "wf-1",
+        "workflow_name": "Evening Summary Deterministic Workflow",
+        "lifecycle": "persistent",
+        "steps": ["collect_gmail", "synthesize_summary"],
+    }
 
 
 # ---------------------------------------------------------------------------

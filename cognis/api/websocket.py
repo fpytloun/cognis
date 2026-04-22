@@ -73,6 +73,21 @@ DEFAULT_OUTBOUND_BUFFER = 100
 DEFAULT_REPLAY_LIMIT = 200
 
 
+def _workflow_composed_payload(conversation_id: str, data: dict[str, Any]) -> dict[str, Any]:
+    """Build the WebSocket payload for a composed workflow event."""
+
+    return {
+        "type": "workflow_composed",
+        "conversation_id": conversation_id,
+        "task_id": data.get("task_id"),
+        "schedule_id": data.get("schedule_id"),
+        "workflow_id": data.get("workflow_id"),
+        "workflow_name": data.get("workflow_name") or data.get("workflow_id"),
+        "lifecycle": data.get("lifecycle", "ephemeral"),
+        "steps": data.get("steps") or [],
+    }
+
+
 # ---------------------------------------------------------------------------
 # AuthenticatedWebSocket
 # ---------------------------------------------------------------------------
@@ -598,20 +613,10 @@ class WebSocketConnectionManager:
                         }
                     )
                     replayed += 1
-                elif event_type == "workflow_composed":
-                    await connection.send_json(
-                        {
-                            "type": "workflow_composed",
-                            "conversation_id": conversation_id,
-                            "task_id": data.get("task_id"),
-                            "schedule_id": data.get("schedule_id"),
-                            "workflow_id": data.get("workflow_id"),
-                            "workflow_name": data.get("workflow_name")
-                            or data.get("workflow_id"),
-                            "lifecycle": data.get("lifecycle", "ephemeral"),
-                            "steps": data.get("steps") or [],
-                        }
-                    )
+                elif event_type == "workflow_composed" or (
+                    event_type == "lifecycle" and data.get("event") == "workflow_composed"
+                ):
+                    await connection.send_json(_workflow_composed_payload(conversation_id, data))
                     replayed += 1
                 elif event_type == "delegation":
                     status = data.get("status")
@@ -1429,16 +1434,7 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
             "attempt": event.data.get("attempt", 1),
         }
     if event.type == EventType.WORKFLOW_COMPOSED:
-        return {
-            "type": "workflow_composed",
-            "conversation_id": conversation_id,
-            "task_id": event.data.get("task_id"),
-            "schedule_id": event.data.get("schedule_id"),
-            "workflow_id": event.data.get("workflow_id"),
-            "workflow_name": event.data.get("workflow_name"),
-            "lifecycle": event.data.get("lifecycle"),
-            "steps": event.data.get("steps"),
-        }
+        return _workflow_composed_payload(conversation_id, event.data)
     if event.type == EventType.SYSTEM_NOTICE:
         return {
             "type": "system_message",
