@@ -176,6 +176,38 @@ class TestSignalInboundDeduplication:
 
         adapter._dispatch_inbound.assert_awaited_once()
 
+    @pytest.mark.asyncio
+    async def test_generic_attachment_bin_is_dropped(self) -> None:
+        adapter = SignalAdapter()
+        adapter._config = ChannelAccountConfig(
+            account_id="acc-1",
+            channel_type="signal",
+            display_name="Signal",
+            credential_refs={},
+            agent_id="agent-1",
+            user_email="user@example.com",
+        )
+        adapter._dispatch_inbound = AsyncMock()  # type: ignore[method-assign]
+
+        envelope = {
+            "source": "+1234567890",
+            "sourceName": "Alice",
+            "dataMessage": {
+                "timestamp": 1710000000000,
+                "attachments": [
+                    {
+                        "filename": "/tmp/attachment.bin",
+                        "contentType": "application/octet-stream",
+                        "id": "att-1",
+                    }
+                ],
+            },
+        }
+
+        await adapter._process_envelope(envelope, envelope["dataMessage"])
+
+        adapter._dispatch_inbound.assert_not_awaited()
+
 
 class TestSignalDirectAttachmentResult:
     def test_extracts_inline_base64_attachment_payload(self) -> None:
@@ -205,6 +237,18 @@ class TestSignalDirectAttachmentResult:
 
         result = _extract_direct_attachment_result(
             {"data": base64.b64encode(b"audio-bytes").decode("ascii")},
+            attachment,
+        )
+
+        assert result == (b"audio-bytes", "audio/ogg", "attachment.ogg")
+
+    def test_extracts_placeholder_path_with_mime_based_filename(self, tmp_path) -> None:
+        path = tmp_path / "attachment.bin"
+        path.write_bytes(b"audio-bytes")
+        attachment = MediaAttachment(mime_type="audio/ogg")
+
+        result = _extract_direct_attachment_result(
+            {"attachment": {"path": str(path)}},
             attachment,
         )
 

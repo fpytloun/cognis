@@ -59,6 +59,7 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 _SIGNAL_DEBUG_ENABLED = _env_flag("COGNIS_SIGNAL_DEBUG", False)
 _SIGNAL_MEDIA_PLACEHOLDER = "\u200b"
+_SIGNAL_PLACEHOLDER_ATTACHMENT_NAME = "attachment.bin"
 
 
 def _is_fatal_signal_error(message: str) -> bool:
@@ -177,6 +178,23 @@ def _attachment_result_metadata(result: Any) -> dict[str, Any]:
     }
 
 
+def _is_generic_signal_attachment_mime(mime_type: str | None) -> bool:
+    normalized = str(mime_type or "").strip().lower()
+    return normalized in {"", "application/octet-stream"}
+
+
+def _is_signal_placeholder_attachment_name(value: str | None) -> bool:
+    if not value:
+        return False
+    return Path(value).name == _SIGNAL_PLACEHOLDER_ATTACHMENT_NAME
+
+
+def _should_drop_signal_attachment(attachment: dict[str, Any]) -> bool:
+    return _is_signal_placeholder_attachment_name(attachment.get("filename")) and (
+        _is_generic_signal_attachment_mime(attachment.get("contentType"))
+    )
+
+
 def _fallback_attachment_filename(attachment: MediaAttachment) -> str:
     if attachment.filename:
         return attachment.filename
@@ -198,6 +216,17 @@ def _fallback_attachment_filename(attachment: MediaAttachment) -> str:
     if extension:
         return f"attachment{extension}"
     return "attachment.bin"
+
+
+def _resolved_signal_inbound_filename(
+    attachment: MediaAttachment,
+    *,
+    path_or_filename: str | None = None,
+) -> str:
+    candidate = attachment.filename or (Path(path_or_filename).name if path_or_filename else "")
+    if candidate and not _is_signal_placeholder_attachment_name(candidate):
+        return candidate
+    return _fallback_attachment_filename(attachment)
 
 
 def _extract_direct_attachment_result(
@@ -228,7 +257,7 @@ def _extract_direct_attachment_result(
             return (
                 path.read_bytes(),
                 attachment.mime_type or "application/octet-stream",
-                attachment.filename or path.name,
+                _resolved_signal_inbound_filename(attachment, path_or_filename=path.name),
             )
 
     nested = result.get("attachment")
@@ -239,7 +268,7 @@ def _extract_direct_attachment_result(
             return (
                 path.read_bytes(),
                 attachment.mime_type or "application/octet-stream",
-                attachment.filename or path.name,
+                _resolved_signal_inbound_filename(attachment, path_or_filename=path.name),
             )
 
     payload = _payload_from(result)
@@ -911,8 +940,13 @@ class SignalAdapter(BaseChannelAdapter):
         source_name = envelope.get("sourceName", "")
         timestamp = data_message.get("timestamp", 0)
         body = data_message.get("message") or ""
+        raw_attachments = [
+            attachment
+            for attachment in data_message.get("attachments", [])
+            if isinstance(attachment, dict) and not _should_drop_signal_attachment(attachment)
+        ]
 
-        if not body and not data_message.get("attachments"):
+        if not body and not raw_attachments:
             return
 
         # Determine chat type and ID
@@ -930,7 +964,6 @@ class SignalAdapter(BaseChannelAdapter):
         if self._remember_inbound_message_key(dedupe_key):
             return
 
-        raw_attachments = list(data_message.get("attachments", []))
         voice_input = _infer_signal_voice_input(body, raw_attachments)
         if _SIGNAL_DEBUG_ENABLED:
             logger.info(
@@ -1055,7 +1088,7 @@ class SignalAdapter(BaseChannelAdapter):
         return (
             content,
             attachment.mime_type or "application/octet-stream",
-            attachment.filename or path.name,
+            _resolved_signal_inbound_filename(attachment, path_or_filename=path.name),
         )
 
     async def _download_attachment_direct(
@@ -1099,7 +1132,9 @@ class SignalAdapter(BaseChannelAdapter):
                         return (
                             content,
                             attachment.mime_type or "application/octet-stream",
-                            attachment.filename or path.name,
+                            _resolved_signal_inbound_filename(
+                                attachment, path_or_filename=path.name
+                            ),
                         )
             return None
 

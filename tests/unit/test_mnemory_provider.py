@@ -26,9 +26,11 @@ class _Response:
 class _Client:
     def __init__(self, payload: dict[str, object]) -> None:
         self.payload = payload
+        self.last_json: dict[str, object] | None = None
 
     async def post(self, path: str, json: dict[str, object], headers: dict[str, str]) -> _Response:
-        del path, json, headers
+        del path, headers
+        self.last_json = json
         return _Response(self.payload)
 
 
@@ -72,3 +74,27 @@ async def test_recall_keeps_matching_session_ids_unflagged() -> None:
 
     assert result["session_id"] == "mem-existing"
     assert result["_session_forged"] is False
+
+
+@pytest.mark.asyncio
+async def test_recall_truncates_oversized_query_payload() -> None:
+    provider = MnemoryProvider("https://mnemory.test", _AuthProvider())
+    client = _Client(
+        {
+            "session_id": "mem-existing",
+            "search_results": [],
+            "stats": {},
+        }
+    )
+    provider.client = client
+    long_query = "a" * 20_000
+
+    with scoped_runtime_context(user_email="user@example.com", agent_id="agent-1"):
+        await provider.recall(query=long_query, session_id="mem-existing", managed=True)
+
+    assert client.last_json is not None
+    bounded_query = client.last_json["query"]
+    assert isinstance(bounded_query, str)
+    assert len(bounded_query) < len(long_query)
+    assert "middle truncated" in bounded_query
+    assert client.last_json["messages"] == [{"role": "user", "content": bounded_query}]

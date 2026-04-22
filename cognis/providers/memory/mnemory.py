@@ -9,6 +9,7 @@ from typing import Any, TypeVar
 import httpx
 from prometheus_client import Counter
 
+from cognis.core.truncation import middle_truncate
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.config import ProviderHealth
@@ -24,6 +25,15 @@ MNEMORY_SESSION_FORGED_TOTAL = Counter(
 )
 
 T = TypeVar("T")
+
+_MAX_RECALL_QUERY_CHARS = 12_000
+
+
+def _truncate_recall_text(text: str) -> tuple[str, bool]:
+    normalized = text.strip()
+    if not normalized:
+        return "", False
+    return middle_truncate(normalized, _MAX_RECALL_QUERY_CHARS)
 
 
 class MnemoryProvider:
@@ -160,10 +170,11 @@ class MnemoryProvider:
         managed: bool = False,
         instruction_mode: str | None = None,
     ) -> dict[str, Any]:
+        bounded_query, query_truncated = _truncate_recall_text(query)
         payload: dict[str, Any] = {
             "session_id": session_id,
-            "query": query,
-            "messages": [{"role": "user", "content": query}],
+            "query": bounded_query,
+            "messages": [{"role": "user", "content": bounded_query}],
             "include_instructions": include_instructions,
             "managed": managed,
             "search_mode": search_mode,
@@ -180,6 +191,7 @@ class MnemoryProvider:
                     "session_id": session_id,
                     "search_mode": search_mode,
                     "query_len": len(query),
+                    "query_truncated": query_truncated,
                 }
             },
         )

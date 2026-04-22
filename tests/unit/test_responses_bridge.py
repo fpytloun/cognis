@@ -63,6 +63,48 @@ def test_messages_to_responses_input_preserves_system_role() -> None:
     assert result == [{"role": "system", "content": "Follow system instructions."}]
 
 
+def test_messages_to_responses_input_drops_filename_when_file_id_present() -> None:
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "file",
+                    "file": {
+                        "file_id": "file-123",
+                        "filename": "report.pdf",
+                        "file_url": "https://example.com/report.pdf",
+                    },
+                }
+            ],
+        }
+    ]
+
+    result = messages_to_responses_input(messages)
+
+    assert result == [{"role": "user", "content": [{"type": "input_file", "file_id": "file-123"}]}]
+
+
+def test_messages_to_responses_input_normalizes_existing_input_file_with_file_id() -> None:
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_file",
+                    "file_id": "file-123",
+                    "filename": "report.pdf",
+                    "file_url": "https://example.com/report.pdf",
+                }
+            ],
+        }
+    ]
+
+    result = messages_to_responses_input(messages)
+
+    assert result == [{"role": "user", "content": [{"type": "input_file", "file_id": "file-123"}]}]
+
+
 def test_split_messages_for_responses_extracts_prefix_into_instructions() -> None:
     messages = [
         {"role": "system", "content": "Immutable persona block.", "_immutable_prefix": True},

@@ -860,8 +860,19 @@ def _normalize_message_content(content: Any) -> Any:
             if not isinstance(part, dict):
                 continue
             part_type = str(part.get("type") or "")
-            if part_type in {"input_text", "input_image", "input_file"}:
+            if part_type in {"input_text", "input_image"}:
                 normalized.append(part)
+                continue
+            if part_type == "input_file":
+                item = {"type": "input_file"}
+                if isinstance(part.get("file_id"), str) and part["file_id"]:
+                    item["file_id"] = part["file_id"]
+                elif isinstance(part.get("file_url"), str) and part["file_url"]:
+                    item["file_url"] = part["file_url"]
+                    if isinstance(part.get("filename"), str) and part["filename"]:
+                        item["filename"] = part["filename"]
+                if len(item) > 1:
+                    normalized.append(item)
                 continue
             if part_type == "text":
                 normalized.append({"type": "input_text", "text": str(part.get("text") or "")})
@@ -884,11 +895,11 @@ def _normalize_message_content(content: Any) -> Any:
                 file_data = part.get("file")
                 if isinstance(file_data, dict):
                     item = {"type": "input_file"}
-                    if isinstance(file_data.get("file_id"), str):
+                    if isinstance(file_data.get("file_id"), str) and file_data["file_id"]:
                         item["file_id"] = file_data["file_id"]
-                    elif isinstance(file_data.get("file_url"), str):
+                    elif isinstance(file_data.get("file_url"), str) and file_data["file_url"]:
                         item["file_url"] = file_data["file_url"]
-                    if isinstance(file_data.get("filename"), str):
+                    if "file_url" in item and isinstance(file_data.get("filename"), str):
                         item["filename"] = file_data["filename"]
                     if len(item) > 1:
                         normalized.append(item)
