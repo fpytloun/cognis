@@ -1,7 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import { ApiError } from '$lib/api/client';
-import { loadTaskPageData, refreshTaskPageData, shouldClearTaskFromError } from '$lib/task-detail';
+import {
+  isTaskRerunnable,
+  loadTaskPageData,
+  refreshTaskPageData,
+  shouldClearTaskFromError
+} from '$lib/task-detail';
 
 const taskDetail = {
   task_id: 'task-1',
@@ -106,5 +111,16 @@ describe('task detail helpers', () => {
   it('only clears the task view for actual not-found detail errors', () => {
     expect(shouldClearTaskFromError(new ApiError('Task not found', { status: 404 }))).toBe(true);
     expect(shouldClearTaskFromError(new ApiError('Temporary failure', { status: 503 }))).toBe(false);
+  });
+
+  it('only exposes rerun for paused and terminal tasks', () => {
+    expect(isTaskRerunnable({ status: 'paused' })).toBe(true);
+    expect(isTaskRerunnable({ status: 'completed' })).toBe(true);
+    expect(isTaskRerunnable({ status: 'failed' })).toBe(true);
+    expect(isTaskRerunnable({ status: 'cancelled' })).toBe(true);
+    expect(isTaskRerunnable({ status: 'running' })).toBe(false);
+    expect(isTaskRerunnable({ status: 'queued' })).toBe(false);
+    expect(isTaskRerunnable({ status: 'draft' })).toBe(false);
+    expect(isTaskRerunnable(null)).toBe(false);
   });
 });

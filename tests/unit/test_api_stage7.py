@@ -15,6 +15,7 @@ from cognis.api.websocket import (
 )
 from cognis.core.agent_loop import PendingPause
 from cognis.core.decision import DecisionResult
+from cognis.core.task_queue import TaskRerunResult
 from cognis.models.session import EventReadResult
 from cognis.models.task import TaskDelivery, TaskModel, TaskStatus
 from cognis.models.workflow import WorkflowState
@@ -197,7 +198,76 @@ def test_task_mutation_rejects_non_owner(monkeypatch: object, tmp_path: Path) ->
             f"/api/v1/tasks/{task_id}/cancel",
             headers=_auth_headers(app, email="attacker@example.com"),
         )
-        assert response.status_code == 403
+        assert response.status_code == 404
+
+
+def test_task_rerun_returns_new_task_target(monkeypatch: object, tmp_path: Path) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> str:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                task = await create_task(
+                    session,
+                    created_by="user@example.com",
+                    agent_id="agent-1",
+                    title="Completed task",
+                    status="completed",
+                )
+                await session.commit()
+                return task.task_id
+
+        task_id = asyncio.run(_seed())
+
+        async def _fake_rerun(task_id: str) -> TaskRerunResult:
+            return TaskRerunResult(
+                source_task_id=task_id,
+                task=TaskModel(
+                    task_id="task_clone",
+                    title="Completed task",
+                    description="",
+                    status=TaskStatus.QUEUED,
+                    priority=0,
+                    created_by="user@example.com",
+                    agent_id="agent-1",
+                    source_type="api",
+                    source_ref=None,
+                    delivery=TaskDelivery(),
+                    workflow_id=None,
+                    workflow_state=WorkflowState(),
+                ),
+                created_new=True,
+            )
+
+        app.state.task_queue.rerun_task = _fake_rerun
+
+        response = client.post(
+            f"/api/v1/tasks/{task_id}/rerun",
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "ok": True,
+            "source_task_id": task_id,
+            "task_id": "task_clone",
+            "status": "queued",
+            "created_new": True,
+        }
 
 
 def test_gate_response_returns_conflict_for_unsupported_action(

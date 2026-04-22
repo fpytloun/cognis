@@ -827,6 +827,14 @@ export interface TaskDetail extends Task {
   pending_pause: PendingPause | null;
 }
 
+export interface TaskRerunResponse {
+  ok: boolean;
+  source_task_id: string;
+  task_id: string;
+  status: string;
+  created_new: boolean;
+}
+
 export interface WorkflowStep {
   name: string;
   type: string;

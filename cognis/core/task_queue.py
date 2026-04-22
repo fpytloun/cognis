@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -17,20 +18,20 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cognis.core.agent_loop import PauseResolution
 from cognis.core.events import Event, EventBus, EventType
+from cognis.core.workflow_engine import WorkflowEngine
 from cognis.core.workflow_management import (
     decode_skill_workflow_candidate_id,
     encode_skill_workflow_candidate_id,
     materialize_skill_workflow,
     skill_workflow_criteria,
 )
-from cognis.core.workflow_engine import WorkflowEngine
 from cognis.core.workflow_registry import WorkflowRegistry
 from cognis.logging import get_logger
 from cognis.models.task import TaskDelivery, TaskModel, TaskStatus
 from cognis.models.workflow import CompletionDeliveryPolicy, WorkflowState
 from cognis.runtime_context import scoped_runtime_context
-from cognis.tools.skills import resolve_skills_for_agent
 from cognis.store.queries import (
+    add_task_dependency,
     count_active_steps,
     create_task,
     fail_orphaned_running_step_runs,
@@ -38,6 +39,7 @@ from cognis.store.queries import (
     get_dependent_tasks,
     get_setting_value,
     get_task,
+    get_task_dependencies,
     get_unmet_dependencies,
     list_stale_running_tasks,
     list_tasks_by_status,
@@ -46,6 +48,7 @@ from cognis.store.queries import (
     update_task_workflow_state,
     update_workflow,
 )
+from cognis.tools.skills import resolve_skills_for_agent
 
 logger = get_logger(__name__)
 
@@ -70,6 +73,17 @@ DEFAULT_MAX_ACTIVE_STEPS_GLOBAL = 10
 DEFAULT_MAX_ACTIVE_STEPS_PER_AGENT = 5
 DEFAULT_POLL_INTERVAL_SECONDS = 1.0
 DEFAULT_STALE_AFTER_SECONDS = 300
+
+_RERUN_CLONE_STATUSES = {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
+
+
+@dataclass(slots=True)
+class TaskRerunResult:
+    """Resolved outcome of a task rerun request."""
+
+    source_task_id: str
+    task: TaskModel
+    created_new: bool
 
 
 def _recover_pause_options(value: Any) -> list[dict[str, Any]] | None:
@@ -478,6 +492,61 @@ class TaskQueue:
         task.workflow_state = ws
         self._launch_task_run(task)
         return task
+
+    async def rerun_task(self, task_id: str) -> TaskRerunResult:
+        """Re-run a task by resuming it or cloning it for a fresh run.
+
+        Paused tasks resume in place. Terminal tasks create a fresh draft copy,
+        preserve direct dependencies, then submit the new task.
+        """
+
+        async with self._session_factory() as db_session:
+            task_row = await get_task(db_session, task_id)
+            if task_row is None:
+                raise ValueError("Task not found")
+            task = _row_to_task_model(task_row)
+
+        if task.status == TaskStatus.PAUSED:
+            resumed = await self.resume_task(task_id)
+            return TaskRerunResult(source_task_id=task_id, task=resumed, created_new=False)
+
+        if task.status not in _RERUN_CLONE_STATUSES:
+            raise ValueError(f"Cannot rerun task in '{task.status}' status.")
+
+        cloned = await self._clone_task_for_rerun(task)
+        return TaskRerunResult(source_task_id=task_id, task=cloned, created_new=True)
+
+    async def _clone_task_for_rerun(self, source_task: TaskModel) -> TaskModel:
+        """Clone a terminal task into a fresh submitted task."""
+
+        draft = await self.create_draft(
+            created_by=source_task.created_by,
+            agent_id=source_task.agent_id,
+            title=source_task.title,
+            description=source_task.description,
+            expected_output=source_task.expected_output,
+            priority=source_task.priority,
+            delivery=source_task.delivery,
+            completion_delivery=source_task.completion_delivery,
+            workflow_id=source_task.workflow_id,
+            workspace_root=source_task.workspace_root,
+            working_directory=source_task.working_directory,
+            source_type=source_task.source_type,
+            source_ref=source_task.source_ref,
+        )
+
+        async with self._session_factory() as db_session:
+            dependencies = await get_task_dependencies(db_session, source_task.task_id)
+            for dependency in dependencies:
+                await add_task_dependency(
+                    db_session,
+                    draft.task_id,
+                    dependency.depends_on,
+                    required=bool(dependency.required),
+                )
+            await db_session.commit()
+
+        return await self.submit_existing(draft.task_id)
 
     async def cancel_task(self, task_id: str) -> TaskModel:
         """Cancel a task in any mutable state."""

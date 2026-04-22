@@ -8,10 +8,10 @@ from types import SimpleNamespace
 import pytest
 
 from cognis.core.agent_registry import AgentRegistry
-from cognis.store.database import create_engine, create_session_factory
-from cognis.core.task_queue import TaskQueue
+from cognis.core.task_queue import TaskQueue, TaskRerunResult
 from cognis.core.workflow_registry import WorkflowRegistry
-from cognis.models.task import TaskModel
+from cognis.models.task import TaskModel, TaskStatus
+from cognis.store.database import create_engine, create_session_factory
 from cognis.store.models import Agent, Base, User
 from cognis.store.queries import (
     add_task_dependency,
@@ -23,6 +23,7 @@ from cognis.store.queries import (
     fail_running_step_runs_for_task,
     get_step_run,
     get_task,
+    get_task_dependencies,
     list_tasks_by_status,
     pick_ready_task,
     set_current_version,
@@ -75,6 +76,173 @@ async def test_create_and_get_task(tmp_path: object) -> None:
             assert task is not None
             assert task.title == "Test Task"
             assert task.status == "draft"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_rerun_task_resumes_paused_task_in_place(tmp_path: object) -> None:
+    engine, factory = await _bootstrap_db(tmp_path)
+    try:
+        async with factory() as session:
+            row = await create_task(
+                session,
+                created_by="user@test.com",
+                agent_id="agent-1",
+                title="Paused task",
+                status="paused",
+            )
+            await session.commit()
+            task_id = row.task_id
+
+        async def _publish(*_args: object, **_kwargs: object) -> None:
+            return None
+
+        queue = TaskQueue(
+            session_factory=factory,
+            workflow_engine=SimpleNamespace(
+                _pause_waiter=SimpleNamespace(find_pending=lambda **_kwargs: None)
+            ),
+            workflow_registry=SimpleNamespace(),
+            event_bus=SimpleNamespace(publish=_publish),
+        )
+
+        async def _has_capacity(*, agent_id: str | None = None) -> bool:
+            assert agent_id == "agent-1"
+            return True
+
+        launches: list[str] = []
+
+        def _launch(task: TaskModel) -> None:
+            launches.append(task.task_id)
+
+        queue._has_capacity = _has_capacity  # type: ignore[method-assign]
+        queue._launch_task_run = _launch  # type: ignore[method-assign]
+
+        result = await queue.rerun_task(task_id)
+
+        assert result == TaskRerunResult(
+            source_task_id=task_id,
+            task=result.task,
+            created_new=False,
+        )
+        assert result.task.task_id == task_id
+        assert result.task.status == TaskStatus.RUNNING
+        assert launches == [task_id]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_rerun_task_clones_terminal_task_with_dependencies(tmp_path: object) -> None:
+    engine, factory = await _bootstrap_db(tmp_path)
+    try:
+        async with factory() as session:
+            dependency = await create_task(
+                session,
+                created_by="user@test.com",
+                agent_id="agent-1",
+                title="Dependency",
+                status="completed",
+                task_id="task_dependency",
+            )
+            original = await create_task(
+                session,
+                created_by="user@test.com",
+                agent_id="agent-1",
+                title="Original task",
+                description="Run the same workflow again",
+                expected_output="Ship the final report",
+                status="failed",
+                priority=42,
+                source_type="chat",
+                source_ref="conv-1",
+                delivery_mode="specific_conversation",
+                delivery_target="conv-2",
+                completion_mode_family="direct",
+                allow_silent_completion=True,
+                workflow_id="wf-1",
+                workspace_root="/tmp/workspace",
+                working_directory="/tmp/workspace/subdir",
+                task_id="task_original",
+            )
+            await add_task_dependency(session, original.task_id, dependency.task_id, required=False)
+            await session.commit()
+
+        async def _publish(*_args: object, **_kwargs: object) -> None:
+            return None
+
+        queue = TaskQueue(
+            session_factory=factory,
+            workflow_engine=SimpleNamespace(
+                _pause_waiter=SimpleNamespace(find_pending=lambda **_kwargs: None)
+            ),
+            workflow_registry=SimpleNamespace(),
+            event_bus=SimpleNamespace(publish=_publish),
+        )
+
+        result = await queue.rerun_task("task_original")
+
+        assert result.created_new is True
+        assert result.source_task_id == "task_original"
+        assert result.task.task_id != "task_original"
+        assert result.task.status == TaskStatus.QUEUED
+
+        async with factory() as session:
+            cloned = await get_task(session, result.task.task_id)
+            dependencies = await get_task_dependencies(session, result.task.task_id)
+            assert cloned is not None
+            assert cloned.title == "Original task"
+            assert cloned.description == "Run the same workflow again"
+            assert cloned.expected_output == "Ship the final report"
+            assert cloned.priority == 42
+            assert cloned.agent_id == "agent-1"
+            assert cloned.source_type == "chat"
+            assert cloned.source_ref == "conv-1"
+            assert cloned.delivery_mode == "specific_conversation"
+            assert cloned.delivery_target == "conv-2"
+            assert cloned.completion_mode_family == "direct"
+            assert cloned.allow_silent_completion is True
+            assert cloned.workflow_id == "wf-1"
+            assert cloned.workspace_root == "/tmp/workspace"
+            assert cloned.working_directory == "/tmp/workspace/subdir"
+            assert cloned.status == "ready"
+            assert len(dependencies) == 1
+            assert dependencies[0].depends_on == "task_dependency"
+            assert dependencies[0].required is False
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_rerun_task_rejects_active_statuses(tmp_path: object) -> None:
+    engine, factory = await _bootstrap_db(tmp_path)
+    try:
+        async with factory() as session:
+            row = await create_task(
+                session,
+                created_by="user@test.com",
+                agent_id="agent-1",
+                title="Running task",
+                status="running",
+                task_id="task_running_rerun",
+            )
+            await session.commit()
+
+        async def _publish(*_args: object, **_kwargs: object) -> None:
+            return None
+
+        queue = TaskQueue(
+            session_factory=factory,
+            workflow_engine=SimpleNamespace(
+                _pause_waiter=SimpleNamespace(find_pending=lambda **_kwargs: None)
+            ),
+            workflow_registry=SimpleNamespace(),
+            event_bus=SimpleNamespace(publish=_publish),
+        )
+
+        with pytest.raises(ValueError, match="Cannot rerun task in 'running' status"):
+            await queue.rerun_task(row.task_id)
     finally:
         await engine.dispose()
 

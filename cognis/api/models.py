@@ -479,6 +479,14 @@ class TaskActionResponse(BaseModel):
     status: str
 
 
+class TaskRerunResponse(BaseModel):
+    ok: bool
+    source_task_id: str
+    task_id: str
+    status: str
+    created_new: bool
+
+
 class BatchSubmitRequest(BaseModel):
     task_ids: list[str] = Field(default_factory=list)
 

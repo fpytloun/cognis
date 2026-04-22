@@ -58,6 +58,7 @@ import type {
   StepProfileDefinition,
   Task,
   TaskDetail,
+  TaskRerunResponse,
   ToolDefinitionSummary,
   UserCreatePayload,
   UserDetail,
@@ -816,6 +817,12 @@ export const api = {
 
     resume(taskId: string): Promise<{ ok: boolean; task_id: string; status: string }> {
       return request<{ ok: boolean; task_id: string; status: string }>(`/api/v1/tasks/${taskId}/resume`, { method: 'POST' });
+    },
+
+    rerun(taskId: string): Promise<TaskRerunResponse> {
+      return request<TaskRerunResponse>(`/api/v1/tasks/${taskId}/rerun`, {
+        method: 'POST'
+      });
     },
 
     cancel(taskId: string): Promise<{ ok: boolean; task_id: string; status: string }> {

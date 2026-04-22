@@ -30,6 +30,7 @@ from cognis.api.models import (
     TaskActionResponse,
     TaskCreateRequest,
     TaskDetailResponse,
+    TaskRerunResponse,
     TaskResponse,
     TaskUpdateRequest,
     WorkflowRunResponse,
@@ -445,6 +446,20 @@ async def task_resume(request: Request, task_id: str) -> TaskActionResponse:
     await _require_task(request, task_id)
     task = await request.app.state.task_queue.resume_task(task_id)
     return TaskActionResponse(ok=True, task_id=task_id, status=str(task.status))
+
+
+@router.post("/api/v1/tasks/{task_id}/rerun", response_model=TaskRerunResponse)
+async def task_rerun(request: Request, task_id: str) -> TaskRerunResponse:
+    forbid_mutation_for_viewer(request)
+    await _require_task(request, task_id)
+    result = await request.app.state.task_queue.rerun_task(task_id)
+    return TaskRerunResponse(
+        ok=True,
+        source_task_id=task_id,
+        task_id=result.task.task_id,
+        status=str(result.task.status),
+        created_new=result.created_new,
+    )
 
 
 @router.post("/api/v1/tasks/{task_id}/cancel", response_model=TaskActionResponse)

@@ -25,6 +25,7 @@ from cognis.api.models import (
     SkillVersionResponse,
     StepProfileResponse,
     StepRunResponse,
+    TaskRerunResponse,
     TaskResponse,
     ToolClassificationActionResponse,
     ToolClassificationOverrideRequest,
@@ -240,6 +241,20 @@ class TestTaskResponseRoundTrip:
         assert response.description == ""
         assert response.workflow_state is None
         assert response.completion_mode_family == "default"
+
+
+def test_task_rerun_response_round_trip() -> None:
+    response = TaskRerunResponse(
+        ok=True,
+        source_task_id="task-old",
+        task_id="task-new",
+        status="queued",
+        created_new=True,
+    )
+
+    assert response.source_task_id == "task-old"
+    assert response.task_id == "task-new"
+    assert response.created_new is True
 
 
 def test_workflow_response_round_trips_lifecycle_and_lineage() -> None:

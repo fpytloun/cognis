@@ -30,7 +30,12 @@ import Target from 'lucide-svelte/icons/target';
   import WorkflowDiagram from '$lib/components/workflows/WorkflowDiagram.svelte';
   import { confirmAction } from '$lib/stores/confirm';
   import { addToast } from '$lib/stores/toasts';
-  import { loadTaskPageData, refreshTaskPageData, shouldClearTaskFromError } from '$lib/task-detail';
+  import {
+    isTaskRerunnable,
+    loadTaskPageData,
+    refreshTaskPageData,
+    shouldClearTaskFromError
+  } from '$lib/task-detail';
   import { renderMarkdown } from '$lib/markdown';
   import { formatAbsoluteTime, formatDuration, formatRelativeTime } from '$lib/time';
   import { workflowToFormState } from '$lib/workflows';
@@ -38,6 +43,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
 
   let loading = $state(true);
   let saving = $state(false);
+  let rerunBusy = $state(false);
   let error = $state('');
   let task = $state<TaskDetail | null>(null);
   let agents = $state<Agent[]>([]);
@@ -103,6 +109,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
   const CANCELLABLE_STATUSES = ['queued', 'ready', 'running', 'paused', 'draft'];
   let isEditable = $derived(task != null && !TERMINAL_STATUSES.includes(task.status));
   let isCancellable = $derived(task != null && CANCELLABLE_STATUSES.includes(task.status));
+  let isRerunnable = $derived(isTaskRerunnable(task));
 
   // ---------------------------------------------------------------------------
   // Helpers
@@ -893,6 +900,27 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
     }
   }
 
+  async function rerunTask(): Promise<void> {
+    if (!task || rerunBusy) return;
+    rerunBusy = true;
+    try {
+      const rerun = await api.tasks.rerun(task.task_id);
+      error = '';
+      if (rerun.created_new) {
+        addToast('Created a new rerun task.', 'success');
+        await goto(`/tasks/${rerun.task_id}`);
+        return;
+      }
+      await refreshTaskOnly();
+      addToast('Task resumed.', 'success');
+    } catch (caughtError) {
+      error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to re-run task');
+    } finally {
+      rerunBusy = false;
+    }
+  }
+
   function startDurationTimer(): void {
     if (durationTimer) return;
     durationTimer = setInterval(() => { tickNow = Date.now(); }, 1000);
@@ -961,6 +989,11 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
         </div>
       </div>
       <div class="flex items-center gap-3">
+        {#if isRerunnable}
+          <Button size="sm" disabled={rerunBusy} onclick={rerunTask}>
+            Re-run task
+          </Button>
+        {/if}
         <Button size="sm" variant="secondary" onclick={() => (configModalOpen = true)}>
           <Settings2 class="mr-1.5 h-3.5 w-3.5" />
           Configure

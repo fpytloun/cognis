@@ -1,6 +1,8 @@
 import { asApiError } from '$lib/api/client';
 import type { Agent, Conversation, Task, TaskDetail, Workflow } from '$lib/types/api';
 
+const RERUNNABLE_TASK_STATUSES = new Set(['paused', 'completed', 'failed', 'cancelled']);
+
 type TaskDetailApi = {
   tasks: {
     detail(taskId: string): Promise<TaskDetail>;
@@ -83,6 +85,11 @@ export async function refreshTaskPageData(
 
 export function shouldClearTaskFromError(error: unknown): boolean {
   return asApiError(error).status === 404;
+}
+
+export function isTaskRerunnable(task: Pick<Task, 'status'> | null | undefined): boolean {
+  if (!task) return false;
+  return RERUNNABLE_TASK_STATUSES.has(task.status);
 }
 
 function firstAuxiliaryError(
