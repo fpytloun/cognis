@@ -34,6 +34,7 @@ from cognis.tools.executor.document import (
     handle_document_generate,
 )
 from cognis.tools.executor.filesystem import (
+    handle_artifact_save,
     handle_edit,
     handle_list_directory,
     handle_multiedit,
@@ -105,6 +106,33 @@ WRITE_TOOL = ToolDefinition(
     read_only=False,
     non_bypassable=True,
     timeout_seconds=30,
+)
+
+ARTIFACT_SAVE_TOOL = ToolDefinition(
+    name="artifact_save",
+    description=(
+        "Save a Cognis artifact to a local executor file path. Use this when you need a saved "
+        "image, PDF, or other artifact as a real filesystem file for subsequent tools."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "file_path": {
+                "type": "string",
+                "description": "Absolute path to write on the executor filesystem.",
+            },
+            "source_artifact_id": {
+                "type": "string",
+                "description": "Cognis artifact id to save to the executor filesystem.",
+            },
+        },
+        "required": ["file_path", "source_artifact_id"],
+    },
+    source=_EXECUTOR_SOURCE,
+    category="filesystem",
+    read_only=False,
+    non_bypassable=True,
+    timeout_seconds=60,
 )
 
 EDIT_TOOL = ToolDefinition(
@@ -589,6 +617,7 @@ WEB_RESEARCH_TOOL = ToolDefinition(
 ALL_EXECUTOR_TOOLS: list[ToolDefinition] = [
     READ_TOOL,
     WRITE_TOOL,
+    ARTIFACT_SAVE_TOOL,
     EDIT_TOOL,
     PATCH_TOOL,
     MULTIEDIT_TOOL,
@@ -610,6 +639,7 @@ _HANDLER_MAP: dict[
 ] = {
     "read": handle_read,
     "write": handle_write,
+    "artifact_save": handle_artifact_save,
     "edit": handle_edit,
     "patch": handle_patch,
     "multiedit": handle_multiedit,

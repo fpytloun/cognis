@@ -883,6 +883,86 @@ async def test_tool_router_reports_attachment_analysis_diagnostics_on_empty_resp
 
 
 @pytest.mark.asyncio
+async def test_tool_router_resolves_artifact_save_content_for_executor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _CapturingExecutor(_RemoteExecutor):
+        def __init__(self) -> None:
+            super().__init__(ToolResult(output="saved"))
+            self.seen_call: ToolCall | None = None
+
+        async def tool_execute(
+            self, tool_call: ToolCall, timeout_seconds: int | None = None
+        ) -> ToolResult:
+            del timeout_seconds
+            self.seen_call = tool_call
+            return self.result
+
+    monkeypatch.setattr(
+        "cognis.core.tool_router.get_artifact_record",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                artifact_id="att_1",
+                status="attached",
+                owner_email="user@example.com",
+                namespace="attachments",
+                object_id="att_1",
+                filename="photo.png",
+                mime_type="image/png",
+            )
+        ),
+    )
+
+    class _Store(_ArtifactStore):
+        async def async_load(
+            self, namespace: str, object_id: str, filename: str
+        ) -> tuple[bytes, str]:
+            del namespace, object_id, filename
+            return b"png-bytes", "image/png"
+
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="artifact_save",
+                description="save artifact",
+                parameters={"type": "object", "properties": {}},
+                source=ToolSource(type="executor"),
+                timeout_seconds=1,
+            )
+        )
+    )
+
+    executor = _CapturingExecutor()
+    router = ToolRouter(
+        guardrails=_Guardrails(),
+        artifact_store=_Store(),
+        session_factory=_session_factory(),
+    )
+
+    result = await router.execute(
+        ToolCall(
+            call_id="artifact-save-1",
+            name="artifact_save",
+            arguments={"file_path": "/tmp/photo.png", "source_artifact_id": "att_1"},
+        ),
+        _session(),
+        _agent(),
+        registry,
+        executor,
+    )
+
+    assert result.is_error is False
+    assert executor.seen_call is not None
+    assert executor.seen_call.arguments["source_artifact_filename"] == "photo.png"
+    assert executor.seen_call.arguments["source_artifact_mime_type"] == "image/png"
+    assert (
+        base64.b64decode(executor.seen_call.arguments["source_artifact_content_b64"])
+        == b"png-bytes"
+    )
+
+
+@pytest.mark.asyncio
 async def test_tool_router_postprocesses_binary_read_with_attachment_analysis_route(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

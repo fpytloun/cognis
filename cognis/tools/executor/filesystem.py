@@ -430,6 +430,59 @@ async def handle_write(arguments: dict[str, Any], context: ToolExecutionContext)
     return await _with_file_lock(context, path, _write)
 
 
+async def handle_artifact_save(arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
+    """Save a controller-resolved Cognis artifact to the executor filesystem."""
+    file_path = arguments.get("file_path", "")
+    content_b64 = arguments.get("source_artifact_content_b64")
+
+    if not isinstance(content_b64, str) or not content_b64.strip():
+        return ToolResult(
+            output=(
+                "artifact_save requires controller-resolved artifact content. "
+                "Provide source_artifact_id so the controller can resolve it first."
+            ),
+            is_error=True,
+        )
+
+    try:
+        content = base64.b64decode(content_b64, validate=True)
+    except Exception:
+        return ToolResult(output="artifact_save received invalid artifact content.", is_error=True)
+
+    try:
+        path = _resolve_path(file_path, context)
+    except ValueError as exc:
+        return ToolResult(output=str(exc), is_error=True)
+
+    async def _write_binary() -> ToolResult:
+        exists = path.exists()
+        if exists:
+            try:
+                await _assert_can_modify_existing(context, path)
+            except RuntimeError as exc:
+                return ToolResult(output=str(exc), is_error=True)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+            await _record_write(context, path)
+        except (OSError, PermissionError) as exc:
+            return ToolResult(output=f"Cannot write file: {exc}", is_error=True)
+
+        source_artifact_id = str(arguments.get("source_artifact_id") or "")
+        source_filename = str(arguments.get("source_artifact_filename") or "")
+        mime_type = str(arguments.get("source_artifact_mime_type") or "application/octet-stream")
+        output = {
+            "saved_path": str(path),
+            "source_artifact_id": source_artifact_id or None,
+            "source_filename": source_filename or None,
+            "mime_type": mime_type,
+            "size_bytes": len(content),
+        }
+        return ToolResult(output=str(output), metadata={"files_written": [str(path)]})
+
+    return await _with_file_lock(context, path, _write_binary)
+
+
 async def handle_edit(arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
     """Edit a file by replacing exact text matches."""
     file_path = arguments.get("file_path", "")

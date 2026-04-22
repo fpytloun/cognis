@@ -868,6 +868,13 @@ class ToolRouter:
         self, tool_call: ToolCall, session: SessionModel, agent: AgentDefinition
     ) -> ToolCall:
         arguments = dict(tool_call.arguments)
+        if tool_call.name == "artifact_save" and (artifact_id := arguments.get("source_artifact_id")):
+            content, mime_type, filename = await self._load_binary_artifact(
+                str(artifact_id), session.user_email
+            )
+            arguments["source_artifact_content_b64"] = base64.b64encode(content).decode("ascii")
+            arguments.setdefault("source_artifact_filename", filename)
+            arguments.setdefault("source_artifact_mime_type", mime_type)
         if tool_call.name == "document_generate" and (
             artifact_id := arguments.get("source_artifact_id")
         ):

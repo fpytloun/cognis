@@ -775,6 +775,9 @@ import Server from 'lucide-svelte/icons/server';
     <button class="w-full flex items-center gap-3 text-left" onclick={() => toggleTool(toolKey)}>
       {#if expandedTools.has(toolKey)}<ChevronDown class="w-4 h-4 text-zinc-500 shrink-0" />{:else}<ChevronRight class="w-4 h-4 text-zinc-500 shrink-0" />{/if}
       <span class="font-mono text-sm text-zinc-100">{tool.name}</span>
+      <Badge class={getSourceType(tool) === 'executor' ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300' : 'border-blue-500/30 bg-blue-500/10 text-blue-300'}>
+        {getSourceLabel(getSourceType(tool))}
+      </Badge>
       <span class="text-sm text-zinc-400 truncate flex-1">{tool.description}</span>
       <div class="flex items-center gap-2 shrink-0">
         {#if tool.read_only}<Badge>read-only</Badge>{/if}

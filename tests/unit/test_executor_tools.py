@@ -16,6 +16,7 @@ from cognis.tools.executor.definitions import (
     executor_tool_handlers,
 )
 from cognis.tools.executor.filesystem import (
+    handle_artifact_save,
     handle_edit,
     handle_list_directory,
     handle_multiedit,
@@ -61,6 +62,7 @@ class TestDefinitions:
         assert {
             "read",
             "write",
+            "artifact_save",
             "edit",
             "patch",
             "multiedit",
@@ -84,7 +86,7 @@ class TestDefinitions:
             assert d.name in handlers, f"Missing handler for {d.name}"
 
     def test_write_tools_are_non_bypassable(self) -> None:
-        write_tools = {"write", "edit", "patch", "multiedit", "bash"}
+        write_tools = {"write", "artifact_save", "edit", "patch", "multiedit", "bash"}
         for tool in ALL_EXECUTOR_TOOLS:
             if tool.name in write_tools:
                 assert tool.non_bypassable, f"{tool.name} should be non_bypassable"
@@ -265,6 +267,36 @@ class TestWriteTool:
 
         assert follow_up.is_error
         assert "Use the read tool first" in follow_up.output
+
+    @pytest.mark.asyncio()
+    async def test_artifact_save_writes_binary_artifact_content(self, tmp_path: Path) -> None:
+        target = tmp_path / "saved.png"
+
+        result = await handle_artifact_save(
+            {
+                "file_path": str(target),
+                "source_artifact_id": "att-1",
+                "source_artifact_content_b64": "cG5nLWJ5dGVz",
+                "source_artifact_filename": "photo.png",
+                "source_artifact_mime_type": "image/png",
+            },
+            _context(),
+        )
+
+        assert not result.is_error
+        assert target.read_bytes() == b"png-bytes"
+
+    @pytest.mark.asyncio()
+    async def test_artifact_save_requires_controller_resolution(self, tmp_path: Path) -> None:
+        target = tmp_path / "saved.png"
+
+        result = await handle_artifact_save(
+            {"file_path": str(target), "source_artifact_id": "att-1"},
+            _context(),
+        )
+
+        assert result.is_error
+        assert "Provide source_artifact_id" in result.output
 
 
 class TestEditTool:
