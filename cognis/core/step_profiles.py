@@ -20,6 +20,74 @@ from cognis.models.workflow import (
     StepToolOverrides,
 )
 
+_DIRECT_DEFAULT_CORE_TOOL_IDS = [
+    "memory_search",
+    "memory_add",
+    "read",
+    "grep",
+    "glob",
+    "web_search",
+]
+
+_GENERAL_TASK_CORE_TOOL_IDS = [
+    "memory_search",
+    "memory_add",
+    "memory_update",
+    "read",
+    "grep",
+    "glob",
+    "bash",
+    "web_search",
+    "web_fetch",
+]
+
+_CODING_CORE_TOOL_IDS = [
+    "memory_search",
+    "memory_add",
+    "read",
+    "grep",
+    "glob",
+    "bash",
+    "edit",
+    "multiedit",
+    "patch",
+    "write",
+    "lsp",
+    "web_search",
+    "web_fetch",
+]
+
+_RESEARCH_CORE_TOOL_IDS = [
+    "memory_search",
+    "memory_add",
+    "read",
+    "grep",
+    "glob",
+    "web_search",
+    "web_fetch",
+]
+
+_REVIEW_CORE_TOOL_IDS = [
+    "memory_search",
+    "memory_add",
+    "read",
+    "grep",
+    "glob",
+    "web_search",
+]
+
+_PINNED_DEFAULT_VISIBLE_TOOL_IDENTIFIERS = (
+    "skill_load",
+    "read_tool_output",
+    "search_tool_output",
+    "list_tool_output_anchors",
+    "read_tool_output_anchor",
+    "get_current_datetime",
+    "convert_timezone",
+    "list_agents",
+    "get_status",
+)
+
 STEP_PROFILE_OVERRIDES_SETTING_KEY = "workflow.step_profile_overrides"
 STEP_PROFILE_CUSTOM_SETTING_KEY = "workflow.step_profiles_custom"
 LEGACY_PROFILE_GROUP_MAP: dict[str, str] = {
@@ -71,7 +139,9 @@ STEP_PROFILES: dict[str, StepProfileDefinition] = {
                 "system": _caps(ToolCapability.READ),
                 "web": _caps(ToolCapability.READ),
                 "development": _caps(ToolCapability.READ),
-            }
+            },
+            tool_overrides=StepToolOverrides(include=["delegate", "create_task"]),
+            core_tool_ids=_DIRECT_DEFAULT_CORE_TOOL_IDS,
         ),
     ),
     "system:general-task": StepProfileDefinition(
@@ -90,7 +160,9 @@ STEP_PROFILES: dict[str, StepProfileDefinition] = {
                 "communication": _caps(ToolCapability.READ, ToolCapability.WRITE),
                 "office": _caps(ToolCapability.READ, ToolCapability.WRITE),
                 "personal": _caps(ToolCapability.READ, ToolCapability.WRITE),
-            }
+            },
+            tool_overrides=StepToolOverrides(include=["delegate"]),
+            core_tool_ids=_GENERAL_TASK_CORE_TOOL_IDS,
         ),
     ),
     "system:research": StepProfileDefinition(
@@ -108,7 +180,9 @@ STEP_PROFILES: dict[str, StepProfileDefinition] = {
                 "office": _caps(ToolCapability.READ),
                 "communication": _caps(ToolCapability.READ),
                 "personal": _caps(ToolCapability.READ),
-            }
+            },
+            tool_overrides=StepToolOverrides(include=["delegate"]),
+            core_tool_ids=_RESEARCH_CORE_TOOL_IDS,
         ),
     ),
     "system:coding": StepProfileDefinition(
@@ -125,8 +199,12 @@ STEP_PROFILES: dict[str, StepProfileDefinition] = {
                 "shell": _caps(ToolCapability.WRITE, ToolCapability.PRIVILEGED),
                 "system": _caps(ToolCapability.READ),
                 "web": _caps(ToolCapability.READ),
-                "development": _caps(ToolCapability.READ, ToolCapability.WRITE, ToolCapability.PRIVILEGED),
-            }
+                "development": _caps(
+                    ToolCapability.READ, ToolCapability.WRITE, ToolCapability.PRIVILEGED
+                ),
+            },
+            tool_overrides=StepToolOverrides(include=["delegate"]),
+            core_tool_ids=_CODING_CORE_TOOL_IDS,
         ),
     ),
     "system:review": StepProfileDefinition(
@@ -140,7 +218,9 @@ STEP_PROFILES: dict[str, StepProfileDefinition] = {
                 "system": _caps(ToolCapability.READ),
                 "web": _caps(ToolCapability.READ),
                 "development": _caps(ToolCapability.READ),
-            }
+            },
+            tool_overrides=StepToolOverrides(include=["delegate"]),
+            core_tool_ids=_REVIEW_CORE_TOOL_IDS,
         ),
     ),
 }
@@ -298,7 +378,26 @@ def step_profile_visible_by_default(tool: ToolDefinition, profile: ResolvedStepP
 
     if profile.config is None:
         return True
-    return apply_profile_overrides(tool, profile)
+    if any(
+        tool_matches_identifier(tool, identifier)
+        for identifier in profile.config.tool_overrides.exclude
+    ):
+        return False
+    if any(
+        tool_matches_identifier(tool, identifier)
+        for identifier in _PINNED_DEFAULT_VISIBLE_TOOL_IDENTIFIERS
+    ):
+        return True
+    if any(
+        tool_matches_identifier(tool, identifier)
+        for identifier in profile.config.tool_overrides.include
+    ):
+        return True
+    if profile.config.core_tool_ids:
+        return profile_matches_tool(tool, profile) and any(
+            tool_matches_identifier(tool, identifier) for identifier in profile.config.core_tool_ids
+        )
+    return profile_matches_tool(tool, profile)
 
 
 def _merge_profile_config(
@@ -320,6 +419,7 @@ def _merge_profile_config(
             exclude=[*base.tool_overrides.exclude, *override.tool_overrides.exclude],
         ),
         allow_tool_search=override.allow_tool_search,
+        core_tool_ids=[*base.core_tool_ids, *override.core_tool_ids],
     )
 
 
@@ -329,7 +429,9 @@ def _normalize_override_payload(payload: dict[str, Any]) -> dict[str, Any]:
     config = StepProfileConfig.model_validate(raw_config if isinstance(raw_config, dict) else {})
     return {
         "name": payload.get("name") if isinstance(payload.get("name"), str) else None,
-        "mode": str(StepProfileMode(mode)) if isinstance(mode, str) and mode else str(StepProfileMode.SOFT),
+        "mode": str(StepProfileMode(mode))
+        if isinstance(mode, str) and mode
+        else str(StepProfileMode.SOFT),
         "config": _normalize_profile_config(config).model_dump(mode="json"),
     }
 
@@ -386,4 +488,19 @@ def _normalize_profile_config(config: StepProfileConfig) -> StepProfileConfig:
         matrix=merged,
         tool_overrides=config.tool_overrides,
         allow_tool_search=config.allow_tool_search,
+        core_tool_ids=_dedupe_identifiers(config.core_tool_ids),
     )
+
+
+def _dedupe_identifiers(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        normalized = value.strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(normalized)
+    return deduped

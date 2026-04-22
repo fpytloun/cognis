@@ -19,10 +19,12 @@ from cognis.core.immutable_prefix import ImmutablePrefixEntry
 from cognis.core.project_context import ProjectContextEntry, build_project_instruction_message
 from cognis.core.prompts import PromptContext
 from cognis.core.runtime import ExecutorEnvironmentSnapshot
+from cognis.core.step_profiles import resolve_step_profile, step_profile_visible_by_default
 from cognis.models.agent import AgentDefinition, AgentLLMConfig
 from cognis.models.config import ModelInfo
 from cognis.models.session import ConversationContext, ConversationModel, SessionModel
 from cognis.models.tool import ToolDefinition, ToolSource
+from cognis.models.workflow import StepDefinition
 
 
 class _CacheEntry:
@@ -739,14 +741,14 @@ async def test_context_assembler_accounts_for_tool_schema_budget() -> None:
 
 
 def test_build_environment_info_contains_required_fields() -> None:
-    """Environment info must include home dir, cwd, platform, and date."""
+    """Environment info must include stable executor context, not wall-clock time."""
     info = _build_environment_info()
     assert "Home directory:" in info
     assert "Working directory:" in info
     assert "Platform:" in info
-    assert "Date:" in info
     assert "Hostname:" in info
     assert "System user:" in info
+    assert "get_current_datetime" in info
     # Must contain the actual home directory, not a generic placeholder
     assert str(Path.home()) in info
     # Must instruct the LLM about ~ expansion
@@ -784,6 +786,7 @@ def test_build_environment_info_marks_unavailable_remote_environment() -> None:
     assert "exec-2" in info
     assert "unavailable" in info
     assert "Do not guess controller paths" in info
+    assert "get_current_datetime" in info
 
 
 @pytest.mark.asyncio
@@ -1462,3 +1465,66 @@ async def test_context_assembler_clears_follow_up_markers_in_skip_memory_path() 
     )
 
     assert all(not any(str(key).startswith("_") for key in message) for message in result.messages)
+
+
+def _profile_tool(name: str, *, category: str, read_only: bool) -> ToolDefinition:
+    return ToolDefinition(
+        name=name,
+        description=name,
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(type="builtin"),
+        category=category,
+        read_only=read_only,
+    )
+
+
+def test_direct_default_profile_keeps_delegate_visible() -> None:
+    profile = resolve_step_profile(
+        StepDefinition(
+            name="direct",
+            type="run",
+            prompt="",
+            step_profile_id="system:direct-default",
+        )
+    )
+
+    assert step_profile_visible_by_default(
+        _profile_tool("delegate", category="orchestration", read_only=False),
+        profile,
+    )
+    assert step_profile_visible_by_default(
+        _profile_tool("create_task", category="orchestration", read_only=False),
+        profile,
+    )
+    assert not step_profile_visible_by_default(
+        _profile_tool("bash", category="shell", read_only=False),
+        profile,
+    )
+
+
+def test_general_task_profile_uses_pinned_helpers_and_core_tools_only() -> None:
+    profile = resolve_step_profile(
+        StepDefinition(
+            name="task",
+            type="run",
+            prompt="",
+            step_profile_id="system:general-task",
+        )
+    )
+
+    assert step_profile_visible_by_default(
+        _profile_tool("memory_search", category="memory", read_only=True),
+        profile,
+    )
+    assert step_profile_visible_by_default(
+        _profile_tool("skill_load", category="skill", read_only=True),
+        profile,
+    )
+    assert step_profile_visible_by_default(
+        _profile_tool("read_tool_output", category="context", read_only=True),
+        profile,
+    )
+    assert not step_profile_visible_by_default(
+        _profile_tool("mcp_googleworkspace__search_messages", category="mcp", read_only=True),
+        profile,
+    )

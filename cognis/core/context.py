@@ -248,9 +248,9 @@ def _build_environment_info(
             "Environment:\n"
             f"- Executor: {executor_label} ({executor_type})\n"
             "- Environment details: unavailable from this executor\n"
-            f"- Date: {datetime.date.today().isoformat()}\n"
             "If you omit a filesystem path or shell workdir, the executor still defaults "
-            "to its own local home directory. Do not guess controller paths."
+            "to its own local home directory. Do not guess controller paths. "
+            "If you need the current date or time, call get_current_datetime."
         )
 
     return (
@@ -267,10 +267,10 @@ def _build_environment_info(
             if effective_working_directory
             else ""
         )
-        + f"- Date: {datetime.date.today().isoformat()}\n"
         + "When the user references ~ or $HOME, use the home directory above. "
         + "If a filesystem path or shell workdir is omitted, tools default to the effective "
-        + "working directory above when available."
+        + "working directory above when available. If you need the current date or time, "
+        + "call get_current_datetime."
     )
 
 

@@ -217,6 +217,7 @@ class StepProfileConfig(BaseModel):
     matrix: dict[str, list[ToolCapability]] = Field(default_factory=dict)
     tool_overrides: StepToolOverrides = Field(default_factory=StepToolOverrides)
     allow_tool_search: bool = True
+    core_tool_ids: list[str] = Field(default_factory=list)
 
 
 class StepDefinition(BaseModel):
